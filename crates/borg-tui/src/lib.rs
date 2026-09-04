@@ -561,6 +561,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/clear", "clear conversation context"),
     ("/compact", "compact the current conversation context"),
     ("/resume", "resume a saved Borg session"),
+    ("/import", "copy threads and memory from another assistant"),
     ("/goal", "view or update the durable goal"),
     ("/todo", "view or update the durable todo list"),
     ("/todos", "alias for /todo"),
@@ -1210,6 +1211,8 @@ pub struct ResumeSessionOption {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PickerKind {
+    ImportSource,
+    ImportPreview { threads: bool, memory: bool },
     Settings,
     Resume,
     Model,
@@ -3503,6 +3506,7 @@ impl BorgTerminal {
 
     pub fn open_settings_picker(&mut self, user_label: &str, assistant_label: &str) {
         let options = vec![
+            "Import threads and memory".to_string(),
             self.tr("Model").to_string(),
             "Reasoning effort".to_string(),
             self.tr("Response language").to_string(),
@@ -3525,6 +3529,7 @@ impl BorgTerminal {
             format!("Assistant label · {assistant_label}"),
         ];
         let values = [
+            "/import",
             "/model",
             "/effort",
             "/language",
@@ -3558,6 +3563,66 @@ impl BorgTerminal {
             query: None,
             viewport_offset: Cell::new(0),
         });
+    }
+
+    pub fn open_import_source_picker(&mut self) {
+        self.picker = Some(Picker {
+            kind: PickerKind::ImportSource,
+            title: "Import into Borg",
+            options: [
+                ("Codex CLI / Desktop", "codex"),
+                ("Claude Code", "claude-code"),
+                ("Claude Desktop export", "claude-desktop"),
+                ("Other apps · portable JSON", "portable"),
+            ]
+            .into_iter()
+            .map(|(label, value)| PickerOption::new(label, value))
+            .collect(),
+            selected: 0,
+            query: None,
+            viewport_offset: Cell::new(0),
+        });
+    }
+
+    pub fn open_import_preview(
+        &mut self,
+        threads: usize,
+        memory: usize,
+        include_threads: bool,
+        include_memory: bool,
+        warnings: &[String],
+    ) {
+        self.picker = Some(Picker {
+            kind: PickerKind::ImportPreview {
+                threads: include_threads,
+                memory: include_memory,
+            },
+            title: "Import · originals stay unchanged",
+            options: vec![
+                PickerOption::new(
+                    format!(
+                        "[{}] Threads · {threads}",
+                        if include_threads { "x" } else { " " }
+                    ),
+                    "threads",
+                ),
+                PickerOption::new(
+                    format!(
+                        "[{}] Memory · {memory}",
+                        if include_memory { "x" } else { " " }
+                    ),
+                    "memory",
+                ),
+                PickerOption::new("Import", "import"),
+            ],
+            selected: 2,
+            query: None,
+            viewport_offset: Cell::new(0),
+        });
+        if !warnings.is_empty() {
+            self.show_info("Import notes", warnings.join("\n"));
+        }
+        self.set_notice("Enter toggles a category or starts Import · Escape cancels · repeat imports skip duplicates");
     }
 
     pub fn open_resume_picker(&mut self, sessions: &[ResumeSessionOption]) {
@@ -5311,6 +5376,55 @@ impl BorgTerminal {
             });
         }
         Ok(match picker.kind {
+            PickerKind::ImportSource => {
+                let source = picker.selected_value();
+                if matches!(source.as_str(), "claude-desktop" | "portable") {
+                    self.composer
+                        .restore(format!("/import {source} --path "), Vec::new());
+                    self.set_notice("Add the export ZIP or JSON path, then send. Claude Desktop: Settings > Privacy > Export data.");
+                    UiAction::None
+                } else {
+                    UiAction::Submit {
+                        target: None,
+                        text: format!("/import {source}"),
+                        attachments: Vec::new(),
+                    }
+                }
+            }
+            PickerKind::ImportPreview {
+                mut threads,
+                mut memory,
+            } => {
+                if picker.selected < 2 {
+                    let mut picker = picker;
+                    if picker.selected == 0 {
+                        threads = !threads;
+                    } else {
+                        memory = !memory;
+                    }
+                    let enabled = if picker.selected == 0 {
+                        threads
+                    } else {
+                        memory
+                    };
+                    picker.options[picker.selected]
+                        .label
+                        .replace_range(1..2, if enabled { "x" } else { " " });
+                    picker.kind = PickerKind::ImportPreview { threads, memory };
+                    self.picker = Some(picker);
+                    UiAction::None
+                } else if threads || memory {
+                    UiAction::Submit {
+                        target: None,
+                        text: format!("/import-confirm {} {}", threads, memory),
+                        attachments: Vec::new(),
+                    }
+                } else {
+                    self.picker = Some(picker);
+                    self.set_notice("Select Threads, Memory, or both.");
+                    UiAction::None
+                }
+            }
             PickerKind::Commands => unreachable!("handled above"),
             PickerKind::Settings => UiAction::Submit {
                 target: None,
@@ -7690,6 +7804,19 @@ impl BorgTerminal {
                 }
                 _ => Ok(UiAction::None),
             };
+        }
+        if key.code == KeyCode::Esc
+            && self
+                .picker
+                .as_ref()
+                .is_some_and(|p| matches!(p.kind, PickerKind::ImportPreview { .. }))
+        {
+            self.picker = None;
+            return Ok(UiAction::Submit {
+                target: None,
+                text: "/import-cancel".into(),
+                attachments: Vec::new(),
+            });
         }
         // Composer editing shortcuts take precedence over Enter-driven picker
         // confirmation. Otherwise opening any picker turns Shift+Enter into a

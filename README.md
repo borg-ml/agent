@@ -76,6 +76,12 @@ the selection. Legacy terminal word and line shortcuts are supported too.
 Full-screen action inspection wraps long commands so their final arguments
 remain visible alongside the output.
 
+Bring existing conversations with you using `/import` or `borg import`.
+Threads and Memory are both selected by default, with independent opt-outs.
+Codex CLI/Desktop, Claude Code, Claude Desktop exports, and portable JSON are
+supported. Imports copy originals, skip duplicates, and appear in `/resume`.
+See [importing threads and memory](docs/importing.md).
+
 ## What it provides
 
 - Responsive TUI and native GPU-rendered frontends over the same durable

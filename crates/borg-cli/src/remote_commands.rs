@@ -2422,8 +2422,28 @@ async fn run_local_agent_session(
     let mut editor_preferences_errors_open = true;
     let mut payload_hydration_results_open = true;
     let mut terminal_io_completions_open = true;
+    let mut import_task: Option<
+        tokio::task::JoinHandle<Result<crate::importer::ImportTaskResult>>,
+    > = None;
+    let mut pending_import: Option<crate::importer::PreparedImport> = None;
     loop {
         tokio::select! {
+            result = async { import_task.as_mut().expect("guarded import task").await }, if import_task.is_some() => {
+                import_task = None;
+                if let Some(terminal) = terminal.as_mut() {
+                    match result {
+                        Ok(Ok(crate::importer::ImportTaskResult::Prepared(plan, threads, memory))) => {
+                            let (thread_count, memory_count) = plan.counts();
+                            terminal.open_import_preview(thread_count, memory_count, threads, memory, &plan.warnings);
+                            pending_import = Some(plan);
+                        }
+                        Ok(Ok(crate::importer::ImportTaskResult::Complete(report))) => terminal.show_info("Import complete", report.summary()),
+                        Ok(Err(error)) => terminal.show_info("Import failed", format!("{error:#}")),
+                        Err(error) => terminal.show_info("Import failed", error.to_string()),
+                    }
+                    terminal_dirty = true;
+                }
+            }
             _ = session_host_tick.tick(), if args.session_host.is_some() => {
                 let unattended_idle = status == SessionStatus::Ready
                     && delivered_projection.state().active_processes.is_empty()
@@ -3926,6 +3946,40 @@ async fn run_local_agent_session(
                     }
                     continue;
                 }
+                if line == "/import" {
+                    println!("Choose a source: /import codex, /import claude-code, or /import claude-desktop --path EXPORT. Threads and Memory default to selected.");
+                    continue;
+                }
+                if let Some(options) = line.strip_prefix("/import ") {
+                    match crate::importer::parse_args(options) {
+                        Ok(options) => match crate::importer::prepare(&options).await {
+                            Ok(plan) => {
+                                let (threads, memory) = plan.counts();
+                                println!("Found {threads} threads and {memory} memory entries.\n{}\n/import-confirm to copy both; /import-confirm true false for threads only; /import-confirm false true for memory only; /import-cancel to cancel.", plan.warnings.join("\n"));
+                                pending_import = Some(plan);
+                            }
+                            Err(error) => eprintln!("Import failed: {error:#}"),
+                        },
+                        Err(error) => eprintln!("{error:#}"),
+                    }
+                    continue;
+                }
+                if line == "/import-cancel" {
+                    pending_import = None;
+                    println!("Import cancelled. Nothing was copied.");
+                    continue;
+                }
+                if line == "/import-confirm" || line.starts_with("/import-confirm ") {
+                    let selection = line.strip_prefix("/import-confirm").unwrap_or_default().trim();
+                    let flags = match selection { "" | "true true" => Some((true, true)), "true false" => Some((true, false)), "false true" => Some((false, true)), _ => None };
+                    if let Some((threads, memory)) = flags && let Some(plan) = pending_import.take() {
+                        match crate::importer::execute(plan, threads, memory).await {
+                            Ok(report) => println!("{}", report.summary()),
+                            Err(error) => eprintln!("Import failed: {error:#}"),
+                        }
+                    } else { eprintln!("Preview a source with /import first and select at least one category."); }
+                    continue;
+                }
                 if line == "/resume" {
                     print_recent_sessions(&sessions_dir, sqlite_store.as_ref(), session_id, &cwd)
                         .await?;
@@ -5417,6 +5471,44 @@ async fn run_local_agent_session(
                                     last_blu_discovery_error.as_deref(),
                                 ),
                             );
+                        } else if line == "/import-cancel" && attachments.is_empty() {
+                            pending_import = None;
+                            terminal.as_mut().expect("terminal").set_notice("Import cancelled. Nothing was copied.");
+                        } else if line == "/import" && attachments.is_empty() {
+                            if import_task.is_some() {
+                                terminal.as_mut().expect("terminal").set_notice("An import is already in progress.");
+                            } else {
+                                pending_import = None;
+                                terminal.as_mut().expect("terminal").open_import_source_picker();
+                            }
+                        } else if let Some(options) = line.strip_prefix("/import ") && attachments.is_empty() {
+                            if import_task.is_some() {
+                                terminal.as_mut().expect("terminal").set_notice("An import is already in progress.");
+                            } else {
+                                match crate::importer::parse_args(options) {
+                                    Ok(options) => {
+                                        pending_import = None;
+                                        terminal.as_mut().expect("terminal").set_notice("Scanning import source… originals remain unchanged.");
+                                        import_task = Some(tokio::spawn(async move {
+                                            let plan = crate::importer::prepare(&options).await?;
+                                            Ok(crate::importer::ImportTaskResult::Prepared(plan, !options.no_threads, !options.no_memory))
+                                        }));
+                                    }
+                                    Err(error) => terminal.as_mut().expect("terminal").show_info("Import options", format!("{error:#}")),
+                                }
+                            }
+                        } else if let Some(selection) = line.strip_prefix("/import-confirm ") && attachments.is_empty() {
+                            if let Some(plan) = pending_import.take() {
+                                let selected = match selection { "true true" => Some((true, true)), "true false" => Some((true, false)), "false true" => Some((false, true)), _ => None };
+                                if let Some((threads, memory)) = selected {
+                                    terminal.as_mut().expect("terminal").set_notice("Copying selected threads and memory…");
+                                    import_task = Some(tokio::spawn(async move {
+                                        crate::importer::execute(plan, threads, memory).await.map(crate::importer::ImportTaskResult::Complete)
+                                    }));
+                                } else { pending_import = Some(plan); }
+                            } else {
+                                terminal.as_mut().expect("terminal").set_notice("Open /import to preview a source first.");
+                            }
                         } else if line == "/customize" && attachments.is_empty() {
                             terminal.as_mut().expect("terminal").show_info(
                                 "Effective customization",
@@ -7021,7 +7113,14 @@ async fn recent_session_options(
         let label = [
             Some(timestamp),
             model.clone(),
-            Some(prompt_summary(&primary_preview, 56)),
+            state
+                .imported_from
+                .as_ref()
+                .map(|source| format!("from {source}")),
+            Some(prompt_summary(
+                state.imported_title.as_deref().unwrap_or(&primary_preview),
+                56,
+            )),
         ]
         .into_iter()
         .flatten()
@@ -7040,6 +7139,14 @@ async fn recent_session_options(
                     time.with_timezone(&Local).format("%A, %B %-d at %H:%M")
                 )
             }),
+            state
+                .imported_from
+                .as_ref()
+                .map(|source| format!("**Imported from:** {source}")),
+            state
+                .imported_title
+                .as_ref()
+                .map(|title| format!("**Original title:** {title}")),
             cwd.map(|cwd| format!("**Directory:** `{cwd}`")),
             model.map(|model| format!("**Model:** `{model}`")),
         ]
@@ -8097,6 +8204,7 @@ fn print_agent_help() {
     println!(
         r#"
   /settings         show interactive settings
+  /import           copy threads and memory from another assistant
   /customize        inspect effective settings and extension authority
   /ask PROFILE TEXT ask another model through its persistent peer thread
   /director TEXT    send a message to the persistent director thread

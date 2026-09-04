@@ -515,6 +515,8 @@ pub struct SessionState {
     pub effective_capabilities: Option<crate::EffectiveCapabilities>,
     pub status: Option<SessionStatus>,
     pub status_detail: Option<String>,
+    pub imported_from: Option<String>,
+    pub imported_title: Option<String>,
     pub active_processes: BTreeSet<Uuid>,
     pub provider_session_id: Option<String>,
     /// Instruction contract of the last acknowledged native provider thread.
@@ -576,6 +578,18 @@ impl SessionState {
         self.activity_at = Some(event.created_at);
         match &event.kind {
             SessionEventKind::SessionStarted => self.started_at = Some(event.created_at),
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "conversation_imported" =>
+            {
+                self.imported_from = payload
+                    .get("source")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                self.imported_title = payload
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
             SessionEventKind::RuntimeProcessStarted { process_id, .. } => {
                 self.active_processes.insert(*process_id);
             }
@@ -4140,6 +4154,38 @@ impl SqliteSessionStore {
             .await?;
         transaction.commit().await?;
         Ok(event)
+    }
+
+    /// Copy a conversation atomically; a stable source id makes repeat imports no-ops.
+    pub async fn import_session_events(
+        &self,
+        session_id: Uuid,
+        events: Vec<SessionEvent>,
+    ) -> Result<bool> {
+        ensure!(!events.is_empty(), "import contains no events");
+        ensure!(
+            events
+                .iter()
+                .all(|event| event.session_id == session_id && event.sequence == 0),
+            "import events must belong to the destination session with unassigned sequences"
+        );
+        let mut transaction = self.begin_write().await?;
+        let now = Utc::now().to_rfc3339();
+        let inserted = sqlx::query("insert into sessions (id, state_json, projection_version, created_at, updated_at) values (?, ?, 3, ?, ?) on conflict(id) do nothing")
+            .bind(session_id.to_string()).bind(serde_json::to_string(&SessionState::default())?)
+            .bind(&now).bind(&now).execute(&mut *transaction).await?.rows_affected();
+        if inserted == 0 {
+            return Ok(false);
+        }
+        sqlx::query("insert into session_workspace_bindings (session_id, workspace_id, participant_id, attached_at) values (?, ?, ?, ?)")
+            .bind(session_id.to_string()).bind(session_id.to_string()).bind(session_id.to_string())
+            .bind(&now).execute(&mut *transaction).await?;
+        for event in events {
+            self.append_durable_in_transaction(&mut transaction, event)
+                .await?;
+        }
+        transaction.commit().await?;
+        Ok(true)
     }
 
     async fn append_durable_in_transaction(

@@ -914,13 +914,15 @@ impl AgentToolDispatcher {
 
     pub(crate) async fn harness_prompt_appendix(&self) -> Result<String> {
         let store = self.session_store();
-        crate::harness::prompt_appendix(
+        let mut appendix = crate::harness::prompt_appendix(
             self.actor_session_id,
             &self.runtime_root,
             store.as_ref(),
             &self.harness_lock,
         )
-        .await
+        .await?;
+        appendix.push_str(&crate::imported_memory::prompt_appendix(&self.runtime_root).await?);
+        Ok(appendix)
     }
 
     fn consultation_enabled(&self) -> bool {

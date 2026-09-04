@@ -9954,3 +9954,72 @@ async fn escape_cancels_connection_retry_without_losing_the_prompt() {
         crate::SessionActionState::Failed
     );
 }
+
+#[tokio::test]
+async fn imported_conversation_is_atomic_and_replays_both_sides_without_live_provider_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = SqliteSessionStore::open(directory.path().join("import.sqlite3"))
+        .await
+        .unwrap();
+    let id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let mut events = vec![
+        SessionEvent::new(id, 0, SessionEventKind::SessionStarted),
+        SessionEvent::new(
+            id,
+            0,
+            SessionEventKind::TurnStarted {
+                message_id,
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+        ),
+    ];
+    for (actor, text) in [
+        (EventActor::User, "Imported question"),
+        (EventActor::Assistant, "Imported answer"),
+    ] {
+        events.push(SessionEvent::new(
+            id,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor,
+                text: text.into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ));
+    }
+    events.push(SessionEvent::new(
+        id,
+        0,
+        SessionEventKind::TurnCompleted {
+            message_id,
+            provider_session_id: None,
+            final_text: String::new(),
+            error: None,
+        },
+    ));
+    let mut invalid = events.clone();
+    invalid.push(events[0].clone());
+    assert!(store.import_session_events(id, invalid).await.is_err());
+    assert!(store.list_sessions(10).await.unwrap().is_empty());
+    assert!(
+        store
+            .import_session_events(id, events.clone())
+            .await
+            .unwrap()
+    );
+    assert!(!store.import_session_events(id, events).await.unwrap());
+    let history = store.read(id).await.unwrap();
+    let replay = native_conversation(&history, CodingProvider::Codex).unwrap();
+    let serialized = serde_json::to_string(&replay).unwrap();
+    assert!(serialized.contains("Imported question"));
+    assert!(serialized.contains("Imported answer"));
+    assert_eq!(replay.len(), 2);
+    assert!(store.state(id).await.unwrap().provider_session_id.is_none());
+}

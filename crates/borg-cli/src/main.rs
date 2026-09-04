@@ -11,6 +11,7 @@ mod editor_preferences {
     pub(crate) use borg_ui::preferences::*;
 }
 mod extensions;
+mod importer;
 mod inspect;
 mod limits;
 mod protection;
@@ -49,6 +50,7 @@ async fn main() -> Result<()> {
         .with_writer(writer)
         .init();
     match command {
+        Command::Import(args) => importer::run(args).await,
         Command::Agent(args) => run_local_agent(args).await,
         Command::Resume { session } => run_local_agent(LocalAgentCliArgs::resume(session)).await,
         Command::Gui { session } => run_gui(session).await,

@@ -16,6 +16,7 @@ mod extension_api;
 mod filesystem;
 mod harness;
 mod host;
+mod imported_memory;
 mod local_control;
 mod lsp;
 mod monitor;
@@ -143,3 +144,5 @@ pub use workspace_snapshot::{
     DEFAULT_MAX_SNAPSHOT_BYTES, DEFAULT_MAX_SNAPSHOT_FILES, MAX_SNAPSHOT_FILE_BYTES,
     WORKSPACE_SNAPSHOT_VERSION, WorkspaceRestoreReport, WorkspaceSnapshot, WorkspaceSnapshotFile,
 };
+
+pub use imported_memory::{ImportedMemory, copy_imported_memory, imported_memory_directory};

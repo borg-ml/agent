@@ -43,6 +43,7 @@ impl Cli {
                 | "call"
                 | "extensions"
                 | "customize"
+                | "import"
                 | "inspect"
                 | "workspaces"
                 | "session"
@@ -71,6 +72,8 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Copy threads and memory from another assistant.
+    Import(crate::importer::ImportArgs),
     /// Start a local agent session.
     #[command(name = "__agent", hide = true, bin_name = "borg")]
     Agent(LocalAgentCliArgs),
@@ -548,6 +551,18 @@ impl LocalAgentCliArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_is_a_command_with_both_categories_selected_by_default() {
+        let parsed = try_parse_direct(["borg", "import", "codex"])
+            .unwrap()
+            .command_or_agent();
+        assert!(matches!(parsed, Command::Import(args) if !args.no_threads && !args.no_memory));
+        let parsed = try_parse_direct(["borg", "import", "claude-code", "--no-threads"])
+            .unwrap()
+            .command_or_agent();
+        assert!(matches!(parsed, Command::Import(args) if args.no_threads && !args.no_memory));
+    }
 
     fn try_parse_direct<const N: usize>(args: [&str; N]) -> clap::error::Result<Cli> {
         Cli::try_parse_from(Cli::agent_default_args(
