@@ -3060,7 +3060,10 @@ struct CodexReasoningState {
 
 impl CodexReasoningState {
     async fn begin_generation(&mut self, events: &mpsc::Sender<ChatStreamEvent>) {
-        if !self.preparing_next_tool && self.running_tools.is_empty() {
+        if !self.preparing_next_tool
+            && self.running_tools.is_empty()
+            && self.generating_tools.is_empty()
+        {
             self.preparing_next_tool = true;
             events
                 .send(ChatStreamEvent::ToolCallGenerating { id: None })
@@ -5479,6 +5482,23 @@ mod tests {
         assert!(
             receiver.try_recv().is_err(),
             "partial edit snapshots must not promote the tool"
+        );
+
+        emit_codex_events_with_state(
+            &sender,
+            &serde_json::json!({"method": "item/completed", "params": {"item": {
+                "id": "parallel-command", "type": "commandExecution", "exitCode": 0
+            }}}),
+            &mut state,
+        )
+        .await;
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(ChatStreamEvent::ToolResult { .. })
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "the streamed edit already has generation feedback"
         );
 
         emit_codex_events_with_state(

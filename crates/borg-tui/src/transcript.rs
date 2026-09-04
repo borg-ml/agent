@@ -146,6 +146,7 @@ struct Transcript {
     context_known: bool,
     context_tokens: Option<u64>,
     context_window_tokens: Option<u64>,
+    session_usage: borg_remote::SubagentUsage,
     cache_diagnostics: CacheDiagnostics,
     tool_run_offsets: HashMap<usize, usize>,
     expanded_tool_runs: HashSet<usize>,
@@ -238,6 +239,7 @@ impl Default for Transcript {
             context_known: false,
             context_tokens: None,
             context_window_tokens: None,
+            session_usage: borg_remote::SubagentUsage::default(),
             cache_diagnostics: CacheDiagnostics::default(),
             tool_run_offsets: HashMap::new(),
             expanded_tool_runs: HashSet::new(),
@@ -508,6 +510,14 @@ impl Transcript {
             self.context_remaining_percent =
                 context_remaining_percent(context_tokens, context_window_tokens);
         }
+        self.session_usage = borg_remote::SubagentUsage {
+            input_tokens: state.usage.input_tokens,
+            output_tokens: state.usage.output_tokens,
+            total_tokens: state.usage.total_tokens,
+            context_tokens: state.usage.context_tokens,
+            cost_microusd: state.usage.cost_microusd,
+            cost_basis: state.usage.cost_basis.clone(),
+        };
         self.live_turn_closed = matches!(
             state.status,
             Some(
@@ -1053,14 +1063,40 @@ impl Transcript {
                 turn_id,
                 provider_context_reused,
                 input_tokens,
+                output_tokens,
                 cached_input_tokens,
                 cache_creation_input_tokens,
+                total_tokens,
                 cost_microusd,
                 cost_basis,
                 context_tokens,
                 context_window_tokens,
                 ..
             } => {
+                self.session_usage.input_tokens = self
+                    .session_usage
+                    .input_tokens
+                    .saturating_add(*input_tokens);
+                self.session_usage.output_tokens = self
+                    .session_usage
+                    .output_tokens
+                    .saturating_add(*output_tokens);
+                self.session_usage.total_tokens = self
+                    .session_usage
+                    .total_tokens
+                    .saturating_add(*total_tokens);
+                if context_tokens.is_some() {
+                    self.session_usage.context_tokens = *context_tokens;
+                }
+                self.session_usage.cost_microusd =
+                    match (self.session_usage.cost_microusd, cost_microusd) {
+                        (Some(current), Some(additional)) => {
+                            Some(current.saturating_add(*additional))
+                        }
+                        (None, Some(value)) => Some(*value),
+                        (current, None) => current,
+                    };
+                self.session_usage.cost_basis = cost_basis.clone();
                 if let (Some(context_tokens), Some(context_window_tokens)) =
                     (context_tokens, context_window_tokens)
                 {
@@ -1113,6 +1149,7 @@ impl Transcript {
                 self.context_known = true;
                 self.context_tokens = Some(*context_tokens);
                 self.context_window_tokens = Some(*context_window_tokens);
+                self.session_usage.context_tokens = Some(*context_tokens);
                 self.context_remaining_percent =
                     context_remaining_percent(*context_tokens, *context_window_tokens);
             }
@@ -1279,11 +1316,13 @@ impl Transcript {
                 self.finish_reasoning(event.created_at);
             }
             SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "action/preparing" => {
-                if !self.action_descriptors {
-                    return removed_entry;
-                }
-                let Some(label) = payload.get("label").and_then(serde_json::Value::as_str) else {
-                    return removed_entry;
+                let label = if self.action_descriptors {
+                    payload
+                        .get("label")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                } else {
+                    ""
                 };
                 self.upsert_action_preparation(
                     event,
@@ -2695,7 +2734,9 @@ impl Transcript {
                 model: model.to_string(),
                 effort: config.effort.as_deref().unwrap_or("default").to_string(),
                 state: "main thread".to_string(),
-                usage: "—".to_string(),
+                usage: format_subagent_usage(&self.session_usage)
+                    .trim_start()
+                    .to_string(),
                 child_id: None,
             });
         } else {

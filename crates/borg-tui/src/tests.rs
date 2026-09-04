@@ -127,6 +127,8 @@ fn older_root_history_hides_agent_cards_and_preserves_authoritative_roster_state
 
     let mut displayed = Transcript::default();
     displayed.upsert_subagent_snapshot(&stopped);
+    displayed.session_usage.total_tokens = 42_000;
+    displayed.session_usage.context_tokens = Some(8_400);
     assert_eq!(displayed.active_subagent_count(), 0);
     let mut director = None;
 
@@ -140,6 +142,8 @@ fn older_root_history_hides_agent_cards_and_preserves_authoritative_roster_state
     assert!(displayed.order.is_empty());
     assert_eq!(displayed.active_subagent_count(), 0);
     assert_eq!(displayed.subagents[&child], SubagentStatus::Stopped);
+    assert_eq!(displayed.session_usage.total_tokens, 42_000);
+    assert_eq!(displayed.session_usage.context_tokens, Some(8_400));
     assert_eq!(
         displayed.subagent_snapshots[&child].detail.as_deref(),
         Some("crash cleanup completed")
@@ -706,16 +710,16 @@ fn focusing_a_new_child_still_shows_the_director_context_boundary() {
 
 #[test]
 fn team_roster_hover_is_visually_distinct_from_focus_and_idle() {
-    let hovered = team_roster_row_style(false, true, true);
-    let focused = team_roster_row_style(true, false, true);
-    let idle_subagent = team_roster_row_style(false, false, true);
-    let idle_director = team_roster_row_style(false, false, false);
+    let hovered = team_roster_row_style(false, true);
+    let focused = team_roster_row_style(true, false);
+    let idle_subagent = team_roster_row_style(false, false);
+    let idle_director = team_roster_row_style(false, false);
 
     assert_eq!(hovered.bg, Some(SUBAGENT_PINK));
     assert_eq!(hovered.fg, Some(Color::Black));
     assert!(hovered.add_modifier.contains(Modifier::BOLD));
     assert_eq!(focused.fg, Some(SUBAGENT_PINK));
-    assert_eq!(idle_subagent.fg, Some(SUBAGENT_PINK));
+    assert_eq!(idle_subagent.fg, Some(Color::White));
     assert_eq!(idle_director.fg, Some(Color::White));
     assert_ne!(hovered, focused);
     assert_ne!(hovered, idle_subagent);
@@ -1882,7 +1886,7 @@ fn edit_preparation_waits_for_the_first_diff_before_promotion() {
 }
 
 #[test]
-fn action_preparation_can_be_hidden_without_hiding_tool_activity() {
+fn hiding_action_descriptions_keeps_generation_feedback_visible() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
     transcript.set_action_descriptors(false);
@@ -1895,7 +1899,14 @@ fn action_preparation_can_be_hidden_without_hiding_tool_activity() {
             payload: serde_json::json!({"label": "edit src/main.rs"}),
         },
     ));
-    assert!(transcript.order.is_empty());
+    let preparing = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(preparing.contains("Generating…"), "{preparing}");
+    assert!(!preparing.contains("edit src/main.rs"), "{preparing}");
 
     transcript.apply(&SessionEvent::new(
         session_id,
@@ -1903,7 +1914,7 @@ fn action_preparation_can_be_hidden_without_hiding_tool_activity() {
         SessionEventKind::ToolStarted {
             tool_call_id: "edit-1".to_string(),
             name: "Edit".to_string(),
-            input: serde_json::json!({"path": "src/main.rs"}),
+            input: serde_json::json!({"path": "src/main.rs", "diff": "@@ -1 +1 @@\n-old\n+new"}),
             input_ref: None,
         },
     ));
@@ -2122,7 +2133,7 @@ fn matching_tool_action_updates_refine_one_live_card() {
         SessionEventKind::ProviderEvent {
             provider: CodingProvider::Codex,
             kind: "action/preparing".to_string(),
-            payload: serde_json::json!({"label": ""}),
+            payload: serde_json::json!({}),
         },
     );
     generating.created_at = started_at;
@@ -3364,6 +3375,25 @@ fn context_limit_label_includes_window_and_tooltip_details() {
             context_window_tokens: 258_400,
         },
     ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::UsageUpdated {
+            provider_duration_ms: 1,
+            turn_id: None,
+            provider_context_reused: None,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            total_tokens: 2,
+            cost_microusd: None,
+            cost_basis: String::new(),
+            cost_usd: None,
+            context_tokens: None,
+            context_window_tokens: None,
+        },
+    ));
 
     assert_eq!(
         transcript.context_limit_label(),
@@ -3373,6 +3403,7 @@ fn context_limit_label_includes_window_and_tooltip_details() {
         transcript.context_tooltip(),
         "137k used of 258.4k window · 49% context left"
     );
+    assert_eq!(transcript.session_usage.context_tokens, Some(137_000));
     assert_eq!(format_context_tokens(1_000_000), "1m");
 }
 
@@ -5518,6 +5549,17 @@ fn subagent_selector_shows_cumulative_usage_without_a_redundant_unit_suffix() {
 
     let label = format_subagent_usage(&usage);
     assert_eq!(label, "  800.0k");
+    assert_eq!(
+        format_subagent_usage(&borg_remote::SubagentUsage {
+            context_tokens: Some(84_600),
+            ..Default::default()
+        }),
+        "  84.6k ctx"
+    );
+    assert_eq!(
+        format_subagent_usage(&borg_remote::SubagentUsage::default()),
+        "  —"
+    );
 }
 
 #[test]
@@ -5539,7 +5581,7 @@ fn persistent_claude_peer_shows_its_product_model() {
         usage: borg_remote::SubagentUsage::default(),
     };
 
-    assert_eq!(display_subagent_model(&peer), "Opus 5");
+    assert_eq!(display_subagent_model(&peer), "claude-opus-5");
 }
 
 #[test]
@@ -5589,7 +5631,7 @@ fn persistent_peers_follow_ordinary_agent_visibility() {
 
     assert_eq!(running_rows.len(), 2);
     assert_eq!(running_rows[1].name, "Claude");
-    assert_eq!(running_rows[1].model, "Opus 5");
+    assert_eq!(running_rows[1].model, "claude-opus-5");
     assert_eq!(running_rows[1].effort, "high");
     assert_eq!(running_rows[1].state, "running");
     assert_eq!(transcript.active_subagent_count(), 1);
@@ -8379,6 +8421,7 @@ fn stale_session_state_cannot_reseed_newer_root_projection_fields() {
 fn projected_session_state_restores_status_config_outside_the_history_tail() {
     let separator = std::path::MAIN_SEPARATOR;
     let mut transcript = Transcript::default();
+    transcript.session_usage.total_tokens = 999;
     transcript.seed_session_state(&SessionState {
         configuration: Some(borg_remote::SessionConfiguration {
             cwd: PathBuf::from("/workspace/borg"),
@@ -8390,6 +8433,7 @@ fn projected_session_state_restores_status_config_outside_the_history_tail() {
             permission_mode: PermissionMode::FullAccess,
         }),
         usage: borg_remote::SessionUsage {
+            total_tokens: 123_000,
             context_tokens: Some(69_768),
             context_window_tokens: Some(258_400),
             ..Default::default()
@@ -8408,6 +8452,7 @@ fn projected_session_state_restores_status_config_outside_the_history_tail() {
         )
     );
     assert_eq!(transcript.context_remaining_percent, 77);
+    assert_eq!(transcript.agent_roster_entries()[0].usage, "123.0k");
 }
 
 #[test]

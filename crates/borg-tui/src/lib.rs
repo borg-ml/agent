@@ -7006,7 +7006,7 @@ impl BorgTerminal {
                         .block(
                             Block::default()
                                 .borders(Borders::ALL)
-                                .border_style(Style::default().fg(SUBAGENT_PINK))
+                                .border_style(Style::default().fg(Color::DarkGray))
                                 .title(Span::styled(
                                     format!(" Team · {active_subagents} working "),
                                     Style::default()
@@ -8567,12 +8567,14 @@ fn replace_root_transcript_history(
         .values()
         .cloned()
         .collect::<Vec<_>>();
+    let reconciled_usage = previous.session_usage.clone();
     let display_events = transcript_history_in_display_order(events);
     let mut replacement = fresh_transcript_like(previous);
     replacement.reserve_history(display_events.len());
     for event in &display_events {
         replacement.apply_history(event);
     }
+    replacement.session_usage = reconciled_usage;
     // Older-page hydration rebuilds the root transcript. It may contain the
     // parent's last pre-crash Running mirror even though child hydration has
     // already reconciled that child to Ready/Stopped. Historical rows may
@@ -8768,11 +8770,7 @@ fn display_subagent_model(agent: &SubagentSnapshot) -> String {
                 .map(|catalog| catalog.default_model.to_string())
         })
         .unwrap_or_else(|| agent.provider.catalog_backend().to_string());
-    borg_provider::CODEX_SELECTABLE_MODELS
-        .iter()
-        .chain(borg_provider::CLAUDE_SELECTABLE_MODELS.iter())
-        .find_map(|(id, label)| (*id == model).then_some((*label).to_string()))
-        .unwrap_or(model)
+    model
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8824,11 +8822,7 @@ fn team_roster_table_lines(
             &entry.usage,
             columns,
         );
-        Line::from(row).style(team_roster_row_style(
-            focused,
-            hovered_row == Some(index),
-            entry.child_id.is_some(),
-        ))
+        Line::from(row).style(team_roster_row_style(focused, hovered_row == Some(index)))
     }))
     .collect()
 }
@@ -8914,7 +8908,7 @@ fn roster_table_cell(value: &str, width: usize) -> String {
     format!("{value}{}", " ".repeat(padding))
 }
 
-fn team_roster_row_style(focused: bool, hovered: bool, is_subagent: bool) -> Style {
+fn team_roster_row_style(focused: bool, hovered: bool) -> Style {
     if hovered {
         Style::default()
             .fg(Color::Black)
@@ -8925,8 +8919,6 @@ fn team_roster_row_style(focused: bool, hovered: bool, is_subagent: bool) -> Sty
             .fg(SUBAGENT_PINK)
             .bg(COMMAND_PANEL_BG)
             .add_modifier(Modifier::BOLD)
-    } else if is_subagent {
-        Style::default().fg(SUBAGENT_PINK).bg(COMMAND_PANEL_BG)
     } else {
         Style::default().fg(Color::White).bg(COMMAND_PANEL_BG)
     }
@@ -9540,12 +9532,18 @@ fn subagent_status_label(status: SubagentStatus) -> &'static str {
 
 fn format_subagent_usage(usage: &borg_remote::SubagentUsage) -> String {
     let displayed_tokens = (usage.total_tokens > 0).then_some(usage.total_tokens);
-    if displayed_tokens.is_none() && usage.cost_microusd.is_none() {
-        return "  usage —".to_string();
+    let displayed_context = displayed_tokens
+        .is_none()
+        .then_some(usage.context_tokens)
+        .flatten();
+    if displayed_tokens.is_none() && displayed_context.is_none() && usage.cost_microusd.is_none() {
+        return "  —".to_string();
     }
     let mut parts = Vec::new();
     if let Some(tokens) = displayed_tokens {
         parts.push(format_compact_token_total(tokens));
+    } else if let Some(tokens) = displayed_context {
+        parts.push(format!("{} ctx", format_compact_token_total(tokens)));
     }
     if let Some(cost_microusd) = usage.cost_microusd {
         let cost = cost_microusd as f64 / 1_000_000.0;

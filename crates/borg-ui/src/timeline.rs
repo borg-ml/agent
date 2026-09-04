@@ -260,7 +260,7 @@ impl TimelineProjector {
                 let label = payload
                     .get("label")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("action");
+                    .unwrap_or_default();
                 let existing = provider_tool_id
                     .and_then(|provider_tool_id| {
                         self.preparing_tools
@@ -668,7 +668,11 @@ mod tests {
                 SessionEventKind::ProviderEvent {
                     provider: CodingProvider::Codex,
                     kind: "action/preparing".into(),
-                    payload: serde_json::json!({"label": label}),
+                    payload: if label.is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::json!({"label": label})
+                    },
                 },
             );
             event.created_at =
