@@ -108,10 +108,10 @@ visible reasoning or a provider-owned conversation. Compatible adapters omit
 that field on the wire.
 
 The small transport probe alone does not establish a native-harness migration.
-Real refresh and re-login recovery, fast-mode capabilities, rate-limit UX,
-and end-to-end subscription steering/cancellation still need verification.
 The small live probe reported zero cached tokens; preserving the cache key is
-not proof of a cache hit. Production routing is deliberately unchanged.
+not proof of a cache hit. The following sections record the subsequent
+subscription, cache, control, and rollout evidence. Production routing remains
+unchanged.
 
 The explicit `LocalAgentTurnExecutor::with_codex_model_only()` probe now routes
 through the real native harness and session actor. Loop ownership is queried
@@ -182,8 +182,11 @@ The additive table upgrade preserves existing sessions. Old subscription
 history without account provenance is refused by the opt-in route and requires
 a new session. The production CLI route is unaffected.
 
-Before enabling the route by default, effective fast routing and real
-expired/revoked-auth recovery still need end-to-end subscription verification.
+Before enabling the route by default, define a durable rollout boundary for
+fresh versus existing sessions. Existing unbound history must not be silently
+migrated or sent under an assumed account. Live expired/revoked-auth recovery
+remains unobserved; the retained upstream credential manager and Borg's tested
+recovery policy must remain intact during rollout.
 
 Turns, compaction, and one-shot consultations now share the same host-owned
 `ModelAccessContext` admission step. The context carries the session/store only
@@ -219,21 +222,29 @@ Isolated consultations use standard routing because consultation profiles do not
 select a speed tier. Wire tests verify the outgoing priority field, and loop tests
 verify the setting survives a steered follow-up model round.
 
-`codex_model_probe --fast` additionally requires the live response to confirm
-priority routing. The live endpoint instead reported `service_tier: "default"`
-on two attempts despite the priority request. This is an unresolved migration
-gap, not proof that fast mode works. Do not switch production routing on the
-strength of request-shape tests alone.
+`codex_model_probe --fast` reports the requested and returned service tiers
+separately. The live endpoint reported `service_tier: "default"` despite a
+priority request. This is not confirmation of delivered priority processing.
 The adapter now also sends the upstream `x-codex-routing-hint` header: model
 only for standard requests, model plus `tier=priority` for fast requests. The
 existing first-character wire test checks that this matches the fast request
-body. A further live fast probe with the header still reported `default`, so
-this transport-parity correction does not resolve the effective-tier mismatch.
+body. A further live fast probe with the header still reported `default`.
 The native-session probe with `--fast` passed tool execution, compaction, and
 restart; it verifies those workflows with fast requested, not the effective tier.
 An ephemeral read-only comparison through installed Codex accepted `priority`
 and completed successfully, but its raw-completion event exposed usage metadata
-without an effective service tier. That comparison does not resolve the mismatch.
+without an effective service tier.
+
+A subsequent bounded localhost relay inspected only model/tier metadata while
+forwarding the installed upstream CLI's requests to the fixed subscription
+endpoint. Both its HTTP fallback and preferred WebSocket transport sent
+`priority`, completed a tool-free Astra/low turn, and received `default` in the
+raw completed response. No credentials or raw bodies were logged or persisted, no
+saved configuration changed, and the relay was stopped after each ephemeral
+turn. Thus this field does not demonstrate a Borg-specific fast-mode regression.
+The probe no longer treats it as one; it still reports the discrepancy explicitly,
+and wire tests still require the priority request and routing hint. Neither the
+upstream comparison nor Borg's probe establishes an effective-priority guarantee.
 
 A real `getAuthStatus` refresh request completed with subscription mode retained
 and `includeToken: false`; no credential was returned to the diagnostic process.

@@ -52,9 +52,8 @@ async fn probe() -> Result<()> {
         .model_turn_for_account(request.clone(), Some(tx), &account)
         .await?;
     if fast {
-        ensure!(
-            first.raw_response["service_tier"] == "priority",
-            "subscription response did not confirm priority routing: {:?}",
+        println!(
+            "Requested priority; first response reports service tier {:?} (not a delivery guarantee)",
             first
                 .raw_response
                 .get("service_tier")
@@ -91,9 +90,8 @@ async fn probe() -> Result<()> {
         .model_turn_for_account(request, None, &account)
         .await?;
     if fast {
-        ensure!(
-            second.raw_response["service_tier"] == "priority",
-            "second subscription response did not confirm priority routing: {:?}",
+        println!(
+            "Requested priority; second response reports service tier {:?} (not a delivery guarantee)",
             second
                 .raw_response
                 .get("service_tier")
