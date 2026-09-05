@@ -4087,7 +4087,7 @@ async fn flush_workspace_messages(
         }
     }
     if sync.workspace_relay_available
-        && execution_workspace_id.is_some()
+        && let Some(workspace_id) = execution_workspace_id
         && Instant::now() >= sync.next_workspace_roster_sync
     {
         let response = client
@@ -4104,7 +4104,6 @@ async fn flush_workspace_messages(
                     .json()
                     .await
                     .context("borg.ml returned an invalid workspace roster")?;
-                let workspace_id = execution_workspace_id.expect("checked above");
                 for remote in roster.participants {
                     store
                         .upsert_relay_roster_entry(
