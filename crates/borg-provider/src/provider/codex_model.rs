@@ -2,12 +2,14 @@
 //! or a tool. Production chat routing stays on app-server until parity is proven.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 use borg_core::{CostBasis, ModelProviderState, ProviderCallUsage};
 use futures::StreamExt;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedSender;
@@ -19,12 +21,59 @@ use super::{
 };
 
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+const MODELS_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/models";
 const MAX_STREAM_BYTES: usize = 128 * 1024 * 1024;
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct CodexModelProvider {
     pub model: String,
     pub effort: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct ModelCapabilities {
+    slug: String,
+    supported_reasoning_levels: Vec<ReasoningLevel>,
+    context_window: Option<u64>,
+    max_context_window: Option<u64>,
+    #[serde(default = "default_context_percent")]
+    effective_context_window_percent: u64,
+}
+
+#[derive(Clone, Deserialize)]
+struct ReasoningLevel {
+    effort: String,
+}
+
+// This is the wire protocol's default when the catalog omits the field.
+fn default_context_percent() -> u64 {
+    95
+}
+
+impl ModelCapabilities {
+    fn usable_context_window(&self) -> Result<u64> {
+        let window = self
+            .context_window
+            .or(self.max_context_window)
+            .filter(|window| *window > 0)
+            .context("Codex model catalog omitted the context window")?;
+        ensure!(
+            (1..=100).contains(&self.effective_context_window_percent),
+            "Codex model catalog returned an invalid usable context percentage"
+        );
+        let usable = u128::from(window) * u128::from(self.effective_context_window_percent) / 100;
+        ensure!(
+            usable > 0,
+            "Codex model catalog returned an empty usable context window"
+        );
+        Ok(usable as u64)
+    }
+}
+
+struct CachedModels {
+    account: String,
+    fetched: Instant,
+    models: Vec<ModelCapabilities>,
 }
 
 // Never serialize or debug credentials. Refresh tokens remain in the original
@@ -43,6 +92,98 @@ impl SubscriptionAccess {
                 self.account_id
             )))
         )
+    }
+
+    async fn model_capabilities(
+        &mut self,
+        client: &reqwest::Client,
+        model: &str,
+    ) -> Result<ModelCapabilities> {
+        static CACHE: OnceLock<tokio::sync::Mutex<Option<CachedModels>>> = OnceLock::new();
+        let mut cache = CACHE
+            .get_or_init(|| tokio::sync::Mutex::new(None))
+            .lock()
+            .await;
+        let account = self.identity();
+        if !cache.as_ref().is_some_and(|entry| {
+            entry.account == account && entry.fetched.elapsed() < Duration::from_secs(300)
+        }) {
+            let mut command = crate::provider_bin::codex_command().await?;
+            let version = tokio::time::timeout(
+                Duration::from_secs(10),
+                command.arg("--version").kill_on_drop(true).output(),
+            )
+            .await
+            .context("Codex version query timed out")?
+            .context("Codex version query failed")?;
+            ensure!(version.status.success(), "Codex version query failed");
+            let version = String::from_utf8(version.stdout).context("invalid Codex version")?;
+            let version = version
+                .trim()
+                .strip_prefix("codex-cli ")
+                .and_then(|version| version.split('-').next())
+                .filter(|version| {
+                    version.split('.').count() == 3
+                        && version.split('.').all(|part| part.parse::<u64>().is_ok())
+                })
+                .context("unrecognized Codex version for model catalog")?;
+            let mut refreshed = false;
+            let response = loop {
+                let response = client
+                    .get(MODELS_ENDPOINT)
+                    .query(&[("client_version", version)])
+                    .bearer_auth(&self.token)
+                    .header("ChatGPT-Account-Id", &self.account_id)
+                    .header("originator", "borg")
+                    .timeout(Duration::from_secs(30))
+                    .send()
+                    .await
+                    .context("Codex model catalog connection failed")?;
+                if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
+                    drop(response);
+                    let access = Self::read(true).await?;
+                    ensure!(
+                        access.identity() == account,
+                        "Codex account changed during authentication recovery; start a new session"
+                    );
+                    *self = access;
+                    refreshed = true;
+                    continue;
+                }
+                break response;
+            };
+            ensure!(
+                response.status().is_success(),
+                "Codex model catalog request failed (HTTP {})",
+                response.status()
+            );
+            let mut stream = response.bytes_stream();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.context("Codex model catalog disconnected")?;
+                ensure!(
+                    bytes.len().saturating_add(chunk.len()) <= MAX_EVENT_BYTES,
+                    "Codex model catalog exceeds size limit"
+                );
+                bytes.extend_from_slice(&chunk);
+            }
+            #[derive(Deserialize)]
+            struct Catalog {
+                models: Vec<ModelCapabilities>,
+            }
+            let catalog: Catalog =
+                serde_json::from_slice(&bytes).context("invalid Codex model catalog")?;
+            *cache = Some(CachedModels {
+                account,
+                fetched: Instant::now(),
+                models: catalog.models,
+            });
+        }
+        cache
+            .as_ref()
+            .and_then(|entry| entry.models.iter().find(|entry| entry.slug == model))
+            .cloned()
+            .context("selected model is not available in this Codex account's catalog")
     }
 
     async fn read(refresh: bool) -> Result<Self> {
@@ -127,6 +268,12 @@ impl CodexModelProvider {
                 .connect_timeout(Duration::from_secs(30))
                 .build()?;
             let mut access = SubscriptionAccess::read(false).await?;
+            ensure!(access.identity() == expected_account,
+                "Codex account differs from this session's bound account; reconnect the original account or start a new session");
+            let capabilities = access.model_capabilities(&client, &self.model).await?;
+            ensure!(capabilities.supported_reasoning_levels.iter().any(|level| level.effort == self.effort),
+                "selected effort is not supported by this Codex model");
+            let context_window = capabilities.usable_context_window()?;
             let mut response = self
                 .send(
                     &client,
@@ -163,11 +310,12 @@ impl CodexModelProvider {
                 "Codex subscription model request failed (HTTP {}); no fallback was attempted",
                 response.status()
             );
-            self.read_stream(response, progress.as_ref()).await
+            let (message, response) = self.read_stream(response, progress.as_ref()).await?;
+            Ok::<_, anyhow::Error>((message, response, context_window))
         }
         .await;
         match result {
-            Ok((message, raw_response)) => {
+            Ok((message, raw_response, context_window)) => {
                 trace.exit_status = Some(0);
                 let input = raw_response
                     .pointer("/usage/input_tokens")
@@ -193,6 +341,7 @@ impl CodexModelProvider {
                         output_tokens: output,
                         total_tokens: input.saturating_add(output),
                         context_tokens: Some(input),
+                        context_window_tokens: Some(context_window),
                         cost_basis: CostBasis::SubscriptionEquivalent,
                         ..Default::default()
                     },
@@ -563,6 +712,34 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{mpsc, oneshot};
+
+    #[test]
+    fn catalog_context_limits_preserve_provider_headroom_without_overflow() {
+        let mut metadata = json!({
+            "slug": "test-model", "supported_reasoning_levels": [{"effort": "low"}],
+            "context_window": 200_000, "max_context_window": 400_000
+        });
+        let usable = |metadata: &Value| {
+            serde_json::from_value::<ModelCapabilities>(metadata.clone())?.usable_context_window()
+        };
+        assert_eq!(usable(&metadata).unwrap(), 190_000);
+        metadata["effective_context_window_percent"] = json!(80);
+        assert_eq!(usable(&metadata).unwrap(), 160_000);
+        metadata["context_window"] = Value::Null;
+        assert_eq!(usable(&metadata).unwrap(), 320_000);
+        metadata["max_context_window"] = json!(u64::MAX);
+        metadata["effective_context_window_percent"] = json!(100);
+        assert_eq!(usable(&metadata).unwrap(), u64::MAX);
+        for percent in [0, 101] {
+            metadata["effective_context_window_percent"] = json!(percent);
+            assert!(usable(&metadata).is_err());
+        }
+        metadata["effective_context_window_percent"] = json!(95);
+        for window in [Value::Null, json!(0), json!(-1)] {
+            metadata["max_context_window"] = window;
+            assert!(usable(&metadata).is_err());
+        }
+    }
 
     #[tokio::test]
     async fn account_mismatch_is_rejected_before_connecting() {

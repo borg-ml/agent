@@ -125,14 +125,19 @@ async fn probe() -> Result<()> {
                         total_tokens,
                         cached_input_tokens,
                         cost_basis,
+                        context_window_tokens,
                         ..
                     } => {
                         ensure!(
                             cost_basis == "subscription_equivalent",
                             "native subscription usage lost its cost classification"
                         );
+                        ensure!(
+                            context_window_tokens.is_some_and(|window| window > 0),
+                            "native subscription usage lost the catalog context limit"
+                        );
                         println!(
-                            "Borg usage: {total_tokens} tokens, {cached_input_tokens} cached input"
+                            "Borg usage: {total_tokens} tokens, {cached_input_tokens} cached input, {context_window_tokens:?} usable context limit"
                         );
                     }
                     SessionEventKind::TurnCompleted {

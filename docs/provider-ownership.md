@@ -79,9 +79,10 @@ which remaining external components are necessary and why.
 `CodexModelProvider` is an explicit prototype, not the production chat route.
 It sends a Responses request directly and returns a `ModelTurnResult`; it
 cannot execute tools or start a provider agent turn. The existing Codex binary
-is used only for `initialize` and `getAuthStatus`, retaining credential-store
-and refresh ownership without copying refresh tokens. A 401 permits one
-auth refresh and retry before streaming; interrupted streams are never retried.
+is used for `initialize`, `getAuthStatus`, and its version for the model catalog,
+retaining credential-store and refresh ownership without copying refresh tokens.
+A 401 permits one auth refresh and retry before streaming; interrupted streams
+are never retried.
 API-key authentication is rejected rather than changing billing routes.
 
 The access boundary remains temporary: app-server is still a large dependency
@@ -107,7 +108,7 @@ visible reasoning or a provider-owned conversation. Compatible adapters omit
 that field on the wire.
 
 The small transport probe alone does not establish a native-harness migration.
-Real refresh and re-login recovery, capabilities/context limits, rate-limit UX,
+Real refresh and re-login recovery, fast-mode capabilities, rate-limit UX,
 and end-to-end subscription steering/cancellation still need verification.
 The small live probe reported zero cached tokens; preserving the cache key is
 not proof of a cache hit. Production routing is deliberately unchanged.
@@ -145,10 +146,9 @@ The additive table upgrade preserves existing sessions. Old subscription
 history without account provenance is refused by the opt-in route and requires
 a new session. The production CLI route is unaffected.
 
-Before enabling the route by default, model limits and fast mode still need
-to flow through the native contract. Real login/refresh
-and in-flight tool control behavior still need end-to-end subscription
-verification.
+Before enabling the route by default, fast mode still needs to flow through the
+native contract. Real login/refresh and in-flight tool control behavior still
+need end-to-end subscription verification.
 
 Turns, compaction, and one-shot consultations now share the same host-owned
 `ModelAccessContext` admission step. The context carries the session/store only
@@ -165,6 +165,16 @@ cost classifications. Mixed reported/estimated API costs are estimates; missing
 prices or incompatible billing bases never produce a misleading partial total.
 The live probe verifies subscription classification through turn, compaction,
 and restart usage events. This does not yet establish rate-limit reporting.
+
+The model adapter reads context limits and supported effort levels directly
+from the subscription model catalog before sending conversation content. The
+endpoint requires the access adapter's client version. Only the small metadata
+subset is retained, cached in memory for five minutes and scoped to the account;
+provider agent instructions and tool policies are not imported. Missing/invalid
+context limits and unavailable model/effort selections fail explicitly. Catalog
+authentication recovery checks account continuity just like model requests.
+The live native probe received a 258,400-token usable context limit for Astra/low,
+so Borg's existing context-threshold policy now has a provider-derived limit.
 
 ## Evidence
 
