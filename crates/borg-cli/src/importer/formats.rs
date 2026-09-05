@@ -83,16 +83,16 @@ pub(super) fn read(
     }
     files.sort();
     let mut names = HashMap::new();
-    if matches!(source, Source::Codex) && threads {
-        if let Ok(file) = fs::File::open(path.join("session_index.jsonl")) {
-            for line in BufReader::new(file).lines() {
-                if let Ok(value) = serde_json::from_str::<Value>(&line?) {
-                    if let (Some(id), Some(name)) =
-                        (value["id"].as_str(), value["thread_name"].as_str())
-                    {
-                        names.insert(id.to_string(), name.to_string());
-                    }
-                }
+    if matches!(source, Source::Codex)
+        && threads
+        && let Ok(file) = fs::File::open(path.join("session_index.jsonl"))
+    {
+        for line in BufReader::new(file).lines() {
+            if let Ok(value) = serde_json::from_str::<Value>(&line?)
+                && let (Some(id), Some(name)) =
+                    (value["id"].as_str(), value["thread_name"].as_str())
+            {
+                names.insert(id.to_string(), name.to_string());
             }
         }
     }
@@ -228,29 +228,30 @@ pub(super) fn read(
                         Ok(value) => export_memories(&value, "memories", &mut plan),
                         Err(error) => plan.warnings.push(format!("{}: {error:#}", file.display())),
                     }
-                } else if memory && name == "projects.json" {
-                    if let Ok(Value::Array(projects)) = read_json(file) {
-                        for project in projects {
-                            if let Some(content) = project
-                                .get("prompt_template")
-                                .and_then(Value::as_str)
-                                .filter(|text| !text.is_empty())
-                            {
-                                let id = string(&project, "uuid");
-                                plan.memory.push(ImportedMemory {
-                                    source: source.key().into(),
-                                    source_id: format!("project:{id}"),
-                                    title: format!(
-                                        "Project instructions: {}",
-                                        string(&project, "name")
-                                    ),
-                                    content: content.into(),
-                                    cwd: None,
-                                    project: Some(id),
-                                    updated_at: timestamp(project.get("updated_at")),
-                                });
-                                plan.warnings.push(format!("Project {} instructions were copied but need a local cwd set in the memory file before use", string(&project, "name")));
-                            }
+                } else if memory
+                    && name == "projects.json"
+                    && let Ok(Value::Array(projects)) = read_json(file)
+                {
+                    for project in projects {
+                        if let Some(content) = project
+                            .get("prompt_template")
+                            .and_then(Value::as_str)
+                            .filter(|text| !text.is_empty())
+                        {
+                            let id = string(&project, "uuid");
+                            plan.memory.push(ImportedMemory {
+                                source: source.key().into(),
+                                source_id: format!("project:{id}"),
+                                title: format!(
+                                    "Project instructions: {}",
+                                    string(&project, "name")
+                                ),
+                                content: content.into(),
+                                cwd: None,
+                                project: Some(id),
+                                updated_at: timestamp(project.get("updated_at")),
+                            });
+                            plan.warnings.push(format!("Project {} instructions were copied but need a local cwd set in the memory file before use", string(&project, "name")));
                         }
                     }
                 }
