@@ -1974,7 +1974,7 @@ async fn send_usage(
 }
 
 fn absorb_usage(total: &mut ProviderCallUsage, usage: &ProviderCallUsage) {
-    let had_usage = total.total_tokens > 0;
+    let had_usage = total.total_tokens > 0 || total.cost_microusd.is_some();
     total.duration_ms = total.duration_ms.saturating_add(usage.duration_ms);
     total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
     total.cached_input_tokens = total
@@ -1987,16 +1987,25 @@ fn absorb_usage(total: &mut ProviderCallUsage, usage: &ProviderCallUsage) {
     total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
     total.context_tokens = usage.context_tokens.or(total.context_tokens);
     total.context_window_tokens = usage.context_window_tokens.or(total.context_window_tokens);
-    total.cost_microusd = match (total.cost_microusd, usage.cost_microusd, had_usage) {
-        (Some(left), Some(right), _) => Some(left.saturating_add(right)),
-        (None, Some(right), false) => Some(right),
-        _ => None,
-    };
-    total.cost_basis = if total.cost_microusd.is_some() {
-        CostBasis::EstimatedFromPricing
-    } else {
-        CostBasis::Unavailable
-    };
+    if usage.total_tokens > 0 || usage.cost_microusd.is_some() {
+        total.cost_basis = if !had_usage || total.cost_basis == usage.cost_basis {
+            usage.cost_basis
+        } else {
+            match (total.cost_basis, usage.cost_basis) {
+                (CostBasis::ProviderReported, CostBasis::EstimatedFromPricing)
+                | (CostBasis::EstimatedFromPricing, CostBasis::ProviderReported) => {
+                    CostBasis::EstimatedFromPricing
+                }
+                _ => CostBasis::Unavailable,
+            }
+        };
+        total.cost_microusd = match (total.cost_microusd, usage.cost_microusd, had_usage) {
+            _ if total.cost_basis == CostBasis::Unavailable => None,
+            (Some(left), Some(right), _) => Some(left.saturating_add(right)),
+            (_, Some(right), false) => Some(right),
+            _ => None,
+        };
+    }
 }
 
 const NATIVE_AUTO_COMPACT_REMAINING_PERCENT: u64 = 5;
@@ -2954,6 +2963,80 @@ mod tests {
         let bounded = bounded_tool_content(output);
         assert!(bounded.is_char_boundary(MAX_TOOL_RESULT_BYTES));
         assert!(bounded.contains("tool output truncated"));
+    }
+
+    #[tokio::test]
+    async fn native_usage_events_preserve_cost_provenance_across_rounds() {
+        use CostBasis::{
+            EstimatedFromPricing, ProviderReported, SubscriptionEquivalent, Unavailable,
+        };
+        for (rounds, expected_basis, expected_cost) in [
+            (
+                vec![(SubscriptionEquivalent, None); 2],
+                SubscriptionEquivalent,
+                None,
+            ),
+            (
+                vec![(ProviderReported, Some(10)); 2],
+                ProviderReported,
+                Some(20),
+            ),
+            (
+                vec![
+                    (ProviderReported, Some(10)),
+                    (EstimatedFromPricing, Some(20)),
+                ],
+                EstimatedFromPricing,
+                Some(30),
+            ),
+            (
+                vec![
+                    (EstimatedFromPricing, Some(10)),
+                    (Unavailable, None),
+                    (EstimatedFromPricing, Some(20)),
+                ],
+                Unavailable,
+                None,
+            ),
+            (
+                vec![
+                    (SubscriptionEquivalent, Some(10)),
+                    (ProviderReported, Some(20)),
+                ],
+                Unavailable,
+                None,
+            ),
+        ] {
+            let mut total = ProviderCallUsage::default();
+            let round_count = rounds.len() as u64;
+            for (cost_basis, cost_microusd) in rounds {
+                absorb_usage(
+                    &mut total,
+                    &ProviderCallUsage {
+                        total_tokens: 100,
+                        cost_basis,
+                        cost_microusd,
+                        ..Default::default()
+                    },
+                );
+            }
+            // A timing-only update must not erase the last model usage.
+            absorb_usage(&mut total, &ProviderCallUsage::default());
+            let (events, mut receiver) = mpsc::channel(1);
+            send_usage(&events, &total, None).await;
+            let Some(SessionEventKind::UsageUpdated {
+                total_tokens,
+                cost_basis,
+                cost_microusd,
+                ..
+            }) = receiver.recv().await
+            else {
+                panic!("missing usage event");
+            };
+            assert_eq!(total_tokens, round_count * 100);
+            assert_eq!(cost_basis, expected_basis.as_str());
+            assert_eq!(cost_microusd, expected_cost);
+        }
     }
 
     #[test]

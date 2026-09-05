@@ -124,8 +124,13 @@ async fn probe() -> Result<()> {
                     SessionEventKind::UsageUpdated {
                         total_tokens,
                         cached_input_tokens,
+                        cost_basis,
                         ..
                     } => {
+                        ensure!(
+                            cost_basis == "subscription_equivalent",
+                            "native subscription usage lost its cost classification"
+                        );
                         println!(
                             "Borg usage: {total_tokens} tokens, {cached_input_tokens} cached input"
                         );

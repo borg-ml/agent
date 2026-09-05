@@ -145,8 +145,8 @@ The additive table upgrade preserves existing sessions. Old subscription
 history without account provenance is refused by the opt-in route and requires
 a new session. The production CLI route is unaffected.
 
-Before enabling the route by default, model limits, fast mode, and subscription
-cost basis still need to flow through the native contract. Real login/refresh
+Before enabling the route by default, model limits and fast mode still need
+to flow through the native contract. Real login/refresh
 and in-flight tool control behavior still need end-to-end subscription
 verification.
 
@@ -159,6 +159,12 @@ in-turn automatic compaction. The expanded live probe passed manual Borg-owned
 compaction, exact-value replay after restart, and a tool-free isolated
 consultation under the same account binding. That compaction run reported zero
 cached tokens; it does not establish cache reuse across a rewritten summary.
+
+Native usage aggregation preserves subscription-equivalent and provider-reported
+cost classifications. Mixed reported/estimated API costs are estimates; missing
+prices or incompatible billing bases never produce a misleading partial total.
+The live probe verifies subscription classification through turn, compaction,
+and restart usage events. This does not yet establish rate-limit reporting.
 
 ## Evidence
 
