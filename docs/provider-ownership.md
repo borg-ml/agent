@@ -241,6 +241,13 @@ The native tool/compaction/restart/consultation probe passed afterwards using th
 original credential store. This verifies access after a requested refresh, not
 expired-token recovery or re-login after revocation, which still need proof.
 
+Catalog and model HTTP requests share one account-bound recovery boundary.
+A controlled loopback test verifies that only HTTP 401 invokes refresh, the
+retry preserves the request body and uses the refreshed token on the original
+account, and a second 401 returns without another attempt. Changed-account and
+failed-refresh results transmit no retry. These checks use synthetic credentials;
+they verify Borg's recovery policy, not live credential rotation or re-login.
+
 Native subscription failures now distinguish usage/rate limits, context limits,
 and denied account access. HTTP `Retry-After` and structured reset fields provide
 retry timing when available. Error bodies are size- and time-bounded; only known

@@ -101,6 +101,43 @@ struct SubscriptionAccess {
 }
 
 impl SubscriptionAccess {
+    async fn send_with_recovery(
+        &mut self,
+        request: reqwest::RequestBuilder,
+        expected_account: &str,
+        refresh: impl std::future::Future<Output = Result<Self>>,
+    ) -> Result<reqwest::Response> {
+        ensure!(
+            self.identity() == expected_account,
+            "Codex account differs from this session's bound account; reconnect the original account or start a new session"
+        );
+        let retry = request
+            .try_clone()
+            .context("Codex request cannot be replayed for authentication recovery")?;
+        let response = request
+            .bearer_auth(&self.token)
+            .header("ChatGPT-Account-Id", &self.account_id)
+            .send()
+            .await
+            .context("Codex subscription connection failed")?;
+        if response.status() != reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(response);
+        }
+        drop(response);
+        let refreshed = refresh.await?;
+        ensure!(
+            refreshed.identity() == expected_account,
+            "Codex account changed during authentication recovery; start a new session"
+        );
+        *self = refreshed;
+        retry
+            .bearer_auth(&self.token)
+            .header("ChatGPT-Account-Id", &self.account_id)
+            .send()
+            .await
+            .context("Codex subscription connection failed")
+    }
+
     fn identity(&self) -> String {
         format!(
             "sha256:{}",
@@ -144,31 +181,17 @@ impl SubscriptionAccess {
                         && version.split('.').all(|part| part.parse::<u64>().is_ok())
                 })
                 .context("unrecognized Codex version for model catalog")?;
-            let mut refreshed = false;
-            let response = loop {
-                let response = client
-                    .get(MODELS_ENDPOINT)
-                    .query(&[("client_version", version)])
-                    .bearer_auth(&self.token)
-                    .header("ChatGPT-Account-Id", &self.account_id)
-                    .header("originator", "borg")
-                    .timeout(Duration::from_secs(30))
-                    .send()
-                    .await
-                    .context("Codex model catalog connection failed")?;
-                if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refreshed {
-                    drop(response);
-                    let access = Self::read(true).await?;
-                    ensure!(
-                        access.identity() == account,
-                        "Codex account changed during authentication recovery; start a new session"
-                    );
-                    *self = access;
-                    refreshed = true;
-                    continue;
-                }
-                break response;
-            };
+            let response = self
+                .send_with_recovery(
+                    client
+                        .get(MODELS_ENDPOINT)
+                        .query(&[("client_version", version)])
+                        .header("originator", "borg")
+                        .timeout(Duration::from_secs(30)),
+                    &account,
+                    Self::read(true),
+                )
+                .await?;
             let response = check_subscription_response(response).await?;
             let mut stream = response.bytes_stream();
             let mut bytes = Vec::new();
@@ -289,37 +312,16 @@ impl CodexModelProvider {
             let context_window = capabilities.usable_context_window()?;
             ensure!(!request.fast || capabilities.supports_fast(),
                 "fast mode is not supported by this Codex model");
-            let mut response = self
+            let response = self
                 .send(
                     &client,
                     ENDPOINT,
-                    &access,
+                    &mut access,
                     expected_account,
                     &request,
                     &body,
                 )
                 .await?;
-            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-                // Retry only an unaccepted HTTP request, never a partial model
-                // stream or completed tool side effect.
-                drop(response);
-                let refreshed = SubscriptionAccess::read(true).await?;
-                ensure!(
-                    refreshed.account_id == access.account_id,
-                    "Codex account changed during authentication recovery; start a new session"
-                );
-                access = refreshed;
-                response = self
-                    .send(
-                        &client,
-                        ENDPOINT,
-                        &access,
-                        expected_account,
-                        &request,
-                        &body,
-                    )
-                    .await?;
-            }
             let (message, response) = self.read_stream(response, progress.as_ref()).await?;
             Ok::<_, anyhow::Error>((message, response, context_window))
         }
@@ -456,15 +458,11 @@ impl CodexModelProvider {
         &self,
         client: &reqwest::Client,
         endpoint: &str,
-        access: &SubscriptionAccess,
+        access: &mut SubscriptionAccess,
         expected_account: &str,
         request: &ModelTurnRequest,
         body: &Value,
     ) -> Result<reqwest::Response> {
-        ensure!(
-            access.identity() == expected_account,
-            "Codex account differs from this session's bound account; reconnect the original account or start a new session"
-        );
         let routing_hint = if request.fast {
             format!("model={};tier=priority", self.model)
         } else {
@@ -472,8 +470,6 @@ impl CodexModelProvider {
         };
         let mut http = client
             .post(endpoint)
-            .bearer_auth(&access.token)
-            .header("ChatGPT-Account-Id", &access.account_id)
             .header("originator", "borg")
             .header("x-codex-routing-hint", routing_hint)
             .header("Accept", "text/event-stream")
@@ -484,10 +480,13 @@ impl CodexModelProvider {
         if let Some(id) = &request.request_id {
             http = http.header("X-Client-Request-Id", id);
         }
-        apply_provider_request_timeout(http)
-            .send()
+        access
+            .send_with_recovery(
+                apply_provider_request_timeout(http),
+                expected_account,
+                SubscriptionAccess::read(true),
+            )
             .await
-            .context("Codex model connection failed")
     }
 
     async fn read_stream(
@@ -829,6 +828,72 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     #[tokio::test]
+    async fn authentication_recovery_retries_once_without_crossing_accounts() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for (statuses, recovery) in [
+                (vec![200], "unused"),
+                (vec![403], "unused"),
+                (vec![401, 200], "same"),
+                (vec![401, 401], "same"),
+                (vec![401], "changed"),
+                (vec![401], "failed"),
+            ] {
+                const BODY: &str = "synthetic-private-context";
+                let expected_status = *statuses.last().unwrap();
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    for (index, status) in statuses.into_iter().enumerate() {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let mut request = Vec::new();
+                        while !request.ends_with(BODY.as_bytes()) {
+                            let mut bytes = [0; 1024];
+                            let count = socket.read(&mut bytes).await.unwrap();
+                            assert!(count > 0);
+                            request.extend_from_slice(&bytes[..count]);
+                        }
+                        let request = String::from_utf8(request).unwrap();
+                        let headers = request.split("\r\n\r\n").next().unwrap().to_lowercase();
+                        assert!(headers.starts_with("post /responses http/1.1\r\n"));
+                        assert!(headers.lines().any(|line| line == "chatgpt-account-id: account-a"));
+                        let token = if index == 0 { "old-token" } else { "new-token" };
+                        assert!(headers.lines().any(|line| line == format!("authorization: bearer {token}")));
+                        assert_eq!(request.split("\r\n\r\n").nth(1), Some(BODY));
+                        socket.write_all(format!("HTTP/1.1 {status} Probe\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                    }
+                    listener
+                });
+                let mut access = SubscriptionAccess { token: "old-token".into(), account_id: "account-a".into() };
+                let account = access.identity();
+                let refreshes = std::sync::atomic::AtomicUsize::new(0);
+                let result = access.send_with_recovery(
+                    reqwest::Client::new().post(endpoint).body(BODY).timeout(Duration::from_secs(1)),
+                    &account,
+                    async {
+                        refreshes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        ensure!(recovery != "failed", "synthetic refresh failure");
+                        Ok(SubscriptionAccess {
+                            token: "new-token".into(),
+                            account_id: if recovery == "changed" { "account-b" } else { "account-a" }.into(),
+                        })
+                    },
+                ).await;
+                assert_eq!(refreshes.load(std::sync::atomic::Ordering::SeqCst), usize::from(recovery != "unused"));
+                if matches!(recovery, "changed" | "failed") {
+                    assert!(result.is_err());
+                    assert_eq!(access.token, "old-token");
+                } else {
+                    assert_eq!(result.unwrap().status().as_u16(), expected_status);
+                }
+                assert_eq!(access.identity(), account);
+                let listener = server.await.unwrap();
+                assert!(tokio::time::timeout(Duration::from_millis(25), listener.accept()).await.is_err(),
+                    "no extra retry or changed-account request may reach the endpoint");
+            }
+        }).await.expect("authentication recovery must remain bounded");
+    }
+
+    #[tokio::test]
     async fn quota_rejection_reports_retry_delay_without_generation_or_private_details() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
@@ -991,7 +1056,7 @@ mod tests {
             token: "old-token".into(),
             account_id: "account-a".into(),
         };
-        let changed = SubscriptionAccess {
+        let mut changed = SubscriptionAccess {
             token: "new-token".into(),
             account_id: "account-b".into(),
         };
@@ -1013,7 +1078,7 @@ mod tests {
             .send(
                 &reqwest::Client::new(),
                 &endpoint,
-                &changed,
+                &mut changed,
                 &original.identity(),
                 &request,
                 &provider.request_body(&request).unwrap(),
@@ -1100,9 +1165,10 @@ mod tests {
             let mut request = ModelTurnRequest { fast: true, request_id: Some("request".into()), session_id: Some("session".into()),
                 prompt_cache_key: Some("cache".into()), messages: vec![ModelMessage::user("Inspect.")],
                 tools: vec![super::super::ModelToolDefinition::new("inspect", "Inspect", json!({"type":"object"})).unwrap()], output_schema: None };
-            let access = SubscriptionAccess { token: "test-token".into(), account_id: "test-account".into() };
+            let mut access = SubscriptionAccess { token: "test-token".into(), account_id: "test-account".into() };
+            let account = access.identity();
             let response = provider.send(&reqwest::Client::new(), &endpoint,
-                &access, &access.identity(),
+                &mut access, &account,
                 &request, &provider.request_body(&request).unwrap()).await.unwrap();
             let (tx, mut rx) = mpsc::unbounded_channel();
             let read = tokio::spawn(async move { provider.read_stream(response, Some(&tx)).await });
