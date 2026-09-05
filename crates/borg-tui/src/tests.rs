@@ -213,7 +213,24 @@ fn fork_history_moves_a_late_user_completion_before_the_response() {
         },
     );
 
-    let history = transcript_history_in_display_order(&[assistant, user_completion]);
+    let previous_turn = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::TurnCompleted {
+            message_id: Uuid::new_v4(),
+            provider_session_id: None,
+            final_text: String::new(),
+            error: None,
+        },
+    );
+    let history = transcript_history_in_display_order(&[previous_turn, assistant, user_completion]);
+    assert_eq!(
+        history
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 3, 2]
+    );
     let mut transcript = Transcript::default();
     for event in &history {
         transcript.apply_history(event);

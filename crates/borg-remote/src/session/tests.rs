@@ -9843,10 +9843,7 @@ async fn monitor_event_wakes_an_idle_session_without_an_active_goal() {
             .await
             .expect("monitor notification wakes idle agent")
             .expect("session remains attached");
-        if matches!(
-            event.kind,
-            SessionEventKind::TurnCompleted { message_id: _, .. }
-        ) {
+        if matches!(event.kind, SessionEventKind::TurnCompleted { .. }) {
             completions += 1;
         }
     }

@@ -2628,10 +2628,8 @@ impl BorgTerminal {
                 SessionEventKind::StatusChanged {
                     status: SessionStatus::Ready | SessionStatus::Stopped | SessionStatus::Failed,
                     ..
-                } => {
-                    if self.connection_retry_at.take().is_some() {
-                        self.notice = None;
-                    }
+                } if self.connection_retry_at.take().is_some() => {
+                    self.notice = None;
                 }
                 _ => {}
             }
@@ -8410,13 +8408,16 @@ fn transcript_history_in_display_order(events: &[SessionEvent]) -> Vec<SessionEv
         // assistant/tool output. Put that orphaned user boundary before the
         // visible turn output so a partial projection reads like the original
         // conversation instead of looking reversed.
-        if turn.iter().any(transcript_turn_has_terminal_boundary) {
-            // A terminal boundary means this prompt was submitted after the
-            // previous turn ended. Keep it at the tail even when its own
-            // lifecycle start was not included in the projection.
-            ordered.append(&mut turn);
-            ordered.push(event.clone());
-        } else if let Some(output_start) = turn.iter().position(transcript_turn_output) {
+        let turn_start = turn
+            .iter()
+            .rposition(transcript_turn_has_terminal_boundary)
+            .map_or(0, |index| index + 1);
+        if let Some(output_start) = turn
+            .iter()
+            .enumerate()
+            .skip(turn_start)
+            .find_map(|(index, event)| transcript_turn_output(event).then_some(index))
+        {
             ordered.extend(turn.drain(..output_start));
             ordered.push(event.clone());
             ordered.append(&mut turn);
@@ -8763,14 +8764,13 @@ fn display_subagent_model(agent: &SubagentSnapshot) -> String {
         (CodingProvider::Claude, "/root/claude") => Some("claude-opus-5"),
         _ => None,
     });
-    let model = model
+    model
         .map(str::to_string)
         .or_else(|| {
             borg_provider::model_catalog_for_backend(agent.provider.catalog_backend())
                 .map(|catalog| catalog.default_model.to_string())
         })
-        .unwrap_or_else(|| agent.provider.catalog_backend().to_string());
-    model
+        .unwrap_or_else(|| agent.provider.catalog_backend().to_string())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
