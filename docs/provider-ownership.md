@@ -112,6 +112,21 @@ and end-to-end Borg permissions/steering/cancellation still need verification.
 The small live probe reported zero cached tokens; preserving the cache key is
 not proof of a cache hit. Production routing is deliberately unchanged.
 
+The explicit `LocalAgentTurnExecutor::with_codex_model_only()` probe now routes
+through the real native harness and session actor. Loop ownership is queried
+from the executor so replay/compaction use the same choice as model dispatch.
+Ordinary executors still use the existing subscription route. Run
+`cargo run -p borg-remote --example codex_native_probe` for a temporary session
+that approves only `cat probe.txt`, stops, and restarts from its durable journal.
+This passed with Astra/low, Borg manual approval and tool execution, preserved
+model state across restart, and 1,024 cached input tokens during the first turn.
+
+Before enabling the route by default, also fix native multi-tool interruption
+and steering: completed results must be journaled before later calls execute,
+and an accepted steer must stop remaining queued actions. Account identity must
+be bound across rounds/restarts; model limits, fast mode, and subscription cost
+basis still need to flow through the native contract.
+
 ## Evidence
 
 - Current routing: `crates/borg-remote/src/contract.rs` (`uses_native_harness`)

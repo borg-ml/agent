@@ -1939,12 +1939,13 @@ async fn run_agent_session_store_kernel(
                                     // replays retained context instead.
                                     provider_session_id = None;
                                     provider_fork_turn_id = None;
-                                    retained_context = if launch.provider.uses_native_harness() {
-                                        None
-                                    } else {
-                                        journal.ensure_complete_context(session_id).await?;
-                                        retained_conversation_context(journal.context_events())
-                                    };
+                                    retained_context =
+                                        if executor.uses_native_harness(launch.provider) {
+                                            None
+                                        } else {
+                                            journal.ensure_complete_context(session_id).await?;
+                                            retained_conversation_context(journal.context_events())
+                                        };
                                 }
                             }
                             Err(error) => {
@@ -2069,11 +2070,13 @@ async fn run_agent_session_store_kernel(
                             Some("user"),
                         )
                         .await?;
-                        if launch.provider.uses_native_harness() || !provider_context_compaction {
+                        if executor.uses_native_harness(launch.provider)
+                            || !provider_context_compaction
+                        {
                             journal.ensure_complete_context(session_id).await?;
                         }
                         let result: Result<Option<crate::AgentCompaction>> = async {
-                            if launch.provider.uses_native_harness() {
+                            if executor.uses_native_harness(launch.provider) {
                                 let model = launch
                                     .model
                                     .as_deref()
@@ -2200,7 +2203,7 @@ async fn run_agent_session_store_kernel(
                                         payload: serde_json::json!({
                                             "status": "completed",
                                             "summary": summary,
-                                            "native": launch.provider.uses_native_harness()
+                                            "native": executor.uses_native_harness(launch.provider)
                                                 || provider_context_preserved,
                                             "provider_context_preserved":
                                                 provider_context_preserved,
@@ -2208,7 +2211,7 @@ async fn run_agent_session_store_kernel(
                                     },
                                 )
                                 .await?;
-                                if launch.provider.uses_native_harness()
+                                if executor.uses_native_harness(launch.provider)
                                     && let Some(context_window_tokens) =
                                         journal.state(session_id).await?.usage.context_window_tokens
                                 {
@@ -2244,7 +2247,7 @@ async fn run_agent_session_store_kernel(
                                         && executor
                                             .supports_subscription_context_reuse(launch.provider);
                                 }
-                                if !launch.provider.uses_native_harness()
+                                if !executor.uses_native_harness(launch.provider)
                                     && !provider_context_preserved
                                 {
                                     // The summary is already durable in the
@@ -2386,7 +2389,7 @@ async fn run_agent_session_store_kernel(
             continue;
         }
 
-        if launch.provider.uses_native_harness() {
+        if executor.uses_native_harness(launch.provider) {
             let state = journal.state(session_id).await?;
             if provider_context_usage_valid && native_auto_compaction_needed(&state) {
                 let context_tokens = state.usage.context_tokens.unwrap_or_default();
@@ -2520,7 +2523,7 @@ async fn run_agent_session_store_kernel(
             }
         }
 
-        let native_provider = launch.provider.uses_native_harness();
+        let native_provider = executor.uses_native_harness(launch.provider);
         let reuse_subscription_context = !native_provider
             && subscription_context_reusable
             && executor.supports_subscription_context_reuse(launch.provider);
@@ -4116,7 +4119,7 @@ async fn run_agent_session_store_kernel(
             &mut goal_active_since,
         )
         .await?;
-        if !launch.provider.uses_native_harness() {
+        if !executor.uses_native_harness(launch.provider) {
             if subscription_context_reusable
                 && executor.supports_subscription_context_reuse(launch.provider)
             {
@@ -4132,7 +4135,7 @@ async fn run_agent_session_store_kernel(
             subscription_context_reusable = false;
             provider_session_id = None;
             provider_fork_turn_id = None;
-            retained_context = if launch.provider.uses_native_harness() {
+            retained_context = if executor.uses_native_harness(launch.provider) {
                 None
             } else {
                 journal.ensure_complete_context(session_id).await?;
@@ -4153,7 +4156,7 @@ async fn run_agent_session_store_kernel(
             ) {
                 provider_session_id = None;
                 provider_fork_turn_id = None;
-                retained_context = if launch.provider.uses_native_harness() {
+                retained_context = if executor.uses_native_harness(launch.provider) {
                     None
                 } else {
                     journal.ensure_complete_context(session_id).await?;
@@ -4428,7 +4431,9 @@ fn native_conversation(
                 let message = serde_json::from_value(payload.clone()).context(
                     "durable native prompt context does not match the model-turn contract",
                 )?;
-                if active_provider.is_some_and(|provider| provider.uses_native_harness()) {
+                if native_structured_in_turn
+                    || active_provider.is_some_and(|provider| provider.uses_native_harness())
+                {
                     pending_native.push(message);
                 } else {
                     pending_generic.push(message);

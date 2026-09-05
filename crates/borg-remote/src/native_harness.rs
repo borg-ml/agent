@@ -61,7 +61,7 @@ impl std::fmt::Debug for NativeHarness {
 impl Default for NativeHarness {
     fn default() -> Self {
         Self {
-            model_client: Arc::new(CompatibleModelClient::default()),
+            model_client: Arc::new(ProviderModelClient::default()),
             execution_provider: Arc::new(crate::LocalExecutionProvider::new()),
             workflow_process_manager: crate::native_process::ProcessManager::default(),
             reviewer_model: None,
@@ -74,7 +74,7 @@ impl Default for NativeHarness {
 impl NativeHarness {
     pub(crate) fn with_settings(settings: &super::agent::LocalAgentSettings) -> Self {
         Self {
-            model_client: Arc::new(CompatibleModelClient {
+            model_client: Arc::new(ProviderModelClient {
                 gateway: None,
                 configured_model_gateways: settings.configured_model_gateways.clone(),
             }),
@@ -91,7 +91,7 @@ impl NativeHarness {
         settings: &super::agent::LocalAgentSettings,
     ) -> Self {
         Self {
-            model_client: Arc::new(CompatibleModelClient {
+            model_client: Arc::new(ProviderModelClient {
                 gateway: Some(model_gateway),
                 configured_model_gateways: settings.configured_model_gateways.clone(),
             }),
@@ -737,13 +737,13 @@ trait NativeModelClient: Send + Sync {
 }
 
 #[derive(Debug, Clone, Default)]
-struct CompatibleModelClient {
+struct ProviderModelClient {
     gateway: Option<ModelGateway>,
     configured_model_gateways: std::collections::BTreeMap<String, ModelGateway>,
 }
 
 #[async_trait]
-impl NativeModelClient for CompatibleModelClient {
+impl NativeModelClient for ProviderModelClient {
     async fn model_turn(
         &self,
         provider: crate::CodingProvider,
@@ -752,6 +752,17 @@ impl NativeModelClient for CompatibleModelClient {
         request: ModelTurnRequest,
         progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        #[cfg(feature = "subscription-adapters")]
+        if provider == crate::CodingProvider::Codex {
+            return borg_provider::provider::CodexModelProvider {
+                model: model.to_string(),
+                effort: effort
+                    .unwrap_or(borg_provider::codex_default_effort())
+                    .to_string(),
+            }
+            .model_turn(request, progress)
+            .await;
+        }
         let configured_gateway = (provider == crate::CodingProvider::OpenAiCompatible)
             .then(|| self.configured_model_gateways.get(model))
             .flatten();

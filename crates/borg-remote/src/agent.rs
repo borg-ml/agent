@@ -203,6 +203,12 @@ pub enum AgentTurnControl {
 /// loop.
 #[async_trait::async_trait]
 pub trait AgentTurnExecutor: Send + Sync {
+    /// The selected execution route owns this decision, not the billing
+    /// provider. It also determines how the actor projects durable context.
+    fn uses_native_harness(&self, provider: CodingProvider) -> bool {
+        provider.uses_native_harness()
+    }
+
     async fn execute(
         &self,
         turn: AgentTurn,
@@ -275,6 +281,7 @@ pub trait AgentTurnExecutor: Send + Sync {
 #[derive(Clone)]
 pub struct LocalAgentTurnExecutor {
     native_harness: NativeHarness,
+    codex_model_only: bool,
     runtime_extensions: Arc<RwLock<RuntimeExtensions>>,
     runtime_extension_loader: Option<RuntimeExtensionLoader>,
     subscription_pools: Arc<SubscriptionPoolRegistry>,
@@ -296,6 +303,7 @@ impl Default for LocalAgentTurnExecutor {
         };
         Self {
             native_harness: NativeHarness::default(),
+            codex_model_only: false,
             runtime_extensions: Arc::new(RwLock::new(RuntimeExtensions::default())),
             runtime_extension_loader: None,
             subscription_pools: Arc::new(SubscriptionPoolRegistry::default()),
@@ -550,6 +558,14 @@ pub struct LocalAgentSettings {
 }
 
 impl LocalAgentTurnExecutor {
+    /// Explicit migration probe; ordinary sessions retain their existing
+    /// subscription route until model-only parity is verified.
+    #[cfg(feature = "subscription-adapters")]
+    pub fn with_codex_model_only(mut self) -> Self {
+        self.codex_model_only = true;
+        self
+    }
+
     pub fn with_settings(settings: LocalAgentSettings) -> Self {
         Self {
             native_harness: NativeHarness::with_settings(&settings),
@@ -796,12 +812,18 @@ fn completed_hook_arguments(turn: &AgentTurn, result: &Result<AgentTurnResult>) 
 
 #[async_trait::async_trait]
 impl AgentTurnExecutor for LocalAgentTurnExecutor {
+    fn uses_native_harness(&self, provider: CodingProvider) -> bool {
+        provider.uses_native_harness()
+            || (self.codex_model_only && provider == CodingProvider::Codex)
+    }
+
     fn web_search_provider(&self) -> Option<Arc<dyn borg_search::WebSearchProvider>> {
         self.web_search.clone()
     }
 
     fn supports_subscription_context_reuse(&self, provider: CodingProvider) -> bool {
-        matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
+        !self.uses_native_harness(provider)
+            && matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
     }
 
     fn extension_workflow_snapshot(
@@ -854,7 +876,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         if let Some(profiler) = self.profiler.as_ref() {
             profiler.set_phase("provider_start");
         }
-        if turn.provider.uses_native_harness() {
+        if self.uses_native_harness(turn.provider) {
             let result = self
                 .native_harness
                 .run(turn.clone(), events, controls)
@@ -916,7 +938,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
     }
 
     async fn consult(&self, request: ConsultationRequest) -> Result<ConsultationResult> {
-        if request.provider.uses_native_harness() {
+        if self.uses_native_harness(request.provider) {
             let model = request
                 .model
                 .as_deref()
