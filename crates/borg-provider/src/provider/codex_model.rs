@@ -465,11 +465,17 @@ impl CodexModelProvider {
             access.identity() == expected_account,
             "Codex account differs from this session's bound account; reconnect the original account or start a new session"
         );
+        let routing_hint = if request.fast {
+            format!("model={};tier=priority", self.model)
+        } else {
+            format!("model={}", self.model)
+        };
         let mut http = client
             .post(endpoint)
             .bearer_auth(&access.token)
             .header("ChatGPT-Account-Id", &access.account_id)
             .header("originator", "borg")
+            .header("x-codex-routing-hint", routing_hint)
             .header("Accept", "text/event-stream")
             .json(body);
         if let Some(id) = &request.session_id {
@@ -1050,6 +1056,7 @@ mod tests {
                         assert!(headers.contains("authorization: bearer test-token"));
                         assert!(headers.contains("chatgpt-account-id: test-account"));
                         assert!(headers.contains("session_id: session"));
+                        assert!(headers.contains("x-codex-routing-hint: model=gpt-6-astra;tier=priority"));
                         let len: usize = headers.lines().find_map(|line| line.strip_prefix("content-length: ")).unwrap().parse().unwrap();
                         break (end + 4, len);
                     }

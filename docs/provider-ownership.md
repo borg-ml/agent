@@ -224,6 +224,11 @@ priority routing. The live endpoint instead reported `service_tier: "default"`
 on two attempts despite the priority request. This is an unresolved migration
 gap, not proof that fast mode works. Do not switch production routing on the
 strength of request-shape tests alone.
+The adapter now also sends the upstream `x-codex-routing-hint` header: model
+only for standard requests, model plus `tier=priority` for fast requests. The
+existing first-character wire test checks that this matches the fast request
+body. A further live fast probe with the header still reported `default`, so
+this transport-parity correction does not resolve the effective-tier mismatch.
 The native-session probe with `--fast` passed tool execution, compaction, and
 restart; it verifies those workflows with fast requested, not the effective tier.
 An ephemeral read-only comparison through installed Codex accepted `priority`
