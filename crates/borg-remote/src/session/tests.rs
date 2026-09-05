@@ -1124,6 +1124,7 @@ struct NarrationThenDelayedCompletionExecutor;
 struct ReadyThenHungExecutor;
 
 struct CleanupBarrierExecutor {
+    cooperative: bool,
     started: Arc<Notify>,
     cleanup_started: Arc<Notify>,
     release_cleanup: Arc<Notify>,
@@ -1219,11 +1220,15 @@ impl AgentTurnExecutor for ReadyThenHungExecutor {
 
 #[async_trait::async_trait]
 impl AgentTurnExecutor for CleanupBarrierExecutor {
+    fn uses_native_harness(&self, _provider: CodingProvider) -> bool {
+        self.cooperative
+    }
+
     async fn execute(
         &self,
         _turn: AgentTurn,
         events: mpsc::Sender<SessionEventKind>,
-        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
         events
             .send(SessionEventKind::ReasoningDelta {
@@ -1232,6 +1237,14 @@ impl AgentTurnExecutor for CleanupBarrierExecutor {
             .await
             .ok();
         self.started.notify_one();
+        if self.cooperative {
+            let mut controls = controls.expect("active native turn has controls");
+            while !matches!(
+                controls.recv().await,
+                Some(AgentTurnControl::Interrupt) | None
+            ) {}
+            anyhow::bail!("native provider turn interrupted");
+        }
         std::future::pending().await
     }
 
@@ -3087,6 +3100,15 @@ async fn interrupted_turn_reaches_fifo_drain_boundary() {
 
 #[tokio::test]
 async fn interrupt_timeout_cannot_publish_ready_before_provider_cleanup_finishes() {
+    assert_interrupt_waits_for_cleanup(false).await;
+}
+
+#[tokio::test]
+async fn cooperative_native_interrupt_waits_for_process_cleanup_before_completion() {
+    assert_interrupt_waits_for_cleanup(true).await;
+}
+
+async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
@@ -3096,6 +3118,7 @@ async fn interrupt_timeout_cannot_publish_ready_before_provider_cleanup_finishes
     let cleanup_started = Arc::new(Notify::new());
     let release_cleanup = Arc::new(Notify::new());
     let executor = Arc::new(CleanupBarrierExecutor {
+        cooperative,
         started: Arc::clone(&started),
         cleanup_started: Arc::clone(&cleanup_started),
         release_cleanup: Arc::clone(&release_cleanup),
@@ -3150,7 +3173,7 @@ async fn interrupt_timeout_cannot_publish_ready_before_provider_cleanup_finishes
         .unwrap();
     tokio::time::timeout(Duration::from_secs(4), cleanup_started.notified())
         .await
-        .expect("interrupt timeout enters provider cleanup");
+        .expect("interrupt enters provider cleanup");
 
     let before_cleanup = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
     assert!(before_cleanup.iter().any(|event| matches!(

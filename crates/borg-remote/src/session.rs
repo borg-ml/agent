@@ -2873,6 +2873,17 @@ async fn run_agent_session_store_kernel(
                         Ok(result) => result,
                         Err(error) => Err(anyhow::anyhow!("agent turn task failed: {error}")),
                     };
+                    let result = if interrupted && executor.uses_native_harness(launch.provider) {
+                        // Cooperative turn cancellation does not stop session-owned processes.
+                        // Reap them before publishing the interrupted terminal boundary.
+                        executor.stop_session(session_id).await?;
+                        Ok(crate::AgentTurnResult {
+                            provider_session_id: None,
+                            final_text: String::new(),
+                        })
+                    } else {
+                        result
+                    };
                     while let Ok(kind) = provider_events.try_recv() {
                         if is_executor_lifecycle_status(&kind) {
                             continue;

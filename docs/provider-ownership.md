@@ -150,6 +150,18 @@ not open a fallback approval prompt. A held-open reviewer test verifies immediat
 control handling and request cancellation. Queued controls are checked again
 after approval/status delivery before the tool starts.
 
+`codex_native_probe --controls` verifies real subscription steering and
+interruption with one allowlisted command in a disposable directory. The command
+records its PID and waits ten seconds. Steering is acknowledged while that
+process is still running and changes the final response within the same turn;
+interrupt must reap the process before the terminal event, within six seconds.
+The live probe exposed a cooperative-interrupt cleanup gap: the model call ended
+but its session-owned process survived. The session actor now waits for native
+process cleanup before publishing interruption, just as the forced-timeout path
+already did. Both live cases passed after the fix. The existing cleanup-barrier
+test also covers cooperative native cancellation, so it cannot regress silently
+between manual subscription probes. CLI subscription thread reuse is unchanged.
+
 Account admission also polls interruption while authentication/storage is pending.
 Steering received during admission remains unacknowledged and recallable until
 admission succeeds, then enters Borg's durable model context in arrival order.
@@ -170,8 +182,8 @@ The additive table upgrade preserves existing sessions. Old subscription
 history without account provenance is refused by the opt-in route and requires
 a new session. The production CLI route is unaffected.
 
-Before enabling the route by default, effective fast routing, real login/refresh,
-and in-flight tool control behavior still need end-to-end subscription verification.
+Before enabling the route by default, effective fast routing and real
+expired/revoked-auth recovery still need end-to-end subscription verification.
 
 Turns, compaction, and one-shot consultations now share the same host-owned
 `ModelAccessContext` admission step. The context carries the session/store only
