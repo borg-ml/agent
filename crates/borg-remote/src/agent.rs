@@ -218,6 +218,16 @@ pub enum AgentTurnControl {
 /// loop.
 #[async_trait::async_trait]
 pub trait AgentTurnExecutor: Send + Sync {
+    /// Resolve durable execution policy before the actor chooses replay or
+    /// compaction. Host executors without per-session routing retain themselves.
+    async fn for_session(
+        &self,
+        _session_id: Uuid,
+        _store: &dyn crate::SessionStore,
+    ) -> Result<Option<Arc<dyn AgentTurnExecutor>>> {
+        Ok(None)
+    }
+
     /// The selected execution route owns this decision, not the billing
     /// provider. It also determines how the actor projects durable context.
     fn uses_native_harness(&self, provider: CodingProvider) -> bool {
@@ -299,6 +309,7 @@ pub trait AgentTurnExecutor: Send + Sync {
 pub struct LocalAgentTurnExecutor {
     native_harness: NativeHarness,
     codex_model_only: bool,
+    codex_session_native: bool,
     runtime_extensions: Arc<RwLock<RuntimeExtensions>>,
     runtime_extension_loader: Option<RuntimeExtensionLoader>,
     subscription_pools: Arc<SubscriptionPoolRegistry>,
@@ -321,6 +332,7 @@ impl Default for LocalAgentTurnExecutor {
         Self {
             native_harness: NativeHarness::default(),
             codex_model_only: false,
+            codex_session_native: false,
             runtime_extensions: Arc::new(RwLock::new(RuntimeExtensions::default())),
             runtime_extension_loader: None,
             subscription_pools: Arc::new(SubscriptionPoolRegistry::default()),
@@ -575,8 +587,8 @@ pub struct LocalAgentSettings {
 }
 
 impl LocalAgentTurnExecutor {
-    /// Explicit migration probe; ordinary sessions retain their existing
-    /// subscription route until model-only parity is verified.
+    /// Require model-only execution, including isolated admission probes.
+    /// This does not override an existing session's compatibility route.
     #[cfg(feature = "subscription-adapters")]
     pub fn with_codex_model_only(mut self) -> Self {
         self.codex_model_only = true;
@@ -829,9 +841,31 @@ fn completed_hook_arguments(turn: &AgentTurn, result: &Result<AgentTurnResult>) 
 
 #[async_trait::async_trait]
 impl AgentTurnExecutor for LocalAgentTurnExecutor {
+    #[cfg(feature = "subscription-adapters")]
+    async fn for_session(
+        &self,
+        session_id: Uuid,
+        store: &dyn crate::SessionStore,
+    ) -> Result<Option<Arc<dyn AgentTurnExecutor>>> {
+        let autonomy = store.autonomy_store().await?;
+        let store = autonomy
+            .as_ref()
+            .context("local execution requires durable harness routing")?
+            .session_store();
+        let native = store.uses_native_codex_harness(session_id).await?;
+        anyhow::ensure!(
+            !self.codex_model_only || native,
+            "this session retains its Codex compatibility route; start a new session for Borg-owned execution"
+        );
+        let mut executor = self.clone();
+        executor.codex_session_native = native;
+        Ok(Some(Arc::new(executor)))
+    }
+
     fn uses_native_harness(&self, provider: CodingProvider) -> bool {
         provider.uses_native_harness()
-            || (self.codex_model_only && provider == CodingProvider::Codex)
+            || ((self.codex_model_only || self.codex_session_native)
+                && provider == CodingProvider::Codex)
     }
 
     fn web_search_provider(&self) -> Option<Arc<dyn borg_search::WebSearchProvider>> {
@@ -2351,6 +2385,45 @@ async fn send(events: &mpsc::Sender<SessionEventKind>, event: SessionEventKind) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "subscription-adapters")]
+    #[tokio::test]
+    async fn session_executor_resolves_each_durable_route_without_inheriting_a_previous_choice() {
+        use crate::SessionStore;
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let fresh = Uuid::new_v4();
+        let legacy = Uuid::new_v4();
+        store.create_session(fresh).await.unwrap();
+        store.create_session(legacy).await.unwrap();
+        store
+            .append(crate::SessionEvent::new(
+                legacy,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        let native = LocalAgentTurnExecutor::default()
+            .for_session(fresh, &store)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(native.uses_native_harness(CodingProvider::Codex));
+        assert!(!native.supports_subscription_context_reuse(CodingProvider::Codex));
+        let compatibility = native.for_session(legacy, &store).await.unwrap().unwrap();
+        assert!(!compatibility.uses_native_harness(CodingProvider::Codex));
+        assert!(compatibility.supports_subscription_context_reuse(CodingProvider::Codex));
+        assert!(
+            LocalAgentTurnExecutor::default()
+                .with_codex_model_only()
+                .for_session(legacy, &store)
+                .await
+                .is_err()
+        );
+    }
 
     #[cfg(feature = "subscription-adapters")]
     #[tokio::test]

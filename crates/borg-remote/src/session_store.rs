@@ -1210,7 +1210,77 @@ impl SqliteSessionStore {
         let has_access_bindings: i64 = sqlx::query_scalar(
             "select exists(select 1 from sqlite_master where type='table' and name='session_model_access')",
         ).fetch_one(&self.pool).await?;
-        Ok(version == Some(SESSION_SCHEMA_VERSION) && has_access_bindings != 0)
+        let has_harness_routes: i64 = sqlx::query_scalar(
+            "select exists(select 1 from sqlite_master where type='table' and name='session_harness_routes')",
+        ).fetch_one(&self.pool).await?;
+        Ok(version == Some(SESSION_SCHEMA_VERSION)
+            && has_access_bindings != 0
+            && has_harness_routes != 0)
+    }
+
+    #[cfg(any(feature = "subscription-adapters", test))]
+    pub(crate) async fn uses_native_codex_harness(&self, session_id: Uuid) -> Result<bool> {
+        let mut transaction = self.begin_write().await?;
+        let native = Self::resolve_codex_harness(&mut transaction, session_id, None).await?;
+        transaction.commit().await?;
+        Ok(native)
+    }
+
+    async fn resolve_codex_harness(
+        transaction: &mut Transaction<'_, Sqlite>,
+        session_id: Uuid,
+        inherited: Option<bool>,
+    ) -> Result<bool> {
+        let existing: Option<bool> = sqlx::query_scalar(
+            "select native from session_harness_routes where session_id=? and provider='codex'",
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let native = if let Some(existing) = existing {
+            existing
+        } else {
+            // Unbound prototype history must still enter native admission, which
+            // refuses replay without account provenance; never fall back to a CLI.
+            let native_history: bool = sqlx::query_scalar(
+                "with recursive lineage(id) as (select ? union all \
+                 select s.parent_session_id from sessions s join lineage l on s.id=l.id \
+                 where s.parent_session_id is not null) \
+                 select exists(select 1 from session_model_access where session_id=? and provider='codex') \
+                 or exists(select 1 from session_events e join lineage l on e.session_id=l.id \
+                 where json_extract(e.event_json, '$.kind.provider')='codex' \
+                 and json_extract(e.event_json, '$.kind.kind')='native_model_message')",
+            )
+            .bind(session_id.to_string())
+            .bind(session_id.to_string())
+            .fetch_one(&mut **transaction)
+            .await?;
+            let row = sqlx::query(
+                "select next_sequence, parent_session_id, owner_session_id from sessions where id=?",
+            )
+            .bind(session_id.to_string())
+            .fetch_one(&mut **transaction)
+            .await?;
+            let empty_root = row.try_get::<i64, _>("next_sequence")? == 1
+                && row
+                    .try_get::<Option<String>, _>("parent_session_id")?
+                    .is_none();
+            let native = native_history
+                || (empty_root
+                    && inherited.unwrap_or(
+                        row.try_get::<Option<String>, _>("owner_session_id")?
+                            .is_none(),
+                    ));
+            sqlx::query("insert into session_harness_routes (session_id, provider, native) values (?, 'codex', ?)")
+                .bind(session_id.to_string()).bind(native)
+                .execute(&mut **transaction).await?;
+            native
+        };
+        ensure!(
+            inherited.is_none_or(|owner| owner == native),
+            "child Codex harness differs from its owner's durable route; start a new child session"
+        );
+        Ok(native)
     }
 
     #[cfg(any(feature = "subscription-adapters", test))]
@@ -1225,6 +1295,18 @@ impl SqliteSessionStore {
             "model account identity is empty"
         );
         let mut transaction = self.begin_write().await?;
+        if provider == CodingProvider::Codex {
+            let native: Option<bool> = sqlx::query_scalar(
+                "select native from session_harness_routes where session_id=? and provider='codex'",
+            )
+            .bind(session_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?;
+            ensure!(
+                native != Some(false),
+                "this session retains its Codex compatibility route; start a new session for Borg-owned execution"
+            );
+        }
         let provider = serde_json::to_value(provider)?
             .as_str()
             .context("provider is not a string")?
@@ -2729,6 +2811,13 @@ impl SqliteSessionStore {
                 primary key (session_id, provider)
             );
 
+            create table if not exists session_harness_routes (
+                session_id text not null references sessions(id) on delete cascade,
+                provider text not null,
+                native integer not null check (native in (0, 1)),
+                primary key (session_id, provider)
+            );
+
             create table if not exists session_events (
                 session_id text not null references sessions(id) on delete cascade,
                 sequence integer not null,
@@ -3176,6 +3265,9 @@ impl SqliteSessionStore {
                 .bind(session_id.to_string())
                 .fetch_one(&mut *transaction)
                 .await?;
+        let owner_native =
+            Self::resolve_codex_harness(&mut transaction, owner_session_id, None).await?;
+        Self::resolve_codex_harness(&mut transaction, session_id, Some(owner_native)).await?;
         if let Some(existing_owner) = existing_owner {
             anyhow::ensure!(
                 existing_owner == owner_session_id.to_string(),
@@ -5931,6 +6023,11 @@ impl SessionStore for SqliteSessionStore {
         .await?;
         sqlx::query("insert into session_model_access (session_id, provider, account_identity) select ?, provider, account_identity from session_model_access where session_id=?")
             .bind(session_id.to_string()).bind(parent_session_id.to_string())
+            .execute(&mut *transaction).await?;
+        let parent_native =
+            Self::resolve_codex_harness(&mut transaction, parent_session_id, None).await?;
+        sqlx::query("insert into session_harness_routes (session_id, provider, native) values (?, 'codex', ?)")
+            .bind(session_id.to_string()).bind(parent_native)
             .execute(&mut *transaction).await?;
         let parent_workspace: Option<String> = sqlx::query_scalar(
             "select workspace_id from session_workspace_bindings where session_id=?",

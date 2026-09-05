@@ -15,6 +15,74 @@ async fn store() -> (tempfile::TempDir, SqliteSessionStore) {
 }
 
 #[tokio::test]
+async fn codex_harness_route_survives_restart_clear_fork_and_child_registration() {
+    let (directory, store) = store().await;
+    let mut expected = Vec::new();
+    for native in [true, false] {
+        let parent = Uuid::new_v4();
+        store.create_session(parent).await.unwrap();
+        if !native {
+            store
+                .append(SessionEvent::new(
+                    parent,
+                    0,
+                    SessionEventKind::SessionStarted,
+                ))
+                .await
+                .unwrap();
+        }
+        let (first, second) = tokio::join!(
+            store.uses_native_codex_harness(parent),
+            store.uses_native_codex_harness(parent),
+        );
+        assert_eq!(first.unwrap(), native);
+        assert_eq!(second.unwrap(), native);
+        if !native {
+            assert!(
+                store
+                    .bind_model_access(parent, CodingProvider::Codex, "account-a")
+                    .await
+                    .is_err()
+            );
+        }
+        store
+            .append(SessionEvent::new(
+                parent,
+                0,
+                SessionEventKind::ContextCleared,
+            ))
+            .await
+            .unwrap();
+        let fork = Uuid::new_v4();
+        store.fork_before(parent, fork, 1).await.unwrap();
+        let child = Uuid::new_v4();
+        store.register_child_session(parent, child).await.unwrap();
+        store.register_child_session(parent, child).await.unwrap();
+        expected.extend([parent, fork, child].map(|id| (id, native)));
+    }
+    // Attaching an already routed child cannot rewrite its execution contract.
+    assert!(
+        store
+            .register_child_session(expected[0].0, expected[3].0)
+            .await
+            .is_err()
+    );
+    store.pool.close().await;
+    let reopened = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    for (session_id, native) in expected {
+        assert_eq!(
+            reopened
+                .uses_native_codex_harness(session_id)
+                .await
+                .unwrap(),
+            native
+        );
+    }
+}
+
+#[tokio::test]
 async fn model_access_binding_is_atomic_durable_and_inherited_without_context_dependence() {
     let (directory, store) = store().await;
     let session_id = Uuid::new_v4();
@@ -70,6 +138,7 @@ async fn model_access_binding_is_atomic_durable_and_inherited_without_context_de
         .await
         .unwrap();
     for id in [session_id, fork_id, child_id] {
+        assert!(reopened.uses_native_codex_harness(id).await.unwrap());
         reopened
             .bind_model_access(id, CodingProvider::Codex, accepted)
             .await
@@ -114,6 +183,7 @@ async fn subscription_access_rejects_unbound_prototype_history_and_its_forks() {
     let fork_id = Uuid::new_v4();
     store.fork_before(session_id, fork_id, 2).await.unwrap();
     for id in [session_id, fork_id] {
+        assert!(store.uses_native_codex_harness(id).await.unwrap());
         assert!(
             store
                 .bind_model_access(id, CodingProvider::Codex, "current-account")
@@ -154,6 +224,7 @@ async fn subscription_access_rejects_unbound_prototype_history_and_its_forks() {
             .to_string()
             .contains("no account binding")
     );
+    assert!(!store.uses_native_codex_harness(legacy).await.unwrap());
 }
 
 #[tokio::test]
@@ -2895,8 +2966,12 @@ async fn interactive_open_adds_account_bindings_without_replacing_existing_sessi
     let (directory, store) = store().await;
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
-    // Reproduce the current database schema before the additive binding table.
+    // Reproduce the current database schema before the additive admission tables.
     sqlx::query("drop table session_model_access")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("drop table session_harness_routes")
         .execute(&store.pool)
         .await
         .unwrap();
@@ -2905,6 +2980,12 @@ async fn interactive_open_adds_account_bindings_without_replacing_existing_sessi
         .await
         .unwrap();
     assert!(reopened.contains_session(session_id).await.unwrap());
+    assert!(
+        reopened
+            .uses_native_codex_harness(session_id)
+            .await
+            .unwrap()
+    );
     reopened
         .bind_model_access(session_id, CodingProvider::Codex, "account-a")
         .await

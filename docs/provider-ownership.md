@@ -74,9 +74,9 @@ usage/rate-limit reporting, and recovery without duplicate actions. Keep the
 working subscription path available until this proof succeeds. Record exactly
 which remaining external components are necessary and why.
 
-### Model-only prototype
+### Codex model-only access
 
-`CodexModelProvider` is an explicit prototype, not the production chat route.
+`CodexModelProvider` serves fresh Codex sessions through Borg's native harness.
 It sends a Responses request directly and returns a `ModelTurnResult`; it
 cannot execute tools or start a provider agent turn. The existing Codex binary
 is used for `initialize`, `getAuthStatus`, and its version for the model catalog,
@@ -110,13 +110,14 @@ that field on the wire.
 The small transport probe alone does not establish a native-harness migration.
 The small live probe reported zero cached tokens; preserving the cache key is
 not proof of a cache hit. The following sections record the subsequent
-subscription, cache, control, and rollout evidence. Production routing remains
-unchanged.
+subscription, cache, control, and rollout evidence.
 
-The explicit `LocalAgentTurnExecutor::with_codex_model_only()` probe now routes
-through the real native harness and session actor. Loop ownership is queried
+`LocalAgentTurnExecutor` resolves each session's durable route before the actor
+loads replay or chooses compaction. Loop ownership is queried
 from the executor so replay/compaction use the same choice as model dispatch.
-Ordinary executors still use the existing subscription route. Run
+Fresh sessions use Borg's harness; existing subscription history retains its
+compatibility route. `with_codex_model_only()` remains an explicit requirement
+for isolated probes, not an override of an existing route. Run
 `cargo run -p borg-remote --example codex_native_probe` for a temporary session
 that approves only `cat probe.txt`, stops, and restarts from its durable journal.
 This passed with Astra/low, Borg manual approval and tool execution, preserved
@@ -179,14 +180,30 @@ model context. Every model round checks the current account against that
 binding before connecting, including authentication recovery. Binding survives
 compaction, context clearing, and restart; forks and child sessions inherit it.
 The additive table upgrade preserves existing sessions. Old subscription
-history without account provenance is refused by the opt-in route and requires
-a new session. The production CLI route is unaffected.
+history without account provenance is refused by model-only admission and requires
+a new session. Existing CLI sessions retain their compatibility route.
 
-Before enabling the route by default, define a durable rollout boundary for
-fresh versus existing sessions. Existing unbound history must not be silently
-migrated or sent under an assumed account. Live expired/revoked-auth recovery
-remains unobserved; the retained upstream credential manager and Borg's tested
-recovery policy must remain intact during rollout.
+The additive `session_harness_routes` table fixes the route independently of
+context clearing, compaction, restart, or a later executable default. Fresh root
+sessions choose native execution; forks and new children inherit the owner's
+choice. Existing sessions without a route retain compatibility, except prior
+account-bound or native-message sessions, which must enter native admission.
+Unbound prototype history therefore fails closed rather than falling back to
+the CLI. Attaching a child with a conflicting route is refused. Native startup
+always loads Borg's journal, never a provider-thread recovery checkpoint.
+The local and enrolled-host factories share this session assembly boundary.
+
+This is not an implicit migration of old history: compatibility sessions still
+have the upstream CLI's generic first-argument streaming limitation. Starting a
+fresh session selects the first-fragment-capable native route. Live
+expired/revoked-auth recovery remains unobserved; the retained upstream
+credential manager and Borg's tested recovery policy remain unchanged.
+
+The default-executor live probe passed approval, execution, compaction,
+consultation, and restart without a native-only override. Its `--controls`
+variant also passed same-turn steering and process cleanup on interruption.
+Storage tests cover concurrent selection, both routes across reopen/clear/fork/
+child registration, conflicting-route refusal, and the additive schema upgrade.
 
 Turns, compaction, and one-shot consultations now share the same host-owned
 `ModelAccessContext` admission step. The context carries the session/store only

@@ -3139,6 +3139,7 @@ async fn restore_mirrors_a_child_stop_journaled_before_the_parent_crashed() {
             .unwrap(),
     );
     store.create_session(root).await.unwrap();
+    store.append(parent_event.clone()).await.unwrap();
     store.create_session(child_id).await.unwrap();
     for kind in [
         SessionEventKind::SessionStarted,
@@ -3232,6 +3233,7 @@ async fn restored_live_child_stays_dormant_and_stops_with_its_root() {
             .unwrap(),
     );
     store.create_session(root).await.unwrap();
+    store.append(parent_event.clone()).await.unwrap();
     store.create_session(child_id).await.unwrap();
     for kind in [
         SessionEventKind::SessionStarted,

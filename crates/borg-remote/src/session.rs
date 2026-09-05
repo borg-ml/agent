@@ -1121,6 +1121,10 @@ async fn run_agent_session_store_kernel(
         .unwrap_or_default();
     let runtime_mcp_servers = runtime_mcp_context.provider_external_servers();
     store.create_session(session_id).await?;
+    let executor = executor
+        .for_session(session_id, store.as_ref())
+        .await?
+        .unwrap_or(executor);
     let initial_state = store.state(session_id).await?;
     let fresh = initial_state.latest_sequence == 0;
     // A provider process can die after the durable TurnStarted boundary but
@@ -1189,6 +1193,7 @@ async fn run_agent_session_store_kernel(
     let (recovery, context_complete) = if fresh {
         (crate::SessionRecovery::default(), true)
     } else if launch.provider == CodingProvider::Codex
+        && !executor.uses_native_harness(launch.provider)
         && provider_checkpoint_contract_current
         && let Some(provider_session_id) = initial_state.provider_session_id.as_deref()
         && let Some(recovery) = store

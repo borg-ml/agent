@@ -53,7 +53,7 @@ async fn probe() -> Result<()> {
                     }.into()), capabilities: Default::default(), subagent_concurrency_limit: None,
                     extension_skill_roots: Vec::new(), team_policy: None,
                 }, command_rx, events,
-                Arc::new(LocalAgentTurnExecutor::default().with_codex_model_only()),
+                Arc::new(LocalAgentTurnExecutor::default()),
             ).await
         });
         let result: Result<()> = async {
@@ -208,7 +208,9 @@ async fn probe() -> Result<()> {
         )), "native tool-round boundary was not persisted");
         if resumed {
             let consultation = LocalAgentTurnExecutor::default()
-                .with_codex_model_only()
+                .for_session(session_id, &store)
+                .await?
+                .context("local executor did not resolve the session route")?
                 .consult(ConsultationRequest {
                     access: ModelAccessContext {
                         session_id,
@@ -267,7 +269,7 @@ async fn control_probe() -> Result<()> {
                     )), capabilities: Default::default(), subagent_concurrency_limit: None,
                     extension_skill_roots: Vec::new(), team_policy: None,
                 }, command_rx, events,
-                Arc::new(LocalAgentTurnExecutor::default().with_codex_model_only()),
+                Arc::new(LocalAgentTurnExecutor::default()),
             ).await
         });
         let result = tokio::time::timeout(Duration::from_secs(90), async {
