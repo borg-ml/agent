@@ -121,11 +121,20 @@ that approves only `cat probe.txt`, stops, and restarts from its durable journal
 This passed with Astra/low, Borg manual approval and tool execution, preserved
 model state across restart, and 1,024 cached input tokens during the first turn.
 
-Before enabling the route by default, also fix native multi-tool interruption
-and steering: completed results must be journaled before later calls execute,
-and an accepted steer must stop remaining queued actions. Account identity must
-be bound across rounds/restarts; model limits, fast mode, and subscription cost
-basis still need to flow through the native contract.
+The shared native loop now emits each stateful tool result before dispatching
+the next call, stops queued actions after an accepted steer, and polls controls
+during parallel read batches. Replay retains completed results and opaque model
+state when a round is interrupted, fails, or ends without a terminal event.
+Missing results are explicitly unknown, not evidence that a command never ran;
+recovery must inspect state before repeating an uncertain action. Accepted
+steering input is retained even if interruption precedes its model-message
+event. Offline loop tests exercise actual file writes and verify the second
+queued write does not run after steering or interruption.
+
+Before enabling the route by default, account identity must be bound across
+rounds/restarts; model limits, fast mode, and subscription cost basis still need
+to flow through the native contract. Real login/refresh and in-flight tool
+control behavior still need end-to-end subscription verification.
 
 ## Evidence
 

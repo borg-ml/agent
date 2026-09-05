@@ -6901,7 +6901,7 @@ fn committed_steer_does_not_consume_a_separate_next_turn_queue_on_resume() {
 }
 
 #[test]
-fn native_replay_discards_an_interrupted_incomplete_tool_round() {
+fn native_replay_preserves_an_interrupted_incomplete_tool_round() {
     use borg_provider::provider::{ModelMessage, ModelToolCall};
 
     let session_id = Uuid::new_v4();
@@ -6974,9 +6974,154 @@ fn native_replay_discards_an_interrupted_incomplete_tool_round() {
     ];
 
     let replay = native_conversation(&events, CodingProvider::OpenRouter).unwrap();
-    assert_eq!(replay.len(), 3);
+    assert_eq!(replay.len(), 5);
     assert!(matches!(replay[0], ModelMessage::User { .. }));
     assert!(matches!(replay[2], ModelMessage::Tool { .. }));
+    assert!(
+        matches!(&replay[4], ModelMessage::Tool { tool_call_id, content }
+        if tool_call_id == "two" && content.contains("outcome unknown"))
+    );
+}
+
+#[test]
+fn native_replay_keeps_completed_batch_results_after_failure_or_crash() {
+    use borg_provider::provider::{ModelMessage, ModelToolCall};
+
+    let session_id = Uuid::new_v4();
+    let calls = ["completed", "uncertain"]
+        .map(|id| {
+            ModelToolCall::function(
+                id.to_string(),
+                "exec".to_string(),
+                r#"{"cmd":"perform action"}"#.to_string(),
+            )
+        })
+        .to_vec();
+    let assistant = ModelMessage::Assistant {
+        content: None,
+        reasoning_content: None,
+        reasoning_details: None,
+        tool_calls: calls,
+        provider_state: Some(serde_json::from_value(json!({
+            "protocol": "open_ai_responses",
+            "output": [
+                {"type": "reasoning", "encrypted_content": "opaque"},
+                {"type": "function_call", "call_id": "completed", "name": "exec", "arguments": "{}"},
+                {"type": "function_call", "call_id": "uncertain", "name": "exec", "arguments": "{}"},
+            ],
+        })).unwrap()),
+    };
+    let completed = ModelMessage::Tool {
+        tool_call_id: "completed".to_string(),
+        content: "action succeeded exactly once".to_string(),
+    };
+    for error in [
+        None,
+        Some("turn interrupted"),
+        Some("connection lost"),
+        Some("provider failed"),
+    ] {
+        let mut events = [
+            ModelMessage::user("perform actions"),
+            assistant.clone(),
+            completed.clone(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, message)| {
+            SessionEvent::new(
+                session_id,
+                sequence as u64 + 1,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: "native_model_message".to_string(),
+                    payload: serde_json::to_value(message).unwrap(),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+        events.insert(
+            0,
+            SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::TurnStarted {
+                    message_id: Uuid::new_v4(),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: false,
+                },
+            ),
+        );
+        events.push(SessionEvent::new(
+            session_id,
+            4,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "stop the remaining actions".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        ));
+        if let Some(error) = error {
+            events.push(SessionEvent::new(
+                session_id,
+                5,
+                SessionEventKind::TurnCompleted {
+                    message_id: Uuid::new_v4(),
+                    provider_session_id: None,
+                    final_text: String::new(),
+                    error: Some(error.to_string()),
+                },
+            ));
+        }
+        let replay = native_conversation(&events, CodingProvider::Codex).unwrap();
+        assert_eq!(replay.len(), 5, "{error:?}");
+        assert_eq!(replay[1], assistant);
+        assert_eq!(replay[2], completed);
+        assert!(
+            matches!(&replay[3], ModelMessage::Tool { tool_call_id, content }
+            if tool_call_id == "uncertain" && content.contains("outcome unknown"))
+        );
+        assert_eq!(replay[4], ModelMessage::user("stop the remaining actions"));
+        let resumed_id = Uuid::new_v4();
+        events.push(SessionEvent::new(
+            session_id,
+            6,
+            SessionEventKind::TurnStarted {
+                message_id: resumed_id,
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+        ));
+        events.push(SessionEvent::new(
+            session_id,
+            7,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "native_model_message".to_string(),
+                payload: serde_json::to_value(ModelMessage::user("check current state")).unwrap(),
+            },
+        ));
+        events.push(SessionEvent::new(
+            session_id,
+            8,
+            SessionEventKind::TurnCompleted {
+                message_id: resumed_id,
+                provider_session_id: None,
+                final_text: String::new(),
+                error: None,
+            },
+        ));
+        let resumed = native_conversation(&events, CodingProvider::Codex).unwrap();
+        assert_eq!(&resumed[..5], replay.as_slice());
+        assert_eq!(resumed[5], ModelMessage::user("check current state"));
+    }
 }
 
 #[test]
@@ -9317,7 +9462,7 @@ fn consultation_profiles_resolve_aliases_and_catalog_models() {
     );
     assert_eq!(
         resolve_consultation_profile("gpt").unwrap(),
-        (CodingProvider::Codex, Some("gpt-5.6-sol".to_string()), None)
+        (CodingProvider::Codex, Some("gpt-6-astra".to_string()), None)
     );
     assert_eq!(
         resolve_consultation_profile("claude/claude-opus-5").unwrap(),

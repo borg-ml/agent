@@ -370,11 +370,11 @@ impl NativeHarness {
                 && tool_calls.iter().all(|call| {
                     runtime.execution_class(&call.function.name) == ToolExecutionClass::ReadOnly
                 });
-            let outcomes = if parallel_reads {
+            let mut trailing_context_tokens = 0_u64;
+            if parallel_reads {
                 let pairs = tool_calls.iter().zip(&inputs).collect::<Vec<_>>();
-                let mut outcomes = Vec::with_capacity(pairs.len());
                 for chunk in pairs.chunks(4) {
-                    let chunk_outcomes =
+                    let reads =
                         futures::future::join_all(chunk.iter().map(|(tool_call, input)| async {
                             match runtime
                                 .call(
@@ -385,70 +385,85 @@ impl NativeHarness {
                                 )
                                 .await
                             {
-                                Ok(value) => (serde_json::to_string(&value), false, None),
-                                Err(error) => (
-                                    Ok(json!({ "error": format!("{error:#}") }).to_string()),
-                                    true,
-                                    None,
-                                ),
+                                Ok(value) => (value.to_string(), false),
+                                Err(error) => {
+                                    (json!({ "error": format!("{error:#}") }).to_string(), true)
+                                }
                             }
-                        }))
-                        .await;
-                    for (output, is_error, steer) in chunk_outcomes {
-                        outcomes.push((output?, is_error, steer));
+                        }));
+                    tokio::pin!(reads);
+                    let outcomes = loop {
+                        if pending_steer.is_some() {
+                            break None;
+                        }
+                        tokio::select! {
+                            biased;
+                            Some(control) = next_control(&mut controls) => {
+                                pending_steer = accept_tool_boundary_control(control)?;
+                            }
+                            outcomes = &mut reads => break Some(outcomes),
+                        }
+                    };
+                    for (index, (tool_call, _)) in chunk.iter().enumerate() {
+                        let (output, is_error) = outcomes
+                            .as_ref()
+                            .map(|outcomes| outcomes[index].clone())
+                            .unwrap_or_else(|| (
+                                json!({"error": "Read cancelled after user steering; no result was obtained."}).to_string(),
+                                true,
+                            ));
+                        trailing_context_tokens = trailing_context_tokens.saturating_add(
+                            record_native_tool_result(
+                                &events,
+                                turn.provider,
+                                &mut messages,
+                                &tool_call.id,
+                                output,
+                                is_error,
+                            )
+                            .await?,
+                        );
                     }
                 }
-                outcomes
             } else {
-                let mut outcomes = Vec::with_capacity(tool_calls.len());
                 for (tool_call, input) in tool_calls.iter().zip(inputs) {
-                    let outcome = match input {
-                        Ok(input) => {
-                            execute_tool(
-                                self,
-                                &runtime,
-                                tool_call,
-                                input,
-                                NativeApprovalContext {
-                                    provider: turn.provider,
-                                    model: &model,
-                                },
-                                &events,
-                                &mut controls,
-                                &mut usage,
-                            )
-                            .await?
+                    let (output, is_error, steer) = if pending_steer.is_some() {
+                        let (output, is_error) = skipped_tool_result();
+                        (output, is_error, None)
+                    } else {
+                        match input {
+                            Ok(input) => {
+                                execute_tool(
+                                    self,
+                                    &runtime,
+                                    tool_call,
+                                    input,
+                                    NativeApprovalContext {
+                                        provider: turn.provider,
+                                        model: &model,
+                                    },
+                                    &events,
+                                    &mut controls,
+                                    &mut usage,
+                                )
+                                .await?
+                            }
+                            Err(error) => (json!({ "error": error }).to_string(), true, None),
                         }
-                        Err(error) => (json!({ "error": error }).to_string(), true, None),
                     };
-                    outcomes.push(outcome);
+                    pending_steer = pending_steer.or(steer);
+                    trailing_context_tokens = trailing_context_tokens.saturating_add(
+                        record_native_tool_result(
+                            &events,
+                            turn.provider,
+                            &mut messages,
+                            &tool_call.id,
+                            output,
+                            is_error,
+                        )
+                        .await?,
+                    );
                 }
-                outcomes
-            };
-            let mut trailing_context_tokens = 0_u64;
-            for (tool_call, (output, is_error, steer)) in tool_calls.iter().zip(outcomes) {
-                pending_steer = pending_steer.or(steer);
-                let output = bounded_tool_content(output);
-                send(
-                    &events,
-                    SessionEventKind::ToolCompleted {
-                        tool_call_id: tool_call.id.clone(),
-                        output: output.clone(),
-                        output_ref: None,
-                        is_error,
-                        input: None,
-                        input_ref: None,
-                    },
-                )
-                .await;
-                let tool_message = ModelMessage::Tool {
-                    tool_call_id: tool_call.id.clone(),
-                    content: output,
-                };
-                trailing_context_tokens =
-                    trailing_context_tokens.saturating_add(estimated_message_tokens(&tool_message));
-                record_native_message(&events, turn.provider, &tool_message).await?;
-                messages.push(tool_message);
             }
 
             if let Some(steer) = pending_steer {
@@ -1449,6 +1464,15 @@ async fn execute_tool(
     controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
     usage: &mut ProviderCallUsage,
 ) -> Result<(String, bool, Option<NativeSteer>)> {
+    while let Some(control) = controls
+        .as_mut()
+        .and_then(|controls| controls.try_recv().ok())
+    {
+        if let Some(steer) = accept_tool_boundary_control(control)? {
+            let (output, is_error) = skipped_tool_result();
+            return Ok((output, is_error, Some(steer)));
+        }
+    }
     let external_mcp = runtime.mcp.contains(&tool_call.function.name);
     let shell_command = match tool_call.function.name.as_str() {
         "exec_command" | "exec" => input.get("cmd").and_then(Value::as_str).map(str::to_string),
@@ -1771,10 +1795,73 @@ async fn request_tool_approval(
 async fn next_control(
     controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
 ) -> Option<AgentTurnControl> {
-    match controls {
+    let control = match controls {
         Some(controls) => controls.recv().await,
         None => std::future::pending().await,
+    };
+    if control.is_none() {
+        *controls = None;
     }
+    control
+}
+
+fn accept_tool_boundary_control(control: AgentTurnControl) -> Result<Option<NativeSteer>> {
+    match control {
+        AgentTurnControl::Interrupt => bail!("native provider turn interrupted"),
+        AgentTurnControl::Steer {
+            text,
+            attachments,
+            admission,
+            ack,
+            ..
+        } => {
+            if !admission.accept() {
+                let _ = ack.send(Err("steer was recalled before delivery".to_string()));
+                return Ok(None);
+            }
+            let _ = ack.send(Ok(()));
+            Ok(Some(NativeSteer { text, attachments }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn skipped_tool_result() -> (String, bool) {
+    (
+        json!({"error": "Tool not executed: cancelled after user steering."}).to_string(),
+        true,
+    )
+}
+
+async fn record_native_tool_result(
+    events: &mpsc::Sender<SessionEventKind>,
+    provider: crate::CodingProvider,
+    messages: &mut Vec<ModelMessage>,
+    tool_call_id: &str,
+    output: String,
+    is_error: bool,
+) -> Result<u64> {
+    let output = bounded_tool_content(output);
+    let message = ModelMessage::Tool {
+        tool_call_id: tool_call_id.to_string(),
+        content: output.clone(),
+    };
+    let tokens = estimated_message_tokens(&message);
+    record_native_message(events, provider, &message).await?;
+    messages.push(message);
+    send(
+        events,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: tool_call_id.to_string(),
+            output,
+            output_ref: None,
+            is_error,
+            input: None,
+            input_ref: None,
+        },
+    )
+    .await;
+    Ok(tokens)
 }
 
 async fn record_native_message(
@@ -2333,6 +2420,180 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    struct BatchClient {
+        requests: Mutex<Vec<ModelTurnRequest>>,
+    }
+
+    #[async_trait]
+    impl NativeModelClient for BatchClient {
+        async fn model_turn(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+            request: ModelTurnRequest,
+            _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+        ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(request);
+            let calls = if requests.len() == 1 {
+                ["first", "second"]
+                    .map(|id| {
+                        ModelToolCall::function(
+                            id.to_string(),
+                            "write_file".to_string(),
+                            json!({"action": "write file", "path": id, "content": id}).to_string(),
+                        )
+                    })
+                    .to_vec()
+            } else {
+                Vec::new()
+            };
+            let finish_reason = if calls.is_empty() {
+                "stop"
+            } else {
+                "tool_calls"
+            }
+            .to_string();
+            Ok(ModelTurnResult {
+                message: ModelMessage::assistant(Some("done".to_string()), None, None, calls),
+                finish_reason,
+                usage: ProviderCallUsage::default(),
+                raw_response: Value::Null,
+                trace: ProviderAttemptTrace::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn native_batch_records_results_before_honoring_controls_and_skips_queued_actions() {
+        for interrupt in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let cwd = root.path().to_path_buf();
+            let session_id = Uuid::new_v4();
+            let client = Arc::new(BatchClient {
+                requests: Mutex::new(Vec::new()),
+            });
+            let harness = NativeHarness {
+                model_client: client.clone(),
+                harness: HarnessMode::Native,
+                ..NativeHarness::default()
+            };
+            let turn = AgentTurn {
+                session_id,
+                message_id: Uuid::new_v4(),
+                context_generation: 0,
+                provider: crate::CodingProvider::OpenRouter,
+                provider_session_id: None,
+                provider_fork_turn_id: None,
+                cwd: cwd.clone(),
+                prompt_delta: "write two files".to_string(),
+                prompt: "write two files".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                model: Some("test-model".to_string()),
+                effort: None,
+                fast: None,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::FullAccess,
+                conversation: Vec::new(),
+                agent_mcp_server: borg_provider::mcp::ExternalMcpServer {
+                    name: "test".to_string(),
+                    command: "test".to_string(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                    allowed_tools: Vec::new(),
+                },
+                agent_tools: crate::AgentToolDispatcher::new(
+                    crate::session::SessionGoalTools::disconnected(),
+                    crate::session::SessionTodoTools::disconnected(),
+                    None,
+                    crate::LspService::new(&cwd),
+                    crate::CodingProvider::OpenRouter,
+                    session_id,
+                    false,
+                    None,
+                    None,
+                    cwd.clone(),
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    crate::native_process::ProcessManager::default(),
+                    PermissionMode::FullAccess,
+                ),
+                external_mcp_servers: Vec::new(),
+                runtime_mcp_context: Default::default(),
+                extension_skill_roots: Vec::new(),
+                extension_workflows: Vec::new(),
+                extension_api: Default::default(),
+                system_prompt_appendix: String::new(),
+            };
+            // One event of backpressure makes the first result a deterministic control boundary.
+            let (events_tx, mut events_rx) = mpsc::channel(1);
+            let (controls_tx, controls_rx) = mpsc::channel(1);
+            let task =
+                tokio::spawn(async move { harness.run(turn, events_tx, Some(controls_rx)).await });
+            let mut controlled = false;
+            let mut steer_ack = None;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(event) = events_rx.recv().await {
+                    if let SessionEventKind::ProviderEvent { kind, payload, .. } = event {
+                        if kind == "native_model_message"
+                            && matches!(
+                                serde_json::from_value::<ModelMessage>(payload).unwrap(),
+                                ModelMessage::Tool { tool_call_id, .. } if tool_call_id == "first"
+                            )
+                        {
+                            assert!(!controlled);
+                            controlled = true;
+                            let control = if interrupt {
+                                AgentTurnControl::Interrupt
+                            } else {
+                                let (ack, receiver) = tokio::sync::oneshot::channel();
+                                steer_ack = Some(receiver);
+                                AgentTurnControl::Steer {
+                                    message_id: Uuid::new_v4(),
+                                    text: "stop writing".to_string(),
+                                    attachments: Vec::new(),
+                                    admission: borg_provider::provider::SteerAdmission::pending(),
+                                    ack,
+                                }
+                            };
+                            controls_tx.send(control).await.unwrap();
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("tool loop should finish after control");
+            assert!(
+                controlled,
+                "first result must be emitted while the batch is active"
+            );
+            assert_eq!(std::fs::read_to_string(cwd.join("first")).unwrap(), "first");
+            assert!(
+                !cwd.join("second").exists(),
+                "queued action must not execute"
+            );
+            let result = task.await.unwrap();
+            if interrupt {
+                assert!(result.unwrap_err().to_string().contains("interrupted"));
+                assert_eq!(client.requests.lock().unwrap().len(), 1);
+            } else {
+                result.unwrap();
+                steer_ack.unwrap().await.unwrap().unwrap();
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(requests.len(), 2);
+                assert!(requests[1].messages.iter().any(|message| matches!(message,
+                    ModelMessage::Tool { tool_call_id, content }
+                    if tool_call_id == "second" && content.contains("not executed"))));
+                assert!(requests[1].messages.iter().any(|message| matches!(message,
+                    ModelMessage::User { content, .. } if content.contains("stop writing"))));
+            }
+        }
+    }
 
     #[derive(Clone)]
     struct HoldingProgressClient {

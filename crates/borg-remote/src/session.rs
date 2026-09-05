@@ -4418,6 +4418,10 @@ fn native_conversation(
                 native_structured_in_turn = false;
             }
             SessionEventKind::TurnStarted { provider, .. } => {
+                if !pending_native.is_empty() {
+                    close_interrupted_native_round(&mut pending_native, &mut pending_generic);
+                    conversation.append(&mut pending_native);
+                }
                 // If a failed prompt was followed by another turn without a
                 // compaction boundary, it is already part of `conversation`;
                 // it no longer needs the exact-tail escape hatch.
@@ -4451,6 +4455,7 @@ fn native_conversation(
                 if kind == "native_tool_round_completed" =>
             {
                 conversation.append(&mut pending_native);
+                pending_generic.clear();
             }
             SessionEventKind::Message {
                 message_id,
@@ -4541,14 +4546,24 @@ fn native_conversation(
                 active_provider = None;
                 native_structured_in_turn = false;
             }
+            SessionEventKind::TurnCompleted { error: Some(_), .. }
+                if !pending_native.is_empty() =>
+            {
+                close_interrupted_native_round(&mut pending_native, &mut pending_generic);
+                failed_prompts.extend(
+                    pending_native
+                        .iter()
+                        .filter(|message| is_context_prompt(message))
+                        .cloned(),
+                );
+                conversation.append(&mut pending_native);
+                active_provider = None;
+                native_structured_in_turn = false;
+            }
             SessionEventKind::TurnCompleted {
                 error: Some(error), ..
             } if provider_error_is_connection_lost(error) => {
-                let partial = if native_structured_in_turn && !pending_native.is_empty() {
-                    &pending_native
-                } else {
-                    &pending_generic
-                };
+                let partial = &pending_generic;
                 if !partial.is_empty() {
                     conversation.push(borg_provider::provider::ModelMessage::user(format!(
                         "The connection was interrupted during this attempt. Recorded progress follows; completed actions must not be repeated, and commands without results need their state checked before rerunning.\n\n{}",
@@ -4591,8 +4606,53 @@ fn native_conversation(
     // message projection. Keep that unresolved user/system input in the next
     // replay even though there is no assistant result to append. This exact
     // tail is also appended after a later compaction summary above.
-    conversation.extend(pending_generic.into_iter().filter(is_context_prompt));
+    if !pending_native.is_empty() {
+        close_interrupted_native_round(&mut pending_native, &mut pending_generic);
+        conversation.append(&mut pending_native);
+    } else {
+        conversation.extend(pending_generic.into_iter().filter(is_context_prompt));
+    }
     Ok(conversation)
+}
+
+fn close_interrupted_native_round(
+    messages: &mut Vec<borg_provider::provider::ModelMessage>,
+    generic: &mut Vec<borg_provider::provider::ModelMessage>,
+) {
+    use borg_provider::provider::ModelMessage;
+
+    let completed = messages
+        .iter()
+        .filter_map(|message| match message {
+            ModelMessage::Tool { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let missing = messages.iter().flat_map(|message| match message {
+        ModelMessage::Assistant { tool_calls, .. } => tool_calls.as_slice(),
+        _ => &[],
+    }).filter(|call| !completed.contains(call.id.as_str()))
+        .map(|call| ModelMessage::Tool {
+            tool_call_id: call.id.clone(),
+            content: serde_json::json!({"error": "Execution outcome unknown: the turn ended before a result was recorded. Inspect current state before repeating this action; it may already have run."}).to_string(),
+        }).collect::<Vec<_>>();
+    messages.extend(missing);
+    // An accepted steer can be journaled before the loop records its model message.
+    for prompt in generic.drain(..).filter(is_context_prompt) {
+        let recorded = messages.iter().any(|message| match (&prompt, message) {
+            (
+                ModelMessage::User { content: left, .. },
+                ModelMessage::User { content: right, .. },
+            )
+            | (ModelMessage::System { content: left }, ModelMessage::System { content: right }) => {
+                left == right
+            }
+            _ => false,
+        });
+        if !recorded {
+            messages.push(prompt);
+        }
+    }
 }
 
 fn compaction_restarts_replay(payload: &Value) -> bool {
