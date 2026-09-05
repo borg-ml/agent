@@ -1162,7 +1162,8 @@ async fn read_compatible_model_stream(
                     {
                         call.arguments.push_str(arguments);
                     }
-                    if generating_tool_calls.insert(index)
+                    if (!call.name.is_empty() || !call.arguments.is_empty())
+                        && generating_tool_calls.insert(index)
                         && let Some(sender) = progress
                     {
                         let _ = sender.send(ProviderProgress::ToolCallGenerating {
@@ -1705,9 +1706,15 @@ mod tests {
             .await
             .expect("bind test server");
         let address = listener.local_addr().expect("test server address");
-        let body = [
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first = [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]},"finish_reason":null}]}"#,
             r#"data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"inspect " }]},"finish_reason":null}]}"#,
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"action\":\"ed"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{"}}]},"finish_reason":null}]}"#,
+            "",
+        ].join("\n");
+        let body = [
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"action\":\"ed"}}]},"finish_reason":null}]}"#,
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read_file","arguments":"it\",\"path\":\"src/lib.rs\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
             "data: [DONE]",
             "",
@@ -1721,39 +1728,55 @@ mod tests {
                 .write_all(
                     format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
+                        first.len() + body.len(),
+                        first
                     )
                     .as_bytes(),
                 )
                 .await
-                .expect("write response");
+                .expect("write first character");
+            release_rx
+                .await
+                .expect("generation observed before remainder");
+            socket
+                .write_all(body.as_bytes())
+                .await
+                .expect("write remainder");
         });
         let response = reqwest::get(format!("http://{address}"))
             .await
             .expect("request test stream");
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-        let streamed =
+        let stream = tokio::spawn(async move {
             read_compatible_model_stream(response, Some(&progress_tx), "local-model", Some("high"))
                 .await
-                .expect("parse stream");
-        server.await.expect("test server task");
+                .expect("parse stream")
+        });
 
         let ProviderProgress::ProviderEvent {
             kind, content_text, ..
-        } = progress_rx.try_recv().expect("reasoning progress event")
+        } = tokio::time::timeout(Duration::from_secs(2), progress_rx.recv())
+            .await
+            .expect("early reasoning")
+            .expect("reasoning progress event")
         else {
             panic!("expected reasoning progress event");
         };
         assert_eq!(kind, "reasoning_delta");
         assert_eq!(content_text.as_deref(), Some("inspect "));
-        let ProviderProgress::ToolCallGenerating { id } = progress_rx
-            .try_recv()
-            .expect("tool generation progress event")
+        let ProviderProgress::ToolCallGenerating { id } =
+            tokio::time::timeout(Duration::from_secs(2), progress_rx.recv())
+                .await
+                .expect("generation on first character")
+                .expect("tool generation progress event")
         else {
             panic!("expected tool generation progress event");
         };
         assert_eq!(id, None);
+        assert!(progress_rx.try_recv().is_err());
+        release_tx.send(()).expect("release remaining arguments");
+        let streamed = stream.await.expect("stream task");
+        server.await.expect("test server task");
         let ProviderProgress::ToolCallStarted { id, name, input } =
             progress_rx.try_recv().expect("tool-call progress event")
         else {
