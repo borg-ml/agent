@@ -143,6 +143,13 @@ Stop retains its bounded cleanup wait. A held-open tool test covers multiple
 steers followed by completion or interruption; no completed result is discarded
 merely because steering was accepted.
 
+Automatic approval review also polls controls while waiting for its model.
+Interruption drops the review request, and accepted steering skips the proposed
+action. These outcomes are distinct from provider errors, so cancellation does
+not open a fallback approval prompt. A held-open reviewer test verifies immediate
+control handling and request cancellation. Queued controls are checked again
+after approval/status delivery before the tool starts.
+
 Borg commits an immutable subscription account fingerprint in its SQLite
 session authority before the first model request. It is not a credential or
 model context. Every model round checks the current account against that

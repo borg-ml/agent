@@ -1571,10 +1571,18 @@ async fn execute_tool(
                     approval_context,
                     &tool_call.function.name,
                     &input,
+                    controls,
                 )
                 .await
                 {
-                    Ok(review) => {
+                    Ok(AutomaticReviewOutcome::Interrupted) => {
+                        bail!("native provider turn interrupted")
+                    }
+                    Ok(AutomaticReviewOutcome::Steered(steer)) => {
+                        let (output, is_error) = skipped_tool_result();
+                        return Ok((output, is_error, Some(steer)));
+                    }
+                    Ok(AutomaticReviewOutcome::Reviewed(review)) => {
                         absorb_usage(usage, &review.usage);
                         send(
                             events,
@@ -1621,6 +1629,16 @@ async fn execute_tool(
                 ));
             }
             ApprovalDecision::AllowOnce | ApprovalDecision::AllowSession => {}
+        }
+        // Approval/status delivery can yield while a new control is queued.
+        while let Some(control) = controls
+            .as_mut()
+            .and_then(|controls| controls.try_recv().ok())
+        {
+            if let Some(steer) = accept_tool_boundary_control(control)? {
+                let (output, is_error) = skipped_tool_result();
+                return Ok((output, is_error, Some(steer)));
+            }
         }
     }
 
@@ -1712,6 +1730,12 @@ struct AutomaticReview {
     usage: ProviderCallUsage,
 }
 
+enum AutomaticReviewOutcome {
+    Reviewed(AutomaticReview),
+    Steered(NativeSteer),
+    Interrupted,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AutomaticReviewPayload {
@@ -1731,7 +1755,8 @@ async fn review_tool_automatically(
     context: NativeApprovalContext<'_>,
     tool_name: &str,
     input: &Value,
-) -> Result<AutomaticReview> {
+    controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
+) -> Result<AutomaticReviewOutcome> {
     let request = ModelTurnRequest {
         fast: context.fast,
         request_id: Some(format!("approval-review:{}", Uuid::new_v4())),
@@ -1757,7 +1782,7 @@ async fn review_tool_automatically(
             "additionalProperties": false
         })),
     };
-    let result = tokio::time::timeout(
+    let review = tokio::time::timeout(
         Duration::from_secs(30),
         harness.model_client.model_turn(
             context.provider,
@@ -1766,8 +1791,23 @@ async fn review_tool_automatically(
             request,
             None,
         ),
-    )
-    .await
+    );
+    tokio::pin!(review);
+    let result = loop {
+        tokio::select! {
+            biased;
+            control = next_control(controls) => match control {
+                Some(AgentTurnControl::Interrupt) => return Ok(AutomaticReviewOutcome::Interrupted),
+                Some(control) => {
+                    if let Some(steer) = accept_tool_boundary_control(control)? {
+                        return Ok(AutomaticReviewOutcome::Steered(steer));
+                    }
+                }
+                None => {}
+            },
+            result = &mut review => break result,
+        }
+    }
     .context("automatic approval review timed out")?
     .map_err(|error| anyhow::anyhow!(error.message))?;
     let ModelMessage::Assistant {
@@ -1788,11 +1828,11 @@ async fn review_tool_automatically(
             .context("automatic approval review returned no decision")?,
     )
     .context("automatic approval review returned invalid JSON")?;
-    Ok(AutomaticReview {
+    Ok(AutomaticReviewOutcome::Reviewed(AutomaticReview {
         allow: matches!(payload.decision, AutomaticReviewDecision::Allow),
         reason: payload.reason,
         usage: result.usage,
-    })
+    }))
 }
 
 async fn request_tool_approval(
@@ -2487,6 +2527,89 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    struct PendingReviewClient {
+        started: tokio::sync::Notify,
+        dropped: CancellationToken,
+    }
+
+    #[async_trait]
+    impl NativeModelClient for PendingReviewClient {
+        async fn model_turn(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+            request: ModelTurnRequest,
+            _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+        ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+            assert!(request.tools.is_empty());
+            assert!(request.output_schema.is_some());
+            let _on_drop = self.dropped.clone().drop_guard();
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_approval_review_honors_controls_and_drops_the_model_request() {
+        for interrupt in [false, true] {
+            let client = Arc::new(PendingReviewClient {
+                started: tokio::sync::Notify::new(),
+                dropped: CancellationToken::new(),
+            });
+            let harness = NativeHarness {
+                model_client: client.clone(),
+                ..NativeHarness::default()
+            };
+            let (control_tx, control_rx) = mpsc::channel(1);
+            let task = tokio::spawn(async move {
+                review_tool_automatically(
+                    &harness,
+                    NativeApprovalContext {
+                        provider: crate::CodingProvider::OpenRouter,
+                        model: "test-model",
+                        fast: false,
+                    },
+                    "exec",
+                    &json!({"cmd":"must not execute"}),
+                    &mut Some(control_rx),
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), client.started.notified())
+                .await
+                .unwrap();
+            let (ack, acknowledged) = tokio::sync::oneshot::channel();
+            control_tx
+                .send(if interrupt {
+                    AgentTurnControl::Interrupt
+                } else {
+                    AgentTurnControl::Steer {
+                        message_id: Uuid::new_v4(),
+                        text: "cancel the proposed command".into(),
+                        attachments: Vec::new(),
+                        admission: borg_provider::provider::SteerAdmission::pending(),
+                        ack,
+                    }
+                })
+                .await
+                .unwrap();
+            let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("controls must not wait for the review timeout")
+                .unwrap()
+                .unwrap();
+            if interrupt {
+                assert!(matches!(outcome, AutomaticReviewOutcome::Interrupted));
+            } else {
+                acknowledged.await.unwrap().unwrap();
+                assert!(matches!(outcome, AutomaticReviewOutcome::Steered(steer)
+                    if steer.text == "cancel the proposed command"));
+            }
+            assert!(client.dropped.is_cancelled());
+        }
+    }
 
     #[tokio::test]
     async fn running_tool_keeps_controls_live_after_steering() {
