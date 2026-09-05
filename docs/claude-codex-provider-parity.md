@@ -44,10 +44,12 @@ Claude reaches practical parity when:
    attachments, MCP, permissions, resume, control races, cancellation,
    malformed/provider-error events, and packaged native-payload resolution.
 
-The only currently known protocol difference is that the Claude SDK does not
-expose a dedicated public compaction method equivalent to Codex
-`thread/compact`; Borg must use the provider's `/compact` session command and
-observe the resulting boundary.
+Known protocol differences include Claude's lack of a dedicated public
+compaction method equivalent to Codex `thread/compact`, and Codex app-server's
+lack of generic tool-input fragments before a complete call. Claude compaction
+uses `/compact` and observes its boundary; Codex generation feedback must not
+be inferred from reasoning or tool completion. See
+[Provider ownership](provider-ownership.md) for the intended model-level boundary.
 
 ## Verification map
 

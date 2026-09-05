@@ -1,5 +1,18 @@
 # Borg Agent instructions
 
+## Provider ownership
+
+- Borg owns the agent loop, context policy, tool execution, permissions,
+  steering, cancellation, subagents, and durable state across providers.
+- Keep external provider responsibilities to model access and the minimum
+  required to fully support subscriptions with good UX. A dependency on an
+  upstream agent runtime is a compatibility constraint to reduce, not the
+  target architecture. Justify any retained responsibility against a concrete
+  subscription requirement.
+- Preserve subscription login/recovery, model capabilities, streaming,
+  continuation/cache behavior, and usage visibility when moving behavior into
+  Borg. Do not silently fall back to API-key billing or another agent loop.
+
 ## Change discipline
 
 - Keep simple changes small and direct. Do not add slop: speculative

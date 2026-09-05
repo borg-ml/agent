@@ -1,6 +1,9 @@
 # Provider parity contract
 
 Borg keeps provider-specific wire protocols behind one durable session contract.
+The target ownership boundary is defined in
+[Provider ownership](provider-ownership.md). The table below describes today's
+execution paths, including the external agent runtimes still being reduced.
 Parity is checked at the boundaries where regressions matter:
 
 | Contract | Codex app server | Claude Agent SDK | Native harness |
