@@ -99,6 +99,10 @@ See [importing threads and memory](docs/importing.md).
 - Borg Remote hosts that use the same durable session and tool runtime.
   See the [unattended-host runbook](docs/remote-unattended-runbook.md) for
   preflight, fault recovery, and rollback procedures.
+- Agent discovery and direct messaging across local projects and machines
+  enrolled under the same account. Agents use `list_instances`, then
+  `send_message` or `followup_task`; no shared project workspace is required.
+  See [multiplayer messaging](docs/multiplayer-workspaces.md).
 
 Extension authority is user-controlled. Packages can request `sandboxed`,
 `trusted`, or `native` runtime access; user policy caps project and user

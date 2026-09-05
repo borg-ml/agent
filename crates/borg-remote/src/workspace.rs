@@ -35,6 +35,14 @@ pub struct Participant {
     pub kind: ParticipantKind,
     pub created_at: DateTime<Utc>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInstance {
+    #[serde(flatten)]
+    pub participant: Participant,
+    pub host_id: Option<Uuid>,
+    pub workspace_id: Option<Uuid>,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParticipantKind {
@@ -486,6 +494,75 @@ impl SqliteWorkspaceStore {
             })
         })
         .transpose()
+    }
+
+    /// Cache authenticated instance discovery without granting project membership.
+    pub async fn upsert_instance(
+        &self,
+        participant: Participant,
+        host_id: Option<Uuid>,
+        workspace_id: Option<Uuid>,
+    ) -> Result<()> {
+        ensure!(
+            participant.kind == ParticipantKind::Agent,
+            "instance must be an agent"
+        );
+        let mut transaction = self.write().await?;
+        sqlx::query(
+            "insert into workspace_participants(id,display_name,kind,created_at) \
+             values(?,?,?,?) on conflict(id) do update set \
+             display_name=excluded.display_name,kind=excluded.kind",
+        )
+        .bind(participant.id.to_string())
+        .bind(participant.display_name)
+        .bind(serde_json::to_string(&participant.kind)?)
+        .bind(participant.created_at.to_rfc3339())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "insert into agent_instances(participant_id,host_id,workspace_id) values(?,?,?) \
+             on conflict(participant_id) do update set \
+             host_id=excluded.host_id,workspace_id=excluded.workspace_id",
+        )
+        .bind(participant.id.to_string())
+        .bind(host_id.map(|id| id.to_string()))
+        .bind(workspace_id.map(|id| id.to_string()))
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn list_instances(&self) -> Result<Vec<AgentInstance>> {
+        let rows = sqlx::query(
+            "select p.id,p.display_name,p.kind,p.created_at,i.host_id,i.workspace_id \
+             from workspace_participants p left join agent_instances i on i.participant_id=p.id \
+             where p.kind=? order by p.created_at,p.id",
+        )
+        .bind(serde_json::to_string(&ParticipantKind::Agent)?)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(AgentInstance {
+                    participant: Participant {
+                        id: Uuid::parse_str(row.try_get("id")?)?,
+                        display_name: row.try_get("display_name")?,
+                        kind: serde_json::from_str(row.try_get("kind")?)?,
+                        created_at: DateTime::parse_from_rfc3339(row.try_get("created_at")?)?
+                            .with_timezone(&Utc),
+                    },
+                    host_id: row
+                        .try_get::<Option<&str>, _>("host_id")?
+                        .map(Uuid::parse_str)
+                        .transpose()?,
+                    workspace_id: row
+                        .try_get::<Option<&str>, _>("workspace_id")?
+                        .map(Uuid::parse_str)
+                        .transpose()?,
+                })
+            })
+            .collect()
     }
 
     /// Apply one authenticated relay roster projection idempotently. This is
@@ -985,6 +1062,7 @@ impl SqliteWorkspaceStore {
         sqlx::raw_sql(r#"
       create table if not exists borg_workspace_schema (id integer primary key check(id=1), version integer not null);
       create table if not exists workspace_participants (id text primary key, display_name text not null, kind text not null, created_at text not null);
+      create table if not exists agent_instances (participant_id text primary key references workspace_participants(id), host_id text, workspace_id text);
       create table if not exists workspaces (id text primary key, name text not null, next_sequence integer not null default 1, created_at text not null);
       create table if not exists workspace_members (workspace_id text not null references workspaces(id) on delete cascade, participant_id text not null references workspace_participants(id), role text not null, joined_at text not null, primary key(workspace_id,participant_id));
       create table if not exists workspace_threads (id text primary key, workspace_id text not null references workspaces(id) on delete cascade, title text not null, created_at text not null);
@@ -1733,6 +1811,83 @@ mod tests {
             .unwrap();
         }
         (s, w, a, b, c)
+    }
+
+    #[tokio::test]
+    async fn discovered_remote_instance_can_receive_private_messages_without_project_membership() {
+        let (store, workspace, owner, agent, _) = fixture().await;
+        let remote = Participant {
+            id: Uuid::new_v4(),
+            display_name: "Linux agent".into(),
+            kind: ParticipantKind::Agent,
+            created_at: Utc::now(),
+        };
+        let host_id = Uuid::new_v4();
+        let remote_project = Uuid::new_v4();
+        store
+            .upsert_instance(remote.clone(), Some(host_id), Some(remote_project))
+            .await
+            .unwrap();
+        store
+            .upsert_instance(remote.clone(), Some(host_id), Some(remote_project))
+            .await
+            .unwrap();
+        let instances = store.list_instances().await.unwrap();
+        let found = instances
+            .iter()
+            .filter(|entry| entry.participant.id == remote.id)
+            .collect::<Vec<_>>();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].host_id, Some(host_id));
+        assert_eq!(found[0].workspace_id, Some(remote_project));
+        assert!(
+            store
+                .workspace_roster(workspace.id, remote.id)
+                .await
+                .is_err()
+        );
+        let direct = store
+            .ensure_direct_workspace(agent.id, remote.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            direct,
+            store
+                .ensure_direct_workspace(remote.id, agent.id)
+                .await
+                .unwrap()
+        );
+        assert!(store.workspace_roster(direct, owner.id).await.is_err());
+        let receipt = store
+            .append_message(NewWorkspaceMessage {
+                workspace_id: direct,
+                author_id: agent.id,
+                text: "Can you deploy?".into(),
+                mentions: Vec::new(),
+                audience: Audience::Direct {
+                    participant: remote.id,
+                },
+                mode: DeliveryMode::Wake,
+                thread_id: None,
+                reply_to_message_id: None,
+                idempotency_key: "remote-handoff".into(),
+            })
+            .await
+            .unwrap();
+        let pending = store
+            .pending_message_events(direct, remote.id, 10)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(
+            matches!(&pending[0].0.kind, WorkspaceEventKind::Message { message, .. } if message.id == receipt.message_id)
+        );
+        assert!(
+            store
+                .workspace_roster(workspace.id, remote.id)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

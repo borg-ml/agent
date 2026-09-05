@@ -97,16 +97,21 @@ Agent collaboration tools are address adapters over this same machinery:
   the immediate wake/steer fast path;
 - `session:<UUID>` addresses any session in the same durable local session
   store, including another root process or project workspace;
-- `participant:<UUID>` addresses a member returned by
-  `list_workspace_participants`, including a participant synchronized from an
-  enrolled remote host;
+- `list_instances` discovers agents across local projects and the authenticated
+  remote instance directory, with host and workspace IDs where available;
+- `participant:<UUID>` addresses an instance returned by `list_instances` or
+  a member returned by `list_workspace_participants`;
 - `broadcast_team` uses the current workspace audience rather than the
   caller's in-memory child list.
 
-Local cross-workspace direct messages materialize one stable private peer
-workspace for the two participants. Cloud and cross-machine messages require
-the sender and recipient to share an authorized cloud workspace; membership
-is the routing grant, not knowledge of a UUID. Every successful send returns
+Cross-workspace direct messages materialize one stable private peer workspace
+for the two participants. Local agents in the same OS user's store can message
+one another without joining each other's projects. Across machines, enrolled
+instances belonging to the same authenticated account can discover and message
+one another without sharing a project workspace. A direct message grants no
+access to either project's history or files. Existing shared-workspace messaging
+retains its membership checks, and broadcasts remain workspace-scoped.
+Every successful send returns
 the committed message ID, workspace sequence, delivery mode, and exact
 recipient IDs/count. Immediate local dispatch is reported separately and is
 never presented as proof of durable recipient delivery.
@@ -252,14 +257,21 @@ authority transfer/import with recorded provenance; Borg never silently merges
 two writable authorities with the same workspace ID.
 
 An enrolled host receives the workspace and participant attachment on launch,
-projects the authenticated cloud roster into its local cache, and uploads
-locally authored message events with their event ID as the cloud idempotency
-key. Borg.ml appends them to the existing `chat_messages` authority, creates
+projects the authenticated cloud roster and account instance directory into its
+local cache, and uploads locally authored message events with their event ID as
+the cloud idempotency key. Terminal-owned sessions connected to Borg Remote use
+the same messaging relay. Direct-message channels have separate upload cursors
+from project workspaces. Borg.ml appends them to the existing `chat_messages` authority, creates
 per-recipient deliveries, and enqueues a deterministic prompt command for each
 attached remote recipient. Session admission and turn-completion events move
 the corresponding cloud delivery to admitted and acknowledged. Retries across
 API instances, host reconnects, or machine changes therefore converge on one
 message and one recipient admission.
+
+Both machines must be enrolled and connected to the same server account for
+remote discovery. Updating only the CLI does not add server endpoints: deploy
+the server's instance-directory and direct-message API support as well. Cached
+directory entries can be offline; a successful enqueue is not an acknowledgement.
 
 Execution is disposable; coordination is durable. Workers, sandboxes,
 worktrees, containers, and cloud hosts may be ephemeral, but their lifecycle,

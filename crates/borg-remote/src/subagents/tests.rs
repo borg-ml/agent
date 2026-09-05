@@ -2312,6 +2312,12 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
         )
         .await
         .unwrap();
+    let host_id = Uuid::new_v4();
+    for session in [sender, recipient] {
+        let mut binding = store.workspace_binding(session).await.unwrap().unwrap();
+        binding.host_id = Some(host_id);
+        store.attach_workspace(binding).await.unwrap();
+    }
     let sender_coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
         sender,
@@ -2331,12 +2337,28 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
     )
     .unwrap();
 
+    let instances = sender_coordinator
+        .call_tool_as(sender, "list_instances", json!({}))
+        .await
+        .unwrap();
+    assert!(
+        instances["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["id"] == recipient.to_string()
+                    && entry["workspace_id"] == recipient.to_string()
+                    && entry["local"] == true
+            })
+    );
+
     let result = sender_coordinator
         .call_tool_as(
             sender,
             "send_message",
             json!({
-                "target": format!("session:{recipient}"),
+                "target": format!("participant:{recipient}"),
                 "message": "cross-workspace handoff"
             }),
         )
@@ -2345,6 +2367,7 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
     assert_eq!(result["queued"], true);
     assert_eq!(result["recipient_count"], 1);
     assert_eq!(result["dispatched_locally"], false);
+    assert_eq!(result["relay_pending"], false);
     let message_id: Uuid = serde_json::from_value(result["message_id"].clone()).unwrap();
     let unread = recipient_coordinator
         .unread_messages_for_session(recipient)
@@ -2362,6 +2385,41 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
             .await
             .unwrap()
             .is_empty()
+    );
+
+    let reply = recipient_coordinator
+        .call_tool_as(
+            recipient,
+            "followup_task",
+            json!({
+                "target": format!("participant:{sender}"),
+                "message": "handoff received"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply["workspace_id"], result["workspace_id"]);
+    let replies = sender_coordinator
+        .unread_messages_for_session(sender)
+        .await
+        .unwrap();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].delivery, PromptDelivery::Steer);
+    assert!(
+        !workspace
+            .workspace_roster(sender, sender)
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.participant.id == recipient)
+    );
+    assert!(
+        !workspace
+            .workspace_roster(recipient, recipient)
+            .await
+            .unwrap()
+            .iter()
+            .any(|entry| entry.participant.id == sender)
     );
 
     let unknown = Uuid::new_v4();
@@ -2528,6 +2586,7 @@ fn tool_catalog_exposes_one_complete_lifecycle() {
             "spawn_agent",
             "list_agents",
             "list_workspace_participants",
+            "list_instances",
             "send_message",
             "followup_task",
             "broadcast_team",

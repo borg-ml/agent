@@ -131,14 +131,14 @@ pub use tool_presentation::{
     tool_process_followup_handle, tool_process_output_text, web_search_query,
 };
 pub use workspace::{
-    AtomicWorkClaim, Audience, DeliveryAttempt, DeliveryCursor, DeliveryMode, DeliveryState,
-    HostAttachment, HostIdentity, NewWorkspaceMessage, Participant, ParticipantKind, PresenceLease,
-    Provenance, RecipientDelivery, SharedWork, SqliteWorkspaceStore, StructuredMention, Thread,
-    WorkDependency, WorkReview, Workspace, WorkspaceArtifact, WorkspaceDecision, WorkspaceEvent,
-    WorkspaceEventKind, WorkspaceHost, WorkspaceHostCapabilities, WorkspaceMembership,
-    WorkspaceMessage, WorkspaceMessageBody, WorkspaceMessageReceipt, WorkspaceReference,
-    WorkspaceReviewRequest, WorkspaceRole, WorkspaceRosterEntry, WorkspaceStore,
-    local_human_participant_id,
+    AgentInstance, AtomicWorkClaim, Audience, DeliveryAttempt, DeliveryCursor, DeliveryMode,
+    DeliveryState, HostAttachment, HostIdentity, NewWorkspaceMessage, Participant, ParticipantKind,
+    PresenceLease, Provenance, RecipientDelivery, SharedWork, SqliteWorkspaceStore,
+    StructuredMention, Thread, WorkDependency, WorkReview, Workspace, WorkspaceArtifact,
+    WorkspaceDecision, WorkspaceEvent, WorkspaceEventKind, WorkspaceHost,
+    WorkspaceHostCapabilities, WorkspaceMembership, WorkspaceMessage, WorkspaceMessageBody,
+    WorkspaceMessageReceipt, WorkspaceReference, WorkspaceReviewRequest, WorkspaceRole,
+    WorkspaceRosterEntry, WorkspaceStore, local_human_participant_id,
 };
 pub use workspace_snapshot::{
     DEFAULT_MAX_SNAPSHOT_BYTES, DEFAULT_MAX_SNAPSHOT_FILES, MAX_SNAPSHOT_FILE_BYTES,

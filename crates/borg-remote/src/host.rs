@@ -259,6 +259,21 @@ struct RelayWorkspaceRoster {
 }
 
 #[derive(Deserialize)]
+struct RelayInstanceDirectory {
+    participants: Vec<RelayInstanceParticipant>,
+}
+
+#[derive(Deserialize)]
+struct RelayInstanceParticipant {
+    id: Uuid,
+    kind: ParticipantKind,
+    display_name: String,
+    created_at: DateTime<Utc>,
+    host_id: Option<Uuid>,
+    workspace_id: Option<Uuid>,
+}
+
+#[derive(Deserialize)]
 struct RelayWorkspaceParticipant {
     id: Uuid,
     kind: ParticipantKind,
@@ -2149,6 +2164,26 @@ pub async fn mirror_local_session(
         }
     };
 
+    if let Some(binding) = store.workspace_binding(session_id).await? {
+        store
+            .attach_workspace(crate::SessionWorkspaceBinding {
+                host_id: Some(config.host_id),
+                ..binding
+            })
+            .await?;
+    }
+    let workspace_store = store.workspace_store().await?;
+    let mut workspace_sync = JournalSync {
+        uploaded_sequence: 0,
+        uploaded_live_revision: 0,
+        uploaded_workspace_sequences: HashMap::new(),
+        workspace_relay_available: false,
+        instance_relay_available: true,
+        next_workspace_roster_sync: Instant::now(),
+        next_instance_directory_sync: Instant::now(),
+        retry_at: Instant::now(),
+    };
+
     let mut capabilities =
         probe_capabilities_with_profile(config.roots.clone(), config.execution_profile).await;
     capabilities.resource_limits = config.resource_limits.clone();
@@ -2216,10 +2251,20 @@ pub async fn mirror_local_session(
                 }
             }
         }
+        let workspace_caught_up = flush_workspace_messages(
+            &client,
+            &config,
+            store.as_ref(),
+            workspace_store.as_ref(),
+            session_id,
+            None,
+            &mut workspace_sync,
+        )
+        .await?;
         // A shutdown can arrive after this iteration read an empty suffix but
         // before the actor commits its terminal status. Only finish after one
         // complete upload pass that began after shutdown was observed.
-        if shutdown_flush_pending && caught_up {
+        if shutdown_flush_pending && caught_up && workspace_caught_up {
             return Ok(());
         }
         if *shutdown.borrow() {
@@ -3517,10 +3562,18 @@ async fn run_session(
             })
             .await?;
     }
+    let effective_workspace_binding = sqlite_store
+        .workspace_binding(session_id)
+        .await?
+        .context("remote session has no local workspace binding")?;
+    sqlite_store
+        .attach_workspace(crate::SessionWorkspaceBinding {
+            host_id: Some(config.host_id),
+            ..effective_workspace_binding.clone()
+        })
+        .await?;
     let workspace_store = sqlite_store.workspace_store().await?;
-    if let (Some(store), Some((workspace_id, participant_id))) =
-        (workspace_store.as_ref(), workspace_attachment)
-    {
+    if let Some(store) = workspace_store.as_ref() {
         let human_display_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
         let human_participant_id = crate::local_human_participant_id(&human_display_name);
         let workspace_name = launch
@@ -3531,11 +3584,11 @@ async fn run_session(
             .unwrap_or("Borg workspace");
         store
             .ensure_execution_workspace(
-                workspace_id,
+                effective_workspace_binding.workspace_id,
                 workspace_name,
                 human_participant_id,
                 &human_display_name,
-                participant_id,
+                effective_workspace_binding.participant_id,
                 launch.name.as_deref().unwrap_or("Borg"),
             )
             .await?;
@@ -3545,9 +3598,11 @@ async fn run_session(
     let mut sync = JournalSync {
         uploaded_sequence: cursor.event_cursor,
         uploaded_live_revision: cursor.live_revision,
-        uploaded_workspace_sequence: 0,
+        uploaded_workspace_sequences: HashMap::new(),
         workspace_relay_available: attachment.is_some(),
+        instance_relay_available: true,
         next_workspace_roster_sync: Instant::now(),
+        next_instance_directory_sync: Instant::now(),
         retry_at: Instant::now(),
     };
     flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
@@ -3557,7 +3612,7 @@ async fn run_session(
         sqlite_store.as_ref(),
         workspace_store.as_ref(),
         session_id,
-        attachment.as_ref(),
+        workspace_attachment.map(|(workspace_id, _)| workspace_id),
         &mut sync,
     )
     .await?;
@@ -3613,7 +3668,7 @@ async fn run_session(
             sqlite_store.as_ref(),
             workspace_store.as_ref(),
             session_id,
-            attachment.as_ref(),
+            workspace_attachment.map(|(workspace_id, _)| workspace_id),
             &mut sync,
         )
         .await?;
@@ -3627,7 +3682,7 @@ async fn run_session(
             sqlite_store.as_ref(),
             workspace_store.as_ref(),
             session_id,
-            attachment.as_ref(),
+            workspace_attachment.map(|(workspace_id, _)| workspace_id),
             &mut sync,
         )
         .await?;
@@ -3644,10 +3699,11 @@ async fn run_session(
         sqlite_store.as_ref(),
         workspace_store.as_ref(),
         session_id,
-        attachment.as_ref(),
+        workspace_attachment.map(|(workspace_id, _)| workspace_id),
         &mut sync,
     )
     .await
+    .map(|_| ())
 }
 
 async fn fetch_runtime_mcp_context(
@@ -3953,33 +4009,87 @@ fn isolated_mcp_command_allowed(command: &str, allowlist: &[String]) -> bool {
 struct JournalSync {
     uploaded_sequence: u64,
     uploaded_live_revision: u64,
-    uploaded_workspace_sequence: u64,
+    uploaded_workspace_sequences: HashMap<Uuid, u64>,
     workspace_relay_available: bool,
+    instance_relay_available: bool,
     next_workspace_roster_sync: Instant,
+    next_instance_directory_sync: Instant,
     retry_at: Instant,
 }
 
 async fn flush_workspace_messages(
     client: &Client,
     config: &HostConfig,
-    session_store: &SqliteSessionStore,
+    session_store: &dyn SessionStore,
     workspace_store: Option<&SqliteWorkspaceStore>,
     session_id: Uuid,
-    attachment: Option<&WorkspaceAttachment>,
+    execution_workspace_id: Option<Uuid>,
     sync: &mut JournalSync,
-) -> Result<()> {
-    if !sync.workspace_relay_available || Instant::now() < sync.retry_at {
-        return Ok(());
+) -> Result<bool> {
+    if !sync.workspace_relay_available && !sync.instance_relay_available {
+        return Ok(true);
+    }
+    if Instant::now() < sync.retry_at {
+        return Ok(false);
     }
     let Some(store) = workspace_store else {
-        return Ok(());
+        return Ok(true);
     };
-    let Some((workspace_id, participant_id)) =
-        attachment.and_then(|attachment| attachment.workspace_id.zip(attachment.participant_id))
-    else {
-        return Ok(());
+    let Some(binding) = session_store.workspace_binding(session_id).await? else {
+        return Ok(true);
     };
-    if Instant::now() >= sync.next_workspace_roster_sync {
+    let participant_id = binding.participant_id;
+    if sync.instance_relay_available && Instant::now() >= sync.next_instance_directory_sync {
+        let response = client
+            .get(endpoint(
+                &config.server,
+                &format!("/api/remote/host/sessions/{session_id}/instances"),
+            ))
+            .bearer_auth(&config.host_token)
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => {
+                let directory: RelayInstanceDirectory = response
+                    .json()
+                    .await
+                    .context("borg.ml returned an invalid instance directory")?;
+                for remote in directory.participants {
+                    store
+                        .upsert_instance(
+                            Participant {
+                                id: remote.id,
+                                display_name: remote.display_name,
+                                kind: remote.kind,
+                                created_at: remote.created_at,
+                            },
+                            remote.host_id,
+                            remote.workspace_id,
+                        )
+                        .await?;
+                }
+                sync.next_instance_directory_sync = Instant::now() + Duration::from_secs(30);
+            }
+            Ok(response) if response.status() == StatusCode::NOT_FOUND => {
+                sync.instance_relay_available = false;
+            }
+            Ok(response) => {
+                tracing::warn!(
+                    status = %response.status(),
+                    "instance directory synchronization failed"
+                );
+                sync.next_instance_directory_sync = Instant::now() + Duration::from_secs(5);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "instance directory synchronization failed");
+                sync.next_instance_directory_sync = Instant::now() + Duration::from_secs(5);
+            }
+        }
+    }
+    if sync.workspace_relay_available
+        && execution_workspace_id.is_some()
+        && Instant::now() >= sync.next_workspace_roster_sync
+    {
         let response = client
             .get(endpoint(
                 &config.server,
@@ -3994,6 +4104,7 @@ async fn flush_workspace_messages(
                     .json()
                     .await
                     .context("borg.ml returned an invalid workspace roster")?;
+                let workspace_id = execution_workspace_id.expect("checked above");
                 for remote in roster.participants {
                     store
                         .upsert_relay_roster_entry(
@@ -4012,7 +4123,6 @@ async fn flush_workspace_messages(
             }
             Ok(response) if response.status() == StatusCode::NOT_FOUND => {
                 sync.workspace_relay_available = false;
-                return Ok(());
             }
             Ok(response) => {
                 tracing::warn!(
@@ -4028,109 +4138,178 @@ async fn flush_workspace_messages(
         }
     }
     const PAGE_SIZE: usize = 256;
-    loop {
-        let events = store
-            .replay(
-                workspace_id,
-                participant_id,
-                sync.uploaded_workspace_sequence,
-                PAGE_SIZE,
-            )
-            .await?;
-        let caught_up = events.len() < PAGE_SIZE;
-        for event in events {
-            if event.author_id == participant_id
-                && let WorkspaceEventKind::Message { message, mode } = &event.kind
-            {
-                let (audience, audience_role, mut recipients) = match &message.audience {
-                    Audience::Workspace => ("workspace", None, Vec::new()),
-                    Audience::Participants { participants } => {
-                        ("participants", None, participants.clone())
-                    }
-                    Audience::Role { role } => {
-                        ("role", Some(serde_json::to_value(role)?), Vec::new())
-                    }
-                    Audience::Direct { participant } => ("direct", None, vec![*participant]),
-                };
-                if matches!(
-                    &message.audience,
-                    Audience::Direct { .. } | Audience::Participants { .. }
-                ) {
-                    let mut cloud_recipients = Vec::with_capacity(recipients.len());
-                    for recipient in recipients {
-                        let local_only = session_store
-                            .workspace_binding(recipient)
-                            .await?
-                            .is_some_and(|binding| binding.host_id.is_none());
-                        if !local_only {
-                            cloud_recipients.push(recipient);
-                        }
-                    }
-                    recipients = cloud_recipients;
-                    if recipients.is_empty() {
-                        sync.uploaded_workspace_sequence = event.sequence;
+    for workspace in store
+        .list_workspaces_for_participant(participant_id)
+        .await?
+    {
+        let shared_workspace = execution_workspace_id == Some(workspace.id);
+        if (shared_workspace && !sync.workspace_relay_available)
+            || (!shared_workspace && !sync.instance_relay_available)
+        {
+            continue;
+        }
+        let mut uploaded_sequence = sync
+            .uploaded_workspace_sequences
+            .get(&workspace.id)
+            .copied()
+            .unwrap_or_default();
+        loop {
+            let events = store
+                .replay(workspace.id, participant_id, uploaded_sequence, PAGE_SIZE)
+                .await?;
+            let caught_up = events.len() < PAGE_SIZE;
+            for event in events {
+                if event.author_id == participant_id
+                    && let WorkspaceEventKind::Message { message, mode } = &event.kind
+                {
+                    if !shared_workspace && !matches!(&message.audience, Audience::Direct { .. }) {
+                        uploaded_sequence = event.sequence;
+                        sync.uploaded_workspace_sequences
+                            .insert(workspace.id, uploaded_sequence);
                         continue;
                     }
-                }
-                let response = client
-                    .post(endpoint(
-                        &config.server,
-                        &format!("/api/remote/host/sessions/{session_id}/workspace/messages"),
-                    ))
-                    .bearer_auth(&config.host_token)
-                    .json(&serde_json::json!({
-                        "text": message.body.text,
-                        "audience": audience,
-                        "audience_role": audience_role,
-                        "recipient_participant_ids": recipients,
-                        "mentions": message.body.mentions,
-                        "thread_id": message.thread_id,
-                        "reply_to_message_id": message.reply_to_message_id,
-                        "idempotency_key": event.id.to_string(),
-                        "delivery_mode": mode,
-                        "metadata": {
-                            "local_workspace_event_id": event.id,
-                            "local_workspace_sequence": event.sequence,
+                    let (audience, audience_role, mut recipients) = match &message.audience {
+                        Audience::Workspace => ("workspace", None, Vec::new()),
+                        Audience::Participants { participants } => {
+                            ("participants", None, participants.clone())
                         }
-                    }))
-                    .send()
-                    .await;
-                match response {
-                    Ok(response) if response.status().is_success() => {}
-                    Ok(response) if response.status() == StatusCode::NOT_FOUND => {
-                        tracing::warn!(
-                            "borg.ml does not expose the workspace relay endpoint; disabling it for this session"
-                        );
-                        sync.workspace_relay_available = false;
-                        return Ok(());
+                        Audience::Role { role } => {
+                            ("role", Some(serde_json::to_value(role)?), Vec::new())
+                        }
+                        Audience::Direct { participant } => ("direct", None, vec![*participant]),
+                    };
+                    if matches!(
+                        &message.audience,
+                        Audience::Direct { .. } | Audience::Participants { .. }
+                    ) {
+                        let mut cloud_recipients = Vec::with_capacity(recipients.len());
+                        for recipient in recipients {
+                            let local_only = session_store
+                                .workspace_binding(recipient)
+                                .await?
+                                .is_some_and(|binding| {
+                                    binding.host_id.is_none()
+                                        || binding.host_id == Some(config.host_id)
+                                });
+                            if !local_only {
+                                cloud_recipients.push(recipient);
+                            }
+                        }
+                        recipients = cloud_recipients;
+                        if recipients.is_empty() {
+                            uploaded_sequence = event.sequence;
+                            sync.uploaded_workspace_sequences
+                                .insert(workspace.id, uploaded_sequence);
+                            continue;
+                        }
                     }
-                    Ok(response) => {
-                        tracing::warn!(
-                            status = %response.status(),
-                            workspace_event_id = %event.id,
-                            "workspace message relay rejected an event"
-                        );
-                        sync.retry_at = Instant::now() + Duration::from_secs(2);
-                        return Ok(());
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            %error,
-                            workspace_event_id = %event.id,
-                            "workspace message relay upload failed"
-                        );
-                        sync.retry_at = Instant::now() + Duration::from_secs(2);
-                        return Ok(());
+                    let relay_path = if shared_workspace {
+                        format!("/api/remote/host/sessions/{session_id}/workspace/messages")
+                    } else {
+                        format!("/api/remote/host/sessions/{session_id}/messages")
+                    };
+                    let delivery_recipients = recipients.clone();
+                    let response = client
+                        .post(endpoint(&config.server, &relay_path))
+                        .bearer_auth(&config.host_token)
+                        .json(&serde_json::json!({
+                            "text": message.body.text,
+                            "audience": audience,
+                            "audience_role": audience_role,
+                            "recipient_participant_ids": recipients,
+                            "mentions": message.body.mentions,
+                            "thread_id": message.thread_id,
+                            "reply_to_message_id": message.reply_to_message_id,
+                            "idempotency_key": event.id.to_string(),
+                            "delivery_mode": mode,
+                            "metadata": {
+                                "local_workspace_event_id": event.id,
+                                "local_workspace_sequence": event.sequence,
+                            }
+                        }))
+                        .send()
+                        .await;
+                    match response {
+                        Ok(response) if response.status().is_success() => {}
+                        Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
+                            bail!("remote host token was rejected; enroll this host again");
+                        }
+                        Ok(response)
+                            if !shared_workspace
+                                && response.status().is_client_error()
+                                && response.status() != StatusCode::TOO_MANY_REQUESTS =>
+                        {
+                            let status = response.status();
+                            let detail = response
+                                .text()
+                                .await
+                                .unwrap_or_default()
+                                .chars()
+                                .take(512)
+                                .collect::<String>();
+                            for recipient in delivery_recipients {
+                                store
+                                    .transition_message_delivery(
+                                        workspace.id,
+                                        message.id,
+                                        recipient,
+                                        crate::DeliveryState::Failed,
+                                        Some(crate::DeliveryAttempt {
+                                            attempted_at: Utc::now(),
+                                            detail: Some(format!(
+                                                "remote instance relay rejected the message ({status}): {detail}"
+                                            )),
+                                        }),
+                                    )
+                                    .await?;
+                            }
+                            tracing::warn!(
+                                %status,
+                                %detail,
+                                workspace_event_id = %event.id,
+                                "instance message relay permanently rejected an event"
+                            );
+                        }
+                        Ok(response)
+                            if shared_workspace && response.status() == StatusCode::NOT_FOUND =>
+                        {
+                            tracing::warn!(
+                                shared_workspace,
+                                "borg.ml does not expose the message relay endpoint; disabling it for this session"
+                            );
+                            sync.workspace_relay_available = false;
+                            return Ok(true);
+                        }
+                        Ok(response) => {
+                            tracing::warn!(
+                                status = %response.status(),
+                                workspace_event_id = %event.id,
+                                "workspace message relay rejected an event"
+                            );
+                            sync.retry_at = Instant::now() + Duration::from_secs(2);
+                            return Ok(false);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                workspace_event_id = %event.id,
+                                "workspace message relay upload failed"
+                            );
+                            sync.retry_at = Instant::now() + Duration::from_secs(2);
+                            return Ok(false);
+                        }
                     }
                 }
+                uploaded_sequence = event.sequence;
+                sync.uploaded_workspace_sequences
+                    .insert(workspace.id, uploaded_sequence);
             }
-            sync.uploaded_workspace_sequence = event.sequence;
-        }
-        if caught_up {
-            break;
+            if caught_up {
+                break;
+            }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 async fn flush_pending(
@@ -4521,7 +4700,7 @@ mod tests {
                         .then(|| value.trim().parse::<usize>().unwrap())
                 })
             })
-            .unwrap();
+            .unwrap_or(0);
         while request.len() - header_end < content_length {
             let mut buffer = [0_u8; 4_096];
             let read = stream.read(&mut buffer).await.unwrap();
@@ -4581,7 +4760,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut first_upload_tx = Some(first_upload_tx);
             let mut uploads = Vec::new();
-            while uploads.len() < 2 {
+            let mut messages = Vec::new();
+            while uploads.len() < 2 || messages.is_empty() {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let (path, body) = read_http_request(&mut stream).await;
                 let response = match path.split_once('?').map_or(path.as_str(), |(path, _)| path) {
@@ -4593,6 +4773,18 @@ mod tests {
                         )
                     }
                     "/api/remote/host/heartbeat" => {
+                        "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                    path if path.ends_with("/instances") => {
+                        let body = r#"{"participants":[]}"#;
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    path if path.ends_with("/messages") => {
+                        messages.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
                         "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                             .to_string()
                     }
@@ -4623,7 +4815,7 @@ mod tests {
                 };
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
-            uploads
+            (uploads, messages)
         });
 
         let root = tempdir().unwrap();
@@ -4633,7 +4825,55 @@ mod tests {
                 .unwrap(),
         );
         let session_id = Uuid::new_v4();
+        let remote_recipient = Uuid::new_v4();
         store.create_session(session_id).await.unwrap();
+        let workspace = store.workspace_store().await.unwrap().unwrap();
+        let binding = store.workspace_binding(session_id).await.unwrap().unwrap();
+        let human = crate::local_human_participant_id("Human");
+        workspace
+            .ensure_execution_workspace(
+                binding.workspace_id,
+                "mirror workspace",
+                human,
+                "Human",
+                session_id,
+                "Mirror sender",
+            )
+            .await
+            .unwrap();
+        workspace
+            .upsert_instance(
+                Participant {
+                    id: remote_recipient,
+                    display_name: "Remote peer".to_string(),
+                    kind: ParticipantKind::Agent,
+                    created_at: Utc::now(),
+                },
+                Some(Uuid::new_v4()),
+                None,
+            )
+            .await
+            .unwrap();
+        let direct_workspace = workspace
+            .ensure_direct_workspace(session_id, remote_recipient)
+            .await
+            .unwrap();
+        workspace
+            .append_message(crate::NewWorkspaceMessage {
+                workspace_id: direct_workspace,
+                author_id: session_id,
+                text: "mirror this private handoff".to_string(),
+                mentions: Vec::new(),
+                audience: Audience::Direct {
+                    participant: remote_recipient,
+                },
+                mode: crate::DeliveryMode::NextTurn,
+                thread_id: None,
+                reply_to_message_id: None,
+                idempotency_key: "mirror-private-handoff".to_string(),
+            })
+            .await
+            .unwrap();
         store
             .append(SessionEvent::new(
                 session_id,
@@ -4701,7 +4941,266 @@ mod tests {
             .expect("mirror should finish after its shutdown flush")
             .unwrap()
             .unwrap();
-        assert_eq!(server.await.unwrap(), vec![vec![1], vec![2]]);
+        let (uploads, messages) = server.await.unwrap();
+        assert_eq!(uploads, vec![vec![1], vec![2]]);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0]["recipient_participant_ids"],
+            serde_json::json!([remote_recipient])
+        );
+    }
+
+    #[tokio::test]
+    async fn private_instance_relay_retries_without_starving_or_duplicating_local_recipients() {
+        let root = tempdir().unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let sender = Uuid::new_v4();
+        let local_recipient = Uuid::new_v4();
+        let retry_recipient = Uuid::new_v4();
+        let stale_recipient = Uuid::new_v4();
+        let healthy_recipient = Uuid::new_v4();
+        store.create_session(sender).await.unwrap();
+        store.create_session(local_recipient).await.unwrap();
+        let workspace = store.workspace_store().await.unwrap().unwrap();
+        let mut config = test_config(root.path());
+        let local_host_id = config.host_id;
+        let human = crate::local_human_participant_id("Human");
+        for (session_id, name) in [(sender, "Sender"), (local_recipient, "Local recipient")] {
+            let binding = store.workspace_binding(session_id).await.unwrap().unwrap();
+            workspace
+                .ensure_execution_workspace(
+                    binding.workspace_id,
+                    name,
+                    human,
+                    "Human",
+                    session_id,
+                    name,
+                )
+                .await
+                .unwrap();
+            store
+                .attach_workspace(crate::SessionWorkspaceBinding {
+                    host_id: Some(local_host_id),
+                    ..binding
+                })
+                .await
+                .unwrap();
+        }
+        let remote_host_id = Uuid::new_v4();
+        let created_at = Utc::now();
+        for (id, name) in [
+            (retry_recipient, "Retry peer"),
+            (stale_recipient, "Stale peer"),
+            (healthy_recipient, "Healthy peer"),
+        ] {
+            workspace
+                .upsert_instance(
+                    Participant {
+                        id,
+                        display_name: name.to_string(),
+                        kind: ParticipantKind::Agent,
+                        created_at,
+                    },
+                    Some(remote_host_id),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut direct_workspaces = HashMap::new();
+        for (recipient, text) in [
+            (retry_recipient, "retry me"),
+            (stale_recipient, "reject me"),
+            (healthy_recipient, "deliver me"),
+            (local_recipient, "stay local"),
+        ] {
+            let workspace_id = workspace
+                .ensure_direct_workspace(sender, recipient)
+                .await
+                .unwrap();
+            workspace
+                .append_message(crate::NewWorkspaceMessage {
+                    workspace_id,
+                    author_id: sender,
+                    text: text.to_string(),
+                    mentions: Vec::new(),
+                    audience: Audience::Direct {
+                        participant: recipient,
+                    },
+                    mode: crate::DeliveryMode::NextTurn,
+                    thread_id: None,
+                    reply_to_message_id: None,
+                    idempotency_key: format!("private-{recipient}"),
+                })
+                .await
+                .unwrap();
+            direct_workspaces.insert(recipient, workspace_id);
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        config.server = format!("http://{address}");
+        let directory = serde_json::json!({
+            "participants": [
+                {
+                    "id": retry_recipient,
+                    "kind": "agent",
+                    "display_name": "Retry peer",
+                    "created_at": created_at,
+                    "host_id": remote_host_id,
+                    "workspace_id": null
+                },
+                {
+                    "id": stale_recipient,
+                    "kind": "agent",
+                    "display_name": "Stale peer",
+                    "created_at": created_at,
+                    "host_id": remote_host_id,
+                    "workspace_id": null
+                },
+                {
+                    "id": healthy_recipient,
+                    "kind": "agent",
+                    "display_name": "Healthy peer",
+                    "created_at": created_at,
+                    "host_id": remote_host_id,
+                    "workspace_id": null
+                }
+            ]
+        })
+        .to_string();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let mut retry_attempted = false;
+            while requests.len() < 4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (path, body) = read_http_request(&mut stream).await;
+                let path = path.split_once('?').map_or(path.as_str(), |(path, _)| path);
+                let response = if path.ends_with("/instances") {
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{directory}",
+                        directory.len()
+                    )
+                } else if path.ends_with("/messages") {
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let recipient =
+                        Uuid::parse_str(body["recipient_participant_ids"][0].as_str().unwrap())
+                            .unwrap();
+                    let idempotency_key = body["idempotency_key"].as_str().unwrap().to_string();
+                    requests.push((recipient, idempotency_key));
+                    if recipient == retry_recipient && !retry_attempted {
+                        retry_attempted = true;
+                        "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string()
+                    } else if recipient == stale_recipient {
+                        let detail = "stale recipient";
+                        format!(
+                            "HTTP/1.1 404 Not Found\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{detail}",
+                            detail.len()
+                        )
+                    } else {
+                        "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_string()
+                    }
+                } else {
+                    panic!("unexpected private relay request: {path}");
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+
+        let mut sync = JournalSync {
+            uploaded_sequence: 0,
+            uploaded_live_revision: 0,
+            uploaded_workspace_sequences: HashMap::new(),
+            workspace_relay_available: false,
+            instance_relay_available: true,
+            next_workspace_roster_sync: Instant::now(),
+            next_instance_directory_sync: Instant::now(),
+            retry_at: Instant::now(),
+        };
+        assert!(
+            !flush_workspace_messages(
+                &Client::new(),
+                &config,
+                &store,
+                Some(&workspace),
+                sender,
+                None,
+                &mut sync,
+            )
+            .await
+            .unwrap()
+        );
+        sync.retry_at = Instant::now();
+        assert!(
+            flush_workspace_messages(
+                &Client::new(),
+                &config,
+                &store,
+                Some(&workspace),
+                sender,
+                None,
+                &mut sync,
+            )
+            .await
+            .unwrap()
+        );
+
+        let requests = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("private relay server should receive every cloud delivery")
+            .unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|(recipient, _)| *recipient == retry_recipient)
+                .count(),
+            2
+        );
+        let retry_keys = requests
+            .iter()
+            .filter(|(recipient, _)| *recipient == retry_recipient)
+            .map(|(_, key)| key)
+            .collect::<Vec<_>>();
+        assert!(
+            retry_keys.windows(2).all(|pair| pair[0] == pair[1]),
+            "retry must preserve the exact idempotency key"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(recipient, _)| *recipient == stale_recipient)
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|(recipient, _)| *recipient == healthy_recipient)
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|(recipient, _)| *recipient == local_recipient)
+        );
+
+        let stale_deliveries = workspace
+            .deliveries_after(direct_workspaces[&stale_recipient], stale_recipient, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(stale_deliveries.len(), 1);
+        assert_eq!(stale_deliveries[0].state, crate::DeliveryState::Failed);
+        assert!(
+            workspace
+                .list_instances()
+                .await
+                .unwrap()
+                .iter()
+                .any(|instance| instance.participant.id == healthy_recipient
+                    && instance.host_id == Some(remote_host_id))
+        );
     }
 
     #[test]

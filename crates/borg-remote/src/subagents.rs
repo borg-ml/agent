@@ -4347,10 +4347,8 @@ impl SubagentCoordinator {
             )
             .await?;
         let relay_pending = self
-            .store
-            .workspace_binding(actor_session_id)
-            .await?
-            .is_some_and(|binding| binding.host_id.is_some());
+            .session_message_needs_relay(actor_session_id, id)
+            .await?;
         if local_id.is_none() {
             let socket_path = crate::session_control_socket_path(&self.journal_root, id);
             let dispatched_locally =
@@ -4541,10 +4539,8 @@ impl SubagentCoordinator {
             )
             .await?;
         let relay_pending = self
-            .store
-            .workspace_binding(actor_session_id)
-            .await?
-            .is_some_and(|binding| binding.host_id.is_some());
+            .session_message_needs_relay(actor_session_id, id)
+            .await?;
         if local_id.is_none() {
             let socket_path = crate::session_control_socket_path(&self.journal_root, id);
             let dispatched_locally =
@@ -4615,6 +4611,20 @@ impl SubagentCoordinator {
         })
     }
 
+    async fn session_message_needs_relay(&self, sender: Uuid, recipient: Uuid) -> Result<bool> {
+        let sender_host = self
+            .store
+            .workspace_binding(sender)
+            .await?
+            .and_then(|binding| binding.host_id);
+        let recipient_host = self
+            .store
+            .workspace_binding(recipient)
+            .await?
+            .and_then(|binding| binding.host_id);
+        Ok(sender_host.is_some() && recipient_host.is_some() && sender_host != recipient_host)
+    }
+
     async fn route_workspace_participant_message_as(
         &self,
         actor_session_id: Uuid,
@@ -4633,19 +4643,50 @@ impl SubagentCoordinator {
             "message recipient must differ from its author"
         );
         let store = self.workspace_store().await?;
+        if self
+            .store
+            .workspace_binding(recipient_participant_id)
+            .await?
+            .is_some()
+        {
+            return match mode {
+                DeliveryMode::Wake => {
+                    Box::pin(self.route_followup_task_with_options_as(
+                        actor_session_id,
+                        &format!("session:{recipient_participant_id}"),
+                        message,
+                        options,
+                    ))
+                    .await
+                }
+                _ => {
+                    Box::pin(self.route_message_with_options_as(
+                        actor_session_id,
+                        &format!("session:{recipient_participant_id}"),
+                        message,
+                        options,
+                    ))
+                    .await
+                }
+            };
+        }
         let roster = store
             .workspace_roster(actor.workspace_id, actor.participant_id)
             .await?;
-        ensure!(
-            roster
-                .iter()
-                .any(|entry| entry.participant.id == recipient_participant_id),
-            "workspace participant {recipient_participant_id} is not an authorized member"
-        );
+        let workspace_id = if roster
+            .iter()
+            .any(|entry| entry.participant.id == recipient_participant_id)
+        {
+            actor.workspace_id
+        } else {
+            store
+                .ensure_direct_workspace(actor.participant_id, recipient_participant_id)
+                .await?
+        };
         let idempotency_id = Uuid::new_v4();
         let receipt = store
             .append_message(NewWorkspaceMessage {
-                workspace_id: actor.workspace_id,
+                workspace_id,
                 author_id: actor.participant_id,
                 text: message.to_string(),
                 mentions: options.mentions,
@@ -4873,6 +4914,25 @@ impl SubagentCoordinator {
                         .workspace_roster(binding.workspace_id, binding.participant_id)
                         .await?,
                 }))
+            }
+            "list_instances" => {
+                let _: NoArgs = serde_json::from_value(arguments)?;
+                let mut instances = Vec::new();
+                for mut instance in self.workspace_store().await?.list_instances().await? {
+                    let binding = self
+                        .store
+                        .workspace_binding(instance.participant.id)
+                        .await?;
+                    let local = binding.is_some();
+                    if let Some(binding) = binding {
+                        instance.host_id = binding.host_id.or(instance.host_id);
+                        instance.workspace_id = Some(binding.workspace_id);
+                    }
+                    let mut entry = serde_json::to_value(instance)?;
+                    entry["local"] = json!(local);
+                    instances.push(entry);
+                }
+                Ok(json!({ "session_id": actor_session_id, "instances": instances }))
             }
             "send_message" => {
                 let args: MessageArgs = serde_json::from_value(arguments)?;
@@ -5131,13 +5191,18 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
             "List every durable participant visible in the current workspace, including independent and remote-synced agents. Use participant:<UUID> to message one.",
             json!({"type":"object","properties":{},"additionalProperties":false}),
         ),
+        tool(
+            "list_instances",
+            "Discover Borg agent instances across all local workspaces and the authenticated remote instance directory. Use participant:<id> with send_message or followup_task. Remote entries require an enrolled host relay and may be offline; discovery does not grant project access.",
+            json!({"type":"object","properties":{},"additionalProperties":false}),
+        ),
         message_tool(
             "send_message",
-            "Queue a durable message for a team member or explicitly addressed peer. Use session:<UUID> for an independent local session or participant:<UUID> for a member from list_workspace_participants; cross-workspace local sessions use a private channel in the same authorized Borg store. Reports sent by a child to /root wake the director for reconciliation.",
+            "Queue a durable message for any discovered Borg instance, across projects and enrolled machines. Use participant:<id> from list_instances, session:<UUID> for a local session, or a team path. Cross-workspace messages use a private channel. Reports sent by a child to /root wake the director for reconciliation.",
         ),
         message_tool(
             "followup_task",
-            "Send a durable follow-up and wake or steer a local recipient when possible. Use session:<UUID> for an independent session.",
+            "Send a durable follow-up and wake or steer a discovered local or remote Borg instance when possible. Use participant:<id> from list_instances or session:<UUID> for a local session.",
         ),
         tool(
             "broadcast_team",
