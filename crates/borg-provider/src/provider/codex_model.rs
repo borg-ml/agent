@@ -169,11 +169,7 @@ impl SubscriptionAccess {
                 }
                 break response;
             };
-            ensure!(
-                response.status().is_success(),
-                "Codex model catalog request failed (HTTP {})",
-                response.status()
-            );
+            let response = check_subscription_response(response).await?;
             let mut stream = response.bytes_stream();
             let mut bytes = Vec::new();
             while let Some(chunk) = stream.next().await {
@@ -324,11 +320,6 @@ impl CodexModelProvider {
                     )
                     .await?;
             }
-            ensure!(
-                response.status().is_success(),
-                "Codex subscription model request failed (HTTP {}); no fallback was attempted",
-                response.status()
-            );
             let (message, response) = self.read_stream(response, progress.as_ref()).await?;
             Ok::<_, anyhow::Error>((message, response, context_window))
         }
@@ -498,6 +489,7 @@ impl CodexModelProvider {
         response: reqwest::Response,
         progress: Option<&UnboundedSender<ProviderProgress>>,
     ) -> Result<(ModelMessage, Value)> {
+        let response = check_subscription_response(response).await?;
         let mut stream = response.bytes_stream();
         let mut buffer = Vec::new();
         let mut data = String::new();
@@ -542,6 +534,95 @@ impl CodexModelProvider {
         }
         bail!("Codex model stream ended before response.completed; no tools were executed")
     }
+}
+
+async fn check_subscription_response(response: reqwest::Response) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::read_provider_error_response_text(response),
+    )
+    .await;
+    let body = match body {
+        Ok(Ok(body)) => serde_json::from_str::<Value>(&body).unwrap_or(Value::Null),
+        _ => Value::Null,
+    };
+    bail!(subscription_failure_message(
+        body.get("error"),
+        Some(status),
+        retry_after.as_deref()
+    ))
+}
+
+fn subscription_failure_message(
+    error: Option<&Value>,
+    status: Option<reqwest::StatusCode>,
+    retry_after: Option<&str>,
+) -> String {
+    let error = error.unwrap_or(&Value::Null);
+    let codes = [error["code"].as_str(), error["type"].as_str()];
+    let limited = status == Some(reqwest::StatusCode::TOO_MANY_REQUESTS)
+        || codes.iter().any(|code| {
+            matches!(
+                code,
+                Some("usage_limit_reached" | "rate_limit_exceeded" | "insufficient_quota")
+            )
+        });
+    let mut message = if limited {
+        "Codex subscription usage or rate limit reached.".to_string()
+    } else if codes.contains(&Some("context_length_exceeded")) {
+        "Codex context limit reached; compact the conversation before trying again.".to_string()
+    } else if status == Some(reqwest::StatusCode::UNAUTHORIZED) {
+        "Codex subscription authentication was rejected after recovery; reconnect Codex."
+            .to_string()
+    } else if status == Some(reqwest::StatusCode::FORBIDDEN) {
+        "Codex subscription access was denied; check account and model access.".to_string()
+    } else {
+        "Codex subscription response did not complete.".to_string()
+    };
+    if let Some(status) = status {
+        message.push_str(&format!(" HTTP {}.", status.as_u16()));
+    }
+    if limited {
+        let retry_date = retry_after
+            .and_then(|value| chrono::DateTime::parse_from_rfc2822(value).ok())
+            .map(|time| time.with_timezone(&chrono::Utc));
+        if let Some(seconds) = retry_after
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .or_else(|| {
+                if retry_date.is_none() {
+                    error["resets_in_seconds"].as_u64()
+                } else {
+                    None
+                }
+            })
+        {
+            message.push_str(&format!(
+                " Provider-reported retry delay: {seconds} seconds."
+            ));
+        } else if let Some(reset) = retry_date.or_else(|| {
+            error["resets_at"]
+                .as_i64()
+                .filter(|value| *value > 0)
+                .and_then(|value| chrono::DateTime::from_timestamp(value, 0))
+        }) {
+            message.push_str(&format!(
+                " Provider-reported reset: {}.",
+                reset.format("%Y-%m-%d %H:%M:%S UTC")
+            ));
+        }
+    }
+    message
+        .push_str(" No billing fallback was attempted; no tools from this response were executed.");
+    message
 }
 
 #[derive(Default)]
@@ -652,7 +733,13 @@ impl ResponseState {
             }
             "response.completed" => return Ok(Some(event["response"].clone())),
             "response.failed" | "response.incomplete" | "error" => {
-                bail!("Codex model did not complete the response")
+                bail!(subscription_failure_message(
+                    event
+                        .pointer("/response/error")
+                        .or_else(|| event.get("error")),
+                    None,
+                    None
+                ))
             }
             _ => {}
         }
@@ -734,6 +821,87 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{mpsc, oneshot};
+
+    #[tokio::test]
+    async fn quota_rejection_reports_retry_delay_without_generation_or_private_details() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let mut bytes = [0; 1024];
+                let count = socket.read(&mut bytes).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&bytes[..count]);
+            }
+            socket.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 12\r\nConnection: close\r\n\r\n{\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"private-token private-account\",\"resets_in_seconds\":99}}").await.unwrap();
+        });
+        let response = reqwest::Client::new().get(endpoint).send().await.unwrap();
+        let (progress, mut events) = mpsc::unbounded_channel();
+        let provider = CodexModelProvider {
+            model: "test-model".into(),
+            effort: "low".into(),
+        };
+        let error = provider
+            .read_stream(response, Some(&progress))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("limit reached") && error.contains("12 seconds"));
+        assert!(!error.contains("private-") && !error.contains("99 seconds"));
+        assert!(events.try_recv().is_err());
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn streamed_limits_abort_partial_calls_and_expose_only_structured_reset_details() {
+        let (progress, mut events) = mpsc::unbounded_channel();
+        let mut state = ResponseState::default();
+        for event in [
+            json!({"type":"response.output_item.added","item":{"type":"function_call","id":"item","call_id":"call","name":"","arguments":""}}),
+            json!({"type":"response.function_call_arguments.delta","item_id":"item","delta":"{"}),
+        ] {
+            assert!(
+                state
+                    .event(&event, Some(&progress), "test-model", "low")
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ProviderProgress::ToolCallGenerating { .. }
+        ));
+        let failure = json!({"type":"response.failed","response":{"error":{
+            "code":"rate_limit_exceeded", "message":"private-account private-token", "resets_at":1893456000
+        }}});
+        let error = state
+            .event(&failure, Some(&progress), "test-model", "low")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("limit reached") && error.contains("2030-01-01 00:00:00 UTC"));
+        assert!(!error.contains("private-"));
+        assert!(events.try_recv().is_err());
+        let context_error = subscription_failure_message(
+            Some(&json!({"code":"context_length_exceeded"})),
+            None,
+            None,
+        );
+        assert!(context_error.contains("compact the conversation"));
+        let malformed = subscription_failure_message(
+            Some(&json!({"code":"private-token", "message":"private-account"})),
+            None,
+            Some("private-header"),
+        );
+        assert!(!malformed.contains("private-"));
+        let dated = subscription_failure_message(
+            Some(&json!({"resets_in_seconds":99})),
+            Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert!(dated.contains("2015-10-21 07:28:00 UTC") && !dated.contains("99 seconds"));
+    }
 
     #[test]
     fn fast_mode_uses_catalog_capabilities_and_explicit_priority_routing() {

@@ -213,6 +213,16 @@ The native tool/compaction/restart/consultation probe passed afterwards using th
 original credential store. This verifies access after a requested refresh, not
 expired-token recovery or re-login after revocation, which still need proof.
 
+Native subscription failures now distinguish usage/rate limits, context limits,
+and denied account access. HTTP `Retry-After` and structured reset fields provide
+retry timing when available. Error bodies are size- and time-bounded; only known
+codes and numeric/date fields inform the user-facing message, never raw provider
+messages or account identifiers. HTTP quota rejection emits no generation event;
+a streamed quota failure after a tool fragment returns no executable result.
+Protocol tests cover these boundaries without exhausting live account quota.
+No quota retry or billing fallback was added. Proactive quota-window reporting
+and live exhausted-account recovery remain unverified.
+
 ## Evidence
 
 - Current routing: `crates/borg-remote/src/contract.rs` (`uses_native_harness`)
