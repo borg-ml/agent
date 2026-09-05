@@ -112,18 +112,18 @@ impl NativeHarness {
         &self,
         turn: AgentTurn,
         events: mpsc::Sender<SessionEventKind>,
-        controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        mut controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
-        self.with_model_access(
-            turn.provider,
-            &crate::ModelAccessContext {
-                session_id: turn.session_id,
-                store: turn.agent_tools.session_store(),
-            },
+        let access = crate::ModelAccessContext {
+            session_id: turn.session_id,
+            store: turn.agent_tools.session_store(),
+        };
+        let (bound, steers) = await_model_admission(
+            self.with_model_access(turn.provider, &access),
+            &mut controls,
         )
-        .await?
-        .run_bound(turn, events, controls)
-        .await
+        .await?;
+        bound.run_bound(turn, events, controls, steers).await
     }
 
     pub(crate) async fn with_model_access(
@@ -160,6 +160,7 @@ impl NativeHarness {
         turn: AgentTurn,
         events: mpsc::Sender<SessionEventKind>,
         mut controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        steers: Vec<NativeSteer>,
     ) -> Result<AgentTurnResult> {
         send(
             &events,
@@ -231,6 +232,11 @@ impl NativeHarness {
         let user_message = native_user_message(&turn.cwd, &turn.prompt, &turn.attachments).await?;
         record_native_message(&events, turn.provider, &user_message).await?;
         messages.push(user_message);
+        for steer in steers {
+            let message = native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
+            record_native_message(&events, turn.provider, &message).await?;
+            messages.push(message);
+        }
         let harness_prompt_appendix = turn.agent_tools.harness_prompt_appendix().await?;
         if !harness_prompt_appendix.is_empty() {
             let context_message = ModelMessage::user(harness_prompt_appendix);
@@ -1890,6 +1896,34 @@ async fn request_tool_approval(
     }
 }
 
+async fn await_model_admission(
+    admission: impl std::future::Future<Output = Result<NativeHarness>>,
+    controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
+) -> Result<(NativeHarness, Vec<NativeSteer>)> {
+    tokio::pin!(admission);
+    let mut queued = Vec::new();
+    loop {
+        tokio::select! {
+            biased;
+            control = next_control(controls) => match control {
+                Some(AgentTurnControl::Interrupt) => bail!("native provider turn interrupted"),
+                Some(control @ AgentTurnControl::Steer { .. }) => queued.push(control),
+                _ => {}
+            },
+            result = &mut admission => {
+                let bound = result?;
+                let mut steers = Vec::new();
+                for control in queued {
+                    if let Some(steer) = accept_tool_boundary_control(control)? {
+                        steers.push(steer);
+                    }
+                }
+                return Ok((bound, steers));
+            }
+        }
+    }
+}
+
 async fn next_control(
     controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
 ) -> Option<AgentTurnControl> {
@@ -2528,6 +2562,94 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn model_admission_is_cancellable_and_keeps_steers_pending_until_success() {
+        for outcome in ["success", "failure", "interrupt"] {
+            let (control_tx, control_rx) = mpsc::channel(4);
+            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+            let started = Arc::new(tokio::sync::Notify::new());
+            let started_in_task = started.clone();
+            let dropped = CancellationToken::new();
+            let dropped_in_task = dropped.clone();
+            let task = tokio::spawn(async move {
+                await_model_admission(
+                    async move {
+                        let _on_drop = dropped_in_task.drop_guard();
+                        started_in_task.notify_one();
+                        finish_rx.await?
+                    },
+                    &mut Some(control_rx),
+                )
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(1), started.notified())
+                .await
+                .unwrap();
+            let mut acknowledgements = Vec::new();
+            for text in ["first", "recalled", "second"] {
+                let (ack, acknowledged) = tokio::sync::oneshot::channel();
+                let admission = borg_provider::provider::SteerAdmission::pending();
+                control_tx
+                    .send(AgentTurnControl::Steer {
+                        message_id: Uuid::new_v4(),
+                        text: text.into(),
+                        attachments: vec![PathBuf::from(text)],
+                        admission: admission.clone(),
+                        ack,
+                    })
+                    .await
+                    .unwrap();
+                if text == "recalled" {
+                    assert!(admission.recall());
+                }
+                acknowledgements.push((admission, acknowledged));
+            }
+            for (admission, acknowledged) in &mut acknowledgements {
+                assert!(!admission.is_accepted());
+                assert!(matches!(
+                    acknowledged.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ));
+            }
+            match outcome {
+                "success" => finish_tx.send(Ok(NativeHarness::default())).unwrap(),
+                "failure" => finish_tx
+                    .send(Err(anyhow::anyhow!("admission denied")))
+                    .unwrap(),
+                _ => control_tx.send(AgentTurnControl::Interrupt).await.unwrap(),
+            }
+            drop(control_tx);
+            let result = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .expect("interrupt must not wait for authentication to finish")
+                .unwrap();
+            assert!(dropped.is_cancelled());
+            if outcome == "success" {
+                let (_, steers) = result.unwrap();
+                assert_eq!(
+                    steers
+                        .iter()
+                        .map(|steer| steer.text.as_str())
+                        .collect::<Vec<_>>(),
+                    ["first", "second"]
+                );
+                for steer in steers {
+                    assert_eq!(steer.attachments, [PathBuf::from(steer.text)]);
+                }
+            } else {
+                assert!(result.is_err());
+            }
+            for (index, (admission, acknowledged)) in acknowledgements.into_iter().enumerate() {
+                let accepted = outcome == "success" && index != 1;
+                assert_eq!(admission.is_accepted(), accepted);
+                assert_eq!(
+                    acknowledged.await.is_ok_and(|result| result.is_ok()),
+                    accepted
+                );
+            }
+        }
+    }
+
     struct PendingReviewClient {
         started: tokio::sync::Notify,
         dropped: CancellationToken,
@@ -2797,30 +2919,29 @@ mod tests {
             let mut steer_ack = None;
             tokio::time::timeout(Duration::from_secs(10), async {
                 while let Some(event) = events_rx.recv().await {
-                    if let SessionEventKind::ProviderEvent { kind, payload, .. } = event {
-                        if kind == "native_model_message"
-                            && matches!(
-                                serde_json::from_value::<ModelMessage>(payload).unwrap(),
-                                ModelMessage::Tool { tool_call_id, .. } if tool_call_id == "first"
-                            )
-                        {
-                            assert!(!controlled);
-                            controlled = true;
-                            let control = if interrupt {
-                                AgentTurnControl::Interrupt
-                            } else {
-                                let (ack, receiver) = tokio::sync::oneshot::channel();
-                                steer_ack = Some(receiver);
-                                AgentTurnControl::Steer {
-                                    message_id: Uuid::new_v4(),
-                                    text: "stop writing".to_string(),
-                                    attachments: Vec::new(),
-                                    admission: borg_provider::provider::SteerAdmission::pending(),
-                                    ack,
-                                }
-                            };
-                            controls_tx.send(control).await.unwrap();
-                        }
+                    if let SessionEventKind::ProviderEvent { kind, payload, .. } = event
+                        && kind == "native_model_message"
+                        && matches!(
+                            serde_json::from_value::<ModelMessage>(payload).unwrap(),
+                            ModelMessage::Tool { tool_call_id, .. } if tool_call_id == "first"
+                        )
+                    {
+                        assert!(!controlled);
+                        controlled = true;
+                        let control = if interrupt {
+                            AgentTurnControl::Interrupt
+                        } else {
+                            let (ack, receiver) = tokio::sync::oneshot::channel();
+                            steer_ack = Some(receiver);
+                            AgentTurnControl::Steer {
+                                message_id: Uuid::new_v4(),
+                                text: "stop writing".to_string(),
+                                attachments: Vec::new(),
+                                admission: borg_provider::provider::SteerAdmission::pending(),
+                                ack,
+                            }
+                        };
+                        controls_tx.send(control).await.unwrap();
                     }
                 }
             })

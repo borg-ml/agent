@@ -150,6 +150,17 @@ not open a fallback approval prompt. A held-open reviewer test verifies immediat
 control handling and request cancellation. Queued controls are checked again
 after approval/status delivery before the tool starts.
 
+Account admission also polls interruption while authentication/storage is pending.
+Steering received during admission remains unacknowledged and recallable until
+admission succeeds, then enters Borg's durable model context in arrival order.
+Failure or interruption drops the pending acknowledgements without accepting the
+messages, so the session actor retains them for a later boundary. A held-admission
+test verifies interruption, failure, ordered text/attachments, and recall without
+touching live credentials. The existing live native-session probe passed tool
+approval/execution, compaction, restart, and isolated consultation after this
+change; the stalled-admission cancellation check itself remains deterministic
+and offline.
+
 Borg commits an immutable subscription account fingerprint in its SQLite
 session authority before the first model request. It is not a credential or
 model context. Every model round checks the current account against that
@@ -220,8 +231,14 @@ codes and numeric/date fields inform the user-facing message, never raw provider
 messages or account identifiers. HTTP quota rejection emits no generation event;
 a streamed quota failure after a tool fragment returns no executable result.
 Protocol tests cover these boundaries without exhausting live account quota.
-No quota retry or billing fallback was added. Proactive quota-window reporting
-and live exhausted-account recovery remain unverified.
+No quota retry or billing fallback was added. Existing `/usage` and host provider
+admission already read subscription windows independently of the agent loop via
+`read_codex_account_rate_limits`. Its access-only app-server exchange initializes
+the connection and calls `account/rateLimits/read`; it starts no thread or model
+turn. A live host capability read returned the Codex weekly percentage and reset
+time. The native route therefore retains the existing on-demand quota view;
+there is no need to introduce a second window-event pipeline for parity. Live
+exhausted-account recovery remains unverified.
 
 ## Evidence
 
