@@ -116,7 +116,12 @@ impl CodexModelProvider {
                 // Retry only an unaccepted HTTP request, never a partial model
                 // stream or completed tool side effect.
                 drop(response);
-                access = SubscriptionAccess::read(true).await?;
+                let refreshed = SubscriptionAccess::read(true).await?;
+                ensure!(
+                    refreshed.account_id == access.account_id,
+                    "Codex account changed during authentication recovery; start a new session"
+                );
+                access = refreshed;
                 response = self
                     .send(&client, ENDPOINT, &access, &request, &body)
                     .await?;
