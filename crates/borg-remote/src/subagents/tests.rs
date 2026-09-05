@@ -2285,6 +2285,12 @@ async fn independent_sessions_share_workspace_broadcasts_exactly_once() {
 
 #[tokio::test]
 async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel() {
+    #[cfg(unix)]
+    let directory = tempfile::Builder::new()
+        .prefix("borg-dm-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    #[cfg(not(unix))]
     let directory = tempdir().unwrap();
     let sender = Uuid::new_v4();
     let recipient = Uuid::new_v4();
@@ -2337,6 +2343,30 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
     )
     .unwrap();
 
+    #[cfg(unix)]
+    let (_control_servers, mut received) = {
+        let mut servers = Vec::new();
+        let mut receivers = Vec::new();
+        for session_id in [sender, recipient] {
+            let writer = crate::SessionWriterLease::try_acquire(
+                directory.path().join(format!("{session_id}.lock")),
+            )
+            .unwrap()
+            .unwrap();
+            let (commands, receiver) = mpsc::channel(1);
+            let server = crate::LocalSessionControlServer::start(
+                crate::session_control_socket_path(directory.path(), session_id),
+                session_id,
+                &writer,
+                commands,
+            )
+            .unwrap();
+            servers.push((server, writer));
+            receivers.push(receiver);
+        }
+        (servers, receivers)
+    };
+
     let instances = sender_coordinator
         .call_tool_as(sender, "list_instances", json!({}))
         .await
@@ -2366,9 +2396,19 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
         .unwrap();
     assert_eq!(result["queued"], true);
     assert_eq!(result["recipient_count"], 1);
-    assert_eq!(result["dispatched_locally"], false);
+    assert_eq!(result["dispatched_locally"], cfg!(unix));
     assert_eq!(result["relay_pending"], false);
     let message_id: Uuid = serde_json::from_value(result["message_id"].clone()).unwrap();
+    #[cfg(unix)]
+    assert!(matches!(
+        received[1].try_recv().unwrap(),
+        HostCommand::TeamPrompt {
+            session_id,
+            message_id: delivered_id,
+            delivery: PromptDelivery::Queue,
+            ..
+        } if session_id == recipient && delivered_id == message_id
+    ));
     let unread = recipient_coordinator
         .unread_messages_for_session(recipient)
         .await
@@ -2399,6 +2439,17 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
         .await
         .unwrap();
     assert_eq!(reply["workspace_id"], result["workspace_id"]);
+    assert_eq!(reply["dispatched_locally"], cfg!(unix));
+    #[cfg(unix)]
+    assert!(matches!(
+        received[0].try_recv().unwrap(),
+        HostCommand::TeamPrompt {
+            session_id,
+            message_id: delivered_id,
+            delivery: PromptDelivery::Steer,
+            ..
+        } if session_id == sender && reply["message_id"] == delivered_id.to_string()
+    ));
     let replies = sender_coordinator
         .unread_messages_for_session(sender)
         .await

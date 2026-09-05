@@ -4356,7 +4356,7 @@ impl SubagentCoordinator {
                     match crate::send_local_session_command(
                         &socket_path,
                         id,
-                        HostCommand::Prompt {
+                        HostCommand::TeamPrompt {
                             session_id: id,
                             message_id: inbox_message.message_id,
                             text: inbox_message.text.clone(),
@@ -4548,7 +4548,7 @@ impl SubagentCoordinator {
                     match crate::send_local_session_command(
                         &socket_path,
                         id,
-                        HostCommand::Prompt {
+                        HostCommand::TeamPrompt {
                             session_id: id,
                             message_id: inbox_message.message_id,
                             text: inbox_message.text,
