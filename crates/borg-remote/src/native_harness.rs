@@ -1640,15 +1640,24 @@ async fn execute_tool(
         workflow_approved,
         call_cancel.clone(),
     );
+    await_tool_with_controls(call, call_cancel, controls).await
+}
+
+async fn await_tool_with_controls(
+    call: impl std::future::Future<Output = Result<Value>>,
+    call_cancel: Option<CancellationToken>,
+    controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
+) -> Result<(String, bool, Option<NativeSteer>)> {
     tokio::pin!(call);
+    let mut pending_steer: Option<NativeSteer> = None;
     loop {
         tokio::select! {
             result = &mut call => return Ok(match result {
-                Ok(value) => (serde_json::to_string(&value)?, false, None),
+                Ok(value) => (serde_json::to_string(&value)?, false, pending_steer),
                 Err(error) => (
                     json!({ "error": format!("{error:#}") }).to_string(),
                     true,
-                    None,
+                    pending_steer,
                 ),
             }),
             control = next_control(controls) => match control {
@@ -1673,20 +1682,14 @@ async fn execute_tool(
                     if let Some(cancel) = &call_cancel {
                         cancel.cancel();
                     }
+                    if let Some(pending) = &mut pending_steer {
+                        pending.text.push('\n');
+                        pending.text.push_str(&text);
+                        pending.attachments.extend(attachments);
+                    } else {
+                        pending_steer = Some(NativeSteer { text, attachments });
+                    }
                     let _ = ack.send(Ok(()));
-                    let result = (&mut call).await;
-                    return Ok(match result {
-                        Ok(value) => (
-                            serde_json::to_string(&value)?,
-                            false,
-                            Some(NativeSteer { text, attachments }),
-                        ),
-                        Err(error) => (
-                            json!({ "error": format!("{error:#}") }).to_string(),
-                            true,
-                            Some(NativeSteer { text, attachments }),
-                        ),
-                    });
                 }
                 Some(AgentTurnControl::Approval { .. })
                 | Some(AgentTurnControl::ProviderInteractionResponse { .. }) => {}
@@ -2484,6 +2487,74 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    #[tokio::test]
+    async fn running_tool_keeps_controls_live_after_steering() {
+        for interrupt in [false, true] {
+            let (control_tx, control_rx) = mpsc::channel(2);
+            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+            let cancel = CancellationToken::new();
+            let call_cancel = cancel.clone();
+            let task = tokio::spawn(async move {
+                await_tool_with_controls(
+                    async { Ok(finish_rx.await?) },
+                    Some(call_cancel),
+                    &mut Some(control_rx),
+                )
+                .await
+            });
+            for text in ["first correction", "second correction"] {
+                let (ack, acknowledged) = tokio::sync::oneshot::channel();
+                control_tx
+                    .send(AgentTurnControl::Steer {
+                        message_id: Uuid::new_v4(),
+                        text: text.into(),
+                        attachments: vec![PathBuf::from(text)],
+                        admission: borg_provider::provider::SteerAdmission::pending(),
+                        ack,
+                    })
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(1), acknowledged)
+                    .await
+                    .expect("steering must not wait for the running tool")
+                    .unwrap()
+                    .unwrap();
+                assert!(cancel.is_cancelled());
+            }
+            if interrupt {
+                control_tx.send(AgentTurnControl::Interrupt).await.unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(3), task)
+                    .await
+                    .expect("interrupt must retain its bounded cleanup wait")
+                    .unwrap();
+                assert!(
+                    result
+                        .err()
+                        .expect("turn must stop")
+                        .to_string()
+                        .contains("interrupted")
+                );
+            } else {
+                finish_tx.send(json!({"completed":true})).unwrap();
+                let (output, is_error, steer) = task.await.unwrap().unwrap();
+                assert!(!is_error);
+                assert_eq!(
+                    serde_json::from_str::<Value>(&output).unwrap(),
+                    json!({"completed":true})
+                );
+                let steer = steer.expect("accepted steering must reach the next model round");
+                assert_eq!(steer.text, "first correction\nsecond correction");
+                assert_eq!(
+                    steer.attachments,
+                    [
+                        PathBuf::from("first correction"),
+                        PathBuf::from("second correction")
+                    ]
+                );
+            }
+        }
+    }
 
     struct BatchClient {
         requests: Mutex<Vec<ModelTurnRequest>>,

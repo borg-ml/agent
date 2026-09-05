@@ -137,6 +137,12 @@ steering input is retained even if interruption precedes its model-message
 event. Offline loop tests exercise actual file writes and verify the second
 queued write does not run after steering or interruption.
 
+The running-tool wait also continues polling controls after accepting steering.
+Further accepted corrections retain their text and attachments in order, while
+Stop retains its bounded cleanup wait. A held-open tool test covers multiple
+steers followed by completion or interruption; no completed result is discarded
+merely because steering was accepted.
+
 Borg commits an immutable subscription account fingerprint in its SQLite
 session authority before the first model request. It is not a credential or
 model context. Every model round checks the current account against that
@@ -190,6 +196,15 @@ gap, not proof that fast mode works. Do not switch production routing on the
 strength of request-shape tests alone.
 The native-session probe with `--fast` passed tool execution, compaction, and
 restart; it verifies those workflows with fast requested, not the effective tier.
+An ephemeral read-only comparison through installed Codex accepted `priority`
+and completed successfully, but its raw-completion event exposed usage metadata
+without an effective service tier. That comparison does not resolve the mismatch.
+
+A real `getAuthStatus` refresh request completed with subscription mode retained
+and `includeToken: false`; no credential was returned to the diagnostic process.
+The native tool/compaction/restart/consultation probe passed afterwards using the
+original credential store. This verifies access after a requested refresh, not
+expired-token recovery or re-login after revocation, which still need proof.
 
 ## Evidence
 
