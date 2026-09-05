@@ -5580,9 +5580,9 @@ fn subagent_selector_shows_cumulative_usage_without_a_redundant_unit_suffix() {
 }
 
 #[test]
-fn persistent_claude_peer_shows_its_product_model() {
+fn subagent_roster_shows_full_model_ids() {
     let now = Utc::now();
-    let peer = SubagentSnapshot {
+    let mut peer = SubagentSnapshot {
         session_id: Uuid::new_v4(),
         parent_session_id: Uuid::new_v4(),
         task_name: "/root/claude".to_string(),
@@ -5599,6 +5599,11 @@ fn persistent_claude_peer_shows_its_product_model() {
     };
 
     assert_eq!(display_subagent_model(&peer), "claude-opus-5");
+
+    peer.provider = CodingProvider::Codex;
+    peer.task_name = "/root/gameplay_ui_polish".to_string();
+    peer.model = Some("gpt-6-astra".to_string());
+    assert_eq!(display_subagent_model(&peer), "gpt-6-astra");
 }
 
 #[test]
