@@ -2093,6 +2093,10 @@ async fn run_agent_session_store_kernel(
                                 }
                                 executor
                                     .compact_native(
+                                        crate::ModelAccessContext {
+                                            session_id,
+                                            store: dispatcher.session_store(),
+                                        },
                                         launch.provider,
                                         model,
                                         launch.effort.as_deref(),
@@ -2435,6 +2439,10 @@ async fn run_agent_session_store_kernel(
                 let result = async {
                     executor
                         .compact_native(
+                            crate::ModelAccessContext {
+                                session_id,
+                                store: dispatcher.session_store(),
+                            },
                             launch.provider,
                             launch
                                 .model
@@ -4076,7 +4084,7 @@ async fn run_agent_session_store_kernel(
                         });
                         executor
                             .consult(ConsultationRequest {
-                                owner_session_id: session_id,
+                                access: crate::ModelAccessContext { session_id, store: dispatcher.session_store() },
                                 message_id: Uuid::new_v4(),
                                 provider,
                                 model,

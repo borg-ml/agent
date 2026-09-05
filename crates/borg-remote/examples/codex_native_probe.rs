@@ -4,9 +4,9 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, ensure};
 use borg_remote::{
-    ApprovalDecision, CodingProvider, HostCommand, LaunchSession, LocalAgentTurnExecutor,
-    PermissionMode, ResponseLanguage, SessionEventKind, SessionStore, SqliteSessionStore,
-    run_agent_session_with_executor,
+    AgentTurnExecutor, ApprovalDecision, CodingProvider, ConsultationRequest, HostCommand,
+    LaunchSession, LocalAgentTurnExecutor, ModelAccessContext, PermissionMode, ResponseLanguage,
+    SessionEventKind, SessionStore, SqliteSessionStore, run_agent_session_with_executor,
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -39,7 +39,7 @@ async fn probe() -> Result<()> {
                     name: None, initial_prompt: Some(if resumed {
                         "Without using any tools, repeat the exact probe value you read in the previous turn."
                     } else {
-                        "This is a read-only integration probe. Use exec exactly once with cmd exactly `cat probe.txt` and action `read probe`. Do not run any other command, discover tools, or change files. Then reply with the exact file contents."
+                        "This is a read-only integration probe. Use exec exactly once with cmd exactly `cat probe.txt` and action `read probe`. Do not run any other command, discover tools, or change files. Then reply with the exact file contents. Preserve this exact value for the next turn, including through any context compaction."
                     }.into()), capabilities: Default::default(), subagent_concurrency_limit: None,
                     extension_skill_roots: Vec::new(), team_policy: None,
                 }, command_rx, events,
@@ -51,8 +51,31 @@ async fn probe() -> Result<()> {
             let mut approved = false;
             let mut tool_completed = false;
             let mut native_state = false;
+            let mut compacting = false;
             while let Some(event) = event_rx.recv().await {
                 match event.kind {
+                    SessionEventKind::ProviderEvent { kind, payload, .. }
+                        if kind == "context_compaction" && payload["status"] == "completed" =>
+                    {
+                        ensure!(
+                            compacting && payload["native"] == true,
+                            "unexpected compaction route"
+                        );
+                        ensure!(
+                            payload["summary"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .contains(&nonce),
+                            "compaction lost the exact probe value"
+                        );
+                        println!("PASS: Borg-owned account-bound compaction");
+                        return Ok(());
+                    }
+                    SessionEventKind::ProviderEvent { kind, payload, .. }
+                        if kind == "context_compaction_failed" =>
+                    {
+                        anyhow::bail!("native compaction failed: {payload}");
+                    }
                     SessionEventKind::ProviderEvent { kind, payload, .. }
                         if kind == "action/preparing" =>
                     {
@@ -130,7 +153,11 @@ async fn probe() -> Result<()> {
                             resumed || tool_completed,
                             "first turn did not execute the approved Borg tool"
                         );
-                        return Ok(());
+                        if resumed {
+                            return Ok(());
+                        }
+                        compacting = true;
+                        commands.send(HostCommand::Compact { session_id }).await?;
                     }
                     _ => {}
                 }
@@ -159,6 +186,31 @@ async fn probe() -> Result<()> {
         ensure!(journal.iter().any(|event| matches!(&event.kind,
             SessionEventKind::ProviderEvent { kind, .. } if kind == "native_tool_round_completed"
         )), "native tool-round boundary was not persisted");
+        if resumed {
+            let consultation = LocalAgentTurnExecutor::default()
+                .with_codex_model_only()
+                .consult(ConsultationRequest {
+                    access: ModelAccessContext {
+                        session_id,
+                        store: Some(store.clone()),
+                    },
+                    message_id: Uuid::new_v4(),
+                    provider: CodingProvider::Codex,
+                    model: Some(borg_provider::codex_product_model().to_string()),
+                    effort: Some(borg_provider::codex_default_effort().to_string()),
+                    cwd: root.path().to_path_buf(),
+                    response_language: ResponseLanguage::Auto,
+                    prompt: format!(
+                        "Reply with exactly this probe value and nothing else: {nonce}"
+                    ),
+                })
+                .await?;
+            ensure!(
+                consultation.final_text.trim() == nonce,
+                "consultation lost its isolated briefing"
+            );
+            println!("PASS: isolated account-bound native consultation");
+        }
         println!(
             "PASS: {}",
             if resumed {

@@ -45,7 +45,7 @@ mod workspace_snapshot;
 pub use agent::{
     AgentCompaction, AgentTurn, AgentTurnControl, AgentTurnExecutor, AgentTurnResult,
     BluWorkflowDefinition, ConsultationRequest, ConsultationResult, LocalAgentSettings,
-    LocalAgentTurnExecutor, run_agent_turn, run_agent_turn_controlled,
+    LocalAgentTurnExecutor, ModelAccessContext, run_agent_turn, run_agent_turn_controlled,
 };
 pub use autonomy::{
     AutonomyCheckpoint, AutonomyJob, AutonomyJobHandler, AutonomyJobState, AutonomyJobTransition,

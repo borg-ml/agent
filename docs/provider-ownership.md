@@ -148,7 +148,17 @@ a new session. The production CLI route is unaffected.
 Before enabling the route by default, model limits, fast mode, and subscription
 cost basis still need to flow through the native contract. Real login/refresh
 and in-flight tool control behavior still need end-to-end subscription
-verification; compaction and consultation must also use session-bound access.
+verification.
+
+Turns, compaction, and one-shot consultations now share the same host-owned
+`ModelAccessContext` admission step. The context carries the session/store only
+inside Borg, never in the model prompt. Native Codex auxiliary calls refuse
+missing durable storage before authentication. Compaction no longer checks the
+provider's old CLI routing flag; it uses the bound model client, including for
+in-turn automatic compaction. The expanded live probe passed manual Borg-owned
+compaction, exact-value replay after restart, and a tool-free isolated
+consultation under the same account binding. That compaction run reported zero
+cached tokens; it does not establish cache reuse across a rewritten summary.
 
 ## Evidence
 

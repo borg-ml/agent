@@ -141,7 +141,7 @@ pub struct BluWorkflowDefinition {
 /// conversation or provider session.
 #[derive(Debug, Clone)]
 pub struct ConsultationRequest {
-    pub owner_session_id: Uuid,
+    pub access: ModelAccessContext,
     pub message_id: Uuid,
     pub provider: CodingProvider,
     pub model: Option<String>,
@@ -149,6 +149,21 @@ pub struct ConsultationRequest {
     pub cwd: PathBuf,
     pub prompt: String,
     pub response_language: ResponseLanguage,
+}
+
+/// Host-owned access scope, never serialized into a model request.
+#[derive(Clone)]
+pub struct ModelAccessContext {
+    pub session_id: Uuid,
+    pub store: Option<crate::SqliteSessionStore>,
+}
+
+impl std::fmt::Debug for ModelAccessContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelAccessContext")
+            .field("session_id", &self.session_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +273,7 @@ pub trait AgentTurnExecutor: Send + Sync {
 
     async fn compact_native(
         &self,
+        _access: ModelAccessContext,
         _provider: CodingProvider,
         _model: &str,
         _effort: Option<&str>,
@@ -945,6 +961,8 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 .context("native consultation requires an explicit model")?;
             let (final_text, usage) = self
                 .native_harness
+                .with_model_access(request.provider, &request.access)
+                .await?
                 .consult(
                     request.provider,
                     model,
@@ -1026,13 +1044,20 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
 
     async fn compact_native(
         &self,
+        access: ModelAccessContext,
         provider: CodingProvider,
         model: &str,
         effort: Option<&str>,
         conversation: Vec<borg_provider::provider::ModelMessage>,
     ) -> Result<AgentCompaction> {
+        anyhow::ensure!(
+            self.uses_native_harness(provider),
+            "provider has no native model route"
+        );
         let (summary, usage) = self
             .native_harness
+            .with_model_access(provider, &access)
+            .await?
             .compact(provider, model, effort, conversation)
             .await?;
         Ok(AgentCompaction {
@@ -2324,6 +2349,49 @@ async fn send(events: &mpsc::Sender<SessionEventKind>, event: SessionEventKind) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "subscription-adapters")]
+    #[tokio::test]
+    async fn native_subscription_auxiliary_calls_require_durable_access_before_auth() {
+        let executor = LocalAgentTurnExecutor::default().with_codex_model_only();
+        let access = ModelAccessContext {
+            session_id: Uuid::new_v4(),
+            store: None,
+        };
+        let model = borg_provider::codex_product_model();
+        let compact = executor
+            .compact_native(
+                access.clone(),
+                CodingProvider::Codex,
+                model,
+                Some("low"),
+                vec![borg_provider::provider::ModelMessage::user(
+                    "private conversation",
+                )],
+            )
+            .await
+            .unwrap_err();
+        let consult = executor
+            .consult(ConsultationRequest {
+                access,
+                message_id: Uuid::new_v4(),
+                provider: CodingProvider::Codex,
+                model: Some(model.to_string()),
+                effort: Some("low".to_string()),
+                cwd: PathBuf::from("."),
+                prompt: "private briefing".to_string(),
+                response_language: ResponseLanguage::Auto,
+            })
+            .await
+            .unwrap_err();
+        for error in [compact, consult] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("requires durable Borg session storage")
+            );
+        }
+    }
 
     #[test]
     fn coding_prompt_requires_progress_and_lean_tool_actions() {

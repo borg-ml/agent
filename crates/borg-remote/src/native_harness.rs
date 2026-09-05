@@ -114,15 +114,34 @@ impl NativeHarness {
         events: mpsc::Sender<SessionEventKind>,
         controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
+        self.with_model_access(
+            turn.provider,
+            &crate::ModelAccessContext {
+                session_id: turn.session_id,
+                store: turn.agent_tools.session_store(),
+            },
+        )
+        .await?
+        .run_bound(turn, events, controls)
+        .await
+    }
+
+    pub(crate) async fn with_model_access(
+        &self,
+        provider: crate::CodingProvider,
+        access: &crate::ModelAccessContext,
+    ) -> Result<Self> {
+        #[cfg(not(feature = "subscription-adapters"))]
+        let _ = (provider, access);
         #[cfg(feature = "subscription-adapters")]
-        if turn.provider == crate::CodingProvider::Codex {
-            let store = turn
-                .agent_tools
-                .session_store()
+        if provider == crate::CodingProvider::Codex {
+            let store = access
+                .store
+                .as_ref()
                 .context("subscription model access requires durable Borg session storage")?;
             let identity = borg_provider::provider::CodexModelProvider::account_identity().await?;
             store
-                .bind_model_access(turn.session_id, turn.provider, &identity)
+                .bind_model_access(access.session_id, provider, &identity)
                 .await?;
             let scoped = Self {
                 model_client: Arc::new(ProviderModelClient {
@@ -131,9 +150,9 @@ impl NativeHarness {
                 }),
                 ..self.clone()
             };
-            return scoped.run_bound(turn, events, controls).await;
+            return Ok(scoped);
         }
-        self.run_bound(turn, events, controls).await
+        Ok(self.clone())
     }
 
     async fn run_bound(
@@ -617,10 +636,6 @@ impl NativeHarness {
         response_language: crate::ResponseLanguage,
         prompt: &str,
     ) -> Result<(String, ProviderCallUsage)> {
-        anyhow::ensure!(
-            provider.uses_native_harness(),
-            "{provider:?} does not use Borg's native model harness"
-        );
         let mut system_prompt =
             "You are a second-opinion consultant in a Borg multi-model workflow. Analyze the complete briefing supplied by the caller, identify important omissions or disagreements, and return a self-contained response that the main agent can reconcile. Do not modify files, call tools, or ask the user for clarification.".to_string();
         if let Some(instruction) = response_language.instruction() {
@@ -684,10 +699,6 @@ impl NativeHarness {
         effort: Option<&str>,
         conversation: Vec<ModelMessage>,
     ) -> Result<(String, ProviderCallUsage)> {
-        anyhow::ensure!(
-            provider.uses_native_harness(),
-            "{provider:?} does not use Borg's native harness"
-        );
         anyhow::ensure!(
             !conversation.is_empty(),
             "there is no native conversation to compact yet"
