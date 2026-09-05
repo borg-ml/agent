@@ -9216,7 +9216,9 @@ fn nested_wheel_motion_applies_a_coalesced_gesture_in_one_render_frame() {
     motion.push(event_lines);
     let mut frames = 0;
     while motion.is_active() {
-        scroll = motion.advance_immediately(scroll, 500);
+        let (next, remainder) = motion.advance_immediately(scroll, 500);
+        assert_eq!(remainder, 0);
+        scroll = next;
         frames += 1;
     }
 
@@ -9557,43 +9559,41 @@ fn action_viewport_uses_up_to_one_third_of_the_terminal() {
 }
 
 #[test]
-fn nested_tool_scroll_keeps_momentum_out_of_the_transcript() {
-    let started_at = Instant::now();
-    let mut capture = None;
+fn nested_tool_scroll_passes_boundary_overflow_without_a_gesture_pause() {
+    for direction in [-1, 1] {
+        let mut inner = ScrollMotion::default();
+        let mut outer = ScrollMotion::default();
+        let mut inner_offset = if direction < 0 { 2 } else { 10 };
+        let mut outer_offset = 100;
+        // Every burst is part of the same continuous gesture. The first one
+        // crosses the inner edge; every later one starts at that edge.
+        for burst in [5, 3, 12, 1, 6] {
+            inner.push(direction * burst);
+            let (next, remainder) = inner.advance_immediately(inner_offset, 12);
+            let moved = next.abs_diff(inner_offset) as isize;
+            assert_eq!(
+                moved + remainder.abs(),
+                burst,
+                "no wheel input may disappear at an inner edge"
+            );
+            assert_ne!(remainder, 0);
+            inner_offset = next;
+            outer.push(-remainder);
+            let next_outer = outer.advance(outer_offset, 200);
+            assert_ne!(
+                next_outer, outer_offset,
+                "the same frame must move the outer viewport"
+            );
+            outer_offset = next_outer;
+        }
+        assert_eq!(inner_offset, if direction < 0 { 0 } else { 12 });
 
-    assert!(nested_scroll_consumed(
-        &mut capture,
-        4,
-        -1,
-        true,
-        started_at,
-    ));
-    assert!(nested_scroll_consumed(
-        &mut capture,
-        4,
-        -1,
-        false,
-        started_at + Duration::from_millis(50),
-    ));
-    for millis in [100, 150, 200] {
-        assert!(nested_scroll_consumed(
-            &mut capture,
-            4,
-            -1,
-            false,
-            started_at + Duration::from_millis(millis),
-        ));
+        // Reversing at the edge immediately moves the inner viewport again.
+        inner.push(-direction * 3);
+        let (next, remainder) = inner.advance_immediately(inner_offset, 12);
+        assert_eq!(next.abs_diff(inner_offset), 3);
+        assert_eq!(remainder, 0);
     }
-    assert!(!nested_scroll_consumed(
-        &mut capture,
-        4,
-        -1,
-        false,
-        started_at
-            + Duration::from_millis(50)
-            + NESTED_SCROLL_GESTURE_GAP
-            + Duration::from_millis(1),
-    ));
 }
 
 #[test]

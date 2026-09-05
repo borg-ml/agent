@@ -101,7 +101,6 @@ const DIRECTOR_CONTEXT_BOUNDARY: &str = "— context provided by director agent 
 const CTRL_C_SEQUENCE_WINDOW: Duration = Duration::from_secs(1);
 const COPY_NOTICE_DURATION: Duration = Duration::from_secs(5);
 const SPLASH_ANIMATION_DURATION: Duration = Duration::from_millis(1_500);
-const NESTED_SCROLL_GESTURE_GAP: Duration = Duration::from_millis(200);
 const WHEEL_SCROLL_VIEWPORT_DIVISOR: usize = 6;
 const MIN_WHEEL_SCROLL_LINES_PER_EVENT: usize = 1;
 const MAX_WHEEL_SCROLL_LINES_PER_EVENT: usize = 12;
@@ -368,13 +367,6 @@ fn parse_key_chord(value: &str) -> Result<KeyChord> {
         modifiers,
         label: value.to_ascii_lowercase(),
     })
-}
-
-#[derive(Clone, Copy)]
-struct NestedScrollCapture {
-    tool_run_start: usize,
-    direction: isize,
-    last_movement: Instant,
 }
 
 struct NestedScrollMotion {
@@ -1040,7 +1032,6 @@ pub struct BorgTerminal {
     fast_status_hovered: bool,
     permission_status_area: Option<Rect>,
     permission_status_hovered: bool,
-    nested_scroll_capture: Option<NestedScrollCapture>,
     nested_scroll_motion: Option<NestedScrollMotion>,
     text_selection: Option<TextSelection>,
     composer_selection: Option<ComposerSelection>,
@@ -2089,7 +2080,6 @@ impl BorgTerminal {
             fast_status_hovered: false,
             permission_status_area: None,
             permission_status_hovered: false,
-            nested_scroll_capture: None,
             nested_scroll_motion: None,
             text_selection: None,
             composer_selection: None,
@@ -2228,7 +2218,6 @@ impl BorgTerminal {
         self.fast_status_hovered = false;
         self.permission_status_area = None;
         self.permission_status_hovered = false;
-        self.nested_scroll_capture = None;
         self.nested_scroll_motion = None;
         self.text_selection = None;
         self.pending_transcript_click = None;
@@ -4658,32 +4647,15 @@ impl BorgTerminal {
                             self.history_page_requested = !nested_scrolled;
                             return Ok(UiAction::None);
                         }
-                        let consumed = if let Some((start, max_offset)) = hovered_tool_run {
-                            let can_move = self.transcript.tool_run_offset(start, max_offset) > 0;
-                            if can_move {
-                                let terminal_height =
-                                    self.terminal.size().map(|size| size.height).unwrap_or(1);
-                                self.queue_nested_wheel_scroll(
-                                    start,
-                                    max_offset,
-                                    -nested_wheel_scroll_distance(
-                                        terminal_height,
-                                        scroll_repetitions,
-                                    ),
-                                );
-                            }
-                            nested_scroll_consumed(
-                                &mut self.nested_scroll_capture,
+                        if let Some((start, max_offset)) = hovered_tool_run {
+                            let terminal_height =
+                                self.terminal.size().map(|size| size.height).unwrap_or(1);
+                            self.queue_nested_wheel_scroll(
                                 start,
-                                -1,
-                                can_move,
-                                Instant::now(),
-                            )
+                                max_offset,
+                                -nested_wheel_scroll_distance(terminal_height, scroll_repetitions),
+                            );
                         } else {
-                            self.nested_scroll_capture = None;
-                            false
-                        };
-                        if !consumed {
                             self.history_page_requested = self.focused_tool.is_none();
                             let viewport_height =
                                 self.transcript_viewport_area.map_or(1, |area| area.height);
@@ -4726,34 +4698,16 @@ impl BorgTerminal {
                             self.history_page_requested = false;
                             return Ok(UiAction::None);
                         }
-                        let consumed = if let Some((start, max_offset)) = hovered_tool_run {
-                            let can_move =
-                                self.transcript.tool_run_offset(start, max_offset) < max_offset;
-                            if can_move {
-                                let terminal_height =
-                                    self.terminal.size().map(|size| size.height).unwrap_or(1);
-                                self.queue_nested_wheel_scroll(
-                                    start,
-                                    max_offset,
-                                    nested_wheel_scroll_distance(
-                                        terminal_height,
-                                        scroll_repetitions,
-                                    ),
-                                );
-                            }
-                            nested_scroll_consumed(
-                                &mut self.nested_scroll_capture,
+                        self.history_page_requested = false;
+                        if let Some((start, max_offset)) = hovered_tool_run {
+                            let terminal_height =
+                                self.terminal.size().map(|size| size.height).unwrap_or(1);
+                            self.queue_nested_wheel_scroll(
                                 start,
-                                1,
-                                can_move,
-                                Instant::now(),
-                            )
+                                max_offset,
+                                nested_wheel_scroll_distance(terminal_height, scroll_repetitions),
+                            );
                         } else {
-                            self.nested_scroll_capture = None;
-                            false
-                        };
-                        if !consumed {
-                            self.history_page_requested = false;
                             let viewport_height =
                                 self.transcript_viewport_area.map_or(1, |area| area.height);
                             self.queue_wheel_scroll(-wheel_scroll_distance(
@@ -4803,38 +4757,7 @@ impl BorgTerminal {
     }
 
     pub fn advance_scroll_frame(&mut self) {
-        let nested_update = self.nested_scroll_motion.as_mut().map(|nested| {
-            let current = self
-                .transcript
-                .tool_run_offset(nested.tool_run_start, nested.max_offset);
-            // Changing an actions viewport invalidates the transcript render
-            // cache. Apply the complete coalesced wheel gesture in one frame
-            // so a long thread is rebuilt once, rather than once per eased
-            // animation step. Main transcript scrolling does not invalidate
-            // that cache and can keep its smoother multi-frame motion.
-            let next = nested
-                .motion
-                .advance_immediately(current, nested.max_offset);
-            (nested.tool_run_start, nested.max_offset, current, next)
-        });
-        if let Some((start, max_offset, current, next)) = nested_update
-            && next != current
-        {
-            let delta = if next >= current {
-                isize::try_from(next - current).unwrap_or(isize::MAX)
-            } else {
-                -isize::try_from(current - next).unwrap_or(isize::MAX)
-            };
-            self.transcript.scroll_tool_run(start, max_offset, delta);
-            self.invalidate_transcript_render_cache();
-        }
-        if self
-            .nested_scroll_motion
-            .as_ref()
-            .is_some_and(|nested| !nested.motion.is_active())
-        {
-            self.nested_scroll_motion = None;
-        }
+        self.advance_nested_scroll_frame();
         let scroll_was_active = self.scroll_motion.is_active();
         self.scroll_from_bottom = self
             .scroll_motion
@@ -4865,6 +4788,48 @@ impl BorgTerminal {
         }
     }
 
+    fn advance_nested_scroll_frame(&mut self) {
+        let Some(mut nested) = self.nested_scroll_motion.take() else {
+            return;
+        };
+        let current = self
+            .transcript
+            .tool_run_offset(nested.tool_run_start, nested.max_offset);
+        // Inner scrolling invalidates the render cache. Coalesce it into one
+        // frame, then ease any overflow through the ordinary transcript path.
+        let (next, remainder) = nested
+            .motion
+            .advance_immediately(current, nested.max_offset);
+        if next != current {
+            let delta = if next >= current {
+                isize::try_from(next - current).unwrap_or(isize::MAX)
+            } else {
+                -isize::try_from(current - next).unwrap_or(isize::MAX)
+            };
+            self.transcript
+                .scroll_tool_run(nested.tool_run_start, nested.max_offset, delta);
+            self.invalidate_transcript_render_cache();
+        }
+        if remainder != 0 {
+            // Inner offsets grow downward; transcript offsets grow upward.
+            // Transfer even the partial event that crosses the edge, keeping
+            // the outer viewport's normal wheel speed and pending momentum.
+            let terminal_height = self.terminal.size().map(|size| size.height).unwrap_or(1);
+            let viewport_height = self.transcript_viewport_area.map_or(1, |area| area.height);
+            let lines = remainder
+                .unsigned_abs()
+                .saturating_mul(wheel_scroll_lines(viewport_height) as usize)
+                .div_ceil(nested_wheel_scroll_lines(terminal_height) as usize);
+            let lines = isize::try_from(lines).unwrap_or(isize::MAX);
+            self.history_page_requested = remainder < 0 && self.focused_tool.is_none();
+            if remainder < 0 {
+                self.transcript.follow_tail = false;
+            }
+            self.scroll_motion
+                .push(if remainder < 0 { lines } else { -lines });
+        }
+    }
+
     pub fn has_pending_scroll_frame(&self) -> bool {
         self.scroll_motion.is_active()
             || self
@@ -4877,7 +4842,8 @@ impl BorgTerminal {
     }
 
     fn queue_wheel_scroll(&mut self, lines: isize) {
-        self.nested_scroll_motion = None;
+        self.advance_nested_scroll_frame();
+        self.history_page_requested = lines > 0 && self.focused_tool.is_none();
         if lines > 0 {
             self.transcript.follow_tail = false;
         } else if lines < 0 && self.scroll_from_bottom == 0 {
@@ -4887,7 +4853,16 @@ impl BorgTerminal {
     }
 
     fn queue_nested_wheel_scroll(&mut self, start: usize, max_offset: usize, lines: isize) {
-        self.scroll_motion.cancel();
+        if self
+            .nested_scroll_motion
+            .as_ref()
+            .is_some_and(|nested| nested.tool_run_start != start)
+        {
+            self.advance_nested_scroll_frame();
+        }
+        if self.scroll_motion.remaining_lines.signum() == lines.signum() {
+            self.scroll_motion.cancel();
+        }
         let nested = self
             .nested_scroll_motion
             .get_or_insert_with(|| NestedScrollMotion {
@@ -4895,15 +4870,7 @@ impl BorgTerminal {
                 max_offset,
                 motion: ScrollMotion::default(),
             });
-        if nested.tool_run_start != start {
-            *nested = NestedScrollMotion {
-                tool_run_start: start,
-                max_offset,
-                motion: ScrollMotion::default(),
-            };
-        } else {
-            nested.max_offset = max_offset;
-        }
+        nested.max_offset = max_offset;
         nested.motion.push(lines);
     }
 
@@ -9754,15 +9721,22 @@ impl ScrollMotion {
         )
     }
 
-    fn advance_immediately(&mut self, scroll_from_bottom: usize, scroll_max: usize) -> usize {
+    fn advance_immediately(
+        &mut self,
+        scroll_from_bottom: usize,
+        scroll_max: usize,
+    ) -> (usize, isize) {
         let requested = std::mem::take(&mut self.remaining_lines);
-        if requested > 0 {
+        let next = if requested > 0 {
             scroll_from_bottom
                 .saturating_add(requested as usize)
                 .min(scroll_max)
         } else {
             scroll_from_bottom.saturating_sub(requested.unsigned_abs())
-        }
+        };
+        let moved = isize::try_from(next.abs_diff(scroll_from_bottom)).unwrap_or(isize::MAX)
+            * requested.signum();
+        (next, requested.saturating_sub(moved))
     }
 
     fn advance_with_limits(
@@ -12501,33 +12475,6 @@ fn visible_row_ranges(
     let first = rows.partition_point(|(_, _, end)| *end <= scroll_start);
     let count = rows[first..].partition_point(|(_, start, _)| *start < visible_end);
     &rows[first..first + count]
-}
-
-fn nested_scroll_consumed(
-    capture: &mut Option<NestedScrollCapture>,
-    tool_run_start: usize,
-    direction: isize,
-    moved: bool,
-    now: Instant,
-) -> bool {
-    let continues_captured_gesture = capture.is_some_and(|capture| {
-        capture.tool_run_start == tool_run_start
-            && capture.direction == direction
-            && now.saturating_duration_since(capture.last_movement) <= NESTED_SCROLL_GESTURE_GAP
-    });
-    if moved {
-        *capture = Some(NestedScrollCapture {
-            tool_run_start,
-            direction,
-            last_movement: now,
-        });
-        true
-    } else if continues_captured_gesture {
-        true
-    } else {
-        *capture = None;
-        false
-    }
 }
 
 fn viewport_hit_area(
