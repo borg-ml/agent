@@ -16,6 +16,7 @@ async fn main() -> Result<()> {
 }
 
 async fn probe() -> Result<()> {
+    let fast = std::env::args().any(|arg| arg == "--fast");
     let account = CodexModelProvider::account_identity().await?;
     let provider = CodexModelProvider {
         model: borg_provider::runtime::codex_product_model().into(),
@@ -23,6 +24,7 @@ async fn probe() -> Result<()> {
     };
     let session = uuid::Uuid::new_v4().to_string();
     let mut request = ModelTurnRequest {
+        fast,
         request_id: Some(uuid::Uuid::new_v4().to_string()),
         session_id: Some(session.clone()), prompt_cache_key: Some(session),
         messages: vec![
@@ -49,6 +51,16 @@ async fn probe() -> Result<()> {
     let first = provider
         .model_turn_for_account(request.clone(), Some(tx), &account)
         .await?;
+    if fast {
+        ensure!(
+            first.raw_response["service_tier"] == "priority",
+            "subscription response did not confirm priority routing: {:?}",
+            first
+                .raw_response
+                .get("service_tier")
+                .and_then(serde_json::Value::as_str)
+        );
+    }
     ensure!(
         progress.await?.is_some(),
         "no tool generation event received"
@@ -78,6 +90,16 @@ async fn probe() -> Result<()> {
     let second = provider
         .model_turn_for_account(request, None, &account)
         .await?;
+    if fast {
+        ensure!(
+            second.raw_response["service_tier"] == "priority",
+            "second subscription response did not confirm priority routing: {:?}",
+            second
+                .raw_response
+                .get("service_tier")
+                .and_then(serde_json::Value::as_str)
+        );
+    }
     let (content, _, calls) = second
         .assistant_parts()
         .context("expected final response")?;

@@ -2100,6 +2100,7 @@ async fn run_agent_session_store_kernel(
                                         launch.provider,
                                         model,
                                         launch.effort.as_deref(),
+                                        launch.fast.unwrap_or(false),
                                         conversation,
                                     )
                                     .await
@@ -2449,6 +2450,7 @@ async fn run_agent_session_store_kernel(
                                 .as_deref()
                                 .context("native context compaction requires a model")?,
                             launch.effort.as_deref(),
+                            launch.fast.unwrap_or(false),
                             native_conversation(journal.context_events(), launch.provider)?,
                         )
                         .await

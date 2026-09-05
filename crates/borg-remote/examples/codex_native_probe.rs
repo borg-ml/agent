@@ -19,6 +19,7 @@ async fn main() -> Result<()> {
 }
 
 async fn probe() -> Result<()> {
+    let fast = std::env::args().any(|arg| arg == "--fast");
     let root = tempfile::tempdir()?;
     let nonce = Uuid::new_v4().to_string();
     tokio::fs::write(root.path().join("probe.txt"), &nonce).await?;
@@ -34,7 +35,7 @@ async fn probe() -> Result<()> {
                 LaunchSession {
                     request_id: message_id, cwd: cwd.clone(), provider: CodingProvider::Codex,
                     model: Some(borg_provider::codex_product_model().into()),
-                    effort: Some(borg_provider::codex_default_effort().into()), fast: Some(false),
+                    effort: Some(borg_provider::codex_default_effort().into()), fast: Some(fast),
                     response_language: ResponseLanguage::Auto, permission_mode: PermissionMode::Manual,
                     name: None, initial_prompt: Some(if resumed {
                         "Without using any tools, repeat the exact probe value you read in the previous turn."

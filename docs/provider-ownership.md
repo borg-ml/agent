@@ -146,9 +146,8 @@ The additive table upgrade preserves existing sessions. Old subscription
 history without account provenance is refused by the opt-in route and requires
 a new session. The production CLI route is unaffected.
 
-Before enabling the route by default, fast mode still needs to flow through the
-native contract. Real login/refresh and in-flight tool control behavior still
-need end-to-end subscription verification.
+Before enabling the route by default, effective fast routing, real login/refresh,
+and in-flight tool control behavior still need end-to-end subscription verification.
 
 Turns, compaction, and one-shot consultations now share the same host-owned
 `ModelAccessContext` admission step. The context carries the session/store only
@@ -175,6 +174,22 @@ context limits and unavailable model/effort selections fail explicitly. Catalog
 authentication recovery checks account continuity just like model requests.
 The live native probe received a 258,400-token usable context limit for Astra/low,
 so Borg's existing context-threshold policy now has a provider-derived limit.
+
+The native model request now carries the session's explicit fast setting through
+model rounds, approval reviews, and manual/automatic compaction. Codex validates
+catalog support and sends `service_tier: "priority"`; standard requests omit it.
+Compatible routes reject unsupported fast requests instead of ignoring the flag.
+Isolated consultations use standard routing because consultation profiles do not
+select a speed tier. Wire tests verify the outgoing priority field, and loop tests
+verify the setting survives a steered follow-up model round.
+
+`codex_model_probe --fast` additionally requires the live response to confirm
+priority routing. The live endpoint instead reported `service_tier: "default"`
+on two attempts despite the priority request. This is an unresolved migration
+gap, not proof that fast mode works. Do not switch production routing on the
+strength of request-shape tests alone.
+The native-session probe with `--fast` passed tool execution, compaction, and
+restart; it verifies those workflows with fast requested, not the effective tier.
 
 ## Evidence
 

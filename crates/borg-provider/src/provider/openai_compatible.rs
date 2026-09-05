@@ -231,6 +231,13 @@ impl OpenAiCompatibleProvider {
             stdout: String::new(),
             stderr: String::new(),
         };
+        if request.fast {
+            return Err(ProviderCallError {
+                message: "fast mode is not supported by this compatible model route".to_string(),
+                trace: Box::new(trace),
+                session_id: None,
+            });
+        }
         let api_key = gateway
             .and_then(|gateway| {
                 (!gateway.bearer_token.trim().is_empty()).then(|| gateway.bearer_token.clone())
@@ -1675,6 +1682,7 @@ mod tests {
         let result = provider
             .model_turn_via_profile(
                 ModelTurnRequest {
+                    fast: false,
                     request_id: Some("kimi-test".to_string()),
                     session_id: None,
                     prompt_cache_key: None,
@@ -1975,6 +1983,7 @@ mod tests {
         let result = provider
             .model_turn_via_profile(
                 ModelTurnRequest {
+                    fast: false,
                     request_id: Some("openrouter-test".to_string()),
                     session_id: Some("borg-session:stable".to_string()),
                     prompt_cache_key: Some("borg-prefix:test".to_string()),

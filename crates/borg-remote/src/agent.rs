@@ -277,6 +277,7 @@ pub trait AgentTurnExecutor: Send + Sync {
         _provider: CodingProvider,
         _model: &str,
         _effort: Option<&str>,
+        _fast: bool,
         _conversation: Vec<borg_provider::provider::ModelMessage>,
     ) -> Result<AgentCompaction> {
         anyhow::bail!("native context compaction is not supported by this provider")
@@ -1048,6 +1049,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         provider: CodingProvider,
         model: &str,
         effort: Option<&str>,
+        fast: bool,
         conversation: Vec<borg_provider::provider::ModelMessage>,
     ) -> Result<AgentCompaction> {
         anyhow::ensure!(
@@ -1058,7 +1060,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             .native_harness
             .with_model_access(provider, &access)
             .await?
-            .compact(provider, model, effort, conversation)
+            .compact(provider, model, effort, fast, conversation)
             .await?;
         Ok(AgentCompaction {
             summary,
@@ -2365,6 +2367,7 @@ mod tests {
                 CodingProvider::Codex,
                 model,
                 Some("low"),
+                false,
                 vec![borg_provider::provider::ModelMessage::user(
                     "private conversation",
                 )],

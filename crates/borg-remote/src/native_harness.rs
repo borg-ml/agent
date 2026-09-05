@@ -266,6 +266,7 @@ impl NativeHarness {
                     &model,
                     turn.effort.as_deref(),
                     ModelTurnRequest {
+                        fast: turn.fast.unwrap_or(false),
                         request_id: Some(format!("{}:{model_round}", turn.message_id)),
                         session_id: Some(provider_session_id.clone()),
                         prompt_cache_key: Some(prompt_cache_key.clone()),
@@ -492,6 +493,7 @@ impl NativeHarness {
                                     NativeApprovalContext {
                                         provider: turn.provider,
                                         model: &model,
+                                        fast: turn.fast.unwrap_or(false),
                                     },
                                     &events,
                                     &mut controls,
@@ -562,6 +564,7 @@ impl NativeHarness {
                         turn.provider,
                         &model,
                         turn.effort.as_deref(),
+                        turn.fast.unwrap_or(false),
                         messages.clone(),
                     )
                     .await;
@@ -649,6 +652,7 @@ impl NativeHarness {
                 model,
                 effort,
                 ModelTurnRequest {
+                    fast: false,
                     request_id: Some(format!("consult:{}", Uuid::new_v4())),
                     session_id: None,
                     prompt_cache_key: None,
@@ -697,6 +701,7 @@ impl NativeHarness {
         provider: crate::CodingProvider,
         model: &str,
         effort: Option<&str>,
+        fast: bool,
         conversation: Vec<ModelMessage>,
     ) -> Result<(String, ProviderCallUsage)> {
         anyhow::ensure!(
@@ -721,6 +726,7 @@ impl NativeHarness {
                 model,
                 effort,
                 ModelTurnRequest {
+                    fast,
                     request_id: Some(format!("compact:{}", Uuid::new_v4())),
                     session_id: None,
                     prompt_cache_key: None,
@@ -1694,6 +1700,7 @@ async fn execute_tool(
 struct NativeApprovalContext<'a> {
     provider: crate::CodingProvider,
     model: &'a str,
+    fast: bool,
 }
 
 struct AutomaticReview {
@@ -1723,6 +1730,7 @@ async fn review_tool_automatically(
     input: &Value,
 ) -> Result<AutomaticReview> {
     let request = ModelTurnRequest {
+        fast: context.fast,
         request_id: Some(format!("approval-review:{}", Uuid::new_v4())),
         session_id: None,
         prompt_cache_key: None,
@@ -2550,7 +2558,7 @@ mod tests {
                 output_schema: None,
                 model: Some("test-model".to_string()),
                 effort: None,
-                fast: None,
+                fast: Some(true),
                 response_language: crate::ResponseLanguage::Auto,
                 permission_mode: PermissionMode::FullAccess,
                 conversation: Vec::new(),
@@ -2634,6 +2642,14 @@ mod tests {
                 "queued action must not execute"
             );
             let result = task.await.unwrap();
+            assert!(
+                client
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.fast)
+            );
             if interrupt {
                 assert!(result.unwrap_err().to_string().contains("interrupted"));
                 assert_eq!(client.requests.lock().unwrap().len(), 1);
@@ -2730,6 +2746,7 @@ mod tests {
                 "test-model",
                 None,
                 ModelTurnRequest {
+                    fast: false,
                     request_id: Some("test-request".to_string()),
                     session_id: None,
                     prompt_cache_key: None,

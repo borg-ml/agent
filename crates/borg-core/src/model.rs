@@ -176,6 +176,8 @@ impl ModelToolDefinition {
 
 #[derive(Debug, Clone)]
 pub struct ModelTurnRequest {
+    /// Explicit fast routing; adapters must reject it when unsupported.
+    pub fast: bool,
     /// Stable idempotency key for one provider request.
     pub request_id: Option<String>,
     /// Stable provider-routing identity for the whole logical session.

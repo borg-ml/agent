@@ -34,6 +34,10 @@ pub struct CodexModelProvider {
 struct ModelCapabilities {
     slug: String,
     supported_reasoning_levels: Vec<ReasoningLevel>,
+    #[serde(default)]
+    service_tiers: Vec<ServiceTier>,
+    #[serde(default)]
+    additional_speed_tiers: Vec<String>,
     context_window: Option<u64>,
     max_context_window: Option<u64>,
     #[serde(default = "default_context_percent")]
@@ -45,12 +49,25 @@ struct ReasoningLevel {
     effort: String,
 }
 
+#[derive(Clone, Deserialize)]
+struct ServiceTier {
+    id: String,
+}
+
 // This is the wire protocol's default when the catalog omits the field.
 fn default_context_percent() -> u64 {
     95
 }
 
 impl ModelCapabilities {
+    fn supports_fast(&self) -> bool {
+        self.service_tiers.iter().any(|tier| tier.id == "priority")
+            || self
+                .additional_speed_tiers
+                .iter()
+                .any(|tier| tier == "fast")
+    }
+
     fn usable_context_window(&self) -> Result<u64> {
         let window = self
             .context_window
@@ -274,6 +291,8 @@ impl CodexModelProvider {
             ensure!(capabilities.supported_reasoning_levels.iter().any(|level| level.effort == self.effort),
                 "selected effort is not supported by this Codex model");
             let context_window = capabilities.usable_context_window()?;
+            ensure!(!request.fast || capabilities.supports_fast(),
+                "fast mode is not supported by this Codex model");
             let mut response = self
                 .send(
                     &client,
@@ -430,6 +449,9 @@ impl CodexModelProvider {
             "input": input, "tools": tools, "tool_choice": "auto", "parallel_tool_calls": true,
             "reasoning": {"effort": self.effort, "summary": "auto"},
             "store": false, "stream": true, "include": ["reasoning.encrypted_content"]});
+        if request.fast {
+            body["service_tier"] = json!("priority");
+        }
         if let Some(key) = &request.prompt_cache_key {
             body["prompt_cache_key"] = json!(key);
         }
@@ -714,6 +736,48 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     #[test]
+    fn fast_mode_uses_catalog_capabilities_and_explicit_priority_routing() {
+        let provider = CodexModelProvider {
+            model: "test-model".into(),
+            effort: "low".into(),
+        };
+        let mut request = ModelTurnRequest {
+            fast: false,
+            request_id: None,
+            session_id: None,
+            prompt_cache_key: None,
+            messages: vec![ModelMessage::user("test")],
+            tools: Vec::new(),
+            output_schema: None,
+        };
+        assert!(
+            provider
+                .request_body(&request)
+                .unwrap()
+                .get("service_tier")
+                .is_none()
+        );
+        request.fast = true;
+        assert_eq!(
+            provider.request_body(&request).unwrap()["service_tier"],
+            "priority"
+        );
+        for (tiers, legacy, expected) in [
+            (json!([]), json!([]), false),
+            (json!([{"id":"flex"}]), json!([]), false),
+            (json!([{"id":"priority"}]), json!([]), true),
+            (json!([]), json!(["fast"]), true),
+        ] {
+            let capabilities: ModelCapabilities = serde_json::from_value(json!({
+                "slug":"test-model", "supported_reasoning_levels":[{"effort":"low"}],
+                "service_tiers":tiers, "additional_speed_tiers":legacy
+            }))
+            .unwrap();
+            assert_eq!(capabilities.supports_fast(), expected);
+        }
+    }
+
+    #[test]
     fn catalog_context_limits_preserve_provider_headroom_without_overflow() {
         let mut metadata = json!({
             "slug": "test-model", "supported_reasoning_levels": [{"effort": "low"}],
@@ -763,6 +827,7 @@ mod tests {
         };
         assert_eq!(original.identity(), refreshed.identity());
         let request = ModelTurnRequest {
+            fast: false,
             request_id: None,
             session_id: Some("session".into()),
             prompt_cache_key: None,
@@ -829,6 +894,7 @@ mod tests {
                 }
                 let body: Value = serde_json::from_slice(&request[end..end + len]).unwrap();
                 assert_eq!(body["store"], false);
+                assert_eq!(body["service_tier"], "priority");
                 assert_eq!(body["prompt_cache_key"], "cache");
                 assert_eq!(body["tools"][0]["name"], "inspect");
                 socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
@@ -856,7 +922,7 @@ mod tests {
                 socket.write_all(&frame.as_bytes()[7..]).await.unwrap();
             });
             let provider = CodexModelProvider { model: "gpt-6-astra".into(), effort: "low".into() };
-            let mut request = ModelTurnRequest { request_id: Some("request".into()), session_id: Some("session".into()),
+            let mut request = ModelTurnRequest { fast: true, request_id: Some("request".into()), session_id: Some("session".into()),
                 prompt_cache_key: Some("cache".into()), messages: vec![ModelMessage::user("Inspect.")],
                 tools: vec![super::super::ModelToolDefinition::new("inspect", "Inspect", json!({"type":"object"})).unwrap()], output_schema: None };
             let access = SubscriptionAccess { token: "test-token".into(), account_id: "test-account".into() };
