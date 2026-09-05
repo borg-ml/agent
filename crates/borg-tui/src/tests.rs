@@ -6559,6 +6559,7 @@ fn resume_picker_uses_a_balanced_two_column_layout() {
                     ),
                     section: Some("Current directory".to_string()),
                     key_hint: None,
+                    disabled: false,
                 },
                 PickerOption {
                     label: "Jul 26 18:56 · No user prompt recorded".to_string(),
@@ -6566,6 +6567,7 @@ fn resume_picker_uses_a_balanced_two_column_layout() {
                     preview: None,
                     section: Some("All directories".to_string()),
                     key_hint: None,
+                    disabled: false,
                 },
             ],
             selected: 0,
@@ -6712,6 +6714,7 @@ fn picker_hit_offsets_match_rendered_rows_with_sections() {
                 preview: None,
                 section: Some("Codex".to_string()),
                 key_hint: None,
+                disabled: false,
             },
             PickerOption {
                 label: "codex-2".to_string(),
@@ -6719,6 +6722,7 @@ fn picker_hit_offsets_match_rendered_rows_with_sections() {
                 preview: None,
                 section: None,
                 key_hint: None,
+                disabled: false,
             },
             PickerOption {
                 label: "claude-1".to_string(),
@@ -6726,6 +6730,7 @@ fn picker_hit_offsets_match_rendered_rows_with_sections() {
                 preview: None,
                 section: Some("Claude".to_string()),
                 key_hint: None,
+                disabled: false,
             },
         ],
         selected: 2,
@@ -9565,6 +9570,15 @@ fn nested_tool_scroll_keeps_momentum_out_of_the_transcript() {
         false,
         started_at + Duration::from_millis(50),
     ));
+    for millis in [100, 150, 200] {
+        assert!(nested_scroll_consumed(
+            &mut capture,
+            4,
+            -1,
+            false,
+            started_at + Duration::from_millis(millis),
+        ));
+    }
     assert!(!nested_scroll_consumed(
         &mut capture,
         4,

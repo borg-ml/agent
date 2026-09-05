@@ -4498,12 +4498,12 @@ async fn run_local_agent_session(
                         } else {
                             dispatch_ui_command(
                                 &ui_interaction_tx,
-                                model_selection_command(session_id, active, target, model),
+                                model_selection_command(session_id, active, target, model.clone()),
                             );
                             terminal
                                 .as_mut()
                                 .expect("terminal")
-                                .open_effort_picker_for(Some(target));
+                                .open_effort_picker_for(Some(target), Some(&model));
                         }
                     }
                     UiAction::AuthenticateProvider {
@@ -4592,12 +4592,12 @@ async fn run_local_agent_session(
                             if outcome.is_ok() {
                                 dispatch_ui_command(
                                     &ui_interaction_tx,
-                                    model_selection_command(session_id, active, target, model),
+                                    model_selection_command(session_id, active, target, model.clone()),
                                 );
                                 terminal
                                     .as_mut()
                                     .expect("terminal")
-                                    .open_effort_picker_for(Some(target));
+                                    .open_effort_picker_for(Some(target), Some(&model));
                             }
                         }
                     }

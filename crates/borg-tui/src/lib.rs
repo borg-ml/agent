@@ -374,7 +374,7 @@ fn parse_key_chord(value: &str) -> Result<KeyChord> {
 struct NestedScrollCapture {
     tool_run_start: usize,
     direction: isize,
-    last_event: Instant,
+    last_movement: Instant,
 }
 
 struct NestedScrollMotion {
@@ -1188,6 +1188,7 @@ struct PickerOption {
     preview: Option<String>,
     section: Option<String>,
     key_hint: Option<String>,
+    disabled: bool,
 }
 
 impl PickerOption {
@@ -1198,6 +1199,7 @@ impl PickerOption {
             preview: None,
             section: None,
             key_hint: None,
+            disabled: false,
         }
     }
 }
@@ -1420,7 +1422,9 @@ impl Picker {
                         )
                     },
                 ),
-                if selected {
+                if option.disabled {
+                    Style::default().fg(Color::DarkGray)
+                } else if selected {
                     Style::default()
                         .fg(BORG_ORANGE)
                         .bg(MESSAGE_HOVER_BG)
@@ -3647,6 +3651,7 @@ impl BorgTerminal {
                         preview: Some(session.preview.clone()),
                         section,
                         key_hint: None,
+                        disabled: false,
                     }
                 })
                 .collect(),
@@ -3664,24 +3669,42 @@ impl BorgTerminal {
             .config
             .as_ref()
             .map(|config| config.provider);
-        self.open_effort_picker_for(provider);
+        let model = self
+            .transcript
+            .config
+            .as_ref()
+            .and_then(|config| config.model.clone());
+        self.open_effort_picker_for(provider, model.as_deref());
     }
 
     /// Opens effort choices for a provider selected in the model picker,
     /// before the asynchronous session-config event has updated the transcript.
-    pub fn open_effort_picker_for(&mut self, provider: Option<CodingProvider>) {
+    pub fn open_effort_picker_for(
+        &mut self,
+        provider: Option<CodingProvider>,
+        model: Option<&str>,
+    ) {
         let current = self
             .transcript
             .config
             .as_ref()
             .and_then(|config| config.effort.clone());
         let options = effort_picker_options(provider);
-        self.picker = Some(Picker::new(
+        let mut picker = Picker::new(
             PickerKind::Effort,
             "Choose effort",
             options.iter().copied(),
             current.as_deref(),
-        ));
+        );
+        if provider == Some(CodingProvider::Codex) && model == Some("gpt-6-astra") {
+            for option in &mut picker.options {
+                option.disabled = option.value == "none";
+            }
+            if picker.options[picker.selected].disabled {
+                picker.next();
+            }
+        }
+        self.picker = Some(picker);
     }
 
     pub fn open_permission_picker(&mut self) {
@@ -5335,6 +5358,14 @@ impl BorgTerminal {
     }
 
     fn run_selected_picker(&mut self) -> Result<UiAction> {
+        if self
+            .picker
+            .as_ref()
+            .and_then(|picker| picker.options.get(picker.selected))
+            .is_some_and(|option| option.disabled)
+        {
+            return Ok(UiAction::None);
+        }
         let picker = self.picker.take().expect("picker exists");
         if matches!(picker.kind, PickerKind::Rewind) {
             let target = self
@@ -12482,14 +12513,16 @@ fn nested_scroll_consumed(
     let continues_captured_gesture = capture.is_some_and(|capture| {
         capture.tool_run_start == tool_run_start
             && capture.direction == direction
-            && now.saturating_duration_since(capture.last_event) <= NESTED_SCROLL_GESTURE_GAP
+            && now.saturating_duration_since(capture.last_movement) <= NESTED_SCROLL_GESTURE_GAP
     });
-    if moved || continues_captured_gesture {
+    if moved {
         *capture = Some(NestedScrollCapture {
             tool_run_start,
             direction,
-            last_event: now,
+            last_movement: now,
         });
+        true
+    } else if continues_captured_gesture {
         true
     } else {
         *capture = None;
