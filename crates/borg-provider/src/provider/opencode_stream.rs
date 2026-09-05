@@ -1,24 +1,27 @@
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
 use super::{ChatStreamEvent, ChatStreamRequest, LocalAgentPermission, complete_tool_action};
 use crate::runtime::ProviderCallUsage;
 
-/// Run OpenCode as a provider subprocess while Borg remains the session and
-/// event authority. OpenCode owns its provider-specific tool loop; its JSON
-/// events are normalized into the same stream contract used by Codex/Claude.
+/// OpenCode owns its tool loop in a private local server. Subscribe before
+/// prompting so tool-input starts are visible before arguments are complete.
 pub fn run_opencode_local_chat_stream(
     request: ChatStreamRequest,
     permission: LocalAgentPermission,
 ) -> mpsc::Receiver<ChatStreamEvent> {
     let (events, receiver) = mpsc::channel(64);
     tokio::spawn(async move {
-        if let Err(error) = run(request, events.clone(), permission).await {
+        let result = tokio::select! {
+            _ = events.closed() => return,
+            result = run(request, events.clone(), permission) => result,
+        };
+        if let Err(error) = result {
             let _ = events
                 .send(ChatStreamEvent::Failed {
                     error: format!("{error:#}"),
@@ -45,19 +48,14 @@ async fn run(
     };
     let mut command = crate::provider_bin::command(crate::provider_bin::Runtime::OpenCode).await?;
     command
-        .args(opencode_run_args(
-            request.session_id.as_deref(),
-            &model,
-            request.effort.as_deref(),
-            permission,
-        ))
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::piped())
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    for attachment in &request.attachments {
-        command.arg("--file").arg(attachment);
+    let mut config = serde_json::json!({});
+    if permission == LocalAgentPermission::FullAccess {
+        config["permission"] = serde_json::json!({"*": "allow"});
     }
     if !request.mcp_external_servers.is_empty() {
         let servers = request
@@ -77,17 +75,65 @@ async fn run(
                 )
             })
             .collect::<serde_json::Map<_, _>>();
-        command.env(
-            "OPENCODE_CONFIG_CONTENT",
-            serde_json::to_string(&serde_json::json!({ "mcp": servers }))?,
-        );
+        config["mcp"] = Value::Object(servers);
+    }
+    if config.as_object().is_some_and(|config| !config.is_empty()) {
+        command.env("OPENCODE_CONFIG_CONTENT", serde_json::to_string(&config)?);
     }
 
-    let mut child = command.spawn().context("failed to spawn OpenCode")?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("OpenCode stdin was not available")?;
+    let password = uuid::Uuid::new_v4().to_string();
+    command
+        .args(["serve", "--hostname", "127.0.0.1", "--port", "0"])
+        .env("OPENCODE_SERVER_PASSWORD", &password)
+        .env("OPENCODE_SERVER_USERNAME", "opencode");
+    let mut server = command.spawn().context("failed to start OpenCode server")?;
+    let mut server_output = BufReader::new(
+        server
+            .stdout
+            .take()
+            .context("OpenCode server stdout missing")?,
+    )
+    .lines();
+    let server_url = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(line) = server_output.next_line().await? {
+            if let Some(url) = line.strip_prefix("opencode server listening on http://127.0.0.1:") {
+                let port: u16 = url.trim().parse().context("invalid OpenCode server port")?;
+                return Ok::<_, anyhow::Error>(format!("http://127.0.0.1:{port}"));
+            }
+        }
+        bail!("OpenCode server closed before listening")
+    })
+    .await
+    .context("OpenCode server startup timed out")??;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(10))
+        .build()?;
+    let session_id = match request.session_id.as_ref() {
+        Some(id) => id.clone(),
+        None => client
+            .post(format!("{server_url}/session"))
+            .basic_auth("opencode", Some(&password))
+            .query(&[("directory", &cwd)])
+            .json(&serde_json::json!({}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?
+            .get("id")
+            .and_then(Value::as_str)
+            .context("OpenCode session response missing id")?
+            .to_string(),
+    };
+    let mut server_events = client
+        .get(format!("{server_url}/event"))
+        .basic_auth("opencode", Some(&password))
+        .query(&[("directory", &cwd)])
+        .send()
+        .await?
+        .error_for_status()?;
+    let mut server_pending = Vec::new();
     let prompt = if request.session_id.is_none() && !request.system_prompt.trim().is_empty() {
         format!(
             "{}\n\nUser request:\n{}",
@@ -97,30 +143,44 @@ async fn run(
     } else {
         request.prompt
     };
-    stdin
-        .write_all(prompt.as_bytes())
-        .await
-        .context("failed to write OpenCode prompt")?;
-    stdin.shutdown().await.ok();
-    drop(stdin);
-
-    let stdout = child
-        .stdout
-        .take()
-        .context("OpenCode stdout was not available")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("OpenCode stderr was not available")?;
-    let stderr_task = tokio::spawn(async move {
-        let mut stderr = stderr;
-        let mut bytes = Vec::new();
-        let _ = stderr.read_to_end(&mut bytes).await;
-        bytes
+    let mut parts = Vec::new();
+    for attachment in &request.attachments {
+        let path = if attachment.is_absolute() {
+            attachment.clone()
+        } else {
+            cwd.join(attachment)
+        };
+        let path = path
+            .canonicalize()
+            .context("OpenCode attachment not found")?;
+        parts.push(serde_json::json!({
+            "type": "file",
+            "url": reqwest::Url::from_file_path(&path).map_err(|_| anyhow::anyhow!("invalid OpenCode attachment path"))?.as_str(),
+            "filename": path.file_name().and_then(|name| name.to_str()),
+            "mime": if path.is_dir() { "application/x-directory" } else { "text/plain" },
+        }));
+    }
+    parts.push(serde_json::json!({"type": "text", "text": prompt}));
+    let (provider_id, model_id) = model
+        .split_once('/')
+        .context("OpenCode model must be provider/model")?;
+    let mut input = serde_json::json!({
+        "model": {"providerID": provider_id, "modelID": model_id},
+        "parts": parts,
     });
-    let mut lines = BufReader::new(stdout).lines();
+    if let Some(effort) = request.effort {
+        input["variant"] = Value::String(effort);
+    }
+    client
+        .post(format!("{server_url}/session/{session_id}/prompt_async"))
+        .basic_auth("opencode", Some(&password))
+        .query(&[("directory", &cwd)])
+        .json(&input)
+        .send()
+        .await?
+        .error_for_status()?;
     let mut text = String::new();
-    let mut session_id = request.session_id;
+    let mut completed_parts = HashSet::new();
     let mut usage = ProviderCallUsage::default();
     let mut saw_usage = false;
     let mut generating_tools = HashSet::new();
@@ -128,18 +188,88 @@ async fn run(
     let mut started_tools = HashSet::new();
     let mut completed_tools = HashSet::new();
 
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .context("failed reading OpenCode output")?
-    {
-        let value: Value = serde_json::from_str(&line)
-            .with_context(|| format!("OpenCode emitted invalid JSON: {line}"))?;
-        if session_id.is_none()
-            && let Some(value) = value.get("sessionID").and_then(Value::as_str)
-        {
-            session_id = Some(value.to_string());
-        }
+    loop {
+        let event = tokio::select! {
+            _ = events.closed() => return Ok(()),
+            event = next_server_event(&mut server_events, &mut server_pending) => event?,
+        };
+        let props = &event["properties"];
+        let kind = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let value = if kind == "message.part.updated" {
+            let part = &props["part"];
+            if part.get("sessionID").and_then(Value::as_str) != Some(&session_id) {
+                continue;
+            }
+            let part_kind = part.get("type").and_then(Value::as_str).unwrap_or_default();
+            let kind = match part_kind {
+                "tool" => "tool_use",
+                "step-finish" => "step_finish",
+                "text" | "reasoning" if !part.pointer("/time/end").is_none_or(Value::is_null) => {
+                    part_kind
+                }
+                _ => continue,
+            };
+            if part_kind != "tool"
+                && !completed_parts.insert(
+                    part.get("id")
+                        .and_then(Value::as_str)
+                        .context("OpenCode part missing id")?
+                        .to_string(),
+                )
+            {
+                continue;
+            }
+            serde_json::json!({"type": kind, "part": part})
+        } else {
+            if props.get("sessionID").and_then(Value::as_str) != Some(&session_id) {
+                continue;
+            }
+            match kind {
+                "session.idle" => break,
+                "session.status"
+                    if props.pointer("/status/type").and_then(Value::as_str) == Some("idle") =>
+                {
+                    break;
+                }
+                "session.error" => serde_json::json!({"type": "error", "error": props["error"]}),
+                "permission.asked" => {
+                    let id = props
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .context("OpenCode permission missing id")?;
+                    let reply = match permission {
+                        LocalAgentPermission::FullAccess | LocalAgentPermission::Auto => "once",
+                        LocalAgentPermission::Manual => "reject",
+                    };
+                    let response = client
+                        .post(format!("{server_url}/permission/{id}/reply"))
+                        .basic_auth("opencode", Some(&password))
+                        .query(&[("directory", &cwd)])
+                        .json(&serde_json::json!({"reply": reply}))
+                        .send()
+                        .await?;
+                    if response.status() == reqwest::StatusCode::NOT_FOUND {
+                        client
+                            .post(format!(
+                                "{server_url}/session/{session_id}/permissions/{id}"
+                            ))
+                            .basic_auth("opencode", Some(&password))
+                            .query(&[("directory", &cwd)])
+                            .json(&serde_json::json!({"response": reply}))
+                            .send()
+                            .await?
+                            .error_for_status()?;
+                    } else {
+                        response.error_for_status()?;
+                    }
+                    continue;
+                }
+                _ => continue,
+            }
+        };
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("event");
         events
             .send(ChatStreamEvent::ProviderEvent {
@@ -229,15 +359,6 @@ async fn run(
         }
     }
 
-    let status = child.wait().await.context("failed waiting for OpenCode")?;
-    let stderr = stderr_task.await.unwrap_or_default();
-    if !status.success() {
-        bail!(
-            "OpenCode exited with {}: {}",
-            status,
-            String::from_utf8_lossy(&stderr).trim()
-        );
-    }
     events
         .send(ChatStreamEvent::Done {
             final_text: text,
@@ -245,7 +366,7 @@ async fn run(
                 duration_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
                 ..usage
             }),
-            session_id,
+            session_id: Some(session_id),
             provider_turn_id: None,
         })
         .await
@@ -253,34 +374,31 @@ async fn run(
     Ok(())
 }
 
-fn opencode_run_args(
-    session_id: Option<&str>,
-    model: &str,
-    effort: Option<&str>,
-    permission: LocalAgentPermission,
-) -> Vec<String> {
-    let mut args = vec![
-        "run".to_string(),
-        "--format".to_string(),
-        "json".to_string(),
-    ];
-    if let Some(session_id) = session_id {
-        args.extend(["--session".to_string(), session_id.to_string()]);
-    }
-    args.extend(["--model".to_string(), model.to_string()]);
-    if let Some(effort) = effort {
-        args.extend(["--variant".to_string(), effort.to_string()]);
-    }
-    match permission {
-        LocalAgentPermission::FullAccess => {
-            args.push("--dangerously-skip-permissions".to_string());
+async fn next_server_event(
+    response: &mut reqwest::Response,
+    pending: &mut Vec<u8>,
+) -> Result<Value> {
+    loop {
+        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
+            let line = pending.drain(..=end).collect::<Vec<_>>();
+            let Some(data) = line.strip_prefix(b"data:") else {
+                continue;
+            };
+            let event: Value =
+                serde_json::from_slice(data).context("invalid OpenCode server event")?;
+            return Ok(event);
         }
-        LocalAgentPermission::Auto => {
-            args.push("--auto".to_string());
-        }
-        LocalAgentPermission::Manual => {}
+        let chunk = response
+            .chunk()
+            .await
+            .context("failed reading OpenCode server events")?
+            .context("OpenCode server event stream closed")?;
+        anyhow::ensure!(
+            pending.len().saturating_add(chunk.len()) <= 8 * 1024 * 1024,
+            "OpenCode server event exceeded 8 MiB"
+        );
+        pending.extend_from_slice(&chunk);
     }
-    args
 }
 
 async fn default_model() -> Result<String> {
@@ -427,32 +545,7 @@ mod tests {
     use serde_json::json;
     use tokio::sync::mpsc;
 
-    use super::{ChatStreamEvent, LocalAgentPermission, emit_tool, opencode_run_args, parse_usage};
-
-    #[test]
-    fn permission_mode_maps_to_supported_opencode_argv() {
-        let full_access = opencode_run_args(
-            Some("session-1"),
-            "openai/gpt-5.6",
-            Some("medium"),
-            LocalAgentPermission::FullAccess,
-        );
-        assert!(
-            full_access
-                .iter()
-                .any(|arg| arg == "--dangerously-skip-permissions")
-        );
-
-        let guarded = opencode_run_args(None, "openai/gpt-5.6", None, LocalAgentPermission::Manual);
-        assert!(
-            !guarded
-                .iter()
-                .any(|arg| arg == "--dangerously-skip-permissions")
-        );
-
-        let automatic = opencode_run_args(None, "openai/gpt-5.6", None, LocalAgentPermission::Auto);
-        assert!(automatic.iter().any(|arg| arg == "--auto"));
-    }
+    use super::{ChatStreamEvent, emit_tool, parse_usage};
 
     #[test]
     fn step_finish_usage_preserves_cache_tokens_and_cost() {
