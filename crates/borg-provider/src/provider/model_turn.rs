@@ -23,6 +23,7 @@ impl ModelTurnResult {
                 content,
                 reasoning_content,
                 reasoning_details: _,
+                provider_state: _,
                 tool_calls,
             } => Some((content, reasoning_content, tool_calls)),
             _ => None,

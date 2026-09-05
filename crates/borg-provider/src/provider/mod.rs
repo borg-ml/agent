@@ -1,6 +1,10 @@
 pub mod chat_stream;
+#[cfg(feature = "codex")]
+mod codex_model;
 mod model_turn;
 mod openai_compatible;
+#[cfg(feature = "codex")]
+pub use codex_model::CodexModelProvider;
 
 pub use chat_stream::{
     ChatApprovalDecision, ChatGitCredential, ChatProviderAuth, ChatStreamControl, ChatStreamEvent,

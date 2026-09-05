@@ -728,6 +728,11 @@ fn parse_claude_account_rate_limits(value: &Value) -> Result<ClaudeAccountRateLi
 
 #[cfg(feature = "codex")]
 async fn read_codex_account_rate_limits_inner() -> Result<CodexAccountRateLimits> {
+    let response = codex_account_request("account/rateLimits/read", serde_json::json!({})).await?;
+    parse_codex_account_rate_limits(&response)
+}
+
+pub(super) async fn codex_account_request(method: &str, params: Value) -> Result<Value> {
     let mut command = crate::provider_bin::codex_command().await?;
     command
         .args(["app-server", "--stdio"])
@@ -769,15 +774,8 @@ async fn read_codex_account_rate_limits_inner() -> Result<CodexAccountRateLimits
         read_codex_response(&mut lines, 1).await?;
         write_codex_notification(&mut stdin, "initialized", Value::Object(Default::default()))
             .await?;
-        write_codex_request(
-            &mut stdin,
-            2,
-            "account/rateLimits/read",
-            Value::Object(Default::default()),
-        )
-        .await?;
-        let response = read_codex_response(&mut lines, 2).await?;
-        parse_codex_account_rate_limits(&response)
+        write_codex_request(&mut stdin, 2, method, params).await?;
+        read_codex_response(&mut lines, 2).await
     }
     .await;
     drop(lines);
@@ -2442,8 +2440,7 @@ async fn read_codex_response(
         if line.trim().is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(&line)
-            .with_context(|| format!("invalid Codex app-server JSON: {line}"))?;
+        let value: Value = serde_json::from_str(&line).context("invalid Codex app-server JSON")?;
         if codex_response_id(&value) == Some(request_id) {
             if value.get("error").is_some() {
                 bail!(

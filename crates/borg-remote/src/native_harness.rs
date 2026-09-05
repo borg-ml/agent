@@ -256,6 +256,7 @@ impl NativeHarness {
                 content,
                 reasoning_content: _,
                 reasoning_details: _,
+                provider_state: _,
                 tool_calls,
             } = &result.message
             else {

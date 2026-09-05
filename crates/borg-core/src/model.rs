@@ -25,6 +25,10 @@ pub enum ModelMessage {
         /// tool rounds.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_details: Option<Value>,
+        /// Opaque model output needed for lossless replay by the originating
+        /// protocol. Other adapters must not forward it as request fields.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_state: Option<ModelProviderState>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ModelToolCall>,
     },
@@ -32,6 +36,12 @@ pub enum ModelMessage {
         tool_call_id: String,
         content: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "protocol", rename_all = "snake_case")]
+pub enum ModelProviderState {
+    OpenAiResponses { output: Vec<Value> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,6 +80,7 @@ impl ModelMessage {
             content,
             reasoning_content,
             reasoning_details,
+            provider_state: None,
             tool_calls,
         }
     }

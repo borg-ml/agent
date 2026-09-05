@@ -8,7 +8,7 @@ pub mod model;
 pub mod usage;
 
 pub use model::{
-    ModelFunctionCall, ModelInputAttachment, ModelMessage, ModelToolCall, ModelToolDefinition,
-    ModelTurnRequest,
+    ModelFunctionCall, ModelInputAttachment, ModelMessage, ModelProviderState, ModelToolCall,
+    ModelToolDefinition, ModelTurnRequest,
 };
 pub use usage::{CostBasis, ProviderCallUsage, ProviderChannel};

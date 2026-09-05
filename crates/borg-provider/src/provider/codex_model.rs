@@ -1,0 +1,633 @@
+//! Opt-in model-only subscription adapter. Codex manages access, never a turn
+//! or a tool. Production chat routing stays on app-server until parity is proven.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail, ensure};
+use base64::Engine;
+use borg_core::{CostBasis, ModelProviderState, ProviderCallUsage};
+use futures::StreamExt;
+use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
+
+use super::{
+    ModelMessage, ModelToolCall, ModelTurnRequest, ModelTurnResult, ProviderAttemptTrace,
+    ProviderCallError, ProviderInvocation, ProviderProgress, ProviderProgressStream,
+    apply_provider_request_timeout, streamed_tool_action,
+};
+
+const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+const MAX_STREAM_BYTES: usize = 128 * 1024 * 1024;
+const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+
+pub struct CodexModelProvider {
+    pub model: String,
+    pub effort: String,
+}
+
+// Never serialize or debug credentials. Refresh tokens remain in the original
+// persistent Codex credential store, owned by Codex's authentication manager.
+struct SubscriptionAccess {
+    token: String,
+    account_id: String,
+}
+
+impl SubscriptionAccess {
+    async fn read(refresh: bool) -> Result<Self> {
+        let response = tokio::time::timeout(
+            Duration::from_secs(60),
+            super::chat_stream::codex_account_request(
+                "getAuthStatus",
+                json!({
+                    "includeToken": true, "refreshToken": refresh
+                }),
+            ),
+        )
+        .await
+        .context("Codex subscription authentication timed out")?
+        .map_err(|_| {
+            anyhow::anyhow!("Codex subscription authentication failed; reconnect Codex")
+        })?;
+        let auth = &response["result"];
+        ensure!(
+            matches!(
+                auth["authMethod"].as_str(),
+                Some("chatgpt" | "chatgptAuthTokens")
+            ),
+            "model-only Codex requires a ChatGPT subscription; no API-key fallback is allowed"
+        );
+        let token = auth["authToken"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .context("Codex did not provide subscription access; reconnect Codex")?
+            .to_owned();
+        let payload = token
+            .split('.')
+            .nth(1)
+            .context("invalid Codex subscription token format")?;
+        let claims: Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .map_err(|_| anyhow::anyhow!("invalid Codex subscription token encoding"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("invalid Codex subscription token claims"))?;
+        let account_id = claims
+            .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .context("Codex subscription token has no account identity")?
+            .to_owned();
+        Ok(Self { token, account_id })
+    }
+}
+
+impl CodexModelProvider {
+    pub async fn model_turn(
+        &self,
+        request: ModelTurnRequest,
+        progress: Option<UnboundedSender<ProviderProgress>>,
+    ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        let started = Instant::now();
+        let mut trace = ProviderAttemptTrace {
+            invocation: ProviderInvocation {
+                provider_label: "codex-model".into(),
+                executable: ENDPOINT.into(),
+                args: Vec::new(),
+                cwd: None,
+                model: Some(self.model.clone()),
+                effort: Some(self.effort.clone()),
+            },
+            exit_status: None,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+        let result = async {
+            let body = self.request_body(&request)?;
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(Duration::from_secs(30))
+                .build()?;
+            let mut access = SubscriptionAccess::read(false).await?;
+            let mut response = self
+                .send(&client, ENDPOINT, &access, &request, &body)
+                .await?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                // Retry only an unaccepted HTTP request, never a partial model
+                // stream or completed tool side effect.
+                drop(response);
+                access = SubscriptionAccess::read(true).await?;
+                response = self
+                    .send(&client, ENDPOINT, &access, &request, &body)
+                    .await?;
+            }
+            ensure!(
+                response.status().is_success(),
+                "Codex subscription model request failed (HTTP {}); no fallback was attempted",
+                response.status()
+            );
+            self.read_stream(response, progress.as_ref()).await
+        }
+        .await;
+        match result {
+            Ok((message, raw_response)) => {
+                trace.exit_status = Some(0);
+                let input = raw_response
+                    .pointer("/usage/input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let cached = raw_response
+                    .pointer("/usage/input_tokens_details/cached_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .min(input);
+                let output = raw_response
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let has_tools = matches!(&message, ModelMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty());
+                Ok(ModelTurnResult {
+                    message,
+                    finish_reason: if has_tools { "tool_calls" } else { "stop" }.into(),
+                    usage: ProviderCallUsage {
+                        duration_ms: crate::runtime::elapsed_millis_u64(started),
+                        input_tokens: input - cached,
+                        cached_input_tokens: cached,
+                        output_tokens: output,
+                        total_tokens: input.saturating_add(output),
+                        context_tokens: Some(input),
+                        cost_basis: CostBasis::SubscriptionEquivalent,
+                        ..Default::default()
+                    },
+                    raw_response,
+                    trace,
+                })
+            }
+            Err(error) => {
+                let message = error.to_string();
+                trace.exit_status = Some(1);
+                trace.stderr = message.clone();
+                Err(ProviderCallError {
+                    message,
+                    trace: Box::new(trace),
+                    session_id: None,
+                })
+            }
+        }
+    }
+
+    fn request_body(&self, request: &ModelTurnRequest) -> Result<Value> {
+        let mut input = Vec::new();
+        let mut instructions = Vec::new();
+        for message in &request.messages {
+            match message {
+                ModelMessage::System { content } => instructions.push(content.as_str()),
+                ModelMessage::User {
+                    content,
+                    attachments,
+                } => {
+                    let mut blocks = vec![json!({"type": "input_text", "text": content})];
+                    for attachment in attachments {
+                        ensure!(
+                            attachment.media_type.starts_with("image/"),
+                            "Codex model attachment must be an image"
+                        );
+                        blocks.push(
+                            json!({"type": "input_image", "image_url": format!("data:{};base64,{}",
+                            attachment.media_type, attachment.data_base64)}),
+                        );
+                    }
+                    input.push(json!({"role": "user", "content": blocks}));
+                }
+                ModelMessage::Assistant {
+                    provider_state: Some(ModelProviderState::OpenAiResponses { output }),
+                    ..
+                } => {
+                    input.extend(output.iter().cloned());
+                }
+                ModelMessage::Assistant {
+                    content,
+                    tool_calls,
+                    ..
+                } => {
+                    if let Some(content) = content {
+                        input.push(json!({"role": "assistant", "content": [{"type": "output_text", "text": content}]}));
+                    }
+                    for call in tool_calls {
+                        ensure!(
+                            call.kind == "function",
+                            "unsupported Codex model history tool type"
+                        );
+                        input.push(json!({"type": "function_call", "call_id": call.id,
+                            "name": call.function.name, "arguments": call.function.arguments}));
+                    }
+                }
+                ModelMessage::Tool {
+                    tool_call_id,
+                    content,
+                } => input.push(json!({
+                    "type": "function_call_output", "call_id": tool_call_id, "output": content
+                })),
+            }
+        }
+        let tools: Vec<_> = request
+            .tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "type": "function", "name": tool.name, "description": tool.description,
+                    "parameters": tool.input_schema, "strict": false
+                })
+            })
+            .collect();
+        let mut body = json!({"model": self.model, "instructions": instructions.join("\n\n"),
+            "input": input, "tools": tools, "tool_choice": "auto", "parallel_tool_calls": true,
+            "reasoning": {"effort": self.effort, "summary": "auto"},
+            "store": false, "stream": true, "include": ["reasoning.encrypted_content"]});
+        if let Some(key) = &request.prompt_cache_key {
+            body["prompt_cache_key"] = json!(key);
+        }
+        if let Some(schema) = &request.output_schema {
+            body["text"] = json!({"format": {"type": "json_schema", "name": "borg_response", "strict": true, "schema": schema}});
+        }
+        Ok(body)
+    }
+
+    async fn send(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        access: &SubscriptionAccess,
+        request: &ModelTurnRequest,
+        body: &Value,
+    ) -> Result<reqwest::Response> {
+        let mut http = client
+            .post(endpoint)
+            .bearer_auth(&access.token)
+            .header("ChatGPT-Account-Id", &access.account_id)
+            .header("originator", "borg")
+            .header("Accept", "text/event-stream")
+            .json(body);
+        if let Some(id) = &request.session_id {
+            http = http.header("session_id", id);
+        }
+        if let Some(id) = &request.request_id {
+            http = http.header("X-Client-Request-Id", id);
+        }
+        apply_provider_request_timeout(http)
+            .send()
+            .await
+            .context("Codex model connection failed")
+    }
+
+    async fn read_stream(
+        &self,
+        response: reqwest::Response,
+        progress: Option<&UnboundedSender<ProviderProgress>>,
+    ) -> Result<(ModelMessage, Value)> {
+        let mut stream = response.bytes_stream();
+        let mut buffer = Vec::new();
+        let mut data = String::new();
+        let mut total = 0usize;
+        let mut state = ResponseState::default();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("Codex model stream disconnected")?;
+            total = total.saturating_add(chunk.len());
+            ensure!(
+                total <= MAX_STREAM_BYTES,
+                "Codex model stream exceeds size limit"
+            );
+            buffer.extend_from_slice(&chunk);
+            while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line = String::from_utf8(buffer.drain(..=end).collect())
+                    .context("invalid Codex stream encoding")?;
+                let line = line.trim_end_matches(['\r', '\n']);
+                if line.is_empty() {
+                    if !data.is_empty() {
+                        let event: Value = serde_json::from_str(&data)
+                            .context("invalid Codex model event JSON")?;
+                        data.clear();
+                        if let Some(response) =
+                            state.event(&event, progress, &self.model, &self.effort)?
+                        {
+                            return state.finish(response);
+                        }
+                    }
+                } else if let Some(value) = line.strip_prefix("data:") {
+                    data.push_str(value.strip_prefix(' ').unwrap_or(value));
+                    data.push('\n');
+                }
+                ensure!(
+                    data.len() <= MAX_EVENT_BYTES,
+                    "Codex model event exceeds size limit"
+                );
+            }
+            ensure!(
+                buffer.len() <= MAX_EVENT_BYTES,
+                "Codex model event exceeds size limit"
+            );
+        }
+        bail!("Codex model stream ended before response.completed; no tools were executed")
+    }
+}
+
+#[derive(Default)]
+struct ResponseState {
+    calls: HashMap<String, (String, String, String)>,
+    generating: HashSet<String>,
+    described: HashSet<String>,
+    output: BTreeMap<u64, Value>,
+    reasoning: String,
+}
+
+impl ResponseState {
+    fn event(
+        &mut self,
+        event: &Value,
+        progress: Option<&UnboundedSender<ProviderProgress>>,
+        model: &str,
+        effort: &str,
+    ) -> Result<Option<Value>> {
+        let emit = |value| {
+            if let Some(sender) = progress {
+                let _ = sender.send(value);
+            }
+        };
+        match event["type"].as_str().unwrap_or_default() {
+            "response.output_item.added" if event["item"]["type"] == "function_call" => {
+                let item = &event["item"];
+                let id = item["id"].as_str().context("Codex tool item has no id")?;
+                let call_id = item["call_id"]
+                    .as_str()
+                    .context("Codex tool item has no call id")?;
+                let name = item["name"].as_str().unwrap_or_default();
+                let arguments = item["arguments"].as_str().unwrap_or_default();
+                self.calls
+                    .insert(id.into(), (call_id.into(), name.into(), arguments.into()));
+                if (!name.is_empty() || !arguments.is_empty())
+                    && self.generating.insert(call_id.into())
+                {
+                    emit(ProviderProgress::ToolCallGenerating {
+                        id: Some(call_id.into()),
+                    });
+                }
+                if !name.is_empty() {
+                    emit(ProviderProgress::ToolCallStarted {
+                        id: call_id.into(),
+                        name: name.into(),
+                        input: Value::Null,
+                    });
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let delta = event["delta"].as_str().unwrap_or_default();
+                if !delta.is_empty() {
+                    let id = event["item_id"]
+                        .as_str()
+                        .context("Codex tool delta has no item id")?;
+                    let (call_id, _, arguments) = self
+                        .calls
+                        .get_mut(id)
+                        .context("Codex tool delta has no matching item")?;
+                    if self.generating.insert(call_id.clone()) {
+                        emit(ProviderProgress::ToolCallGenerating {
+                            id: Some(call_id.clone()),
+                        });
+                    }
+                    arguments.push_str(delta);
+                    if !self.described.contains(call_id)
+                        && let Some(action) = streamed_tool_action(arguments)
+                    {
+                        self.described.insert(call_id.clone());
+                        emit(ProviderProgress::ToolCallAction {
+                            id: call_id.clone(),
+                            action,
+                        });
+                    }
+                }
+            }
+            "response.output_text.delta" => {
+                if let Some(text) = event["delta"].as_str().filter(|s| !s.is_empty()) {
+                    emit(ProviderProgress::Bytes {
+                        stream: ProviderProgressStream::Stdout,
+                        chunk: text.as_bytes().to_vec(),
+                    });
+                }
+            }
+            "response.reasoning_summary_text.delta" => {
+                if let Some(text) = event["delta"].as_str().filter(|s| !s.is_empty()) {
+                    self.reasoning.push_str(text);
+                    emit(ProviderProgress::ProviderEvent {
+                        kind: "reasoning_delta".into(),
+                        payload: json!({"text": text}),
+                        raw_payload: Box::new(None),
+                        stream_channel: Some("reasoning".into()),
+                        content_text: Some(text.into()),
+                        provider_item_id: event["item_id"].as_str().map(str::to_owned),
+                        tool_use_id: None,
+                        tool_name: None,
+                        model: Some(model.into()),
+                        effort: Some(effort.into()),
+                    });
+                }
+            }
+            "response.output_item.done" => {
+                let index = event["output_index"]
+                    .as_u64()
+                    .context("Codex output item has no index")?;
+                self.output.insert(index, event["item"].clone());
+            }
+            "response.completed" => return Ok(Some(event["response"].clone())),
+            "response.failed" | "response.incomplete" | "error" => {
+                bail!("Codex model did not complete the response")
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    fn finish(self, mut response: Value) -> Result<(ModelMessage, Value)> {
+        ensure!(
+            response["status"] == "completed",
+            "Codex model response was not completed"
+        );
+        let output = response["output"]
+            .as_array()
+            .filter(|items| !items.is_empty())
+            .cloned()
+            .unwrap_or_else(|| self.output.into_values().collect());
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        let mut ids = HashSet::new();
+        for item in &output {
+            match item["type"].as_str() {
+                Some("message") => {
+                    if let Some(blocks) = item["content"].as_array() {
+                        for block in blocks {
+                            if let Some(text) =
+                                block["text"].as_str().or_else(|| block["refusal"].as_str())
+                            {
+                                content.push_str(text);
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    let id = item["call_id"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .context("Codex tool has no call id")?;
+                    ensure!(ids.insert(id), "Codex returned duplicate tool call ids");
+                    let name = item["name"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .context("Codex tool has no name")?;
+                    let arguments = item["arguments"]
+                        .as_str()
+                        .context("Codex tool has no arguments")?;
+                    let parsed: Value = serde_json::from_str(arguments)
+                        .context("Codex tool arguments are incomplete")?;
+                    ensure!(parsed.is_object(), "Codex tool arguments must be an object");
+                    calls.push(ModelToolCall::function(
+                        id.into(),
+                        name.into(),
+                        arguments.into(),
+                    ));
+                }
+                Some("reasoning") => {}
+                _ => bail!("Codex returned an unsupported output item; no tools were executed"),
+            }
+        }
+        ensure!(
+            !content.is_empty() || !calls.is_empty(),
+            "Codex returned no answer or tool calls"
+        );
+        response["output"] = json!(output);
+        Ok((
+            ModelMessage::Assistant {
+                content: (!content.is_empty()).then_some(content),
+                reasoning_content: (!self.reasoning.is_empty()).then_some(self.reasoning),
+                reasoning_details: None,
+                provider_state: Some(ModelProviderState::OpenAiResponses { output }),
+                tool_calls: calls,
+            },
+            response,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::{mpsc, oneshot};
+
+    #[tokio::test]
+    async fn first_character_precedes_complete_arguments_and_native_output_survives_replay() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+            let (first_tx, first_rx) = oneshot::channel();
+            let (finish_tx, finish_rx) = oneshot::channel();
+            let native_output = json!([
+                {"type":"reasoning","id":"reason","encrypted_content":"opaque","summary":[]},
+                {"type":"message","id":"comment","role":"assistant","phase":"commentary",
+                    "content":[{"type":"output_text","text":"Checking."}]},
+                {"type":"function_call","id":"item","call_id":"call","name":"inspect",
+                    "arguments":"{\"action\":\"inspect\"}"}
+            ]);
+            let expected_output = native_output.clone();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let (end, len) = loop {
+                    let mut bytes = [0; 4096];
+                    let n = socket.read(&mut bytes).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&bytes[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                        assert!(headers.contains("authorization: bearer test-token"));
+                        assert!(headers.contains("chatgpt-account-id: test-account"));
+                        assert!(headers.contains("session_id: session"));
+                        let len: usize = headers.lines().find_map(|line| line.strip_prefix("content-length: ")).unwrap().parse().unwrap();
+                        break (end + 4, len);
+                    }
+                };
+                while request.len() < end + len {
+                    let mut bytes = [0; 4096];
+                    let n = socket.read(&mut bytes).await.unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&bytes[..n]);
+                }
+                let body: Value = serde_json::from_slice(&request[end..end + len]).unwrap();
+                assert_eq!(body["store"], false);
+                assert_eq!(body["prompt_cache_key"], "cache");
+                assert_eq!(body["tools"][0]["name"], "inspect");
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").await.unwrap();
+                // Metadata and reasoning cannot cause speculative generation.
+                for event in [
+                    json!({"type":"response.output_item.added","item":{"type":"function_call","id":"item","call_id":"call","name":"","arguments":""}}),
+                    json!({"type":"response.function_call_arguments.delta","item_id":"item","delta":""}),
+                    json!({"type":"response.reasoning_summary_text.delta","delta":"Thinking"})
+                ] {
+                    socket.write_all(format!("data: {event}\r\n\r\n").as_bytes()).await.unwrap();
+                }
+                first_rx.await.unwrap();
+                let first = json!({"type":"response.function_call_arguments.delta","item_id":"item","delta":"{"});
+                socket.write_all(format!("data: {first}\n\n").as_bytes()).await.unwrap();
+                finish_rx.await.unwrap();
+                for (index, item) in native_output.as_array().unwrap().iter().enumerate() {
+                    let event = json!({"type":"response.output_item.done","output_index":index,"item":item});
+                    socket.write_all(format!("data: {event}\n\n").as_bytes()).await.unwrap();
+                }
+                let end = json!({"type":"response.completed","response":{"status":"completed","output":[],
+                    "usage":{"input_tokens":12,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}}});
+                // Split the SSE frame across transport chunks as well.
+                let frame = format!("data: {end}\n\n");
+                socket.write_all(&frame.as_bytes()[..7]).await.unwrap();
+                socket.write_all(&frame.as_bytes()[7..]).await.unwrap();
+            });
+            let provider = CodexModelProvider { model: "gpt-6-astra".into(), effort: "low".into() };
+            let mut request = ModelTurnRequest { request_id: Some("request".into()), session_id: Some("session".into()),
+                prompt_cache_key: Some("cache".into()), messages: vec![ModelMessage::user("Inspect.")],
+                tools: vec![super::super::ModelToolDefinition::new("inspect", "Inspect", json!({"type":"object"})).unwrap()], output_schema: None };
+            let response = provider.send(&reqwest::Client::new(), &endpoint,
+                &SubscriptionAccess { token: "test-token".into(), account_id: "test-account".into() },
+                &request, &provider.request_body(&request).unwrap()).await.unwrap();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let read = tokio::spawn(async move { provider.read_stream(response, Some(&tx)).await });
+            assert!(matches!(rx.recv().await.unwrap(), ProviderProgress::ProviderEvent { kind, .. } if kind == "reasoning_delta"));
+            assert!(rx.try_recv().is_err());
+            first_tx.send(()).unwrap();
+            assert!(matches!(rx.recv().await.unwrap(), ProviderProgress::ToolCallGenerating { id: Some(id) } if id == "call"));
+            assert!(!read.is_finished(), "complete arguments must still be withheld");
+            finish_tx.send(()).unwrap();
+            let (message, _) = read.await.unwrap().unwrap();
+            server.await.unwrap();
+            // Simulate Borg's durable serialization before the next tool round.
+            request.messages.push(serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap());
+            request.messages.push(ModelMessage::Tool { tool_call_id: "call".into(), content: "ok".into() });
+            let provider = CodexModelProvider { model: "gpt-6-astra".into(), effort: "low".into() };
+            let replay = provider.request_body(&request).unwrap();
+            assert_eq!(&replay["input"].as_array().unwrap()[1..4], expected_output.as_array().unwrap());
+            assert_eq!(replay["input"][4], json!({"type":"function_call_output","call_id":"call","output":"ok"}));
+            assert_eq!(replay["prompt_cache_key"], "cache");
+        }).await.expect("stream test timed out");
+    }
+
+    #[test]
+    fn incomplete_or_duplicate_calls_never_become_executable_results() {
+        let call =
+            json!({"type":"function_call","call_id":"call","name":"inspect","arguments":"{}"});
+        let mut partial = call.clone();
+        partial["arguments"] = json!("{");
+        for response in [
+            json!({"status":"incomplete","output":[call.clone()]}),
+            json!({"status":"completed","output":[call.clone(),call.clone()]}),
+            json!({"status":"completed","output":[partial]}),
+        ] {
+            assert!(ResponseState::default().finish(response).is_err());
+        }
+    }
+}

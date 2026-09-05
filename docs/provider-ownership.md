@@ -74,6 +74,44 @@ usage/rate-limit reporting, and recovery without duplicate actions. Keep the
 working subscription path available until this proof succeeds. Record exactly
 which remaining external components are necessary and why.
 
+### Model-only prototype
+
+`CodexModelProvider` is an explicit prototype, not the production chat route.
+It sends a Responses request directly and returns a `ModelTurnResult`; it
+cannot execute tools or start a provider agent turn. The existing Codex binary
+is used only for `initialize` and `getAuthStatus`, retaining credential-store
+and refresh ownership without copying refresh tokens. A 401 permits one
+auth refresh and retry before streaming; interrupted streams are never retried.
+API-key authentication is rejected rather than changing billing routes.
+
+The access boundary remains temporary: app-server is still a large dependency
+for this small responsibility. Importing the inspected `codex-login` would
+bring 32 local Codex crates (17 for `codex-api` alone), though neither brings
+`codex-core`. The upstream SSE decoder also discards function-call argument
+deltas. Borg therefore implements the small model wire adapter directly;
+extracting/reusing a narrower maintained login component remains open.
+
+Run the bounded, subscription-backed probe explicitly:
+
+```sh
+cargo run -p borg-provider --features subscription-adapters --example codex_model_probe
+```
+
+The probe verified Astra/low, first tool-generation feedback, a host-owned
+read-only tool result, and a second model round after durable-message
+serialization. Offline streaming tests additionally hold back complete
+arguments until the first `{` generates feedback, and verify opaque reasoning,
+assistant phase, and call IDs survive replay. Responses state is recorded in
+the optional protocol-tagged `ModelMessage.provider_state`, not hidden in
+visible reasoning or a provider-owned conversation. Compatible adapters omit
+that field on the wire.
+
+This is not yet a native-harness migration. Session-scoped access, real refresh
+and re-login recovery, capabilities/context limits, cache hits, rate-limit UX,
+and end-to-end Borg permissions/steering/cancellation still need verification.
+The small live probe reported zero cached tokens; preserving the cache key is
+not proof of a cache hit. Production routing is deliberately unchanged.
+
 ## Evidence
 
 - Current routing: `crates/borg-remote/src/contract.rs` (`uses_native_harness`)

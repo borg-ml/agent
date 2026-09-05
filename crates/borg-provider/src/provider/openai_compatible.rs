@@ -966,6 +966,9 @@ fn model_message_wire_value(message: &ModelMessage, deepseek_model: bool) -> Val
         );
     }
 
+    if let Some(object) = wire.as_object_mut() {
+        object.remove("provider_state");
+    }
     wire
 }
 
@@ -2027,6 +2030,7 @@ mod tests {
             reasoning_content,
             reasoning_details,
             tool_calls,
+            ..
         } = result.message
         else {
             panic!("assistant response expected");

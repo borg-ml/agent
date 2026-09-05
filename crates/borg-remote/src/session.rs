@@ -4495,6 +4495,7 @@ fn native_conversation(
                         content: None,
                         reasoning_content: None,
                         reasoning_details: None,
+                        provider_state: None,
                         tool_calls,
                     }) if !tool_calls.is_empty()
                 );
@@ -5093,6 +5094,7 @@ fn fit_compaction_context(
             content,
             reasoning_content,
             reasoning_details,
+            provider_state,
             tool_calls,
         } = message
         {
@@ -5101,6 +5103,7 @@ fn fit_compaction_context(
             }
             *reasoning_content = None;
             *reasoning_details = None;
+            *provider_state = None;
             for call in tool_calls {
                 call.function.arguments = truncate_compaction_context(
                     &call.function.arguments,
@@ -5174,6 +5177,7 @@ fn compact_message_for_budget(
             content,
             reasoning_content,
             reasoning_details,
+            provider_state,
             tool_calls,
         } => {
             if let Some(content) = content {
@@ -5181,6 +5185,7 @@ fn compact_message_for_budget(
             }
             *reasoning_content = None;
             *reasoning_details = None;
+            *provider_state = None;
             for call in tool_calls {
                 call.function.arguments =
                     truncate_compaction_context(&call.function.arguments, content_limit / 4);
