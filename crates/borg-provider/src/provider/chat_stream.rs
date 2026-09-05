@@ -2009,7 +2009,6 @@ async fn run_pooled_codex_turn(
     let mut turn_status = None;
     let mut reasoning_state = CodexReasoningState::default();
     let mut compaction_capture = CodexCompactionCapture::new(process.rollout_path.clone(), true);
-    reasoning_state.begin_generation(events).await;
 
     loop {
         tokio::select! {
@@ -2258,7 +2257,6 @@ async fn run_codex_subscription_process(
     let mut turn_status = None;
     let mut reasoning_state = CodexReasoningState::default();
     let mut compaction_capture = CodexCompactionCapture::new(rollout_path, false);
-    reasoning_state.begin_generation(&events).await;
 
     loop {
         tokio::select! {
@@ -3054,36 +3052,9 @@ struct CodexReasoningState {
     aggregates: HashMap<String, String>,
     aligned_single_streams: HashSet<String>,
     generating_tools: HashSet<String>,
-    running_tools: HashSet<String>,
-    preparing_next_tool: bool,
 }
 
 impl CodexReasoningState {
-    async fn begin_generation(&mut self, events: &mpsc::Sender<ChatStreamEvent>) {
-        if !self.preparing_next_tool
-            && self.running_tools.is_empty()
-            && self.generating_tools.is_empty()
-        {
-            self.preparing_next_tool = true;
-            events
-                .send(ChatStreamEvent::ToolCallGenerating { id: None })
-                .await
-                .ok();
-        }
-    }
-
-    async fn cancel_generation(&mut self, events: &mpsc::Sender<ChatStreamEvent>) {
-        if std::mem::take(&mut self.preparing_next_tool) {
-            events
-                .send(ChatStreamEvent::Phase {
-                    name: "action/preparing_cancelled".to_string(),
-                    input: Value::Null,
-                })
-                .await
-                .ok();
-        }
-    }
-
     fn observe_delta(&mut self, value: &Value, incoming: &str) -> Option<String> {
         let (item_id, summary_index) = codex_reasoning_stream_key(value);
         let key = (item_id.clone(), summary_index);
@@ -3288,12 +3259,6 @@ async fn emit_codex_events_with_state(
                 return;
             };
             let item_type = codex_item_type(item);
-            if codex_item_is_agent_message(item_type)
-                || codex_item_is_reasoning(item_type)
-                || codex_item_is_context_compaction(item)
-            {
-                reasoning_state.cancel_generation(events).await;
-            }
             if codex_item_is_non_rendered(item_type) {
                 return;
             }
@@ -3303,8 +3268,6 @@ async fn emit_codex_events_with_state(
                 return;
             }
             let generation_already_visible = reasoning_state.generating_tools.remove(&id);
-            reasoning_state.preparing_next_tool = false;
-            reasoning_state.running_tools.insert(id.clone());
             let (name, input) = codex_tool_signature(item_type, item);
             if !generation_already_visible {
                 events
@@ -3338,7 +3301,6 @@ async fn emit_codex_events_with_state(
                 return;
             };
             if reasoning_state.generating_tools.insert(id.to_string()) {
-                reasoning_state.preparing_next_tool = false;
                 events
                     .send(ChatStreamEvent::ToolCallGenerating {
                         id: Some(id.to_string()),
@@ -3353,7 +3315,6 @@ async fn emit_codex_events_with_state(
             };
             let item_type = codex_item_type(item);
             if codex_item_is_agent_message(item_type) {
-                reasoning_state.cancel_generation(events).await;
                 if let Some(message) = codex_agent_message_text(item) {
                     // App-server streams the item deltas separately. Emit
                     // only the completed narration here; this also keeps the
@@ -3364,13 +3325,9 @@ async fn emit_codex_events_with_state(
                         .await
                         .ok();
                 }
-                if item.get("phase").and_then(Value::as_str) == Some("commentary") {
-                    reasoning_state.begin_generation(events).await;
-                }
                 return;
             }
             if codex_item_is_reasoning(item_type) {
-                reasoning_state.cancel_generation(events).await;
                 if let Some(reasoning) = codex_reasoning_text(item)
                     && let Some(reasoning) = reasoning_state.completion_suffix(value, &reasoning)
                     && !reasoning.is_empty()
@@ -3387,12 +3344,6 @@ async fn emit_codex_events_with_state(
                     })
                     .await
                     .ok();
-                // Codex app-server does not expose generic custom-tool input
-                // deltas. Once reasoning ends, the next model item is being
-                // generated; keep an unkeyed card live so long code-mode edits
-                // are visible for their entire generation interval. A normal
-                // assistant message cancels it from item/started above.
-                reasoning_state.begin_generation(events).await;
                 return;
             }
             if codex_item_is_non_rendered(item_type) {
@@ -3404,7 +3355,6 @@ async fn emit_codex_events_with_state(
                 return;
             }
             reasoning_state.generating_tools.remove(&id);
-            reasoning_state.running_tools.remove(&id);
             events
                 .send(ChatStreamEvent::ToolResult {
                     tool_use_id: id,
@@ -3414,12 +3364,6 @@ async fn emit_codex_events_with_state(
                 })
                 .await
                 .ok();
-            // App-server has no generic tool-input deltas. Cover consecutive
-            // calls even when the model emits no reasoning or commentary.
-            reasoning_state.begin_generation(events).await;
-        }
-        "turn/completed" => {
-            reasoning_state.cancel_generation(events).await;
         }
         _ => {}
     }
@@ -3434,11 +3378,6 @@ async fn observe_codex_output_event(
 ) {
     emit_codex_events_with_state(events, value, reasoning_state).await;
     if let Some(delta) = codex_event_delta(value) {
-        if !delta.is_empty()
-            && (codex_event_is_reasoning_delta(value) || codex_event_is_assistant_text_delta(value))
-        {
-            reasoning_state.cancel_generation(events).await;
-        }
         if codex_event_is_reasoning_delta(value) {
             if let Some(delta) = reasoning_state.observe_delta(value, &delta) {
                 events
@@ -4984,10 +4923,7 @@ mod tests {
             receiver.recv().await,
             Some(ChatStreamEvent::Phase { name, .. }) if name == "reasoning_completed"
         ));
-        assert!(matches!(
-            receiver.recv().await,
-            Some(ChatStreamEvent::ToolCallGenerating { id: None })
-        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -5106,10 +5042,7 @@ mod tests {
             receiver.recv().await,
             Some(ChatStreamEvent::Phase { name, .. }) if name == "reasoning_completed"
         ));
-        assert!(matches!(
-            receiver.recv().await,
-            Some(ChatStreamEvent::ToolCallGenerating { id: None })
-        ));
+        assert!(receiver.try_recv().is_err());
 
         emit_codex_events_with_state(
             &sender,
@@ -5124,10 +5057,7 @@ mod tests {
             &mut state,
         )
         .await;
-        assert!(matches!(
-            receiver.recv().await,
-            Some(ChatStreamEvent::Phase { name, .. }) if name == "action/preparing_cancelled"
-        ));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -5355,7 +5285,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_consecutive_tools_show_generation_before_the_next_call_arrives() {
+    async fn codex_consecutive_tools_wait_for_the_next_call_before_showing_generation() {
         let (sender, mut receiver) = mpsc::channel(16);
         let mut state = CodexReasoningState::default();
         // Two parallel calls have no action metadata or intervening narration.
@@ -5390,13 +5320,7 @@ mod tests {
                 );
             }
         }
-        assert!(
-            matches!(
-                receiver.try_recv(),
-                Ok(ChatStreamEvent::ToolCallGenerating { id: None })
-            ),
-            "generation feedback must precede the next tool's completed input"
-        );
+        assert!(receiver.try_recv().is_err(), "no next tool has arrived");
 
         emit_codex_events_with_state(
             &sender,
@@ -5617,10 +5541,6 @@ mod tests {
         ));
         assert!(matches!(
             receiver.recv().await,
-            Some(ChatStreamEvent::ToolCallGenerating { id: None })
-        ));
-        assert!(matches!(
-            receiver.recv().await,
             Some(ChatStreamEvent::ToolCallGenerating { id: Some(id) }) if id == "command-1"
         ));
         assert!(matches!(
@@ -5633,23 +5553,11 @@ mod tests {
         ));
         assert!(matches!(
             receiver.recv().await,
-            Some(ChatStreamEvent::ToolCallGenerating { id: None })
-        ));
-        assert!(matches!(
-            receiver.recv().await,
-            Some(ChatStreamEvent::Phase { name, .. }) if name == "action/preparing_cancelled"
-        ));
-        assert!(matches!(
-            receiver.recv().await,
             Some(ChatStreamEvent::Delta(text)) if text == "After the tool."
         ));
         assert!(matches!(
             receiver.recv().await,
             Some(ChatStreamEvent::Narration { text }) if text == "After the tool."
-        ));
-        assert!(matches!(
-            receiver.recv().await,
-            Some(ChatStreamEvent::ToolCallGenerating { id: None })
         ));
         assert_eq!(text, "Before the tool.After the tool.");
         assert_eq!(final_text.as_deref(), Some("After the tool."));
