@@ -77,6 +77,8 @@ impl NativeHarness {
             model_client: Arc::new(ProviderModelClient {
                 gateway: None,
                 configured_model_gateways: settings.configured_model_gateways.clone(),
+                #[cfg(feature = "subscription-adapters")]
+                codex_account: None,
             }),
             reviewer_model: settings.approval_reviewer_model.clone(),
             reviewer_effort: settings.approval_reviewer_effort.clone(),
@@ -94,6 +96,8 @@ impl NativeHarness {
             model_client: Arc::new(ProviderModelClient {
                 gateway: Some(model_gateway),
                 configured_model_gateways: settings.configured_model_gateways.clone(),
+                #[cfg(feature = "subscription-adapters")]
+                codex_account: None,
             }),
             ..Self::with_settings(settings)
         }
@@ -105,6 +109,34 @@ impl NativeHarness {
     }
 
     pub(crate) async fn run(
+        &self,
+        turn: AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        #[cfg(feature = "subscription-adapters")]
+        if turn.provider == crate::CodingProvider::Codex {
+            let store = turn
+                .agent_tools
+                .session_store()
+                .context("subscription model access requires durable Borg session storage")?;
+            let identity = borg_provider::provider::CodexModelProvider::account_identity().await?;
+            store
+                .bind_model_access(turn.session_id, turn.provider, &identity)
+                .await?;
+            let scoped = Self {
+                model_client: Arc::new(ProviderModelClient {
+                    codex_account: Some(identity),
+                    ..ProviderModelClient::default()
+                }),
+                ..self.clone()
+            };
+            return scoped.run_bound(turn, events, controls).await;
+        }
+        self.run_bound(turn, events, controls).await
+    }
+
+    async fn run_bound(
         &self,
         turn: AgentTurn,
         events: mpsc::Sender<SessionEventKind>,
@@ -755,6 +787,8 @@ trait NativeModelClient: Send + Sync {
 struct ProviderModelClient {
     gateway: Option<ModelGateway>,
     configured_model_gateways: std::collections::BTreeMap<String, ModelGateway>,
+    #[cfg(feature = "subscription-adapters")]
+    codex_account: Option<String>,
 }
 
 #[async_trait]
@@ -768,14 +802,16 @@ impl NativeModelClient for ProviderModelClient {
         progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
         #[cfg(feature = "subscription-adapters")]
-        if provider == crate::CodingProvider::Codex {
+        if provider == crate::CodingProvider::Codex
+            && let Some(account) = self.codex_account.as_deref()
+        {
             return borg_provider::provider::CodexModelProvider {
                 model: model.to_string(),
                 effort: effort
                     .unwrap_or(borg_provider::codex_default_effort())
                     .to_string(),
             }
-            .model_turn(request, progress)
+            .model_turn_for_account(request, progress, account)
             .await;
         }
         let configured_gateway = (provider == crate::CodingProvider::OpenAiCompatible)

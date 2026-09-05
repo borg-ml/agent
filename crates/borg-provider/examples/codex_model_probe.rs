@@ -16,6 +16,7 @@ async fn main() -> Result<()> {
 }
 
 async fn probe() -> Result<()> {
+    let account = CodexModelProvider::account_identity().await?;
     let provider = CodexModelProvider {
         model: borg_provider::runtime::codex_product_model().into(),
         effort: borg_provider::runtime::codex_default_effort().into(),
@@ -45,7 +46,9 @@ async fn probe() -> Result<()> {
         }
         first
     });
-    let first = provider.model_turn(request.clone(), Some(tx)).await?;
+    let first = provider
+        .model_turn_for_account(request.clone(), Some(tx), &account)
+        .await?;
     ensure!(
         progress.await?.is_some(),
         "no tool generation event received"
@@ -72,7 +75,9 @@ async fn probe() -> Result<()> {
         content: value.clone(),
     });
     request.request_id = Some(uuid::Uuid::new_v4().to_string());
-    let second = provider.model_turn(request, None).await?;
+    let second = provider
+        .model_turn_for_account(request, None, &account)
+        .await?;
     let (content, _, calls) = second
         .assistant_parts()
         .context("expected final response")?;

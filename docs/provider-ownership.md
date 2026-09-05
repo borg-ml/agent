@@ -106,9 +106,9 @@ the optional protocol-tagged `ModelMessage.provider_state`, not hidden in
 visible reasoning or a provider-owned conversation. Compatible adapters omit
 that field on the wire.
 
-This is not yet a native-harness migration. Session-scoped access, real refresh
-and re-login recovery, capabilities/context limits, cache hits, rate-limit UX,
-and end-to-end Borg permissions/steering/cancellation still need verification.
+The small transport probe alone does not establish a native-harness migration.
+Real refresh and re-login recovery, capabilities/context limits, rate-limit UX,
+and end-to-end subscription steering/cancellation still need verification.
 The small live probe reported zero cached tokens; preserving the cache key is
 not proof of a cache hit. Production routing is deliberately unchanged.
 
@@ -120,6 +120,11 @@ Ordinary executors still use the existing subscription route. Run
 that approves only `cat probe.txt`, stops, and restarts from its durable journal.
 This passed with Astra/low, Borg manual approval and tool execution, preserved
 model state across restart, and 1,024 cached input tokens during the first turn.
+The strengthened probe also checks opaque output and tool-round boundaries in
+the stored journal, not only the live event stream. This caught provider-static
+persistence/context filters that discarded native Codex model events. Those
+filters now recognize Borg-native event kinds independently of the provider.
+The rerun passed journal checks and reported 1,152 cached tokens after restart.
 
 The shared native loop now emits each stateful tool result before dispatching
 the next call, stops queued actions after an accepted steer, and polls controls
@@ -131,10 +136,19 @@ steering input is retained even if interruption precedes its model-message
 event. Offline loop tests exercise actual file writes and verify the second
 queued write does not run after steering or interruption.
 
-Before enabling the route by default, account identity must be bound across
-rounds/restarts; model limits, fast mode, and subscription cost basis still need
-to flow through the native contract. Real login/refresh and in-flight tool
-control behavior still need end-to-end subscription verification.
+Borg commits an immutable subscription account fingerprint in its SQLite
+session authority before the first model request. It is not a credential or
+model context. Every model round checks the current account against that
+binding before connecting, including authentication recovery. Binding survives
+compaction, context clearing, and restart; forks and child sessions inherit it.
+The additive table upgrade preserves existing sessions. Old subscription
+history without account provenance is refused by the opt-in route and requires
+a new session. The production CLI route is unaffected.
+
+Before enabling the route by default, model limits, fast mode, and subscription
+cost basis still need to flow through the native contract. Real login/refresh
+and in-flight tool control behavior still need end-to-end subscription
+verification; compaction and consultation must also use session-bound access.
 
 ## Evidence
 

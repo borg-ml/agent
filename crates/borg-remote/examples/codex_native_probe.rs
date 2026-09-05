@@ -5,7 +5,8 @@ use std::{sync::Arc, time::Duration};
 use anyhow::{Context, Result, ensure};
 use borg_remote::{
     ApprovalDecision, CodingProvider, HostCommand, LaunchSession, LocalAgentTurnExecutor,
-    PermissionMode, ResponseLanguage, SessionEventKind, run_agent_session_with_executor,
+    PermissionMode, ResponseLanguage, SessionEventKind, SessionStore, SqliteSessionStore,
+    run_agent_session_with_executor,
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -140,6 +141,24 @@ async fn probe() -> Result<()> {
         let _ = commands.send(HostCommand::Stop { session_id }).await;
         actor.await??;
         result?;
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3")).await?;
+        let journal = store.read(session_id).await?;
+        let native_outputs = journal
+            .iter()
+            .filter(|event| {
+                matches!(&event.kind,
+                    SessionEventKind::ProviderEvent { kind, payload, .. }
+                    if kind == "native_model_message" && payload.get("provider_state").is_some()
+                )
+            })
+            .count();
+        ensure!(
+            native_outputs >= if resumed { 2 } else { 1 },
+            "opaque native model state was not persisted in the journal"
+        );
+        ensure!(journal.iter().any(|event| matches!(&event.kind,
+            SessionEventKind::ProviderEvent { kind, .. } if kind == "native_tool_round_completed"
+        )), "native tool-round boundary was not persisted");
         println!(
             "PASS: {}",
             if resumed {

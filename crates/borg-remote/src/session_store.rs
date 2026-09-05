@@ -246,12 +246,11 @@ impl SessionEventKind {
 
     pub fn persistence(&self) -> EventPersistence {
         match self {
-            Self::ProviderEvent { provider, kind, .. }
-                if provider.uses_native_harness()
-                    && matches!(
-                        kind.as_str(),
-                        "native_model_message" | "native_tool_round_completed"
-                    ) =>
+            Self::ProviderEvent { kind, .. }
+                if matches!(
+                    kind.as_str(),
+                    "native_model_message" | "native_tool_round_completed"
+                ) =>
             {
                 EventPersistence::Durable
             }
@@ -349,7 +348,7 @@ impl SessionEventKind {
             {
                 true
             }
-            Self::ProviderEvent { provider, kind, .. } if provider.uses_native_harness() => {
+            Self::ProviderEvent { kind, .. } => {
                 matches!(
                     kind.as_str(),
                     "native_model_message" | "native_tool_round_completed"
@@ -1208,7 +1207,68 @@ impl SqliteSessionStore {
             sqlx::query_scalar("select version from borg_session_schema where id=1")
                 .fetch_optional(&self.pool)
                 .await?;
-        Ok(version == Some(SESSION_SCHEMA_VERSION))
+        let has_access_bindings: i64 = sqlx::query_scalar(
+            "select exists(select 1 from sqlite_master where type='table' and name='session_model_access')",
+        ).fetch_one(&self.pool).await?;
+        Ok(version == Some(SESSION_SCHEMA_VERSION) && has_access_bindings != 0)
+    }
+
+    #[cfg(any(feature = "subscription-adapters", test))]
+    pub(crate) async fn bind_model_access(
+        &self,
+        session_id: Uuid,
+        provider: CodingProvider,
+        account_identity: &str,
+    ) -> Result<()> {
+        ensure!(
+            !account_identity.is_empty(),
+            "model account identity is empty"
+        );
+        let mut transaction = self.begin_write().await?;
+        let provider = serde_json::to_value(provider)?
+            .as_str()
+            .context("provider is not a string")?
+            .to_owned();
+        let existing: Option<String> = sqlx::query_scalar(
+            "select account_identity from session_model_access where session_id=? and provider=?",
+        )
+        .bind(session_id.to_string())
+        .bind(&provider)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(existing) = existing {
+            ensure!(
+                existing == account_identity,
+                "model account differs from this session's bound account; reconnect the original account or start a new session"
+            );
+        } else {
+            // Pre-binding prototype history has no trustworthy account provenance.
+            let has_unbound_history: i64 = sqlx::query_scalar(
+                "with recursive lineage(id) as (select ? union all \
+                 select s.parent_session_id from sessions s join lineage l on s.id=l.id \
+                 where s.parent_session_id is not null) \
+                 select exists(select 1 from session_events e join lineage l on e.session_id=l.id \
+                 where json_extract(e.event_json, '$.kind.provider')=? \
+                 and (json_extract(e.event_json, '$.kind.kind')='native_model_message' \
+                 or (json_extract(e.event_json, '$.kind.type')='turn_started' and exists( \
+                 select 1 from session_events done where done.session_id=e.session_id \
+                 and json_extract(done.event_json, '$.kind.type')='turn_completed' \
+                 and json_extract(done.event_json, '$.kind.message_id')=json_extract(e.event_json, '$.kind.message_id')))))",
+            )
+            .bind(session_id.to_string())
+            .bind(&provider)
+            .fetch_one(&mut *transaction)
+            .await?;
+            ensure!(
+                has_unbound_history == 0,
+                "native model history has no account binding; start a new session before using subscription model access"
+            );
+            sqlx::query("insert into session_model_access (session_id, provider, account_identity) values (?, ?, ?)")
+                .bind(session_id.to_string()).bind(&provider).bind(account_identity)
+                .execute(&mut *transaction).await?;
+        }
+        transaction.commit().await?;
+        Ok(())
     }
 
     pub async fn finish_interactive_open(&self, session_id: Uuid) -> Result<()> {
@@ -2662,6 +2722,13 @@ impl SqliteSessionStore {
                 updated_at text not null
             );
 
+            create table if not exists session_model_access (
+                session_id text not null references sessions(id) on delete cascade,
+                provider text not null,
+                account_identity text not null,
+                primary key (session_id, provider)
+            );
+
             create table if not exists session_events (
                 session_id text not null references sessions(id) on delete cascade,
                 sequence integer not null,
@@ -3121,6 +3188,19 @@ impl SqliteSessionStore {
                 .execute(&mut *transaction)
                 .await?;
         }
+        let conflicting_access: i64 = sqlx::query_scalar(
+            "select exists(select 1 from session_model_access child join session_model_access owner \
+             on child.provider=owner.provider where child.session_id=? and owner.session_id=? \
+             and child.account_identity<>owner.account_identity)",
+        ).bind(session_id.to_string()).bind(owner_session_id.to_string())
+            .fetch_one(&mut *transaction).await?;
+        ensure!(
+            conflicting_access == 0,
+            "child model account differs from its owner's bound account"
+        );
+        sqlx::query("insert into session_model_access (session_id, provider, account_identity) select ?, provider, account_identity from session_model_access where session_id=? on conflict(session_id, provider) do nothing")
+            .bind(session_id.to_string()).bind(owner_session_id.to_string())
+            .execute(&mut *transaction).await?;
         let owner_workspace: Option<String> = sqlx::query_scalar(
             "select workspace_id from session_workspace_bindings where session_id=?",
         )
@@ -5849,6 +5929,9 @@ impl SessionStore for SqliteSessionStore {
         .bind(&now)
         .execute(&mut *transaction)
         .await?;
+        sqlx::query("insert into session_model_access (session_id, provider, account_identity) select ?, provider, account_identity from session_model_access where session_id=?")
+            .bind(session_id.to_string()).bind(parent_session_id.to_string())
+            .execute(&mut *transaction).await?;
         let parent_workspace: Option<String> = sqlx::query_scalar(
             "select workspace_id from session_workspace_bindings where session_id=?",
         )

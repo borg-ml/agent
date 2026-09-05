@@ -15,6 +15,148 @@ async fn store() -> (tempfile::TempDir, SqliteSessionStore) {
 }
 
 #[tokio::test]
+async fn model_access_binding_is_atomic_durable_and_inherited_without_context_dependence() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let (first, second) = tokio::join!(
+        store.bind_model_access(session_id, CodingProvider::Codex, "account-a"),
+        store.bind_model_access(session_id, CodingProvider::Codex, "account-b"),
+    );
+    assert_ne!(
+        first.is_ok(),
+        second.is_ok(),
+        "only one first-use identity may win"
+    );
+    let (accepted, rejected) = if first.is_ok() {
+        ("account-a", "account-b")
+    } else {
+        ("account-b", "account-a")
+    };
+    for kind in [
+        SessionEventKind::ContextCleared,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({"summary": "compacted"}),
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    let fork_id = Uuid::new_v4();
+    store.fork_before(session_id, fork_id, 1).await.unwrap();
+    let child_id = Uuid::new_v4();
+    store
+        .register_child_session(session_id, child_id)
+        .await
+        .unwrap();
+    let conflicting_child = Uuid::new_v4();
+    store.create_session(conflicting_child).await.unwrap();
+    store
+        .bind_model_access(conflicting_child, CodingProvider::Codex, rejected)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .register_child_session(session_id, conflicting_child)
+            .await
+            .is_err()
+    );
+    store.pool.close().await;
+    let reopened = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    for id in [session_id, fork_id, child_id] {
+        reopened
+            .bind_model_access(id, CodingProvider::Codex, accepted)
+            .await
+            .unwrap();
+        assert!(
+            reopened
+                .bind_model_access(id, CodingProvider::Codex, rejected)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("bound account")
+        );
+    }
+    let fresh = Uuid::new_v4();
+    reopened.create_session(fresh).await.unwrap();
+    reopened
+        .bind_model_access(fresh, CodingProvider::Codex, rejected)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn subscription_access_rejects_unbound_prototype_history_and_its_forks() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "native_model_message".to_string(),
+                payload: serde_json::to_value(borg_provider::provider::ModelMessage::user(
+                    "old private context",
+                ))
+                .unwrap(),
+            },
+        ))
+        .await
+        .unwrap();
+    let fork_id = Uuid::new_v4();
+    store.fork_before(session_id, fork_id, 2).await.unwrap();
+    for id in [session_id, fork_id] {
+        assert!(
+            store
+                .bind_model_access(id, CodingProvider::Codex, "current-account")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("no account binding")
+        );
+    }
+    let legacy = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    store.create_session(legacy).await.unwrap();
+    for kind in [
+        SessionEventKind::TurnStarted {
+            message_id,
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+        },
+        SessionEventKind::TurnCompleted {
+            message_id,
+            provider_session_id: None,
+            final_text: "old result".to_string(),
+            error: None,
+        },
+    ] {
+        store
+            .append(SessionEvent::new(legacy, 0, kind))
+            .await
+            .unwrap();
+    }
+    assert!(
+        store
+            .bind_model_access(legacy, CodingProvider::Codex, "current-account")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("no account binding")
+    );
+}
+
+#[tokio::test]
 async fn runtime_manifest_and_checkpoint_survive_store_reopen_and_detect_worker_restart() {
     let (directory, store) = store().await;
     let path = directory.path().join("sessions.sqlite3");
@@ -2746,6 +2888,27 @@ async fn interactive_open_defers_terminal_live_state_repair_until_requested() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn interactive_open_adds_account_bindings_without_replacing_existing_sessions() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    // Reproduce the current database schema before the additive binding table.
+    sqlx::query("drop table session_model_access")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    store.pool.close().await;
+    let reopened = SqliteSessionStore::open_interactive(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    assert!(reopened.contains_session(session_id).await.unwrap());
+    reopened
+        .bind_model_access(session_id, CodingProvider::Codex, "account-a")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

@@ -9,6 +9,7 @@ use base64::Engine;
 use borg_core::{CostBasis, ModelProviderState, ProviderCallUsage};
 use futures::StreamExt;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::{
@@ -34,6 +35,16 @@ struct SubscriptionAccess {
 }
 
 impl SubscriptionAccess {
+    fn identity(&self) -> String {
+        format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(format!(
+                "borg:codex:account:{}",
+                self.account_id
+            )))
+        )
+    }
+
     async fn read(refresh: bool) -> Result<Self> {
         let response = tokio::time::timeout(
             Duration::from_secs(60),
@@ -83,10 +94,17 @@ impl SubscriptionAccess {
 }
 
 impl CodexModelProvider {
-    pub async fn model_turn(
+    /// Non-secret subscription account identity, suitable for a host-owned binding.
+    pub async fn account_identity() -> Result<String> {
+        Ok(SubscriptionAccess::read(false).await?.identity())
+    }
+
+    /// The host must commit this identity before transmitting a durable session's context.
+    pub async fn model_turn_for_account(
         &self,
         request: ModelTurnRequest,
         progress: Option<UnboundedSender<ProviderProgress>>,
+        expected_account: &str,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
         let started = Instant::now();
         let mut trace = ProviderAttemptTrace {
@@ -110,7 +128,14 @@ impl CodexModelProvider {
                 .build()?;
             let mut access = SubscriptionAccess::read(false).await?;
             let mut response = self
-                .send(&client, ENDPOINT, &access, &request, &body)
+                .send(
+                    &client,
+                    ENDPOINT,
+                    &access,
+                    expected_account,
+                    &request,
+                    &body,
+                )
                 .await?;
             if response.status() == reqwest::StatusCode::UNAUTHORIZED {
                 // Retry only an unaccepted HTTP request, never a partial model
@@ -123,7 +148,14 @@ impl CodexModelProvider {
                 );
                 access = refreshed;
                 response = self
-                    .send(&client, ENDPOINT, &access, &request, &body)
+                    .send(
+                        &client,
+                        ENDPOINT,
+                        &access,
+                        expected_account,
+                        &request,
+                        &body,
+                    )
                     .await?;
             }
             ensure!(
@@ -263,9 +295,14 @@ impl CodexModelProvider {
         client: &reqwest::Client,
         endpoint: &str,
         access: &SubscriptionAccess,
+        expected_account: &str,
         request: &ModelTurnRequest,
         body: &Value,
     ) -> Result<reqwest::Response> {
+        ensure!(
+            access.identity() == expected_account,
+            "Codex account differs from this session's bound account; reconnect the original account or start a new session"
+        );
         let mut http = client
             .post(endpoint)
             .bearer_auth(&access.token)
@@ -528,6 +565,54 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     #[tokio::test]
+    async fn account_mismatch_is_rejected_before_connecting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+        let provider = CodexModelProvider {
+            model: "gpt-6-astra".into(),
+            effort: "low".into(),
+        };
+        let original = SubscriptionAccess {
+            token: "old-token".into(),
+            account_id: "account-a".into(),
+        };
+        let changed = SubscriptionAccess {
+            token: "new-token".into(),
+            account_id: "account-b".into(),
+        };
+        let refreshed = SubscriptionAccess {
+            token: "refreshed-token".into(),
+            account_id: "account-a".into(),
+        };
+        assert_eq!(original.identity(), refreshed.identity());
+        let request = ModelTurnRequest {
+            request_id: None,
+            session_id: Some("session".into()),
+            prompt_cache_key: None,
+            messages: vec![ModelMessage::user("private context")],
+            tools: Vec::new(),
+            output_schema: None,
+        };
+        let error = provider
+            .send(
+                &reqwest::Client::new(),
+                &endpoint,
+                &changed,
+                &original.identity(),
+                &request,
+                &provider.request_body(&request).unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("bound account"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn first_character_precedes_complete_arguments_and_native_output_survives_replay() {
         tokio::time::timeout(Duration::from_secs(10), async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -597,8 +682,9 @@ mod tests {
             let mut request = ModelTurnRequest { request_id: Some("request".into()), session_id: Some("session".into()),
                 prompt_cache_key: Some("cache".into()), messages: vec![ModelMessage::user("Inspect.")],
                 tools: vec![super::super::ModelToolDefinition::new("inspect", "Inspect", json!({"type":"object"})).unwrap()], output_schema: None };
+            let access = SubscriptionAccess { token: "test-token".into(), account_id: "test-account".into() };
             let response = provider.send(&reqwest::Client::new(), &endpoint,
-                &SubscriptionAccess { token: "test-token".into(), account_id: "test-account".into() },
+                &access, &access.identity(),
                 &request, &provider.request_body(&request).unwrap()).await.unwrap();
             let (tx, mut rx) = mpsc::unbounded_channel();
             let read = tokio::spawn(async move { provider.read_stream(response, Some(&tx)).await });
