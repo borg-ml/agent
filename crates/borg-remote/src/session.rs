@@ -756,6 +756,53 @@ struct SessionConsultationToolCall {
     response: oneshot::Sender<std::result::Result<ConsultationResult, String>>,
 }
 
+struct SessionToolApprovalRequest {
+    title: String,
+    detail: String,
+    response: oneshot::Sender<crate::ApprovalDecision>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionToolApprovals {
+    requests: mpsc::Sender<SessionToolApprovalRequest>,
+}
+
+impl SessionToolApprovals {
+    pub(crate) async fn request(
+        &self,
+        title: String,
+        detail: String,
+    ) -> Result<crate::ApprovalDecision> {
+        let (response, receiver) = oneshot::channel();
+        self.requests
+            .send(SessionToolApprovalRequest {
+                title,
+                detail,
+                response,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("tool approval turn is no longer active"))?;
+        receiver
+            .await
+            .context("tool approval ended without authorization")
+    }
+}
+
+struct PendingApproval {
+    id: String,
+    response: Option<oneshot::Sender<crate::ApprovalDecision>>,
+}
+
+async fn tool_approval_caller_closed(pending: &mut Option<PendingApproval>) {
+    match pending
+        .as_mut()
+        .and_then(|pending| pending.response.as_mut())
+    {
+        Some(response) => response.closed().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Model-facing consultation tool backed by the session actor. The main
 /// provider chooses the complete freeform briefing; this channel only carries
 /// that briefing and the requested provider/model profile to the isolated
@@ -2850,12 +2897,16 @@ async fn run_agent_session_store_kernel(
             continue;
         }
         let turn_executor = Arc::clone(&executor);
+        let (tool_approval_tx, mut tool_approval_rx) = mpsc::channel(8);
+        dispatcher.configure_tool_approvals(SessionToolApprovals {
+            requests: tool_approval_tx,
+        });
         let mut running = tokio::spawn(async move {
             turn_executor
                 .execute(turn, provider_events_tx, Some(control_rx))
                 .await
         });
-        let mut pending_approval: Option<String> = None;
+        let mut pending_approval: Option<PendingApproval> = None;
         let mut pending_provider_interaction: Option<String> = None;
         let mut pending_steers = VecDeque::<PendingSteer>::new();
         let mut steer_boundary_generation = 0_u64;
@@ -2873,6 +2924,26 @@ async fn run_agent_session_store_kernel(
         tokio::pin!(liveness_deadline);
         loop {
             tokio::select! {
+                Some(request) = tool_approval_rx.recv(), if pending_approval.is_none() && !interrupted => {
+                    if request.response.is_closed() { continue; }
+                    let approval_id = Uuid::new_v4().to_string();
+                    record(&mut journal, &events, session_id, SessionEventKind::StatusChanged {
+                        status: SessionStatus::WaitingForApproval, detail: None,
+                    }).await?;
+                    record(&mut journal, &events, session_id, SessionEventKind::ApprovalRequested {
+                        approval_id: approval_id.clone(), title: request.title, detail: request.detail, command: None,
+                    }).await?;
+                    pending_approval = Some(PendingApproval { id: approval_id, response: Some(request.response) });
+                    turn_phase = TurnPhase::Active;
+                    liveness_deadline.as_mut().reset(tokio::time::Instant::now() + turn_phase.liveness_timeout());
+                }
+                _ = tool_approval_caller_closed(&mut pending_approval) => {
+                    deny_pending_approval(&mut journal, &events, session_id, &mut pending_approval).await?;
+                    record(&mut journal, &events, session_id, SessionEventKind::StatusChanged {
+                        status: SessionStatus::Running, detail: None,
+                    }).await?;
+                    liveness_deadline.as_mut().reset(tokio::time::Instant::now() + turn_phase.liveness_timeout());
+                }
                 result = &mut running => {
                     let result = match result {
                         Ok(result) => result,
@@ -2914,6 +2985,10 @@ async fn run_agent_session_store_kernel(
                                 },
                             )
                             .await?;
+                        }
+                        if matches!(&kind, SessionEventKind::ApprovalRequested { .. })
+                            && pending_approval.as_ref().is_some_and(|pending| pending.response.is_some()) {
+                            deny_pending_approval(&mut journal, &events, session_id, &mut pending_approval).await?;
                         }
                         track_approval(&kind, &mut pending_approval);
                         track_provider_interaction(&kind, &mut pending_provider_interaction);
@@ -3233,6 +3308,10 @@ async fn run_agent_session_store_kernel(
                     }
                     let retry_steers = provider_event_is_steer_boundary(&kind)
                         || compaction_status == Some("completed");
+                    if matches!(&kind, SessionEventKind::ApprovalRequested { .. })
+                        && pending_approval.as_ref().is_some_and(|pending| pending.response.is_some()) {
+                        deny_pending_approval(&mut journal, &events, session_id, &mut pending_approval).await?;
+                    }
                     track_approval(&kind, &mut pending_approval);
                     track_provider_interaction(&kind, &mut pending_provider_interaction);
                     let usage = goal_token_usage(&kind);
@@ -3360,7 +3439,7 @@ async fn run_agent_session_store_kernel(
                     next_ready_detail = Some("Interrupted".to_string());
                     break;
                 }
-                _ = &mut liveness_deadline => {
+                _ = &mut liveness_deadline, if pending_approval.is_none() => {
                     let timed_out_phase = turn_phase;
                     subscription_context_reusable = false;
                     running.abort();
@@ -3746,8 +3825,8 @@ async fn run_agent_session_store_kernel(
                             approval_id,
                             decision,
                             ..
-                        } if pending_approval.as_deref() == Some(approval_id.as_str()) => {
-                            pending_approval = None;
+                        } if !interrupted && pending_approval.as_ref().map(|pending| pending.id.as_str()) == Some(approval_id.as_str()) => {
+                            let pending = pending_approval.take().expect("matching approval");
                             record(
                                 &mut journal,
                                 &events,
@@ -3766,13 +3845,20 @@ async fn run_agent_session_store_kernel(
                                     detail: None,
                                 },
                             ).await?;
-                            control_tx
-                                .send(AgentTurnControl::Approval {
-                                    approval_id,
-                                    decision,
-                                })
-                                .await
-                                .ok();
+                            if let Some(response) = pending.response {
+                                if response.send(decision).is_ok() && decision != crate::ApprovalDecision::Deny {
+                                    turn_had_side_effects = true;
+                                }
+                            } else {
+                                control_tx
+                                    .send(AgentTurnControl::Approval {
+                                        approval_id,
+                                        decision,
+                                    })
+                                    .await
+                                    .ok();
+                            }
+                            liveness_deadline.as_mut().reset(tokio::time::Instant::now() + turn_phase.liveness_timeout());
                         }
                         HostCommand::RespondToProviderInteraction {
                             interaction_id,
@@ -3865,6 +3951,9 @@ async fn run_agent_session_store_kernel(
                                 &mut goal_active_since,
                             ).await?;
                             control_tx.send(AgentTurnControl::Interrupt).await.ok();
+                            if pending_approval.as_ref().is_some_and(|pending| pending.response.is_some()) {
+                                deny_pending_approval(&mut journal, &events, session_id, &mut pending_approval).await?;
+                            }
                             turn_phase = TurnPhase::Cancelling;
                             interrupt_deadline =
                                 Some(Box::pin(tokio::time::sleep(INTERRUPT_GRACE_PERIOD)));
@@ -7334,13 +7423,17 @@ fn goal_token_usage(kind: &SessionEventKind) -> Option<u64> {
     }
 }
 
-fn track_approval(kind: &SessionEventKind, pending: &mut Option<String>) {
+fn track_approval(kind: &SessionEventKind, pending: &mut Option<PendingApproval>) {
     match kind {
         SessionEventKind::ApprovalRequested { approval_id, .. } => {
-            *pending = Some(approval_id.clone())
+            *pending = Some(PendingApproval {
+                id: approval_id.clone(),
+                response: None,
+            })
         }
         SessionEventKind::ApprovalResolved { approval_id, .. }
-            if pending.as_deref() == Some(approval_id.as_str()) =>
+            if pending.as_ref().map(|pending| pending.id.as_str())
+                == Some(approval_id.as_str()) =>
         {
             *pending = None
         }
@@ -7366,15 +7459,15 @@ async fn deny_pending_approval(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
-    pending: &mut Option<String>,
+    pending: &mut Option<PendingApproval>,
 ) -> Result<()> {
-    if let Some(approval_id) = pending.take() {
+    if let Some(pending) = pending.take() {
         record(
             journal,
             events,
             session_id,
             SessionEventKind::ApprovalResolved {
-                approval_id,
+                approval_id: pending.id,
                 decision: crate::ApprovalDecision::Deny,
             },
         )

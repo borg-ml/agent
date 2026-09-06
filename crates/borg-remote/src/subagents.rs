@@ -208,6 +208,7 @@ pub struct AgentToolDispatcher {
     extension_api: Arc<RwLock<crate::ExtensionApiSnapshot>>,
     runtime_root: PathBuf,
     runtime_permission: crate::PermissionMode,
+    tool_approvals: Arc<RwLock<Option<crate::session::SessionToolApprovals>>>,
     resource_limits: Option<HostResourceLimits>,
     execution_provider: Arc<RwLock<Arc<dyn crate::ExecutionProvider>>>,
     persistent_runtimes: PersistentRuntimeRegistry,
@@ -733,6 +734,7 @@ impl AgentToolDispatcher {
             extension_api: Arc::new(RwLock::new(crate::ExtensionApiSnapshot::default())),
             runtime_root,
             runtime_permission: permission,
+            tool_approvals: Arc::new(RwLock::new(None)),
             resource_limits: None,
             execution_provider: Arc::new(RwLock::new(execution_provider)),
             persistent_runtimes: PersistentRuntimeRegistry::default(),
@@ -745,6 +747,13 @@ impl AgentToolDispatcher {
     pub(crate) fn with_monitors(mut self, monitors: crate::monitor::Monitors) -> Self {
         self.monitors = Some(monitors);
         self
+    }
+
+    pub(crate) fn configure_tool_approvals(&self, approvals: crate::session::SessionToolApprovals) {
+        *self
+            .tool_approvals
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(approvals);
     }
 
     pub(crate) fn with_resource_limits(mut self, limits: Option<HostResourceLimits>) -> Self {
@@ -1059,6 +1068,39 @@ impl AgentToolDispatcher {
         workflow_approved: bool,
         workflow_cancel: Option<CancellationToken>,
     ) -> Result<Value> {
+        let mut workflow_approved = workflow_approved;
+        if name == "runtime_exec"
+            && !workflow_approved
+            && self.runtime_permission != crate::PermissionMode::FullAccess
+        {
+            let approvals = self
+                .tool_approvals
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(approvals) = approvals {
+                let detail = serde_json::to_string(&arguments)?;
+                ensure!(
+                    detail.len() <= crate::MAX_HOOK_ARGUMENT_BYTES,
+                    "tool request is too large to display for approval; split it into smaller calls"
+                );
+                let request = approvals.request("Use Borg persistent runtime".to_string(), detail);
+                let decision = if let Some(cancel) = &workflow_cancel {
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => bail!("tool approval was cancelled"),
+                        decision = request => decision?,
+                    }
+                } else {
+                    request.await?
+                };
+                ensure!(
+                    decision != crate::ApprovalDecision::Deny,
+                    "tool execution was denied by the approval policy"
+                );
+                workflow_approved = true;
+            }
+        }
         self.call_with_workflow_control_and_invocation(
             name,
             arguments,

@@ -9515,18 +9515,213 @@ fn consultation_profiles_resolve_aliases_and_catalog_models() {
 }
 
 #[tokio::test]
+async fn borg_tool_approvals_route_and_cancel_without_provider_controls() {
+    struct RuntimeExecutor {
+        cancel: tokio_util::sync::CancellationToken,
+        result: Arc<Mutex<Option<Result<Value, String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for RuntimeExecutor {
+        async fn execute(
+            &self,
+            turn: AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            let mut controls = controls.unwrap();
+            let call = turn.agent_tools.call_with_workflow_control(
+                "runtime_exec",
+                json!({"code": "40 + 2"}),
+                false,
+                Some(self.cancel.clone()),
+            );
+            tokio::pin!(call);
+            let result = tokio::select! {
+                biased;
+                control = controls.recv() => {
+                    assert!(matches!(control, Some(AgentTurnControl::Interrupt)),
+                        "Borg approval must not be forwarded to the provider");
+                    Err(anyhow::anyhow!("interrupted"))
+                }
+                result = &mut call => result,
+            };
+            *self.result.lock().unwrap() = Some(result.map_err(|error| error.to_string()));
+            events
+                .send(SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: "tool finished".into(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                })
+                .await
+                .unwrap();
+            Ok(AgentTurnResult {
+                provider_session_id: None,
+                final_text: "tool finished".into(),
+            })
+        }
+    }
+
+    for outcome in ["allow", "deny", "disconnect", "interrupt"] {
+        let root = tempdir().unwrap();
+        let journal_path = root.path().join("session.lock");
+        let session_id = Uuid::new_v4();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let result = Arc::new(Mutex::new(None));
+        let executor = Arc::new(RuntimeExecutor {
+            cancel: cancel.clone(),
+            result: result.clone(),
+        });
+        let actor = tokio::spawn(async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd: root.path().to_path_buf(),
+                    provider: CodingProvider::Claude,
+                    model: None,
+                    effort: None,
+                    fast: None,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: Some("use runtime".into()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        });
+        let approval_id = loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let SessionEventKind::ApprovalRequested { approval_id, .. } = event.kind {
+                break approval_id;
+            }
+        };
+        assert!(
+            result.lock().unwrap().is_none(),
+            "execution must wait for authorization"
+        );
+        command_tx
+            .send(HostCommand::Approve {
+                session_id,
+                approval_id: "unrelated".into(),
+                decision: crate::ApprovalDecision::AllowOnce,
+            })
+            .await
+            .unwrap();
+        match outcome {
+            "disconnect" => cancel.cancel(),
+            "interrupt" => {
+                command_tx
+                    .send(HostCommand::Interrupt { session_id })
+                    .await
+                    .unwrap();
+                command_tx
+                    .send(HostCommand::Approve {
+                        session_id,
+                        approval_id: approval_id.clone(),
+                        decision: crate::ApprovalDecision::AllowOnce,
+                    })
+                    .await
+                    .unwrap();
+            }
+            _ => command_tx
+                .send(HostCommand::Approve {
+                    session_id,
+                    approval_id: approval_id.clone(),
+                    decision: if outcome == "allow" {
+                        crate::ApprovalDecision::AllowOnce
+                    } else {
+                        crate::ApprovalDecision::Deny
+                    },
+                })
+                .await
+                .unwrap(),
+        }
+        let mut resolved = false;
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match event.kind {
+                SessionEventKind::ApprovalResolved {
+                    approval_id: id,
+                    decision,
+                } => {
+                    assert_eq!(id, approval_id);
+                    assert_eq!(
+                        decision,
+                        if outcome == "allow" {
+                            crate::ApprovalDecision::AllowOnce
+                        } else {
+                            crate::ApprovalDecision::Deny
+                        }
+                    );
+                    assert!(!resolved);
+                    resolved = true;
+                }
+                SessionEventKind::TurnCompleted { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(
+            resolved,
+            "terminal turn must resolve the canonical approval"
+        );
+        if outcome != "interrupt" {
+            let result = result.lock().unwrap();
+            let result = result.as_ref().expect("tool caller completed");
+            if outcome == "allow" {
+                assert_eq!(result.as_ref().unwrap()["value"], 42);
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        actor.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
 async fn cancelling_a_turn_resolves_its_pending_approval_as_denied() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
     let (_store, mut journal) = sqlite_runtime_store(&root, session_id).await;
     let (events, mut event_rx) = mpsc::channel(4);
-    let mut pending = Some("approval-1".to_string());
+    let (response, receiver) = oneshot::channel();
+    let mut pending = Some(PendingApproval {
+        id: "approval-1".to_string(),
+        response: Some(response),
+    });
 
     deny_pending_approval(&mut journal, &events, session_id, &mut pending)
         .await
         .unwrap();
 
     assert!(pending.is_none());
+    assert!(
+        receiver.await.is_err(),
+        "cancellation must not authorize the caller"
+    );
     let event = event_rx.recv().await.unwrap();
     assert!(matches!(
         event.kind,

@@ -72,6 +72,16 @@ MCP clients share the same execution provider and workspace-root checks.
 The bridge test verifies discovery, action metadata, bounded line reads, and
 refusal to list/read/search outside the session root in Manual mode.
 
+The existing persistent-runtime tool now requests approval directly from the
+Borg session actor when called through the bridge in limited permission modes.
+The actor journals the prompt and decision and answers the waiting Borg tool,
+not the provider control channel. Denial, caller disconnect, interruption, and
+turn completion cannot authorize the waiting call; queued requests expire with
+their turn. Human approval waits do not trigger the model-stall timeout. Requests
+too large to display are rejected instead of presenting a blind approval.
+This first consumer uses explicit approval in both Manual and Auto modes when
+the caller has not already obtained approval; native Auto review is unchanged.
+
 Merely disabling provider tools is still not a complete migration. Shell and
 file mutation retain their existing execution paths. A narrower SDK
 compatibility mode needs Borg's approval, cancellation, and result-journaling
