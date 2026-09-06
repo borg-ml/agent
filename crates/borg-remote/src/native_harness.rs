@@ -21,16 +21,14 @@ use uuid::Uuid;
 
 use crate::{
     AgentTurn, AgentTurnControl, AgentTurnResult, ApprovalDecision, EventActor,
-    ExecutionCommandRequest, ExecutionProvider, ExecutionReadRequest, ExecutionSearchRequest,
-    ExecutionStdinRequest, HarnessMode, HostResourceLimits, MessageStatus, PermissionMode,
-    SessionEventKind, SessionStatus, WorkspaceFilesystemOperation, WorkspaceFilesystemOutcome,
-    WorkspaceFilesystemRequest,
+    ExecutionCommandRequest, ExecutionProvider, ExecutionStdinRequest, HarnessMode,
+    HostResourceLimits, MessageStatus, PermissionMode, SessionEventKind, SessionStatus,
+    WorkspaceFilesystemOperation, WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest,
 };
 
 const MAX_TOOL_ROUNDS: usize = 32;
 const MAX_TOOL_RESULT_BYTES: usize = 1024 * 1024;
 const MAX_APPROVAL_DETAIL_BYTES: usize = 8 * 1024;
-const DEFAULT_FILE_BYTES: u64 = 256 * 1024;
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
@@ -991,43 +989,6 @@ impl NativeToolRuntime {
             arguments.remove("action");
         }
         match name {
-            "list_files" => {
-                let args: ListFilesArgs = serde_json::from_value(arguments)?;
-                self.filesystem(WorkspaceFilesystemOperation::List {
-                    path: PathBuf::from(args.path.unwrap_or_else(|| ".".to_string())),
-                    limit: args.limit.unwrap_or(200).clamp(1, 2_000),
-                })
-                .await
-            }
-            "read_file" => {
-                let args: ReadFileArgs = serde_json::from_value(arguments)?;
-                self.execution_provider
-                    .read_file(ExecutionReadRequest {
-                        root: self.root.clone(),
-                        path: PathBuf::from(args.path),
-                        offset_line: args.offset_line.unwrap_or(1),
-                        limit_lines: args.limit_lines.unwrap_or(2_000),
-                        max_bytes: args
-                            .max_bytes
-                            .unwrap_or(DEFAULT_FILE_BYTES)
-                            .clamp(1, MAX_FILE_BYTES) as usize,
-                    })
-                    .await
-            }
-            "search_files" => {
-                let args: SearchFilesArgs = serde_json::from_value(arguments)?;
-                self.execution_provider
-                    .search_files(ExecutionSearchRequest {
-                        root: self.root.clone(),
-                        path: PathBuf::from(args.path.unwrap_or_else(|| ".".to_string())),
-                        pattern: args.pattern,
-                        literal: args.literal.unwrap_or(false),
-                        case_sensitive: args.case_sensitive.unwrap_or(true),
-                        offset: args.offset.unwrap_or(0),
-                        limit: args.limit.unwrap_or(200),
-                    })
-                    .await
-            }
             "write_file" => {
                 let args: WriteFileArgs = serde_json::from_value(arguments)?;
                 self.filesystem(WorkspaceFilesystemOperation::WriteText {
@@ -2215,50 +2176,6 @@ async fn native_user_message(
 fn builtin_tool_specs() -> Vec<Value> {
     vec![
         tool(
-            "list_files",
-            "List one workspace directory without following symlinks.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "default": "." },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 2000 }
-                },
-                "additionalProperties": false
-            }),
-        ),
-        tool(
-            "read_file",
-            "Read a bounded line range from a UTF-8 workspace file. Continue with next_line when truncated.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "minLength": 1 },
-                    "offset_line": { "type": "integer", "minimum": 1, "default": 1 },
-                    "limit_lines": { "type": "integer", "minimum": 1, "maximum": 20000, "default": 2000 },
-                    "max_bytes": { "type": "integer", "minimum": 1, "maximum": MAX_FILE_BYTES }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
-        ),
-        tool(
-            "search_files",
-            "Search workspace text without requiring external executables. Results are gitignore-aware, bounded, and resumable with next_offset.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "pattern": { "type": "string", "minLength": 1 },
-                    "path": { "type": "string", "default": "." },
-                    "literal": { "type": "boolean", "default": false },
-                    "case_sensitive": { "type": "boolean", "default": true },
-                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": 2000, "default": 200 }
-                },
-                "required": ["pattern"],
-                "additionalProperties": false
-            }),
-        ),
-        tool(
             "write_file",
             "Create or deliberately overwrite a UTF-8 workspace file.",
             json!({
@@ -2448,33 +2365,6 @@ fn sort_tool_definitions(definitions: &mut [ModelToolDefinition]) {
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({ "name": name, "description": description, "inputSchema": input_schema })
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ListFilesArgs {
-    path: Option<String>,
-    limit: Option<usize>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ReadFileArgs {
-    path: String,
-    offset_line: Option<usize>,
-    limit_lines: Option<usize>,
-    max_bytes: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SearchFilesArgs {
-    pattern: String,
-    path: Option<String>,
-    literal: Option<bool>,
-    case_sensitive: Option<bool>,
-    offset: Option<usize>,
-    limit: Option<usize>,
 }
 
 #[derive(Deserialize)]

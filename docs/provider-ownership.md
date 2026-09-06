@@ -66,13 +66,19 @@ while that boundary is unresolved; do not infer that a subscription credential
 can simply replace an API key in a new direct adapter.
 
 Borg currently passes Claude's partial-message flag and MCP bridge but leaves
-built-in tools enabled. Merely disabling those tools is not a complete
-migration: Borg's shell/filesystem tool executor currently lives in the native
-harness, while the MCP dispatcher exposes the durable coordination/runtime
-tools. A narrower SDK compatibility mode needs that same permission-checked
-executor exposed through Borg first, with interruption and result journaling
-verified. Even then, the SDK would still own its internal model loop and
-session context; describe that limitation explicitly.
+built-in tools enabled. File listing, bounded reads, and search now live in the
+central Borg dispatcher: native tools, persistent runtimes, and subscription
+MCP clients share the same execution provider and workspace-root checks.
+The bridge test verifies discovery, action metadata, bounded line reads, and
+refusal to list/read/search outside the session root in Manual mode.
+
+Merely disabling provider tools is still not a complete migration. Shell and
+file mutation retain their existing execution paths. A narrower SDK
+compatibility mode needs Borg's approval, cancellation, and result-journaling
+boundary connected before those tools can move into the bridge. Raw execution
+methods must not become an MCP shortcut around that boundary. Even then, the
+SDK would still own its internal model loop and session context; describe that
+limitation explicitly.
 
 The inspected OpenCode source (`bbd72fb`) exposes provider metadata and OAuth
 authorization/callback routes, not a model-only streaming endpoint. Its

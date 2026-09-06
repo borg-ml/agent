@@ -934,6 +934,85 @@ impl AgentToolDispatcher {
             .await
     }
 
+    async fn read_workspace_tool(
+        &self,
+        execution_provider: &dyn crate::ExecutionProvider,
+        name: &str,
+        mut arguments: Value,
+    ) -> Result<Value> {
+        if let Some(arguments) = arguments.as_object_mut() {
+            arguments.remove("action");
+        }
+        match name {
+            "read_file" => {
+                let args: RuntimeReadFileArgs = serde_json::from_value(arguments)?;
+                execution_provider
+                    .read_file(crate::ExecutionReadRequest {
+                        root: self.runtime_root.clone(),
+                        path: PathBuf::from(args.path),
+                        offset_line: args.offset_line.unwrap_or(1),
+                        limit_lines: args.limit_lines.unwrap_or(2_000),
+                        max_bytes: args
+                            .max_bytes
+                            .unwrap_or(RUNTIME_DEFAULT_FILE_BYTES)
+                            .min(
+                                self.resource_limits
+                                    .as_ref()
+                                    .map(|limits| limits.max_file_transfer_bytes)
+                                    .unwrap_or(RUNTIME_MAX_FILE_BYTES),
+                            )
+                            .clamp(1, RUNTIME_MAX_FILE_BYTES)
+                            as usize,
+                    })
+                    .await
+            }
+            "search_files" => {
+                let args: RuntimeSearchFilesArgs = serde_json::from_value(arguments)?;
+                execution_provider
+                    .search_files(crate::ExecutionSearchRequest {
+                        root: self.runtime_root.clone(),
+                        path: PathBuf::from(args.path.unwrap_or_else(|| ".".to_string())),
+                        pattern: args.pattern,
+                        literal: args.literal.unwrap_or(false),
+                        case_sensitive: args.case_sensitive.unwrap_or(true),
+                        offset: args.offset.unwrap_or(0),
+                        limit: args.limit.unwrap_or(200),
+                    })
+                    .await
+            }
+            "list_files" => {
+                let args: RuntimeListFilesArgs = serde_json::from_value(arguments)?;
+                let response = execution_provider
+                    .filesystem(
+                        std::slice::from_ref(&self.runtime_root),
+                        WorkspaceFilesystemRequest {
+                            request_id: Uuid::new_v4(),
+                            workspace_id: self.actor_session_id,
+                            root_path: self.runtime_root.clone(),
+                            timeout_ms: 30_000,
+                            operation: WorkspaceFilesystemOperation::List {
+                                path: PathBuf::from(args.path.unwrap_or_else(|| ".".to_string())),
+                                limit: args.limit.unwrap_or(200).clamp(1, 2_000),
+                            },
+                        },
+                        &self.resource_limits.clone().unwrap_or_default(),
+                    )
+                    .await;
+                match response.outcome {
+                    WorkspaceFilesystemOutcome::Success { output } => {
+                        Ok(serde_json::to_value(output)?)
+                    }
+                    WorkspaceFilesystemOutcome::Failure {
+                        code,
+                        message,
+                        retryable,
+                    } => bail!("{code:?}: {message} (retryable={retryable})"),
+                }
+            }
+            _ => bail!("unknown workspace read tool {name}"),
+        }
+    }
+
     pub(crate) async fn call_without_extension_hooks(
         &self,
         name: &str,
@@ -1188,6 +1267,10 @@ impl AgentToolDispatcher {
                 .await;
         }
         match name {
+            "read_file" | "search_files" | "list_files" => {
+                self.read_workspace_tool(self.execution_provider().as_ref(), name, arguments)
+                    .await
+            }
             "monitor" => {
                 ensure!(
                     self.runtime_permission == crate::PermissionMode::FullAccess
@@ -1800,50 +1883,10 @@ impl RuntimeHost for DispatcherRuntimeHost {
             "persistent runtime exceeded the per-execution limit of {MAX_RUNTIME_HOST_CALLS} host calls"
         );
         match operation {
-            "read_file" => {
-                let args: RuntimeReadFileArgs = serde_json::from_value(arguments)?;
-                self.execution_provider
-                    .read_file(crate::ExecutionReadRequest {
-                        root: self.root.clone(),
-                        path: PathBuf::from(args.path),
-                        offset_line: args.offset_line.unwrap_or(1),
-                        limit_lines: args.limit_lines.unwrap_or(2_000),
-                        max_bytes: args
-                            .max_bytes
-                            .unwrap_or(RUNTIME_DEFAULT_FILE_BYTES)
-                            .min(
-                                self.dispatcher
-                                    .resource_limits
-                                    .as_ref()
-                                    .map(|limits| limits.max_file_transfer_bytes)
-                                    .unwrap_or(RUNTIME_MAX_FILE_BYTES),
-                            )
-                            .clamp(1, RUNTIME_MAX_FILE_BYTES)
-                            as usize,
-                    })
+            "read_file" | "search_files" | "list_files" => {
+                self.dispatcher
+                    .read_workspace_tool(self.execution_provider.as_ref(), operation, arguments)
                     .await
-            }
-            "search_files" => {
-                let args: RuntimeSearchFilesArgs = serde_json::from_value(arguments)?;
-                self.execution_provider
-                    .search_files(crate::ExecutionSearchRequest {
-                        root: self.root.clone(),
-                        path: PathBuf::from(args.path.unwrap_or_else(|| ".".to_string())),
-                        pattern: args.pattern,
-                        literal: args.literal.unwrap_or(false),
-                        case_sensitive: args.case_sensitive.unwrap_or(true),
-                        offset: args.offset.unwrap_or(0),
-                        limit: args.limit.unwrap_or(200),
-                    })
-                    .await
-            }
-            "list_files" => {
-                let args: RuntimeListFilesArgs = serde_json::from_value(arguments)?;
-                self.filesystem(WorkspaceFilesystemOperation::List {
-                    path: PathBuf::from(args.path.unwrap_or_else(|| ".".to_string())),
-                    limit: args.limit.unwrap_or(200).clamp(1, 2_000),
-                })
-                .await
             }
             "write_file" => {
                 let args: RuntimeWriteFileArgs = serde_json::from_value(arguments)?;
@@ -5466,6 +5509,50 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         "additionalProperties": false
     });
     let mut specs = vec![
+        tool(
+            "list_files",
+            "List one workspace directory without following symlinks.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "default": "." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 2000 }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "read_file",
+            "Read a bounded line range from a UTF-8 workspace file. Continue with next_line when truncated.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "minLength": 1 },
+                    "offset_line": { "type": "integer", "minimum": 1, "default": 1 },
+                    "limit_lines": { "type": "integer", "minimum": 1, "maximum": 20000, "default": 2000 },
+                    "max_bytes": { "type": "integer", "minimum": 1, "maximum": RUNTIME_MAX_FILE_BYTES }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "search_files",
+            "Search workspace text without requiring external executables. Results are gitignore-aware, bounded, and resumable with next_offset.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "minLength": 1 },
+                    "path": { "type": "string", "default": "." },
+                    "literal": { "type": "boolean", "default": false },
+                    "case_sensitive": { "type": "boolean", "default": true },
+                    "offset": { "type": "integer", "minimum": 0, "default": 0 },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 2000, "default": 200 }
+                },
+                "required": ["pattern"],
+                "additionalProperties": false
+            }),
+        ),
         tool(
             "monitor",
             "Start a session-scoped background command that watches logs, files, or external status. Each stdout line is delivered to you automatically in bounded batches, including when idle. Use a command that emits only meaningful changes. Do not poll or wait for it. Requires shell approval; runs until stopped, session exit, or 24 hours. Use list_monitors and stop_monitor to manage watches.",

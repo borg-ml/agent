@@ -6,6 +6,106 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::tempdir;
 
+#[tokio::test]
+async fn mcp_workspace_reads_are_bounded_and_cannot_escape_the_session_root() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("sample.txt"), "first\nneedle\nlast\n").unwrap();
+    std::fs::write(directory.path().join("private.txt"), "private needle").unwrap();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(&root),
+        CodingProvider::Claude,
+        Uuid::new_v4(),
+        false,
+        None,
+        None,
+        root,
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::Manual,
+    );
+    let (client, server) = tokio::io::duplex(8192);
+    let task = tokio::spawn(serve_agent_tool_connection(server, dispatcher, None));
+    let (read, mut write) = tokio::io::split(client);
+    let mut lines = BufReader::new(read).lines();
+    for (name, arguments, denied) in [
+        ("__borg_tools", json!({}), false),
+        (
+            "read_file",
+            json!({"action":"read", "path":"sample.txt", "offset_line":2, "limit_lines":1}),
+            false,
+        ),
+        (
+            "search_files",
+            json!({"action":"search", "pattern":"needle", "path":"."}),
+            false,
+        ),
+        ("list_files", json!({"action":"list", "path":"."}), false),
+        (
+            "read_file",
+            json!({"action":"read", "path":"../private.txt"}),
+            true,
+        ),
+        (
+            "search_files",
+            json!({"action":"search", "pattern":"needle", "path":".."}),
+            true,
+        ),
+        ("list_files", json!({"action":"list", "path":".."}), true),
+    ] {
+        let request = json!({"name":name, "arguments":arguments}).to_string() + "\n";
+        write.write_all(request.as_bytes()).await.unwrap();
+        let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            response.get("error").is_some(),
+            denied,
+            "{name}: {response}"
+        );
+        if denied {
+            continue;
+        }
+        let result = &response["result"];
+        match name {
+            "__borg_tools" => {
+                for name in ["read_file", "search_files", "list_files"] {
+                    assert!(
+                        result
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|spec| spec["name"] == name)
+                    );
+                }
+            }
+            "read_file" => {
+                assert_eq!(result["text"], "needle\n");
+                assert_eq!(result["next_line"], 3);
+            }
+            "search_files" => {
+                assert_eq!(result["matches"].as_array().unwrap().len(), 1);
+                assert_eq!(result["matches"][0]["line"], 2);
+            }
+            "list_files" => assert_eq!(result["entries"][0]["name"], "sample.txt"),
+            _ => unreachable!(),
+        }
+    }
+    drop(write);
+    drop(lines);
+    task.await.unwrap();
+}
+
 #[test]
 fn agent_mcp_executable_uses_existing_current_binary() {
     let directory = tempdir().unwrap();
