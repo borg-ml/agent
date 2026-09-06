@@ -111,7 +111,7 @@ pub trait ExecutionProvider: Send + Sync {
 
     async fn write_stdin(&self, request: ExecutionStdinRequest) -> Result<ProcessSnapshot>;
 
-    async fn terminate_session(&self, session_id: Uuid);
+    async fn terminate_session(&self, session_id: Uuid) -> Result<()>;
 }
 
 /// The current local execution world. It preserves Borg's existing process,
@@ -176,7 +176,7 @@ impl ExecutionProvider for LocalExecutionProvider {
             .await
     }
 
-    async fn terminate_session(&self, session_id: Uuid) {
-        self.processes.terminate_session(session_id).await;
+    async fn terminate_session(&self, session_id: Uuid) -> Result<()> {
+        self.processes.terminate_session(session_id).await
     }
 }

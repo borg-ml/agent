@@ -691,11 +691,13 @@ impl NativeHarness {
         Ok((final_text, result.usage))
     }
 
-    pub(crate) async fn stop_session(&self, session_id: Uuid) {
-        self.execution_provider.terminate_session(session_id).await;
-        self.workflow_process_manager
-            .terminate_session(session_id)
-            .await;
+    pub(crate) async fn stop_session(&self, session_id: Uuid) -> Result<()> {
+        let (commands, workflows) = tokio::join!(
+            self.execution_provider.terminate_session(session_id),
+            self.workflow_process_manager.terminate_session(session_id),
+        );
+        commands?;
+        workflows
     }
 
     pub(crate) async fn compact(

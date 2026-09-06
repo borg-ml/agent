@@ -1191,8 +1191,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         {
             pool.shutdown().await;
         }
-        self.native_harness.stop_session(session_id).await;
-        Ok(())
+        self.native_harness.stop_session(session_id).await
     }
 }
 

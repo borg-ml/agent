@@ -68,6 +68,7 @@ struct ProcessEntry {
     status: Mutex<ProcessStatus>,
     changed: Notify,
     finished: Notify,
+    cancellation: CancellationToken,
     updates: broadcast::Sender<(Uuid, Option<Vec<u8>>)>,
 }
 
@@ -226,6 +227,7 @@ impl ProcessManager {
         cancel: CancellationToken,
         environment: &BTreeMap<String, String>,
     ) -> Result<ProcessSnapshot> {
+        let cancel = cancel.child_token();
         ensure!(!cancel.is_cancelled(), "process execution was cancelled");
         let cwd = resolve_workdir(root, workdir)?;
         let active = self
@@ -292,6 +294,7 @@ impl ProcessManager {
             }),
             changed: Notify::new(),
             finished: Notify::new(),
+            cancellation: cancel.clone(),
             updates: self.inner.updates.clone(),
         });
         self.inner
@@ -344,7 +347,6 @@ impl ProcessManager {
             stdout_task,
             stderr_task,
             journal,
-            cancel.clone(),
         ));
         startup.pid = None;
 
@@ -406,17 +408,9 @@ impl ProcessManager {
     ) -> Result<ProcessSnapshot> {
         let entry = self.entry(owner_session_id, process_id)?;
         if terminate {
-            {
-                let mut status = entry
-                    .status
-                    .lock()
-                    .expect("native process status lock poisoned");
-                if status.running {
-                    status.terminated = true;
-                }
-            }
-            terminate_process_tree(entry.pid).await;
-            entry.stdin.lock().await.take();
+            entry.cancellation.cancel();
+            let _ =
+                tokio::time::timeout(Duration::from_secs(2), wait_for_process_finish(&entry)).await;
         } else if let Some(chars) = chars {
             let mut stdin = entry.stdin.lock().await;
             let pipe = stdin
@@ -465,39 +459,56 @@ impl ProcessManager {
         Ok(entry)
     }
 
-    pub(crate) async fn terminate_session(&self, owner_session_id: Uuid) {
+    pub(crate) async fn terminate_session(&self, owner_session_id: Uuid) -> Result<()> {
         let entries = {
-            let mut processes = self
+            let processes = self
                 .inner
                 .processes
                 .lock()
                 .expect("native process registry lock poisoned");
-            let ids = processes
-                .iter()
-                .filter_map(|(id, entry)| (entry.session_id == owner_session_id).then_some(*id))
-                .collect::<Vec<_>>();
-            ids.into_iter()
-                .filter_map(|id| processes.remove(&id))
+            processes
+                .values()
+                .filter(|entry| entry.session_id == owner_session_id)
+                .cloned()
                 .collect::<Vec<_>>()
         };
         for entry in &entries {
-            let mut status = entry
+            entry.cancellation.cancel();
+        }
+        let drained = tokio::time::timeout(
+            Duration::from_secs(5),
+            futures::future::join_all(entries.iter().map(wait_for_process_finish)),
+        )
+        .await;
+        let mut errors = Vec::new();
+        for entry in entries {
+            let status = entry
                 .status
                 .lock()
                 .expect("native process status lock poisoned");
             if status.running {
-                status.terminated = true;
+                continue;
             }
+            if let Some(error) = &status.error {
+                errors.push(format!("{}: {error}", entry.process_id));
+            }
+            drop(status);
+            self.inner
+                .processes
+                .lock()
+                .expect("native process registry lock poisoned")
+                .remove(&entry.process_id);
         }
-        futures::future::join_all(
-            entries
-                .iter()
-                .map(|entry| terminate_process_tree(entry.pid)),
-        )
-        .await;
-        for entry in entries {
-            entry.stdin.lock().await.take();
-        }
+        ensure!(
+            drained.is_ok(),
+            "timed out waiting for session process cleanup"
+        );
+        ensure!(
+            errors.is_empty(),
+            "session process cleanup failed: {}",
+            errors.join("; ")
+        );
+        Ok(())
     }
 
     pub(crate) async fn recover_session(
@@ -938,16 +949,22 @@ async fn supervise_process(
     stdout_task: tokio::task::JoinHandle<()>,
     stderr_task: tokio::task::JoinHandle<()>,
     journal: Option<SqliteSessionStore>,
-    cancel: CancellationToken,
 ) {
+    let complete = async {
+        let result = child.wait().await;
+        entry.stdin.lock().await.take();
+        let _ = tokio::join!(stdout_task, stderr_task);
+        result
+    };
+    tokio::pin!(complete);
     let result = tokio::select! {
         biased;
-        _ = cancel.cancelled() => {
+        _ = entry.cancellation.cancelled() => {
             entry.status.lock().expect("native process status lock poisoned").terminated = true;
-            terminate_process_tree(entry.pid).await;
-            child.wait().await
+            let (_, result) = tokio::join!(terminate_process_tree(entry.pid), &mut complete);
+            result
         }
-        result = tokio::time::timeout(timeout, child.wait()) => match result {
+        result = tokio::time::timeout(timeout, &mut complete) => match result {
             Ok(result) => result,
             Err(_) => {
                 entry
@@ -955,13 +972,11 @@ async fn supervise_process(
                     .lock()
                     .expect("native process status lock poisoned")
                     .timed_out = true;
-                terminate_process_tree(entry.pid).await;
-                child.wait().await
+                let (_, result) = tokio::join!(terminate_process_tree(entry.pid), &mut complete);
+                result
             }
         },
     };
-    entry.stdin.lock().await.take();
-    let _ = tokio::join!(stdout_task, stderr_task);
     let (runtime_status, exit_code, timed_out, error) = {
         let mut status = entry
             .status
@@ -1247,22 +1262,147 @@ mod tests {
         let root = tempfile::tempdir().expect("workspace");
         let manager = ProcessManager::default();
         let owner = Uuid::new_v4();
+        let parent = CancellationToken::new();
         let process = manager
-            .exec(
+            .exec_with_cancel(
                 owner,
                 root.path(),
-                "sleep 30".to_string(),
+                "exec /bin/sh -c 'sleep 30 &'".to_string(),
                 None,
                 Some(1),
                 Some(100),
                 60_000,
                 None,
+                parent.clone(),
             )
             .await
             .expect("spawn");
+        let entry = manager.entry(owner, process.session_id).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while unsafe { libc::kill(entry.pid as i32, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the shell must exit while its child retains the output pipe");
+        let other_owner = Uuid::new_v4();
+        let unrelated = manager
+            .exec_with_cancel(
+                other_owner,
+                root.path(),
+                "sleep 30".into(),
+                None,
+                Some(1),
+                Some(100),
+                60_000,
+                None,
+                parent.clone(),
+            )
+            .await
+            .unwrap();
         assert!(process.running);
-        manager.terminate_session(owner).await;
+        manager.terminate_session(owner).await.unwrap();
         assert!(manager.entry(owner, process.session_id).is_err());
+        assert!(!parent.is_cancelled());
+        assert!(
+            manager
+                .write_stdin(
+                    other_owner,
+                    unrelated.session_id,
+                    None,
+                    false,
+                    Some(0),
+                    None
+                )
+                .await
+                .unwrap()
+                .running
+        );
+        manager.terminate_session(other_owner).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn session_cleanup_waits_for_journaling_and_propagates_failure() {
+        for fail_journal in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap();
+            let owner = Uuid::new_v4();
+            store.create_session(owner).await.unwrap();
+            let manager = ProcessManager::default();
+            let process = manager
+                .exec(
+                    owner,
+                    root.path(),
+                    "sleep 30".into(),
+                    None,
+                    Some(1),
+                    Some(100),
+                    60_000,
+                    Some(store.clone()),
+                )
+                .await
+                .unwrap();
+            let entry = manager.entry(owner, process.session_id).unwrap();
+            let transaction = if fail_journal {
+                store.pool().close().await;
+                None
+            } else {
+                Some(store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap())
+            };
+            let stop_manager = manager.clone();
+            let first = tokio::spawn(async move { stop_manager.terminate_session(owner).await });
+            if let Some(transaction) = transaction {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while unsafe { libc::kill(entry.pid as i32, 0) } == 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("cleanup must reap the child before waiting for its journal");
+                assert!(!first.is_finished());
+                assert!(manager.entry(owner, process.session_id).is_ok());
+                let stop_manager = manager.clone();
+                let mut second =
+                    tokio::spawn(async move { stop_manager.terminate_session(owner).await });
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut second)
+                        .await
+                        .is_err(),
+                    "a concurrent stop must also wait for the terminal journal write"
+                );
+                transaction.rollback().await.unwrap();
+                tokio::time::timeout(Duration::from_secs(3), second)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(3), first)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.is_err(), fail_journal);
+            assert!(manager.entry(owner, process.session_id).is_err());
+            if !fail_journal {
+                assert!(
+                    store
+                        .read(owner)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|event| matches!(
+                            event.kind,
+                            SessionEventKind::RuntimeProcessCompleted {
+                                status: RuntimeProcessStatus::Terminated,
+                                ..
+                            }
+                        ))
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1321,7 +1461,7 @@ mod tests {
                 .unwrap()
                 .running
         );
-        manager.terminate_session(owner).await;
+        manager.terminate_session(owner).await.unwrap();
     }
 
     #[tokio::test]
