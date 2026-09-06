@@ -25,6 +25,8 @@ pub struct ExecutionCommandRequest {
     /// Session-scoped capability transport inherited by model-authored child
     /// processes. Provider and deployment credentials are never added here.
     pub environment: BTreeMap<String, String>,
+    /// Remains attached to the process after the initial background snapshot.
+    pub cancellation: Option<tokio_util::sync::CancellationToken>,
 }
 
 /// One stdin interaction with a process in an agent's execution world.
@@ -146,7 +148,7 @@ impl ExecutionProvider for LocalExecutionProvider {
 
     async fn command(&self, request: ExecutionCommandRequest) -> Result<ProcessSnapshot> {
         self.processes
-            .exec_with_environment(
+            .exec_with_cancel_and_environment(
                 request.owner_session_id,
                 &request.root,
                 request.command,
@@ -155,6 +157,7 @@ impl ExecutionProvider for LocalExecutionProvider {
                 request.max_output_tokens,
                 request.timeout_ms,
                 request.journal,
+                request.cancellation.unwrap_or_default(),
                 &request.environment,
             )
             .await

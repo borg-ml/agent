@@ -1888,6 +1888,7 @@ impl AgentToolDispatcher {
             }
             _ => unreachable!("persistent runtime was validated above"),
         };
+        let cancellation = cancellation.unwrap_or_default().child_token();
         let host: Arc<dyn RuntimeHost> = Arc::new(DispatcherRuntimeHost {
             session_id: self.actor_session_id,
             root: self.runtime_root.clone(),
@@ -1898,6 +1899,7 @@ impl AgentToolDispatcher {
             host_calls: Arc::new(AtomicUsize::new(0)),
             session_store: self.session_store(),
             runtime_worker_id: runtime_worker.worker_id(),
+            process_cancellation: cancellation.clone(),
         });
         let timeout_ms = match (args.timeout_ms, self.resource_limits.as_ref()) {
             (Some(requested), Some(limits)) => Some(requested.min(limits.max_runtime_execution_ms)),
@@ -1906,7 +1908,7 @@ impl AgentToolDispatcher {
         };
         Ok(serde_json::to_value(
             runtime_worker
-                .execute_as(runtime, &args.code, timeout_ms, host, cancellation)
+                .execute_as(runtime, &args.code, timeout_ms, host, Some(cancellation))
                 .await?,
         )?)
     }
@@ -1922,6 +1924,7 @@ struct DispatcherRuntimeHost {
     host_calls: Arc<AtomicUsize>,
     session_store: Option<crate::SqliteSessionStore>,
     runtime_worker_id: Uuid,
+    process_cancellation: CancellationToken,
 }
 
 impl DispatcherRuntimeHost {
@@ -1990,6 +1993,7 @@ impl RuntimeHost for DispatcherRuntimeHost {
                                 .clamp(1, RUNTIME_MAX_COMMAND_TIMEOUT_MS),
                             journal: self.session_store.clone(),
                             environment: BTreeMap::new(),
+                            cancellation: Some(self.process_cancellation.clone()),
                         })
                         .await?,
                 )?)

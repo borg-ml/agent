@@ -1070,6 +1070,7 @@ impl NativeToolRuntime {
                         .clamp(1, MAX_COMMAND_TIMEOUT_MS),
                     journal: self.session_store.clone(),
                     environment: self.command_environment.clone(),
+                    cancellation: None,
                 })
                 .await?,
         )?)

@@ -37,6 +37,25 @@ struct ProcessManagerInner {
     updates: broadcast::Sender<(Uuid, Option<Vec<u8>>)>,
 }
 
+struct ProcessStartupGuard {
+    manager: Arc<ProcessManagerInner>,
+    process_id: Uuid,
+    pid: Option<u32>,
+}
+
+impl Drop for ProcessStartupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            force_kill_process_tree_now(pid);
+            self.manager
+                .processes
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&self.process_id);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ProcessEntry {
     process_id: Uuid,
@@ -136,6 +155,7 @@ impl ProcessManager {
         .await
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn exec_with_environment(
         &self,
@@ -193,7 +213,7 @@ impl ProcessManager {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn exec_with_cancel_and_environment(
+    pub(crate) async fn exec_with_cancel_and_environment(
         &self,
         owner_session_id: Uuid,
         root: &Path,
@@ -250,6 +270,11 @@ impl ProcessManager {
         let pid = child
             .id()
             .context("spawned command did not expose a process id")?;
+        let mut startup = ProcessStartupGuard {
+            manager: self.inner.clone(),
+            process_id,
+            pid: Some(pid),
+        };
         let stdin = child.stdin.take();
         let stdout = child.stdout.take().context("command stdout pipe missing")?;
         let stderr = child.stderr.take().context("command stderr pipe missing")?;
@@ -296,6 +321,7 @@ impl ProcessManager {
             entry.stdin.lock().await.take();
             terminate_process_tree(pid).await;
             let _ = child.wait().await;
+            startup.pid = None;
             return Err(error.context("failed to journal native process start"));
         }
 
@@ -317,9 +343,10 @@ impl ProcessManager {
             Duration::from_millis(timeout_ms),
             stdout_task,
             stderr_task,
-            process_id,
             journal,
+            cancel.clone(),
         ));
+        startup.pid = None;
 
         let yield_for =
             Duration::from_millis(yield_time_ms.unwrap_or(DEFAULT_YIELD_MS).min(MAX_YIELD_MS));
@@ -332,17 +359,6 @@ impl ProcessManager {
             tokio::select! {
                 _ = tokio::time::timeout(yield_for, entry.finished.notified()) => {}
                 _ = cancel.cancelled() => {
-                    {
-                        let mut status = entry
-                            .status
-                            .lock()
-                            .expect("native process status lock poisoned");
-                        if status.running {
-                            status.terminated = true;
-                        }
-                    }
-                    terminate_process_tree(entry.pid).await;
-                    entry.stdin.lock().await.take();
                     let _ = tokio::time::timeout(
                         Duration::from_secs(2),
                         wait_for_process_finish(&entry),
@@ -921,22 +937,28 @@ async fn supervise_process(
     timeout: Duration,
     stdout_task: tokio::task::JoinHandle<()>,
     stderr_task: tokio::task::JoinHandle<()>,
-    process_id: Uuid,
     journal: Option<SqliteSessionStore>,
+    cancel: CancellationToken,
 ) {
-    let result = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(result) => result,
-        Err(_) => {
-            {
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            entry.status.lock().expect("native process status lock poisoned").terminated = true;
+            terminate_process_tree(entry.pid).await;
+            child.wait().await
+        }
+        result = tokio::time::timeout(timeout, child.wait()) => match result {
+            Ok(result) => result,
+            Err(_) => {
                 entry
                     .status
                     .lock()
                     .expect("native process status lock poisoned")
                     .timed_out = true;
+                terminate_process_tree(entry.pid).await;
+                child.wait().await
             }
-            terminate_process_tree(entry.pid).await;
-            child.wait().await
-        }
+        },
     };
     entry.stdin.lock().await.take();
     let _ = tokio::join!(stdout_task, stderr_task);
@@ -963,7 +985,7 @@ async fn supervise_process(
         let _ = append_runtime_completed(
             store,
             entry.session_id,
-            process_id,
+            entry.process_id,
             entry.pid,
             runtime_status,
             exit_code,
@@ -1224,6 +1246,117 @@ mod tests {
         assert!(process.running);
         manager.terminate_session(owner).await;
         assert!(manager.entry(owner, process.session_id).is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn background_cancellation_is_scoped_and_journaled() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let owner = Uuid::new_v4();
+        store.create_session(owner).await.unwrap();
+        let manager = ProcessManager::default();
+        let cancel = CancellationToken::new();
+        let scoped = manager
+            .exec_with_cancel(
+                owner,
+                root.path(),
+                "sleep 30".into(),
+                None,
+                Some(1),
+                Some(100),
+                60_000,
+                Some(store.clone()),
+                cancel.clone(),
+            )
+            .await
+            .unwrap();
+        let unrelated = manager
+            .exec(
+                owner,
+                root.path(),
+                "sleep 30".into(),
+                None,
+                Some(1),
+                Some(100),
+                60_000,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(scoped.running && unrelated.running);
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let events = store.events_after(owner, 0, 100).await.unwrap();
+                if events.iter().any(|event| matches!(event.kind,
+                    SessionEventKind::RuntimeProcessCompleted { process_id, status: RuntimeProcessStatus::Terminated, .. }
+                    if process_id == scoped.session_id)) { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("background cancellation must reach its durable terminal event");
+        assert!(
+            manager
+                .write_stdin(owner, unrelated.session_id, None, false, Some(1), Some(100))
+                .await
+                .unwrap()
+                .running
+        );
+        manager.terminate_session(owner).await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn dropping_command_startup_kills_the_unjournaled_process() {
+        let root = tempfile::tempdir().unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let owner = Uuid::new_v4();
+        store.create_session(owner).await.unwrap();
+        let transaction = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let manager = ProcessManager::default();
+        let task_manager = manager.clone();
+        let cwd = root.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            task_manager
+                .exec(
+                    owner,
+                    &cwd,
+                    "/bin/sh -c 'echo $$ > startup.pid; exec sleep 30'".into(),
+                    None,
+                    Some(30_000),
+                    Some(100),
+                    60_000,
+                    Some(store),
+                )
+                .await
+        });
+        let pid: i32 = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(pid) = tokio::fs::read_to_string(root.path().join("startup.pid")).await
+                    && let Ok(pid) = pid.trim().parse()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        transaction.rollback().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("aborted startup must reap its child");
+        assert!(manager.inner.processes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

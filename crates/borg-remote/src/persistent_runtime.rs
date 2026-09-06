@@ -338,6 +338,7 @@ impl PersistentRuntimeWorker {
             if result.is_err()
                 && let Some(mut process) = process.take()
             {
+                cancellation.cancel();
                 process.stop().await;
             }
             {

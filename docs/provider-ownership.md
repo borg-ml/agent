@@ -91,8 +91,14 @@ shell-process and tool-result lifecycle needed for standalone MCP mutation tools
 Runtime workers now have isolated process groups on Unix and use Borg's existing
 process-tree cleanup on cancellation, failure, and shutdown, including escalation
 for children that ignore termination. Dropping a worker also force-stops its group.
-This covers inherited subprocess groups, not deliberately detached processes or
-commands launched separately through Borg's execution provider.
+This covers inherited subprocess groups, not deliberately detached processes.
+Commands launched through Borg's execution provider retain the current runtime
+call's cancellation token after their initial background snapshot. Cancelling or
+failing that call stops those commands without stopping unrelated session commands;
+successful calls can leave intentional background work running. A startup guard
+also force-stops commands dropped while their start event is being journaled,
+before the process supervisor takes ownership. Terminal process events are still
+journaled by that supervisor; full tool-result lifecycle integration remains open.
 
 Native and persistent-runtime file writes/edits now share the dispatcher as
 well, including configured transfer limits and exact-match edit validation.

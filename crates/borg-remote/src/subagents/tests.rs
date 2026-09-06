@@ -48,28 +48,32 @@ async fn mcp_disconnect_and_shutdown_reap_the_active_runtime_worker() {
             shutdown.clone(),
         ));
         let request = json!({"name": "runtime_exec", "arguments": {"code":
-            "import os, time, subprocess, sys\nfrom pathlib import Path\nsubprocess.Popen([sys.executable, '-c', \"import os, signal, time; from pathlib import Path; signal.signal(signal.SIGTERM, signal.SIG_IGN); Path('child.pid').write_text(str(os.getpid())); time.sleep(60)\"])\nPath('worker.pid').write_text(str(os.getpid()))\ntime.sleep(60)\nPath('late-write').write_text('must not run')"
+            "import os, time, subprocess, sys\nfrom pathlib import Path\nsubprocess.Popen([sys.executable, '-c', \"import os, signal, time; from pathlib import Path; signal.signal(signal.SIGTERM, signal.SIG_IGN); Path('child.pid').write_text(str(os.getpid())); time.sleep(60)\"])\nborg.exec(\"/bin/sh -c 'echo $$ > managed.pid; exec sleep 60'\", yield_time_ms=1)\nPath('worker.pid').write_text(str(os.getpid()))\ntime.sleep(60)\nPath('late-write').write_text('must not run')"
         }});
         client
             .write_all(format!("{request}\n").as_bytes())
             .await
             .unwrap();
-        let (pid, child_pid): (i32, i32) = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if let Ok(pid) =
-                    tokio::fs::read_to_string(directory.path().join("worker.pid")).await
-                    && let Ok(pid) = pid.parse()
-                    && let Ok(child_pid) =
-                        tokio::fs::read_to_string(directory.path().join("child.pid")).await
-                    && let Ok(child_pid) = child_pid.parse()
-                {
-                    break (pid, child_pid);
+        let (pid, child_pid, managed_pid): (i32, i32, i32) =
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Ok(pid) =
+                        tokio::fs::read_to_string(directory.path().join("worker.pid")).await
+                        && let Ok(pid) = pid.parse()
+                        && let Ok(child_pid) =
+                            tokio::fs::read_to_string(directory.path().join("child.pid")).await
+                        && let Ok(child_pid) = child_pid.parse()
+                        && let Ok(managed_pid) =
+                            tokio::fs::read_to_string(directory.path().join("managed.pid")).await
+                        && let Ok(managed_pid) = managed_pid.trim().parse()
+                    {
+                        break (pid, child_pid, managed_pid);
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("runtime must start before cancellation");
+            })
+            .await
+            .expect("runtime must start before cancellation");
         let mut child_cleanup = ChildCleanup(child_pid);
         if server_shutdown {
             shutdown.cancel();
@@ -103,6 +107,13 @@ async fn mcp_disconnect_and_shutdown_reap_the_active_runtime_worker() {
         .await
         .expect("a child ignoring SIGTERM must still be stopped");
         child_cleanup.0 = 0;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while unsafe { libc::kill(managed_pid, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("commands launched through Borg must also be reaped");
         assert!(!directory.path().join("late-write").exists());
         let next = dispatcher
             .call("runtime_exec", json!({"code": "40 + 2"}))
@@ -149,6 +160,7 @@ async fn workspace_mutations_preserve_authorization_and_file_contents_on_failure
         host_calls: Arc::new(AtomicUsize::new(0)),
         session_store: None,
         runtime_worker_id: Uuid::new_v4(),
+        process_cancellation: CancellationToken::new(),
     };
     let create = serde_json::json!({"path": "sample.txt", "content": "same same"});
     assert!(host.call("write_file", create.clone()).await.is_err());
@@ -981,6 +993,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
         host_calls: Arc::new(AtomicUsize::new(0)),
         session_store: None,
         runtime_worker_id: runtime.worker_id(),
+        process_cancellation: CancellationToken::new(),
     });
     let result = runtime
         .execute("borg.semantic_search('alpha')", None, Arc::clone(&host))
