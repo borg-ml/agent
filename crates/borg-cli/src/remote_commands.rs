@@ -707,6 +707,109 @@ async fn open_browser(url: &str) -> Result<()> {
 }
 
 async fn install_host_service(config_path: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        return install_macos_host_service(config_path).await;
+    }
+    #[cfg(not(target_os = "macos"))]
+    install_systemd_host_service(config_path).await
+}
+
+#[cfg(target_os = "macos")]
+async fn install_macos_host_service(config_path: &Path) -> Result<()> {
+    let config: HostConfig = serde_json::from_slice(
+        &fs::read(config_path).context("read host config; run `borg remote connect` to enroll")?,
+    )?;
+    ensure!(
+        config.execution_profile == HostExecutionProfile::TrustedUser,
+        "macOS remote services support trusted-user hosts only"
+    );
+    let config_path = config_path.canonicalize()?;
+    let executable = std::env::current_exe()?;
+    let home = dirs::home_dir().context("cannot locate the user's home directory")?;
+    let service_dir = home.join("Library/LaunchAgents");
+    fs::create_dir_all(&service_dir)?;
+    let label = "ml.borg.remote";
+    let service_path = service_dir.join(format!("{label}.plist"));
+    let mut environment = serde_json::Map::new();
+    for name in [
+        "PATH",
+        "BORG_HOME",
+        "XDG_CONFIG_HOME",
+        "CODEX_HOME",
+        "CLAUDE_CONFIG_DIR",
+    ] {
+        if let Ok(value) = std::env::var(name) {
+            environment.insert(name.into(), value.into());
+        }
+    }
+    environment.insert("HOME".into(), home.to_string_lossy().into_owned().into());
+    let service = serde_json::json!({
+        "Label": label,
+        "ProgramArguments": [executable, "remote", "host", "--config", config_path],
+        "EnvironmentVariables": environment,
+        "WorkingDirectory": home,
+        "RunAtLoad": true,
+        "KeepAlive": true,
+        "ThrottleInterval": 5,
+        "SoftResourceLimits": { "Core": 0 },
+        "HardResourceLimits": { "Core": 0 }
+    });
+    let mut temporary = tempfile::NamedTempFile::new_in(&service_dir)?;
+    serde_json::to_writer(temporary.as_file_mut(), &service)?;
+    let status = TokioCommand::new("/usr/bin/plutil")
+        .args(["-convert", "xml1"])
+        .arg(temporary.path())
+        .status()
+        .await?;
+    ensure!(
+        status.success(),
+        "failed to generate the Borg LaunchAgent plist"
+    );
+    temporary.persist(&service_path)?;
+
+    // SAFETY: geteuid has no preconditions and only reads the current user ID.
+    let domain = format!("gui/{}", unsafe { libc::geteuid() });
+    let target = format!("{domain}/{label}");
+    let loaded = TokioCommand::new("/bin/launchctl")
+        .args(["print", &target])
+        .output()
+        .await?
+        .status
+        .success();
+    if loaded {
+        let status = TokioCommand::new("/bin/launchctl")
+            .args(["bootout", &target])
+            .status()
+            .await?;
+        ensure!(
+            status.success(),
+            "failed to unload the previous Borg Remote service"
+        );
+    }
+    let status = TokioCommand::new("/bin/launchctl")
+        .args(["enable", &target])
+        .status()
+        .await?;
+    ensure!(status.success(), "failed to enable Borg Remote");
+    let status = TokioCommand::new("/bin/launchctl")
+        .args(["bootstrap", &domain])
+        .arg(&service_path)
+        .status()
+        .await?;
+    ensure!(
+        status.success(),
+        "failed to start Borg Remote; install from a logged-in macOS account"
+    );
+    println!(
+        "Borg Remote is installed and starts automatically at login.\n  {}\nThe Mac must remain logged in and awake for remote access.",
+        service_path.display()
+    );
+    Ok(())
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+async fn install_systemd_host_service(config_path: &Path) -> Result<()> {
     ensure!(
         cfg!(target_os = "linux"),
         "`borg remote install` currently supports Linux systemd user services; run `borg remote host` from your platform's login service"

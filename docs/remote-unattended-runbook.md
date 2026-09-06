@@ -1,5 +1,38 @@
 # Borg Remote unattended-host runbook
 
+## Connect another computer
+
+On each computer whose projects should appear in Borg Remote, run:
+
+```sh
+borg remote connect --name "My laptop" --root /path/to/project
+```
+
+Approve the computer in the browser using the same Borg account as the web
+app. Repeat `--root` to include more projects. Opening the web app on a new
+computer does not automatically enroll that computer or expose its files.
+
+On macOS, this installs `~/Library/LaunchAgents/ml.borg.remote.plist`, starts
+the outbound connection, and restarts it after process exits and subsequent
+logins. The Mac must stay logged in and awake; a LaunchAgent does not run
+before login or after logout. Check it with:
+
+```sh
+launchctl print gui/$(id -u)/ml.borg.remote
+```
+
+After updating Borg, run `borg remote install` from the intended executable
+to refresh the service. Linux uses the systemd service described below.
+Other platforms can enroll with `borg remote enroll` and run
+`borg remote host` under their own login service.
+
+Borg's `/sleep` option (enabled by default; `/sleep on` or `/sleep off`)
+prevents idle sleep during active terminal turns. It does not keep an idle
+remote host awake, and on macOS it does not override lid-close sleep. Configure
+the computer's power settings for unattended availability.
+
+## Linux unattended operation
+
 This runbook covers a personal Linux machine enrolled as a Borg Remote
 `trusted_user` host. The host makes an outbound connection to Borg; it does
 not require an internet-facing inbound port.

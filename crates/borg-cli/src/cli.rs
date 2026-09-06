@@ -1022,7 +1022,7 @@ pub(crate) enum RemoteCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Install and start the outbound host as a systemd user service.
+    /// Install and start the outbound host (Linux systemd or macOS LaunchAgent).
     Install {
         #[arg(long)]
         config: Option<PathBuf>,
