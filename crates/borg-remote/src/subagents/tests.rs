@@ -7,6 +7,80 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::tempdir;
 
 #[tokio::test]
+#[cfg(unix)]
+async fn mcp_disconnect_and_shutdown_reap_the_active_runtime_worker() {
+    for server_shutdown in [false, true] {
+        let directory = tempdir().unwrap();
+        let dispatcher = AgentToolDispatcher::new(
+            SessionGoalTools::disconnected(),
+            SessionTodoTools::disconnected(),
+            None,
+            crate::LspService::new(directory.path()),
+            CodingProvider::Claude,
+            Uuid::new_v4(),
+            false,
+            None,
+            None,
+            directory.path().to_path_buf(),
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::native_process::ProcessManager::default(),
+            PermissionMode::FullAccess,
+        );
+        let shutdown = CancellationToken::new();
+        let (mut client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(serve_agent_tool_connection(
+            server,
+            dispatcher.clone(),
+            None,
+            shutdown.clone(),
+        ));
+        let request = json!({"name": "runtime_exec", "arguments": {"code":
+            "import os, time\nfrom pathlib import Path\nPath('worker.pid').write_text(str(os.getpid()))\ntime.sleep(60)\nPath('late-write').write_text('must not run')"
+        }});
+        client
+            .write_all(format!("{request}\n").as_bytes())
+            .await
+            .unwrap();
+        let pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(pid) =
+                    tokio::fs::read_to_string(directory.path().join("worker.pid")).await
+                    && let Ok(pid) = pid.parse()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("runtime must start before cancellation");
+        if server_shutdown {
+            shutdown.cancel();
+        } else {
+            drop(client);
+        }
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("connection must finish cancellation cleanup")
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "cancelled worker must be reaped"
+        );
+        assert!(!directory.path().join("late-write").exists());
+        let next = dispatcher
+            .call("runtime_exec", json!({"code": "40 + 2"}))
+            .await
+            .unwrap();
+        assert_eq!(next["value"], 42, "next call must get a usable worker");
+    }
+}
+
+#[tokio::test]
 async fn workspace_mutations_preserve_authorization_and_file_contents_on_failure() {
     let directory = tempdir().unwrap();
     let root = directory.path().join("workspace");
@@ -137,7 +211,12 @@ async fn mcp_workspace_reads_are_bounded_and_cannot_escape_the_session_root() {
         PermissionMode::Manual,
     );
     let (client, server) = tokio::io::duplex(8192);
-    let task = tokio::spawn(serve_agent_tool_connection(server, dispatcher, None));
+    let task = tokio::spawn(serve_agent_tool_connection(
+        server,
+        dispatcher,
+        None,
+        CancellationToken::new(),
+    ));
     let (read, mut write) = tokio::io::split(client);
     let mut lines = BufReader::new(read).lines();
     for (name, arguments, denied) in [

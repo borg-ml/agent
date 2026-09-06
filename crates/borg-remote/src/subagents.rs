@@ -366,9 +366,18 @@ impl AgentToolServer {
                 };
                 let Ok((stream, _)) = accepted else { break };
                 let dispatcher = dispatcher.clone();
-                tokio::spawn(serve_agent_tool_connection(stream, dispatcher, None));
+                tokio::spawn(serve_agent_tool_connection(
+                    stream,
+                    dispatcher,
+                    None,
+                    server_cancel.clone(),
+                ));
             }
             let _ = std::fs::remove_file(cleanup_path);
+            dispatcher
+                .persistent_runtimes
+                .stop_session(dispatcher.actor_session_id)
+                .await;
         });
         Ok(Self {
             socket_path,
@@ -419,8 +428,13 @@ impl AgentToolServer {
                     stream,
                     dispatcher.clone(),
                     Some(server_token.clone()),
+                    server_cancel.clone(),
                 ));
             }
+            dispatcher
+                .persistent_runtimes
+                .stop_session(dispatcher.actor_session_id)
+                .await;
         });
         Ok(Self {
             tcp_addr,
@@ -565,12 +579,17 @@ async fn serve_agent_tool_connection<S>(
     stream: S,
     dispatcher: AgentToolDispatcher,
     expected_token: Option<String>,
+    shutdown: CancellationToken,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (read, mut write) = tokio::io::split(stream);
     let mut lines = BufReader::new(read).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
+    while let Ok(Some(line)) = tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => Ok(None),
+        line = lines.next_line() => line,
+    } {
         let response = match serde_json::from_str::<AgentToolWireRequest>(&line) {
             Ok(request)
                 if expected_token
@@ -583,7 +602,7 @@ async fn serve_agent_tool_connection<S>(
                 json!({ "result": dispatcher.specs() })
             }
             Ok(request) => {
-                let cancel = CancellationToken::new();
+                let cancel = shutdown.child_token();
                 let call = dispatcher.call_with_workflow_control(
                     &request.name,
                     request.arguments,
@@ -596,8 +615,18 @@ async fn serve_agent_tool_connection<S>(
                         Ok(result) => json!({ "result": result }),
                         Err(error) => json!({ "error": format!("{error:#}") }),
                     },
-                    next = lines.next_line() => {
+                    next = async {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.cancelled() => Ok(None),
+                            next = lines.next_line() => next,
+                        }
+                    } => {
                         cancel.cancel();
+                        // Poll cancellation cleanup before dropping the tool future.
+                        if tokio::time::timeout(Duration::from_secs(2), &mut call).await.is_err() {
+                            tracing::warn!(tool = %request.name, "agent tool cancellation cleanup timed out");
+                        }
                         match next {
                             Ok(Some(_)) => json!({
                                 "error": "agent tool connection received a second request before the first completed"
@@ -609,11 +638,13 @@ async fn serve_agent_tool_connection<S>(
             }
             Err(error) => json!({ "error": error.to_string() }),
         };
-        if write
-            .write_all(format!("{response}\n").as_bytes())
-            .await
-            .is_err()
-        {
+        let response = format!("{response}\n");
+        let written = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            written = write.write_all(response.as_bytes()) => written,
+        };
+        if written.is_err() {
             break;
         }
     }
@@ -1873,36 +1904,11 @@ impl AgentToolDispatcher {
             (None, Some(limits)) => Some(limits.max_runtime_execution_ms),
             (requested, None) => requested,
         };
-        let execute = || async {
-            if runtime == "typescript" {
-                runtime_worker
-                    .execute_as(runtime, &args.code, timeout_ms, host.clone())
-                    .await
-            } else {
-                runtime_worker
-                    .execute(&args.code, timeout_ms, host.clone())
-                    .await
-            }
-        };
-        if let Some(cancel) = cancellation {
-            let result = {
-                let execution = execute();
-                tokio::pin!(execution);
-                tokio::select! {
-                    result = &mut execution => Some(result),
-                    _ = cancel.cancelled() => None,
-                }
-            };
-            match result {
-                Some(result) => Ok(serde_json::to_value(result?)?),
-                None => {
-                    runtime_worker.stop().await;
-                    bail!("persistent runtime was cancelled")
-                }
-            }
-        } else {
-            Ok(serde_json::to_value(execute().await?)?)
-        }
+        Ok(serde_json::to_value(
+            runtime_worker
+                .execute_as(runtime, &args.code, timeout_ms, host, cancellation)
+                .await?,
+        )?)
     }
 }
 

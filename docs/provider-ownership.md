@@ -81,6 +81,13 @@ their turn. Human approval waits do not trigger the model-stall timeout. Request
 too large to display are rejected instead of presenting a blind approval.
 This first consumer uses explicit approval in both Manual and Auto modes when
 the caller has not already obtained approval; native Auto review is unchanged.
+The MCP bridge drains cancellation cleanup for up to two seconds on disconnect
+or server shutdown. Active runtime cancellation kills the worker while holding
+its execution lock and records the failed execution before admitting a successor;
+cancelling a queued call does not stop the call ahead of it. Server shutdown also
+stops the session's idle persistent workers without discarding durable checkpoint
+recovery. This does not yet provide the full
+shell-process and tool-result lifecycle needed for standalone MCP mutation tools.
 
 Native and persistent-runtime file writes/edits now share the dispatcher as
 well, including configured transfer limits and exact-match edit validation.

@@ -2084,8 +2084,7 @@ impl SqliteSessionStore {
                 existing.root == root,
                 "runtime manifest for session {session_id} is bound to a different root"
             );
-            let recovered = existing.worker_id != worker_id
-                && !matches!(existing.status, RuntimeManifestStatus::Stopped);
+            let recovered = existing.worker_id != worker_id;
             sqlx::query(
                 "update runtime_manifests set command=?, worker_id=?, status='running', \
                  updated_at=? where session_id=?",

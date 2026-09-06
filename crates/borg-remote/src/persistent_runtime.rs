@@ -61,6 +61,15 @@ pub(crate) struct PersistentRuntimeRegistry {
 }
 
 impl PersistentRuntimeRegistry {
+    pub(crate) async fn stop_session(&self, session_id: Uuid) {
+        for runtimes in [&self.python, &self.bun] {
+            let runtime = runtimes.lock().await.remove(&session_id);
+            if let Some(runtime) = runtime {
+                runtime.stop().await;
+            }
+        }
+    }
+
     pub(crate) async fn python_for_session(
         &self,
         session_id: Uuid,
@@ -209,13 +218,15 @@ impl PersistentRuntimeWorker {
         Ok(recovered)
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute(
         &self,
         code: &str,
         timeout_ms: Option<u64>,
         host: Arc<dyn RuntimeHost>,
     ) -> Result<PersistentRuntimeResult> {
-        self.execute_as(self.runtime, code, timeout_ms, host).await
+        self.execute_as(self.runtime, code, timeout_ms, host, None)
+            .await
     }
 
     pub(crate) async fn execute_as(
@@ -224,7 +235,13 @@ impl PersistentRuntimeWorker {
         code: &str,
         timeout_ms: Option<u64>,
         host: Arc<dyn RuntimeHost>,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
     ) -> Result<PersistentRuntimeResult> {
+        let cancellation = cancellation.unwrap_or_default();
+        ensure!(
+            !cancellation.is_cancelled(),
+            "persistent runtime was cancelled"
+        );
         ensure!(
             (self.runtime == "python" && requested_runtime == "python")
                 || (self.runtime == "javascript"
@@ -248,8 +265,12 @@ impl PersistentRuntimeWorker {
                 .clamp(1, MAX_EXECUTION_TIMEOUT_MS),
         );
 
+        let mut process = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => bail!("persistent runtime was cancelled"),
+            process = self.process.lock() => process,
+        };
         let result = {
-            let mut process = self.process.lock().await;
             let process_exited = if let Some(process) = process.as_mut() {
                 process.child.try_wait()?.is_some()
             } else {
@@ -282,21 +303,23 @@ impl PersistentRuntimeWorker {
             }
 
             let request_id = Uuid::new_v4().to_string();
-            let result = execute_request(
-                process.as_mut().expect("persistent Python process exists"),
-                &request_id,
-                requested_runtime,
-                code,
-                timeout,
-                checkpoint_state.as_ref(),
-                host,
-            )
-            .await;
-            if result.is_err() {
-                if let Some(process) = process.as_mut() {
-                    let _ = process.child.kill().await;
-                }
-                *process = None;
+            let result = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Err(anyhow::anyhow!("persistent runtime was cancelled")),
+                result = execute_request(
+                    process.as_mut().expect("persistent Python process exists"),
+                    &request_id,
+                    requested_runtime,
+                    code,
+                    timeout,
+                    checkpoint_state.as_ref(),
+                    host,
+                ) => result,
+            };
+            if result.is_err()
+                && let Some(mut process) = process.take()
+            {
+                let _ = process.child.kill().await;
             }
             {
                 let mut metadata = self.metadata.lock().await;
@@ -327,6 +350,8 @@ impl PersistentRuntimeWorker {
             metadata.execution_count = metadata.execution_count.saturating_add(1);
             metadata.execution_count
         };
+        // Publish the durable result before a successor can use this worker.
+        drop(process);
         let mut result = result?;
         result.recovered_from_manifest = recovered_from_manifest;
         result.execution_count = execution_count;
@@ -1341,6 +1366,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_runtime_calls_does_not_kill_other_requests() {
+        use crate::SessionStore;
+        if !python_available().await {
+            return;
+        }
+        struct HoldingHost {
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl RuntimeHost for HoldingHost {
+            async fn call(&self, _operation: &str, _arguments: Value) -> Result<Value> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(json!(42))
+            }
+        }
+        let root = tempdir().unwrap();
+        let store = crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        let runtime = Arc::new(PersistentRuntimeWorker::for_python(
+            session_id,
+            root.path().to_path_buf(),
+            Some(store.clone()),
+        ));
+        let host = Arc::new(HoldingHost {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let active_runtime = runtime.clone();
+        let active_host = host.clone();
+        let active = tokio::spawn(async move {
+            active_runtime
+                .execute("answer = borg.call('hold', {})\nanswer", None, active_host)
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), host.entered.notified())
+            .await
+            .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let queued = runtime.execute_as(
+            "python",
+            "answer = 0",
+            None,
+            Arc::new(TestHost),
+            Some(cancel.clone()),
+        );
+        tokio::pin!(queued);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut queued)
+                .await
+                .is_err()
+        );
+        cancel.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut queued)
+                .await
+                .unwrap()
+                .is_err()
+        );
+        host.release.notify_one();
+        assert_eq!(active.await.unwrap().unwrap().value, 42);
+        assert_eq!(
+            runtime
+                .execute("answer", None, Arc::new(TestHost))
+                .await
+                .unwrap()
+                .value,
+            42
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let active_runtime = runtime.clone();
+        let active_host = host.clone();
+        let active_cancel = cancel.clone();
+        let active = tokio::spawn(async move {
+            active_runtime
+                .execute_as(
+                    "python",
+                    "borg.call('hold', {})",
+                    None,
+                    active_host,
+                    Some(active_cancel),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), host.entered.notified())
+            .await
+            .unwrap();
+        let successor = runtime.execute("40 + 2", None, Arc::new(TestHost));
+        tokio::pin!(successor);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut successor)
+                .await
+                .is_err()
+        );
+        cancel.cancel();
+        let (cancelled, next) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(active, &mut successor)
+        })
+        .await
+        .unwrap();
+        assert!(cancelled.unwrap().is_err());
+        assert_eq!(next.unwrap().value, 42);
+        let manifest = store.runtime_manifest(session_id).await.unwrap().unwrap();
+        assert_eq!(
+            manifest.execution_count, 4,
+            "started cancellations are recorded; queued cancellations are not executions"
+        );
+        assert_eq!(
+            manifest.status,
+            crate::session_store::RuntimeManifestStatus::Running
+        );
+        assert!(
+            manifest.last_error.is_none(),
+            "cancelled predecessor cannot overwrite the successor's durable result"
+        );
+        runtime.stop().await;
+    }
+
+    #[tokio::test]
     async fn python_namespace_survives_multiple_requests() {
         if !python_available().await {
             return;
@@ -1487,6 +1635,7 @@ mod tests {
                 "const typedAnswer: number = 41; typedAnswer + 1",
                 None,
                 Arc::new(TestHost),
+                None,
             )
             .await
             .expect("Bun TypeScript execution");
