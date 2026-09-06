@@ -42,7 +42,8 @@ Do not silently switch billing routes or execute a second agent loop as fallback
 
 | Route | Current implementation | Remaining external agent behavior |
 | --- | --- | --- |
-| Codex subscription | Pooled `codex app-server` | Model/tool loop, native tools, context/compaction behavior, and parts of approval policy |
+| Fresh Codex subscription sessions | Borg native harness and direct model transport | CLI retained for subscription authentication/recovery, version metadata, and quota reads; no provider agent turn |
+| Existing Codex compatibility sessions | Pooled `codex app-server` | Model/tool loop, native tools, context/compaction behavior, and parts of approval policy |
 | Claude subscription | Claude binary through `claude-agents` | Model/tool loop, native tools, and native session/context behavior |
 | OpenCode | Authenticated local server event stream | Model/tool loop, native tools, and native session/context behavior |
 | Kimi, GLM, OpenRouter, compatible endpoints | Borg native harness | Model service and provider protocol only |
@@ -50,6 +51,41 @@ Do not silently switch billing routes or execute a second agent loop as fallback
 The OpenCode server integration fixes early tool visibility but does not yet
 meet the target ownership boundary. Equivalent rendered events alone do not
 establish equivalent ownership.
+
+### Remaining subscription boundaries (checked 2026-09-06)
+
+Claude's [Agent SDK overview](https://code.claude.com/docs/en/agent-sdk/overview)
+explicitly includes Claude Code's loop and context management; it directs
+callers implementing their own loop to the model API instead. The SDK overview
+also requires prior approval for offering subscription login in third-party
+products. The newer [subscription usage notice](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan)
+says the planned SDK billing change was paused and existing SDK/CLI/third-party
+usage still draws on subscription limits. These are not a documented
+model-only subscription API contract. Keep the existing SDK-backed access path
+while that boundary is unresolved; do not infer that a subscription credential
+can simply replace an API key in a new direct adapter.
+
+Borg currently passes Claude's partial-message flag and MCP bridge but leaves
+built-in tools enabled. Merely disabling those tools is not a complete
+migration: Borg's shell/filesystem tool executor currently lives in the native
+harness, while the MCP dispatcher exposes the durable coordination/runtime
+tools. A narrower SDK compatibility mode needs that same permission-checked
+executor exposed through Borg first, with interruption and result journaling
+verified. Even then, the SDK would still own its internal model loop and
+session context; describe that limitation explicitly.
+
+The inspected OpenCode source (`bbd72fb`) exposes provider metadata and OAuth
+authorization/callback routes, not a model-only streaming endpoint. Its
+provider/auth/plugin services are coupled to instance configuration and the
+session processor. Retaining the local server preserves those integrations;
+calling its session prompt endpoint is still another agent loop, not a native
+model adapter. A replacement needs a separately verified access boundary for
+each underlying provider, not an assumption that all OpenCode credentials are
+interchangeable subscription tokens.
+
+For generation feedback, pending OpenCode tool-input events remain immediate.
+An already-running/completed/error snapshot is not evidence of current input
+generation, so it must not synthesize a generation event or reopen that phase.
 
 ## First migration proof: Codex subscription model access
 
