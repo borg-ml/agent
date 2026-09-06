@@ -82,8 +82,14 @@ too large to display are rejected instead of presenting a blind approval.
 This first consumer uses explicit approval in both Manual and Auto modes when
 the caller has not already obtained approval; native Auto review is unchanged.
 
-Merely disabling provider tools is still not a complete migration. Shell and
-file mutation retain their existing execution paths. A narrower SDK
+Native and persistent-runtime file writes/edits now share the dispatcher as
+well, including configured transfer limits and exact-match edit validation.
+Native trusted-workspace permission policy and the runtime's explicit effects
+gate remain at their call sites. The shared mutation handler is not exposed as
+a standalone MCP tool.
+
+Merely disabling provider tools is still not a complete migration. Shell
+retains its existing execution paths. A narrower SDK
 compatibility mode needs Borg's approval, cancellation, and result-journaling
 boundary connected before those tools can move into the bridge. Raw execution
 methods must not become an MCP shortcut around that boundary. Even then, the

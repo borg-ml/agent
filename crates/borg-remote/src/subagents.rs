@@ -991,35 +991,115 @@ impl AgentToolDispatcher {
             }
             "list_files" => {
                 let args: RuntimeListFilesArgs = serde_json::from_value(arguments)?;
-                let response = execution_provider
-                    .filesystem(
-                        std::slice::from_ref(&self.runtime_root),
-                        WorkspaceFilesystemRequest {
-                            request_id: Uuid::new_v4(),
-                            workspace_id: self.actor_session_id,
-                            root_path: self.runtime_root.clone(),
-                            timeout_ms: 30_000,
-                            operation: WorkspaceFilesystemOperation::List {
-                                path: PathBuf::from(args.path.unwrap_or_else(|| ".".to_string())),
-                                limit: args.limit.unwrap_or(200).clamp(1, 2_000),
-                            },
-                        },
-                        &self.resource_limits.clone().unwrap_or_default(),
-                    )
-                    .await;
-                match response.outcome {
-                    WorkspaceFilesystemOutcome::Success { output } => {
-                        Ok(serde_json::to_value(output)?)
-                    }
-                    WorkspaceFilesystemOutcome::Failure {
-                        code,
-                        message,
-                        retryable,
-                    } => bail!("{code:?}: {message} (retryable={retryable})"),
-                }
+                self.workspace_filesystem(
+                    execution_provider,
+                    WorkspaceFilesystemOperation::List {
+                        path: PathBuf::from(args.path.unwrap_or_else(|| ".".to_string())),
+                        limit: args.limit.unwrap_or(200).clamp(1, 2_000),
+                    },
+                )
+                .await
             }
             _ => bail!("unknown workspace read tool {name}"),
         }
+    }
+
+    async fn workspace_filesystem(
+        &self,
+        execution_provider: &dyn crate::ExecutionProvider,
+        operation: WorkspaceFilesystemOperation,
+    ) -> Result<Value> {
+        let response = execution_provider
+            .filesystem(
+                std::slice::from_ref(&self.runtime_root),
+                WorkspaceFilesystemRequest {
+                    request_id: Uuid::new_v4(),
+                    workspace_id: self.actor_session_id,
+                    root_path: self.runtime_root.clone(),
+                    timeout_ms: 30_000,
+                    operation,
+                },
+                &self.resource_limits.clone().unwrap_or_default(),
+            )
+            .await;
+        match response.outcome {
+            WorkspaceFilesystemOutcome::Success { output } => Ok(serde_json::to_value(output)?),
+            WorkspaceFilesystemOutcome::Failure {
+                code,
+                message,
+                retryable,
+            } => {
+                bail!("{code:?}: {message} (retryable={retryable})")
+            }
+        }
+    }
+
+    // Only authorized native/runtime callers may enter here; this is not an MCP dispatch route.
+    pub(crate) async fn mutate_workspace_tool(
+        &self,
+        execution_provider: &dyn crate::ExecutionProvider,
+        name: &str,
+        mut arguments: Value,
+    ) -> Result<Value> {
+        if let Some(arguments) = arguments.as_object_mut() {
+            arguments.remove("action");
+        }
+        let operation = match name {
+            "write_file" => {
+                let args: RuntimeWriteFileArgs = serde_json::from_value(arguments)?;
+                WorkspaceFilesystemOperation::WriteText {
+                    path: PathBuf::from(args.path),
+                    text: args.content,
+                    overwrite: args.overwrite.unwrap_or(false),
+                    create_parent_dirs: args.create_parent_dirs.unwrap_or(true),
+                }
+            }
+            "edit_file" => {
+                let args: RuntimeEditFileArgs = serde_json::from_value(arguments)?;
+                ensure!(
+                    !args.old_text.is_empty(),
+                    "edit_file old_text must not be empty"
+                );
+                let read = self
+                    .workspace_filesystem(
+                        execution_provider,
+                        WorkspaceFilesystemOperation::ReadText {
+                            path: PathBuf::from(&args.path),
+                            max_bytes: RUNTIME_MAX_FILE_BYTES,
+                        },
+                    )
+                    .await?;
+                let current = read
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .context("workspace read did not return text")?;
+                let matches = current.matches(&args.old_text).count();
+                ensure!(
+                    matches > 0,
+                    "edit_file old_text was not found in {}",
+                    args.path
+                );
+                ensure!(
+                    matches == 1 || args.replace_all.unwrap_or(false),
+                    "edit_file old_text matched {matches} locations in {}; set replace_all=true or provide more context",
+                    args.path
+                );
+                let text = if args.replace_all.unwrap_or(false) {
+                    current.replace(&args.old_text, &args.new_text)
+                } else {
+                    current.replacen(&args.old_text, &args.new_text, 1)
+                };
+                WorkspaceFilesystemOperation::WriteText {
+                    path: PathBuf::from(args.path),
+                    text,
+                    overwrite: true,
+                    create_parent_dirs: false,
+                }
+            }
+            _ => bail!("unknown workspace mutation tool {name}"),
+        };
+        self.workspace_filesystem(execution_provider, operation)
+            .await
     }
 
     pub(crate) async fn call_without_extension_hooks(
@@ -1846,74 +1926,6 @@ impl DispatcherRuntimeHost {
         );
         Ok(())
     }
-
-    async fn filesystem(&self, operation: WorkspaceFilesystemOperation) -> Result<Value> {
-        if operation.is_mutating() {
-            self.ensure_effects()?;
-        }
-        let limits = self.dispatcher.resource_limits.clone().unwrap_or_default();
-        let response = self
-            .execution_provider
-            .filesystem(
-                std::slice::from_ref(&self.root),
-                WorkspaceFilesystemRequest {
-                    request_id: Uuid::new_v4(),
-                    workspace_id: self.session_id,
-                    root_path: self.root.clone(),
-                    timeout_ms: 30_000,
-                    operation,
-                },
-                &limits,
-            )
-            .await;
-        match response.outcome {
-            WorkspaceFilesystemOutcome::Success { output } => Ok(serde_json::to_value(output)?),
-            WorkspaceFilesystemOutcome::Failure {
-                code,
-                message,
-                retryable,
-            } => bail!("{code:?}: {message} (retryable={retryable})"),
-        }
-    }
-
-    async fn edit_file(&self, args: RuntimeEditFileArgs) -> Result<Value> {
-        if args.old_text.is_empty() {
-            bail!("edit_file old_text must not be empty");
-        }
-        let read = self
-            .filesystem(WorkspaceFilesystemOperation::ReadText {
-                path: PathBuf::from(&args.path),
-                max_bytes: RUNTIME_MAX_FILE_BYTES,
-            })
-            .await?;
-        let current = read
-            .get("text")
-            .and_then(Value::as_str)
-            .context("workspace read did not return text")?;
-        let matches = current.matches(&args.old_text).count();
-        ensure!(
-            matches > 0,
-            "edit_file old_text was not found in {}",
-            args.path
-        );
-        ensure!(
-            matches == 1 || args.replace_all.unwrap_or(false),
-            "edit_file old_text matched {matches} locations in {}; set replace_all=true or provide more context",
-            args.path
-        );
-        let updated = if args.replace_all.unwrap_or(false) {
-            current.replace(&args.old_text, &args.new_text)
-        } else {
-            current.replacen(&args.old_text, &args.new_text, 1)
-        };
-        self.filesystem(WorkspaceFilesystemOperation::WriteText {
-            path: PathBuf::from(args.path),
-            text: updated,
-            overwrite: true,
-            create_parent_dirs: false,
-        })
-        .await
-    }
 }
 
 #[async_trait::async_trait]
@@ -1930,15 +1942,11 @@ impl RuntimeHost for DispatcherRuntimeHost {
                     .read_workspace_tool(self.execution_provider.as_ref(), operation, arguments)
                     .await
             }
-            "write_file" => {
-                let args: RuntimeWriteFileArgs = serde_json::from_value(arguments)?;
-                self.filesystem(WorkspaceFilesystemOperation::WriteText {
-                    path: PathBuf::from(args.path),
-                    text: args.content,
-                    overwrite: args.overwrite.unwrap_or(false),
-                    create_parent_dirs: args.create_parent_dirs.unwrap_or(true),
-                })
-                .await
+            "write_file" | "edit_file" => {
+                self.ensure_effects()?;
+                self.dispatcher
+                    .mutate_workspace_tool(self.execution_provider.as_ref(), operation, arguments)
+                    .await
             }
             "exec_command" => {
                 self.ensure_effects()?;
@@ -1994,10 +2002,6 @@ impl RuntimeHost for DispatcherRuntimeHost {
                         })
                         .await?,
                 )?)
-            }
-            "edit_file" => {
-                let args: RuntimeEditFileArgs = serde_json::from_value(arguments)?;
-                self.edit_file(args).await
             }
             "borg_tool" => {
                 let args: RuntimeBorgToolArgs = serde_json::from_value(arguments)?;

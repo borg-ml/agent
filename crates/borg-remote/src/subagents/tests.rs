@@ -7,6 +7,111 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::tempdir;
 
 #[tokio::test]
+async fn workspace_mutations_preserve_authorization_and_file_contents_on_failure() {
+    let directory = tempdir().unwrap();
+    let root = directory.path().join("workspace");
+    std::fs::create_dir(&root).unwrap();
+    let session_id = Uuid::new_v4();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(&root),
+        CodingProvider::Codex,
+        session_id,
+        false,
+        None,
+        None,
+        root.clone(),
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::Manual,
+    )
+    .with_resource_limits(Some(HostResourceLimits {
+        max_file_transfer_bytes: 16,
+        ..HostResourceLimits::default()
+    }));
+    let mut host = DispatcherRuntimeHost {
+        session_id,
+        root: root.clone(),
+        allow_effects: false,
+        dispatcher: dispatcher.clone(),
+        execution_provider: Arc::new(crate::LocalExecutionProvider::new()),
+        host_calls: Arc::new(AtomicUsize::new(0)),
+        session_store: None,
+        runtime_worker_id: Uuid::new_v4(),
+    };
+    let create = serde_json::json!({"path": "sample.txt", "content": "same same"});
+    assert!(host.call("write_file", create.clone()).await.is_err());
+    assert!(!root.join("sample.txt").exists());
+    // Sharing the implementation must not expose an unguarded MCP mutation route.
+    assert!(dispatcher.call("write_file", create.clone()).await.is_err());
+    assert!(
+        dispatcher
+            .specs()
+            .iter()
+            .all(|spec| !matches!(spec["name"].as_str(), Some("write_file" | "edit_file")))
+    );
+
+    host.allow_effects = true;
+    host.call("write_file", create.clone()).await.unwrap();
+    assert!(host.call("write_file", create).await.is_err());
+    let edit = serde_json::json!({"path": "sample.txt", "old_text": "same", "new_text": "new"});
+    assert!(host.call("edit_file", edit.clone()).await.is_err());
+    assert_eq!(
+        std::fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "same same"
+    );
+    let mut replace_all = edit;
+    replace_all["replace_all"] = serde_json::json!(true);
+    host.call("edit_file", replace_all).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "new new"
+    );
+
+    for arguments in [
+        serde_json::json!({"path": "sample.txt", "content": "x".repeat(17), "overwrite": true}),
+        serde_json::json!({"path": "../outside.txt", "content": "outside"}),
+    ] {
+        assert!(host.call("write_file", arguments).await.is_err());
+    }
+    assert!(
+        host.call(
+            "edit_file",
+            serde_json::json!({
+                "path": "sample.txt", "old_text": "new new", "new_text": "x".repeat(17),
+            })
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "new new"
+    );
+    assert!(!directory.path().join("outside.txt").exists());
+    host.allow_effects = false;
+    assert!(
+        host.call(
+            "edit_file",
+            serde_json::json!({
+                "path": "sample.txt", "old_text": "new new", "new_text": "denied",
+            })
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("sample.txt")).unwrap(),
+        "new new"
+    );
+}
+
+#[tokio::test]
 async fn mcp_workspace_reads_are_bounded_and_cannot_escape_the_session_root() {
     let directory = tempdir().unwrap();
     let root = directory.path().join("workspace");

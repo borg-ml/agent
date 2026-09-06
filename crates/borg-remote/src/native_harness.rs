@@ -21,15 +21,13 @@ use uuid::Uuid;
 
 use crate::{
     AgentTurn, AgentTurnControl, AgentTurnResult, ApprovalDecision, EventActor,
-    ExecutionCommandRequest, ExecutionProvider, ExecutionStdinRequest, HarnessMode,
-    HostResourceLimits, MessageStatus, PermissionMode, SessionEventKind, SessionStatus,
-    WorkspaceFilesystemOperation, WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest,
+    ExecutionCommandRequest, ExecutionProvider, ExecutionStdinRequest, HarnessMode, MessageStatus,
+    PermissionMode, SessionEventKind, SessionStatus,
 };
 
 const MAX_TOOL_ROUNDS: usize = 32;
 const MAX_TOOL_RESULT_BYTES: usize = 1024 * 1024;
 const MAX_APPROVAL_DETAIL_BYTES: usize = 8 * 1024;
-const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 #[derive(Clone)]
@@ -989,19 +987,10 @@ impl NativeToolRuntime {
             arguments.remove("action");
         }
         match name {
-            "write_file" => {
-                let args: WriteFileArgs = serde_json::from_value(arguments)?;
-                self.filesystem(WorkspaceFilesystemOperation::WriteText {
-                    path: PathBuf::from(args.path),
-                    text: args.content,
-                    overwrite: args.overwrite.unwrap_or(false),
-                    create_parent_dirs: args.create_parent_dirs.unwrap_or(true),
-                })
-                .await
-            }
-            "edit_file" => {
-                let args: EditFileArgs = serde_json::from_value(arguments)?;
-                self.edit_file(args).await
+            "write_file" | "edit_file" => {
+                self.agent_tools
+                    .mutate_workspace_tool(self.execution_provider.as_ref(), name, arguments)
+                    .await
             }
             "exec_command" => {
                 let args: ExecCommandArgs = serde_json::from_value(arguments)?;
@@ -1140,70 +1129,6 @@ impl NativeToolRuntime {
                 )
                 .await?,
         )?)
-    }
-
-    async fn filesystem(&self, operation: WorkspaceFilesystemOperation) -> Result<Value> {
-        let response = self
-            .execution_provider
-            .filesystem(
-                std::slice::from_ref(&self.root),
-                WorkspaceFilesystemRequest {
-                    request_id: Uuid::new_v4(),
-                    workspace_id: self.session_id,
-                    root_path: self.root.clone(),
-                    timeout_ms: 30_000,
-                    operation,
-                },
-                &HostResourceLimits::default(),
-            )
-            .await;
-        match response.outcome {
-            WorkspaceFilesystemOutcome::Success { output } => Ok(serde_json::to_value(output)?),
-            WorkspaceFilesystemOutcome::Failure {
-                code,
-                message,
-                retryable,
-            } => bail!("{code:?}: {message} (retryable={retryable})"),
-        }
-    }
-
-    async fn edit_file(&self, args: EditFileArgs) -> Result<Value> {
-        if args.old_text.is_empty() {
-            bail!("edit_file old_text must not be empty");
-        }
-        let path = PathBuf::from(&args.path);
-        let read = self
-            .filesystem(WorkspaceFilesystemOperation::ReadText {
-                path: path.clone(),
-                max_bytes: MAX_FILE_BYTES,
-            })
-            .await?;
-        let current = read
-            .get("text")
-            .and_then(Value::as_str)
-            .context("workspace read did not return text")?;
-        let matches = current.matches(&args.old_text).count();
-        if matches == 0 {
-            bail!("edit_file old_text was not found in {}", args.path);
-        }
-        if matches > 1 && !args.replace_all.unwrap_or(false) {
-            bail!(
-                "edit_file old_text matched {matches} locations in {}; set replace_all=true or provide more context",
-                args.path
-            );
-        }
-        let updated = if args.replace_all.unwrap_or(false) {
-            current.replace(&args.old_text, &args.new_text)
-        } else {
-            current.replacen(&args.old_text, &args.new_text, 1)
-        };
-        self.filesystem(WorkspaceFilesystemOperation::WriteText {
-            path,
-            text: updated,
-            overwrite: true,
-            create_parent_dirs: false,
-        })
-        .await
     }
 }
 
@@ -2365,24 +2290,6 @@ fn sort_tool_definitions(definitions: &mut [ModelToolDefinition]) {
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({ "name": name, "description": description, "inputSchema": input_schema })
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WriteFileArgs {
-    path: String,
-    content: String,
-    overwrite: Option<bool>,
-    create_parent_dirs: Option<bool>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EditFileArgs {
-    path: String,
-    old_text: String,
-    new_text: String,
-    replace_all: Option<bool>,
 }
 
 #[derive(Deserialize)]
