@@ -9,6 +9,16 @@ use tempfile::tempdir;
 #[tokio::test]
 #[cfg(unix)]
 async fn mcp_disconnect_and_shutdown_reap_the_active_runtime_worker() {
+    struct ChildCleanup(i32);
+    impl Drop for ChildCleanup {
+        fn drop(&mut self) {
+            if self.0 > 0 {
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+    }
     for server_shutdown in [false, true] {
         let directory = tempdir().unwrap();
         let dispatcher = AgentToolDispatcher::new(
@@ -38,25 +48,29 @@ async fn mcp_disconnect_and_shutdown_reap_the_active_runtime_worker() {
             shutdown.clone(),
         ));
         let request = json!({"name": "runtime_exec", "arguments": {"code":
-            "import os, time\nfrom pathlib import Path\nPath('worker.pid').write_text(str(os.getpid()))\ntime.sleep(60)\nPath('late-write').write_text('must not run')"
+            "import os, time, subprocess, sys\nfrom pathlib import Path\nsubprocess.Popen([sys.executable, '-c', \"import os, signal, time; from pathlib import Path; signal.signal(signal.SIGTERM, signal.SIG_IGN); Path('child.pid').write_text(str(os.getpid())); time.sleep(60)\"])\nPath('worker.pid').write_text(str(os.getpid()))\ntime.sleep(60)\nPath('late-write').write_text('must not run')"
         }});
         client
             .write_all(format!("{request}\n").as_bytes())
             .await
             .unwrap();
-        let pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
+        let (pid, child_pid): (i32, i32) = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(pid) =
                     tokio::fs::read_to_string(directory.path().join("worker.pid")).await
                     && let Ok(pid) = pid.parse()
+                    && let Ok(child_pid) =
+                        tokio::fs::read_to_string(directory.path().join("child.pid")).await
+                    && let Ok(child_pid) = child_pid.parse()
                 {
-                    break pid;
+                    break (pid, child_pid);
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("runtime must start before cancellation");
+        let mut child_cleanup = ChildCleanup(child_pid);
         if server_shutdown {
             shutdown.cancel();
         } else {
@@ -71,6 +85,24 @@ async fn mcp_disconnect_and_shutdown_reap_the_active_runtime_worker() {
             -1,
             "cancelled worker must be reaped"
         );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let status = tokio::process::Command::new("ps")
+                    .args(["-o", "stat=", "-p", &child_pid.to_string()])
+                    .output()
+                    .await
+                    .unwrap();
+                let status = String::from_utf8_lossy(&status.stdout);
+                // Orphan zombies cannot run and are reaped by the OS, not by Borg.
+                if status.trim().is_empty() || status.trim().starts_with('Z') {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a child ignoring SIGTERM must still be stopped");
+        child_cleanup.0 = 0;
         assert!(!directory.path().join("late-write").exists());
         let next = dispatcher
             .call("runtime_exec", json!({"code": "40 + 2"}))

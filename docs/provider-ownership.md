@@ -88,6 +88,11 @@ cancelling a queued call does not stop the call ahead of it. Server shutdown als
 stops the session's idle persistent workers without discarding durable checkpoint
 recovery. This does not yet provide the full
 shell-process and tool-result lifecycle needed for standalone MCP mutation tools.
+Runtime workers now have isolated process groups on Unix and use Borg's existing
+process-tree cleanup on cancellation, failure, and shutdown, including escalation
+for children that ignore termination. Dropping a worker also force-stops its group.
+This covers inherited subprocess groups, not deliberately detached processes or
+commands launched separately through Borg's execution provider.
 
 Native and persistent-runtime file writes/edits now share the dispatcher as
 well, including configured transfer limits and exact-match edit validation.

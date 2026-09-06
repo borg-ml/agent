@@ -1038,7 +1038,10 @@ fn shell_command(command: &str) -> Command {
 }
 
 #[cfg(unix)]
-async fn terminate_process_tree(pid: u32) {
+pub(crate) async fn terminate_process_tree(pid: u32) {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return;
+    }
     terminate_process_tree_now(pid);
     let deadline = Instant::now() + Duration::from_millis(750);
     while process_group_is_alive(pid) && Instant::now() < deadline {
@@ -1047,11 +1050,7 @@ async fn terminate_process_tree(pid: u32) {
     if !process_group_is_alive(pid) {
         return;
     }
-    // SAFETY: a negative, checked child process id addresses only the process group
-    // created for this command. ESRCH is harmless when the group already exited.
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
+    force_kill_process_tree_now(pid);
 }
 
 #[cfg(unix)]
@@ -1066,7 +1065,7 @@ fn process_group_is_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-async fn terminate_process_tree(pid: u32) {
+pub(crate) async fn terminate_process_tree(pid: u32) {
     let _ = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
@@ -1078,10 +1077,29 @@ async fn terminate_process_tree(pid: u32) {
 
 #[cfg(unix)]
 fn terminate_process_tree_now(pid: u32) {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return;
+    }
     // SAFETY: the process was spawned into its own process group with this id.
     unsafe {
         libc::kill(-(pid as i32), libc::SIGTERM);
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn force_kill_process_tree_now(pid: u32) {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return;
+    }
+    // SAFETY: the caller retains the id of a child spawned as its own group leader.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn force_kill_process_tree_now(pid: u32) {
+    terminate_process_tree_now(pid);
 }
 
 #[cfg(windows)]

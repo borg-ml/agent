@@ -131,8 +131,27 @@ struct RuntimeMetadata {
 
 struct PythonProcess {
     child: Child,
+    group_pid: Option<u32>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+impl PythonProcess {
+    async fn stop(&mut self) {
+        if let Some(pid) = self.group_pid {
+            crate::native_process::terminate_process_tree(pid).await;
+            let _ = self.child.kill().await;
+            self.group_pid = None;
+        }
+    }
+}
+
+impl Drop for PythonProcess {
+    fn drop(&mut self) {
+        if let Some(pid) = self.group_pid {
+            crate::native_process::force_kill_process_tree_now(pid);
+        }
+    }
 }
 
 impl PersistentRuntimeWorker {
@@ -319,7 +338,7 @@ impl PersistentRuntimeWorker {
             if result.is_err()
                 && let Some(mut process) = process.take()
             {
-                let _ = process.child.kill().await;
+                process.stop().await;
             }
             {
                 let mut metadata = self.metadata.lock().await;
@@ -361,8 +380,7 @@ impl PersistentRuntimeWorker {
     pub(crate) async fn stop(&self) {
         let mut process = self.process.lock().await;
         if let Some(mut process) = process.take() {
-            let _ = process.child.kill().await;
-            let _ = process.child.wait().await;
+            process.stop().await;
         }
         drop(process);
         if let Some(store) = &self.store {
@@ -402,6 +420,10 @@ fn spawn_worker(root: &Path, command: &str, source: &str, runtime: &str) -> Resu
     } else {
         process.arg("-u").arg("-c").arg(source);
     }
+    #[cfg(unix)]
+    process.process_group(0);
+    #[cfg(windows)]
+    process.creation_flags(0x0000_0200);
     let mut child = process
         .current_dir(root)
         .stdin(Stdio::piped())
@@ -419,6 +441,7 @@ fn spawn_worker(root: &Path, command: &str, source: &str, runtime: &str) -> Resu
         .take()
         .context("persistent runtime stdout was not piped")?;
     Ok(PythonProcess {
+        group_pid: child.id(),
         child,
         stdin,
         stdout: BufReader::new(stdout),
