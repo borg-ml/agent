@@ -103,8 +103,11 @@ is reported in the snapshot rather than silently discarded. Session cleanup now
 cancels each process supervisor and waits up to five seconds for terminal results,
 retaining pending handles so concurrent stops wait for the same cleanup. Cleanup
 timeouts and reported process errors propagate through the executor's stop result
-instead of returning successful cleanup. Cancellation and command deadlines cover output
-draining after the shell exits. Full tool-result lifecycle integration remains open.
+instead of returning successful cleanup. An initial command cancellation also
+reports persistence failures and retains the failed handle for session cleanup;
+ordinary completed cancellations still release their handles. Cancellation and
+command deadlines cover output draining after the shell exits. Full tool-result
+lifecycle integration remains open.
 
 Native and persistent-runtime file writes/edits now share the dispatcher as
 well, including configured transfer limits and exact-match edit validation.

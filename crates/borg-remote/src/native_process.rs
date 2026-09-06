@@ -359,19 +359,22 @@ impl ProcessManager {
             .running
         {
             tokio::select! {
-                _ = tokio::time::timeout(yield_for, entry.finished.notified()) => {}
+                biased;
                 _ = cancel.cancelled() => {
                     let _ = tokio::time::timeout(
                         Duration::from_secs(2),
                         wait_for_process_finish(&entry),
                     )
                     .await;
-                    if !entry
+                    let status = entry
                         .status
                         .lock()
                         .expect("native process status lock poisoned")
-                        .running
-                    {
+                        .clone();
+                    if let Some(error) = status.error {
+                        bail!("process execution was cancelled; cleanup failed: {error}");
+                    }
+                    if !status.running {
                         self.inner
                             .processes
                             .lock()
@@ -380,6 +383,7 @@ impl ProcessManager {
                     }
                     bail!("process execution was cancelled");
                 }
+                _ = tokio::time::timeout(yield_for, entry.finished.notified()) => {}
             }
         }
         let result = snapshot(
@@ -594,7 +598,14 @@ impl Drop for ProcessManagerInner {
             .get_mut()
             .expect("native process registry lock poisoned");
         for entry in entries.values() {
-            terminate_process_tree_now(entry.pid);
+            if entry
+                .status
+                .lock()
+                .expect("native process status lock poisoned")
+                .running
+            {
+                terminate_process_tree_now(entry.pid);
+            }
         }
     }
 }
@@ -1519,45 +1530,67 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn cancellable_process_execution_reaps_the_workflow_child() {
-        let root = tempfile::tempdir().expect("workspace");
-        let manager = ProcessManager::default();
-        let owner = Uuid::new_v4();
-        let cancel = CancellationToken::new();
-        let task_manager = manager.clone();
-        let task_cancel = cancel.clone();
-        let task = tokio::spawn(async move {
-            task_manager
-                .exec_with_cancel(
-                    owner,
-                    root.path(),
-                    "sleep 30".to_string(),
-                    None,
-                    Some(30_000),
-                    Some(100),
-                    60_000,
-                    None,
-                    task_cancel,
-                )
+        for fail_journal in [false, true] {
+            let root = tempfile::tempdir().expect("workspace");
+            let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
                 .await
-        });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        cancel.cancel();
-        let error = tokio::time::timeout(Duration::from_secs(2), task)
+                .unwrap();
+            let manager = ProcessManager::default();
+            let owner = Uuid::new_v4();
+            store.create_session(owner).await.unwrap();
+            let cancel = CancellationToken::new();
+            let task_manager = manager.clone();
+            let task_cancel = cancel.clone();
+            let task_store = store.clone();
+            let task = tokio::spawn(async move {
+                task_manager
+                    .exec_with_cancel(
+                        owner,
+                        root.path(),
+                        "sleep 30".to_string(),
+                        None,
+                        Some(30_000),
+                        Some(100),
+                        60_000,
+                        Some(task_store),
+                        task_cancel,
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while store.read(owner).await.unwrap().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
             .await
-            .expect("cancellation completes")
-            .expect("process task")
-            .expect_err("cancelled process must not return a snapshot");
-        assert!(error.to_string().contains("cancelled"));
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(
-            manager
-                .inner
-                .processes
-                .lock()
-                .expect("process registry lock")
-                .values()
-                .all(|entry| entry.session_id != owner)
-        );
+            .expect("process start must be journaled before cancellation");
+            if fail_journal {
+                store.pool().close().await;
+            }
+            cancel.cancel();
+            let error = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("cancellation completes")
+                .expect("process task")
+                .expect_err("cancelled process must not return a snapshot");
+            assert!(error.to_string().contains("cancelled"));
+            if fail_journal {
+                assert!(error.to_string().contains("cleanup failed"));
+                assert!(
+                    manager.terminate_session(owner).await.is_err(),
+                    "cancellation must preserve its journal failure for session cleanup"
+                );
+            }
+            assert!(
+                manager
+                    .inner
+                    .processes
+                    .lock()
+                    .expect("process registry lock")
+                    .values()
+                    .all(|entry| entry.session_id != owner)
+            );
+        }
     }
 
     #[tokio::test]
