@@ -446,7 +446,10 @@ async fn emit_tool(
         .to_string();
     let state = value.pointer("/part/state").cloned().unwrap_or(Value::Null);
     let input = state.get("input").cloned().unwrap_or(Value::Null);
-    if generating_tools.insert(id.clone())
+    let status = state.get("status").and_then(Value::as_str);
+    if status == Some("pending")
+        && !started_tools.contains(&id)
+        && generating_tools.insert(id.clone())
         && events
             .send(ChatStreamEvent::ToolCallGenerating {
                 id: Some(id.clone()),
@@ -456,7 +459,8 @@ async fn emit_tool(
     {
         return Ok(());
     }
-    if !started_tools.contains(&id)
+    if status == Some("pending")
+        && !started_tools.contains(&id)
         && !described_tools.contains(&id)
         && let Some(action) = complete_tool_action(&input)
     {
@@ -472,8 +476,10 @@ async fn emit_tool(
             return Ok(());
         }
     }
-    let status = state.get("status").and_then(Value::as_str);
     if status == Some("pending") {
+        return Ok(());
+    }
+    if !matches!(status, Some("running" | "completed" | "error")) {
         return Ok(());
     }
     if started_tools.insert(id.clone())
@@ -586,7 +592,8 @@ mod tests {
                     "tool": "mcp__borg_agent__update_plan",
                     "state": {
                         "status": "pending",
-                        "input": {"action": "edit"}
+                        "input": {},
+                        "raw": "{"
                     }
                 }
             }),
@@ -602,6 +609,20 @@ mod tests {
             receiver.recv().await,
             Some(ChatStreamEvent::ToolCallGenerating { id: Some(id) }) if id == "tool-1"
         ));
+        assert!(receiver.try_recv().is_err());
+        emit_tool(
+            &sender,
+            &json!({"part": {
+                "id": "tool-1", "tool": "mcp__borg_agent__update_plan",
+                "state": {"status": "pending", "input": {"action": "edit"}}
+            }}),
+            &mut generating,
+            &mut described,
+            &mut started,
+            &mut completed,
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             receiver.recv().await,
             Some(ChatStreamEvent::ToolCallAction { id, action })
@@ -636,5 +657,52 @@ mod tests {
                 if id == "tool-1" && name == "mcp__borg_agent__update_plan"
         ));
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn late_tool_snapshots_never_invent_generation_or_reopen_it() {
+        for status in ["running", "completed", "error"] {
+            let (sender, mut receiver) = mpsc::channel(8);
+            let mut generating = HashSet::new();
+            let mut described = HashSet::new();
+            let mut started = HashSet::new();
+            let mut completed = HashSet::new();
+            let mut snapshot = json!({"part": {
+                "id": "tool-1", "tool": "bash",
+                "state": {"status": status, "input": {"action": "read file"},
+                          "output": "file contents", "error": "read failed"}
+            }});
+            emit_tool(
+                &sender,
+                &snapshot,
+                &mut generating,
+                &mut described,
+                &mut started,
+                &mut completed,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(receiver.try_recv().unwrap(), ChatStreamEvent::ToolCall { id, .. } if id == "tool-1")
+            );
+            if status != "running" {
+                assert!(
+                    matches!(receiver.try_recv().unwrap(), ChatStreamEvent::ToolResult { is_error, .. } if is_error == (status == "error"))
+                );
+            }
+            assert!(receiver.try_recv().is_err());
+            snapshot["part"]["state"]["status"] = json!("pending");
+            emit_tool(
+                &sender,
+                &snapshot,
+                &mut generating,
+                &mut described,
+                &mut started,
+                &mut completed,
+            )
+            .await
+            .unwrap();
+            assert!(receiver.try_recv().is_err());
+        }
     }
 }
