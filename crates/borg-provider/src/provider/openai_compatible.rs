@@ -12,11 +12,10 @@ use crate::runtime::elapsed_millis_u64;
 use super::{
     ChatCompletionResponseFormat, ModelMessage, ModelToolCall, ModelTurnRequest, ModelTurnResult,
     Provider, ProviderAttemptTrace, ProviderCallError, ProviderCallResult, ProviderInvocation,
-    ProviderProgress, StructuredOutputDialect, apply_provider_request_timeout,
+    ProviderProgress, StreamedToolAction, StructuredOutputDialect, apply_provider_request_timeout,
     chat_completion_response_format, extract_chat_completions_usage, nonempty_env,
     parse_chat_completion_json_text, provider_cost_usd_to_microusd,
-    read_provider_error_response_text, read_provider_success_response_text, streamed_tool_action,
-    truncate_provider_text,
+    read_provider_error_response_text, read_provider_success_response_text, truncate_provider_text,
 };
 
 const COMPATIBLE_STREAM_MAX_BYTES: usize = 128 * 1024 * 1024;
@@ -1012,6 +1011,7 @@ struct PartialToolCall {
     id: String,
     name: String,
     arguments: String,
+    action_parser: StreamedToolAction,
 }
 
 fn emit_compatible_reasoning_progress(
@@ -1159,6 +1159,7 @@ async fn read_compatible_model_stream(
                         .and_then(|index| usize::try_from(index).ok())
                         .ok_or_else(|| "tool-call delta is missing a valid index".to_string())?;
                     let call = tool_calls.entry(index).or_default();
+                    let was_unkeyed = call.id.is_empty();
                     let name_delta = delta
                         .pointer("/function/name")
                         .and_then(Value::as_str)
@@ -1194,6 +1195,7 @@ async fn read_compatible_model_stream(
                     }
                     if !call.id.is_empty()
                         && !call.name.is_empty()
+                        && !described_tool_calls.contains(&index)
                         && started_tool_calls.insert(index)
                         && let Some(sender) = progress
                     {
@@ -1203,14 +1205,14 @@ async fn read_compatible_model_stream(
                             input: Value::Null,
                         });
                     }
-                    if !call.id.is_empty()
-                        && !described_tool_calls.contains(&index)
-                        && let Some(action) = streamed_tool_action(&call.arguments)
+                    if (!described_tool_calls.contains(&index)
+                        || (was_unkeyed && !call.id.is_empty()))
+                        && let Some(action) = call.action_parser.observe(&call.arguments)
                     {
                         described_tool_calls.insert(index);
                         if let Some(sender) = progress {
                             let _ = sender.send(ProviderProgress::ToolCallAction {
-                                id: call.id.clone(),
+                                id: (!call.id.is_empty()).then(|| call.id.clone()),
                                 action,
                             });
                         }
@@ -1734,11 +1736,11 @@ mod tests {
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]},"finish_reason":null}]}"#,
             r#"data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"inspect " }]},"finish_reason":null}]}"#,
             r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{"}}]},"finish_reason":null}]}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"path\":\"src/lib.rs\",\"action\":\"edit\","}}]},"finish_reason":null}]}"#,
             "",
         ].join("\n");
         let body = [
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"action\":\"ed"}}]},"finish_reason":null}]}"#,
-            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read_file","arguments":"it\",\"path\":\"src/lib.rs\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read_file","arguments":"\"offset\":1}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#,
             "data: [DONE]",
             "",
         ]
@@ -1796,32 +1798,30 @@ mod tests {
             panic!("expected tool generation progress event");
         };
         assert_eq!(id, None);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), progress_rx.recv())
+                .await
+                .unwrap(),
+            Some(ProviderProgress::ToolCallInputDelta { id: None })
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), progress_rx.recv()).await.unwrap(),
+            Some(ProviderProgress::ToolCallAction { id: None, action }) if action == "edit"
+        ));
         assert!(progress_rx.try_recv().is_err());
         release_tx.send(()).expect("release remaining arguments");
         let streamed = stream.await.expect("stream task");
         server.await.expect("test server task");
         assert!(matches!(
             progress_rx.try_recv(),
-            Ok(ProviderProgress::ToolCallInputDelta { id: None })
-        ));
-        assert!(matches!(
-            progress_rx.try_recv(),
             Ok(ProviderProgress::ToolCallInputDelta { id: Some(id) }) if id == "call-1"
         ));
-        let ProviderProgress::ToolCallStarted { id, name, input } =
-            progress_rx.try_recv().expect("tool-call progress event")
-        else {
-            panic!("expected tool-call progress event");
-        };
-        assert_eq!(id, "call-1");
-        assert_eq!(name, "read_file");
-        assert_eq!(input, Value::Null);
         let ProviderProgress::ToolCallAction { id, action } =
             progress_rx.try_recv().expect("tool action progress event")
         else {
             panic!("expected tool action progress event");
         };
-        assert_eq!(id, "call-1");
+        assert_eq!(id.as_deref(), Some("call-1"));
         assert_eq!(action, "edit");
         assert_eq!(streamed.finish_reason, "tool_calls");
         let ModelMessage::Assistant {
@@ -1846,20 +1846,21 @@ mod tests {
         assert_eq!(tool_calls[0].function.name, "read_file");
         assert_eq!(
             tool_calls[0].function.arguments,
-            r#"{"action":"edit","path":"src/lib.rs"}"#
+            r#"{"path":"src/lib.rs","action":"edit","offset":1}"#
         );
         assert_eq!(streamed.raw["usage"]["prompt_tokens"], 10);
     }
 
     #[test]
-    fn streamed_action_is_early_when_first_and_accepts_reordered_complete_input() {
+    fn streamed_action_is_early_even_when_reordered() {
+        let streamed_tool_action = |input: &str| StreamedToolAction::default().observe(input);
         assert_eq!(
             streamed_tool_action(r#"{"action":"delete files","#).as_deref(),
             Some("delete files")
         );
         assert_eq!(streamed_tool_action(r#"{"action":"edi"#), None);
         assert_eq!(
-            streamed_tool_action(r#"{"cmd":"pwd","action":"inspect"}"#).as_deref(),
+            streamed_tool_action(r#"{"cmd":"pwd","action":"inspect","#).as_deref(),
             Some("inspect")
         );
         assert_eq!(
@@ -1867,7 +1868,7 @@ mod tests {
             None
         );
         assert_eq!(
-            streamed_tool_action(r#"{"payload":{"action":"nested"},"action":"edit"}"#).as_deref(),
+            streamed_tool_action(r#"{"payload":{"action":"nested"},"action":"edit","#).as_deref(),
             Some("edit")
         );
     }

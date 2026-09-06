@@ -2659,6 +2659,86 @@ fn cached_transcript_reuses_history_for_same_width_timer_updates() {
 }
 
 #[test]
+fn action_status_updates_refresh_cached_transcript_text() {
+    let session_id = Uuid::new_v4();
+    let render_time = Utc::now();
+    let mut transcript = Transcript::default();
+    let mut cache = None;
+    for (sequence, kind, payload, expected) in [
+        (
+            1,
+            "action/preparing",
+            serde_json::json!({"label": ""}),
+            "Generating…",
+        ),
+        (
+            2,
+            "action/preparing",
+            serde_json::json!({"label": "edit retry policy"}),
+            "Generating edit retry policy",
+        ),
+        (
+            3,
+            "action/generation_status",
+            serde_json::json!({"waiting": true}),
+            "Waiting for provider…",
+        ),
+        (
+            4,
+            "action/generation_status",
+            serde_json::json!({"waiting": false, "label": "edit retry policy"}),
+            "Generating edit retry policy",
+        ),
+        (5, "action/preparing_cancelled", serde_json::json!({}), ""),
+    ] {
+        let mut event = SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: kind.into(),
+                payload,
+            },
+        );
+        event.created_at = render_time;
+        transcript.apply(&event);
+        // Root and focused-child event handling use this same invalidation predicate.
+        if session_event_changes_transcript(&event.kind) {
+            cache = None;
+        }
+        let labels = transcript.running_tool_elapsed_labels_at(render_time);
+        let rendered = cached_transcript_render(
+            &transcript,
+            &mut cache,
+            100,
+            DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT,
+            None,
+            &labels,
+            render_time.with_timezone(&Local).date_naive(),
+            render_time,
+        );
+        let text = rendered
+            .0
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if expected.is_empty() {
+            assert!(
+                !text.contains("Generating") && !text.contains("Waiting for provider"),
+                "{text}"
+            );
+        } else {
+            assert!(text.contains(expected), "{kind}: {text}");
+            assert_eq!(transcript.order.len(), 1);
+            assert!(
+                matches!(&transcript.order[0], TranscriptEntry::Tool { started_at, .. } if *started_at == render_time)
+            );
+        }
+    }
+}
+
+#[test]
 fn background_tool_elapsed_cache_tick_also_changes_each_tenth() {
     let started_at = DateTime::parse_from_rfc3339("2026-07-29T10:00:00.000Z")
         .unwrap()

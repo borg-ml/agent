@@ -688,8 +688,8 @@ mod tests {
             assert!(
                 tool["inputSchema"]["required"]
                     .as_array()
-                    .is_some_and(|required| required.iter().any(|field| field == "action")),
-                "{} must require action",
+                    .is_some_and(|required| required.iter().all(|field| field != "action")),
+                "{} must not reject missing presentation metadata",
                 tool["name"]
             );
         }
@@ -712,6 +712,14 @@ mod tests {
                 "payload": {"action": "domain value"}
             })
         );
+        for metadata in [json!(null), json!(42), json!({"not": "a summary"})] {
+            let mut arguments = json!({"path": "src/main.rs", "action": metadata});
+            strip_action_metadata(&mut arguments);
+            assert_eq!(arguments, json!({"path": "src/main.rs"}));
+        }
+        let mut arguments = json!({"path": "src/main.rs"});
+        strip_action_metadata(&mut arguments);
+        assert_eq!(arguments, json!({"path": "src/main.rs"}));
     }
 
     #[tokio::test]

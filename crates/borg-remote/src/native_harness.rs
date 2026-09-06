@@ -200,7 +200,7 @@ impl NativeHarness {
         match self.harness {
             HarnessMode::Borg => system_prompt.push_str(concat!(
                 "\n\nBorg provides one shell-first execution surface through `exec`. ",
-                "Put the required `action` argument first in every tool call so the live UI can display it while the remaining arguments stream. ",
+                "Include a short `action` summary first in every tool call so the live UI can display it while the remaining arguments stream. ",
                 "Use shell commands for orchestration and invoke the language or installed runtime that best fits the problem, such as TypeScript/JavaScript for web and JSON work or Python for data and scientific work. ",
                 "This is trusted user-authority execution, not a security sandbox. ",
                 "Use `borg tools` to discover Borg, Blu, plugin, history, workflow, and collaboration capabilities on demand, and `borg call NAME JSON` to invoke one. ",
@@ -208,7 +208,7 @@ impl NativeHarness {
             )),
             HarnessMode::Native => system_prompt.push_str(concat!(
                 "\n\nUse the available Borg capabilities directly. `exec_command` runs trusted user-authority shell commands and can invoke any installed language runtime. ",
-                "Put the required `action` argument first in every tool call so the live UI can display it while the remaining arguments stream. ",
+                "Include a short `action` summary first in every tool call so the live UI can display it while the remaining arguments stream. ",
                 "Use `query_history` when compacted context is insufficient."
             )),
         }
@@ -2279,7 +2279,7 @@ fn add_action_metadata(definition: &mut ModelToolDefinition) -> Result<()> {
             "type": "string",
             "minLength": 1,
             "maxLength": 64,
-            "description": "Required one- or two-word summary for the live UI. Always emit this as the first argument field."
+            "description": "One- or two-word summary for the live UI. Emit this as the first argument field. Presentation metadata only; it does not affect tool execution."
         }),
     );
     properties.extend(existing);
@@ -2288,9 +2288,7 @@ fn add_action_metadata(definition: &mut ModelToolDefinition) -> Result<()> {
         .or_insert_with(|| json!([]))
         .as_array_mut()
         .context("native tool required schema is not an array")?;
-    if !required.iter().any(|field| field == "action") {
-        required.push(json!("action"));
-    }
+    required.retain(|field| field != "action");
     Ok(())
 }
 
@@ -2833,7 +2831,7 @@ mod tests {
                 .expect("progress receiver remains alive");
             progress
                 .send(ProviderProgress::ToolCallAction {
-                    id: "call-1".to_string(),
+                    id: Some("call-1".to_string()),
                     action: "delete files".to_string(),
                 })
                 .expect("progress receiver remains alive");
@@ -2974,7 +2972,7 @@ mod tests {
     }
 
     #[test]
-    fn native_action_metadata_is_first_and_required() {
+    fn native_action_metadata_is_first_but_not_an_execution_requirement() {
         let mut definition = exec_tool_definition().expect("exec schema is valid");
         add_action_metadata(&mut definition).expect("action metadata is valid");
         let properties = definition.input_schema["properties"].as_object().unwrap();
@@ -2982,7 +2980,7 @@ mod tests {
         assert!(
             definition.input_schema["required"]
                 .as_array()
-                .is_some_and(|required| required.iter().any(|field| field == "action"))
+                .is_some_and(|required| required.iter().all(|field| field != "action"))
         );
     }
 

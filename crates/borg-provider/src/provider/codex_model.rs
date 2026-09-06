@@ -17,7 +17,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::{
     ModelMessage, ModelToolCall, ModelTurnRequest, ModelTurnResult, ProviderAttemptTrace,
     ProviderCallError, ProviderInvocation, ProviderProgress, ProviderProgressStream,
-    apply_provider_request_timeout, streamed_tool_action,
+    StreamedToolAction, apply_provider_request_timeout,
 };
 
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -635,6 +635,7 @@ struct ResponseState {
     calls: HashMap<String, (String, String, String)>,
     generating: HashSet<String>,
     described: HashSet<String>,
+    action_parsers: HashMap<String, StreamedToolAction>,
     output: BTreeMap<u64, Value>,
     reasoning: String,
 }
@@ -677,6 +678,19 @@ impl ResponseState {
                         input: Value::Null,
                     });
                 }
+                if !self.described.contains(call_id)
+                    && let Some(action) = self
+                        .action_parsers
+                        .entry(call_id.into())
+                        .or_default()
+                        .observe(arguments)
+                {
+                    self.described.insert(call_id.into());
+                    emit(ProviderProgress::ToolCallAction {
+                        id: Some(call_id.into()),
+                        action,
+                    });
+                }
             }
             "response.function_call_arguments.delta" => {
                 let delta = event["delta"].as_str().unwrap_or_default();
@@ -699,11 +713,15 @@ impl ResponseState {
                     }
                     arguments.push_str(delta);
                     if !self.described.contains(call_id)
-                        && let Some(action) = streamed_tool_action(arguments)
+                        && let Some(action) = self
+                            .action_parsers
+                            .entry(call_id.clone())
+                            .or_default()
+                            .observe(arguments)
                     {
                         self.described.insert(call_id.clone());
                         emit(ProviderProgress::ToolCallAction {
-                            id: call_id.clone(),
+                            id: Some(call_id.clone()),
                             action,
                         });
                     }
@@ -1000,6 +1018,31 @@ mod tests {
             events.try_recv(),
             Ok(ProviderProgress::ToolCallInputDelta { id: Some(id) }) if id == "call"
         ));
+        assert!(events.try_recv().is_err());
+        state.event(
+            &json!({"type":"response.function_call_arguments.delta","item_id":"item","delta":"\"file\",\"action\":\"edit\",\"body\":\""}),
+            Some(&progress), "test-model", "low",
+        ).unwrap();
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ProviderProgress::ToolCallInputDelta { .. })
+        ));
+        assert!(
+            matches!(events.try_recv(), Ok(ProviderProgress::ToolCallAction { id: Some(id), action })
+            if id == "call" && action == "edit")
+        );
+        state.event(
+            &json!({"type":"response.output_item.added","item":{"type":"function_call","id":"next","call_id":"next-call","name":"","arguments":"{\"action\":\"read\","}}),
+            Some(&progress), "test-model", "low",
+        ).unwrap();
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ProviderProgress::ToolCallGenerating { .. })
+        ));
+        assert!(
+            matches!(events.try_recv(), Ok(ProviderProgress::ToolCallAction { id: Some(id), action })
+            if id == "next-call" && action == "read")
+        );
         assert!(events.try_recv().is_err());
     }
 

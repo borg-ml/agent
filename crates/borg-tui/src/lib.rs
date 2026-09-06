@@ -2676,6 +2676,8 @@ impl BorgTerminal {
                 is_context_compaction(kind)
                     || is_live_tool_call_event(kind)
                     || kind == "action/preparing"
+                    || kind == "action/generation_status"
+                    || kind == "action/preparing_cancelled"
                     || kind == "network_retry"
                     || kind == "network_recovered"
             }
@@ -9870,6 +9872,8 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
             is_context_compaction(kind)
                 || is_live_tool_call_event(kind)
                 || kind == "action/preparing"
+                || kind == "action/generation_status"
+                || kind == "action/preparing_cancelled"
         }
         SessionEventKind::SubagentActivity {
             activity,

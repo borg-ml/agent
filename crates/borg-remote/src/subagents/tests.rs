@@ -3054,7 +3054,7 @@ fn update_plan_accepts_legacy_aliases_but_advertises_the_canonical_contract() {
         .find(|tool| tool["name"] == "update_plan")
         .expect("update_plan tool spec");
     let schema = &update_plan["inputSchema"];
-    assert_eq!(schema["required"], json!(["plan", "action"]));
+    assert_eq!(schema["required"], json!(["plan"]));
     assert_eq!(
         schema["properties"]["plan"]["maxItems"],
         crate::session::MAX_PLAN_ITEMS

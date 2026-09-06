@@ -210,7 +210,7 @@ pub enum ProviderProgress {
         input: Value,
     },
     ToolCallAction {
-        id: String,
+        id: Option<String>,
         action: String,
     },
     ToolCallCompleted {
@@ -233,51 +233,84 @@ pub enum ProviderProgress {
     },
 }
 
-pub(super) fn streamed_tool_action(arguments: &str) -> Option<String> {
-    let mut remaining = arguments.trim_start().strip_prefix('{')?.trim_start();
-    let (field, rest) = parse_complete_json_string(remaining)?;
-    let action = if field == "action" {
-        remaining = rest.trim_start().strip_prefix(':')?.trim_start();
-        parse_complete_json_string(remaining)?.0
-    } else {
-        // Reordered metadata is still usable once the input is complete.
-        // Avoid reparsing a growing edit body on every token while waiting.
-        if !arguments.trim_end().ends_with('}') {
-            return None;
-        }
-        #[derive(Deserialize)]
-        struct ActionMetadata {
-            action: String,
-        }
-        serde_json::from_str::<ActionMetadata>(arguments)
-            .ok()?
-            .action
-    };
-    let action = action.trim();
-    (!action.is_empty() && action.chars().count() <= 64).then(|| action.to_string())
+#[derive(Default)]
+pub(super) struct StreamedToolAction {
+    offset: usize,
+    depth: usize,
+    string_start: Option<usize>,
+    escaped: bool,
+    expecting_key: bool,
+    action_key: bool,
+    action_value: bool,
+    finished: bool,
+    action: Option<String>,
 }
 
-fn parse_complete_json_string(input: &str) -> Option<(String, &str)> {
-    if !input.starts_with('"') {
-        return None;
-    }
-    let mut escaped = false;
-    for (offset, character) in input[1..].char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
+impl StreamedToolAction {
+    // Input is the accumulated argument stream. Scan each byte once, including
+    // large values preceding action, without interpreting nested action fields.
+    pub(super) fn observe(&mut self, arguments: &str) -> Option<String> {
+        if self.finished {
+            return self.action.clone();
         }
-        match character {
-            '\\' => escaped = true,
-            '"' => {
-                let end = offset + 2;
-                let value = serde_json::from_str::<String>(&input[..end]).ok()?;
-                return Some((value, &input[end..]));
+        for (offset, byte) in arguments.bytes().enumerate().skip(self.offset) {
+            self.offset = offset + 1;
+            if let Some(start) = self.string_start {
+                if self.escaped {
+                    self.escaped = false;
+                } else if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == b'"' {
+                    self.string_start = None;
+                    if self.depth == 1 && self.expecting_key {
+                        self.action_key =
+                            serde_json::from_str::<String>(&arguments[start..self.offset])
+                                .is_ok_and(|key| key == "action");
+                        self.expecting_key = false;
+                    } else if self.depth == 1 && self.action_value {
+                        self.finished = true;
+                        self.action =
+                            serde_json::from_str::<String>(&arguments[start..self.offset])
+                                .ok()
+                                .map(|action| action.trim().to_string())
+                                .filter(|action| {
+                                    !action.is_empty() && action.chars().count() <= 64
+                                });
+                        return self.action.clone();
+                    }
+                }
+                continue;
             }
-            _ => {}
+            match byte {
+                b'"' => self.string_start = Some(offset),
+                b'{' | b'[' => {
+                    self.depth += 1;
+                    if self.depth == 1 {
+                        if byte != b'{' {
+                            self.finished = true;
+                            return None;
+                        }
+                        self.expecting_key = true;
+                    }
+                }
+                b'}' | b']' => {
+                    self.depth = self.depth.saturating_sub(1);
+                    if self.depth == 0 {
+                        self.finished = true;
+                        return None;
+                    }
+                }
+                b':' if self.depth == 1 => self.action_value = self.action_key,
+                b',' if self.depth == 1 => {
+                    self.expecting_key = true;
+                    self.action_key = false;
+                    self.action_value = false;
+                }
+                _ => {}
+            }
         }
+        None
     }
-    None
 }
 
 impl ProviderProgress {
@@ -849,6 +882,34 @@ mod tests {
         parse_chat_completion_json_text, provider_cost_usd_to_microusd,
         provider_response_body_would_exceed_limit, truncate_provider_text,
     };
+
+    #[test]
+    fn action_stream_handles_fragmentation_and_ignores_nested_or_quoted_decoys() {
+        for prefix in [
+            "{".to_string(),
+            format!(
+                r#"{{"body":"{}","nested":[{{"action":"wrong"}}],"number":42,"#,
+                "é\\\"action\\\"".repeat(1024)
+            ),
+        ] {
+            let input = format!(r#"{prefix}"action":"edit \u0066iles","body":"unfinished"#);
+            let boundary = input.rfind(r#"","body":"#).unwrap() + 1;
+            let mut parser = super::StreamedToolAction::default();
+            for (index, character) in input.char_indices() {
+                let end = index + character.len_utf8();
+                let action = parser.observe(&input[..end]);
+                assert_eq!(action.as_deref(), (end >= boundary).then_some("edit files"));
+            }
+        }
+        for input in [
+            r#"{"action":null}"#,
+            r#"{"action":42}"#,
+            r#"{"action":""}"#,
+            r#"{"body":"action","nested":{"action":"wrong"}}"#,
+        ] {
+            assert_eq!(super::StreamedToolAction::default().observe(input), None);
+        }
+    }
 
     #[test]
     fn provider_error_body_limit_allows_exact_boundary() {

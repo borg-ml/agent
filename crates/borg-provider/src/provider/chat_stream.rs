@@ -217,6 +217,7 @@ struct ClaudeToolGenerationState {
 struct ClaudeToolGenerationBlock {
     id: Option<String>,
     arguments: String,
+    action_parser: super::StreamedToolAction,
     generating_emitted: bool,
     action_emitted: bool,
 }
@@ -257,7 +258,10 @@ impl ClaudeToolGenerationState {
                     content_block.get("input").and_then(complete_tool_action),
                 ) {
                     block.action_emitted = true;
-                    progress.push(ChatStreamEvent::ToolCallAction { id, action });
+                    progress.push(ChatStreamEvent::ToolCallAction {
+                        id: Some(id),
+                        action,
+                    });
                 }
                 self.blocks.insert(index, block);
                 progress
@@ -291,11 +295,13 @@ impl ClaudeToolGenerationState {
                 }
                 block.arguments.push_str(partial);
                 if !block.action_emitted
-                    && let Some(id) = block.id.clone()
-                    && let Some(action) = super::streamed_tool_action(&block.arguments)
+                    && let Some(action) = block.action_parser.observe(&block.arguments)
                 {
                     block.action_emitted = true;
-                    progress.push(ChatStreamEvent::ToolCallAction { id, action });
+                    progress.push(ChatStreamEvent::ToolCallAction {
+                        id: block.id.clone(),
+                        action,
+                    });
                 }
                 progress
             }
@@ -341,7 +347,7 @@ pub enum ChatStreamEvent {
         id: Option<String>,
     },
     ToolCallAction {
-        id: String,
+        id: Option<String>,
         action: String,
     },
     ToolCall {
@@ -3291,7 +3297,7 @@ async fn emit_codex_events_with_state(
             if let Some(action) = complete_tool_action(&input) {
                 events
                     .send(ChatStreamEvent::ToolCallAction {
-                        id: id.clone(),
+                        id: Some(id.clone()),
                         action,
                     })
                     .await
@@ -4512,7 +4518,7 @@ mod tests {
                 ChatStreamEvent::ToolCallInputDelta { id: Some(delta_id) },
                 ChatStreamEvent::ToolCallAction { id, action }
             ]
-                if delta_id == "tool-1" && id == "tool-1" && action == "edit"
+                if delta_id == "tool-1" && id.as_deref() == Some("tool-1") && action == "edit"
         ));
 
         for partial in [None, Some(""), Some("{")] {
@@ -5417,7 +5423,7 @@ mod tests {
         ));
         assert!(matches!(
             receiver.recv().await,
-            Some(ChatStreamEvent::ToolCallAction { id, action })
+            Some(ChatStreamEvent::ToolCallAction { id: Some(id), action })
                 if id == "tool-1" && action == "edit"
         ));
         assert!(matches!(

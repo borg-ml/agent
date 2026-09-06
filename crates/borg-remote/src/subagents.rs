@@ -6735,7 +6735,7 @@ fn add_action_metadata(specs: &mut [Value]) {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 64,
-                "description": "Required one- or two-word summary for the live UI. Always emit this as the first argument field."
+                "description": "One- or two-word summary for the live UI. Emit this as the first argument field. Presentation metadata only; it does not affect tool execution."
             }),
         );
         properties.extend(existing);
@@ -6743,9 +6743,8 @@ fn add_action_metadata(specs: &mut [Value]) {
             .entry("required")
             .or_insert_with(|| json!([]))
             .as_array_mut()
-            && !required.iter().any(|field| field == "action")
         {
-            required.push(json!("action"));
+            required.retain(|field| field != "action");
         }
     }
 }

@@ -428,11 +428,18 @@ async fn default_model() -> Result<String> {
         .to_string())
 }
 
+struct PendingToolInput {
+    name: String,
+    input: Value,
+    raw: String,
+    action_parser: crate::provider::StreamedToolAction,
+}
+
 async fn emit_tool(
     events: &mpsc::Sender<ChatStreamEvent>,
     value: &Value,
     generating_tools: &mut HashSet<String>,
-    pending_tool_snapshots: &mut HashMap<String, (String, Value, String)>,
+    pending_tool_snapshots: &mut HashMap<String, PendingToolInput>,
     described_tools: &mut HashSet<String>,
     started_tools: &mut HashSet<String>,
     completed_tools: &mut HashSet<String>,
@@ -455,7 +462,13 @@ async fn emit_tool(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let snapshot = (name.clone(), input.clone(), raw);
+    let mut snapshot = PendingToolInput {
+        name: name.clone(),
+        input: input.clone(),
+        raw,
+        action_parser: Default::default(),
+    };
+    let mut raw_action = None;
     if status == Some("pending")
         && !started_tools.contains(&id)
         && generating_tools.insert(id.clone())
@@ -470,12 +483,11 @@ async fn emit_tool(
     }
     if status == Some("pending") && !started_tools.contains(&id) {
         if let Some(previous) = pending_tool_snapshots.get(&id)
-            && previous != &snapshot
-            && ((!snapshot.0.is_empty() && snapshot.0 != previous.0)
-                || (!snapshot.1.is_null()
-                    && snapshot.1 != Value::Object(Default::default())
-                    && snapshot.1 != previous.1)
-                || (!snapshot.2.is_empty() && snapshot.2 != previous.2))
+            && ((!snapshot.name.is_empty() && snapshot.name != previous.name)
+                || (!snapshot.input.is_null()
+                    && snapshot.input != Value::Object(Default::default())
+                    && snapshot.input != previous.input)
+                || (!snapshot.raw.is_empty() && snapshot.raw != previous.raw))
             && events
                 .send(ChatStreamEvent::ToolCallInputDelta {
                     id: Some(id.clone()),
@@ -485,17 +497,23 @@ async fn emit_tool(
         {
             return Ok(());
         }
+        if let Some(previous) = pending_tool_snapshots.get_mut(&id)
+            && snapshot.raw.starts_with(&previous.raw)
+        {
+            snapshot.action_parser = std::mem::take(&mut previous.action_parser);
+        }
+        raw_action = snapshot.action_parser.observe(&snapshot.raw);
         pending_tool_snapshots.insert(id.clone(), snapshot);
     }
     if status == Some("pending")
         && !started_tools.contains(&id)
         && !described_tools.contains(&id)
-        && let Some(action) = complete_tool_action(&input)
+        && let Some(action) = complete_tool_action(&input).or(raw_action)
     {
         described_tools.insert(id.clone());
         if events
             .send(ChatStreamEvent::ToolCallAction {
-                id: id.clone(),
+                id: Some(id.clone()),
                 action,
             })
             .await
@@ -645,7 +663,8 @@ mod tests {
             &sender,
             &json!({"part": {
                 "id": "tool-1", "tool": "mcp__borg_agent__update_plan",
-                "state": {"status": "pending", "input": {"action": "edit"}}
+                "state": {"status": "pending", "input": {},
+                    "raw": "{\"nested\":{\"action\":\"wrong\"},\"action\":\"edit\",\"plan\":["}
             }}),
             &mut generating,
             &mut snapshots,
@@ -661,7 +680,7 @@ mod tests {
         ));
         assert!(matches!(
             receiver.recv().await,
-            Some(ChatStreamEvent::ToolCallAction { id, action })
+            Some(ChatStreamEvent::ToolCallAction { id: Some(id), action })
                 if id == "tool-1" && action == "edit"
         ));
         assert!(receiver.try_recv().is_err());
@@ -669,7 +688,8 @@ mod tests {
             &sender,
             &json!({"part": {
                 "id": "tool-1", "tool": "mcp__borg_agent__update_plan",
-                "state": {"status": "pending", "input": {"action": "edit"}}
+                "state": {"status": "pending", "input": {},
+                    "raw": "{\"nested\":{\"action\":\"wrong\"},\"action\":\"edit\",\"plan\":["}
             }}),
             &mut generating,
             &mut snapshots,

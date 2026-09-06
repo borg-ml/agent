@@ -38,6 +38,19 @@ Coalesced live state preserves parallel calls and their latest status on reconne
 and execution/completion removes the matching preparation state. Compatibility
 adapters can report only the input progress their upstream stream exposes.
 
+Borg places `action` first in tool schemas and asks for a one- or two-word summary
+first in each call. It is presentation metadata, not a required execution input:
+missing or unusable summaries must not reject or retry an otherwise valid call.
+The incremental reader recognizes only a top-level action string, including when
+other fields precede it, and publishes it as soon as the closing quote arrives.
+It does not wait for the remaining arguments or a tool-call ID. A later ID attaches
+to the same preparing card without replacing its summary with a generic label.
+OpenCode uses raw pending input as well as parsed snapshots; terminal status
+transitions invalidate the rendered card cache. Legacy Codex cannot expose an
+early model-written summary for upstream tools without streamed action arguments;
+retain honest generic feedback there rather than inventing text or migrating a
+live subscription session implicitly.
+
 Provider continuation handles and opaque model state may be necessary for
 quality and cache reuse. Preserve them as part of Borg's recorded model
 exchange; a provider-owned conversation must not silently become authoritative.
