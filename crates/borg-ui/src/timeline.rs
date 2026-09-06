@@ -10,6 +10,9 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
+    if complete && name == "Wait for provider" {
+        return Cow::Borrowed("Stopped waiting for provider");
+    }
     if complete && (name == "Generate" || name.starts_with("Generate ")) {
         let label = name.strip_prefix("Generate ").unwrap_or("command");
         return Cow::Owned(format!("Stopped generating {label}"));
@@ -285,7 +288,11 @@ impl TimelineProjector {
                                     .copied()
                                     .filter(|index| {
                                         self.entries.get(*index).is_some_and(|entry| {
-                                            entry.running && entry.title == "Generate"
+                                            entry.running
+                                                && matches!(
+                                                    entry.title.as_str(),
+                                                    "Generate" | "Wait for provider"
+                                                )
                                         })
                                     })
                             })
@@ -327,6 +334,55 @@ impl TimelineProjector {
                         .insert(provider_tool_id.to_string(), index);
                 } else {
                     self.unkeyed_preparing_tools.push(index);
+                }
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "action/generation_status" =>
+            {
+                let provider_tool_id = payload
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str);
+                if provider_tool_id.is_some_and(|tool_call_id| {
+                    self.tools.contains_key(tool_call_id)
+                        && !self.preparing_tools.contains_key(tool_call_id)
+                }) {
+                    return;
+                }
+                let mapped = provider_tool_id
+                    .and_then(|tool_call_id| self.preparing_tools.get(tool_call_id).copied());
+                let index = mapped.or_else(|| self.unkeyed_preparing_tools.last().copied());
+                let Some(index) = index else {
+                    return;
+                };
+                let Some(entry) = self.entries.get_mut(index) else {
+                    return;
+                };
+                let entry = Arc::make_mut(entry);
+                if !entry.running || entry.kind != TimelineKind::Tool {
+                    return;
+                }
+                let waiting = payload
+                    .get("waiting")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let label = payload
+                    .get("label")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                entry.title = if waiting {
+                    "Wait for provider".into()
+                } else if label.is_empty() {
+                    "Generate".into()
+                } else {
+                    format!("Generate {label}")
+                };
+                if mapped.is_none()
+                    && let Some(provider_tool_id) = provider_tool_id
+                {
+                    self.unkeyed_preparing_tools
+                        .retain(|candidate| *candidate != index);
+                    self.preparing_tools
+                        .insert(provider_tool_id.to_string(), index);
                 }
             }
             SessionEventKind::ToolStarted {
@@ -748,5 +804,173 @@ mod tests {
                 .iter()
                 .all(|entry| !entry.title.starts_with("Generate"))
         );
+    }
+
+    #[test]
+    fn generation_status_waits_and_resumes_the_same_action() {
+        let session_id = Uuid::new_v4();
+        let started_at = Utc::now();
+        let mut projector = TimelineProjector::default();
+        let mut preparing = SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "action/preparing".into(),
+                payload: serde_json::json!({
+                    "label": "read configuration",
+                    "tool_call_id": null,
+                }),
+            },
+        );
+        preparing.created_at = started_at;
+        projector.push(&preparing);
+        let original_id = projector.entries[0].id.clone();
+        let original_detail = projector.entries[0].detail.clone();
+
+        for (sequence, waiting) in [(2, true), (3, false)] {
+            projector.push(&SessionEvent::new(
+                session_id,
+                sequence,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: "action/generation_status".into(),
+                    payload: serde_json::json!({
+                        "tool_call_id": if waiting { None } else { Some("read-1") },
+                        "waiting": waiting,
+                        "label": "read configuration",
+                    }),
+                },
+            ));
+            assert_eq!(projector.entries.len(), 1);
+            assert_eq!(projector.entries[0].id, original_id);
+            assert_eq!(projector.entries[0].created_at, started_at);
+            assert_eq!(projector.entries[0].detail, original_detail);
+            if waiting {
+                assert_eq!(
+                    tool_lifecycle_label(&projector.entries[0].title, false),
+                    "Waiting for provider…"
+                );
+            }
+        }
+        assert_eq!(projector.entries[0].title, "Generate read configuration");
+        assert!(projector.entries[0].running);
+        projector.push(&SessionEvent::new(
+            session_id,
+            4,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "read-1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "config.toml"}),
+                input_ref: None,
+            },
+        ));
+        assert_eq!(projector.entries.len(), 1);
+        assert!(!projector.entries[0].title.starts_with("Generate"));
+    }
+
+    #[test]
+    fn generation_status_respects_parallel_and_completed_actions() {
+        let session_id = Uuid::new_v4();
+        let mut projector = TimelineProjector::default();
+        for (sequence, tool_call_id, label) in [(1, "tool-a", "read"), (2, "tool-b", "run tests")] {
+            projector.push(&SessionEvent::new(
+                session_id,
+                sequence,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: "action/preparing".into(),
+                    payload: serde_json::json!({
+                        "tool_call_id": tool_call_id,
+                        "label": label,
+                    }),
+                },
+            ));
+        }
+        projector.push(&SessionEvent::new(
+            session_id,
+            3,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "action/generation_status".into(),
+                payload: serde_json::json!({
+                    "tool_call_id": "tool-b",
+                    "waiting": true,
+                    "label": "run tests",
+                }),
+            },
+        ));
+        assert_eq!(projector.entries[0].title, "Generate read");
+        assert_eq!(projector.entries[1].title, "Wait for provider");
+
+        projector.push(&SessionEvent::new(
+            session_id,
+            4,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "tool-b".into(),
+                name: "exec_command".into(),
+                input: serde_json::json!({"cmd": "cargo test"}),
+                input_ref: None,
+            },
+        ));
+        let promoted_title = projector.entries[1].title.clone();
+        projector.push(&SessionEvent::new(
+            session_id,
+            5,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "action/generation_status".into(),
+                payload: serde_json::json!({
+                    "tool_call_id": "tool-b",
+                    "waiting": true,
+                    "label": "run tests",
+                }),
+            },
+        ));
+        assert_eq!(projector.entries[1].title, promoted_title);
+        projector.push(&SessionEvent::new(
+            session_id,
+            6,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "tool-b".into(),
+                output: "done".into(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+            },
+        ));
+        projector.push(&SessionEvent::new(
+            session_id,
+            7,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "action/generation_status".into(),
+                payload: serde_json::json!({
+                    "tool_call_id": "tool-b",
+                    "waiting": false,
+                    "label": "run tests",
+                }),
+            },
+        ));
+        assert!(!projector.entries[1].running);
+        assert_eq!(projector.entries[1].title, promoted_title);
+
+        projector.push(&SessionEvent::new(
+            session_id,
+            8,
+            SessionEventKind::TurnCompleted {
+                message_id: Uuid::new_v4(),
+                provider_session_id: None,
+                final_text: String::new(),
+                error: None,
+            },
+        ));
+        assert!(!projector.entries[0].running);
+        assert_eq!(
+            tool_lifecycle_label(&projector.entries[0].title, true),
+            "Stopped generating read"
+        );
+        assert_eq!(projector.entries[1].title, promoted_title);
     }
 }

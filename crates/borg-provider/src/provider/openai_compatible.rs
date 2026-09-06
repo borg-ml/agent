@@ -1159,26 +1159,38 @@ async fn read_compatible_model_stream(
                         .and_then(|index| usize::try_from(index).ok())
                         .ok_or_else(|| "tool-call delta is missing a valid index".to_string())?;
                     let call = tool_calls.entry(index).or_default();
+                    let name_delta = delta
+                        .pointer("/function/name")
+                        .and_then(Value::as_str)
+                        .filter(|fragment| !fragment.is_empty());
+                    let arguments_delta = delta
+                        .pointer("/function/arguments")
+                        .and_then(Value::as_str)
+                        .filter(|fragment| !fragment.is_empty());
                     if let Some(id) = delta.get("id").and_then(Value::as_str)
                         && !id.is_empty()
                     {
                         call.id = id.to_string();
                     }
-                    if let Some(name) = delta.pointer("/function/name").and_then(Value::as_str) {
+                    if let Some(name) = name_delta {
                         call.name.push_str(name);
                     }
-                    if let Some(arguments) =
-                        delta.pointer("/function/arguments").and_then(Value::as_str)
-                    {
+                    if let Some(arguments) = arguments_delta {
                         call.arguments.push_str(arguments);
                     }
-                    if (!call.name.is_empty() || !call.arguments.is_empty())
-                        && generating_tool_calls.insert(index)
-                        && let Some(sender) = progress
-                    {
-                        let _ = sender.send(ProviderProgress::ToolCallGenerating {
-                            id: (!call.id.is_empty()).then(|| call.id.clone()),
-                        });
+                    if name_delta.is_some() || arguments_delta.is_some() {
+                        let event = if generating_tool_calls.insert(index) {
+                            ProviderProgress::ToolCallGenerating {
+                                id: (!call.id.is_empty()).then(|| call.id.clone()),
+                            }
+                        } else {
+                            ProviderProgress::ToolCallInputDelta {
+                                id: (!call.id.is_empty()).then(|| call.id.clone()),
+                            }
+                        };
+                        if let Some(sender) = progress {
+                            let _ = sender.send(event);
+                        }
                     }
                     if !call.id.is_empty()
                         && !call.name.is_empty()
@@ -1788,6 +1800,14 @@ mod tests {
         release_tx.send(()).expect("release remaining arguments");
         let streamed = stream.await.expect("stream task");
         server.await.expect("test server task");
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Ok(ProviderProgress::ToolCallInputDelta { id: None })
+        ));
+        assert!(matches!(
+            progress_rx.try_recv(),
+            Ok(ProviderProgress::ToolCallInputDelta { id: Some(id) }) if id == "call-1"
+        ));
         let ProviderProgress::ToolCallStarted { id, name, input } =
             progress_rx.try_recv().expect("tool-call progress event")
         else {

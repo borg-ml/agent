@@ -263,7 +263,9 @@ impl SessionEventKind {
                 EventPersistence::Durable
             }
             Self::ProviderEvent { kind, .. }
-                if kind == "action/preparing" || kind == "action/preparing_cancelled" =>
+                if kind == "action/preparing"
+                    || kind == "action/preparing_cancelled"
+                    || kind == "action/generation_status" =>
             {
                 EventPersistence::Coalesced
             }
@@ -388,10 +390,23 @@ impl SessionEventKind {
                 ..
             } => Some(format!("message:{message_id}")),
             Self::ReasoningDelta { .. } => Some("reasoning".to_string()),
-            Self::ProviderEvent { kind, .. }
-                if kind == "action/preparing" || kind == "action/preparing_cancelled" =>
+            Self::ProviderEvent { kind, payload, .. }
+                if kind == "action/preparing"
+                    || kind == "action/preparing_cancelled"
+                    || kind == "action/generation_status" =>
             {
-                Some("action_preparing".to_string())
+                let prefix = if kind == "action/generation_status" {
+                    "action_generation_status"
+                } else {
+                    "action_preparing"
+                };
+                Some(format!(
+                    "{prefix}:{}",
+                    payload
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                ))
             }
             Self::ContextWindowUpdated { .. } => Some("context_window".to_string()),
             _ => None,
@@ -400,6 +415,53 @@ impl SessionEventKind {
 
     pub fn cleared_live_state_keys(&self) -> Vec<String> {
         match self {
+            Self::ProviderEvent { kind, payload, .. } if kind == "action/preparing" => {
+                let id = payload
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let mut keys = vec![
+                    format!("action_generation_status:{id}"),
+                    "action_preparing".into(),
+                ];
+                if !id.is_empty() {
+                    keys.extend([
+                        "action_preparing:".into(),
+                        "action_generation_status:".into(),
+                    ]);
+                }
+                keys
+            }
+            Self::ToolStarted {
+                tool_call_id,
+                name,
+                input,
+                ..
+            }
+            | Self::ToolUpdated {
+                tool_call_id,
+                name,
+                input,
+            } if !crate::edit_is_awaiting_diff(name, input) => {
+                vec![
+                    "reasoning".into(),
+                    "action_preparing".into(),
+                    "action_preparing:".into(),
+                    "action_generation_status:".into(),
+                    format!("action_preparing:{tool_call_id}"),
+                    format!("action_generation_status:{tool_call_id}"),
+                ]
+            }
+            Self::ToolCompleted { tool_call_id, .. } => {
+                vec![
+                    "reasoning".into(),
+                    "action_preparing".into(),
+                    "action_preparing:".into(),
+                    "action_generation_status:".into(),
+                    format!("action_preparing:{tool_call_id}"),
+                    format!("action_generation_status:{tool_call_id}"),
+                ]
+            }
             Self::Message {
                 message_id,
                 actor,
@@ -418,8 +480,6 @@ impl SessionEventKind {
                 ..
             } => vec!["reasoning".to_string(), "action_preparing".to_string()],
             Self::ReasoningCompleted
-            | Self::ToolStarted { .. }
-            | Self::ToolCompleted { .. }
             | Self::ApprovalRequested { .. }
             | Self::ProviderInteractionRequested { .. }
             | Self::StatusChanged {
@@ -441,7 +501,8 @@ impl SessionEventKind {
     pub fn clears_live_turn_state(&self) -> bool {
         matches!(
             self,
-            Self::TurnCompleted { .. }
+            Self::ContextCleared
+                | Self::TurnCompleted { .. }
                 | Self::StatusChanged {
                     status: SessionStatus::Ready
                         | SessionStatus::Completed
@@ -4119,6 +4180,13 @@ impl SqliteSessionStore {
             .fetch_optional(&mut *transaction)
             .await?
             .with_context(|| format!("session {} does not exist", event.session_id))?;
+        for key in event.kind.cleared_live_state_keys() {
+            sqlx::query("delete from session_live_state where session_id = ? and live_key = ?")
+                .bind(event.session_id.to_string())
+                .bind(key)
+                .execute(&mut *transaction)
+                .await?;
+        }
         let current_revision = row.try_get::<i64, _>("live_revision")?;
         let state: SessionState = serde_json::from_str(row.try_get("state_json")?)?;
         let turn_live_allowed = matches!(

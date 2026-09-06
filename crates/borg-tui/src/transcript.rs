@@ -1332,6 +1332,29 @@ impl Transcript {
                         .and_then(serde_json::Value::as_str),
                 );
             }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "action/generation_status" =>
+            {
+                let waiting = payload
+                    .get("waiting")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let label = if self.action_descriptors {
+                    payload
+                        .get("label")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                } else {
+                    ""
+                };
+                self.update_action_generation_status(
+                    payload
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str),
+                    waiting,
+                    label,
+                );
+            }
             SessionEventKind::ProviderEvent { kind, .. }
                 if kind == "action/preparing_cancelled" =>
             {
@@ -2355,7 +2378,8 @@ impl Transcript {
                                         name,
                                         complete: false,
                                         ..
-                                    } if source_name == "action_preparing" && name == "Generate"
+                                    } if source_name == "action_preparing"
+                                        && (name == "Generate" || name == "Wait for provider")
                                 )
                             })
                             })
@@ -2416,6 +2440,58 @@ impl Transcript {
             *complete = true;
             *stored_completed_at = Some(completed_at);
             *backgrounded = false;
+        }
+    }
+
+    fn update_action_generation_status(
+        &mut self,
+        provider_tool_id: Option<&str>,
+        waiting: bool,
+        label: &str,
+    ) {
+        if provider_tool_id.is_some_and(|tool_call_id| {
+            self.tools.contains_key(tool_call_id)
+                && !self.preparing_tools.contains_key(tool_call_id)
+        }) {
+            return;
+        }
+        let mapped = provider_tool_id
+            .and_then(|provider_tool_id| self.preparing_tools.get(provider_tool_id).cloned());
+        let preparing_id = mapped
+            .clone()
+            .or_else(|| self.unkeyed_preparing_tools.last().cloned());
+        let Some(preparing_id) = preparing_id else {
+            return;
+        };
+        let Some(index) = self.tools.get(&preparing_id).copied() else {
+            return;
+        };
+        let Some(TranscriptEntry::Tool {
+            source_name,
+            name,
+            complete: false,
+            ..
+        }) = self.order.get_mut(index)
+        else {
+            return;
+        };
+        if source_name != "action_preparing" {
+            return;
+        }
+        *name = if waiting {
+            "Wait for provider".to_string()
+        } else if label.is_empty() {
+            "Generate".to_string()
+        } else {
+            format!("Generate {label}")
+        };
+        if mapped.is_none()
+            && let Some(provider_tool_id) = provider_tool_id
+        {
+            self.unkeyed_preparing_tools
+                .retain(|candidate| candidate != &preparing_id);
+            self.preparing_tools
+                .insert(provider_tool_id.to_string(), preparing_id);
         }
     }
 

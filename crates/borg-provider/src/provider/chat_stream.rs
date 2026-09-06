@@ -278,9 +278,14 @@ impl ClaudeToolGenerationState {
                 };
                 let block = self.blocks.entry(index).or_default();
                 let mut progress = Vec::new();
-                if !block.generating_emitted {
+                let generation_already_visible = block.generating_emitted;
+                if !generation_already_visible {
                     block.generating_emitted = true;
                     progress.push(ChatStreamEvent::ToolCallGenerating {
+                        id: block.id.clone(),
+                    });
+                } else {
+                    progress.push(ChatStreamEvent::ToolCallInputDelta {
                         id: block.id.clone(),
                     });
                 }
@@ -330,6 +335,9 @@ pub enum ChatStreamEvent {
         input: Value,
     },
     ToolCallGenerating {
+        id: Option<String>,
+    },
+    ToolCallInputDelta {
         id: Option<String>,
     },
     ToolCallAction {
@@ -3054,6 +3062,7 @@ struct CodexReasoningState {
     aggregates: HashMap<String, String>,
     aligned_single_streams: HashSet<String>,
     generating_tools: HashSet<String>,
+    patch_snapshots: HashMap<String, Value>,
 }
 
 impl CodexReasoningState {
@@ -3302,6 +3311,10 @@ async fn emit_codex_events_with_state(
                 tracing::warn!("Codex patch update without an item id");
                 return;
             };
+            let snapshot = value
+                .pointer("/params/changes")
+                .cloned()
+                .unwrap_or(Value::Null);
             if reasoning_state.generating_tools.insert(id.to_string()) {
                 events
                     .send(ChatStreamEvent::ToolCallGenerating {
@@ -3309,7 +3322,19 @@ async fn emit_codex_events_with_state(
                     })
                     .await
                     .ok();
+            } else if !snapshot.is_null()
+                && reasoning_state.patch_snapshots.get(id) != Some(&snapshot)
+            {
+                events
+                    .send(ChatStreamEvent::ToolCallInputDelta {
+                        id: Some(id.to_string()),
+                    })
+                    .await
+                    .ok();
             }
+            reasoning_state
+                .patch_snapshots
+                .insert(id.to_string(), snapshot);
         }
         "item/completed" => {
             let Some(item) = codex_event_item(value) else {
@@ -3357,6 +3382,7 @@ async fn emit_codex_events_with_state(
                 return;
             }
             reasoning_state.generating_tools.remove(&id);
+            reasoning_state.patch_snapshots.remove(&id);
             events
                 .send(ChatStreamEvent::ToolResult {
                     tool_use_id: id,
@@ -4456,7 +4482,7 @@ mod tests {
             [ChatStreamEvent::ToolCallGenerating { id: Some(id) }] if id == "tool-1"
         ));
 
-        assert!(
+        assert!(matches!(
             state
                 .observe(&serde_json::json!({
                     "type": "stream_event",
@@ -4466,8 +4492,9 @@ mod tests {
                         "delta": {"type": "input_json_delta", "partial_json": "{\"act"}
                     }
                 }))
-                .is_empty()
-        );
+                .as_slice(),
+            [ChatStreamEvent::ToolCallInputDelta { id: Some(id) }] if id == "tool-1"
+        ));
         let refined = state.observe(&serde_json::json!({
             "type": "stream_event",
             "event": {
@@ -4481,8 +4508,11 @@ mod tests {
         }));
         assert!(matches!(
             refined.as_slice(),
-            [ChatStreamEvent::ToolCallAction { id, action }]
-                if id == "tool-1" && action == "edit"
+            [
+                ChatStreamEvent::ToolCallInputDelta { id: Some(delta_id) },
+                ChatStreamEvent::ToolCallAction { id, action }
+            ]
+                if delta_id == "tool-1" && id == "tool-1" && action == "edit"
         ));
 
         for partial in [None, Some(""), Some("{")] {
@@ -5426,8 +5456,16 @@ mod tests {
         ));
         assert!(
             receiver.try_recv().is_err(),
-            "partial edit snapshots must not promote the tool"
+            "unchanged partial edit snapshots must not refresh the tool"
         );
+
+        let mut refined = partial.clone();
+        refined["params"]["changes"][0]["diff"] = serde_json::json!("more complete diff");
+        emit_codex_events_with_state(&sender, &refined, &mut state).await;
+        assert!(matches!(
+            receiver.recv().await,
+            Some(ChatStreamEvent::ToolCallInputDelta { id: Some(id) }) if id == "edit-1"
+        ));
 
         emit_codex_events_with_state(
             &sender,

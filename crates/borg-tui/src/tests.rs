@@ -2232,6 +2232,67 @@ fn unkeyed_action_label_refines_the_generic_live_card() {
 }
 
 #[test]
+fn generation_status_hides_action_description_and_preserves_the_card() {
+    let session_id = Uuid::new_v4();
+    let started_at = Utc::now();
+    let mut transcript = Transcript {
+        action_descriptors: false,
+        ..Transcript::default()
+    };
+    let mut preparing = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "action/preparing".into(),
+            payload: serde_json::json!({"label": "secret detail", "tool_call_id": "tool-1"}),
+        },
+    );
+    preparing.created_at = started_at;
+    transcript.apply(&preparing);
+
+    for (sequence, waiting) in [(2, true), (3, false)] {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "action/generation_status".into(),
+                payload: serde_json::json!({
+                    "tool_call_id": "tool-1",
+                    "waiting": waiting,
+                    "label": "secret detail",
+                }),
+            },
+        ));
+        assert_eq!(transcript.order.len(), 1);
+        assert!(matches!(
+            &transcript.order[0],
+            TranscriptEntry::Tool {
+                started_at: stored_started_at,
+                complete: false,
+                ..
+            } if *stored_started_at == started_at
+        ));
+        let rendered = transcript
+            .lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            rendered.contains(if waiting {
+                "Waiting for provider…"
+            } else {
+                "Generating…"
+            }),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("secret detail"), "{rendered}");
+    }
+}
+
+#[test]
 fn provider_progress_keeps_an_unbacked_tool_in_the_foreground() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();

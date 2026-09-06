@@ -28,6 +28,16 @@ generation visible; incomplete arguments never need to parse first. Tool
 execution begins only after a complete, validated call. Transport activity,
 reasoning completion, and silence do not establish that a new call is generating.
 
+Borg tracks freshness per preparing call. After five seconds without a tool-input
+fragment, the same action shows `Waiting for provider…`; the next fragment restores
+generation immediately, without waiting for valid JSON or an action description.
+Empty deltas, repeated snapshots, unrelated output, and transport heartbeats do
+not refresh it. Waiting is display state, not a timeout that cancels the model.
+Only status transitions are published; raw fragment pulses are not journaled.
+Coalesced live state preserves parallel calls and their latest status on reconnect,
+and execution/completion removes the matching preparation state. Compatibility
+adapters can report only the input progress their upstream stream exposes.
+
 Provider continuation handles and opaque model state may be necessary for
 quality and cache reuse. Preserve them as part of Borg's recorded model
 exchange; a provider-owned conversation must not silently become authoritative.

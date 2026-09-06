@@ -1262,6 +1262,13 @@ async fn call_model_streaming(
                     )
                     .await;
                 }
+                Some(ProviderProgress::ToolCallInputDelta { id }) => {
+                    send(context.events, SessionEventKind::ProviderEvent {
+                        provider: context.coding_provider,
+                        kind: "action/input_delta".into(),
+                        payload: json!({"tool_call_id": id}),
+                    }).await;
+                }
                 Some(ProviderProgress::ToolCallStarted { id, .. }) => {
                     send(
                         context.events,

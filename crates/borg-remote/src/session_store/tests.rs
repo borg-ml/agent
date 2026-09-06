@@ -2505,6 +2505,88 @@ async fn a_rewind_does_not_inherit_the_queue_entry_of_the_discarded_prompt() {
 }
 
 #[tokio::test]
+async fn parallel_generation_status_survives_reconnect_and_clears_per_call() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Running,
+            detail: None,
+        },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    for id in ["a", "b"] {
+        for (kind, waiting) in [
+            ("action/preparing", false),
+            ("action/generation_status", true),
+        ] {
+            store.append(SessionEvent::new(session_id, 0, SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Claude, kind: kind.into(),
+                payload: serde_json::json!({"tool_call_id": id, "label": "read file", "waiting": waiting}),
+            })).await.unwrap();
+        }
+    }
+    let live = store.live_events_after(session_id, 0).await.unwrap();
+    assert_eq!(live.len(), 4);
+    for (events, id) in live.as_chunks::<2>().0.iter().zip(["a", "b"]) {
+        assert!(
+            matches!(&events[0].event.kind, SessionEventKind::ProviderEvent { kind, payload, .. }
+            if kind == "action/preparing" && payload["tool_call_id"] == id)
+        );
+        assert!(
+            matches!(&events[1].event.kind, SessionEventKind::ProviderEvent { kind, payload, .. }
+            if kind == "action/generation_status" && payload["tool_call_id"] == id && payload["waiting"] == true)
+        );
+    }
+    assert_eq!(
+        store.read(session_id).await.unwrap().len(),
+        3,
+        "live status must not grow the durable conversation"
+    );
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "a".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({}),
+                input_ref: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let live = store.live_events_after(session_id, 0).await.unwrap();
+    assert_eq!(live.len(), 2);
+    assert!(live.iter().all(|event| matches!(&event.event.kind, SessionEventKind::ProviderEvent { payload, .. } if payload["tool_call_id"] == "b")));
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .live_events_after(session_id, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn live_state_coalesces_without_consuming_durable_sequences() {
     let (directory, store) = store().await;
     let session_id = Uuid::new_v4();

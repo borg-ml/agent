@@ -2920,10 +2920,17 @@ async fn run_agent_session_store_kernel(
         let mut batch_pending_after_interrupt = false;
         let mut interrupt_deadline: Option<Pin<Box<Sleep>>> = None;
         let mut turn_phase = TurnPhase::AwaitingProvider;
+        let mut generation = crate::generation_activity::GenerationActivity::new(launch.provider);
         let liveness_deadline = tokio::time::sleep(turn_phase.liveness_timeout());
         tokio::pin!(liveness_deadline);
         loop {
             tokio::select! {
+                _ = generation.wait(), if !interrupted => {
+                    if !provider_events.is_empty() { continue; }
+                    for kind in generation.expire(tokio::time::Instant::now()) {
+                        record(&mut journal, &events, session_id, kind).await?;
+                    }
+                }
                 Some(request) = tool_approval_rx.recv(), if pending_approval.is_none() && !interrupted => {
                     if request.response.is_closed() { continue; }
                     let approval_id = Uuid::new_v4().to_string();
@@ -2961,6 +2968,7 @@ async fn run_agent_session_store_kernel(
                         result
                     };
                     while let Ok(kind) = provider_events.try_recv() {
+                        let Some(kind) = generation.observe(kind, tokio::time::Instant::now()) else { continue; };
                         if is_executor_lifecycle_status(&kind) {
                             continue;
                         }
@@ -3267,6 +3275,10 @@ async fn run_agent_session_store_kernel(
                         push_coalesced_provider_event(&mut provider_batch, kind);
                     }
                     for kind in provider_batch {
+                    let Some(kind) = generation.observe(kind, tokio::time::Instant::now()) else {
+                        liveness_deadline.as_mut().reset(tokio::time::Instant::now() + turn_phase.liveness_timeout());
+                        continue;
+                    };
                     if is_executor_lifecycle_status(&kind) {
                         if executor_reports_provider_drained(&kind) {
                             turn_phase = TurnPhase::Draining;
@@ -7593,7 +7605,7 @@ async fn deliver_recorded_event(
     let ordered_live_boundary = matches!(
         &event.kind,
         SessionEventKind::ProviderEvent { kind, .. }
-            if kind == "action/preparing" || kind == "action/preparing_cancelled"
+            if kind == "action/preparing" || kind == "action/preparing_cancelled" || kind == "action/generation_status"
     );
     if matches!(persistence, crate::EventPersistence::Durable) || ordered_live_boundary {
         let sequence = event.sequence;

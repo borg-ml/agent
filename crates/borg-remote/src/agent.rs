@@ -1757,6 +1757,17 @@ async fn run_borg_provider_turn(
                 )
                 .await;
             }
+            ChatStreamEvent::ToolCallInputDelta { id } => {
+                send(
+                    &events,
+                    SessionEventKind::ProviderEvent {
+                        provider: turn.provider,
+                        kind: "action/input_delta".into(),
+                        payload: serde_json::json!({"tool_call_id": id}),
+                    },
+                )
+                .await;
+            }
             ChatStreamEvent::ToolCallAction { id, action } => {
                 if first_model_output {
                     first_model_output = false;

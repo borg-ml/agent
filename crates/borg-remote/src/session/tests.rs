@@ -20,6 +20,134 @@ type RecordedProviderTurns =
 type RecordedCompactionTurns = Arc<Mutex<Vec<(CodingProvider, Option<String>, String)>>>;
 type SeenConsultProvider = Arc<Mutex<Vec<(CodingProvider, Option<String>, String)>>>;
 
+#[tokio::test]
+async fn session_generation_waits_on_silence_and_resumes_without_exposing_fragment_pulses() {
+    struct FragmentExecutor {
+        resume: Arc<Notify>,
+        finish: Arc<Notify>,
+    }
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for FragmentExecutor {
+        async fn execute(
+            &self,
+            turn: AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            events
+                .send(SessionEventKind::ProviderEvent {
+                    provider: turn.provider,
+                    kind: "action/preparing".into(),
+                    payload: json!({"tool_call_id": "call", "label": "read file"}),
+                })
+                .await?;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            events
+                .send(SessionEventKind::ReasoningDelta {
+                    text: "unrelated output".into(),
+                })
+                .await?;
+            self.resume.notified().await;
+            events
+                .send(SessionEventKind::ProviderEvent {
+                    provider: turn.provider,
+                    kind: "action/input_delta".into(),
+                    payload: json!({"tool_call_id": "call"}),
+                })
+                .await?;
+            self.finish.notified().await;
+            events
+                .send(SessionEventKind::ToolStarted {
+                    tool_call_id: "call".into(),
+                    name: "read_file".into(),
+                    input: json!({}),
+                    input_ref: None,
+                })
+                .await?;
+            Ok(AgentTurnResult {
+                provider_session_id: None,
+                final_text: "done".into(),
+            })
+        }
+    }
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let resume = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let executor = Arc::new(FragmentExecutor {
+        resume: resume.clone(),
+        finish: finish.clone(),
+    });
+    let actor = tokio::spawn(async move {
+        run_agent_session_with_executor(
+            &root.path().join("session.lock"),
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Claude,
+                model: None,
+                effort: None,
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: Some("test generation".into()),
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+        )
+        .await
+    });
+    let mut statuses = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = event_rx.recv().await {
+            match event.kind {
+                SessionEventKind::ProviderEvent { kind, payload, .. } => {
+                    assert_ne!(
+                        kind, "action/input_delta",
+                        "fragment pulses are internal, not timeline rows"
+                    );
+                    if kind == "action/generation_status" {
+                        assert_eq!(payload["label"], "read file");
+                        let waiting = payload["waiting"].as_bool().unwrap();
+                        statuses.push(waiting);
+                        if waiting {
+                            resume.notify_one();
+                        } else {
+                            finish.notify_one();
+                        }
+                    }
+                }
+                SessionEventKind::TurnCompleted { error, .. } => {
+                    assert!(error.is_none());
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("session must publish waiting, immediate resumption and completion");
+    assert_eq!(statuses, [true, false]);
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), actor)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
 fn subscription_prompt_ends_with(prompt: &str, text: &str) -> bool {
     let frame = format_subscription_frame(&format_subscription_actor_value(EventActor::User, text));
     prompt.ends_with(&frame)

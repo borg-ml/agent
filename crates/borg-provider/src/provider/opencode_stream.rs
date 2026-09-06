@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -184,6 +184,7 @@ async fn run(
     let mut usage = ProviderCallUsage::default();
     let mut saw_usage = false;
     let mut generating_tools = HashSet::new();
+    let mut pending_tool_snapshots = HashMap::new();
     let mut described_tools = HashSet::new();
     let mut started_tools = HashSet::new();
     let mut completed_tools = HashSet::new();
@@ -324,6 +325,7 @@ async fn run(
                     &events,
                     &value,
                     &mut generating_tools,
+                    &mut pending_tool_snapshots,
                     &mut described_tools,
                     &mut started_tools,
                     &mut completed_tools,
@@ -430,6 +432,7 @@ async fn emit_tool(
     events: &mpsc::Sender<ChatStreamEvent>,
     value: &Value,
     generating_tools: &mut HashSet<String>,
+    pending_tool_snapshots: &mut HashMap<String, (String, Value, String)>,
     described_tools: &mut HashSet<String>,
     started_tools: &mut HashSet<String>,
     completed_tools: &mut HashSet<String>,
@@ -447,6 +450,12 @@ async fn emit_tool(
     let state = value.pointer("/part/state").cloned().unwrap_or(Value::Null);
     let input = state.get("input").cloned().unwrap_or(Value::Null);
     let status = state.get("status").and_then(Value::as_str);
+    let raw = state
+        .get("raw")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let snapshot = (name.clone(), input.clone(), raw);
     if status == Some("pending")
         && !started_tools.contains(&id)
         && generating_tools.insert(id.clone())
@@ -458,6 +467,25 @@ async fn emit_tool(
             .is_err()
     {
         return Ok(());
+    }
+    if status == Some("pending") && !started_tools.contains(&id) {
+        if let Some(previous) = pending_tool_snapshots.get(&id)
+            && previous != &snapshot
+            && ((!snapshot.0.is_empty() && snapshot.0 != previous.0)
+                || (!snapshot.1.is_null()
+                    && snapshot.1 != Value::Object(Default::default())
+                    && snapshot.1 != previous.1)
+                || (!snapshot.2.is_empty() && snapshot.2 != previous.2))
+            && events
+                .send(ChatStreamEvent::ToolCallInputDelta {
+                    id: Some(id.clone()),
+                })
+                .await
+                .is_err()
+        {
+            return Ok(());
+        }
+        pending_tool_snapshots.insert(id.clone(), snapshot);
     }
     if status == Some("pending")
         && !started_tools.contains(&id)
@@ -482,6 +510,7 @@ async fn emit_tool(
     if !matches!(status, Some("running" | "completed" | "error")) {
         return Ok(());
     }
+    pending_tool_snapshots.remove(&id);
     if started_tools.insert(id.clone())
         && events
             .send(ChatStreamEvent::ToolCall {
@@ -546,7 +575,7 @@ fn parse_usage(value: &Value) -> Option<ProviderCallUsage> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use serde_json::json;
     use tokio::sync::mpsc;
@@ -580,6 +609,7 @@ mod tests {
     async fn pending_tool_generation_is_visible_until_opencode_starts_it() {
         let (sender, mut receiver) = mpsc::channel(8);
         let mut generating = HashSet::new();
+        let mut snapshots = HashMap::new();
         let mut described = HashSet::new();
         let mut started = HashSet::new();
         let mut completed = HashSet::new();
@@ -598,6 +628,7 @@ mod tests {
                 }
             }),
             &mut generating,
+            &mut snapshots,
             &mut described,
             &mut started,
             &mut completed,
@@ -617,6 +648,7 @@ mod tests {
                 "state": {"status": "pending", "input": {"action": "edit"}}
             }}),
             &mut generating,
+            &mut snapshots,
             &mut described,
             &mut started,
             &mut completed,
@@ -625,9 +657,28 @@ mod tests {
         .unwrap();
         assert!(matches!(
             receiver.recv().await,
+            Some(ChatStreamEvent::ToolCallInputDelta { id: Some(id) }) if id == "tool-1"
+        ));
+        assert!(matches!(
+            receiver.recv().await,
             Some(ChatStreamEvent::ToolCallAction { id, action })
                 if id == "tool-1" && action == "edit"
         ));
+        assert!(receiver.try_recv().is_err());
+        emit_tool(
+            &sender,
+            &json!({"part": {
+                "id": "tool-1", "tool": "mcp__borg_agent__update_plan",
+                "state": {"status": "pending", "input": {"action": "edit"}}
+            }}),
+            &mut generating,
+            &mut snapshots,
+            &mut described,
+            &mut started,
+            &mut completed,
+        )
+        .await
+        .unwrap();
         assert!(receiver.try_recv().is_err());
 
         emit_tool(
@@ -644,6 +695,7 @@ mod tests {
                 }
             }),
             &mut generating,
+            &mut snapshots,
             &mut described,
             &mut started,
             &mut completed,
@@ -664,6 +716,7 @@ mod tests {
         for status in ["running", "completed", "error"] {
             let (sender, mut receiver) = mpsc::channel(8);
             let mut generating = HashSet::new();
+            let mut snapshots = HashMap::new();
             let mut described = HashSet::new();
             let mut started = HashSet::new();
             let mut completed = HashSet::new();
@@ -676,6 +729,7 @@ mod tests {
                 &sender,
                 &snapshot,
                 &mut generating,
+                &mut snapshots,
                 &mut described,
                 &mut started,
                 &mut completed,
@@ -696,6 +750,7 @@ mod tests {
                 &sender,
                 &snapshot,
                 &mut generating,
+                &mut snapshots,
                 &mut described,
                 &mut started,
                 &mut completed,

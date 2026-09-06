@@ -14,6 +14,7 @@ mod contract;
 mod execution;
 mod extension_api;
 mod filesystem;
+mod generation_activity;
 mod harness;
 mod host;
 mod imported_memory;

@@ -692,6 +692,10 @@ impl ResponseState {
                         emit(ProviderProgress::ToolCallGenerating {
                             id: Some(call_id.clone()),
                         });
+                    } else {
+                        emit(ProviderProgress::ToolCallInputDelta {
+                            id: Some(call_id.clone()),
+                        });
                     }
                     arguments.push_str(delta);
                     if !self.described.contains(call_id)
@@ -972,6 +976,31 @@ mod tests {
             Some("Wed, 21 Oct 2015 07:28:00 GMT"),
         );
         assert!(dated.contains("2015-10-21 07:28:00 UTC") && !dated.contains("99 seconds"));
+    }
+
+    #[test]
+    fn native_tool_input_progress_ignores_empty_and_refreshes_after_generation() {
+        let (progress, mut events) = mpsc::unbounded_channel();
+        let mut state = ResponseState::default();
+        for event in [
+            json!({"type":"response.output_item.added","item":{"type":"function_call","id":"item","call_id":"call","name":"","arguments":""}}),
+            json!({"type":"response.function_call_arguments.delta","item_id":"item","delta":""}),
+            json!({"type":"response.function_call_arguments.delta","item_id":"item","delta":"{"}),
+            json!({"type":"response.function_call_arguments.delta","item_id":"item","delta":"\"path\":"}),
+        ] {
+            state
+                .event(&event, Some(&progress), "test-model", "low")
+                .unwrap();
+        }
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ProviderProgress::ToolCallGenerating { id: Some(id) }) if id == "call"
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ProviderProgress::ToolCallInputDelta { id: Some(id) }) if id == "call"
+        ));
+        assert!(events.try_recv().is_err());
     }
 
     #[test]
