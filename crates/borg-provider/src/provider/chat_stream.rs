@@ -269,6 +269,13 @@ impl ClaudeToolGenerationState {
                 if delta.get("type").and_then(Value::as_str) != Some("input_json_delta") {
                     return Vec::new();
                 }
+                let Some(partial) = delta
+                    .get("partial_json")
+                    .and_then(Value::as_str)
+                    .filter(|partial| !partial.is_empty())
+                else {
+                    return Vec::new();
+                };
                 let block = self.blocks.entry(index).or_default();
                 let mut progress = Vec::new();
                 if !block.generating_emitted {
@@ -277,9 +284,7 @@ impl ClaudeToolGenerationState {
                         id: block.id.clone(),
                     });
                 }
-                if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
-                    block.arguments.push_str(partial);
-                }
+                block.arguments.push_str(partial);
                 if !block.action_emitted
                     && let Some(id) = block.id.clone()
                     && let Some(action) = super::streamed_tool_action(&block.arguments)
@@ -4479,6 +4484,25 @@ mod tests {
             [ChatStreamEvent::ToolCallAction { id, action }]
                 if id == "tool-1" && action == "edit"
         ));
+
+        for partial in [None, Some(""), Some("{")] {
+            let progress = state.observe(&serde_json::json!({
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "index": 2,
+                    "delta": {"type": "input_json_delta", "partial_json": partial}
+                }
+            }));
+            if partial == Some("{") {
+                assert!(matches!(
+                    progress.as_slice(),
+                    [ChatStreamEvent::ToolCallGenerating { id: None }]
+                ));
+            } else {
+                assert!(progress.is_empty());
+            }
+        }
     }
 
     #[test]
