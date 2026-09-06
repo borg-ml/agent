@@ -97,8 +97,10 @@ call's cancellation token after their initial background snapshot. Cancelling or
 failing that call stops those commands without stopping unrelated session commands;
 successful calls can leave intentional background work running. A startup guard
 also force-stops commands dropped while their start event is being journaled,
-before the process supervisor takes ownership. Terminal process events are still
-journaled by that supervisor; full tool-result lifecycle integration remains open.
+before the process supervisor takes ownership. The supervisor publishes completed
+process snapshots only after the terminal journal write finishes; a failed write
+is reported in the snapshot rather than silently discarded. Full session cleanup
+and tool-result lifecycle integration remains open.
 
 Native and persistent-runtime file writes/edits now share the dispatcher as
 well, including configured transfer limits and exact-match edit validation.

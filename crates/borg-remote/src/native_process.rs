@@ -967,7 +967,6 @@ async fn supervise_process(
             .status
             .lock()
             .expect("native process status lock poisoned");
-        status.running = false;
         match result {
             Ok(exit) => status.exit_code = exit.code(),
             Err(error) => status.error = Some(format!("failed to wait for process: {error}")),
@@ -979,10 +978,10 @@ async fn supervise_process(
             status.error.clone(),
         )
     };
-    if let Some(store) = journal.as_ref() {
+    let journal_error = if let Some(store) = journal.as_ref() {
         let (stdout, stdout_omitted_bytes) = snapshot_output(&entry, JOURNAL_OUTPUT_TOKENS, true);
         let (stderr, stderr_omitted_bytes) = snapshot_output(&entry, JOURNAL_OUTPUT_TOKENS, false);
-        let _ = append_runtime_completed(
+        append_runtime_completed(
             store,
             entry.session_id,
             entry.process_id,
@@ -996,7 +995,25 @@ async fn supervise_process(
             stderr_omitted_bytes,
             error,
         )
-        .await;
+        .await
+        .err()
+    } else {
+        None
+    };
+    {
+        let mut status = entry
+            .status
+            .lock()
+            .expect("native process status lock poisoned");
+        if let Some(error) = journal_error {
+            let message = format!("failed to journal process completion: {error}");
+            tracing::warn!(process_id = %entry.process_id, %message);
+            status.error = Some(match status.error.take() {
+                Some(previous) => format!("{previous}; {message}"),
+                None => message,
+            });
+        }
+        status.running = false;
     }
     entry.changed.notify_waiters();
     let _ = entry.updates.send((entry.process_id, None));
@@ -1538,6 +1555,103 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn completion_poll_waits_for_journal_or_reports_its_failure() {
+        for fail_journal in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+                .await
+                .unwrap();
+            let owner = Uuid::new_v4();
+            store.create_session(owner).await.unwrap();
+            let manager = ProcessManager::default();
+            let initial = manager
+                .exec(
+                    owner,
+                    directory.path(),
+                    "exec /bin/sh -c 'read reply'".into(),
+                    None,
+                    Some(1),
+                    Some(100),
+                    10_000,
+                    Some(store.clone()),
+                )
+                .await
+                .unwrap();
+            assert!(initial.running);
+            let entry = manager.entry(owner, initial.session_id).unwrap();
+            let transaction = if fail_journal {
+                store.pool().close().await;
+                None
+            } else {
+                Some(store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap())
+            };
+            manager
+                .write_stdin(
+                    owner,
+                    initial.session_id,
+                    Some("done\n"),
+                    false,
+                    Some(0),
+                    None,
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while entry.status.lock().unwrap().exit_code.is_none() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("command must exit independently of the journal write");
+            if let Some(transaction) = transaction {
+                let pending = manager
+                    .write_stdin(owner, initial.session_id, None, false, Some(0), None)
+                    .await
+                    .unwrap();
+                assert!(
+                    pending.running,
+                    "completion must not precede its journal write"
+                );
+                assert!(
+                    !store
+                        .read(owner)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|event| matches!(
+                            event.kind,
+                            SessionEventKind::RuntimeProcessCompleted { .. }
+                        ))
+                );
+                transaction.rollback().await.unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(3), wait_for_process_finish(&entry))
+                .await
+                .unwrap();
+            let completed = manager
+                .write_stdin(owner, initial.session_id, None, false, Some(0), None)
+                .await
+                .unwrap();
+            assert!(!completed.running);
+            assert_eq!(completed.error.is_some(), fail_journal);
+            if !fail_journal {
+                assert!(
+                    store
+                        .read(owner)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .any(|event| matches!(
+                            event.kind,
+                            SessionEventKind::RuntimeProcessCompleted { .. }
+                        ))
+                );
+            }
+        }
     }
 
     #[tokio::test]
