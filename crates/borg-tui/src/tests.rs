@@ -8244,7 +8244,7 @@ fn compaction_without_provider_detail_is_not_tautological() {
         1,
         SessionEventKind::ProviderEvent {
             provider: CodingProvider::Codex,
-            kind: "context_compaction".to_string(),
+            kind: "item/completed:contextCompaction".to_string(),
             payload: serde_json::json!({}),
         },
     ));
