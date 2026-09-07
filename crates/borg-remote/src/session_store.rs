@@ -257,7 +257,12 @@ impl SessionEventKind {
             Self::ProviderEvent { kind, .. }
                 if matches!(
                     kind.as_str(),
-                    "context_compaction" | "context_compaction_failed"
+                    "context_compaction"
+                        | "context_compaction_failed"
+                        | "item/started:contextCompaction"
+                        | "item/completed:contextCompaction"
+                        | "item/started:context_compaction"
+                        | "item/completed:context_compaction"
                 ) =>
             {
                 EventPersistence::Durable

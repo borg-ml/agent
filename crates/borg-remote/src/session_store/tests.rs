@@ -3436,6 +3436,22 @@ fn persistence_and_fork_rules_are_typed_rust_contracts() {
         .persistence(),
         EventPersistence::Coalesced
     );
+    for kind in [
+        "item/started:contextCompaction",
+        "item/completed:contextCompaction",
+        "item/started:context_compaction",
+        "item/completed:context_compaction",
+    ] {
+        let notification = SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: kind.to_string(),
+            payload: serde_json::Value::Null,
+        };
+        assert_eq!(notification.persistence(), EventPersistence::Durable);
+        assert!(!notification.is_completed_context_compaction());
+        assert!(!notification.is_completed_provider_recovery_checkpoint());
+        assert!(!notification.is_context_relevant());
+    }
     let compaction_started = SessionEventKind::ProviderEvent {
         provider: CodingProvider::Codex,
         kind: "context_compaction".to_string(),
