@@ -9845,6 +9845,7 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::ProviderInteractionResolved { .. }
         | SessionEventKind::UsageUpdated { .. }
         | SessionEventKind::ContextWindowUpdated { .. }
+        | SessionEventKind::UserStopChanged { .. }
         | SessionEventKind::SubagentControl { .. }
         | SessionEventKind::ProviderSessionLinked { .. }
         | SessionEventKind::RuntimeProcessStarted { .. }
@@ -9880,7 +9881,8 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
             agent,
             event,
         } => subagent_activity_summary(*activity, agent, event.as_deref()).is_some(),
-        SessionEventKind::Message { .. }
+        SessionEventKind::AgentMessageReceived { .. }
+        | SessionEventKind::Message { .. }
         | SessionEventKind::ReasoningDelta { .. }
         | SessionEventKind::ReasoningCompleted
         | SessionEventKind::ToolStarted { .. }
@@ -10036,10 +10038,7 @@ pub fn subagent_activity_summary(
 
 type SubagentActionProjection = (String, String, Option<String>, TranscriptActionState);
 
-/// Project every subagent lifecycle update into the same typed action shape.
-/// The transcript keeps the report as an optional body instead of embedding
-/// it in a status string; this makes updates idempotent and gives the renderer
-/// one place to decide whether the body is collapsed or expanded.
+/// Keep legacy report bodies until a standalone AgentMessageReceived owns them.
 fn subagent_action_projection(
     activity: SubagentActivityKind,
     agent: &SubagentSnapshot,

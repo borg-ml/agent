@@ -298,6 +298,9 @@ impl SessionEventKind {
                 | Self::EffectiveCapabilitiesUpdated { .. }
                 | Self::TurnStarted { .. }
                 | Self::StatusChanged { .. }
+                // A fork is a fresh human-initiated branch and never inherits
+                // the parent's user-stop gate.
+                | Self::UserStopChanged { .. }
                 | Self::SubagentActivity { .. }
                 | Self::SubagentControl { .. }
                 | Self::RuntimeProcessStarted { .. }
@@ -606,6 +609,12 @@ pub struct SessionState {
     pub first_prompt: Option<String>,
     pub latest_prompt: Option<String>,
     pub latest_response: Option<String>,
+    /// Explicit user-stop gate. Set true by a human Escape and cleared only by
+    /// an explicit human prompt or goal resume (`UserStopChanged`). Persisted
+    /// so the session actor re-engages the gate after a reload and never lets
+    /// background input override a stop until the human re-engages.
+    #[serde(default)]
+    pub user_stopped: bool,
 }
 
 impl SessionState {
@@ -873,6 +882,9 @@ impl SessionState {
             } if !text.trim().is_empty() => {
                 self.latest_response = Some(text.trim().to_string());
             }
+            SessionEventKind::UserStopChanged { engaged } => {
+                self.user_stopped = *engaged;
+            }
             _ => {}
         }
         Ok(())
@@ -883,6 +895,9 @@ impl SessionState {
         state.latest_sequence = inherited_event_count;
         state.status = None;
         state.status_detail = None;
+        // A fork is a fresh human-initiated branch; it never inherits a
+        // parent's user-stop gate.
+        state.user_stopped = false;
         state.provider_session_id = None;
         state.provider_turn_id = None;
         state.pending_provider_turn_id = None;

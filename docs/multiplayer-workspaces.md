@@ -384,3 +384,16 @@ Use `borg remote sync --session SESSION_UUID --send-pending` when an older runni
 session has queued private outgoing messages but its relay is disabled. This
 explicit option replays the existing private-message relay with stable idempotency
 keys; previously accepted messages are not duplicated. Default sync receives only.
+
+## Notifications and explicit wake requests
+
+`send_message` delivers an attributed agent notification by default, including
+child reports to `/root`. It does not start an idle recipient. Use
+`send_message` with `wake: true`, or `followup_task`, to request a new turn.
+An explicit user stop takes precedence over background wake requests until a
+human sends new input or explicitly resumes the session. This stop state is
+durable across session reloads and is separate from goal status.
+
+Incoming messages appear as read-only **Agent message** entries with their sender
+and full body, even while the recipient is stopped. Receipt is independent of
+provider admission and never adds text to editable human Pending Input.

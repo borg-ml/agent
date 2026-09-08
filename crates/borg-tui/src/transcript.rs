@@ -125,6 +125,8 @@ struct Transcript {
     subagents: HashMap<Uuid, SubagentStatus>,
     subagent_snapshots: HashMap<Uuid, SubagentSnapshot>,
     subagent_entries: HashMap<Uuid, usize>,
+    agent_messages: HashSet<Uuid>,
+    agent_message_senders: HashSet<Uuid>,
     runtime_processes: HashMap<Uuid, RuntimeProcessProjection>,
     provider_backgrounds: HashMap<String, ProviderBackgroundProjection>,
     provider_followups: HashMap<String, String>,
@@ -218,6 +220,8 @@ impl Default for Transcript {
             subagents: HashMap::new(),
             subagent_snapshots: HashMap::new(),
             subagent_entries: HashMap::new(),
+            agent_messages: HashSet::new(),
+            agent_message_senders: HashSet::new(),
             runtime_processes: HashMap::new(),
             provider_backgrounds: HashMap::new(),
             provider_followups: HashMap::new(),
@@ -547,6 +551,8 @@ impl Transcript {
         self.messages.clear();
         self.tools.clear();
         self.subagent_entries.clear();
+        self.agent_messages.clear();
+        self.agent_message_senders.clear();
         self.queued_messages.clear();
         self.queued_message_sequences.clear();
         self.tool_run_offsets.clear();
@@ -1183,11 +1189,7 @@ impl Transcript {
                 {
                     return removed_entry;
                 }
-                // Team delivery is provider input, not a human-authored chat
-                // message. Its child-authored report is projected separately
-                // through SubagentActivity with the correct agent identity.
-                // System delivery is provider input, not a chat row. The
-                // child-authored report is rendered through SubagentActivity.
+                // Provider input is hidden; AgentMessageReceived owns visible team reports.
                 if *actor == EventActor::System {
                     removed_entry = self.remove_message(*message_id);
                     return removed_entry;
@@ -1498,7 +1500,9 @@ impl Transcript {
                         *detail = completion_presentation.detail.clone();
                     }
                     if completion_presentation.category != ToolPresentationCategory::Edit
-                        && input.as_ref().is_some_and(|value| value.as_object().is_none_or(|object| !object.is_empty()))
+                        && input.as_ref().is_some_and(|value| {
+                            value.as_object().is_none_or(|object| !object.is_empty())
+                        })
                         && let Some(body) = completion_presentation.input.as_ref()
                     {
                         *code_view = Some((body.language.clone(), body.text.clone()));
@@ -1830,6 +1834,30 @@ impl Transcript {
                     }
                 }
             }
+            SessionEventKind::AgentMessageReceived {
+                message_id,
+                sender_id,
+                sender_name,
+                text,
+            } => {
+                if self.agent_messages.insert(*message_id) {
+                    self.agent_message_senders.insert(*sender_id);
+                    self.hide_received_subagent_report(*sender_id);
+                    self.order.push(TranscriptEntry::Action {
+                        kind: TranscriptActionKind::Agent,
+                        label: "Agent".to_string(),
+                        detail: if sender_name.trim().is_empty() {
+                            sender_id.to_string()
+                        } else {
+                            sender_name.clone()
+                        },
+                        body: Some(text.clone()),
+                        time: local_event_time(event),
+                        state: TranscriptActionState::Complete,
+                        expanded: true,
+                    });
+                }
+            }
             SessionEventKind::SubagentActivity {
                 activity,
                 agent,
@@ -1885,6 +1913,7 @@ impl Transcript {
                         });
                     }
                 }
+                self.hide_received_subagent_report(agent.session_id);
             }
             SessionEventKind::Error { message } => {
                 self.finish_reasoning(event.created_at);
@@ -1901,6 +1930,21 @@ impl Transcript {
             _ => {}
         }
         removed_entry
+    }
+
+    fn hide_received_subagent_report(&mut self, sender_id: Uuid) {
+        if self.agent_message_senders.contains(&sender_id)
+            && let Some(index) = self.subagent_entries.get(&sender_id)
+            && let Some(TranscriptEntry::Action {
+                body,
+                expanded,
+                state: TranscriptActionState::Complete | TranscriptActionState::Stopped,
+                ..
+            }) = self.order.get_mut(*index)
+        {
+            *body = None;
+            *expanded = false;
+        }
     }
 
     fn remove_message(&mut self, message_id: Uuid) -> Option<usize> {
@@ -2540,7 +2584,10 @@ impl Transcript {
                 *name = format!("Run {detail}");
                 detail.clear();
             } else {
-                let label = name.strip_prefix("Generate ").or_else(|| name.strip_prefix("Prepare ")).unwrap_or("command");
+                let label = name
+                    .strip_prefix("Generate ")
+                    .or_else(|| name.strip_prefix("Prepare "))
+                    .unwrap_or("command");
                 *name = format!("Run {label}");
             }
         }

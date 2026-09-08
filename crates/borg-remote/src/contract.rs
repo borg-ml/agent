@@ -2189,6 +2189,22 @@ pub enum SessionEventKind {
     GoalCleared {
         goal_id: Uuid,
     },
+    AgentMessageReceived {
+        message_id: Uuid,
+        sender_id: Uuid,
+        sender_name: String,
+        text: String,
+    },
+    /// Durable record of the explicit user-stop gate toggling. Engaged by a
+    /// human Escape (turn boundary, active turn, or idle reconnect wait);
+    /// cleared only by an explicit human prompt or an explicit goal resume.
+    /// While engaged, no background input (team Steer/Queue prompts, queued
+    /// internal prompts, monitor events, autonomy jobs, automatic retries)
+    /// may open a provider turn. Survives session-actor reload so the
+    /// NEVER-override-Escape contract holds across restarts.
+    UserStopChanged {
+        engaged: bool,
+    },
     SubagentActivity {
         activity: crate::SubagentActivityKind,
         agent: crate::SubagentSnapshot,

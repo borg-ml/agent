@@ -2722,6 +2722,39 @@ impl SubagentCoordinator {
         let projected = self.projected_root_messages.lock().await.clone();
         let mut reports = Vec::new();
         for message in pending {
+            if !projected.contains(&message.message_id)
+                && message.sender_session_id != root_session_id
+            {
+                let sender_name = match self.get(message.sender_session_id).await {
+                    Some(agent) => agent.task_name,
+                    None => self
+                        .workspace_store()
+                        .await?
+                        .participant(message.sender_session_id)
+                        .await?
+                        .map(|participant| participant.display_name)
+                        .unwrap_or_else(|| message.sender_session_id.to_string()),
+                };
+                reports.push((
+                    message.message_id,
+                    SubagentActivity::SessionEvent {
+                        parent_session_id: root_session_id,
+                        task_name: sender_name,
+                        event: SessionEvent::new(
+                            message.sender_session_id,
+                            0,
+                            SessionEventKind::Message {
+                                message_id: message.message_id,
+                                actor: crate::EventActor::Assistant,
+                                text: message.report_text.clone(),
+                                attachments: Vec::new(),
+                                status: MessageStatus::Complete,
+                                delivery: None,
+                            },
+                        ),
+                    },
+                ));
+            }
             if self
                 .store
                 .contains_message(root_session_id, message.message_id)
@@ -2735,8 +2768,10 @@ impl SubagentCoordinator {
                     .lock()
                     .await
                     .retain(|queued| queued.message_id != message.message_id);
-                self.acknowledge_message_for_session(root_session_id, message.message_id)
-                    .await?;
+                if projected.contains(&message.message_id) {
+                    self.acknowledge_message_for_session(root_session_id, message.message_id)
+                        .await?;
+                }
                 continue;
             }
             let dispatch_is_recent = self
@@ -2761,34 +2796,6 @@ impl SubagentCoordinator {
                     inbox.push(message.clone());
                 }
             }
-            if projected.contains(&message.message_id) {
-                continue;
-            }
-            let Some(agent) = self.get(message.sender_session_id).await else {
-                continue;
-            };
-            if agent.session_id == root_session_id {
-                continue;
-            }
-            reports.push((
-                message.message_id,
-                SubagentActivity::SessionEvent {
-                    parent_session_id: root_session_id,
-                    task_name: agent.task_name.clone(),
-                    event: SessionEvent::new(
-                        agent.session_id,
-                        0,
-                        SessionEventKind::Message {
-                            message_id: message.message_id,
-                            actor: crate::EventActor::Assistant,
-                            text: message.report_text.clone(),
-                            attachments: Vec::new(),
-                            status: MessageStatus::Complete,
-                            delivery: None,
-                        },
-                    ),
-                },
-            ));
         }
         Ok(reports)
     }
@@ -3007,6 +3014,9 @@ impl SubagentCoordinator {
         let mut latest = HashMap::<Uuid, SubagentSnapshot>::new();
         let mut projected_root_messages = HashSet::new();
         for event in events {
+            if let SessionEventKind::AgentMessageReceived { message_id, .. } = &event.kind {
+                projected_root_messages.insert(*message_id);
+            }
             if let SessionEventKind::SubagentActivity {
                 agent,
                 event: child_event,
@@ -4425,23 +4435,14 @@ impl SubagentCoordinator {
         if status.is_some_and(SubagentStatus::is_terminal) {
             bail!("subagent {target} is not running");
         }
-        let wakes_root = id == root_session_id && actor_session_id != root_session_id;
         let (inbox_message, receipt) = self
             .persist_team_message(
                 actor_session_id,
                 id,
                 &actor,
                 &message,
-                if wakes_root {
-                    PromptDelivery::Steer
-                } else {
-                    PromptDelivery::Queue
-                },
-                if wakes_root {
-                    DeliveryMode::Wake
-                } else {
-                    DeliveryMode::NextTurn
-                },
+                PromptDelivery::Queue,
+                DeliveryMode::NextTurn,
                 options,
             )
             .await?;
@@ -4486,15 +4487,8 @@ impl SubagentCoordinator {
             });
         }
         if id == root_session_id {
-            if wakes_root {
-                self.broadcast_root_message(inbox_message.clone()).await;
-            } else {
-                self.root_inbox.lock().await.push(inbox_message.clone());
-            }
+            self.root_inbox.lock().await.push(inbox_message.clone());
             if actor_session_id != root_session_id {
-                // Project a child-authored report through the activity stream;
-                // the root actor also receives the durable Wake delivery above
-                // and can reconcile it without requiring a human relay.
                 let _ = self.activity_tx.send(SubagentActivity::SessionEvent {
                     parent_session_id: root_session_id,
                     task_name: actor,
@@ -5035,14 +5029,23 @@ impl SubagentCoordinator {
             }
             "send_message" => {
                 let args: MessageArgs = serde_json::from_value(arguments)?;
-                let routed = self
-                    .route_message_with_options_as(
+                let routed = if args.wake {
+                    self.route_followup_task_with_options_as(
                         actor_session_id,
                         &args.target,
                         &args.message,
                         args.options(),
                     )
-                    .await?;
+                    .await?
+                } else {
+                    self.route_message_with_options_as(
+                        actor_session_id,
+                        &args.target,
+                        &args.message,
+                        args.options(),
+                    )
+                    .await?
+                };
                 Ok(routed_message_json(routed, "queued"))
             }
             "followup_task" => {
@@ -5297,7 +5300,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         message_tool(
             "send_message",
-            "Queue a durable message for any discovered Borg instance, across projects and enrolled machines. Use participant:<id> from list_instances, session:<UUID> for a local session, or a team path. Cross-workspace messages use a private channel. Reports sent by a child to /root wake the director for reconciliation.",
+            "Queue a durable message for any discovered Borg instance, across projects and enrolled machines. Use participant:<id> from list_instances, session:<UUID> for a local session, or a team path. Cross-workspace messages use a private channel. Messages notify by default without starting an idle agent. Set wake:true to request a turn; explicit user interruption still takes precedence.",
         ),
         message_tool(
             "followup_task",
@@ -6481,6 +6484,8 @@ struct ListAgentsArgs {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MessageArgs {
+    #[serde(default)]
+    wake: bool,
     target: String,
     message: String,
     #[serde(default)]
@@ -6786,7 +6791,7 @@ fn lsp_position_schema() -> Value {
 }
 
 fn message_tool(name: &str, description: &str) -> Value {
-    tool(
+    let mut definition = tool(
         name,
         description,
         json!({
@@ -6800,7 +6805,14 @@ fn message_tool(name: &str, description: &str) -> Value {
             "required": ["target", "message"],
             "additionalProperties": false
         }),
-    )
+    );
+    if name == "send_message" {
+        definition["inputSchema"]["properties"]["wake"] = json!({
+            "type": "boolean", "default": false,
+            "description": "Request waking an idle recipient; never overrides an explicit user stop."
+        });
+    }
+    definition
 }
 
 fn target_schema() -> Value {

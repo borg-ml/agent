@@ -2266,10 +2266,11 @@ async fn child_messages_are_team_scoped_and_can_report_to_root() {
     ));
     assert!(matches!(
         wake.try_recv(),
-        Ok(message)
-            if message.delivery == PromptDelivery::Steer
-                && message.text.contains("blocked on an API decision")
+        Err(broadcast::error::TryRecvError::Empty)
     ));
+    let notifications = coordinator.take_root_inbox().await;
+    assert_eq!(notifications.len(), 1);
+    assert_eq!(notifications[0].delivery, PromptDelivery::Queue);
 
     coordinator
         .followup_task_as(worker.session_id, "/root", "please review")
@@ -2278,6 +2279,18 @@ async fn child_messages_are_team_scoped_and_can_report_to_root() {
     let followup = wake.recv().await.unwrap();
     assert!(followup.text.contains("please review"));
     assert!(coordinator.take_root_inbox().await.is_empty());
+    let receipt = coordinator
+        .call_tool_as(
+            worker.session_id,
+            "send_message",
+            json!({
+                "target": "/root", "message": "explicit wake", "wake": true
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt["delivery_mode"], "boundary");
+    assert!(wake.recv().await.unwrap().text.contains("explicit wake"));
 }
 
 #[tokio::test]
@@ -2310,7 +2323,7 @@ async fn durable_root_inbox_poll_replays_a_report_when_wake_delivery_was_missed(
     // No root receiver exists. The durable inbox must retain the wake and
     // replay it when the root session reconnects.
     coordinator
-        .send_message_as(worker.session_id, "/root", "durable result")
+        .followup_task_as(worker.session_id, "/root", "durable result")
         .await
         .unwrap();
 
@@ -2369,7 +2382,7 @@ async fn durable_root_wake_retries_after_the_receiver_is_lost() {
     // interval instead of treating that send as an acknowledgement.
     let first_wake = coordinator.subscribe_root_messages();
     coordinator
-        .send_message_as(worker.session_id, "/root", "retry this report")
+        .followup_task_as(worker.session_id, "/root", "retry this report")
         .await
         .unwrap();
     drop(first_wake);
@@ -3427,6 +3440,19 @@ async fn durable_parent_activity_restores_child_topology() {
         .restore_from_events(&[partial, completed])
         .await
         .unwrap();
+    assert!(coordinator.root_message_is_projected(message_id).await);
+
+    let receipt = SessionEvent::new(
+        root,
+        5,
+        SessionEventKind::AgentMessageReceived {
+            message_id,
+            sender_id: Uuid::new_v4(),
+            sender_name: "independent reviewer".into(),
+            text: "Durable report".into(),
+        },
+    );
+    coordinator.restore_from_events(&[receipt]).await.unwrap();
     assert!(coordinator.root_message_is_projected(message_id).await);
 }
 

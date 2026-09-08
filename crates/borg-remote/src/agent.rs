@@ -39,7 +39,8 @@ Use the tools from the borg_agent MCP server for durable goals, plans, and subag
 Never invoke provider-native delegation tools such as `subAgentActivity` or `collabAgentToolCall`; \
 delegate only through `mcp__borg_agent__spawn_agent`. \
 For work involving another Borg instance or machine, discover peers with `list_instances` first. \
-Use `send_message` for durable information and `followup_task` to wake or steer an existing agent; \
+Use `send_message` for notifications; `wake: true` or `followup_task` requests an agent turn. \
+An explicit user stop overrides background wake requests until human input or resume; \
 address it as `participant:<id>` from discovery. Discovery is not proof of liveness, project access, \
 or completed delivery: inspect delivery state and verify the requested result. Do not ask the human \
 to relay messages or restart active agents to repair connectivity. For stale discovery or inboxes \

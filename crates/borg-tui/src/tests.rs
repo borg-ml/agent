@@ -5947,7 +5947,7 @@ fn value_colored_status_segments_keep_hover_styling() {
 }
 
 #[test]
-fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
+fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
     let now = chrono::Utc::now();
@@ -6023,6 +6023,27 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
             && detail == "inspect_ui · report ready"
             && body.starts_with("Found the renderer issue")
     ));
+    transcript.toggle_action_expansion(0);
+    assert!(
+        transcript
+            .lines(100)
+            .iter()
+            .any(|line| line.to_string().contains("Found the renderer issue"))
+    );
+    transcript.apply(&SessionEvent::new(
+        parent_id,
+        4,
+        SessionEventKind::AgentMessageReceived {
+            message_id: Uuid::new_v4(),
+            sender_id: child_id,
+            sender_name: agent.task_name.clone(),
+            text: "Found the renderer issue.".to_string(),
+        },
+    ));
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Action { body: None, .. }
+    ));
     agent.status = SubagentStatus::WaitingForApproval;
     transcript.apply(&activity(
         4,
@@ -6039,7 +6060,7 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
             },
         ))),
     ));
-    assert_eq!(transcript.order.len(), 1);
+    assert_eq!(transcript.order.len(), 2);
     assert!(matches!(
         &transcript.order[0],
         TranscriptEntry::Action {
@@ -6047,9 +6068,11 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
             label,
             detail,
             state: TranscriptActionState::Waiting,
+            body: Some(body),
             ..
         } if label == "Agent"
             && detail == "inspect_ui · needs approval · Run focused tests?"
+            && body == "Cargo will compile the CLI"
     ));
     // A terminal activity can carry the last live snapshot from before the
     // child published its completion boundary.
@@ -6057,7 +6080,7 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
     agent.final_text = Some("Found the renderer issue.\nExtra detail".to_string());
     transcript.apply(&activity(5, SubagentActivityKind::Completed, &agent, None));
 
-    assert_eq!(transcript.order.len(), 1);
+    assert_eq!(transcript.order.len(), 2);
     assert_eq!(transcript.active_subagent_count(), 0);
     assert_eq!(transcript.subagents[&child_id], SubagentStatus::Ready);
     assert_eq!(
@@ -6070,13 +6093,19 @@ fn subagent_activity_collapses_chatter_and_keeps_terminal_result() {
             kind: TranscriptActionKind::Agent,
             label,
             detail,
-            body: Some(body),
+            body: None,
             state: TranscriptActionState::Complete,
             ..
         } if label == "Agent"
             && detail == "inspect_ui · completed"
-            && body == "Found the renderer issue.\nExtra detail"
     ));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(rendered.matches("Found the renderer issue.").count(), 1);
 }
 
 #[test]
@@ -7661,6 +7690,56 @@ fn resume_mid_turn_accepts_an_assistant_live_snapshot_without_turn_started() {
             ..
         }) if text == "resumed response"
     ));
+}
+
+#[test]
+fn agent_message_is_visible_while_stopped_once_on_replay_and_never_human_pending() {
+    let session_id = Uuid::new_v4();
+    let receipt = SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::AgentMessageReceived {
+            message_id: Uuid::new_v4(),
+            sender_id: Uuid::new_v4(),
+            sender_name: "independent reviewer".to_string(),
+            text: "The review is ready.\nNo model turn was needed.".to_string(),
+        },
+    );
+    let stopped = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Stopped,
+            detail: None,
+        },
+    );
+    let replay: SessionEvent =
+        serde_json::from_value(serde_json::to_value(&receipt).unwrap()).unwrap();
+    let events = [stopped, receipt, replay];
+    let mut transcript = Transcript::default();
+    let mut pending = Vec::new();
+    for event in &events {
+        transcript.apply(event);
+        update_queued_prompts(&mut pending, &event.kind);
+    }
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("independent reviewer"), "{rendered}");
+    assert_eq!(
+        rendered.matches("The review is ready.").count(),
+        1,
+        "{rendered}"
+    );
+    assert!(rendered.contains("No model turn was needed."), "{rendered}");
+    assert!(pending.is_empty());
+    assert!(pending_prompt_projection_from_events(&events).is_empty());
+    let mut composer = Composer::default();
+    composer.seed_session_events(&events);
+    assert!(composer.history.is_empty());
 }
 
 #[test]
