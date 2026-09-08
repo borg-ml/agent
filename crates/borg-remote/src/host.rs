@@ -4026,9 +4026,6 @@ async fn flush_workspace_messages(
     execution_workspace_id: Option<Uuid>,
     sync: &mut JournalSync,
 ) -> Result<bool> {
-    if !sync.workspace_relay_available && !sync.instance_relay_available {
-        return Ok(true);
-    }
     if Instant::now() < sync.retry_at {
         return Ok(false);
     }
@@ -4039,7 +4036,7 @@ async fn flush_workspace_messages(
         return Ok(true);
     };
     let participant_id = binding.participant_id;
-    if sync.instance_relay_available && Instant::now() >= sync.next_instance_directory_sync {
+    if Instant::now() >= sync.next_instance_directory_sync {
         let response = client
             .get(endpoint(
                 &config.server,
@@ -4068,10 +4065,12 @@ async fn flush_workspace_messages(
                         )
                         .await?;
                 }
+                sync.instance_relay_available = true;
                 sync.next_instance_directory_sync = Instant::now() + Duration::from_secs(30);
             }
             Ok(response) if response.status() == StatusCode::NOT_FOUND => {
                 sync.instance_relay_available = false;
+                sync.next_instance_directory_sync = Instant::now() + Duration::from_secs(30);
             }
             Ok(response) => {
                 tracing::warn!(
@@ -5074,11 +5073,16 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
             let mut retry_attempted = false;
+            let mut directory_attempted = false;
             while requests.len() < 4 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let (path, body) = read_http_request(&mut stream).await;
                 let path = path.split_once('?').map_or(path.as_str(), |(path, _)| path);
-                let response = if path.ends_with("/instances") {
+                let response = if path.ends_with("/instances") && !directory_attempted {
+                    directory_attempted = true;
+                    "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        .to_string()
+                } else if path.ends_with("/instances") {
                     format!(
                         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{directory}",
                         directory.len()
@@ -5121,6 +5125,20 @@ mod tests {
             next_instance_directory_sync: Instant::now(),
             retry_at: Instant::now(),
         };
+        flush_workspace_messages(
+            &Client::new(),
+            &config,
+            &store,
+            Some(&workspace),
+            sender,
+            None,
+            &mut sync,
+        )
+        .await
+        .unwrap();
+        assert!(!sync.instance_relay_available);
+        assert!(sync.next_instance_directory_sync > Instant::now());
+        sync.next_instance_directory_sync = Instant::now();
         assert!(
             !flush_workspace_messages(
                 &Client::new(),
