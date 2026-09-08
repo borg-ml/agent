@@ -1178,6 +1178,7 @@ async fn call_model_streaming(
     let call = model_client.model_turn(provider, model, effort, request, Some(progress_tx));
     tokio::pin!(call);
     let mut text = String::new();
+    let mut emitted_text_len = 0;
     let mut last_text_emit = Instant::now() - Duration::from_millis(50);
     let mut pending_reasoning = String::new();
     let mut reasoning_accumulated = String::new();
@@ -1195,7 +1196,25 @@ async fn call_model_streaming(
                     .map(NativeModelOutcome::Completed)
                     .map_err(|error| anyhow::anyhow!(error.message)));
             }
-            progress = progress_rx.recv(), if progress_open => match progress {
+            progress = progress_rx.recv(), if progress_open => {
+                if text.len() != emitted_text_len
+                    && matches!(&progress,
+                        Some(ProviderProgress::ToolCallGenerating { .. }
+                            | ProviderProgress::ToolCallStarted { .. }
+                            | ProviderProgress::ToolCallAction { .. }))
+                {
+                    send(context.events, SessionEventKind::Message {
+                        message_id: context.assistant_message_id,
+                        actor: EventActor::Assistant,
+                        text: text.clone(),
+                        attachments: Vec::new(),
+                        status: MessageStatus::InProgress,
+                        delivery: None,
+                    }).await;
+                    emitted_text_len = text.len();
+                    last_text_emit = Instant::now();
+                }
+                match progress {
                 Some(ProviderProgress::Bytes {
                     stream: ProviderProgressStream::Stdout,
                     chunk,
@@ -1212,6 +1231,7 @@ async fn call_model_streaming(
                             status: MessageStatus::InProgress,
                             delivery: None,
                         }).await;
+                        emitted_text_len = text.len();
                         last_text_emit = Instant::now();
                     }
                 }
@@ -1293,6 +1313,7 @@ async fn call_model_streaming(
                 }
                 Some(_) => {}
                 None => progress_open = false,
+                }
             },
             control = next_control(context.controls) => match control {
                 Some(AgentTurnControl::Interrupt) => bail!("native provider turn interrupted"),
@@ -2783,6 +2804,110 @@ mod tests {
                     if tool_call_id == "second" && content.contains("not executed"))));
                 assert!(requests[1].messages.iter().any(|message| matches!(message,
                     ModelMessage::User { content, .. } if content.contains("stop writing"))));
+            }
+        }
+    }
+
+    struct CommentaryBoundaryClient {
+        boundary: usize,
+    }
+
+    #[async_trait]
+    impl NativeModelClient for CommentaryBoundaryClient {
+        async fn model_turn(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+            _request: ModelTurnRequest,
+            progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+        ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+            let progress = progress.unwrap();
+            for text in ["The", " commentary is complete."] {
+                progress
+                    .send(ProviderProgress::Bytes {
+                        stream: ProviderProgressStream::Stdout,
+                        chunk: text.as_bytes().to_vec(),
+                    })
+                    .unwrap();
+            }
+            let boundaries = [
+                ProviderProgress::ToolCallGenerating {
+                    id: Some("call".into()),
+                },
+                ProviderProgress::ToolCallStarted {
+                    id: "call".into(),
+                    name: "exec".into(),
+                    input: Value::Null,
+                },
+                ProviderProgress::ToolCallAction {
+                    id: Some("call".into()),
+                    action: "edit boundary".into(),
+                },
+            ];
+            for boundary in boundaries.into_iter().skip(self.boundary) {
+                progress.send(boundary).unwrap();
+            }
+            progress
+                .send(ProviderProgress::ToolCallInputDelta {
+                    id: Some("call".into()),
+                })
+                .unwrap();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn commentary_is_flushed_before_tool_generation_without_duplicate_snapshots() {
+        for boundary in 0..3 {
+            let client = CommentaryBoundaryClient { boundary };
+            let (events_tx, mut events_rx) = mpsc::channel(16);
+            let message_id = Uuid::new_v4();
+            let mut controls = None;
+            let call = call_model_streaming(
+                &client,
+                crate::CodingProvider::Codex,
+                "test-model",
+                None,
+                ModelTurnRequest {
+                    fast: false,
+                    request_id: None,
+                    session_id: None,
+                    prompt_cache_key: None,
+                    messages: vec![ModelMessage::user("hello")],
+                    tools: Vec::new(),
+                    output_schema: None,
+                },
+                ModelStreamContext {
+                    coding_provider: crate::CodingProvider::Codex,
+                    assistant_message_id: message_id,
+                    events: &events_tx,
+                    controls: &mut controls,
+                },
+            );
+            tokio::pin!(call);
+            let observe = async {
+                for expected in ["The", "The commentary is complete."] {
+                    assert!(matches!(events_rx.recv().await,
+                        Some(SessionEventKind::Message {
+                            message_id: id, text, status: MessageStatus::InProgress, ..
+                        }) if id == message_id && text == expected));
+                }
+                for _ in boundary..3 {
+                    assert!(matches!(events_rx.recv().await,
+                        Some(SessionEventKind::ProviderEvent { kind, .. })
+                        if kind == "action/preparing"));
+                }
+                assert!(matches!(events_rx.recv().await,
+                    Some(SessionEventKind::ProviderEvent { kind, .. })
+                    if kind == "action/input_delta"));
+                assert!(events_rx.try_recv().is_err());
+            };
+            tokio::select! {
+                _ = &mut call => panic!("model must remain unfinished while generating"),
+                result = tokio::time::timeout(Duration::from_secs(1), observe) => {
+                    result.expect("commentary and generation must arrive before model completion");
+                }
             }
         }
     }
