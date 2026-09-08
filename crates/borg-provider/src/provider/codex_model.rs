@@ -638,6 +638,7 @@ struct ResponseState {
     action_parsers: HashMap<String, StreamedToolAction>,
     output: BTreeMap<u64, Value>,
     reasoning: String,
+    reasoning_part: Option<(Option<String>, Option<u64>)>,
 }
 
 impl ResponseState {
@@ -737,7 +738,23 @@ impl ResponseState {
             }
             "response.reasoning_summary_text.delta" => {
                 if let Some(text) = event["delta"].as_str().filter(|s| !s.is_empty()) {
-                    self.reasoning.push_str(text);
+                    let part = (
+                        event["item_id"].as_str().map(str::to_owned),
+                        event["summary_index"].as_u64(),
+                    );
+                    let text = if self
+                        .reasoning_part
+                        .as_ref()
+                        .is_some_and(|last| last != &part)
+                        && !self.reasoning.ends_with("\n")
+                        && !text.starts_with("\n")
+                    {
+                        format!("\n{text}")
+                    } else {
+                        text.to_owned()
+                    };
+                    self.reasoning_part = Some(part);
+                    self.reasoning.push_str(&text);
                     emit(ProviderProgress::ProviderEvent {
                         kind: "reasoning_delta".into(),
                         payload: json!({"text": text}),
@@ -945,6 +962,41 @@ mod tests {
         assert!(!error.contains("private-") && !error.contains("99 seconds"));
         assert!(events.try_recv().is_err());
         server.await.unwrap();
+    }
+
+    #[test]
+    fn reasoning_summary_boundaries_preserve_streamed_fragments() {
+        let mut state = ResponseState::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for (item, part, text) in [
+            ("first", 0, "Running "),
+            ("first", 0, "validation"),
+            ("first", 1, "Reviewing the diff"),
+            ("second", 0, "Checking replay"),
+        ] {
+            state
+                .event(
+                    &json!({"type":"response.reasoning_summary_text.delta",
+                "item_id":item,"summary_index":part,"delta":text}),
+                    Some(&tx),
+                    "model",
+                    "low",
+                )
+                .unwrap();
+        }
+        let expected = "Running validation\nReviewing the diff\nChecking replay";
+        assert_eq!(state.reasoning, expected);
+        let mut streamed = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ProviderProgress::ProviderEvent {
+                content_text: Some(text),
+                ..
+            } = event
+            {
+                streamed.push_str(&text);
+            }
+        }
+        assert_eq!(streamed, expected);
     }
 
     #[test]
