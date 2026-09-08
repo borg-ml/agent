@@ -379,3 +379,8 @@ borg remote sync --session SESSION_UUID
 This refreshes relay projections only; it does not take over the session, invoke a
 provider, or restart agents. A session running an older executable needs this
 explicit refresh until it is resumed on the updated executable.
+
+Use `borg remote sync --session SESSION_UUID --send-pending` when an older running
+session has queued private outgoing messages but its relay is disabled. This
+explicit option replays the existing private-message relay with stable idempotency
+keys; previously accepted messages are not duplicated. Default sync receives only.

@@ -1029,6 +1029,9 @@ pub(crate) enum RemoteCommand {
     },
     /// Refresh remote discovery and the agent inbox without restarting a session.
     Sync {
+        /// Replay private outgoing messages through the idempotent relay.
+        #[arg(long)]
+        send_pending: bool,
         #[arg(long)]
         session: Uuid,
         #[arg(long)]

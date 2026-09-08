@@ -44,7 +44,7 @@ address it as `participant:<id>` from discovery. Discovery is not proof of liven
 or completed delivery: inspect delivery state and verify the requested result. Do not ask the human \
 to relay messages or restart active agents to repair connectivity. For stale discovery or inboxes \
 on an enrolled host, `borg remote sync --session SESSION_UUID` refreshes that session without takeover; \
-it does not upgrade its running process or flush its outgoing queue. Use `borg remote --help` for \
+add `--send-pending` to retry private outgoing messages idempotently. It does not upgrade the running process. Use `borg remote --help` for \
 enrollment and recovery commands; never expose host tokens or silently change provider billing. \
 For a substantial multi-step user request, call get_goal first, create a concise goal when none \
 exists, then create the plan. Before updating an existing plan, call get_plan and reuse its exact \

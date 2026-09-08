@@ -4074,7 +4074,11 @@ async fn sync_instance_directory(
 }
 
 /// Refresh relay projections without taking over or restarting the session actor.
-pub async fn sync_remote_session(config_path: &Path, session_id: Uuid) -> Result<usize> {
+pub async fn sync_remote_session(
+    config_path: &Path,
+    session_id: Uuid,
+    send_pending: bool,
+) -> Result<usize> {
     let config: HostConfig = serde_json::from_slice(&fs::read(config_path)?)?;
     config.validate()?;
     ensure_execution_boundary(&config)?;
@@ -4114,6 +4118,33 @@ pub async fn sync_remote_session(config_path: &Path, session_id: Uuid) -> Result
         .await?,
         "relay does not support the agent inbox yet"
     );
+    if send_pending {
+        let next_sync = Instant::now() + Duration::from_secs(30);
+        let mut sync = JournalSync {
+            uploaded_sequence: 0,
+            uploaded_live_revision: 0,
+            uploaded_workspace_sequences: HashMap::new(),
+            workspace_relay_available: false,
+            instance_relay_available: true,
+            next_workspace_roster_sync: next_sync,
+            next_instance_directory_sync: next_sync,
+            next_inbox_sync: next_sync,
+            retry_at: Instant::now(),
+        };
+        ensure!(
+            flush_workspace_messages(
+                &client,
+                &config,
+                &store,
+                Some(&workspace),
+                session_id,
+                None,
+                &mut sync,
+            )
+            .await?,
+            "outgoing relay did not finish; retry sync with --send-pending"
+        );
+    }
     Ok(count)
 }
 
