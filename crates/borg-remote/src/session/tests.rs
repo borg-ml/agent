@@ -5877,6 +5877,49 @@ fn recalling_prompts_targets_the_exact_queue_entry_and_skips_steers() {
     assert_eq!(pending[1].message_id, steer_id);
 }
 
+/// A visible, queued peer message is System input the human never authored.
+/// Neither a targeted recall nor recall-all may retract it: the actor
+/// predicate, not visibility, is what protects imported relay deliveries.
+#[test]
+fn recalling_prompts_preserves_visible_system_queued_input() {
+    let human_id = Uuid::new_v4();
+    let imported_id = Uuid::new_v4();
+    let queued = |message_id, actor, text: &str| QueuedPrompt {
+        message_id,
+        text: text.to_string(),
+        actor,
+        attachments: Vec::new(),
+        output_schema: None,
+        delivery: PromptDelivery::Queue,
+        // Imported peer input is rendered in the transcript, so visibility
+        // alone cannot distinguish it from a human draft.
+        visible: true,
+        interrupt_batch: false,
+        batch: Vec::new(),
+    };
+    let mut pending = VecDeque::from([
+        queued(imported_id, EventActor::System, "Team message from peer"),
+        queued(human_id, EventActor::User, "my own draft"),
+    ]);
+
+    // Targeted recall of the peer message is a no-op.
+    assert!(recall_visible_queued_prompts(&mut pending, Some(imported_id)).is_empty());
+    assert_eq!(pending.len(), 2);
+
+    // Recall-all takes only the human draft.
+    let recalled = recall_visible_queued_prompts(&mut pending, None);
+    assert_eq!(
+        recalled
+            .iter()
+            .map(|prompt| prompt.message_id)
+            .collect::<Vec<_>>(),
+        [human_id]
+    );
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].message_id, imported_id);
+    assert_eq!(pending[0].actor, EventActor::System);
+}
+
 /// ↑ on an empty composer must give back exactly the work whose provider
 /// admission is still unclaimed. Once provider admission wins, recall cannot
 /// claim or remove the steer.
@@ -10510,4 +10553,252 @@ async fn imported_conversation_is_atomic_and_replays_both_sides_without_live_pro
     assert!(serialized.contains("Imported answer"));
     assert_eq!(replay.len(), 2);
     assert!(store.state(id).await.unwrap().provider_session_id.is_none());
+}
+
+struct RelayPromptExecutor {
+    seen: RecordedPromptTurns,
+    called: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for RelayPromptExecutor {
+    async fn execute(
+        &self,
+        turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((turn.prompt, turn.attachments));
+        self.called.notify_one();
+        Ok(AgentTurnResult {
+            provider_session_id: Some("provider-session".to_string()),
+            final_text: "acknowledged".to_string(),
+        })
+    }
+}
+
+/// An authenticated relay delivery imported by `sync_relay_inbox` must reach
+/// the session actor through the same durable workspace inbox as a local team
+/// message. Provenance is the property under test: the imported peer message
+/// becomes `EventActor::System` provider input, never a human prompt left
+/// editable and recallable in the transcript.
+#[tokio::test]
+async fn imported_relay_message_wakes_the_actor_as_system_provenance() {
+    let root = tempdir().unwrap();
+    let root_path = root.path().to_path_buf();
+    let session_id = Uuid::new_v4();
+    let writer =
+        SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
+    let sqlite = Arc::new(
+        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap(),
+    );
+    sqlite.create_session(session_id).await.unwrap();
+    let binding = sqlite
+        .workspace_binding(session_id)
+        .await
+        .unwrap()
+        .expect("a durable session is bound to its workspace participant");
+    let workspace = sqlite
+        .workspace_store()
+        .await
+        .unwrap()
+        .expect("SQLite session store exposes the canonical workspace projection");
+    let human_id = crate::local_human_participant_id("Human");
+    workspace
+        .ensure_execution_workspace(
+            binding.workspace_id,
+            "relay inbox test",
+            human_id,
+            "Human",
+            binding.participant_id,
+            "Agent",
+        )
+        .await
+        .unwrap();
+
+    // The peer lives on another host: its workspace and participant identities
+    // are cloud-side and unknown locally until the pull+ack inbox imports them.
+    let peer_participant_id = Uuid::new_v4();
+    let relay_workspace_id = Uuid::new_v4();
+    let relay_message_id = Uuid::new_v4();
+    let imported = workspace
+        .import_relay_message(
+            crate::WorkspaceMessage {
+                id: relay_message_id,
+                workspace_id: relay_workspace_id,
+                thread_id: None,
+                reply_to_message_id: None,
+                author_id: peer_participant_id,
+                body: crate::WorkspaceMessageBody {
+                    text: "the benchmark rerun finished".to_string(),
+                    mentions: Vec::new(),
+                },
+                audience: crate::Audience::Direct {
+                    participant: binding.participant_id,
+                },
+                created_at: chrono::Utc::now(),
+            },
+            "peer-instance",
+            binding.participant_id,
+            crate::DeliveryMode::Wake,
+        )
+        .await
+        .unwrap();
+    assert_eq!(imported.id, relay_message_id);
+    assert_eq!(
+        imported.idempotency_key,
+        format!("relay-message:{relay_message_id}")
+    );
+
+    let store: Arc<dyn SessionStore> = sqlite.clone();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let seen: RecordedPromptTurns = Arc::new(Mutex::new(Vec::new()));
+    let called = Arc::new(Notify::new());
+    let executor = Arc::new(RelayPromptExecutor {
+        seen: Arc::clone(&seen),
+        called: Arc::clone(&called),
+    });
+    let actor_store = Arc::clone(&store);
+    let actor = tokio::spawn({
+        let root_path = root_path.clone();
+        async move {
+            run_agent_session_with_store_and_writer(
+                &root_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd: root_path.clone(),
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: crate::SessionCapabilities {
+                        multiplayer: true,
+                        subagents: true,
+                        ..Default::default()
+                    },
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                actor_store,
+                writer,
+            )
+            .await
+        }
+    });
+
+    // The actor owns its own coordinator, so the durable root inbox tick is
+    // what discovers the imported delivery. No host command is involved.
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
+        .await
+        .expect("the imported relay message reaches the provider");
+
+    let mut observed_statuses = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("the imported relay turn completes")
+            .expect("session remains attached");
+        if let SessionEventKind::Message {
+            message_id,
+            actor,
+            status,
+            ..
+        } = &event.kind
+            && *message_id == relay_message_id
+        {
+            // Provenance must be System at every observed transition.
+            assert_eq!(
+                *actor,
+                EventActor::System,
+                "an imported relay message must never be attributed to the human"
+            );
+            observed_statuses.push(*status);
+            if *status == MessageStatus::Complete {
+                break;
+            }
+        }
+    }
+    assert_eq!(observed_statuses.last(), Some(&MessageStatus::Complete));
+
+    // A blanket human recall must not retract already-admitted peer input.
+    command_tx
+        .send(HostCommand::RecallQueuedPrompt {
+            session_id,
+            message_id: None,
+        })
+        .await
+        .unwrap();
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    let history = store.read(session_id).await.unwrap();
+    let relay_messages = history
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::Message {
+                message_id,
+                actor,
+                status,
+                text,
+                ..
+            } if *message_id == relay_message_id => Some((*actor, *status, text.clone())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !relay_messages.is_empty(),
+        "the imported relay message is projected into the durable transcript"
+    );
+    assert!(
+        relay_messages
+            .iter()
+            .all(|(actor, _, _)| *actor == EventActor::System),
+        "durable provenance stays System: {relay_messages:?}"
+    );
+    assert!(
+        !relay_messages
+            .iter()
+            .any(|(_, status, _)| *status == MessageStatus::Queued),
+        "an imported peer message is never left as human pending input: {relay_messages:?}"
+    );
+    assert!(
+        !history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::PromptRecalled { message_id, .. } if *message_id == relay_message_id
+        )),
+        "a human recall must not retract imported peer input"
+    );
+
+    // Attribution survives the import: the provider sees who spoke.
+    let prompts = seen.lock().unwrap().clone();
+    assert!(
+        prompts
+            .iter()
+            .any(|(prompt, _)| prompt.contains("the benchmark rerun finished")),
+        "the peer message body reaches the provider: {prompts:?}"
+    );
+    assert!(
+        prompts
+            .iter()
+            .any(|(prompt, _)| prompt.contains("peer-instance")),
+        "imported author attribution survives the relay import: {prompts:?}"
+    );
 }

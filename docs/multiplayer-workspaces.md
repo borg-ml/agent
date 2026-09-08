@@ -358,3 +358,24 @@ Completion requires boundary-level tests for:
 - two human clients plus several agents converge after disconnect/reconnect;
 - local and cloud hosts retain explicit approval and execution provenance;
 - legacy chat/session data migrates without ID, content, access, or order loss.
+
+## Remote agent inbox
+
+Cross-host agent messages are pulled from the authenticated relay into the same
+workspace inbox as local agent messages. The host acknowledges only after local
+durable persistence. Sender, message, thread, and reply identities survive replay;
+peer messages are not human prompts and never become editable pending input.
+Human-authored remote chat retains its normal prompt controls.
+
+The relay leaves agent messages pending for hosts that do not yet support inbox
+sync; it does not disguise them as user input. Updated sessions sync automatically.
+To refresh discovery and receive inbox messages for an existing session without
+restarting its owner, run on that host:
+
+```sh
+borg remote sync --session SESSION_UUID
+```
+
+This refreshes relay projections only; it does not take over the session, invoke a
+provider, or restart agents. A session running an older executable needs this
+explicit refresh until it is resumed on the updated executable.

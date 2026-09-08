@@ -1191,48 +1191,76 @@ impl SqliteWorkspaceStore {
     }
 }
 
-#[async_trait]
-impl WorkspaceStore for SqliteWorkspaceStore {
-    async fn create_participant(&self, p: Participant) -> Result<()> {
-        sqlx::query("insert into workspace_participants values(?,?,?,?)")
-            .bind(p.id.to_string())
-            .bind(p.display_name)
-            .bind(serde_json::to_string(&p.kind)?)
-            .bind(p.created_at.to_rfc3339())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+impl SqliteWorkspaceStore {
+    /// Project an authenticated relay delivery into the same inbox as local messages.
+    /// Thread/reply references remain cloud identities; their history need not be local.
+    pub(crate) async fn import_relay_message(
+        &self,
+        message: WorkspaceMessage,
+        author_name: &str,
+        recipient_id: Uuid,
+        mode: DeliveryMode,
+    ) -> Result<WorkspaceEvent> {
+        ensure!(
+            message.author_id != recipient_id,
+            "relay sender cannot be its recipient"
+        );
+        ensure!(
+            !message.body.text.trim().is_empty(),
+            "relay message is empty"
+        );
+        ensure!(
+            message.audience
+                == Audience::Direct {
+                    participant: recipient_id
+                },
+            "relay delivery recipient mismatch"
+        );
+        let mut tx = self.write().await?;
+        sqlx::query(
+            "insert into workspaces(id,name,created_at) values(?,?,?) on conflict(id) do nothing",
+        )
+        .bind(message.workspace_id.to_string())
+        .bind("Borg instance conversation")
+        .bind(message.created_at.to_rfc3339())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("insert into workspace_participants(id,display_name,kind,created_at) values(?,?,?,?) on conflict(id) do nothing")
+            .bind(message.author_id.to_string()).bind(author_name)
+            .bind(serde_json::to_string(&ParticipantKind::Agent)?)
+            .bind(message.created_at.to_rfc3339()).execute(&mut *tx).await?;
+        let author_kind: String =
+            sqlx::query_scalar("select kind from workspace_participants where id=?")
+                .bind(message.author_id.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+        ensure!(
+            serde_json::from_str::<ParticipantKind>(&author_kind)? == ParticipantKind::Agent,
+            "relay agent identity conflicts with a local human participant"
+        );
+        for participant_id in [message.author_id, recipient_id] {
+            sqlx::query("insert into workspace_members(workspace_id,participant_id,role,joined_at) values(?,?,?,?) on conflict(workspace_id,participant_id) do nothing")
+                .bind(message.workspace_id.to_string()).bind(participant_id.to_string())
+                .bind(serde_json::to_string(&WorkspaceRole::Viewer)?)
+                .bind(message.created_at.to_rfc3339()).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        let event = WorkspaceEvent {
+            id: message.id,
+            workspace_id: message.workspace_id,
+            sequence: 0,
+            author_id: message.author_id,
+            idempotency_key: format!("relay-message:{}", message.id),
+            created_at: message.created_at,
+            kind: WorkspaceEventKind::Message { message, mode },
+        };
+        self.append_event(event, false).await
     }
-    async fn create_workspace(&self, w: Workspace) -> Result<()> {
-        sqlx::query("insert into workspaces(id,name,created_at) values(?,?,?)")
-            .bind(w.id.to_string())
-            .bind(w.name)
-            .bind(w.created_at.to_rfc3339())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-    async fn add_member(&self, m: WorkspaceMembership) -> Result<()> {
-        sqlx::query("insert into workspace_members values(?,?,?,?)")
-            .bind(m.workspace_id.to_string())
-            .bind(m.participant_id.to_string())
-            .bind(serde_json::to_string(&m.role)?)
-            .bind(m.joined_at.to_rfc3339())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-    async fn create_thread(&self, t: Thread) -> Result<()> {
-        sqlx::query("insert into workspace_threads values(?,?,?,?)")
-            .bind(t.id.to_string())
-            .bind(t.workspace_id.to_string())
-            .bind(t.title)
-            .bind(t.created_at.to_rfc3339())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-    async fn append(&self, mut e: WorkspaceEvent) -> Result<WorkspaceEvent> {
+    async fn append_event(
+        &self,
+        mut e: WorkspaceEvent,
+        validate_references: bool,
+    ) -> Result<WorkspaceEvent> {
         ensure!(
             !e.idempotency_key.is_empty(),
             "idempotency key must not be empty"
@@ -1370,7 +1398,7 @@ impl WorkspaceStore for SqliteWorkspaceStore {
                     message.workspace_id == e.workspace_id && message.author_id == e.author_id,
                     "message workspace/author mismatch"
                 );
-                if let Some(thread) = message.thread_id {
+                if let Some(thread) = message.thread_id.filter(|_| validate_references) {
                     let found: i64 = sqlx::query_scalar(
                         "select exists(select 1 from workspace_threads \
                          where id=? and workspace_id=?)",
@@ -1381,7 +1409,8 @@ impl WorkspaceStore for SqliteWorkspaceStore {
                     .await?;
                     ensure!(found != 0, "thread is not in workspace");
                 }
-                if let Some(reply_to) = message.reply_to_message_id {
+                if let Some(reply_to) = message.reply_to_message_id.filter(|_| validate_references)
+                {
                     let found: i64 = sqlx::query_scalar(
                         "select exists(\
                             select 1 from workspace_events \
@@ -1484,7 +1513,52 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         tx.commit().await?;
         Ok(e)
     }
+}
 
+#[async_trait]
+impl WorkspaceStore for SqliteWorkspaceStore {
+    async fn create_participant(&self, p: Participant) -> Result<()> {
+        sqlx::query("insert into workspace_participants values(?,?,?,?)")
+            .bind(p.id.to_string())
+            .bind(p.display_name)
+            .bind(serde_json::to_string(&p.kind)?)
+            .bind(p.created_at.to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    async fn create_workspace(&self, w: Workspace) -> Result<()> {
+        sqlx::query("insert into workspaces(id,name,created_at) values(?,?,?)")
+            .bind(w.id.to_string())
+            .bind(w.name)
+            .bind(w.created_at.to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    async fn add_member(&self, m: WorkspaceMembership) -> Result<()> {
+        sqlx::query("insert into workspace_members values(?,?,?,?)")
+            .bind(m.workspace_id.to_string())
+            .bind(m.participant_id.to_string())
+            .bind(serde_json::to_string(&m.role)?)
+            .bind(m.joined_at.to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    async fn create_thread(&self, t: Thread) -> Result<()> {
+        sqlx::query("insert into workspace_threads values(?,?,?,?)")
+            .bind(t.id.to_string())
+            .bind(t.workspace_id.to_string())
+            .bind(t.title)
+            .bind(t.created_at.to_rfc3339())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+    async fn append(&self, e: WorkspaceEvent) -> Result<WorkspaceEvent> {
+        self.append_event(e, true).await
+    }
     /// Append session-event projections in one durable transaction.
     ///
     /// Session events are already validated by the canonical session journal;

@@ -1027,6 +1027,13 @@ pub(crate) enum RemoteCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Refresh remote discovery and the agent inbox without restarting a session.
+    Sync {
+        #[arg(long)]
+        session: Uuid,
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Log in through a provider's native subscription flow.
     Login {
         #[arg(value_enum)]

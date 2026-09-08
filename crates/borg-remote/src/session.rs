@@ -5751,7 +5751,7 @@ fn recall_visible_queued_prompts(
     let mut recalled = Vec::new();
     let mut retained = VecDeque::with_capacity(pending.len());
     while let Some(prompt) = pending.pop_front() {
-        if prompt.visible && prompt.delivery == PromptDelivery::Queue {
+        if queued_prompt_matches_recall(&prompt, None) {
             recalled.push(prompt);
         } else {
             retained.push_back(prompt);
@@ -5762,7 +5762,8 @@ fn recall_visible_queued_prompts(
 }
 
 fn queued_prompt_matches_recall(prompt: &QueuedPrompt, message_id: Option<Uuid>) -> bool {
-    prompt.visible
+    prompt.actor == EventActor::User
+        && prompt.visible
         && prompt.delivery == PromptDelivery::Queue
         && message_id.is_none_or(|message_id| {
             prompt.message_id == message_id

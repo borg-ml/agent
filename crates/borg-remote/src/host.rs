@@ -259,6 +259,24 @@ struct RelayWorkspaceRoster {
 }
 
 #[derive(Deserialize)]
+struct RelayInbox {
+    messages: Vec<RelayInboxMessage>,
+}
+
+#[derive(Deserialize)]
+struct RelayInboxMessage {
+    id: Uuid,
+    workspace_id: Uuid,
+    author_id: Uuid,
+    author_name: String,
+    text: String,
+    thread_id: Option<Uuid>,
+    reply_to_message_id: Option<Uuid>,
+    created_at: DateTime<Utc>,
+    delivery_mode: crate::DeliveryMode,
+}
+
+#[derive(Deserialize)]
 struct RelayInstanceDirectory {
     participants: Vec<RelayInstanceParticipant>,
 }
@@ -2181,6 +2199,7 @@ pub async fn mirror_local_session(
         instance_relay_available: true,
         next_workspace_roster_sync: Instant::now(),
         next_instance_directory_sync: Instant::now(),
+        next_inbox_sync: Instant::now(),
         retry_at: Instant::now(),
     };
 
@@ -3603,6 +3622,7 @@ async fn run_session(
         instance_relay_available: true,
         next_workspace_roster_sync: Instant::now(),
         next_instance_directory_sync: Instant::now(),
+        next_inbox_sync: Instant::now(),
         retry_at: Instant::now(),
     };
     flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
@@ -4014,7 +4034,139 @@ struct JournalSync {
     instance_relay_available: bool,
     next_workspace_roster_sync: Instant,
     next_instance_directory_sync: Instant,
+    next_inbox_sync: Instant,
     retry_at: Instant,
+}
+
+async fn sync_instance_directory(
+    client: &Client,
+    config: &HostConfig,
+    store: &SqliteWorkspaceStore,
+    session_id: Uuid,
+) -> Result<usize> {
+    let directory: RelayInstanceDirectory = client
+        .get(endpoint(
+            &config.server,
+            &format!("/api/remote/host/sessions/{session_id}/instances"),
+        ))
+        .bearer_auth(&config.host_token)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let count = directory.participants.len();
+    for remote in directory.participants {
+        store
+            .upsert_instance(
+                Participant {
+                    id: remote.id,
+                    display_name: remote.display_name,
+                    kind: remote.kind,
+                    created_at: remote.created_at,
+                },
+                remote.host_id,
+                remote.workspace_id,
+            )
+            .await?;
+    }
+    Ok(count)
+}
+
+/// Refresh relay projections without taking over or restarting the session actor.
+pub async fn sync_remote_session(config_path: &Path, session_id: Uuid) -> Result<usize> {
+    let config: HostConfig = serde_json::from_slice(&fs::read(config_path)?)?;
+    config.validate()?;
+    ensure_execution_boundary(&config)?;
+    let database = config_path
+        .parent()
+        .context("host config has no parent")?
+        .join("sessions/sessions.sqlite3");
+    ensure!(database.is_file(), "session database does not exist");
+    let store = SqliteSessionStore::open(database).await?;
+    let binding = store
+        .workspace_binding(session_id)
+        .await?
+        .context("session has no workspace binding")?;
+    ensure!(
+        binding.host_id == Some(config.host_id),
+        "session is not attached to this enrolled host"
+    );
+    let workspace = store
+        .workspace_store()
+        .await?
+        .context("session has no workspace store")?;
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(35))
+        .build()?;
+    let count = sync_instance_directory(&client, &config, &workspace, session_id).await?;
+    ensure!(
+        sync_relay_inbox(
+            &client,
+            &config,
+            &workspace,
+            session_id,
+            binding.participant_id
+        )
+        .await?,
+        "relay does not support the agent inbox yet"
+    );
+    Ok(count)
+}
+
+async fn sync_relay_inbox(
+    client: &Client,
+    config: &HostConfig,
+    store: &SqliteWorkspaceStore,
+    session_id: Uuid,
+    participant_id: Uuid,
+) -> Result<bool> {
+    let path = format!("/api/remote/host/sessions/{session_id}/inbox");
+    let response = client
+        .get(endpoint(&config.server, &path))
+        .bearer_auth(&config.host_token)
+        .send()
+        .await?;
+    if response.status() == StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    let inbox: RelayInbox = response.error_for_status()?.json().await?;
+    for incoming in inbox.messages {
+        let message_id = incoming.id;
+        store
+            .import_relay_message(
+                crate::WorkspaceMessage {
+                    id: message_id,
+                    workspace_id: incoming.workspace_id,
+                    author_id: incoming.author_id,
+                    thread_id: incoming.thread_id,
+                    reply_to_message_id: incoming.reply_to_message_id,
+                    body: crate::WorkspaceMessageBody {
+                        text: incoming.text,
+                        mentions: Vec::new(),
+                    },
+                    audience: Audience::Direct {
+                        participant: participant_id,
+                    },
+                    created_at: incoming.created_at,
+                },
+                &incoming.author_name,
+                participant_id,
+                incoming.delivery_mode,
+            )
+            .await?;
+        client
+            .post(endpoint(
+                &config.server,
+                &format!("{path}/{message_id}/ack"),
+            ))
+            .bearer_auth(&config.host_token)
+            .send()
+            .await?
+            .error_for_status()?;
+    }
+    Ok(true)
 }
 
 async fn flush_workspace_messages(
@@ -4036,52 +4188,35 @@ async fn flush_workspace_messages(
         return Ok(true);
     };
     let participant_id = binding.participant_id;
+    if Instant::now() >= sync.next_inbox_sync {
+        let delay = match sync_relay_inbox(client, config, store, session_id, participant_id).await
+        {
+            Ok(true) => Duration::from_secs(1),
+            Ok(false) => Duration::from_secs(30),
+            Err(error) => {
+                tracing::warn!(%error, %session_id, "remote agent inbox synchronization failed");
+                Duration::from_secs(5)
+            }
+        };
+        sync.next_inbox_sync = Instant::now() + delay;
+    }
     if Instant::now() >= sync.next_instance_directory_sync {
-        let response = client
-            .get(endpoint(
-                &config.server,
-                &format!("/api/remote/host/sessions/{session_id}/instances"),
-            ))
-            .bearer_auth(&config.host_token)
-            .send()
-            .await;
-        match response {
-            Ok(response) if response.status().is_success() => {
-                let directory: RelayInstanceDirectory = response
-                    .json()
-                    .await
-                    .context("borg.ml returned an invalid instance directory")?;
-                for remote in directory.participants {
-                    store
-                        .upsert_instance(
-                            Participant {
-                                id: remote.id,
-                                display_name: remote.display_name,
-                                kind: remote.kind,
-                                created_at: remote.created_at,
-                            },
-                            remote.host_id,
-                            remote.workspace_id,
-                        )
-                        .await?;
-                }
+        match sync_instance_directory(client, config, store, session_id).await {
+            Ok(_) => {
                 sync.instance_relay_available = true;
                 sync.next_instance_directory_sync = Instant::now() + Duration::from_secs(30);
             }
-            Ok(response) if response.status() == StatusCode::NOT_FOUND => {
-                sync.instance_relay_available = false;
-                sync.next_instance_directory_sync = Instant::now() + Duration::from_secs(30);
-            }
-            Ok(response) => {
-                tracing::warn!(
-                    status = %response.status(),
-                    "instance directory synchronization failed"
-                );
-                sync.next_instance_directory_sync = Instant::now() + Duration::from_secs(5);
-            }
             Err(error) => {
-                tracing::warn!(%error, "instance directory synchronization failed");
-                sync.next_instance_directory_sync = Instant::now() + Duration::from_secs(5);
+                let missing = error
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(|error| error.status() == Some(StatusCode::NOT_FOUND));
+                if missing {
+                    sync.instance_relay_available = false;
+                } else {
+                    tracing::warn!(%error, "instance directory synchronization failed");
+                }
+                sync.next_instance_directory_sync =
+                    Instant::now() + Duration::from_secs(if missing { 30 } else { 5 });
             }
         }
     }
@@ -4774,6 +4909,10 @@ mod tests {
                         "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                             .to_string()
                     }
+                    path if path.ends_with("/inbox") => {
+                        "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                            .to_string()
+                    }
                     path if path.ends_with("/instances") => {
                         let body = r#"{"participants":[]}"#;
                         format!(
@@ -4949,6 +5088,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_inbox_replay_preserves_one_durable_agent_message_before_ack() {
+        let root = tempdir().unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let recipient = Uuid::new_v4();
+        store.create_session(recipient).await.unwrap();
+        let workspace = store.workspace_store().await.unwrap().unwrap();
+        let binding = store.workspace_binding(recipient).await.unwrap().unwrap();
+        workspace
+            .ensure_execution_workspace(
+                binding.workspace_id,
+                "Recipient",
+                crate::local_human_participant_id("Human"),
+                "Human",
+                recipient,
+                "Recipient",
+            )
+            .await
+            .unwrap();
+        let author = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let thread = Uuid::new_v4();
+        let reply = Uuid::new_v4();
+        let body = serde_json::json!({"messages":[{
+            "id":message_id,"workspace_id":workspace_id,"author_id":author,"author_name":"Remote peer",
+            "text":"A peer result", "thread_id":thread,"reply_to_message_id":reply,
+            "created_at":Utc::now(),"delivery_mode":"next_turn"
+        }]}).to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for attempt in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (path, _) = read_http_request(&mut stream).await;
+                let response = if attempt % 2 == 0 {
+                    assert!(path.ends_with("/inbox"));
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    assert!(path.ends_with(&format!("/{message_id}/ack")));
+                    let status = if attempt == 1 {
+                        "500 Internal Server Error"
+                    } else {
+                        "204 No Content"
+                    };
+                    format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let config = HostConfig {
+            server: format!("http://{address}"),
+            ..test_config(root.path())
+        };
+        assert!(
+            sync_relay_inbox(&Client::new(), &config, &workspace, recipient, recipient)
+                .await
+                .is_err()
+        );
+        assert!(
+            sync_relay_inbox(&Client::new(), &config, &workspace, recipient, recipient)
+                .await
+                .unwrap()
+        );
+        server.await.unwrap();
+        let pending = workspace
+            .pending_message_events(workspace_id, recipient, 10)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        let WorkspaceEventKind::Message { message, .. } = &pending[0].0.kind else {
+            panic!("expected agent inbox message")
+        };
+        assert_eq!(message.id, message_id);
+        assert_eq!(message.author_id, author);
+        assert_eq!(message.thread_id, Some(thread));
+        assert_eq!(message.reply_to_message_id, Some(reply));
+        assert_eq!(
+            workspace.participant(author).await.unwrap().unwrap().kind,
+            ParticipantKind::Agent
+        );
+        assert!(!store.contains_message(recipient, message_id).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn private_instance_relay_retries_without_starving_or_duplicating_local_recipients() {
         let root = tempdir().unwrap();
         let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
@@ -5078,7 +5306,10 @@ mod tests {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let (path, body) = read_http_request(&mut stream).await;
                 let path = path.split_once('?').map_or(path.as_str(), |(path, _)| path);
-                let response = if path.ends_with("/instances") && !directory_attempted {
+                let response = if path.ends_with("/inbox") {
+                    "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        .to_string()
+                } else if path.ends_with("/instances") && !directory_attempted {
                     directory_attempted = true;
                     "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                         .to_string()
@@ -5123,6 +5354,7 @@ mod tests {
             instance_relay_available: true,
             next_workspace_roster_sync: Instant::now(),
             next_instance_directory_sync: Instant::now(),
+            next_inbox_sync: Instant::now(),
             retry_at: Instant::now(),
         };
         flush_workspace_messages(

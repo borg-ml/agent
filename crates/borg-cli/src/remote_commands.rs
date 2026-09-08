@@ -506,6 +506,14 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
             let config_path = config.unwrap_or_else(default_host_config_path);
             install_host_service(&config_path).await?;
         }
+        RemoteCommand::Sync { session, config } => {
+            let config = config.unwrap_or_else(default_host_config_path);
+            let instances = borg_remote::sync_remote_session(&config, session).await?;
+            println!(
+                "{}",
+                serde_json::json!({"session_id":session,"instances":instances,"inbox_synced":true})
+            );
+        }
         RemoteCommand::Login { provider } => {
             login_provider(provider.into()).await?;
         }
