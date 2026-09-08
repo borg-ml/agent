@@ -25,7 +25,6 @@ use crate::{
     PermissionMode, SessionEventKind, SessionStatus,
 };
 
-const MAX_TOOL_ROUNDS: usize = 32;
 const MAX_TOOL_RESULT_BYTES: usize = 1024 * 1024;
 const MAX_APPROVAL_DETAIL_BYTES: usize = 8 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
@@ -260,7 +259,7 @@ impl NativeHarness {
         let mut assistant_message_id = Uuid::new_v4();
         let mut model_round = 0_usize;
         let mut tool_round = 0_usize;
-        while model_round < MAX_TOOL_ROUNDS {
+        loop {
             model_round += 1;
             let result = match self
                 .call_model(
@@ -630,7 +629,6 @@ impl NativeHarness {
                 )));
             }
         }
-        bail!("native provider exceeded the harness limit of {MAX_TOOL_ROUNDS} tool rounds")
     }
 
     pub(crate) async fn consult(
@@ -2628,6 +2626,7 @@ mod tests {
     }
 
     struct BatchClient {
+        tool_rounds: usize,
         requests: Mutex<Vec<ModelTurnRequest>>,
     }
 
@@ -2653,6 +2652,12 @@ mod tests {
                         )
                     })
                     .to_vec()
+            } else if requests.len() <= self.tool_rounds {
+                vec![ModelToolCall::function(
+                    format!("read-{}", requests.len()),
+                    "read_file".to_string(),
+                    json!({"path": "first"}).to_string(),
+                )]
             } else {
                 Vec::new()
             };
@@ -2674,11 +2679,12 @@ mod tests {
 
     #[tokio::test]
     async fn native_batch_records_results_before_honoring_controls_and_skips_queued_actions() {
-        for interrupt in [false, true] {
+        for (interrupt, tool_rounds) in [(false, 1), (true, 1), (false, 40)] {
             let root = tempfile::tempdir().unwrap();
             let cwd = root.path().to_path_buf();
             let session_id = Uuid::new_v4();
             let client = Arc::new(BatchClient {
+                tool_rounds,
                 requests: Mutex::new(Vec::new()),
             });
             let harness = NativeHarness {
@@ -2798,7 +2804,7 @@ mod tests {
                 result.unwrap();
                 steer_ack.unwrap().await.unwrap().unwrap();
                 let requests = client.requests.lock().unwrap();
-                assert_eq!(requests.len(), 2);
+                assert_eq!(requests.len(), tool_rounds + 1);
                 assert!(requests[1].messages.iter().any(|message| matches!(message,
                     ModelMessage::Tool { tool_call_id, content }
                     if tool_call_id == "second" && content.contains("not executed"))));
