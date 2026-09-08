@@ -4089,8 +4089,10 @@ pub async fn sync_remote_session(config_path: &Path, session_id: Uuid) -> Result
         .await?
         .context("session has no workspace binding")?;
     ensure!(
-        binding.host_id == Some(config.host_id),
-        "session is not attached to this enrolled host"
+        binding
+            .host_id
+            .is_none_or(|host_id| host_id == config.host_id),
+        "session is attached to another enrolled host"
     );
     let workspace = store
         .workspace_store()
