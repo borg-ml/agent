@@ -11777,8 +11777,7 @@ fn exec_poll_completion_renders_command_and_readable_output() {
         let output = serde_json::json!({
             "command": "git push origin main",
             "stdout": "first line\nsecond line\n",
-            "stderr": "remote message
-        ",
+            "stderr": "remote message\n",
             "exit_code": exit_code,
             "running": false,
             "stdout_omitted_bytes": 12,
