@@ -1303,9 +1303,16 @@ impl SqliteSessionStore {
         let has_host_journal_cursors: i64 = sqlx::query_scalar(
             "select exists(select 1 from sqlite_master where type='table' and name='host_journal_cursors')",
         ).fetch_one(&self.pool).await?;
+        let has_host_workspace_cursors: i64 =
+            sqlx::query_scalar("select count(*) from sqlite_master where type=? and name=?")
+                .bind("table")
+                .bind("host_workspace_cursors")
+                .fetch_one(&self.pool)
+                .await?;
         Ok(version == Some(SESSION_SCHEMA_VERSION)
             && has_host_bootstraps != 0
             && has_host_journal_cursors != 0
+            && has_host_workspace_cursors != 0
             && has_access_bindings != 0
             && has_harness_routes != 0)
     }
@@ -2132,6 +2139,81 @@ impl SqliteSessionStore {
         .bind(i64::try_from(live_revision).context("host live revision exceeds SQLite integer")?)
         .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn pending_host_workspace_messages(
+        &self,
+        host_id: Uuid,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<Uuid>> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "select h.session_id from host_launches h \
+             join session_workspace_bindings b on b.session_id=h.session_id \
+             where b.host_id=? and h.session_id > ? \
+               and exists(select 1 from workspace_members m \
+                 join workspace_events e on e.workspace_id=m.workspace_id \
+                 left join host_workspace_cursors c on c.host_id=b.host_id \
+                   and c.session_id=h.session_id and c.workspace_id=e.workspace_id \
+                 where m.participant_id=b.participant_id and e.author_id=b.participant_id \
+                   and json_extract(e.event_json, '$.kind.type')='message' \
+                   and e.sequence > coalesce(c.sequence,0)) \
+             order by h.session_id limit ?",
+        )
+        .bind(host_id.to_string())
+        .bind(after.map(|id| id.to_string()).unwrap_or_default())
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(|id| parse_uuid(&id)).collect()
+    }
+
+    pub(crate) async fn host_workspace_cursors(
+        &self,
+        host_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<HashMap<Uuid, u64>> {
+        let rows = sqlx::query(
+            "select workspace_id,sequence from host_workspace_cursors where host_id=? and session_id=?",
+        )
+        .bind(host_id.to_string())
+        .bind(session_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    parse_uuid(row.try_get("workspace_id")?)?,
+                    u64::try_from(row.try_get::<i64, _>("sequence")?)
+                        .context("invalid host workspace cursor")?,
+                ))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn acknowledge_host_workspaces(
+        &self,
+        host_id: Uuid,
+        session_id: Uuid,
+        cursors: &HashMap<Uuid, u64>,
+    ) -> Result<()> {
+        if cursors.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self.begin_write().await?;
+        for (workspace_id, sequence) in cursors {
+            sqlx::query(
+                "insert into host_workspace_cursors(host_id,session_id,workspace_id,sequence) values(?,?,?,?) \
+                 on conflict(host_id,session_id,workspace_id) do update set sequence=max(sequence,excluded.sequence)",
+            )
+            .bind(host_id.to_string())
+            .bind(session_id.to_string())
+            .bind(workspace_id.to_string())
+            .bind(i64::try_from(*sequence).context("host workspace cursor exceeds SQLite integer")?)
+            .execute(&mut *transaction).await?;
+        }
         transaction.commit().await?;
         Ok(())
     }
@@ -3184,6 +3266,14 @@ impl SqliteSessionStore {
                 session_id text primary key references host_launches(session_id) on delete cascade,
                 event_cursor integer not null default 0,
                 live_revision integer not null default 0
+            );
+
+            create table if not exists host_workspace_cursors (
+                host_id text not null,
+                session_id text not null references sessions(id) on delete cascade,
+                workspace_id text not null,
+                sequence integer not null default 0,
+                primary key(host_id,session_id,workspace_id)
             );
 
             create table if not exists host_bootstraps (

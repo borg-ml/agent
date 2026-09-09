@@ -1925,6 +1925,12 @@ pub async fn run_host_with_executor_factory(
         Arc::clone(&session_store),
         Arc::clone(&sessions),
     )));
+    let _workspace_recovery = AbortTask(tokio::spawn(run_host_workspace_recovery_loop(
+        client.clone(),
+        config.clone(),
+        Arc::clone(&session_store),
+        Arc::clone(&sessions),
+    )));
     let operations = AbortTask(tokio::spawn(run_host_operation_loop(
         client.clone(),
         config.clone(),
@@ -2253,6 +2259,190 @@ async fn recover_host_journal(
         .await?;
     result?;
     Ok(sync.retry_at)
+}
+
+async fn run_host_workspace_recovery_loop(
+    client: Client,
+    config: HostConfig,
+    store: Arc<SqliteSessionStore>,
+    sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
+) {
+    let workspace = loop {
+        match store.workspace_store().await {
+            Ok(Some(workspace)) => break workspace,
+            result => {
+                let error = result.err();
+                tracing::warn!(
+                    ?error,
+                    "cannot open hosted message recovery store; retrying"
+                );
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    };
+    let mut after = None;
+    let mut retry_at = HashMap::new();
+    loop {
+        retry_at.retain(|_, retry| *retry > Instant::now());
+        let pending = match store
+            .pending_host_workspace_messages(config.host_id, after, 32)
+            .await
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(%error, "cannot scan pending hosted messages; retrying");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        after = if pending.len() == 32 {
+            pending.last().copied()
+        } else {
+            None
+        };
+        for session_id in pending {
+            if sessions.lock().await.contains_key(&session_id)
+                || retry_at
+                    .get(&session_id)
+                    .is_some_and(|retry| Instant::now() < *retry)
+            {
+                continue;
+            }
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                recover_host_workspace_messages(&client, &config, &store, &workspace, session_id),
+            )
+            .await;
+            let retry = match result {
+                Ok(Ok(retry)) => retry,
+                error => {
+                    tracing::warn!(?error, %session_id, "hosted message recovery deferred");
+                    Instant::now() + Duration::from_secs(10)
+                }
+            };
+            if retry > Instant::now() {
+                retry_at.insert(session_id, retry);
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn recover_host_workspace_messages(
+    client: &Client,
+    config: &HostConfig,
+    store: &SqliteSessionStore,
+    workspace: &SqliteWorkspaceStore,
+    session_id: Uuid,
+) -> Result<Instant> {
+    let binding = store
+        .workspace_binding(session_id)
+        .await?
+        .context("hosted session has no workspace binding")?;
+    ensure!(
+        binding.host_id == Some(config.host_id),
+        "session belongs to another enrolled host"
+    );
+    let metadata = load_launch_metadata(store, session_id)
+        .await?
+        .context("session has no hosted launch")?;
+    let execution_workspace = metadata
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.workspace_id);
+    ensure!(
+        execution_workspace.is_none_or(|id| id == binding.workspace_id),
+        "hosted workspace binding changed"
+    );
+    let participant = metadata
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.participant_id);
+    ensure!(
+        execution_workspace.is_some() == participant.is_some(),
+        "incoherent hosted workspace identity"
+    );
+    ensure!(
+        binding.participant_id == participant.unwrap_or(session_id),
+        "hosted participant binding changed"
+    );
+    if let Some(identity) = metadata
+        .attachment
+        .as_ref()
+        .and_then(|attachment| attachment.host_identity.as_ref())
+    {
+        ensure!(
+            identity.host_id == config.host_id,
+            "hosted launch belongs to another enrolled host"
+        );
+    }
+    // Upload only: no inbox import, actor startup, provider admission, or lease renewal.
+    let later = Instant::now() + Duration::from_secs(60);
+    let mut sync = JournalSync {
+        uploaded_sequence: 0,
+        uploaded_live_revision: 0,
+        uploaded_workspace_sequences: store
+            .host_workspace_cursors(config.host_id, session_id)
+            .await?,
+        workspace_relay_available: execution_workspace.is_some(),
+        instance_relay_available: true,
+        next_workspace_roster_sync: later,
+        next_instance_directory_sync: later,
+        next_inbox_sync: later,
+        retry_at: Instant::now(),
+    };
+    flush_host_workspace_messages(
+        client,
+        config,
+        store,
+        Some(workspace),
+        session_id,
+        execution_workspace,
+        &mut sync,
+    )
+    .await?;
+    if execution_workspace.is_some() && !sync.workspace_relay_available {
+        return Ok(Instant::now() + Duration::from_secs(300));
+    }
+    Ok(sync.retry_at)
+}
+
+async fn flush_host_workspace_messages(
+    client: &Client,
+    config: &HostConfig,
+    store: &SqliteSessionStore,
+    workspace: Option<&SqliteWorkspaceStore>,
+    session_id: Uuid,
+    execution_workspace: Option<Uuid>,
+    sync: &mut JournalSync,
+) -> Result<bool> {
+    let before = sync.uploaded_workspace_sequences.clone();
+    let result = flush_workspace_messages(
+        client,
+        config,
+        store,
+        workspace,
+        session_id,
+        execution_workspace,
+        sync,
+    )
+    .await;
+    if sync.uploaded_workspace_sequences != before {
+        if let Err(error) = store
+            .acknowledge_host_workspaces(
+                config.host_id,
+                session_id,
+                &sync.uploaded_workspace_sequences,
+            )
+            .await
+        {
+            sync.uploaded_workspace_sequences = before;
+            // Retry the checkpoint without masking a fatal upload rejection.
+            result?;
+            return Err(error);
+        }
+    }
+    result
 }
 
 async fn run_host_heartbeat_loop(
@@ -4292,8 +4482,11 @@ async fn run_session(
     let store: Arc<dyn SessionStore> = sqlite_store.clone();
     let cursor = load_session_sync(&client, &config, session_id).await?;
     let mut sync = JournalSync::new(cursor, attachment.is_some());
+    sync.uploaded_workspace_sequences = sqlite_store
+        .host_workspace_cursors(config.host_id, session_id)
+        .await?;
     flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
-    flush_workspace_messages(
+    flush_host_workspace_messages(
         &client,
         &config,
         sqlite_store.as_ref(),
@@ -4364,7 +4557,7 @@ async fn run_session(
         }
         let synchronized: Result<()> = async {
             flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
-            flush_workspace_messages(
+            flush_host_workspace_messages(
                 &client,
                 &config,
                 sqlite_store.as_ref(),
@@ -4395,7 +4588,7 @@ async fn run_session(
     if session_expired {
         let _ = (&mut actor.0).await;
         flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
-        flush_workspace_messages(
+        flush_host_workspace_messages(
             &client,
             &config,
             sqlite_store.as_ref(),
@@ -4415,7 +4608,7 @@ async fn run_session(
         .context("agent session task failed")??;
     finish_ready_host_bootstrap(&sqlite_store, session_id, initial_prompt_id).await?;
     flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
-    flush_workspace_messages(
+    flush_host_workspace_messages(
         &client,
         &config,
         sqlite_store.as_ref(),
@@ -8001,6 +8194,345 @@ connection: close
         assert!(
             reason.is_some(),
             "unsupported command is retained, not executed or silently deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopped_host_recovers_final_messages_without_an_actor_or_pending_journal() {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        let root = tempdir().unwrap();
+        let path = root.path().join("sessions.sqlite3");
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        // Current-v5 databases acquire the additive table without losing their journal.
+        sqlx::query("drop table host_workspace_cursors")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        drop(store);
+        let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let session_id = Uuid::new_v4();
+        let recipient = Uuid::new_v4();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config(root.path());
+        config.server = format!("http://{}", listener.local_addr().unwrap());
+        config.resource_limits.max_concurrent_sessions = 1;
+        store.create_session(session_id).await.unwrap();
+        let binding = store.workspace_binding(session_id).await.unwrap().unwrap();
+        let attachment = WorkspaceAttachment {
+            workspace_id: Some(binding.workspace_id),
+            participant_id: Some(session_id),
+            command_authority: None,
+            host_identity: None,
+            host_capabilities: None,
+            presence_lease: None,
+            approval_provenance: None,
+            reconnect_sync_cursors: None,
+        };
+        persist_launch_metadata(
+            &store,
+            session_id,
+            &bootstrap_test_launch(root.path()),
+            Some(&attachment),
+        )
+        .await
+        .unwrap();
+        store
+            .attach_workspace(crate::SessionWorkspaceBinding {
+                host_id: Some(config.host_id),
+                ..binding.clone()
+            })
+            .await
+            .unwrap();
+        let workspace = store.workspace_store().await.unwrap().unwrap();
+        workspace
+            .ensure_execution_workspace(
+                binding.workspace_id,
+                "Sender",
+                crate::local_human_participant_id("Human"),
+                "Human",
+                session_id,
+                "Sender",
+            )
+            .await
+            .unwrap();
+        workspace
+            .upsert_instance(
+                Participant {
+                    id: recipient,
+                    display_name: "Remote".to_string(),
+                    kind: ParticipantKind::Agent,
+                    created_at: Utc::now(),
+                },
+                Some(Uuid::new_v4()),
+                None,
+            )
+            .await
+            .unwrap();
+        let direct = workspace
+            .ensure_direct_workspace(session_id, recipient)
+            .await
+            .unwrap();
+        workspace
+            .append_message(crate::NewWorkspaceMessage {
+                workspace_id: direct,
+                author_id: session_id,
+                text: "final private report".to_string(),
+                mentions: Vec::new(),
+                audience: Audience::Direct {
+                    participant: recipient,
+                },
+                mode: crate::DeliveryMode::NextTurn,
+                thread_id: None,
+                reply_to_message_id: None,
+                idempotency_key: "final-report".to_string(),
+            })
+            .await
+            .unwrap();
+        let stopped = store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                crate::SessionEventKind::StatusChanged {
+                    status: crate::SessionStatus::Stopped,
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+        store
+            .acknowledge_host_journal(session_id, stopped.sequence, 0)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .pending_host_journals(None, 8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .pending_host_launch_metadata(8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let (sent, mut received) = mpsc::channel(8);
+        let status = Arc::new(AtomicU16::new(503));
+        let server_status = Arc::clone(&status);
+        let _server = AbortTask(tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (path, body) = read_http_request(&mut socket).await;
+                assert!(
+                    path.ends_with("/messages"),
+                    "recovery must only upload messages: {path}"
+                );
+                sent.send((
+                    path,
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                ))
+                .await
+                .unwrap();
+                let status = server_status.load(Ordering::SeqCst);
+                if status == 0 {
+                    continue;
+                } // Accepted by relay, response lost.
+                socket.write_all(format!("HTTP/1.1 {status} Response\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            }
+        }));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let retry =
+            recover_host_workspace_messages(&client, &config, &store, &workspace, session_id)
+                .await
+                .unwrap();
+        assert!(retry > Instant::now());
+        let original = received.recv().await.unwrap();
+        assert_eq!(original.1["text"], "final private report");
+        assert_eq!(
+            store
+                .pending_host_workspace_messages(config.host_id, None, 8)
+                .await
+                .unwrap(),
+            [session_id]
+        );
+        drop(workspace);
+        drop(store);
+        let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let workspace = store.workspace_store().await.unwrap().unwrap();
+        for rejected in [0, 401] {
+            status.store(rejected, Ordering::SeqCst);
+            let result =
+                recover_host_workspace_messages(&client, &config, &store, &workspace, session_id)
+                    .await;
+            if rejected == 401 {
+                assert_eq!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<reqwest::Error>()
+                        .unwrap()
+                        .status(),
+                    Some(StatusCode::UNAUTHORIZED)
+                );
+            } else {
+                assert!(result.unwrap() > Instant::now());
+            }
+            assert_eq!(
+                received.recv().await.unwrap(),
+                original,
+                "lost/rejected responses replay identical message identity and body"
+            );
+            assert_eq!(
+                store
+                    .pending_host_workspace_messages(config.host_id, None, 8)
+                    .await
+                    .unwrap(),
+                [session_id]
+            );
+        }
+        status.store(204, Ordering::SeqCst);
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = mpsc::channel(1);
+        sessions.lock().await.insert(session_id, tx.clone());
+        let mut worker = AbortTask(tokio::spawn(run_host_workspace_recovery_loop(
+            client.clone(),
+            config.clone(),
+            Arc::clone(&store),
+            Arc::clone(&sessions),
+        )));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), received.recv())
+                .await
+                .is_err(),
+            "active actors keep their own uploader"
+        );
+        sessions.lock().await.remove(&session_id);
+        let active_id = Uuid::new_v4();
+        sessions.lock().await.insert(active_id, tx);
+        let delivered = tokio::time::timeout(Duration::from_secs(5), received.recv()).await
+            .expect("stopped hosted messages must recover even when the session journal is already caught up")
+            .unwrap();
+        assert_eq!(delivered, original);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !store
+                .pending_host_workspace_messages(config.host_id, None, 8)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        worker.0.abort();
+        let _ = (&mut worker.0).await;
+        assert_eq!(
+            sessions.lock().await.keys().copied().collect::<Vec<_>>(),
+            [active_id]
+        );
+        assert_eq!(
+            store.state(session_id).await.unwrap().status,
+            Some(crate::SessionStatus::Stopped)
+        );
+        let acknowledged = store
+            .host_workspace_cursors(config.host_id, session_id)
+            .await
+            .unwrap();
+        store
+            .acknowledge_host_workspaces(config.host_id, session_id, &HashMap::from([(direct, 0)]))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .host_workspace_cursors(config.host_id, session_id)
+                .await
+                .unwrap(),
+            acknowledged
+        );
+        drop(workspace);
+        drop(store);
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let workspace = store.workspace_store().await.unwrap().unwrap();
+        assert_eq!(
+            store
+                .host_workspace_cursors(config.host_id, session_id)
+                .await
+                .unwrap(),
+            acknowledged
+        );
+        recover_host_workspace_messages(&client, &config, &store, &workspace, session_id)
+            .await
+            .unwrap();
+        assert!(
+            received.try_recv().is_err(),
+            "acknowledged output stays caught up after reopen"
+        );
+        let mut other_host = config.clone();
+        other_host.host_id = Uuid::new_v4();
+        assert!(
+            store
+                .pending_host_workspace_messages(other_host.host_id, None, 8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .host_workspace_cursors(other_host.host_id, session_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            recover_host_workspace_messages(&client, &other_host, &store, &workspace, session_id)
+                .await
+                .is_err()
+        );
+        assert!(received.try_recv().is_err());
+        workspace
+            .append_message(crate::NewWorkspaceMessage {
+                workspace_id: binding.workspace_id,
+                author_id: session_id,
+                text: "final shared report".to_string(),
+                mentions: Vec::new(),
+                audience: Audience::Workspace,
+                mode: crate::DeliveryMode::NextTurn,
+                thread_id: None,
+                reply_to_message_id: None,
+                idempotency_key: "shared-report".to_string(),
+            })
+            .await
+            .unwrap();
+        status.store(404, Ordering::SeqCst);
+        let retry =
+            recover_host_workspace_messages(&client, &config, &store, &workspace, session_id)
+                .await
+                .unwrap();
+        assert!(retry > Instant::now() + Duration::from_secs(290));
+        let shared = received.recv().await.unwrap();
+        assert!(shared.0.ends_with("/workspace/messages"));
+        assert_eq!(
+            store
+                .pending_host_workspace_messages(config.host_id, None, 8)
+                .await
+                .unwrap(),
+            [session_id]
+        );
+        status.store(204, Ordering::SeqCst);
+        recover_host_workspace_messages(&client, &config, &store, &workspace, session_id)
+            .await
+            .unwrap();
+        assert_eq!(received.recv().await.unwrap(), shared);
+        assert!(
+            store
+                .pending_host_workspace_messages(config.host_id, None, 8)
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 

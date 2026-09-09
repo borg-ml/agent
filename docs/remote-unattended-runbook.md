@@ -210,8 +210,7 @@ An inactive terminal session is not resurrected by a late command or duplicate
 Launch. Startup rechecks terminal state under writer ownership as well, so a
 Stop recorded while startup awaited the relay wins over that stale startup.
 Historical queue events are retained. These host checks do not establish
-explicit local CLI reopening behavior or workspace/private-message delivery
-settlement.
+explicit local CLI reopening behavior or recipient-side message consumption.
 Terminal launch rejection still uploads its failure before acknowledgement.
 
 ## Hosted actor ownership and synchronization faults
@@ -242,9 +241,45 @@ cessation of action-lease heartbeats. They use a pending fake executor, not a
 live model. Owned Rust task cancellation does not prove cleanup of every
 external provider process or detached helper. Actor errors and duration limits
 can still leave nonterminal durable work eligible for later recovery. Initial
-and final synchronization retain their existing behavior; the independent
-journal worker covers final session output, not guaranteed final
-workspace/private-message delivery. Production acceptance remains required.
+and final synchronization retain their existing behavior; independent recovery
+workers publish retained session output and hosted workspace/private messages
+after the actor exits. Production acceptance remains required.
+
+## Final hosted workspace and private messages
+
+A separate upload-only recovery worker drains workspace/private messages for
+inactive hosted sessions, even when their session journal is already caught up
+and all actor slots are occupied. It never starts an actor/provider, imports an
+inbox, refreshes presence, or renews a lease. Active hosted sessions retain their
+own uploader; both paths persist progress in `host_workspace_cursors`, keyed by
+host, session, and workspace. This additive current-v5 table does not rewrite
+journal history. Reopening the database preserves acknowledged progress.
+
+Only sessions with durable hosted launch metadata and a workspace binding to
+the current enrolled host are scanned. A binding/launch identity mismatch is
+retained for diagnosis, not silently reassigned. This does not repair historical
+host-ownership reassignment in other startup paths. Local CLI mirrors without
+hosted launch metadata are outside this worker; their mirror or explicit
+`borg remote sync --session SESSION_UUID --send-pending` remains responsible.
+
+Network errors, HTTP 503, or a lost success response retain the exact message
+idempotency key for replay. Cursors advance only over handled events; they never
+regress on stale checkpoints. A cursor is an upload/disposition boundary, not
+proof the recipient actor consumed the message. Existing permanent private
+message rejection policy remains: most HTTP 4xx responses record Failed locally;
+401 and 429 are not treated as delivered. Shared-workspace 404 retains the
+message and schedules a 300-second retry. Other transient failures retain their
+normal backoff. Worker attempts are bounded to ten seconds per session and scan
+past deferred/active sessions, independently of journal and command polling.
+
+Successful old-binary uploads have no local durable cursor, so the first new
+recovery pass can replay historical messages with their original IDs. Relay
+idempotency is required for that replay and concurrent uploaders. Rollback to
+an old binary leaves the new cursor table intact but removes inactive message
+recovery until a capable binary returns. Never delete workspace events or
+cursor rows to force recovery. A failing workspace may still delay other
+messages from the same sender; this is not a general per-recipient outbox or a
+guarantee that unavailable/deleted recipients will accept output.
 
 ## Deferred shell and workspace commands
 
