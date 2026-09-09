@@ -86,6 +86,30 @@ Never print the complete host config in logs or support messages: it contains
 the host bearer token. The config directory should be mode `0700` and the
 config and state files mode `0600`.
 
+## Relay permission compatibility
+
+Current terminal registration sends canonical `manual` or `auto` approval
+policies. A relay that only accepts legacy sandbox modes rejects these sessions
+with HTTP 422; upgrade the relay rather than relabeling the terminal policy.
+The relay must preserve these values in registration and renewal. Its workspace
+execution grants remain distinct from approval policies. Older relay binaries
+cannot safely read sessions stored with the new modes, so relay rollback needs
+a separately reviewed data/recovery plan.
+
+Event upload currently retains a historical compatibility rewrite (`manual` to
+`read_only`, `auto` to `workspace_write`). Do not assume local and remote event
+payloads are identical or remove the rewrite without a replay-aware transition:
+an already uploaded event, including one whose response was lost, must not be
+retried with conflicting content.
+
+The 2026-09-09 disposable local Chrome/real-relay smoke verified two terminal
+mirrors alongside background host polling: discovery, isolated prompt delivery,
+connection loss/503 recovery, browser offline/reload output catch-up, mirror
+restart retaining identity, and browser Stop. Replies were deterministic; no
+provider was invoked. This is local transport evidence, not production or
+provider acceptance. No real enrollment, user session, or production deployment
+was changed.
+
 ## Automatic recovery contract
 
 | Fault | Expected automatic behavior |
