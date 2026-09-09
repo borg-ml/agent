@@ -1958,7 +1958,7 @@ pub async fn run_host_with_executor_factory(
             !operations.0.is_finished(),
             "remote host operation worker stopped"
         );
-        recovery_offset = resume_pending_host_sessions(
+        match resume_pending_host_sessions(
             recovery_offset,
             &client,
             &config,
@@ -1967,7 +1967,13 @@ pub async fn run_host_with_executor_factory(
             &session_store,
             &executor_factory,
         )
-        .await?;
+        .await
+        {
+            Ok(next_offset) => recovery_offset = next_offset,
+            Err(error) => {
+                tracing::warn!(%error, recovery_offset, "host session recovery failed; retaining scan position and continuing command polling");
+            }
+        }
         let command_cursor = acknowledged.lock().await.sequence;
         let response = client
             .get(endpoint(&config.server, "/api/remote/host/commands"))
@@ -9181,6 +9187,161 @@ mod tests {
                 .unwrap()[0]
                 .0,
             unstarted
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_scan_fault_keeps_host_polling_and_recovers_without_restart() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::sync::oneshot;
+        let root = tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config(root.path());
+        config.server = format!("http://{}", listener.local_addr().unwrap());
+        let config_path = root.path().join("host.json");
+        write_config(&config_path, &config).unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions/sessions.sqlite3"))
+            .await
+            .unwrap();
+        let (gates_tx, mut gates) = mpsc::channel(2);
+        let stop = Arc::new(AtomicBool::new(false));
+        let uploads = Arc::new(AtomicUsize::new(0));
+        let server_stop = Arc::clone(&stop);
+        let server_uploads = Arc::clone(&uploads);
+        let _server = AbortTask(tokio::spawn(async move {
+            let mut polls = 0;
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (path, _) = read_http_request(&mut socket).await;
+                let path = path.split("?").next().unwrap();
+                let (status, body) = if path == "/api/remote/host/commands" {
+                    polls += 1;
+                    if polls <= 2 {
+                        let (release, wait) = oneshot::channel();
+                        gates_tx.send(release).await.unwrap();
+                        wait.await.unwrap();
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    if server_stop.load(Ordering::SeqCst) {
+                        (401, "")
+                    } else {
+                        (200, "{\"commands\":[]}")
+                    }
+                } else if path == "/api/remote/host/events" {
+                    server_uploads.fetch_add(1, Ordering::SeqCst);
+                    (200, "")
+                } else if path.ends_with("/sync") {
+                    (200, "{\"event_cursor\":0,\"live_revision\":0}")
+                } else if matches!(
+                    path,
+                    "/api/remote/host/heartbeat" | "/api/remote/host/live-state"
+                ) {
+                    (200, "")
+                } else {
+                    (404, "")
+                };
+                socket.write_all(format!("HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        }));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&factory_calls);
+        let factory: HostExecutorFactory = Arc::new(move |_, _| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            bail!("test launch must fail cwd validation before provider construction")
+        });
+        let mut host = AbortTask(tokio::spawn(async move {
+            run_host_with_executor_factory(&config_path, factory).await
+        }));
+        let first = tokio::time::timeout(Duration::from_secs(30), gates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let id = Uuid::new_v4();
+        let mut launch = bootstrap_test_launch(root.path());
+        launch.cwd = root.path().join("no-longer-present");
+        persist_launch_metadata(&config, &store, id, &launch, None)
+            .await
+            .unwrap();
+        store.begin_host_bootstrap(id).await.unwrap();
+        let metadata = store.load_host_launch_metadata(id).await.unwrap().unwrap();
+        // Corrupt only the disposable recovery row after the host is already polling.
+        sqlx::query("update host_launches set metadata_json=? where session_id=?")
+            .bind("{")
+            .bind(id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        assert!(
+            store
+                .pending_host_launch_metadata_for_host(
+                    0,
+                    Some((config.host_id, &host_relay_origin(&config).unwrap())),
+                    256,
+                )
+                .await
+                .is_err()
+        );
+        first.send(()).unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                gate = gates.recv() => gate.expect("mock relay remains available"),
+                result = &mut host.0 => panic!("a local recovery scan fault disconnected the host: {result:?}"),
+            }
+        }).await.expect("command polling must continue during a local recovery scan failure");
+        assert!(!store.contains_session(id).await.unwrap());
+        let retained: String =
+            sqlx::query_scalar("select metadata_json from host_launches where session_id=?")
+                .bind(id.to_string())
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            retained, "{",
+            "failed recovery must not rewrite or discard the faulted row"
+        );
+        sqlx::query("update host_launches set metadata_json=? where session_id=?")
+            .bind(serde_json::to_string(&metadata).unwrap())
+            .bind(id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        second.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if store.contains_session(id).await.unwrap()
+                    && store.state(id).await.unwrap().status == Some(crate::SessionStatus::Failed)
+                    && store
+                        .pending_host_launch_metadata(8)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                {
+                    break;
+                }
+                assert!(
+                    !host.0.is_finished(),
+                    "repaired recovery must not require a host restart"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(uploads.load(Ordering::SeqCst) > 0);
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.load_host_launch_metadata(id).await.unwrap(),
+            Some(metadata)
+        );
+        stop.store(true, Ordering::SeqCst);
+        let error = tokio::time::timeout(Duration::from_secs(10), &mut host.0)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("token was rejected"),
+            "relay revocation must remain fatal: {error:#}"
         );
     }
 

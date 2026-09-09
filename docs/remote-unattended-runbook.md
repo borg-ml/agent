@@ -194,6 +194,13 @@ returned candidates per pass, not database scan cost or wall-clock recovery
 latency. Restoration still requires the existing ownership, lease, capacity,
 and writer fences; idle sessions without pending work are not newly restored.
 
+A recovery scan error is logged and retried from the same offset on a later
+polling pass. It no longer exits the host loop and tears down heartbeats and
+background workers before the next relay command poll. Unreadable recovery data
+is retained, not silently skipped or repaired, and can still block actor recovery
+until it becomes readable. Relay command-poll authentication rejection remains
+fatal; this is not a blanket retry policy for host errors.
+
 An independent upload-only recovery loop also scans inactive hosted journals
 against durable, confirmed relay cursors. Final session events and remaining
 live-state snapshots are retried even if the actor already exited, including
