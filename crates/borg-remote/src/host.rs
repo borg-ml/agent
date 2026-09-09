@@ -19,6 +19,7 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::receipt::{ReceiptState, SqliteReceiptStore};
+use crate::session::AbortTask;
 use crate::{
     AgentRuntimeCommandEnvelope, AgentRuntimeEventEnvelope, AgentTurnExecutor, Audience,
     CodingProvider, HostCapabilities, HostCommand, HostCommandEnvelope, HostExecutionProfile,
@@ -81,14 +82,6 @@ struct HostAcknowledgement {
 struct PersistedHostState {
     host_id: Uuid,
     acknowledged: HostAcknowledgement,
-}
-
-struct AbortTask(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortTask {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 #[derive(Default)]
@@ -468,7 +461,8 @@ async fn upload_event_payloads(
             match response {
                 Ok(response) if response.status().is_success() => Ok(true),
                 Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                    bail!("remote host token was rejected; enroll this host again");
+                    return Err(response.error_for_status().unwrap_err())
+                        .context("remote host token was rejected; enroll this host again");
                 }
                 Ok(response) => {
                     tracing::warn!(
@@ -750,14 +744,16 @@ async fn upload_event_page(
                 });
             }
             Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                bail!("remote host token was rejected; enroll this host again");
+                return Err(response.error_for_status().unwrap_err())
+                    .context("remote host token was rejected; enroll this host again");
             }
             Ok(response) if response.status() == StatusCode::CONFLICT => {
-                bail!(
-                    "remote event replay conflicted with the durable journal for session {}: {}",
-                    batch[0].session_id,
-                    response.text().await.unwrap_or_default()
-                );
+                let error = response.error_for_status_ref().unwrap_err();
+                let detail = response.text().await.unwrap_or_default();
+                return Err(error).with_context(|| format!(
+                    "remote event replay conflicted with the durable journal for session {}: {detail}",
+                    batch[0].session_id
+                ));
             }
             Ok(response)
                 if response.status().is_client_error()
@@ -858,7 +854,8 @@ async fn upload_live_state(
             Ok(true)
         }
         Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-            bail!("remote host token was rejected; enroll this host again");
+            return Err(response.error_for_status().unwrap_err())
+                .context("remote host token was rejected; enroll this host again");
         }
         Ok(response) => {
             tracing::warn!(
@@ -4320,7 +4317,7 @@ async fn run_session(
         .filter(|prompt| !prompt.trim().is_empty())
         .map(|_| launch.request_id);
     let mut bootstrap_finished = false;
-    let actor = tokio::spawn(async move {
+    let mut actor = AbortTask(tokio::spawn(async move {
         run_agent_session_with_store_and_writer_and_lsp_policy(
             &actor_session_root,
             session_id,
@@ -4333,7 +4330,7 @@ async fn run_session(
             lsp_policy,
         )
         .await
-    });
+    }));
     let session_deadline = tokio::time::sleep(Duration::from_secs(
         config.resource_limits.max_session_seconds,
     ));
@@ -4352,7 +4349,7 @@ async fn run_session(
                 // withholding prompts; the local journal remains available
                 // for the normal recovery path.
                 session_expired = true;
-                actor.abort();
+                actor.0.abort();
                 break;
             }
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -4365,20 +4362,38 @@ async fn run_session(
                 }
             }
         }
-        flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
-        flush_workspace_messages(
-            &client,
-            &config,
-            sqlite_store.as_ref(),
-            workspace_store.as_ref(),
-            session_id,
-            workspace_attachment.map(|(workspace_id, _)| workspace_id),
-            &mut sync,
-        )
-        .await?;
+        let synchronized: Result<()> = async {
+            flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
+            flush_workspace_messages(
+                &client,
+                &config,
+                sqlite_store.as_ref(),
+                workspace_store.as_ref(),
+                session_id,
+                workspace_attachment.map(|(workspace_id, _)| workspace_id),
+                &mut sync,
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = synchronized {
+            if error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+                matches!(
+                    error.status(),
+                    Some(StatusCode::UNAUTHORIZED | StatusCode::CONFLICT)
+                )
+            }) {
+                actor.0.abort();
+                let _ = (&mut actor.0).await;
+                return Err(error);
+            }
+            tracing::warn!(%error, %session_id, "session synchronization failed; keeping actor and controls alive for retry");
+            sync.retry_at = Instant::now() + Duration::from_secs(2);
+        }
     }
     if session_expired {
-        let _ = actor.await;
+        let _ = (&mut actor.0).await;
         flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
         flush_workspace_messages(
             &client,
@@ -4395,7 +4410,9 @@ async fn run_session(
             config.resource_limits.max_session_seconds
         );
     }
-    actor.await.context("agent session task failed")??;
+    (&mut actor.0)
+        .await
+        .context("agent session task failed")??;
     finish_ready_host_bootstrap(&sqlite_store, session_id, initial_prompt_id).await?;
     flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
     flush_workspace_messages(
@@ -5125,7 +5142,8 @@ async fn flush_workspace_messages(
                     match response {
                         Ok(response) if response.status().is_success() => {}
                         Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                            bail!("remote host token was rejected; enroll this host again");
+                            return Err(response.error_for_status().unwrap_err())
+                                .context("remote host token was rejected; enroll this host again");
                         }
                         Ok(response)
                             if !shared_workspace
@@ -6614,6 +6632,191 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auxiliary_upload_rejection_preserves_status_and_unacknowledged_output() {
+        let root = tempdir().unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                crate::SessionEventKind::ToolCompleted {
+                    tool_call_id: "large".to_string(),
+                    output: "x".repeat(crate::session_store::INLINE_SESSION_PAYLOAD_BYTES + 1),
+                    output_ref: None,
+                    is_error: false,
+                    input: None,
+                    input_ref: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let events = store.events_after(session_id, 0, 8).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = HostConfig {
+            server: format!("http://{}", listener.local_addr().unwrap()),
+            ..test_config(root.path())
+        };
+        let server = AbortTask(tokio::spawn(async move {
+            let mut paths = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (path, _) = read_http_request(&mut stream).await;
+                paths.push(path);
+                stream.write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await.unwrap();
+            }
+            paths
+        }));
+        let client = Client::new();
+        let mut uploaded_sequence = 0;
+        let error = upload_event_page(
+            &client,
+            &config,
+            &store,
+            &events,
+            &mut uploaded_sequence,
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<reqwest::Error>()
+                .and_then(|e| e.status()),
+            Some(StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(uploaded_sequence, 0);
+        assert_eq!(
+            serde_json::to_value(store.events_after(session_id, 0, 8).await.unwrap()).unwrap(),
+            serde_json::to_value(&events).unwrap()
+        );
+
+        let workspace = store.workspace_store().await.unwrap().unwrap();
+        let binding = store.workspace_binding(session_id).await.unwrap().unwrap();
+        let human = crate::local_human_participant_id("Human");
+        workspace
+            .ensure_execution_workspace(
+                binding.workspace_id,
+                "Sender",
+                human,
+                "Human",
+                session_id,
+                "Sender",
+            )
+            .await
+            .unwrap();
+        let recipient = Uuid::new_v4();
+        workspace
+            .upsert_instance(
+                Participant {
+                    id: recipient,
+                    display_name: "Remote".to_string(),
+                    kind: ParticipantKind::Agent,
+                    created_at: Utc::now(),
+                },
+                Some(Uuid::new_v4()),
+                None,
+            )
+            .await
+            .unwrap();
+        let direct_workspace = workspace
+            .ensure_direct_workspace(session_id, recipient)
+            .await
+            .unwrap();
+        for shared in [false, true] {
+            let workspace_id = if shared {
+                binding.workspace_id
+            } else {
+                direct_workspace
+            };
+            workspace
+                .append_message(crate::NewWorkspaceMessage {
+                    workspace_id,
+                    author_id: session_id,
+                    text: "retain on rejection".to_string(),
+                    mentions: Vec::new(),
+                    audience: if shared {
+                        Audience::Workspace
+                    } else {
+                        Audience::Direct {
+                            participant: recipient,
+                        }
+                    },
+                    mode: crate::DeliveryMode::NextTurn,
+                    thread_id: None,
+                    reply_to_message_id: None,
+                    idempotency_key: format!("auth-{shared}"),
+                })
+                .await
+                .unwrap();
+            let before = workspace
+                .replay(workspace_id, session_id, 0, 256)
+                .await
+                .unwrap();
+            let message_sequence = before
+                .iter()
+                .find(|e| matches!(e.kind, WorkspaceEventKind::Message { .. }))
+                .unwrap()
+                .sequence;
+            let later = Instant::now() + Duration::from_secs(60);
+            let mut sync = JournalSync {
+                uploaded_sequence: 0,
+                uploaded_live_revision: 0,
+                uploaded_workspace_sequences: HashMap::new(),
+                workspace_relay_available: shared,
+                instance_relay_available: !shared,
+                next_workspace_roster_sync: later,
+                next_instance_directory_sync: later,
+                next_inbox_sync: later,
+                retry_at: Instant::now(),
+            };
+            let error = flush_workspace_messages(
+                &client,
+                &config,
+                &store,
+                Some(&workspace),
+                session_id,
+                Some(binding.workspace_id),
+                &mut sync,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<reqwest::Error>()
+                    .and_then(|e| e.status()),
+                Some(StatusCode::UNAUTHORIZED)
+            );
+            assert!(
+                sync.uploaded_workspace_sequences
+                    .get(&workspace_id)
+                    .copied()
+                    .unwrap_or_default()
+                    < message_sequence
+            );
+            assert_eq!(
+                workspace
+                    .replay(workspace_id, session_id, 0, 256)
+                    .await
+                    .unwrap(),
+                before
+            );
+        }
+        let mut server = server;
+        let paths = tokio::time::timeout(Duration::from_secs(3), &mut server.0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(paths[0].contains("/payloads/"));
+        assert!(paths[1].ends_with(&format!("/{session_id}/messages")));
+        assert!(paths[2].ends_with("/workspace/messages"));
+    }
+
+    #[tokio::test]
     #[ignore = "explicit remote payload upload concurrency profile"]
     async fn remote_payload_upload_concurrency_profile() {
         let root = tempdir().unwrap();
@@ -7001,6 +7204,218 @@ mod tests {
             subagent_concurrency_limit: None,
             extension_skill_roots: Vec::new(),
             team_policy: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_actor_survives_sync_faults_but_is_owned_on_rejection_or_cancellation() {
+        use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+        use tokio::sync::Notify;
+        struct PendingExecutor {
+            started: Arc<Notify>,
+            dropped: Arc<Notify>,
+        }
+        struct NotifyDrop(Arc<Notify>);
+        impl Drop for NotifyDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        #[async_trait::async_trait]
+        impl AgentTurnExecutor for PendingExecutor {
+            async fn execute(
+                &self,
+                _turn: crate::AgentTurn,
+                _events: mpsc::Sender<crate::SessionEventKind>,
+                _controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
+            ) -> Result<crate::AgentTurnResult> {
+                let _lifetime = NotifyDrop(Arc::clone(&self.dropped));
+                self.started.notify_one();
+                std::future::pending().await
+            }
+        }
+        let root = tempdir().unwrap();
+        let mut config = test_config(root.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.server = format!("http://{}", listener.local_addr().unwrap());
+        let rejection = Arc::new(AtomicU16::new(200));
+        let uploaded = Arc::new(AtomicU64::new(0));
+        let server_rejection = Arc::clone(&rejection);
+        let server_uploaded = Arc::clone(&uploaded);
+        let _server = AbortTask(tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (path, request) = read_http_request(&mut stream).await;
+                let path = path.split("?").next().unwrap();
+                let (status, body) = if path.ends_with("/sync") {
+                    (200, "{\"event_cursor\":0,\"live_revision\":0}")
+                } else if path == "/api/remote/host/events" {
+                    let status = server_rejection.load(Ordering::SeqCst);
+                    if status == 200 {
+                        let body: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                        for event in body["events"].as_array().unwrap() {
+                            let sequence = event["sequence"]
+                                .as_u64()
+                                .or_else(|| event["event"]["sequence"].as_u64())
+                                .unwrap();
+                            server_uploaded.fetch_max(sequence, Ordering::SeqCst);
+                        }
+                    }
+                    (status, "")
+                } else if path == "/api/remote/host/live-state" {
+                    (200, "")
+                } else {
+                    (404, "")
+                };
+                stream.write_all(format!("HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        }));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let executor: Arc<dyn AgentTurnExecutor> = Arc::new(PendingExecutor {
+            started: Arc::clone(&started),
+            dropped: Arc::clone(&dropped),
+        });
+        let factory: HostExecutorFactory = Arc::new(move |_, _| Ok(Arc::clone(&executor)));
+        let session_id = Uuid::new_v4();
+        let (commands, rx) = mpsc::channel(8);
+        let mut supervisor = AbortTask(tokio::spawn(run_session(
+            client.clone(),
+            config.clone(),
+            root.path().to_path_buf(),
+            Arc::clone(&factory),
+            HostSessionLaunch {
+                session_id,
+                request: bootstrap_test_launch(root.path()),
+                attachment: None,
+            },
+            rx,
+        )));
+        tokio::time::timeout(Duration::from_secs(30), started.notified())
+            .await
+            .unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        // Corrupt only a disposable live projection, not the authoritative journal.
+        sqlx::query("insert into session_live_state(session_id,live_key,revision,event_json,updated_at) values(?,?,?,?,?)")
+            .bind(session_id.to_string()).bind("injected").bind(i64::MAX).bind("{")
+            .bind(Utc::now().to_rfc3339()).execute(store.pool()).await.unwrap();
+        assert!(store.live_events_after(session_id, 0).await.is_err());
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !supervisor.0.is_finished(),
+            "a projection read failure must not abandon the actor"
+        );
+        assert!(
+            SessionWriterLease::try_acquire(root.path().join(format!("{session_id}.lock")))
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query("delete from session_live_state where session_id=? and live_key=?")
+            .bind(session_id.to_string())
+            .bind("injected")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let marker = store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                crate::SessionEventKind::Error {
+                    message: "sync recovery marker".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(8), async {
+            while uploaded.load(Ordering::SeqCst) < marker.sequence {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        commands
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(8), &mut supervisor.0)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.state(session_id).await.unwrap().status,
+            Some(crate::SessionStatus::Stopped)
+        );
+        assert!(
+            uploaded.load(Ordering::SeqCst)
+                >= store.state(session_id).await.unwrap().latest_sequence
+        );
+        for status in [Some(401), Some(409), None] {
+            rejection.store(200, Ordering::SeqCst);
+            let id = Uuid::new_v4();
+            let (_commands, rx) = mpsc::channel(8);
+            let mut supervisor = AbortTask(tokio::spawn(run_session(
+                client.clone(),
+                config.clone(),
+                root.path().to_path_buf(),
+                Arc::clone(&factory),
+                HostSessionLaunch {
+                    session_id: id,
+                    request: bootstrap_test_launch(root.path()),
+                    attachment: None,
+                },
+                rx,
+            )));
+            tokio::time::timeout(Duration::from_secs(30), started.notified())
+                .await
+                .unwrap();
+            if let Some(status) = status {
+                rejection.store(status, Ordering::SeqCst);
+                store
+                    .append(SessionEvent::new(
+                        id,
+                        0,
+                        crate::SessionEventKind::Error {
+                            message: "rejection marker".to_string(),
+                        },
+                    ))
+                    .await
+                    .unwrap();
+                let error = tokio::time::timeout(Duration::from_secs(8), &mut supervisor.0)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert_eq!(
+                    error
+                        .downcast_ref::<reqwest::Error>()
+                        .unwrap()
+                        .status()
+                        .unwrap()
+                        .as_u16(),
+                    status
+                );
+            } else {
+                supervisor.0.abort();
+                assert!((&mut supervisor.0).await.unwrap_err().is_cancelled());
+            }
+            tokio::time::timeout(Duration::from_secs(2), dropped.notified())
+                .await
+                .expect("host supervisor must not detach its actor or provider turn");
+            assert!(
+                SessionWriterLease::try_acquire(root.path().join(format!("{id}.lock")))
+                    .unwrap()
+                    .is_some()
+            );
         }
     }
 

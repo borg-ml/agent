@@ -21,6 +21,119 @@ type RecordedCompactionTurns = Arc<Mutex<Vec<(CodingProvider, Option<String>, St
 type SeenConsultProvider = Arc<Mutex<Vec<(CodingProvider, Option<String>, String)>>>;
 
 #[tokio::test]
+async fn aborting_session_cancels_its_provider_turn_and_action_heartbeat() {
+    struct PendingExecutor {
+        started: Arc<Notify>,
+        dropped: Arc<Notify>,
+    }
+    struct NotifyDrop(Arc<Notify>);
+    impl Drop for NotifyDrop {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for PendingExecutor {
+        async fn execute(
+            &self,
+            _turn: AgentTurn,
+            _events: mpsc::Sender<SessionEventKind>,
+            _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            let _lifetime = NotifyDrop(Arc::clone(&self.dropped));
+            self.started.notify_one();
+            std::future::pending().await
+        }
+    }
+    let root = tempdir().unwrap();
+    let root_path = root.path().to_path_buf();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let sqlite = Arc::new(
+        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap(),
+    );
+    let store: Arc<dyn SessionStore> = sqlite.clone();
+    let writer =
+        SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
+    let (_commands, command_rx) = mpsc::channel(8);
+    let (events, _event_rx) = mpsc::channel(128);
+    let started = Arc::new(Notify::new());
+    let dropped = Arc::new(Notify::new());
+    let executor = Arc::new(PendingExecutor {
+        started: Arc::clone(&started),
+        dropped: Arc::clone(&dropped),
+    });
+    let actor = tokio::spawn(async move {
+        run_agent_session_with_store_and_writer(
+            &root_path,
+            session_id,
+            LaunchSession {
+                request_id: message_id,
+                cwd: root_path.clone(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: Some("wait until cancelled".to_string()),
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: vec![],
+                team_policy: None,
+            },
+            command_rx,
+            events,
+            executor,
+            store,
+            writer,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .unwrap();
+    let before = sqlite
+        .action(session_id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(before.lease_token.is_some());
+    actor.abort();
+    assert!(actor.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+        .await
+        .expect("aborting the actor must also drop its pending provider execution");
+    assert!(
+        SessionWriterLease::try_acquire(root.path().join(format!("{session_id}.lock")))
+            .unwrap()
+            .is_some()
+    );
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    let after = sqlite
+        .action(session_id, message_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.lease_heartbeat_at, before.lease_heartbeat_at,
+        "an abandoned actor must not keep renewing its action lease"
+    );
+    let recovered = sqlite
+        .recover_expired_actions(session_id, Utc::now() + chrono::Duration::seconds(120), 8)
+        .await
+        .unwrap();
+    assert!(
+        recovered
+            .iter()
+            .any(|action| action.action_id == message_id)
+    );
+}
+
+#[tokio::test]
 async fn session_generation_waits_on_silence_and_resumes_without_exposing_fragment_pulses() {
     struct FragmentExecutor {
         resume: Arc<Notify>,

@@ -214,6 +214,38 @@ explicit local CLI reopening behavior or workspace/private-message delivery
 settlement.
 Terminal launch rejection still uploads its failure before acknowledgement.
 
+## Hosted actor ownership and synchronization faults
+
+The hosted session supervisor owns its actor task, and the actor owns its
+provider-turn task and action-lease heartbeat. Dropping or aborting the
+supervisor cancels these owned tasks rather than detaching execution and
+continuing to renew an abandoned action lease. On fatal synchronization
+rejection the supervisor explicitly aborts and joins the actor before returning.
+
+During active execution, journal/projection decoding or storage errors in output
+synchronization are logged and retried after a two-second backoff without
+tearing down the actor or its command channel. Fixing the local projection or
+restoring storage availability allows upload to catch up. This is not automatic
+repair of malformed durable data; do not delete journal rows to clear an error.
+Existing network-failure backoff and missing-session retention still apply.
+
+HTTP 401 from event, payload, live-state, or workspace/private-message uploads
+remains fatal rather than becoming a retryable synchronization error. A journal
+replay conflict (HTTP 409) is also fatal, with relay conflict details retained.
+Rejected output is not acknowledged locally. Inbox/directory/roster refreshes
+retain their existing internal retry policies; this is not a blanket new
+revocation policy for every relay endpoint.
+
+Disposable localhost tests cover sync fault recovery, Stop after recovery,
+upload rejection, supervisor cancellation, provider-future cancellation, and
+cessation of action-lease heartbeats. They use a pending fake executor, not a
+live model. Owned Rust task cancellation does not prove cleanup of every
+external provider process or detached helper. Actor errors and duration limits
+can still leave nonterminal durable work eligible for later recovery. Initial
+and final synchronization retain their existing behavior; the independent
+journal worker covers final session output, not guaranteed final
+workspace/private-message delivery. Production acceptance remains required.
+
 ## Deferred shell and workspace commands
 
 Shell and workspace command acknowledgements mean **durable local admission**,

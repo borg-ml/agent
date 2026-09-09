@@ -26,6 +26,14 @@ use crate::{
     WorkspaceEventKind, WorkspaceStore,
 };
 
+pub(crate) struct AbortTask<T = ()>(pub(crate) tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 const ROOT_INBOX_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(not(test))]
 const USAGE_LIMIT_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5 * 60);
@@ -2878,7 +2886,7 @@ async fn run_agent_session_store_kernel(
             &store,
             session_id,
         );
-        if let Some(action_lease_token) = store
+        let _action_heartbeat = if let Some(action_lease_token) = store
             .claim_action(
                 session_id,
                 prompt.message_id,
@@ -2891,7 +2899,7 @@ async fn run_agent_session_store_kernel(
             let heartbeat_store = Arc::clone(&store);
             let heartbeat_owner = format!("session-actor:{session_id}");
             let heartbeat_action_id = prompt.message_id;
-            tokio::spawn(async move {
+            Some(AbortTask(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(15));
                 interval.tick().await;
                 loop {
@@ -2910,8 +2918,10 @@ async fn run_agent_session_store_kernel(
                         break;
                     }
                 }
-            });
-        }
+            })))
+        } else {
+            None
+        };
         let mut prompt_delta = if native_provider {
             prompt.text.clone()
         } else {
@@ -2978,11 +2988,11 @@ async fn run_agent_session_store_kernel(
         dispatcher.configure_tool_approvals(SessionToolApprovals {
             requests: tool_approval_tx,
         });
-        let mut running = tokio::spawn(async move {
+        let mut running = AbortTask(tokio::spawn(async move {
             turn_executor
                 .execute(turn, provider_events_tx, Some(control_rx))
                 .await
-        });
+        }));
         let mut pending_approval: Option<PendingApproval> = None;
         let mut pending_provider_interaction: Option<String> = None;
         let mut pending_steers = VecDeque::<PendingSteer>::new();
@@ -3028,7 +3038,7 @@ async fn run_agent_session_store_kernel(
                     }).await?;
                     liveness_deadline.as_mut().reset(tokio::time::Instant::now() + turn_phase.liveness_timeout());
                 }
-                result = &mut running => {
+                result = &mut running.0 => {
                     let result = match result {
                         Ok(result) => result,
                         Err(error) => Err(anyhow::anyhow!("agent turn task failed: {error}")),
@@ -3475,8 +3485,8 @@ async fn run_agent_session_store_kernel(
                     subscription_context_reusable = false;
                     provider_session_id = None;
                     provider_fork_turn_id = None;
-                    running.abort();
-                    let _ = (&mut running).await;
+                    running.0.abort();
+                    let _ = (&mut running.0).await;
                     executor.stop_session(session_id).await?;
                     deny_pending_approval(
                         &mut journal,
@@ -3531,8 +3541,8 @@ async fn run_agent_session_store_kernel(
                 _ = &mut liveness_deadline, if pending_approval.is_none() => {
                     let timed_out_phase = turn_phase;
                     subscription_context_reusable = false;
-                    running.abort();
-                    let _ = (&mut running).await;
+                    running.0.abort();
+                    let _ = (&mut running.0).await;
                     executor.stop_session(session_id).await?;
                     deny_pending_approval(
                         &mut journal,
@@ -3648,8 +3658,8 @@ async fn run_agent_session_store_kernel(
                 }
                 command = next_host_command(&mut deferred_commands, &mut commands) => {
                     let Some(command) = command else {
-                        running.abort();
-                        let _ = (&mut running).await;
+                        running.0.abort();
+                        let _ = (&mut running.0).await;
                         executor.stop_session(session_id).await?;
                         deny_pending_approval(
                             &mut journal,
@@ -4157,8 +4167,8 @@ async fn run_agent_session_store_kernel(
                                 true,
                             ).await?;
                             retry_not_before = None;
-                            running.abort();
-                            let _ = (&mut running).await;
+                            running.0.abort();
+                            let _ = (&mut running.0).await;
                             executor.stop_session(session_id).await?;
                             subscription_context_reusable = false;
                             provider_session_id = None;
@@ -4247,8 +4257,8 @@ async fn run_agent_session_store_kernel(
                                 &mut goal,
                                 &mut goal_active_since,
                             ).await?;
-                            running.abort();
-                            let _ = (&mut running).await;
+                            running.0.abort();
+                            let _ = (&mut running.0).await;
                             executor.stop_session(session_id).await?;
                             deny_pending_approval(
                                 &mut journal,
