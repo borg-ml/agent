@@ -10438,6 +10438,16 @@ async fn parent_journal_preserves_full_child_transcript_events() {
     .unwrap();
 
     let partial = event_rx.recv().await.unwrap();
+    let notification = event_rx.recv().await.unwrap();
+    assert!(matches!(
+        notification.kind,
+        SessionEventKind::AgentMessageReceived {
+            message_id: received_id,
+            sender_id,
+            ref text,
+            ..
+        } if received_id == message_id && sender_id == child_id && text == "I am complete"
+    ));
     let complete = event_rx.recv().await.unwrap();
     assert!(matches!(
         partial.kind,
