@@ -2791,6 +2791,10 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             )
             .await;
         }
+        if let Err(error) = session_store.begin_host_bootstrap(session_id).await {
+            tracing::warn!(%error, %session_id, "failed to durably admit host bootstrap; retaining launch");
+            return false;
+        }
         spawn_host_session(
             client,
             config,
@@ -2945,14 +2949,19 @@ async fn reject_host_launch(
             store.create_session(session_id).await?;
         }
         let state = store.state(session_id).await?;
-        ensure!(
-            state.started_at.is_none(),
-            "cannot reject an already-started session"
-        );
-        if !matches!(
+        let terminal = matches!(
             state.status,
-            Some(crate::SessionStatus::Failed | crate::SessionStatus::Stopped)
-        ) {
+            Some(
+                crate::SessionStatus::Failed
+                    | crate::SessionStatus::Stopped
+                    | crate::SessionStatus::Completed
+            )
+        );
+        ensure!(
+            state.started_at.is_none() || terminal,
+            "cannot reject an already-running session"
+        );
+        if !terminal {
             store
                 .append(SessionEvent::new(
                     session_id,
@@ -2984,6 +2993,7 @@ async fn reject_host_launch(
                 return Ok(false);
             }
             if events.len() < 1_024 {
+                store.finish_host_bootstrap(session_id).await?;
                 return Ok(true);
             }
         }
@@ -3711,14 +3721,39 @@ async fn resume_pending_host_sessions(
         .resource_limits
         .max_concurrent_sessions
         .saturating_sub(sessions.lock().await.len() as u32) as usize;
-    if available == 0 {
-        return Ok(());
-    }
     for (session_id, value) in session_store.pending_host_launch_metadata(256).await? {
-        if available == 0 {
-            break;
-        }
         if sessions.lock().await.contains_key(&session_id) {
+            continue;
+        }
+        let state = match stored_host_session_state(session_store, session_id).await {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(%error, %session_id, "cannot read recovering session; deferring it");
+                continue;
+            }
+        };
+        if state.is_some_and(|state| {
+            matches!(
+                state.status,
+                Some(
+                    crate::SessionStatus::Failed
+                        | crate::SessionStatus::Stopped
+                        | crate::SessionStatus::Completed
+                )
+            )
+        }) {
+            reject_host_launch(
+                client,
+                config,
+                session_root,
+                session_store,
+                session_id,
+                "launch already rejected",
+            )
+            .await;
+            continue;
+        }
+        if available == 0 {
             continue;
         }
         let metadata = match serde_json::from_value::<PersistedLaunchMetadata>(value) {
@@ -3766,10 +3801,45 @@ async fn spawn_host_session(
     sessions.lock().await.insert(session_id, tx.clone());
     let sessions_for_cleanup = sessions.clone();
     tokio::spawn(async move {
-        if let Err(error) =
-            run_session(client, config, session_root, executor_factory, launch, rx).await
+        if let Err(error) = run_session(
+            client.clone(),
+            config.clone(),
+            session_root.clone(),
+            executor_factory,
+            launch,
+            rx,
+        )
+        .await
         {
             tracing::error!(session_id = %session_id, %error, "remote agent session failed");
+            // A fresh launch has no action for ordinary prompt recovery yet.
+            // Keep its bootstrap marker until this terminal failure is visible.
+            if let Ok(store) = SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await
+            {
+                match stored_host_session_state(&store, session_id).await {
+                    Ok(state)
+                        if state
+                            .as_ref()
+                            .is_none_or(|state| state.started_at.is_none()) =>
+                    {
+                        reject_host_launch(
+                            &client,
+                            &config,
+                            &session_root,
+                            &store,
+                            session_id,
+                            "remote session failed during startup; check host logs",
+                        )
+                        .await;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, %session_id, "cannot read failed bootstrap; retaining recovery marker")
+                    }
+                }
+            } else {
+                tracing::warn!(%session_id, "cannot open failed bootstrap journal; retaining recovery marker");
+            }
         }
         sessions_for_cleanup.lock().await.remove(&session_id);
     });
@@ -3791,15 +3861,15 @@ async fn run_session(
     } = launch_request;
     launch.cwd = validate_host_cwd(&config.roots, &launch.cwd)?;
     discard_serialized_extension_roots(&mut launch);
+    if let Some(context) = fetch_runtime_mcp_context(&client, &config, session_id).await? {
+        launch.capabilities.runtime_mcp_context = Some(context);
+    }
     // The controller may have sent a stale or malicious capability snapshot.
     // Authentication is a host-local fact, so refresh it after the workspace
     // boundary and before constructing the child coordinator.
     launch.capabilities.provider_capabilities =
         probe_provider_admission_capabilities_with_managed_kimi(true).await;
     launch.capabilities.resource_limits = Some(config.resource_limits.clone());
-    if let Some(context) = fetch_runtime_mcp_context(&client, &config, session_id).await? {
-        launch.capabilities.runtime_mcp_context = Some(context);
-    }
     let lock_path = session_root.join(format!("{session_id}.lock"));
     let writer = SessionWriterLease::acquire(&lock_path)?;
     let sqlite_store =
@@ -3890,6 +3960,12 @@ async fn run_session(
         HostExecutionProfile::IsolatedHosted => LspPathPolicy::session_workspace(),
         HostExecutionProfile::TrustedUser => LspPathPolicy::authorized_roots(config.roots.clone()),
     };
+    let initial_prompt_id = launch
+        .initial_prompt
+        .as_deref()
+        .filter(|prompt| !prompt.trim().is_empty())
+        .map(|_| launch.request_id);
+    let mut bootstrap_finished = false;
     let actor = tokio::spawn(async move {
         run_agent_session_with_store_and_writer_and_lsp_policy(
             &actor_session_root,
@@ -3927,6 +4003,14 @@ async fn run_session(
             }
             _ = tokio::time::sleep(Duration::from_secs(1)) => {}
         }
+        if !bootstrap_finished {
+            match finish_ready_host_bootstrap(&sqlite_store, session_id, initial_prompt_id).await {
+                Ok(finished) => bootstrap_finished = finished,
+                Err(error) => {
+                    tracing::warn!(%error, %session_id, "cannot settle host bootstrap; retaining recovery marker")
+                }
+            }
+        }
         flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
         flush_workspace_messages(
             &client,
@@ -3958,6 +4042,7 @@ async fn run_session(
         );
     }
     actor.await.context("agent session task failed")??;
+    finish_ready_host_bootstrap(&sqlite_store, session_id, initial_prompt_id).await?;
     flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
     flush_workspace_messages(
         &client,
@@ -3970,6 +4055,32 @@ async fn run_session(
     )
     .await
     .map(|_| ())
+}
+
+async fn finish_ready_host_bootstrap(
+    store: &SqliteSessionStore,
+    session_id: Uuid,
+    initial_prompt_id: Option<Uuid>,
+) -> Result<bool> {
+    let state = store.state(session_id).await?;
+    let ready = state.started_at.is_some()
+        && state.configuration.is_some()
+        && !matches!(
+            state.status,
+            Some(
+                crate::SessionStatus::Stopped
+                    | crate::SessionStatus::Failed
+                    | crate::SessionStatus::Completed
+            )
+        )
+        && match initial_prompt_id {
+            Some(id) => store.contains_message(session_id, id).await?,
+            None => state.status == Some(crate::SessionStatus::Ready),
+        };
+    if ready {
+        store.finish_host_bootstrap(session_id).await?;
+    }
+    Ok(ready)
 }
 
 async fn fetch_runtime_mcp_context(
@@ -6502,6 +6613,274 @@ mod tests {
             "a denied command must be acknowledged as handled"
         );
         assert!(sessions.lock().await.is_empty());
+    }
+
+    fn bootstrap_test_launch(root: &Path) -> LaunchSession {
+        LaunchSession {
+            request_id: Uuid::new_v4(),
+            cwd: root.to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: Some(false),
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: crate::PermissionMode::Manual,
+            name: None,
+            initial_prompt: Some("must survive bootstrap".to_string()),
+            capabilities: Default::default(),
+            subagent_concurrency_limit: None,
+            extension_skill_roots: Vec::new(),
+            team_policy: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn acknowledged_bootstrap_failure_replays_after_restart_without_execution() {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config(root.path());
+        config.server = format!("http://{}", listener.local_addr().unwrap());
+        let (context_seen_tx, context_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (path, _) = read_http_request(&mut stream).await;
+            assert_eq!(
+                path,
+                format!("/api/remote/host/sessions/{session_id}/runtime-context")
+            );
+            context_seen_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+            let mut uploads = Vec::new();
+            for status in ["503 Service Unavailable", "200 OK"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (path, body) = read_http_request(&mut stream).await;
+                assert!(path.starts_with("/api/remote/host/events"));
+                uploads.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            uploads
+        });
+        let store = Arc::new(
+            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let executor: HostExecutorFactory =
+            Arc::new(|_, _| panic!("failed bootstrap must never execute"));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        assert!(
+            dispatch(
+                DispatchContext {
+                    client: client.clone(),
+                    config: config.clone(),
+                    session_root: root.path().to_path_buf(),
+                    sessions: Arc::clone(&sessions),
+                    session_store: Arc::clone(&store),
+                    receipts: Arc::new(sqlite_receipts().await),
+                    executor_factory: Arc::clone(&executor),
+                },
+                HostCommand::Launch {
+                    session_id,
+                    request: Box::new(bootstrap_test_launch(root.path())),
+                    attachment: None,
+                }
+            )
+            .await
+        );
+        tokio::time::timeout(Duration::from_secs(5), context_seen_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!store.contains_session(session_id).await.unwrap());
+        assert_eq!(
+            store.pending_host_launch_metadata(8).await.unwrap()[0].0,
+            session_id,
+            "acknowledged launch must be recoverable before any session/action exists"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while sessions.lock().await.contains_key(&session_id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let failed = store.events_after(session_id, 0, 10).await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            store.state(session_id).await.unwrap().status,
+            Some(crate::SessionStatus::Failed)
+        );
+        assert_eq!(
+            store.pending_host_launch_metadata(8).await.unwrap().len(),
+            1
+        );
+        drop(store);
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        resume_pending_host_sessions(&client, &config, root.path(), &sessions, &store, &executor)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .pending_host_launch_metadata(8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(sessions.lock().await.is_empty());
+        assert_eq!(
+            serde_json::to_value(store.events_after(session_id, 0, 10).await.unwrap()).unwrap(),
+            serde_json::to_value(failed).unwrap()
+        );
+        let uploads = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            uploads[0], uploads[1],
+            "recovery must replay identical durable failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_upgrade_and_handoff_preserve_initial_prompt_recovery() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("sessions.sqlite3");
+        let session_id = Uuid::new_v4();
+        let launch = bootstrap_test_launch(root.path());
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        persist_launch_metadata(&store, session_id, &launch, None)
+            .await
+            .unwrap();
+        // Simulate the previous current schema: additive upgrade must preserve metadata.
+        sqlx::query("drop table host_bootstraps")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        drop(store);
+        let store = SqliteSessionStore::open_interactive(&path).await.unwrap();
+        store.begin_host_bootstrap(session_id).await.unwrap();
+        drop(store);
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        assert_eq!(
+            store.pending_host_launch_metadata(8).await.unwrap()[0].0,
+            session_id
+        );
+        store.create_session(session_id).await.unwrap();
+        for kind in [
+            crate::SessionEventKind::SessionStarted,
+            crate::SessionEventKind::SessionConfigured {
+                cwd: launch.cwd.clone(),
+                provider: launch.provider,
+                model: None,
+                effort: None,
+                fast: false,
+                response_language: launch.response_language,
+                permission_mode: launch.permission_mode,
+            },
+        ] {
+            store
+                .append(SessionEvent::new(session_id, 0, kind))
+                .await
+                .unwrap();
+        }
+        assert!(
+            !finish_ready_host_bootstrap(&store, session_id, Some(launch.request_id))
+                .await
+                .unwrap(),
+            "started/configured alone does not prove initial prompt admission"
+        );
+        admit_remote_prompt(
+            &store,
+            session_id,
+            launch.request_id,
+            launch.initial_prompt.as_deref().unwrap(),
+            &[],
+            crate::PromptDelivery::Steer,
+        )
+        .await
+        .unwrap();
+        assert!(
+            finish_ready_host_bootstrap(&store, session_id, Some(launch.request_id))
+                .await
+                .unwrap()
+        );
+        let markers: i64 = sqlx::query_scalar("select count(*) from host_bootstraps")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(markers, 0);
+        assert_eq!(
+            store.pending_host_launch_metadata(8).await.unwrap()[0].0,
+            session_id,
+            "durable action takes over recovery after bootstrap marker is removed"
+        );
+
+        let stopped_id = Uuid::new_v4();
+        persist_launch_metadata(&store, stopped_id, &launch, None)
+            .await
+            .unwrap();
+        store.begin_host_bootstrap(stopped_id).await.unwrap();
+        store.create_session(stopped_id).await.unwrap();
+        for kind in [
+            crate::SessionEventKind::SessionStarted,
+            crate::SessionEventKind::StatusChanged {
+                status: crate::SessionStatus::Stopped,
+                detail: None,
+            },
+        ] {
+            store
+                .append(SessionEvent::new(stopped_id, 0, kind))
+                .await
+                .unwrap();
+        }
+        // Keep the other recoverable prompt assigned while checking stopped bootstrap recovery.
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = mpsc::channel(1);
+        sessions.lock().await.insert(session_id, tx);
+        let executor: HostExecutorFactory =
+            Arc::new(|_, _| panic!("stopped bootstrap must not restart"));
+        let (server_url, server) = event_server(vec!["200 OK"]).await;
+        let mut config = test_config(root.path());
+        config.server = server_url;
+        config.resource_limits.max_concurrent_sessions = 1;
+        resume_pending_host_sessions(
+            &Client::new(),
+            &config,
+            root.path(),
+            &sessions,
+            &store,
+            &executor,
+        )
+        .await
+        .unwrap();
+        assert!(!sessions.lock().await.contains_key(&stopped_id));
+        assert_eq!(server.await.unwrap(), vec![vec![1, 2]]);
+        assert!(
+            store
+                .pending_host_launch_metadata(8)
+                .await
+                .unwrap()
+                .iter()
+                .all(|(id, _)| *id != stopped_id)
+        );
     }
 
     #[tokio::test]

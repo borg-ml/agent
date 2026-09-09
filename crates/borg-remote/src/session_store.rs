@@ -1297,7 +1297,11 @@ impl SqliteSessionStore {
         let has_harness_routes: i64 = sqlx::query_scalar(
             "select exists(select 1 from sqlite_master where type='table' and name='session_harness_routes')",
         ).fetch_one(&self.pool).await?;
+        let has_host_bootstraps: i64 = sqlx::query_scalar(
+            "select exists(select 1 from sqlite_master where type='table' and name='host_bootstraps')",
+        ).fetch_one(&self.pool).await?;
         Ok(version == Some(SESSION_SCHEMA_VERSION)
+            && has_host_bootstraps != 0
             && has_access_bindings != 0
             && has_harness_routes != 0)
     }
@@ -2084,7 +2088,27 @@ impl SqliteSessionStore {
             .transpose()
     }
 
-    /// Return host-owned launches that still have durable non-terminal work.
+    pub(crate) async fn begin_host_bootstrap(&self, session_id: Uuid) -> Result<()> {
+        let mut transaction = self.begin_write().await?;
+        sqlx::query("insert into host_bootstraps (session_id) values (?) on conflict do nothing")
+            .bind(session_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn finish_host_bootstrap(&self, session_id: Uuid) -> Result<()> {
+        let mut transaction = self.begin_write().await?;
+        sqlx::query("delete from host_bootstraps where session_id=?")
+            .bind(session_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Return host-owned launches with unfinished bootstrap or session actions.
     /// The remote host calls this after a process restart so an acknowledged
     /// prompt cannot remain stranded until another command happens to arrive.
     pub async fn pending_host_launch_metadata(
@@ -2093,7 +2117,8 @@ impl SqliteSessionStore {
     ) -> Result<Vec<(Uuid, serde_json::Value)>> {
         let rows = sqlx::query(
             "select h.session_id, h.metadata_json from host_launches h \
-             where exists (select 1 from session_actions a \
+             where exists (select 1 from host_bootstraps b where b.session_id=h.session_id) \
+                or exists (select 1 from session_actions a \
                  where a.session_id=h.session_id \
                    and a.state not in ('completed','failed','cancelled')) \
              order by h.created_at asc limit ?",
@@ -3068,6 +3093,10 @@ impl SqliteSessionStore {
                 metadata_json text not null,
                 created_at text not null,
                 updated_at text not null
+            );
+
+            create table if not exists host_bootstraps (
+                session_id text primary key references host_launches(session_id) on delete cascade
             );
 
             -- A runtime manifest records how a trusted namespace was opened

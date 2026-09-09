@@ -124,6 +124,19 @@ slot opens; stop another session or correct the directory and create a new
 session instead. If failure publication cannot reach the relay, the launch
 remains unacknowledged until publication succeeds.
 
+New hosted launches also persist an unfinished-bootstrap record before
+acknowledgement. Recovery can therefore find a launch even before its session
+or initial prompt exists. The record hands off to normal prompt recovery only
+after the initial prompt is durable (or an empty session reports Ready).
+Pre-actor startup errors publish a generic Failed status; host logs contain the
+diagnostic, and a fresh launch is required after correcting the cause. Failed
+publication is retried by the host recovery loop, including after restart.
+Already-terminal sessions replay their journal rather than execute again.
+
+This is an additive SQLite change, not a database reset. It does not establish
+full recovery for idle sessions, every failure inside actor initialization, or
+final output after an otherwise completed actor; those need separate acceptance.
+
 Upgrade the relay before the agent for full remote controls. Against a relay
 that does not confirm session-scoped commands, the new mirror still uploads
 output and renews presence, but deliberately does not poll or acknowledge the
