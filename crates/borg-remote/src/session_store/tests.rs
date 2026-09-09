@@ -82,7 +82,7 @@ async fn host_launch_owner_is_atomic_immutable_and_scoped_across_reopen() {
     store.begin_host_bootstrap(id).await.unwrap();
     assert_eq!(
         store
-            .pending_host_launch_metadata_for_host(Some((owner, origin)), 1)
+            .pending_host_launch_metadata_for_host(0, Some((owner, origin)), 1)
             .await
             .unwrap()[0]
             .0,
@@ -91,12 +91,43 @@ async fn host_launch_owner_is_atomic_immutable_and_scoped_across_reopen() {
     );
     assert!(
         store
-            .pending_host_launch_metadata_for_host(Some((other, origin)), 8)
+            .pending_host_launch_metadata_for_host(0, Some((other, origin)), 8)
             .await
             .unwrap()
             .iter()
             .all(|(candidate, _)| *candidate != id)
     );
+    // Reopened/imported launches may share timestamps. Page order must remain
+    // deterministic, with foreign owners filtered before both limit and offset.
+    let mut expected = vec![id];
+    for candidate_owner in [owner, other, owner] {
+        let candidate = Uuid::new_v4();
+        store
+            .persist_owned_host_launch_metadata(candidate, &metadata, candidate_owner, origin)
+            .await
+            .unwrap();
+        store.begin_host_bootstrap(candidate).await.unwrap();
+        if candidate_owner == owner {
+            expected.push(candidate);
+        }
+    }
+    sqlx::query("update host_launches set created_at=?")
+        .bind("2026-01-01T00:00:00Z")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    expected.sort();
+    expected.push(legacy);
+    for offset in 0..=expected.len() {
+        let page = store
+            .pending_host_launch_metadata_for_host(offset, Some((owner, origin)), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
+            expected.get(offset).copied().into_iter().collect::<Vec<_>>()
+        );
+    }
     drop(store);
     let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
         .await

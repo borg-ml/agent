@@ -2429,12 +2429,13 @@ impl SqliteSessionStore {
         &self,
         limit: usize,
     ) -> Result<Vec<(Uuid, serde_json::Value)>> {
-        self.pending_host_launch_metadata_for_host(None, limit)
+        self.pending_host_launch_metadata_for_host(0, None, limit)
             .await
     }
 
     pub(crate) async fn pending_host_launch_metadata_for_host(
         &self,
+        offset: usize,
         owner: Option<(Uuid, &str)>,
         limit: usize,
     ) -> Result<Vec<(Uuid, serde_json::Value)>> {
@@ -2450,11 +2451,12 @@ impl SqliteSessionStore {
                  and (w.host_id is null or w.host_id=?1) \
                  and (json_extract(h.metadata_json,'$.attachment.host_identity.host_id') is null \
                    or json_extract(h.metadata_json,'$.attachment.host_identity.host_id')=?1))) \
-             order by case when ?1 is null then 0 else o.session_id is null end, h.created_at asc limit ?3",
+             order by case when ?1 is null then 0 else o.session_id is null end, h.created_at asc, h.session_id asc limit ?3 offset ?4",
         )
         .bind(owner.map(|(id, _)| id.to_string()))
         .bind(owner.map(|(_, origin)| origin))
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .bind(i64::try_from(offset).unwrap_or(i64::MAX))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()

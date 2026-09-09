@@ -183,6 +183,17 @@ and unverified legacy launches are not failed by this recovery path. Started
 sessions with invalid attachments still await authorized recovery; this does not
 renew leases or solve all actor-initialization failures.
 
+Actor recovery inspects at most 256 pending launches per command-poll pass,
+advancing across pages even when earlier sessions are active, lease-blocked,
+unverified, or capacity-blocked. Owned launches retain priority over unverified
+legacy launches; creation time and session ID give each page a stable order.
+The in-memory offset wraps at the end and resets on host restart. Settlement or
+ownership changes can move entries between passes, so a skipped entry is
+revisited on a later sweep rather than considered acknowledged. This bounds
+returned candidates per pass, not database scan cost or wall-clock recovery
+latency. Restoration still requires the existing ownership, lease, capacity,
+and writer fences; idle sessions without pending work are not newly restored.
+
 An independent upload-only recovery loop also scans inactive hosted journals
 against durable, confirmed relay cursors. Final session events and remaining
 live-state snapshots are retried even if the actor already exited, including

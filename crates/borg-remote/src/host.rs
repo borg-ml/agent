@@ -1952,12 +1952,14 @@ pub async fn run_host_with_executor_factory(
         session_root.clone(),
     )));
     let mut command_poll_backoff = RemoteRetryBackoff::default();
+    let mut recovery_offset = 0;
     loop {
         ensure!(
             !operations.0.is_finished(),
             "remote host operation worker stopped"
         );
-        resume_pending_host_sessions(
+        recovery_offset = resume_pending_host_sessions(
+            recovery_offset,
             &client,
             &config,
             &session_root,
@@ -4449,24 +4451,33 @@ struct HostSessionLaunch {
 }
 
 async fn resume_pending_host_sessions(
+    offset: usize,
     client: &Client,
     config: &HostConfig,
     session_root: &Path,
     sessions: &Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
     session_store: &SqliteSessionStore,
     executor_factory: &HostExecutorFactory,
-) -> Result<()> {
+) -> Result<usize> {
     let mut available = config
         .resource_limits
         .max_concurrent_sessions
         .saturating_sub(sessions.lock().await.len() as u32) as usize;
-    for (session_id, value) in session_store
+    let pending = session_store
         .pending_host_launch_metadata_for_host(
+            offset,
             Some((config.host_id, &host_relay_origin(&config)?)),
             256,
         )
-        .await?
-    {
+        .await?;
+    // The offset is only a bounded scan position. Wrap even when no actor can start;
+    // changes to the pending set are picked up on the next sweep.
+    let next_offset = if pending.len() == 256 {
+        offset.saturating_add(pending.len())
+    } else {
+        0
+    };
+    for (session_id, value) in pending {
         if let Err(error) = validate_stored_host_identity(config, session_store, session_id).await {
             tracing::warn!(%error, %session_id, "skipping recovery for incompatible stored host identity");
             continue;
@@ -4568,7 +4579,7 @@ async fn resume_pending_host_sessions(
         .await;
         available -= 1;
     }
-    Ok(())
+    Ok(next_offset)
 }
 
 async fn spawn_host_session(
@@ -7899,9 +7910,17 @@ mod tests {
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let forbidden: HostExecutorFactory =
             Arc::new(|_, _| panic!("expired work must not restart"));
-        resume_pending_host_sessions(&client, &config, root.path(), &sessions, &store, &forbidden)
-            .await
-            .unwrap();
+        resume_pending_host_sessions(
+            0,
+            &client,
+            &config,
+            root.path(),
+            &sessions,
+            &store,
+            &forbidden,
+        )
+        .await
+        .unwrap();
         assert!(sessions.lock().await.is_empty());
         release.notify_one();
         recover_host_journal(&client, &config, &store, id)
@@ -8331,9 +8350,17 @@ mod tests {
         config.resource_limits.max_concurrent_sessions = 1;
         let executor: HostExecutorFactory =
             Arc::new(|_, _| panic!("migration must not construct a provider"));
-        resume_pending_host_sessions(&client, &config, root.path(), &sessions, &store, &executor)
-            .await
-            .unwrap();
+        resume_pending_host_sessions(
+            0,
+            &client,
+            &config,
+            root.path(),
+            &sessions,
+            &store,
+            &executor,
+        )
+        .await
+        .unwrap();
         assert!(
             requests.try_recv().is_err(),
             "legacy proof must not block command polling"
@@ -8570,6 +8597,7 @@ mod tests {
             assert!(!dispatch(command_context(&config), command).await);
         }
         resume_pending_host_sessions(
+            0,
             &Client::new(),
             &config,
             root.path(),
@@ -8641,6 +8669,7 @@ mod tests {
             .await
         );
         resume_pending_host_sessions(
+            0,
             &Client::new(),
             &config,
             root.path(),
@@ -8684,6 +8713,7 @@ mod tests {
         assert_eq!(
             store
                 .pending_host_launch_metadata_for_host(
+                    0,
                     Some((config.host_id, &host_relay_origin(&config).unwrap())),
                     1
                 )
@@ -8696,6 +8726,7 @@ mod tests {
         assert_eq!(
             store
                 .pending_host_launch_metadata_for_host(
+                    0,
                     Some((original_host, &host_relay_origin(&config).unwrap())),
                     1
                 )
@@ -8703,6 +8734,183 @@ mod tests {
                 .unwrap()[0]
                 .0,
             unstarted
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_pages_past_lease_blocked_launches_to_acknowledged_work() {
+        let root = tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config(root.path());
+        config.server = format!("http://{}", listener.local_addr().unwrap());
+        config.resource_limits.max_concurrent_sessions = 1;
+        let path = root.path().join("sessions.sqlite3");
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let launch = bootstrap_test_launch(root.path());
+        let expired = serde_json::to_value(PersistedLaunchMetadata {
+            request: launch.clone(),
+            attachment: Some(WorkspaceAttachment {
+                workspace_id: None,
+                participant_id: None,
+                command_authority: None,
+                host_identity: None,
+                host_capabilities: None,
+                presence_lease: Some(crate::RemotePresenceLease {
+                    lease_id: Uuid::new_v4(),
+                    expires_at: Utc::now() - ChronoDuration::minutes(1),
+                }),
+                approval_provenance: None,
+                reconnect_sync_cursors: None,
+            }),
+        })
+        .unwrap();
+        let mut blocked = Vec::new();
+        for _ in 0..256 {
+            let id = Uuid::new_v4();
+            store
+                .persist_owned_host_launch_metadata(
+                    id,
+                    &expired,
+                    config.host_id,
+                    &host_relay_origin(&config).unwrap(),
+                )
+                .await
+                .unwrap();
+            store.begin_host_bootstrap(id).await.unwrap();
+            store.create_session(id).await.unwrap();
+            store
+                .append(SessionEvent::new(
+                    id,
+                    0,
+                    crate::SessionEventKind::SessionStarted,
+                ))
+                .await
+                .unwrap();
+            blocked.push(id);
+        }
+        let next = Uuid::new_v4();
+        persist_launch_metadata(&config, &store, next, &launch, None)
+            .await
+            .unwrap();
+        store.create_session(next).await.unwrap();
+        for kind in [
+            crate::SessionEventKind::SessionStarted,
+            crate::SessionEventKind::SessionConfigured {
+                cwd: launch.cwd.clone(),
+                provider: launch.provider,
+                model: None,
+                effort: None,
+                fast: false,
+                response_language: launch.response_language,
+                permission_mode: launch.permission_mode,
+            },
+        ] {
+            store
+                .append(SessionEvent::new(next, 0, kind))
+                .await
+                .unwrap();
+        }
+        admit_remote_prompt(
+            &store,
+            next,
+            launch.request_id,
+            "acknowledged before host restart",
+            &[],
+            crate::PromptDelivery::Queue,
+        )
+        .await
+        .unwrap();
+        drop(store);
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let executor: HostExecutorFactory =
+            Arc::new(|_, _| panic!("recovery probe must stop before provider construction"));
+        let client = Client::new();
+        for settle_earlier in [false, true] {
+            let offset = resume_pending_host_sessions(
+                0,
+                &client,
+                &config,
+                root.path(),
+                &sessions,
+                &store,
+                &executor,
+            )
+            .await
+            .unwrap();
+            assert_eq!(offset, 256);
+            assert!(sessions.lock().await.is_empty());
+            if settle_earlier {
+                // Deliberately remove one earlier candidate between page reads.
+                store.finish_host_bootstrap(blocked[0]).await.unwrap();
+            }
+            let offset = resume_pending_host_sessions(
+                offset,
+                &client,
+                &config,
+                root.path(),
+                &sessions,
+                &store,
+                &executor,
+            )
+            .await
+            .unwrap();
+            assert_eq!(offset, 0, "a short or empty page must wrap the scan");
+            if settle_earlier {
+                assert!(
+                    sessions.lock().await.is_empty(),
+                    "the target shifted behind the offset"
+                );
+                resume_pending_host_sessions(
+                    offset,
+                    &client,
+                    &config,
+                    root.path(),
+                    &sessions,
+                    &store,
+                    &executor,
+                )
+                .await
+                .unwrap();
+            }
+            assert!(
+                sessions.lock().await.contains_key(&next),
+                "a full page of lease-blocked launches must not permanently hide later durable work"
+            );
+            assert_eq!(sessions.lock().await.len(), 1);
+            let (mut socket, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            let (path, _) = read_http_request(&mut socket).await;
+            assert!(path.contains(&next.to_string()) && path.ends_with("/runtime-context"));
+            socket
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            drop(socket);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !sessions.lock().await.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(store.pending_actions(next, 8).await.unwrap().len(), 1);
+        }
+        for id in blocked {
+            assert_eq!(
+                store.load_host_launch_metadata(id).await.unwrap(),
+                Some(expired.clone())
+            );
+            assert_eq!(store.state(id).await.unwrap().latest_sequence, 1);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
         );
     }
 
@@ -8930,6 +9138,7 @@ mod tests {
             );
             sessions.lock().await.clear();
             resume_pending_host_sessions(
+                0,
                 &client,
                 &config,
                 root.path(),
@@ -9189,6 +9398,7 @@ mod tests {
         let executor: HostExecutorFactory =
             Arc::new(|_, _| panic!("recovery probe must fail before provider construction"));
         resume_pending_host_sessions(
+            0,
             &client,
             &config,
             root.path(),
@@ -9224,6 +9434,7 @@ mod tests {
         // A free slot schedules the durable prompt without another relay command.
         sessions.lock().await.clear();
         resume_pending_host_sessions(
+            0,
             &client,
             &config,
             root.path(),
@@ -10832,6 +11043,7 @@ connection: close
         tokio::time::timeout(
             Duration::from_secs(2),
             resume_pending_host_sessions(
+                0,
                 &client,
                 &config,
                 root.path(),
@@ -10881,6 +11093,7 @@ connection: close
         tokio::time::timeout(
             Duration::from_secs(2),
             resume_pending_host_sessions(
+                0,
                 &client,
                 &config,
                 root.path(),
@@ -11105,9 +11318,17 @@ connection: close
                 .await
                 .unwrap(),
         );
-        resume_pending_host_sessions(&client, &config, root.path(), &sessions, &store, &executor)
-            .await
-            .unwrap();
+        resume_pending_host_sessions(
+            0,
+            &client,
+            &config,
+            root.path(),
+            &sessions,
+            &store,
+            &executor,
+        )
+        .await
+        .unwrap();
         assert!(
             store
                 .pending_host_launch_metadata(8)
@@ -11269,6 +11490,7 @@ connection: close
         let executor: HostExecutorFactory =
             Arc::new(|_, _| panic!("stopped bootstrap must not restart"));
         resume_pending_host_sessions(
+            0,
             &Client::new(),
             &config,
             root.path(),
