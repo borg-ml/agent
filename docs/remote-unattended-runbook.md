@@ -244,7 +244,11 @@ not execution permission or a renewed lease. Queue/Steer delivery and attachment
 paths are retained in the journal. The pending-action scan schedules the prompt
 only once capacity and a valid attachment allow restoration, without needing
 another relay command. Exact retries reuse the same message/action rather than
-creating a second turn. A later Stop can cancel the deferred action locally;
+creating a second turn. If the workspace inbox also contains the same ID, an
+existing local action still requires validation against the original journal
+admission: changed text, attachment paths, or delivery mode is not an exact
+retry. A coalesced action payload does not replace that original baseline.
+A later Stop can cancel the deferred action locally;
 no actor is created merely to admit or cancel it.
 
 This is deliberately not a general deferred-control queue. Schema-bearing

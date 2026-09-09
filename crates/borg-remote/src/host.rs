@@ -3646,7 +3646,9 @@ async fn admit_remote_prompt(
         Some(workspace) => workspace.contains_message(message_id).await?,
         None => false,
     };
-    if !workspace_durable {
+    // A workspace copy does not replace validation of an existing local admission.
+    // Action lookup is session-local; inherited and inbox-only messages stay actionless.
+    if !workspace_durable || store.action(session_id, message_id).await?.is_some() {
         store
             .admit_prompt(SessionEvent::new(
                 session_id,
@@ -8824,14 +8826,108 @@ mod tests {
             assert!(
                 matches!(rx.try_recv(), Ok(HostCommand::Stop { session_id }) if session_id == active_id)
             );
+            let workspace = store.workspace_store().await.unwrap().unwrap();
+            let binding = store.workspace_binding(session_id).await.unwrap().unwrap();
+            workspace
+                .ensure_execution_workspace(
+                    binding.workspace_id,
+                    "Replay test",
+                    crate::local_human_participant_id("Human"),
+                    "Human",
+                    session_id,
+                    "Recipient",
+                )
+                .await
+                .unwrap();
+            let incoming = crate::WorkspaceMessage {
+                id: message_id,
+                workspace_id: binding.workspace_id,
+                author_id: Uuid::new_v4(),
+                thread_id: None,
+                reply_to_message_id: None,
+                body: crate::WorkspaceMessageBody {
+                    text: "retain while authorization is expired".into(),
+                    mentions: vec![],
+                },
+                audience: Audience::Direct {
+                    participant: session_id,
+                },
+                created_at: Utc::now(),
+            };
+            workspace
+                .import_relay_message(
+                    incoming.clone(),
+                    "Sender",
+                    session_id,
+                    crate::DeliveryMode::NextTurn,
+                )
+                .await
+                .unwrap();
+            assert!(workspace.contains_message(message_id).await.unwrap());
+            drop(workspace);
             drop(store);
             let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+            for field in ["text", "attachments", "delivery"] {
+                let mut conflicting = prompt();
+                let HostCommand::Prompt {
+                    text,
+                    attachments,
+                    delivery,
+                    ..
+                } = &mut conflicting
+                else {
+                    unreachable!()
+                };
+                match field {
+                    "text" => *text = "changed after admission".into(),
+                    "attachments" => attachments.clear(),
+                    "delivery" => {
+                        *delivery = match delivery {
+                            crate::PromptDelivery::Queue => crate::PromptDelivery::Steer,
+                            crate::PromptDelivery::Steer => crate::PromptDelivery::Queue,
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    !dispatch(context(&store), conflicting).await,
+                    "workspace presence must not acknowledge changed {field} as an exact retry"
+                );
+            }
             assert!(dispatch(context(&store), prompt()).await);
             assert_eq!(
                 serde_json::to_value(store.events_after(session_id, 0, 20).await.unwrap()).unwrap(),
                 admitted
             );
             assert_eq!(store.pending_actions(session_id, 8).await.unwrap().len(), 1);
+            store
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    crate::SessionEventKind::Message {
+                        message_id,
+                        actor: crate::EventActor::User,
+                        text: "coalesced execution payload".into(),
+                        attachments: vec![],
+                        status: crate::MessageStatus::InProgress,
+                        delivery: Some(delivery),
+                    },
+                ))
+                .await
+                .unwrap();
+            let action =
+                serde_json::to_value(store.action(session_id, message_id).await.unwrap()).unwrap();
+            let sequence = store.state(session_id).await.unwrap().latest_sequence;
+            assert!(dispatch(context(&store), prompt()).await);
+            assert_eq!(
+                serde_json::to_value(store.action(session_id, message_id).await.unwrap()).unwrap(),
+                action,
+                "exact replay validates the original journal, not the coalesced action payload"
+            );
+            assert_eq!(
+                store.state(session_id).await.unwrap().latest_sequence,
+                sequence
+            );
             sessions.lock().await.clear();
             resume_pending_host_sessions(
                 &client,
@@ -8903,6 +8999,80 @@ mod tests {
             assert_eq!(
                 store.load_host_launch_metadata(session_id).await.unwrap(),
                 Some(metadata)
+            );
+            // Workspace-only delivery must remain in the inbox, not become a new local action.
+            let workspace = store.workspace_store().await.unwrap().unwrap();
+            let workspace_only_id = Uuid::new_v4();
+            let mut workspace_only = incoming;
+            workspace_only.id = workspace_only_id;
+            workspace
+                .import_relay_message(
+                    workspace_only,
+                    "Sender",
+                    session_id,
+                    crate::DeliveryMode::NextTurn,
+                )
+                .await
+                .unwrap();
+            admit_remote_prompt(
+                store.as_ref(),
+                session_id,
+                workspace_only_id,
+                "retain while authorization is expired",
+                &[],
+                delivery,
+            )
+            .await
+            .unwrap();
+            assert!(
+                store
+                    .action(session_id, workspace_only_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                !store
+                    .contains_message(session_id, workspace_only_id)
+                    .await
+                    .unwrap()
+            );
+
+            // A settled history entry may be inherited without its parent-owned action.
+            store
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    crate::SessionEventKind::Message {
+                        message_id,
+                        actor: crate::EventActor::User,
+                        text: "retain while authorization is expired".into(),
+                        attachments: vec![root.path().join("note.txt")],
+                        status: crate::MessageStatus::Complete,
+                        delivery: Some(delivery),
+                    },
+                ))
+                .await
+                .unwrap();
+            let fork_id = Uuid::new_v4();
+            let cut = store.state(session_id).await.unwrap().latest_sequence + 1;
+            store.fork_before(session_id, fork_id, cut).await.unwrap();
+            assert!(store.contains_message(fork_id, message_id).await.unwrap());
+            let inherited = store.state(fork_id).await.unwrap().latest_sequence;
+            admit_remote_prompt(
+                store.as_ref(),
+                fork_id,
+                message_id,
+                "retain while authorization is expired",
+                &[root.path().join("note.txt")],
+                delivery,
+            )
+            .await
+            .unwrap();
+            assert!(store.action(fork_id, message_id).await.unwrap().is_none());
+            assert_eq!(
+                store.state(fork_id).await.unwrap().latest_sequence,
+                inherited
             );
             assert!(
                 tokio::time::timeout(Duration::from_millis(50), listener.accept())
