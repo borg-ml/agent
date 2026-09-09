@@ -157,18 +157,30 @@ nonterminal actor still requires a valid attachment. Stop may settle that inacti
 session locally despite lease expiry, but only after host ownership, structural
 attachment identity, and any explicit Stop grant have been checked. This neither renews the lease nor starts
 an actor. A queued prompt requiring restoration with an expired lease can still
-block a later Stop. Already-acknowledged bootstrap recovery with an expired
-attachment still defers restoration; lease renewal and general queue fairness
-remain open.
+block a later Stop; lease renewal for started sessions and general queue
+fairness remain open.
 
 New hosted launches also persist an unfinished-bootstrap record before
 acknowledgement. Recovery can therefore find a launch even before its session
 or initial prompt exists. The record hands off to normal prompt recovery only
 after the initial prompt is durable (or an empty session reports Ready).
-Pre-actor startup errors publish a generic Failed status; host logs contain the
+Pre-actor startup errors record a generic Failed status; host logs contain the
 diagnostic, and a fresh launch is required after correcting the cause. Failed
-publication is retried by the host recovery loop, including after restart.
+publication is retried by the independent journal worker, including after restart.
 Already-terminal sessions replay their journal rather than execute again.
+
+An acknowledged, unstarted bootstrap whose attachment expires or becomes invalid
+is marked Failed and locally settled during recovery, even at full execution
+capacity. Terminal bootstrap markers are also settled locally. Recovery holds
+the session writer lease through status and action/bootstrap settlement, preserves
+launch metadata and terminal states, and does not await a relay probe or upload.
+The journal worker retains responsibility for publication after the marker is
+removed, so the browser may not observe Failed until the relay recovers.
+Command-triggered rejection still publishes successfully before acknowledgement.
+Active actors, held writer leases, started nonterminal sessions, foreign owners,
+and unverified legacy launches are not failed by this recovery path. Started
+sessions with invalid attachments still await authorized recovery; this does not
+renew leases or solve all actor-initialization failures.
 
 An independent upload-only recovery loop also scans inactive hosted journals
 against durable, confirmed relay cursors. Final session events and remaining

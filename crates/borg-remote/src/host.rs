@@ -3229,6 +3229,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                     &session_store,
                     session_id,
                     "launch already rejected",
+                    true,
                 )
                 .await;
             }
@@ -3268,6 +3269,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                 &session_store,
                 session_id,
                 &reason,
+                true,
             )
             .await;
         }
@@ -3536,6 +3538,7 @@ async fn stored_host_session_state(
     }
 }
 
+// Recovery-only local success is not permission to acknowledge a relay command.
 async fn reject_host_launch(
     client: &Client,
     config: &HostConfig,
@@ -3543,10 +3546,19 @@ async fn reject_host_launch(
     store: &SqliteSessionStore,
     session_id: Uuid,
     reason: &str,
+    publish_before_ack: bool,
 ) -> bool {
     let result: Result<bool> = async {
         let _writer = SessionWriterLease::acquire(session_root.join(format!("{session_id}.lock")))?;
-        ensure_host_launch_owner(client, config, store, session_id).await?;
+        if publish_before_ack {
+            ensure_host_launch_owner(client, config, store, session_id).await?;
+        } else {
+            validate_stored_host_identity(config, store, session_id).await?;
+            ensure!(
+                store.host_launch_owner(session_id).await?.is_some(),
+                "unverified launch cannot be settled offline"
+            );
+        }
         if !store.contains_session(session_id).await? {
             store.create_session(session_id).await?;
         }
@@ -3574,6 +3586,11 @@ async fn reject_host_launch(
                     },
                 ))
                 .await?;
+        }
+        if !publish_before_ack {
+            // Recovery settles locally; the independent journal worker owns publication.
+            store.settle_terminal_host_session(session_id).await?;
+            return Ok(true);
         }
         // Do not acknowledge rejection until the browser can observe it. An
         // exact retry replays the same journal instead of starting the launch.
@@ -3604,7 +3621,7 @@ async fn reject_host_launch(
     match result {
         Ok(handled) => handled,
         Err(error) => {
-            tracing::warn!(%error, %session_id, "failed to publish rejected launch; retaining command for retry");
+            tracing::warn!(%error, %session_id, publish_before_ack, "failed to settle rejected launch; retaining it for retry");
             false
         }
     }
@@ -4459,7 +4476,7 @@ async fn resume_pending_host_sessions(
                 continue;
             }
         };
-        if state.is_some_and(|state| {
+        if state.as_ref().is_some_and(|state| {
             matches!(
                 state.status,
                 Some(
@@ -4476,6 +4493,7 @@ async fn resume_pending_host_sessions(
                 session_store,
                 session_id,
                 "launch already rejected",
+                false,
             )
             .await;
             continue;
@@ -4490,6 +4508,7 @@ async fn resume_pending_host_sessions(
                     session_store,
                     session_id,
                     &rejected_launch.reason,
+                    false,
                 )
                 .await;
                 continue;
@@ -4499,13 +4518,29 @@ async fn resume_pending_host_sessions(
                 continue;
             }
         };
-        if available == 0 {
-            continue;
-        }
         if let Err(error) =
             validate_workspace_attachment(config, session_id, metadata.attachment.as_ref(), true)
         {
-            tracing::error!(%error, %session_id, "cannot recover remote session with an invalid workspace attachment");
+            if state
+                .as_ref()
+                .is_none_or(|state| state.started_at.is_none())
+            {
+                reject_host_launch(
+                    client,
+                    config,
+                    session_root,
+                    session_store,
+                    session_id,
+                    &error.to_string(),
+                    false,
+                )
+                .await;
+            } else {
+                tracing::warn!(%error, %session_id, "cannot restore a started session with an invalid workspace attachment");
+            }
+            continue;
+        }
+        if available == 0 {
             continue;
         }
         tracing::info!(%session_id, "recovering remote session with durable unfinished work");
@@ -4552,7 +4587,7 @@ async fn spawn_host_session(
         {
             tracing::error!(session_id = %session_id, %error, "remote agent session failed");
             // A fresh launch has no action for ordinary prompt recovery yet.
-            // Keep its bootstrap marker until this terminal failure is visible.
+            // Keep its bootstrap marker until terminal settlement is durable.
             if let Ok(store) = SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await
             {
                 match stored_host_session_state(&store, session_id).await {
@@ -4568,6 +4603,7 @@ async fn spawn_host_session(
                             &store,
                             session_id,
                             "remote session failed during startup; check host logs",
+                            true,
                         )
                         .await;
                     }
@@ -8580,7 +8616,8 @@ mod tests {
                 root.path(),
                 &store,
                 unstarted,
-                "wrong host startup failed"
+                "wrong host startup failed",
+                true,
             )
             .await
         );
@@ -10334,9 +10371,236 @@ connection: close
     }
 
     #[tokio::test]
+    async fn expired_bootstrap_settles_offline_before_capacity_and_recovers_publication() {
+        let root = tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config(root.path());
+        config.server = format!("http://{}", listener.local_addr().unwrap());
+        config.resource_limits.max_concurrent_sessions = 1;
+        let path = root.path().join("sessions.sqlite3");
+        let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let [expired, locked, started, active, foreign, legacy] =
+            std::array::from_fn(|_| Uuid::new_v4());
+        let metadata = serde_json::to_value(PersistedLaunchMetadata {
+            request: bootstrap_test_launch(root.path()),
+            attachment: Some(WorkspaceAttachment {
+                workspace_id: None,
+                participant_id: None,
+                command_authority: None,
+                host_identity: None,
+                host_capabilities: None,
+                presence_lease: Some(crate::RemotePresenceLease {
+                    lease_id: Uuid::new_v4(),
+                    expires_at: Utc::now() - ChronoDuration::minutes(1),
+                }),
+                approval_provenance: None,
+                reconnect_sync_cursors: None,
+            }),
+        })
+        .unwrap();
+        // Durable snapshots admitted before their lease expired and before host restart.
+        for id in [expired, locked, started, active, foreign, legacy] {
+            if id == legacy {
+                store
+                    .persist_host_launch_metadata(id, &metadata)
+                    .await
+                    .unwrap();
+            } else {
+                store
+                    .persist_owned_host_launch_metadata(
+                        id,
+                        &metadata,
+                        if id == foreign {
+                            Uuid::new_v4()
+                        } else {
+                            config.host_id
+                        },
+                        &host_relay_origin(&config).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            store.begin_host_bootstrap(id).await.unwrap();
+        }
+        store.create_session(started).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                started,
+                0,
+                crate::SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        let started_events = store.events_after(started, 0, 10).await.unwrap();
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, mut rx) = mpsc::channel(1);
+        sessions.lock().await.insert(active, tx);
+        let writer =
+            SessionWriterLease::acquire(root.path().join(format!("{locked}.lock"))).unwrap();
+        let executor: HostExecutorFactory =
+            Arc::new(|_, _| panic!("expired bootstrap cannot execute"));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            resume_pending_host_sessions(
+                &client,
+                &config,
+                root.path(),
+                &sessions,
+                &store,
+                &executor,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let failed = store.events_after(expired, 0, 10).await.unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            store.state(expired).await.unwrap().status,
+            Some(crate::SessionStatus::Failed)
+        );
+        assert!(store.state(expired).await.unwrap().started_at.is_none());
+        for id in [locked, active, foreign, legacy] {
+            assert!(!store.contains_session(id).await.unwrap());
+        }
+        assert_eq!(
+            serde_json::to_value(store.events_after(started, 0, 10).await.unwrap()).unwrap(),
+            serde_json::to_value(started_events).unwrap()
+        );
+        assert!(
+            dispatch(
+                DispatchContext {
+                    client: client.clone(),
+                    config: config.clone(),
+                    session_root: root.path().to_path_buf(),
+                    sessions: Arc::clone(&sessions),
+                    session_store: Arc::clone(&store),
+                    receipts: Arc::new(sqlite_receipts().await),
+                    executor_factory: Arc::clone(&executor),
+                },
+                HostCommand::Stop { session_id: active }
+            )
+            .await
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(HostCommand::Stop { session_id }) if session_id == active)
+        );
+        drop(writer);
+        drop(store);
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            resume_pending_host_sessions(
+                &client,
+                &config,
+                root.path(),
+                &sessions,
+                &store,
+                &executor,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            store.state(locked).await.unwrap().status,
+            Some(crate::SessionStatus::Failed)
+        );
+        assert_eq!(
+            serde_json::to_value(store.events_after(expired, 0, 10).await.unwrap()).unwrap(),
+            serde_json::to_value(failed).unwrap()
+        );
+        let pending: HashSet<_> = store
+            .pending_host_launch_metadata(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(pending, HashSet::from([started, active, foreign, legacy]));
+        for id in [expired, locked, started, active, foreign, legacy] {
+            assert_eq!(
+                store.load_host_launch_metadata(id).await.unwrap(),
+                Some(metadata.clone())
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err(),
+            "local bootstrap settlement must not probe or publish to the relay"
+        );
+        let unpublished = store.pending_host_journals(None, 10).await.unwrap();
+        assert!(
+            unpublished.contains(&expired) && unpublished.contains(&locked),
+            "journal recovery must discover failures after bootstrap markers are removed"
+        );
+        let server = tokio::spawn(async move {
+            let mut uploads = Vec::new();
+            for status in ["503 Service Unavailable", "200 OK"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (path, _) = read_http_request(&mut stream).await;
+                assert_eq!(path, format!("/api/remote/host/sessions/{expired}/sync"));
+                let body = r#"{"event_cursor":0,"live_revision":0}"#;
+                stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (path, body) = read_http_request(&mut stream).await;
+                assert_eq!(path.split("?").next().unwrap(), "/api/remote/host/events");
+                uploads.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            uploads
+        });
+        recover_host_journal(&client, &config, &store, expired)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .pending_host_journals(None, 10)
+                .await
+                .unwrap()
+                .contains(&expired)
+        );
+        drop(store);
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        recover_host_journal(&client, &config, &store, expired)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .pending_host_journals(None, 10)
+                .await
+                .unwrap()
+                .contains(&expired)
+        );
+        let uploads = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(uploads.len(), 2);
+        assert_eq!(
+            uploads[0], uploads[1],
+            "publication retries preserve the exact failure journal"
+        );
+    }
+
+    #[tokio::test]
     async fn acknowledged_bootstrap_failure_replays_after_restart_without_execution() {
         let root = tempdir().unwrap();
         let session_id = Uuid::new_v4();
+        let launch = bootstrap_test_launch(root.path());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut config = test_config(root.path());
         config.server = format!("http://{}", listener.local_addr().unwrap());
@@ -10353,7 +10617,27 @@ connection: close
             release_rx.await.unwrap();
             stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
             let mut uploads = Vec::new();
-            for status in ["503 Service Unavailable", "200 OK"] {
+            for status in [
+                "503 Service Unavailable",
+                "503 Service Unavailable",
+                "200 OK",
+            ] {
+                if status == "200 OK" {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let (path, _) = read_http_request(&mut stream).await;
+                    assert_eq!(path, format!("/api/remote/host/sessions/{session_id}/sync"));
+                    let body = r#"{"event_cursor":0,"live_revision":0}"#;
+                    stream
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                }
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let (path, body) = read_http_request(&mut stream).await;
                 assert!(path.starts_with("/api/remote/host/events"));
@@ -10395,7 +10679,7 @@ connection: close
                 },
                 HostCommand::Launch {
                     session_id,
-                    request: Box::new(bootstrap_test_launch(root.path())),
+                    request: Box::new(launch.clone()),
                     attachment: None,
                 }
             )
@@ -10430,9 +10714,11 @@ connection: close
             1
         );
         drop(store);
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let store = Arc::new(
+            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
         resume_pending_host_sessions(&client, &config, root.path(), &sessions, &store, &executor)
             .await
             .unwrap();
@@ -10448,6 +10734,36 @@ connection: close
             serde_json::to_value(store.events_after(session_id, 0, 10).await.unwrap()).unwrap(),
             serde_json::to_value(failed).unwrap()
         );
+        // Offline bootstrap settlement must not weaken the relay command ACK fence.
+        assert!(
+            !dispatch(
+                DispatchContext {
+                    client: client.clone(),
+                    config: config.clone(),
+                    session_root: root.path().to_path_buf(),
+                    sessions: Arc::clone(&sessions),
+                    session_store: Arc::clone(&store),
+                    receipts: Arc::new(sqlite_receipts().await),
+                    executor_factory: Arc::clone(&executor),
+                },
+                HostCommand::Launch {
+                    session_id,
+                    request: Box::new(launch),
+                    attachment: None
+                }
+            )
+            .await
+        );
+        assert!(
+            store
+                .pending_host_journals(None, 8)
+                .await
+                .unwrap()
+                .contains(&session_id)
+        );
+        recover_host_journal(&client, &config, &store, session_id)
+            .await
+            .unwrap();
         let uploads = tokio::time::timeout(Duration::from_secs(5), server)
             .await
             .unwrap()
@@ -10456,14 +10772,16 @@ connection: close
             uploads[0], uploads[1],
             "recovery must replay identical durable failure"
         );
+        assert_eq!(
+            uploads[0], uploads[2],
+            "background publication preserves failure identity"
+        );
     }
 
     #[tokio::test]
     async fn bootstrap_upgrade_and_handoff_preserve_initial_prompt_recovery() {
         let root = tempdir().unwrap();
-        let (server_url, server) = event_server(vec!["200 OK"]).await;
         let mut config = test_config(root.path());
-        config.server = server_url;
         config.resource_limits.max_concurrent_sessions = 1;
         let path = root.path().join("sessions.sqlite3");
         let session_id = Uuid::new_v4();
@@ -10575,7 +10893,6 @@ connection: close
         .await
         .unwrap();
         assert!(!sessions.lock().await.contains_key(&stopped_id));
-        assert_eq!(server.await.unwrap(), vec![vec![1, 2]]);
         assert!(
             store
                 .pending_host_launch_metadata(8)
