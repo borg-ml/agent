@@ -4623,15 +4623,18 @@ async fn spawn_host_session(
     sessions.lock().await.insert(session_id, tx.clone());
     let sessions_for_cleanup = sessions.clone();
     tokio::spawn(async move {
-        if let Err(error) = run_session(
+        let mut supervisor = AbortTask(tokio::spawn(run_session(
             client.clone(),
             config.clone(),
             session_root.clone(),
             executor_factory,
             launch,
             rx,
-        )
-        .await
+        )));
+        if let Err(error) = (&mut supervisor.0)
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result)
         {
             tracing::error!(session_id = %session_id, %error, "remote agent session failed");
             // A fresh launch has no action for ordinary prompt recovery yet.
@@ -8313,6 +8316,184 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn panicked_host_startup_releases_routing_and_preserves_durable_recovery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+        for started in [false, true] {
+            let root = tempdir().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = test_config(root.path());
+            config.server = format!("http://{}", listener.local_addr().unwrap());
+            let _server = AbortTask(tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let (path, _) = read_http_request(&mut socket).await;
+                    let path = path.split("?").next().unwrap();
+                    let (status, body) = if path.ends_with("/sync") {
+                        (200, "{\"event_cursor\":0,\"live_revision\":0}")
+                    } else if matches!(
+                        path,
+                        "/api/remote/host/events" | "/api/remote/host/live-state"
+                    ) {
+                        (200, "")
+                    } else {
+                        (404, "")
+                    };
+                    socket.write_all(format!("HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            }));
+            let path = root.path().join("sessions.sqlite3");
+            let store = SqliteSessionStore::open(&path).await.unwrap();
+            let id = Uuid::new_v4();
+            let launch = bootstrap_test_launch(root.path());
+            persist_launch_metadata(&config, &store, id, &launch, None)
+                .await
+                .unwrap();
+            store.begin_host_bootstrap(id).await.unwrap();
+            if started {
+                store.create_session(id).await.unwrap();
+                for kind in [
+                    crate::SessionEventKind::SessionStarted,
+                    crate::SessionEventKind::SessionConfigured {
+                        cwd: launch.cwd.clone(),
+                        provider: launch.provider,
+                        model: None,
+                        effort: None,
+                        fast: false,
+                        response_language: launch.response_language,
+                        permission_mode: launch.permission_mode,
+                    },
+                ] {
+                    store.append(SessionEvent::new(id, 0, kind)).await.unwrap();
+                }
+                admit_remote_prompt(
+                    &store,
+                    id,
+                    launch.request_id,
+                    "recover after panic",
+                    &[],
+                    crate::PromptDelivery::Queue,
+                )
+                .await
+                .unwrap();
+            }
+            let sessions = Arc::new(Mutex::new(HashMap::new()));
+            let reached = Arc::new(Notify::new());
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let factory_reached = Arc::clone(&reached);
+            let factory_attempts = Arc::clone(&attempts);
+            let factory: HostExecutorFactory = Arc::new(move |_, _| {
+                factory_attempts.fetch_add(1, Ordering::SeqCst);
+                factory_reached.notify_one();
+                panic!("injected hosted startup panic");
+            });
+            let client = Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap();
+            let commands = spawn_host_session(
+                client.clone(),
+                config.clone(),
+                root.path().to_path_buf(),
+                Arc::clone(&sessions),
+                factory,
+                HostSessionLaunch {
+                    session_id: id,
+                    request: launch,
+                    attachment: None,
+                },
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(30), reached.notified())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), commands.closed())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while sessions.lock().await.contains_key(&id) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect(
+                "a panic must not leave a closed route that blocks recovery and consumes capacity",
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if SessionWriterLease::try_acquire(root.path().join(format!("{id}.lock")))
+                        .unwrap()
+                        .is_some()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("startup panic must release writer ownership");
+            drop(store);
+            let store = SqliteSessionStore::open(&path).await.unwrap();
+            let journal = serde_json::to_value(store.read(id).await.unwrap()).unwrap();
+            if started {
+                assert_ne!(
+                    store.state(id).await.unwrap().status,
+                    Some(crate::SessionStatus::Failed)
+                );
+                assert_eq!(store.pending_actions(id, 8).await.unwrap().len(), 1);
+            } else {
+                assert_eq!(
+                    store.state(id).await.unwrap().status,
+                    Some(crate::SessionStatus::Failed)
+                );
+                assert!(
+                    store
+                        .pending_host_launch_metadata(8)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            let factory_reached = Arc::clone(&reached);
+            let factory_attempts = Arc::clone(&attempts);
+            let retry: HostExecutorFactory = Arc::new(move |_, _| {
+                factory_attempts.fetch_add(1, Ordering::SeqCst);
+                factory_reached.notify_one();
+                bail!("stop recovery probe before executing a provider")
+            });
+            resume_pending_host_sessions(
+                0,
+                &client,
+                &config,
+                root.path(),
+                &sessions,
+                &store,
+                &retry,
+            )
+            .await
+            .unwrap();
+            if started {
+                tokio::time::timeout(Duration::from_secs(30), reached.notified())
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while sessions.lock().await.contains_key(&id) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            assert_eq!(attempts.load(Ordering::SeqCst), if started { 2 } else { 1 });
+            assert_eq!(
+                serde_json::to_value(store.read(id).await.unwrap()).unwrap(),
+                journal
+            );
+            assert!(sessions.lock().await.is_empty());
+        }
     }
 
     #[tokio::test]

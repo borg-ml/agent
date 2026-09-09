@@ -318,6 +318,15 @@ synchronization retain their existing behavior; independent recovery workers
 publish retained session output and hosted workspace/private messages after the
 actor exits. Production acceptance remains required.
 
+The host wraps each hosted supervisor in an abort-owned Tokio task. An unwinding
+panic in that supervisor now reaches ordinary failure handling and route cleanup
+instead of leaving a closed sender permanently counted as active. Unstarted
+launches use the existing durable rejection path; started journals and pending
+work remain eligible for normal recovery. Cleanup still waits for that error
+handling, and route removal is not proof that every child or external process has
+finished cancellation. This is not protection against process aborts or panics
+or cancellation in the outer cleanup task itself.
+
 ## Hosted duration expiry
 
 The host duration timer covers the actor supervision loop, including awaited
