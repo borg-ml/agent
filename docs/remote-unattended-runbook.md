@@ -247,10 +247,11 @@ after the actor exits. Production acceptance remains required.
 
 ## Final hosted workspace and private messages
 
-A separate upload-only recovery worker drains workspace/private messages for
+A separate output recovery worker drains workspace/private messages for
 inactive hosted sessions, even when their session journal is already caught up
 and all actor slots are occupied. It never starts an actor/provider, imports an
-inbox, refreshes presence, or renews a lease. Active hosted sessions retain their
+inbox, refreshes presence, or renews a lease. Legacy launches first require the
+one-time ownership verification described below. Active hosted sessions retain their
 own uploader; both paths persist progress in `host_workspace_cursors`, keyed by
 host, session, and workspace. This additive current-v5 table does not rewrite
 journal history. Reopening the database preserves acknowledged progress.
@@ -299,14 +300,39 @@ hide eligible work for the current host. Foreign relay commands remain
 unacknowledged and can still block later commands on that relay queue; this is
 not a command-transfer or remote rejection-result protocol.
 
-These checks use existing durable evidence; they do not invent an owner for a
-legacy/pre-start launch that has neither a bound host nor an attachment host
-identity. `host_launches` still lacks a required immutable host owner, so those
-unbound rows remain a recovery gap. This checkpoint also does not repair a
-binding already overwritten by an older binary, establish ownership across
-relay-origin changes, or change local CLI mirror enrollment behavior. Do not
-edit host IDs in the database or restart active actors as an automatic repair.
-A complete re-enrollment migration/authorization policy remains required.
+New hosted launches atomically persist an immutable `(host_id, relay_origin)`
+owner in `host_launch_owners` with their launch metadata, before acknowledgement
+or actor startup. The origin is the normalized scheme/host/port: trailing slashes
+and default-port spelling do not create a new owner, but a different relay does.
+Exact launch retries preserve that owner; another host or relay cannot adopt the
+same local launch ID. A failed owner write rolls back launch admission too.
+Token rotation for the same host and origin does not change this ownership key.
+
+The additive current-v5 table leaves legacy rows unowned. It never infers their
+owner from the currently enrolled host. Background journal recovery scans these
+rows even without a session journal and verifies `/sessions/SESSION_UUID/sync`
+using the configured host credentials. Only a successful, valid response permits
+a one-time owner claim; the SQLite transaction rechecks local binding/attachment
+identity and any concurrent owner claim. A 401, 404, outage, or malformed reply
+retains the original metadata/bootstrap without constructing an actor, settling
+work, or inventing ownership. Known mismatches are rejected before any probe.
+
+The main command/recovery poller does not wait for these legacy network probes.
+It retains unverified legacy commands and waits for background verification;
+verified owned launches are prioritized over unowned rows in the bounded launch
+recovery scan. First recovery after upgrading an unowned legacy launch therefore
+requires relay availability, including before an inactive Stop can be accepted.
+Once verified, ownership survives restart and the same owner can again Stop
+locally while offline. Legacy verification does not prove recipient consumption
+or publish output from a session that has not yet been created.
+
+A binding already overwritten by an older binary is not automatically repaired;
+conflicting durable evidence remains an error. Local CLI mirrors without hosted
+launch metadata remain outside this ownership table. Old binaries do not enforce
+the new owner/origin checks: retain the table on rollback and do not use an old
+binary to re-enroll or take over shared state. Do not edit host IDs in the database
+or restart active actors as an automatic repair. Explicit ownership transfer and
+local CLI mirror re-enrollment policy remain separate work.
 
 ## Deferred shell and workspace commands
 

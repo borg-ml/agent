@@ -15,12 +15,137 @@ async fn store() -> (tempfile::TempDir, SqliteSessionStore) {
 }
 
 #[tokio::test]
+async fn host_launch_owner_is_atomic_immutable_and_scoped_across_reopen() {
+    let (root, store) = store().await;
+    let id = Uuid::new_v4();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let origin = "https://relay.invalid";
+    let metadata = serde_json::json!({"request_id": id});
+    sqlx::raw_sql("create trigger reject_owner before insert on host_launch_owners begin select raise(abort, 'injected owner write failure'); end;")
+        .execute(store.pool()).await.unwrap();
+    assert!(
+        store
+            .persist_owned_host_launch_metadata(id, &metadata, first, origin)
+            .await
+            .is_err()
+    );
+    assert!(
+        store.load_host_launch_metadata(id).await.unwrap().is_none(),
+        "owner and launch admission must commit together"
+    );
+    sqlx::query("drop trigger reject_owner")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let bound = Uuid::new_v4();
+    store.create_session(bound).await.unwrap();
+    let binding = store.workspace_binding(bound).await.unwrap().unwrap();
+    store
+        .attach_workspace(crate::SessionWorkspaceBinding {
+            host_id: Some(second),
+            ..binding
+        })
+        .await
+        .unwrap();
+    assert!(
+        store
+            .persist_owned_host_launch_metadata(bound, &metadata, first, origin)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .load_host_launch_metadata(bound)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.host_launch_owner(bound).await.unwrap().is_none());
+    let legacy = Uuid::new_v4();
+    store
+        .persist_host_launch_metadata(legacy, &metadata)
+        .await
+        .unwrap();
+    store.begin_host_bootstrap(legacy).await.unwrap();
+    let (a, b) = tokio::join!(
+        store.persist_owned_host_launch_metadata(id, &metadata, first, origin),
+        store.persist_owned_host_launch_metadata(id, &metadata, second, origin),
+    );
+    assert_ne!(
+        a.is_ok(),
+        b.is_ok(),
+        "exactly one concurrent owner may admit the launch"
+    );
+    let owner = if a.is_ok() { first } else { second };
+    let other = if a.is_ok() { second } else { first };
+    store.begin_host_bootstrap(id).await.unwrap();
+    assert_eq!(
+        store
+            .pending_host_launch_metadata_for_host(Some((owner, origin)), 1)
+            .await
+            .unwrap()[0]
+            .0,
+        id,
+        "unverified legacy rows cannot crowd out owned recovery"
+    );
+    assert!(
+        store
+            .pending_host_launch_metadata_for_host(Some((other, origin)), 8)
+            .await
+            .unwrap()
+            .iter()
+            .all(|(candidate, _)| *candidate != id)
+    );
+    drop(store);
+    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.host_launch_owner(id).await.unwrap(),
+        Some((owner, origin.to_string()))
+    );
+    store
+        .persist_owned_host_launch_metadata(id, &metadata, owner, origin)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .persist_owned_host_launch_metadata(id, &metadata, other, origin)
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .persist_owned_host_launch_metadata(id, &metadata, owner, "https://other.invalid")
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .persist_owned_host_launch_metadata(legacy, &metadata, owner, origin)
+            .await
+            .is_err(),
+        "an incoming launch retry alone is not legacy ownership proof"
+    );
+    assert!(store.host_launch_owner(legacy).await.unwrap().is_none());
+    assert_eq!(
+        store.load_host_launch_metadata(legacy).await.unwrap(),
+        Some(metadata)
+    );
+    assert_eq!(
+        store.host_launch_owner(id).await.unwrap(),
+        Some((owner, origin.to_string()))
+    );
+}
+
+#[tokio::test]
 async fn terminal_host_settlement_cancels_abandoned_actions_and_fences_old_leases() {
     let (directory, store) = store().await;
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
     store
-        .persist_host_launch_metadata(session_id, &serde_json::json!({"request_id": session_id}))
+        .persist_owned_host_launch_metadata(session_id, &serde_json::json!({"request_id": session_id}), Uuid::nil(), "https://relay.invalid")
         .await
         .unwrap();
     store.begin_host_bootstrap(session_id).await.unwrap();
@@ -146,7 +271,7 @@ async fn host_journal_cursors_preserve_late_events_live_state_and_pagination() {
             .unwrap();
         if id != local {
             store
-                .persist_host_launch_metadata(id, &serde_json::json!({"request_id": id}))
+                .persist_owned_host_launch_metadata(id, &serde_json::json!({"request_id": id}), Uuid::nil(), "https://relay.invalid")
                 .await
                 .unwrap();
         }
@@ -280,7 +405,7 @@ async fn host_journal_cursors_preserve_late_events_live_state_and_pagination() {
     let fork = store.fork_before(local, fork_id, 3).await.unwrap();
     assert!(fork.inherited_event_count > 0);
     store
-        .persist_host_launch_metadata(fork_id, &serde_json::json!({"request_id": fork_id}))
+        .persist_owned_host_launch_metadata(fork_id, &serde_json::json!({"request_id": fork_id}), Uuid::nil(), "https://relay.invalid")
         .await
         .unwrap();
     assert_eq!(

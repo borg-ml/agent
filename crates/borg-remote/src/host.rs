@@ -2242,7 +2242,10 @@ async fn recover_host_journal(
     store: &SqliteSessionStore,
     session_id: Uuid,
 ) -> Result<Instant> {
-    validate_stored_host_identity(config, store, session_id).await?;
+    ensure_host_launch_owner(client, config, store, session_id).await?;
+    if !store.contains_session(session_id).await? {
+        return Ok(Instant::now());
+    }
     // The relay is authoritative after a lost response or a host restart.
     // This path only publishes journals; it never constructs a session actor.
     let cursor = load_session_sync(client, config, session_id).await?;
@@ -2336,6 +2339,7 @@ async fn recover_host_workspace_messages(
     workspace: &SqliteWorkspaceStore,
     session_id: Uuid,
 ) -> Result<Instant> {
+    ensure_host_launch_owner(client, config, store, session_id).await?;
     let binding = store
         .workspace_binding(session_id)
         .await?
@@ -3138,11 +3142,24 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             }
         };
     }
-    if let Some(session_id) = command.session_id()
-        && let Err(error) = validate_stored_host_identity(&config, &session_store, session_id).await
-    {
-        tracing::warn!(%error, %session_id, "stored session host identity rejected command; retaining it");
-        return false;
+    if let Some(session_id) = command.session_id() {
+        let authorized: Result<()> = async {
+            validate_stored_host_identity(&config, &session_store, session_id).await?;
+            ensure!(
+                session_store
+                    .load_host_launch_metadata(session_id)
+                    .await?
+                    .is_none()
+                    || session_store.host_launch_owner(session_id).await?.is_some(),
+                "legacy launch awaits background relay ownership verification"
+            );
+            Ok(())
+        }
+        .await;
+        if let Err(error) = authorized {
+            tracing::warn!(%error, %session_id, "stored session host identity rejected command; retaining it");
+            return false;
+        }
     }
     if let HostCommand::Launch {
         session_id,
@@ -3155,8 +3172,14 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             tracing::error!(%error, %session_id, "failed to persist remote session launch");
             return false;
         }
-        if let Err(error) =
-            persist_launch_metadata(&session_store, session_id, &request, attachment.as_ref()).await
+        if let Err(error) = persist_launch_metadata(
+            &config,
+            &session_store,
+            session_id,
+            &request,
+            attachment.as_ref(),
+        )
+        .await
         {
             tracing::error!(%error, %session_id, "failed to persist remote session launch");
             return false;
@@ -3488,7 +3511,7 @@ async fn reject_host_launch(
 ) -> bool {
     let result: Result<bool> = async {
         let _writer = SessionWriterLease::acquire(session_root.join(format!("{session_id}.lock")))?;
-        validate_stored_host_identity(config, store, session_id).await?;
+        ensure_host_launch_owner(client, config, store, session_id).await?;
         if !store.contains_session(session_id).await? {
             store.create_session(session_id).await?;
         }
@@ -4206,11 +4229,43 @@ fn authorize_workspace_command(
     Ok(())
 }
 
+fn host_relay_origin(config: &HostConfig) -> Result<String> {
+    Ok(Url::parse(&validate_server_url(&config.server)?)?
+        .origin()
+        .ascii_serialization())
+}
+
+async fn ensure_host_launch_owner(
+    client: &Client,
+    config: &HostConfig,
+    store: &SqliteSessionStore,
+    session_id: Uuid,
+) -> Result<()> {
+    validate_stored_host_identity(config, store, session_id).await?;
+    if store.host_launch_owner(session_id).await?.is_none()
+        && store.load_host_launch_metadata(session_id).await?.is_some()
+    {
+        // An unowned legacy row is not authorization. The relay checks both
+        // session ID and host credentials before any local ownership mutation.
+        load_session_sync(client, config, session_id).await?;
+        store
+            .claim_legacy_host_launch_owner(session_id, config.host_id, &host_relay_origin(config)?)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn validate_stored_host_identity(
     config: &HostConfig,
     store: &SqliteSessionStore,
     session_id: Uuid,
 ) -> Result<()> {
+    if let Some((host_id, origin)) = store.host_launch_owner(session_id).await? {
+        ensure!(
+            host_id == config.host_id && origin == host_relay_origin(config)?,
+            "session launch belongs to another host or relay"
+        );
+    }
     if let Some(binding) = store.workspace_binding(session_id).await?
         && let Some(host_id) = binding.host_id
     {
@@ -4233,6 +4288,7 @@ async fn validate_stored_host_identity(
 }
 
 async fn persist_launch_metadata(
+    config: &HostConfig,
     store: &SqliteSessionStore,
     session_id: Uuid,
     request: &LaunchSession,
@@ -4243,7 +4299,12 @@ async fn persist_launch_metadata(
         attachment: attachment.cloned(),
     };
     store
-        .persist_host_launch_metadata(session_id, &serde_json::to_value(current)?)
+        .persist_owned_host_launch_metadata(
+            session_id,
+            &serde_json::to_value(current)?,
+            config.host_id,
+            &host_relay_origin(config)?,
+        )
         .await
 }
 
@@ -4292,11 +4353,18 @@ async fn resume_pending_host_sessions(
         .max_concurrent_sessions
         .saturating_sub(sessions.lock().await.len() as u32) as usize;
     for (session_id, value) in session_store
-        .pending_host_launch_metadata_for_host(Some(config.host_id), 256)
+        .pending_host_launch_metadata_for_host(
+            Some((config.host_id, &host_relay_origin(&config)?)),
+            256,
+        )
         .await?
     {
         if let Err(error) = validate_stored_host_identity(config, session_store, session_id).await {
             tracing::warn!(%error, %session_id, "skipping recovery for incompatible stored host identity");
+            continue;
+        }
+        // Legacy verification runs in background journal recovery, not the command poller.
+        if session_store.host_launch_owner(session_id).await?.is_none() {
             continue;
         }
         if sessions.lock().await.contains_key(&session_id) {
@@ -4440,7 +4508,7 @@ async fn run_session(
     discard_serialized_extension_roots(&mut launch);
     let sqlite_store =
         Arc::new(SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await?);
-    validate_stored_host_identity(&config, &sqlite_store, session_id).await?;
+    ensure_host_launch_owner(&client, &config, &sqlite_store, session_id).await?;
     if let Some(context) = fetch_runtime_mcp_context(&client, &config, session_id).await? {
         launch.capabilities.runtime_mcp_context = Some(context);
     }
@@ -7404,9 +7472,15 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        persist_launch_metadata(&session_store, session_id, &launch, Some(&attachment))
-            .await
-            .unwrap();
+        persist_launch_metadata(
+            &config,
+            &session_store,
+            session_id,
+            &launch,
+            Some(&attachment),
+        )
+        .await
+        .unwrap();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let receipts = Arc::new(sqlite_receipts().await);
 
@@ -7661,6 +7735,224 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_launch_owner_requires_relay_proof_and_rechecks_binding() {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        let root = tempdir().unwrap();
+        let path = root.path().join("sessions.sqlite3");
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let id = Uuid::new_v4();
+        let metadata = serde_json::to_value(PersistedLaunchMetadata {
+            request: bootstrap_test_launch(root.path()),
+            attachment: None,
+        })
+        .unwrap();
+        store
+            .persist_host_launch_metadata(id, &metadata)
+            .await
+            .unwrap();
+        store.begin_host_bootstrap(id).await.unwrap();
+        sqlx::query("drop table host_launch_owners")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        drop(store);
+        let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        assert!(
+            store.host_launch_owner(id).await.unwrap().is_none(),
+            "schema upgrade must not invent an owner"
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config(root.path());
+        config.server = format!("http://{}", listener.local_addr().unwrap());
+        let mode = Arc::new(AtomicU16::new(404));
+        let server_mode = Arc::clone(&mode);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::clone(&release);
+        let (sent, mut requests) = mpsc::channel(8);
+        let _server = AbortTask(tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (path, _) = read_http_request(&mut socket).await;
+                assert!(
+                    path.ends_with("/sync"),
+                    "legacy authorization must not execute or upload output"
+                );
+                sent.send(path).await.unwrap();
+                let mode = server_mode.load(Ordering::SeqCst);
+                if mode == 0 {
+                    gate.notified().await;
+                }
+                let status = if mode <= 1 { 200 } else { mode };
+                let body = if mode == 0 || mode == 200 {
+                    "{\"event_cursor\":0,\"live_revision\":0}"
+                } else {
+                    ""
+                };
+                socket.write_all(format!("HTTP/1.1 {status} Response\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        }));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        for rejection in [404, 401, 503, 1] {
+            mode.store(rejection, Ordering::SeqCst);
+            assert!(
+                ensure_host_launch_owner(&client, &config, &store, id)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                requests.recv().await.unwrap(),
+                format!("/api/remote/host/sessions/{id}/sync")
+            );
+            assert!(store.host_launch_owner(id).await.unwrap().is_none());
+            assert!(!store.contains_session(id).await.unwrap());
+            assert_eq!(
+                store.load_host_launch_metadata(id).await.unwrap(),
+                Some(metadata.clone())
+            );
+            assert_eq!(
+                store.pending_host_launch_metadata(8).await.unwrap().len(),
+                1
+            );
+        }
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let (active, _active_rx) = mpsc::channel(1);
+        sessions.lock().await.insert(Uuid::new_v4(), active);
+        config.resource_limits.max_concurrent_sessions = 1;
+        let executor: HostExecutorFactory =
+            Arc::new(|_, _| panic!("migration must not construct a provider"));
+        resume_pending_host_sessions(&client, &config, root.path(), &sessions, &store, &executor)
+            .await
+            .unwrap();
+        assert!(
+            requests.try_recv().is_err(),
+            "legacy proof must not block command polling"
+        );
+        mode.store(200, Ordering::SeqCst);
+        let mut recovery = AbortTask(tokio::spawn(run_host_journal_recovery_loop(
+            client.clone(),
+            config.clone(),
+            Arc::clone(&store),
+            Arc::clone(&sessions),
+        )));
+        tokio::time::timeout(Duration::from_secs(3), requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while store.host_launch_owner(id).await.unwrap().is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        recovery.0.abort();
+        let _ = (&mut recovery.0).await;
+        assert!(!store.contains_session(id).await.unwrap());
+        assert_eq!(sessions.lock().await.len(), 1);
+        assert_eq!(
+            store.host_launch_owner(id).await.unwrap(),
+            Some((config.host_id, host_relay_origin(&config).unwrap()))
+        );
+        ensure_host_launch_owner(&client, &config, &store, id)
+            .await
+            .unwrap();
+        let mut foreign = config.clone();
+        foreign.host_id = Uuid::new_v4();
+        assert!(
+            ensure_host_launch_owner(&client, &foreign, &store, id)
+                .await
+                .is_err()
+        );
+        foreign = config.clone();
+        foreign.server = "https://other.invalid".to_string();
+        assert!(
+            ensure_host_launch_owner(&client, &foreign, &store, id)
+                .await
+                .is_err()
+        );
+        assert!(
+            requests.try_recv().is_err(),
+            "verified or foreign ownership must not re-probe"
+        );
+        let racing = Uuid::new_v4();
+        store
+            .persist_host_launch_metadata(racing, &metadata)
+            .await
+            .unwrap();
+        mode.store(0, Ordering::SeqCst);
+        let task_store = Arc::clone(&store);
+        let task_config = config.clone();
+        let mut authorization = AbortTask(tokio::spawn(async move {
+            ensure_host_launch_owner(&client, &task_config, &task_store, racing).await
+        }));
+        assert_eq!(
+            requests.recv().await.unwrap(),
+            format!("/api/remote/host/sessions/{racing}/sync")
+        );
+        store.create_session(racing).await.unwrap();
+        let binding = store.workspace_binding(racing).await.unwrap().unwrap();
+        let binding = crate::SessionWorkspaceBinding {
+            host_id: Some(Uuid::new_v4()),
+            ..binding
+        };
+        store.attach_workspace(binding.clone()).await.unwrap();
+        release.notify_one();
+        assert!(
+            (&mut authorization.0).await.unwrap().is_err(),
+            "relay proof cannot override a concurrently changed local identity"
+        );
+        assert!(store.host_launch_owner(racing).await.unwrap().is_none());
+        assert_eq!(
+            store.workspace_binding(racing).await.unwrap().unwrap(),
+            binding
+        );
+    }
+
+    #[tokio::test]
+    async fn prestart_launch_keeps_its_host_and_relay_owner_after_reopen() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("sessions.sqlite3");
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let config = test_config(root.path());
+        let id = Uuid::new_v4();
+        persist_launch_metadata(
+            &config,
+            &store,
+            id,
+            &bootstrap_test_launch(root.path()),
+            None,
+        )
+        .await
+        .unwrap();
+        store.begin_host_bootstrap(id).await.unwrap();
+        assert!(!store.contains_session(id).await.unwrap());
+        drop(store);
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let mut foreign = config.clone();
+        foreign.host_id = Uuid::new_v4();
+        assert!(
+            validate_stored_host_identity(&foreign, &store, id)
+                .await
+                .is_err(),
+            "an acknowledged pre-start launch must retain its original host without a workspace binding"
+        );
+        foreign = config.clone();
+        foreign.server = "https://another-relay.invalid".to_string();
+        assert!(
+            validate_stored_host_identity(&foreign, &store, id)
+                .await
+                .is_err(),
+            "host UUID reuse at another relay must not transfer launch ownership"
+        );
+        validate_stored_host_identity(&config, &store, id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn reenrolled_host_cannot_rebind_or_settle_another_host_session() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let root = tempdir().unwrap();
@@ -7671,8 +7963,14 @@ mod tests {
         );
         let session_id = Uuid::new_v4();
         let original_host = Uuid::new_v4();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config(root.path());
+        assert_ne!(config.host_id, original_host);
+        config.server = format!("http://{}", listener.local_addr().unwrap());
+        let mut owner_config = config.clone();
+        owner_config.host_id = original_host;
         let launch = bootstrap_test_launch(root.path());
-        persist_launch_metadata(&store, session_id, &launch, None)
+        persist_launch_metadata(&owner_config, &store, session_id, &launch, None)
             .await
             .unwrap();
         store.create_session(session_id).await.unwrap();
@@ -7691,10 +7989,6 @@ mod tests {
             .await
             .unwrap();
         store.begin_host_bootstrap(session_id).await.unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut config = test_config(root.path());
-        assert_ne!(config.host_id, original_host);
-        config.server = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&requests);
         let _server = AbortTask(tokio::spawn(async move {
@@ -7812,7 +8106,7 @@ mod tests {
             approval_provenance: None,
             reconnect_sync_cursors: None,
         };
-        persist_launch_metadata(&store, unstarted, &launch, Some(&attachment))
+        persist_launch_metadata(&owner_config, &store, unstarted, &launch, Some(&attachment))
             .await
             .unwrap();
         store.begin_host_bootstrap(unstarted).await.unwrap();
@@ -7853,8 +8147,6 @@ mod tests {
             2
         );
 
-        let mut owner_config = config.clone();
-        owner_config.host_id = original_host;
         assert!(
             dispatch(
                 command_context(&owner_config),
@@ -7876,13 +8168,16 @@ mod tests {
         let current = Uuid::new_v4();
         let mut current_attachment = attachment.clone();
         current_attachment.host_identity.as_mut().unwrap().host_id = config.host_id;
-        persist_launch_metadata(&store, current, &launch, Some(&current_attachment))
+        persist_launch_metadata(&config, &store, current, &launch, Some(&current_attachment))
             .await
             .unwrap();
         store.begin_host_bootstrap(current).await.unwrap();
         assert_eq!(
             store
-                .pending_host_launch_metadata_for_host(Some(config.host_id), 1)
+                .pending_host_launch_metadata_for_host(
+                    Some((config.host_id, &host_relay_origin(&config).unwrap())),
+                    1
+                )
                 .await
                 .unwrap()[0]
                 .0,
@@ -7891,7 +8186,10 @@ mod tests {
         );
         assert_eq!(
             store
-                .pending_host_launch_metadata_for_host(Some(original_host), 1)
+                .pending_host_launch_metadata_for_host(
+                    Some((original_host, &host_relay_origin(&config).unwrap())),
+                    1
+                )
                 .await
                 .unwrap()[0]
                 .0,
@@ -7910,7 +8208,7 @@ mod tests {
         let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
         let session_id = Uuid::new_v4();
         let launch = bootstrap_test_launch(root.path());
-        persist_launch_metadata(&store, session_id, &launch, None)
+        persist_launch_metadata(&config, &store, session_id, &launch, None)
             .await
             .unwrap();
         store.create_session(session_id).await.unwrap();
@@ -8516,6 +8814,7 @@ connection: close
             reconnect_sync_cursors: None,
         };
         persist_launch_metadata(
+            &config,
             &store,
             session_id,
             &bootstrap_test_launch(root.path()),
@@ -8871,6 +9170,7 @@ connection: close
         let path = root.path().join("sessions.sqlite3");
         let store = SqliteSessionStore::open(&path).await.unwrap();
         persist_launch_metadata(
+            &config,
             &store,
             session_id,
             &bootstrap_test_launch(root.path()),
@@ -9119,11 +9419,15 @@ connection: close
     #[tokio::test]
     async fn bootstrap_upgrade_and_handoff_preserve_initial_prompt_recovery() {
         let root = tempdir().unwrap();
+        let (server_url, server) = event_server(vec!["200 OK"]).await;
+        let mut config = test_config(root.path());
+        config.server = server_url;
+        config.resource_limits.max_concurrent_sessions = 1;
         let path = root.path().join("sessions.sqlite3");
         let session_id = Uuid::new_v4();
         let launch = bootstrap_test_launch(root.path());
         let store = SqliteSessionStore::open(&path).await.unwrap();
-        persist_launch_metadata(&store, session_id, &launch, None)
+        persist_launch_metadata(&config, &store, session_id, &launch, None)
             .await
             .unwrap();
         // Simulate the previous current schema: additive upgrade must preserve metadata.
@@ -9195,7 +9499,7 @@ connection: close
         );
 
         let stopped_id = Uuid::new_v4();
-        persist_launch_metadata(&store, stopped_id, &launch, None)
+        persist_launch_metadata(&config, &store, stopped_id, &launch, None)
             .await
             .unwrap();
         store.begin_host_bootstrap(stopped_id).await.unwrap();
@@ -9218,10 +9522,6 @@ connection: close
         sessions.lock().await.insert(session_id, tx);
         let executor: HostExecutorFactory =
             Arc::new(|_, _| panic!("stopped bootstrap must not restart"));
-        let (server_url, server) = event_server(vec!["200 OK"]).await;
-        let mut config = test_config(root.path());
-        config.server = server_url;
-        config.resource_limits.max_concurrent_sessions = 1;
         resume_pending_host_sessions(
             &Client::new(),
             &config,
@@ -9429,7 +9729,7 @@ connection: close
                 .await
                 .unwrap();
         }
-        persist_launch_metadata(&session_store, session_id, &launch, None)
+        persist_launch_metadata(&config, &session_store, session_id, &launch, None)
             .await
             .unwrap();
         let sessions = Arc::new(Mutex::new(HashMap::new()));

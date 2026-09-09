@@ -1309,10 +1309,17 @@ impl SqliteSessionStore {
                 .bind("host_workspace_cursors")
                 .fetch_one(&self.pool)
                 .await?;
+        let has_host_launch_owners: i64 =
+            sqlx::query_scalar("select count(*) from sqlite_master where type=? and name=?")
+                .bind("table")
+                .bind("host_launch_owners")
+                .fetch_one(&self.pool)
+                .await?;
         Ok(version == Some(SESSION_SCHEMA_VERSION)
             && has_host_bootstraps != 0
             && has_host_journal_cursors != 0
             && has_host_workspace_cursors != 0
+            && has_host_launch_owners != 0
             && has_access_bindings != 0
             && has_harness_routes != 0)
     }
@@ -2039,6 +2046,26 @@ impl SqliteSessionStore {
         session_id: Uuid,
         metadata: &serde_json::Value,
     ) -> Result<()> {
+        self.persist_host_launch(session_id, metadata, None).await
+    }
+
+    pub(crate) async fn persist_owned_host_launch_metadata(
+        &self,
+        session_id: Uuid,
+        metadata: &serde_json::Value,
+        host_id: Uuid,
+        relay_origin: &str,
+    ) -> Result<()> {
+        self.persist_host_launch(session_id, metadata, Some((host_id, relay_origin)))
+            .await
+    }
+
+    async fn persist_host_launch(
+        &self,
+        session_id: Uuid,
+        metadata: &serde_json::Value,
+        owner: Option<(Uuid, &str)>,
+    ) -> Result<()> {
         ensure!(
             metadata.is_object(),
             "host launch metadata must be an object"
@@ -2049,11 +2076,33 @@ impl SqliteSessionStore {
             "host launch metadata exceeds {MAX_HOST_LAUNCH_METADATA_BYTES} bytes"
         );
         let mut transaction = self.begin_write().await?;
+        if let Some((host_id, _)) = owner {
+            let bound: Option<Option<String>> = sqlx::query_scalar(
+                "select host_id from session_workspace_bindings where session_id=?",
+            )
+            .bind(session_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if let Some(bound) = bound.flatten() {
+                ensure!(
+                    parse_uuid(&bound)? == host_id,
+                    "session binding belongs to another host"
+                );
+            }
+            if let Some(identity) = metadata.pointer("/attachment/host_identity/host_id") {
+                ensure!(
+                    parse_uuid(identity.as_str().context("invalid launch host identity")?)?
+                        == host_id,
+                    "launch attachment belongs to another host"
+                );
+            }
+        }
         let existing: Option<String> =
             sqlx::query_scalar("select metadata_json from host_launches where session_id=?")
                 .bind(session_id.to_string())
                 .fetch_optional(&mut *transaction)
                 .await?;
+        let was_existing = existing.is_some();
         if let Some(existing) = existing {
             ensure!(
                 existing == metadata_json,
@@ -2072,6 +2121,103 @@ impl SqliteSessionStore {
             .execute(&mut *transaction)
             .await?;
         }
+        if let Some((host_id, relay_origin)) = owner {
+            let existing_owner = sqlx::query(
+                "select host_id,relay_origin from host_launch_owners where session_id=?",
+            )
+            .bind(session_id.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if let Some(row) = existing_owner {
+                ensure!(
+                    parse_uuid(row.try_get("host_id")?)? == host_id
+                        && row.try_get::<String, _>("relay_origin")? == relay_origin,
+                    "host launch already belongs to another host or relay"
+                );
+            } else {
+                ensure!(
+                    !was_existing,
+                    "legacy launch requires relay-verified ownership before admission"
+                );
+                sqlx::query(
+                    "insert into host_launch_owners(session_id,host_id,relay_origin) values(?,?,?)",
+                )
+                .bind(session_id.to_string())
+                .bind(host_id.to_string())
+                .bind(relay_origin)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn host_launch_owner(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<(Uuid, String)>> {
+        sqlx::query("select host_id,relay_origin from host_launch_owners where session_id=?")
+            .bind(session_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| {
+                Ok((
+                    parse_uuid(row.try_get("host_id")?)?,
+                    row.try_get("relay_origin")?,
+                ))
+            })
+            .transpose()
+    }
+
+    /// Caller must first verify this legacy session with the host-authenticated relay.
+    pub(crate) async fn claim_legacy_host_launch_owner(
+        &self,
+        session_id: Uuid,
+        host_id: Uuid,
+        relay_origin: &str,
+    ) -> Result<()> {
+        let mut transaction = self.begin_write().await?;
+        let metadata: String =
+            sqlx::query_scalar("select metadata_json from host_launches where session_id=?")
+                .bind(session_id.to_string())
+                .fetch_one(&mut *transaction)
+                .await?;
+        let metadata: serde_json::Value = serde_json::from_str(&metadata)?;
+        let bound: Option<Option<String>> =
+            sqlx::query_scalar("select host_id from session_workspace_bindings where session_id=?")
+                .bind(session_id.to_string())
+                .fetch_optional(&mut *transaction)
+                .await?;
+        if let Some(bound) = bound.flatten() {
+            ensure!(
+                parse_uuid(&bound)? == host_id,
+                "legacy session binding belongs to another host"
+            );
+        }
+        if let Some(owner) = metadata.pointer("/attachment/host_identity/host_id") {
+            ensure!(
+                parse_uuid(
+                    owner
+                        .as_str()
+                        .context("invalid legacy launch host identity")?
+                )? == host_id,
+                "legacy launch belongs to another host"
+            );
+        }
+        sqlx::query("insert into host_launch_owners(session_id,host_id,relay_origin) values(?,?,?) on conflict do nothing")
+            .bind(session_id.to_string()).bind(host_id.to_string()).bind(relay_origin)
+            .execute(&mut *transaction).await?;
+        let row =
+            sqlx::query("select host_id,relay_origin from host_launch_owners where session_id=?")
+                .bind(session_id.to_string())
+                .fetch_one(&mut *transaction)
+                .await?;
+        ensure!(
+            parse_uuid(row.try_get("host_id")?)? == host_id
+                && row.try_get::<String, _>("relay_origin")? == relay_origin,
+            "host launch already belongs to another host or relay"
+        );
         transaction.commit().await?;
         Ok(())
     }
@@ -2106,10 +2252,11 @@ impl SqliteSessionStore {
     ) -> Result<Vec<Uuid>> {
         let rows: Vec<String> = sqlx::query_scalar(
             "select h.session_id from host_launches h \
-             join sessions s on s.id=h.session_id \
+             left join sessions s on s.id=h.session_id \
+             left join host_launch_owners o on o.session_id=h.session_id \
              left join host_journal_cursors c on c.session_id=h.session_id \
              where h.session_id > coalesce(?, '') \
-               and (s.next_sequence-1 > coalesce(c.event_cursor,0) \
+               and (o.session_id is null or s.next_sequence-1 > coalesce(c.event_cursor,0) \
                  or exists(select 1 from session_live_state l where l.session_id=h.session_id \
                    and l.revision > coalesce(c.live_revision,0))) \
              order by h.session_id limit ?",
@@ -2288,22 +2435,25 @@ impl SqliteSessionStore {
 
     pub(crate) async fn pending_host_launch_metadata_for_host(
         &self,
-        host_id: Option<Uuid>,
+        owner: Option<(Uuid, &str)>,
         limit: usize,
     ) -> Result<Vec<(Uuid, serde_json::Value)>> {
         let rows = sqlx::query(
             "select h.session_id, h.metadata_json from host_launches h \
+             left join host_launch_owners o on o.session_id=h.session_id \
              left join session_workspace_bindings w on w.session_id=h.session_id \
              where (exists (select 1 from host_bootstraps b where b.session_id=h.session_id) \
                 or exists (select 1 from session_actions a \
                  where a.session_id=h.session_id \
                    and a.state not in ('completed','failed','cancelled'))) \
-               and (?1 is null or ((w.host_id is null or w.host_id=?1) \
+               and (?1 is null or ((o.session_id is null or (o.host_id=?1 and o.relay_origin=?2)) \
+                 and (w.host_id is null or w.host_id=?1) \
                  and (json_extract(h.metadata_json,'$.attachment.host_identity.host_id') is null \
                    or json_extract(h.metadata_json,'$.attachment.host_identity.host_id')=?1))) \
-             order by h.created_at asc limit ?2",
+             order by case when ?1 is null then 0 else o.session_id is null end, h.created_at asc limit ?3",
         )
-        .bind(host_id.map(|id| id.to_string()))
+        .bind(owner.map(|(id, _)| id.to_string()))
+        .bind(owner.map(|(_, origin)| origin))
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
         .fetch_all(&self.pool)
         .await?;
@@ -3274,6 +3424,12 @@ impl SqliteSessionStore {
                 metadata_json text not null,
                 created_at text not null,
                 updated_at text not null
+            );
+
+            create table if not exists host_launch_owners (
+                session_id text primary key references host_launches(session_id) on delete cascade,
+                host_id text not null,
+                relay_origin text not null
             );
 
             create table if not exists host_journal_cursors (
