@@ -2631,10 +2631,21 @@ pub async fn mirror_local_session(
             .await;
         let retry_delay = match response {
             Ok(response) if response.status().is_success() => {
-                let registered: RegisterSessionResponse = response
-                    .json()
-                    .await
-                    .context("Borg returned an invalid local session registration")?;
+                let registered: RegisterSessionResponse = match response.json().await {
+                    Ok(registered) => registered,
+                    Err(error) => {
+                        let retry_delay = registration_backoff.next_delay(None);
+                        tracing::warn!(
+                            %error,
+                            retry_seconds = retry_delay.as_secs(),
+                            "invalid local session registration response; retrying"
+                        );
+                        if wait_for_mirror_shutdown(&mut shutdown, retry_delay).await {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
                 let scoped_commands = registered.command_scope.as_deref() == Some("session_v1");
                 if !scoped_commands {
                     tracing::warn!(%session_id, "relay lacks session-scoped commands; mirroring read-only until the relay is upgraded");
@@ -6450,9 +6461,17 @@ mod tests {
             let mut first_upload_tx = Some(first_upload_tx);
             let mut uploads = Vec::new();
             let mut messages = Vec::new();
+            let mut registrations = Vec::new();
             while uploads.len() < 3 || messages.is_empty() {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let (path, body) = read_http_request(&mut stream).await;
+                if path != "/api/remote/host/sessions" {
+                    assert_eq!(
+                        registrations.len(),
+                        3,
+                        "no mirroring before valid registration"
+                    );
+                }
                 let response = match path.split_once('?').map_or(path.as_str(), |(path, _)| path) {
                     "/api/remote/host/commands" => {
                         assert!(
@@ -6491,7 +6510,20 @@ mod tests {
                         let registration: serde_json::Value =
                             serde_json::from_slice(&body).unwrap();
                         assert_eq!(registration["command_scope"], "session_v1");
-                        let body = if scoped {
+                        assert_eq!(registration["session_id"], session_id.to_string());
+                        registrations.push(registration);
+                        if registrations.len() == 1 {
+                            stream
+                                .write_all(
+                                    b"HTTP/1.1 503 Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                                )
+                                .await
+                                .unwrap();
+                            continue;
+                        }
+                        let body = if registrations.len() == 2 {
+                            "{"
+                        } else if scoped {
                             r#"{"command_scope":"session_v1","command_cursor":1234,"event_cursor":0,"live_revision":0}"#
                         } else {
                             r#"{"command_cursor":1234,"event_cursor":0,"live_revision":0}"#
@@ -6565,6 +6597,12 @@ mod tests {
                 };
                 stream.write_all(response.as_bytes()).await.unwrap();
             }
+            assert_eq!(registrations.len(), 3);
+            assert!(
+                registrations
+                    .iter()
+                    .all(|request| request == &registrations[0])
+            );
             (uploads, messages)
         });
 

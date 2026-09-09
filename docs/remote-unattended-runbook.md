@@ -111,6 +111,14 @@ host cannot consume those commands. Output upload and presence renewal continue
 independently of command long-polls. Prompts are journaled locally before the
 mirror acknowledges delivery.
 
+Terminal registration retries network errors, HTTP 5xx/429, and malformed
+successful responses with bounded backoff and the same session/request identity.
+No upload, presence heartbeat, or command polling begins before a valid
+registration reply. Registration retry waits are interrupted by local shutdown;
+an in-flight HTTP request remains subject to its existing timeout. Authentication
+rejection and other non-retryable HTTP errors still stop registration. A valid
+legacy reply still permits only read-only mirroring, not shared command polling.
+
 After a lost command-poll response, delivery can wait for the outstanding
 60-second claim lease to expire. Later commands must not bypass that lease: a
 claim proves reservation, not receipt or execution. Arbitrary controls are not
