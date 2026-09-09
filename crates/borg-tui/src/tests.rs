@@ -11758,3 +11758,87 @@ fn fullscreen_command_preserves_long_lines_and_completion_input() {
         200
     );
 }
+
+#[test]
+fn exec_poll_completion_renders_command_and_readable_output() {
+    for (exit_code, is_error, deferred) in [(0, false, false), (1, true, false), (0, false, true)] {
+        let session_id = Uuid::new_v4();
+        let mut transcript = Transcript::default();
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "poll".into(),
+                name: "functions.exec".into(),
+                input: serde_json::json!({"action": "confirm push", "session_id": Uuid::new_v4()}),
+                input_ref: None,
+            },
+        ));
+        let output = serde_json::json!({
+            "command": "git push origin main",
+            "stdout": "first line\nsecond line\n",
+            "stderr": "remote message
+        ",
+            "exit_code": exit_code,
+            "running": false,
+            "stdout_omitted_bytes": 12,
+        })
+        .to_string();
+        let payload = SessionPayloadRef {
+            id: Uuid::new_v4(),
+            kind: SessionPayloadKind::ToolOutput,
+            byte_len: output.len() as u64,
+        };
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "poll".into(),
+                output: if deferred {
+                    String::new()
+                } else {
+                    output.clone()
+                },
+                output_ref: deferred.then(|| payload.clone()),
+                is_error,
+                input: None,
+                input_ref: None,
+            },
+        ));
+        if deferred {
+            transcript
+                .hydrate_payload(&payload, output.into_bytes())
+                .unwrap();
+        }
+        let Some(TranscriptEntry::Tool {
+            code_view,
+            output_view,
+            expanded,
+            ..
+        }) = transcript.order.first_mut()
+        else {
+            panic!("poll remains a tool card");
+        };
+        assert_eq!(
+            code_view,
+            &Some(("command".into(), "git push origin main".into()))
+        );
+        let (language, output) = output_view.as_ref().unwrap();
+        assert_eq!(language, "text");
+        assert!(output.contains("first line\nsecond line\n"));
+        assert!(output.contains("remote message"));
+        assert!(output.contains(&format!("Exit code: {exit_code}")));
+        assert!(output.contains("12 stdout bytes omitted"));
+        *expanded = true;
+        let rendered = transcript
+            .lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("git push origin main"));
+        assert!(rendered.contains("second line"));
+        assert!(!rendered.contains("\"stdout\""));
+        assert!(!rendered.contains("\"session_id\""));
+    }
+}

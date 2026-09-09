@@ -67,8 +67,14 @@ pub fn project_tool_presentation(
     {
         detail = output_detail;
     }
-    let input_body =
-        tool_code_view(name, input).map(|(language, text)| ToolPresentationBody { language, text });
+    let input_body = tool_code_view(name, input)
+        .or_else(|| {
+            (tool_leaf_name(name) == "exec").then_some(())?;
+            let value = serde_json::from_str::<Value>(&readable_result_text(output?)).ok()?;
+            command_from_input(&value)?;
+            tool_code_view(name, &value)
+        })
+        .map(|(language, text)| ToolPresentationBody { language, text });
     let input_has_diff = input_body
         .as_ref()
         .is_some_and(|body| is_diff_language(&body.language));
@@ -309,6 +315,9 @@ pub fn tool_code_view(name: &str, input: &Value) -> Option<(String, String)> {
         && !command.trim().is_empty()
     {
         return Some(("command".to_string(), unwrapped_shell_command(command)));
+    }
+    if tool_leaf_name(name) == "exec" && input.get("session_id").is_some() {
+        return None;
     }
     (!input.is_null()).then(|| {
         (
@@ -707,6 +716,35 @@ pub fn tool_output_code_view(name: &str, output: &str) -> Option<(String, String
     }
     let readable = readable_result_text(trimmed);
     if let Ok(value) = serde_json::from_str::<Value>(&readable) {
+        if tool_leaf_name(name) == "exec" && value.get("stdout").is_some() {
+            let mut text = tool_process_output_text(&readable);
+            let status = if value.get("timed_out").and_then(Value::as_bool) == Some(true) {
+                Some("Timed out".to_string())
+            } else if value.get("running").and_then(Value::as_bool) == Some(true) {
+                Some("Still running".to_string())
+            } else {
+                value
+                    .get("exit_code")
+                    .and_then(Value::as_i64)
+                    .map(|code| format!("Exit code: {code}"))
+            };
+            if let Some(status) = status {
+                if !text.is_empty() {
+                    text.push_str("\n\n");
+                }
+                text.push_str(&status);
+            }
+            for stream in ["stdout", "stderr"] {
+                if let Some(bytes) = value
+                    .get(format!("{stream}_omitted_bytes"))
+                    .and_then(Value::as_u64)
+                    .filter(|bytes| *bytes > 0)
+                {
+                    text.push_str(&format!("\n[{bytes} {stream} bytes omitted]"));
+                }
+            }
+            return Some(("text".to_string(), text));
+        }
         return Some((
             "json".to_string(),
             serde_json::to_string_pretty(&value).unwrap_or(readable),
@@ -998,7 +1036,13 @@ fn summarize_tool_result(
     output: &str,
     is_error: bool,
 ) -> Option<String> {
-    let readable = readable_result_text(output);
+    let readable = if tool_leaf_name(name) == "exec" {
+        tool_output_code_view(name, output)
+            .map(|(_, text)| text)
+            .unwrap_or_default()
+    } else {
+        readable_result_text(output)
+    };
     let trimmed = readable.trim();
     if trimmed.is_empty() || trimmed == "null" {
         return None;

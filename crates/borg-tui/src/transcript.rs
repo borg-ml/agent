@@ -860,12 +860,24 @@ impl Transcript {
                     *code_view = Some((body.language, body.text));
                     *output_view = None;
                 } else {
+                    if let Some(body) = hydrated_presentation
+                        .input
+                        .filter(|body| body.language == "command")
+                    {
+                        *code_view = Some((body.language, body.text));
+                    }
                     *output_view = if is_mcp_resource_probe(source_name) {
                         None
-                    } else if *error && !output.trim().is_empty() {
+                    } else if *error
+                        && !output.trim().is_empty()
+                        && hydrated_presentation
+                            .output
+                            .as_ref()
+                            .is_none_or(|body| body.language != "text")
+                    {
                         Some(("text".to_string(), output.trim_end().to_string()))
                     } else {
-                        tool_output_code_view(name, &output)
+                        tool_output_code_view(source_name, &output)
                     };
                 }
             }
@@ -1500,10 +1512,11 @@ impl Transcript {
                         *detail = completion_presentation.detail.clone();
                     }
                     if completion_presentation.category != ToolPresentationCategory::Edit
-                        && input.as_ref().is_some_and(|value| {
-                            value.as_object().is_none_or(|object| !object.is_empty())
-                        })
                         && let Some(body) = completion_presentation.input.as_ref()
+                        && (body.language == "command"
+                            || input.as_ref().is_some_and(|value| {
+                                value.as_object().is_none_or(|object| !object.is_empty())
+                            }))
                     {
                         *code_view = Some((body.language.clone(), body.text.clone()));
                     }
@@ -1557,13 +1570,19 @@ impl Transcript {
                             } else if *is_error && !output.trim().is_empty() {
                                 Some(("text".to_string(), output.trim_end().to_string()))
                             } else {
-                                tool_output_code_view(name, output)
+                                tool_output_code_view(source_name, output)
                             };
                         }
                     } else {
                         *output_view = if is_mcp_resource_probe(source_name) {
                             None
-                        } else if *is_error && !output.trim().is_empty() {
+                        } else if *is_error
+                            && !output.trim().is_empty()
+                            && completion_presentation
+                                .output
+                                .as_ref()
+                                .is_none_or(|body| body.language != "text")
+                        {
                             Some(("text".to_string(), output.trim_end().to_string()))
                         } else {
                             borg_control_tool_output_view(source_name, input.as_ref(), output)
@@ -1581,7 +1600,7 @@ impl Transcript {
                                         text,
                                     )
                                 })
-                                .or_else(|| tool_output_code_view(name, output))
+                                .or_else(|| tool_output_code_view(source_name, output))
                         };
                     }
                     let _ = name;
