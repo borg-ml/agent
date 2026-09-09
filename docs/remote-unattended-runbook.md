@@ -180,6 +180,63 @@ Use disposable sessions for stop/restart and connectivity fault tests. Never
 kill active user work to prove recovery, and never expose host tokens while
 collecting evidence.
 
+## Deferred shell and workspace commands
+
+Shell and workspace command acknowledgements mean **durable local admission**,
+not execution success. The host stores the immutable command in
+`host_operation_queue` in `sessions.sqlite3` before advancing its relay cursor.
+An independent, serial worker executes these operations and uploads their
+results; a long command or failed result upload does not block host polling,
+Stop/Interrupt delivery to session actors, presence, or session journal upload.
+Filesystem operations and OpenTerminal still run on the polling path.
+
+The deferred lane preserves FIFO among valid commands, including waiting for a
+result upload before starting the next operation. Other command kinds may pass
+it. Callers with dependent operations must await the actual result, not just
+command admission. Execution timeouts do not include time spent waiting in the
+local queue; the web request may time out first and must reconcile its request
+ID rather than assume no side effects occurred.
+
+A process-level worker lock prevents two hosts sharing the same session root
+from executing the lane concurrently. Completed receipts replay the exact
+stored result after restart or a lost upload response. A Started receipt without
+a completed result becomes Indeterminate after worker ownership is released;
+Borg does not re-execute uncertain side effects. The queue entry is removed only
+after result acceptance (or relay 404/410), while its receipt remains. This is
+conservative receipt recovery, not a universal exactly-once guarantee.
+
+CancelWorkspaceCommand durably records Cancelled for an unstarted queued
+workspace command. Cancellation and execution use the same per-request lock;
+cancellation cannot overwrite a live or prior Started/Terminal receipt. If
+ownership exists but admission is not yet durable, cancellation remains
+unacknowledged for retry. This does **not** stop a command whose execution has
+already started. Shell commands have no cancellation command. Cancelling a queued
+workspace command prevents execution even if its Cancelled result must wait
+behind another operation for upload.
+
+Invalid persisted UUID/JSON, oversized payloads, unsupported command kinds, and
+mismatched identities are quarantined: retained with `quarantine_reason` and
+logged, but skipped so later valid operations can proceed. They are not marked
+successful or automatically retried after an upgrade. No result is uploaded for
+a quarantined row; the web request times out and reconciliation remains pending
+until diagnosed. Inspect queue metadata without printing command payloads
+(which may contain private data):
+
+```sql
+SELECT sequence, request_id, host_id, quarantine_reason
+FROM host_operation_queue ORDER BY sequence;
+```
+
+Do not clear quarantine, delete receipts, or reassign host IDs blindly. A new
+host enrollment does not authorize executing an old host queue. Admission
+failures (including conflicting request identity, payload bounds, or storage
+failure) retain the relay command with a warning rather than acknowledge lost
+work; these can still block later relay commands and require diagnosis. Keep
+the database and lock files intact during recovery; per-request lock files
+accumulate and must not be unlinked while hosts are active (that could split
+lock ownership across inodes). Rolling back to a binary without this worker
+leaves locally admitted operations pending until a capable binary runs again; they are no longer recoverable from the relay cursor alone.
+
 ## Diagnose through an independent connection
 
 If borg.ml still shows the host offline, use the independently tested access

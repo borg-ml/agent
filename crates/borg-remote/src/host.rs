@@ -1928,8 +1928,18 @@ pub async fn run_host_with_executor_factory(
         Arc::clone(&session_store),
         Arc::clone(&sessions),
     )));
+    let operations = AbortTask(tokio::spawn(run_host_operation_loop(
+        client.clone(),
+        config.clone(),
+        Arc::clone(&receipts),
+        session_root.clone(),
+    )));
     let mut command_poll_backoff = RemoteRetryBackoff::default();
     loop {
+        ensure!(
+            !operations.0.is_finished(),
+            "remote host operation worker stopped"
+        );
         resume_pending_host_sessions(
             &client,
             &config,
@@ -2014,6 +2024,151 @@ pub async fn run_host_with_executor_factory(
             )
             .await?;
         }
+    }
+}
+
+fn deferred_host_operation_id(command: &HostCommand) -> Option<Uuid> {
+    match command {
+        HostCommand::ShellCommand { request } => Some(request.request_id),
+        HostCommand::WorkspaceCommand { request } => Some(request.request_id),
+        _ => None,
+    }
+}
+
+async fn run_host_operation_loop(
+    client: Client,
+    config: HostConfig,
+    receipts: Arc<SqliteReceiptStore>,
+    session_root: PathBuf,
+) {
+    loop {
+        let result: Result<bool> = async {
+            // A receipt marked Started is only indeterminate after its worker
+            // has released ownership. Never race another live host worker.
+            let Some(_owner) =
+                SessionWriterLease::try_acquire(session_root.join("host-operations.lock"))?
+            else {
+                return Ok(false);
+            };
+            let Some((request_id, value)) = receipts.next_host_operation(config.host_id).await?
+            else {
+                return Ok(false);
+            };
+            let command = match serde_json::from_value::<HostCommand>(value) {
+                Ok(command) if deferred_host_operation_id(&command) == Some(request_id) => command,
+                _ => {
+                    receipts.quarantine_host_operation(config.host_id, request_id).await?;
+                    tracing::error!(%request_id, "unsupported host operation quarantined; retained in host_operation_queue");
+                    return Ok(true);
+                }
+            };
+            let Some(_operation_owner) = SessionWriterLease::try_acquire(
+                session_root.join(format!("host-operation-{request_id}.lock")),
+            )? else { return Ok(false) };
+            if !execute_host_operation(&client, &config, &receipts, &command).await {
+                return Ok(false);
+            }
+            receipts
+                .finish_host_operation(config.host_id, request_id)
+                .await?;
+            Ok(true)
+        }
+        .await;
+        match result {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, "host operation remains queued for recovery"),
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+async fn cancel_queued_workspace_command(
+    receipts: &SqliteReceiptStore,
+    host_id: Uuid,
+    session_root: &Path,
+    request_id: Uuid,
+) -> Result<()> {
+    // Do not overwrite a live execution or interpret its Started receipt as a crash.
+    let owner = SessionWriterLease::try_acquire(
+        session_root.join(format!("host-operation-{request_id}.lock")),
+    )?;
+    let Some(value) = receipts.queued_host_operation(host_id, request_id).await? else {
+        return Ok(());
+    };
+    let Ok(HostCommand::WorkspaceCommand { request }) = serde_json::from_value(value) else {
+        return Ok(());
+    };
+    if request.request_id != request_id {
+        receipts
+            .quarantine_host_operation(host_id, request_id)
+            .await?;
+        tracing::error!(%request_id, "queued cancellation identity mismatch; operation quarantined");
+        return Ok(());
+    }
+    if matches!(
+        receipts
+            .load::<_, WorkspaceCommandResponse>(request_id, &request)
+            .await?,
+        ReceiptState::Missing
+    ) {
+        ensure!(
+            owner.is_some(),
+            "workspace admission or cancellation is still being persisted"
+        );
+        receipts
+            .finish(
+                request_id,
+                &request,
+                &WorkspaceCommandResponse {
+                    request_id,
+                    workspace_id: request.workspace_id,
+                    outcome: WorkspaceCommandOutcome::Failure {
+                        code: WorkspaceCommandErrorCode::Cancelled,
+                        message: "workspace command cancelled before execution".to_string(),
+                        retryable: false,
+                    },
+                },
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn execute_host_operation(
+    client: &Client,
+    config: &HostConfig,
+    receipts: &SqliteReceiptStore,
+    command: &HostCommand,
+) -> bool {
+    match command {
+        HostCommand::ShellCommand { request } => {
+            let Some(response) = shell_command_response(receipts, config, request).await else {
+                return false;
+            };
+            upload_host_action_result(
+                client,
+                config,
+                "/api/remote/host/shell-command-results",
+                response.request_id,
+                &response,
+            )
+            .await
+        }
+        HostCommand::WorkspaceCommand { request } => {
+            let Some(response) = workspace_command_response(receipts, config, request).await else {
+                return false;
+            };
+            upload_host_action_result(
+                client,
+                config,
+                "/api/remote/host/workspace-command-results",
+                response.request_id,
+                &response,
+            )
+            .await
+        }
+        _ => false,
     }
 }
 
@@ -2709,18 +2864,17 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
         receipts,
         executor_factory,
     } = context;
-    if let HostCommand::ShellCommand { request } = &command {
-        let Some(response) = shell_command_response(&receipts, &config, request).await else {
-            return false;
+    if let Some(request_id) = deferred_host_operation_id(&command) {
+        return match receipts
+            .enqueue_host_operation(config.host_id, request_id, &command)
+            .await
+        {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(%error, %request_id, "failed to durably enqueue host operation; retaining relay command");
+                false
+            }
         };
-        return upload_host_action_result(
-            &client,
-            &config,
-            "/api/remote/host/shell-command-results",
-            response.request_id,
-            &response,
-        )
-        .await;
     }
     if let HostCommand::OpenTerminal { request } = &command {
         let Some(response) = open_terminal_response(&receipts, &config, request).await else {
@@ -2780,50 +2934,21 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
     if let HostCommand::CancelWorkspaceFilesystem { .. } = &command {
         return true;
     }
-    if let HostCommand::WorkspaceCommand { request } = &command {
-        let Some(response) = workspace_command_response(&receipts, &config, request).await else {
-            return false;
-        };
-        let result = client
-            .post(endpoint(
-                &config.server,
-                "/api/remote/host/workspace-command-results",
-            ))
-            .bearer_auth(&config.host_token)
-            .json(&response)
-            .send()
-            .await;
-        let uploaded = match result {
-            Ok(result) if result.status().is_success() => true,
-            Ok(result) if matches!(result.status(), StatusCode::NOT_FOUND | StatusCode::GONE) => {
-                tracing::warn!(
-                    status = %result.status(),
-                    request_id = %response.request_id,
-                    "workspace command no longer exists on the relay; acknowledging terminal result"
-                );
-                true
-            }
-            Ok(result) => {
-                tracing::warn!(
-                    status = %result.status(),
-                    request_id = %response.request_id,
-                    "workspace command result upload failed"
-                );
-                false
-            }
+    if let HostCommand::CancelWorkspaceCommand { request_id } = &command {
+        return match cancel_queued_workspace_command(
+            &receipts,
+            config.host_id,
+            &session_root,
+            *request_id,
+        )
+        .await
+        {
+            Ok(()) => true,
             Err(error) => {
-                tracing::warn!(
-                    %error,
-                    request_id = %response.request_id,
-                    "workspace command result upload failed"
-                );
+                tracing::warn!(%error, %request_id, "failed to persist queued workspace cancellation; retaining relay command");
                 false
             }
         };
-        return uploaded;
-    }
-    if let HostCommand::CancelWorkspaceCommand { .. } = &command {
-        return true;
     }
     if let HostCommand::Launch {
         session_id,
@@ -6734,6 +6859,325 @@ mod tests {
             extension_skill_roots: Vec::new(),
             team_policy: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn queued_shell_does_not_block_controls_and_recovers_results_without_reexecution() {
+        let root = tempdir().unwrap();
+        let mut config = test_config(root.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.server = format!("http://{}", listener.local_addr().unwrap());
+        let (first_post_tx, first_post_rx) = tokio::sync::oneshot::channel();
+        let (drop_response_tx, drop_response_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (path, body) = read_http_request(&mut stream).await;
+            assert_eq!(path, "/api/remote/host/shell-command-results");
+            let first: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(first["outcome"]["type"], "success");
+            first_post_tx.send(()).unwrap();
+            drop_response_rx.await.unwrap();
+            drop(stream);
+            let mut responses = Vec::new();
+            for expected in [
+                "/api/remote/host/shell-command-results",
+                "/api/remote/host/workspace-command-results",
+                "/api/remote/host/workspace-command-results",
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (path, body) = read_http_request(&mut stream).await;
+                assert_eq!(path, expected);
+                responses.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                responses[0], first,
+                "terminal receipt replays the exact result"
+            );
+            assert_eq!(responses[1]["outcome"]["code"], "indeterminate");
+            assert_eq!(responses[2]["outcome"]["code"], "cancelled");
+        });
+        let path = root.path().join("sessions.sqlite3");
+        let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let receipts = Arc::new(
+            SqliteReceiptStore::open(store.pool().clone())
+                .await
+                .unwrap(),
+        );
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let active_id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(2);
+        sessions.lock().await.insert(active_id, tx);
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let context = || DispatchContext {
+            client: client.clone(),
+            config: config.clone(),
+            session_root: root.path().to_path_buf(),
+            sessions: Arc::clone(&sessions),
+            session_store: Arc::clone(&store),
+            receipts: Arc::clone(&receipts),
+            executor_factory: Arc::new(|_, _| panic!("host operation must not construct an agent")),
+        };
+        let poisoned = Uuid::new_v4();
+        receipts
+            .enqueue_host_operation(
+                config.host_id,
+                poisoned,
+                &serde_json::json!({"type": "unknown_future_command"}),
+            )
+            .await
+            .unwrap();
+        let request = HostShellCommandRequest {
+            request_id: Uuid::new_v4(), cwd: root.path().to_path_buf(),
+            command: format!("/bin/sh -c {}", serde_json::to_string("printf x >> executions; touch started; while [ ! -f release ]; do sleep 0.02; done; printf done").unwrap()),
+            timeout_ms: 10_000, output_max_bytes: 1_024,
+        };
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                dispatch(
+                    context(),
+                    HostCommand::ShellCommand {
+                        request: request.clone()
+                    }
+                )
+            )
+            .await
+            .unwrap()
+        );
+        let uncertain = WorkspaceCommandRequest {
+            request_id: Uuid::new_v4(),
+            workspace_id: Uuid::new_v4(),
+            root_path: root.path().to_path_buf(),
+            cwd: PathBuf::from("."),
+            command: vec!["touch".to_string(), "must-not-run".to_string()],
+            timeout_ms: 1_000,
+            output_max_bytes: 1_024,
+        };
+        receipts
+            .begin(uncertain.request_id, &uncertain)
+            .await
+            .unwrap();
+        assert!(
+            dispatch(
+                context(),
+                HostCommand::WorkspaceCommand {
+                    request: uncertain.clone()
+                }
+            )
+            .await
+        );
+        let cancelled = WorkspaceCommandRequest {
+            request_id: Uuid::new_v4(),
+            command: vec!["touch".to_string(), "cancelled-must-not-run".to_string()],
+            ..uncertain.clone()
+        };
+        assert!(
+            dispatch(
+                context(),
+                HostCommand::WorkspaceCommand {
+                    request: cancelled.clone()
+                }
+            )
+            .await
+        );
+        let mismatched = Uuid::new_v4();
+        receipts
+            .enqueue_host_operation(
+                config.host_id,
+                mismatched,
+                &HostCommand::WorkspaceCommand {
+                    request: cancelled.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            dispatch(
+                context(),
+                HostCommand::CancelWorkspaceCommand {
+                    request_id: mismatched
+                }
+            )
+            .await
+        );
+        assert!(matches!(
+            receipts
+                .load::<_, WorkspaceCommandResponse>(cancelled.request_id, &cancelled)
+                .await
+                .unwrap(),
+            ReceiptState::Missing
+        ));
+        let first = tokio::spawn(run_host_operation_loop(
+            client.clone(),
+            config.clone(),
+            Arc::clone(&receipts),
+            root.path().to_path_buf(),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !root.path().join("started").exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            SessionWriterLease::try_acquire(root.path().join("host-operations.lock"))
+                .unwrap()
+                .is_none()
+        );
+        let second = tokio::spawn(run_host_operation_loop(
+            client.clone(),
+            config.clone(),
+            Arc::clone(&receipts),
+            root.path().to_path_buf(),
+        ));
+        for command in [
+            HostCommand::Stop {
+                session_id: active_id,
+            },
+            HostCommand::Interrupt {
+                session_id: active_id,
+            },
+        ] {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), dispatch(context(), command))
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(
+            matches!(rx.try_recv(), Ok(HostCommand::Stop { session_id }) if session_id == active_id)
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(HostCommand::Interrupt { session_id }) if session_id == active_id)
+        );
+        assert!(matches!(
+            receipts
+                .load::<_, HostShellCommandResponse>(request.request_id, &request)
+                .await
+                .unwrap(),
+            ReceiptState::Started
+        ));
+        // Ownership alone is not durable admission: retry cancellation until the receipt exists.
+        let owner = SessionWriterLease::try_acquire(
+            root.path()
+                .join(format!("host-operation-{}.lock", cancelled.request_id)),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !dispatch(
+                context(),
+                HostCommand::CancelWorkspaceCommand {
+                    request_id: cancelled.request_id
+                }
+            )
+            .await
+        );
+        assert!(matches!(
+            receipts
+                .load::<_, WorkspaceCommandResponse>(cancelled.request_id, &cancelled)
+                .await
+                .unwrap(),
+            ReceiptState::Missing
+        ));
+        drop(owner);
+        for request_id in [uncertain.request_id, cancelled.request_id] {
+            assert!(
+                dispatch(
+                    context(),
+                    HostCommand::CancelWorkspaceCommand { request_id }
+                )
+                .await
+            );
+        }
+        assert!(matches!(
+            receipts
+                .load::<_, WorkspaceCommandResponse>(uncertain.request_id, &uncertain)
+                .await
+                .unwrap(),
+            ReceiptState::Started
+        ));
+        assert!(matches!(
+            receipts
+                .load::<_, WorkspaceCommandResponse>(cancelled.request_id, &cancelled)
+                .await
+                .unwrap(),
+            ReceiptState::Terminal(_)
+        ));
+        fs::write(root.path().join("release"), "go").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), first_post_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        first.abort();
+        second.abort();
+        let _ = first.await;
+        let _ = second.await;
+        drop_response_tx.send(()).unwrap();
+        assert!(
+            receipts
+                .next_host_operation(config.host_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        drop(receipts);
+        drop(store);
+
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let receipts = Arc::new(
+            SqliteReceiptStore::open(store.pool().clone())
+                .await
+                .unwrap(),
+        );
+        let _worker = AbortTask(tokio::spawn(run_host_operation_loop(
+            client,
+            config.clone(),
+            Arc::clone(&receipts),
+            root.path().to_path_buf(),
+        )));
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while receipts
+                .next_host_operation(config.host_id)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(root.path().join("executions")).unwrap(),
+            "x"
+        );
+        assert!(!root.path().join("must-not-run").exists());
+        assert!(!root.path().join("cancelled-must-not-run").exists());
+        let reason: Option<String> = sqlx::query_scalar(
+            "select quarantine_reason from host_operation_queue where request_id=?",
+        )
+        .bind(poisoned.to_string())
+        .fetch_one(receipts.pool())
+        .await
+        .unwrap();
+        assert!(
+            reason.is_some(),
+            "unsupported command is retained, not executed or silently deleted"
+        );
     }
 
     #[tokio::test]
