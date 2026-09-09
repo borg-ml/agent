@@ -219,6 +219,18 @@ struct CommandsResponse {
     commands: Vec<HostCommandWire>,
 }
 
+impl CommandsResponse {
+    fn into_ordered(self) -> Result<Vec<HostCommandEnvelope>> {
+        let mut commands = self
+            .commands
+            .into_iter()
+            .map(HostCommandWire::into_legacy)
+            .collect::<Result<Vec<_>>>()?;
+        commands.sort_by_key(|command| command.sequence);
+        Ok(commands)
+    }
+}
+
 /// The CLI host accepts the canonical v1 envelope and the legacy relay shape
 /// during migration. Both paths enter the same HostCommand dispatcher and
 /// journal; the wire form never creates a second runtime authority.
@@ -240,6 +252,8 @@ impl HostCommandWire {
 
 #[derive(Deserialize)]
 struct RegisterSessionResponse {
+    #[serde(default)]
+    command_scope: Option<String>,
     command_cursor: u64,
     #[serde(default)]
     event_cursor: u64,
@@ -1905,6 +1919,7 @@ pub async fn run_host_with_executor_factory(
         client.clone(),
         config.clone(),
         Arc::clone(&acknowledged),
+        Arc::clone(&sessions),
         capabilities,
     )));
     let mut command_poll_backoff = RemoteRetryBackoff::default();
@@ -1955,15 +1970,16 @@ pub async fn run_host_with_executor_factory(
             tokio::time::sleep(retry_delay).await;
             continue;
         }
+        let commands: CommandsResponse = match response.json().await {
+            Ok(commands) => commands,
+            Err(error) => {
+                tracing::warn!(%error, "invalid remote command response; retrying without advancing cursor");
+                tokio::time::sleep(command_poll_backoff.next_delay(None)).await;
+                continue;
+            }
+        };
         command_poll_backoff.reset();
-        let commands: CommandsResponse = response
-            .json()
-            .await
-            .context("Borg returned invalid remote commands")?;
-        for wire in commands.commands {
-            let envelope = wire
-                .into_legacy()
-                .context("Borg returned an invalid agent runtime command envelope")?;
+        for envelope in commands.into_ordered()? {
             let sequence = envelope.sequence;
             let claim_token = envelope.claim_token;
             let handled = dispatch(
@@ -1999,6 +2015,7 @@ async fn run_host_heartbeat_loop(
     client: Client,
     config: HostConfig,
     acknowledged: Arc<Mutex<HostAcknowledgement>>,
+    sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
     mut capabilities: HostCapabilities,
 ) {
     let mut capabilities_probed_at = Instant::now();
@@ -2017,12 +2034,15 @@ async fn run_host_heartbeat_loop(
             capabilities_probed_at = Instant::now();
         }
         let acknowledgement = *acknowledged.lock().await;
+        let active_session_ids = sessions.lock().await.keys().copied().collect();
         match heartbeat(
             &client,
             &config,
             capabilities.clone(),
             acknowledgement.sequence,
             acknowledgement.claim_token,
+            active_session_ids,
+            None,
         )
         .await
         {
@@ -2119,10 +2139,11 @@ pub async fn mirror_local_session(
         .build()?;
     let registration = serde_json::json!({
         "session_id": session_id,
+        "command_scope": "session_v1",
         "request": request,
     });
     let mut registration_backoff = RemoteRetryBackoff::default();
-    let command_cursor = loop {
+    let (scoped_commands, command_cursor) = loop {
         let response = client
             .post(endpoint(&config.server, "/api/remote/host/sessions"))
             .bearer_auth(&config.host_token)
@@ -2135,13 +2156,20 @@ pub async fn mirror_local_session(
                     .json()
                     .await
                     .context("Borg returned an invalid local session registration")?;
-                break merge_reconnect_cursors(
-                    (
-                        registered.command_cursor,
-                        registered.event_cursor,
-                        registered.live_revision,
+                let scoped_commands = registered.command_scope.as_deref() == Some("session_v1");
+                if !scoped_commands {
+                    tracing::warn!(%session_id, "relay lacks session-scoped commands; mirroring read-only until the relay is upgraded");
+                }
+                break (
+                    scoped_commands,
+                    merge_reconnect_cursors(
+                        (
+                            registered.command_cursor,
+                            registered.event_cursor,
+                            registered.live_revision,
+                        ),
+                        None,
                     ),
-                    None,
                 );
             }
             Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
@@ -2206,190 +2234,256 @@ pub async fn mirror_local_session(
     let mut capabilities =
         probe_capabilities_with_profile(config.roots.clone(), config.execution_profile).await;
     capabilities.resource_limits = config.resource_limits.clone();
-    let mut last_heartbeat = Instant::now() - Duration::from_secs(30);
     let (mut command_cursor, mut uploaded_sequence, mut uploaded_live_revision) = command_cursor;
-    let mut command_claim_token = None;
-    let mut event_retry_at = Instant::now();
-    let mut shutdown_flush_pending = false;
-    let mut command_poll_backoff = RemoteRetryBackoff::default();
-    loop {
-        if last_heartbeat.elapsed() >= Duration::from_secs(15) {
-            if let Err(error) = heartbeat(
+    let mut command_shutdown = shutdown.clone();
+    let acknowledged = Mutex::new(HostAcknowledgement {
+        sequence: if scoped_commands { command_cursor } else { 0 },
+        claim_token: None,
+    });
+    let presence = async {
+        let mut retry = RemoteRetryBackoff::default();
+        let mut capabilities_probed_at = Instant::now();
+        loop {
+            if capabilities_probed_at.elapsed() >= Duration::from_secs(300) {
+                capabilities =
+                    probe_capabilities_with_profile(config.roots.clone(), config.execution_profile)
+                        .await;
+                capabilities.resource_limits = config.resource_limits.clone();
+                capabilities_probed_at = Instant::now();
+            }
+            let acknowledgement = *acknowledged.lock().await;
+            let delay = match heartbeat(
                 &client,
                 &config,
                 capabilities.clone(),
-                command_cursor,
-                command_claim_token,
+                acknowledgement.sequence,
+                acknowledgement.claim_token,
+                vec![session_id],
+                scoped_commands.then_some(session_id),
             )
             .await
             {
-                tracing::warn!(%error, "local session heartbeat failed");
-            } else {
-                last_heartbeat = Instant::now();
+                Ok(()) => {
+                    retry.reset();
+                    HOST_HEARTBEAT_INTERVAL
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "local session heartbeat failed");
+                    retry.next_delay(None).min(HOST_HEARTBEAT_RETRY_MAX)
+                }
+            };
+            tokio::time::sleep(delay).await;
+        }
+    };
+    let control = async {
+        if !scoped_commands {
+            return std::future::pending().await;
+        }
+        let mut command_claim_token = None;
+        let mut command_poll_backoff = RemoteRetryBackoff::default();
+        loop {
+            if *command_shutdown.borrow() {
+                // Stop accepting work while the independent journal task flushes.
+                return std::future::pending().await;
+            }
+
+            let request = client
+                .get(endpoint(&config.server, "/api/remote/host/commands"))
+                .bearer_auth(&config.host_token)
+                .query(&[
+                    ("session_id", session_id.to_string()),
+                    ("after", command_cursor.to_string()),
+                    ("wait_seconds", "20".to_string()),
+                    ("protocol", "1".to_string()),
+                ])
+                .send();
+            let response = tokio::select! {
+                response = request => Some(response),
+                changed = command_shutdown.changed() => {
+                    if changed.is_err() || *command_shutdown.borrow() {
+                        None
+                    } else {
+                        continue;
+                    }
+                }
+            };
+            let Some(response) = response else {
+                return std::future::pending().await;
+            };
+            let response = match response {
+                Ok(response) if response.status().is_success() => response,
+                Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
+                    bail!("remote host token was rejected; enroll this host again");
+                }
+                Ok(response) if response.status() == StatusCode::CONFLICT => {
+                    bail!(
+                        "remote event replay conflicted with the durable remote journal: {}",
+                        response.text().await.unwrap_or_default()
+                    );
+                }
+                Ok(response) => {
+                    let retry_delay =
+                        command_poll_backoff.next_delay(response_retry_after(&response));
+                    tracing::warn!(
+                        status = %response.status(),
+                        retry_seconds = retry_delay.as_secs(),
+                        "local session command poll failed"
+                    );
+                    if wait_for_mirror_shutdown(&mut command_shutdown, retry_delay).await {
+                        continue;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    let retry_delay = command_poll_backoff.next_delay(None);
+                    tracing::warn!(
+                        %error,
+                        retry_seconds = retry_delay.as_secs(),
+                        "local session command poll failed"
+                    );
+                    if wait_for_mirror_shutdown(&mut command_shutdown, retry_delay).await {
+                        continue;
+                    }
+                    continue;
+                }
+            };
+            let response: CommandsResponse = match response.json().await {
+                Ok(commands) => commands,
+                Err(error) => {
+                    tracing::warn!(%error, "invalid remote command response; retrying without advancing cursor");
+                    wait_for_mirror_shutdown(
+                        &mut command_shutdown,
+                        command_poll_backoff.next_delay(None),
+                    )
+                    .await;
+                    continue;
+                }
+            };
+            command_poll_backoff.reset();
+            for envelope in response.into_ordered()? {
+                let sequence = envelope.sequence;
+                let claim_token = envelope.claim_token;
+                ensure!(
+                    envelope.command.session_id() == Some(session_id),
+                    "relay returned a command outside the requested session scope"
+                );
+                if let HostCommand::Prompt {
+                    message_id,
+                    text,
+                    attachments,
+                    delivery,
+                    ..
+                } = &envelope.command
+                {
+                    admit_remote_prompt(
+                        store.as_ref(),
+                        session_id,
+                        *message_id,
+                        text,
+                        attachments,
+                        *delivery,
+                    )
+                    .await?;
+                }
+                if commands.send(envelope.command).await.is_err() {
+                    return Ok(());
+                }
+                let (acknowledged_sequence, acknowledged_token) = update_acknowledged_command(
+                    command_cursor,
+                    command_claim_token,
+                    sequence,
+                    claim_token,
+                );
+                command_cursor = acknowledged_sequence;
+                command_claim_token = acknowledged_token;
+                *acknowledged.lock().await = HostAcknowledgement {
+                    sequence: command_cursor,
+                    claim_token: command_claim_token,
+                };
             }
         }
-
-        let mut caught_up = false;
-        if Instant::now() >= event_retry_at {
-            let pending = store
-                .events_after(session_id, uploaded_sequence, 1_024)
-                .await?;
-            match upload_event_page(
+    };
+    let journal = async {
+        let mut event_retry_at = Instant::now();
+        let mut shutdown_flush_pending = false;
+        loop {
+            let mut caught_up = false;
+            if Instant::now() >= event_retry_at {
+                let pending = store
+                    .events_after(session_id, uploaded_sequence, 1_024)
+                    .await?;
+                match upload_event_page(
+                    &client,
+                    &config,
+                    store.as_ref(),
+                    &pending,
+                    &mut uploaded_sequence,
+                    Duration::from_secs(5),
+                )
+                .await?
+                {
+                    EventUploadOutcome::Complete => {
+                        if upload_live_state(
+                            &client,
+                            &config,
+                            store.as_ref(),
+                            session_id,
+                            &mut uploaded_live_revision,
+                        )
+                        .await?
+                        {
+                            caught_up = pending.len() < 1_024;
+                            event_retry_at = Instant::now();
+                        } else {
+                            event_retry_at = Instant::now() + Duration::from_secs(2);
+                        }
+                    }
+                    EventUploadOutcome::Retryable => {
+                        event_retry_at = Instant::now() + Duration::from_secs(2);
+                    }
+                    EventUploadOutcome::Blocked { .. } => {
+                        // Keep heartbeats and remote interrupt/stop commands alive
+                        // without rereading the same irreducible event in a loop.
+                        event_retry_at = Instant::now() + Duration::from_secs(300);
+                    }
+                }
+            }
+            let workspace_caught_up = flush_workspace_messages(
                 &client,
                 &config,
                 store.as_ref(),
-                &pending,
-                &mut uploaded_sequence,
-                Duration::from_secs(5),
+                workspace_store.as_ref(),
+                session_id,
+                None,
+                &mut workspace_sync,
             )
-            .await?
-            {
-                EventUploadOutcome::Complete => {
-                    if upload_live_state(
-                        &client,
-                        &config,
-                        store.as_ref(),
-                        session_id,
-                        &mut uploaded_live_revision,
-                    )
-                    .await?
-                    {
-                        caught_up = pending.len() < 1_024;
-                        event_retry_at = Instant::now();
-                    } else {
-                        event_retry_at = Instant::now() + Duration::from_secs(2);
-                    }
-                }
-                EventUploadOutcome::Retryable => {
-                    event_retry_at = Instant::now() + Duration::from_secs(2);
-                }
-                EventUploadOutcome::Blocked { .. } => {
-                    // Keep heartbeats and remote interrupt/stop commands alive
-                    // without rereading the same irreducible event in a loop.
-                    event_retry_at = Instant::now() + Duration::from_secs(300);
-                }
-            }
-        }
-        let workspace_caught_up = flush_workspace_messages(
-            &client,
-            &config,
-            store.as_ref(),
-            workspace_store.as_ref(),
-            session_id,
-            None,
-            &mut workspace_sync,
-        )
-        .await?;
-        // A shutdown can arrive after this iteration read an empty suffix but
-        // before the actor commits its terminal status. Only finish after one
-        // complete upload pass that began after shutdown was observed.
-        if shutdown_flush_pending && caught_up && workspace_caught_up {
-            return Ok(());
-        }
-        if *shutdown.borrow() {
-            shutdown_flush_pending = true;
-            let retry_delay = event_retry_at.saturating_duration_since(Instant::now());
-            if retry_delay.is_zero() {
-                tokio::task::yield_now().await;
-            } else {
-                tokio::time::sleep(retry_delay).await;
-            }
-            continue;
-        }
-        if caught_up && wait_for_mirror_shutdown(&mut shutdown, Duration::from_millis(250)).await {
-            shutdown_flush_pending = true;
-            continue;
-        }
-
-        let request = client
-            .get(endpoint(&config.server, "/api/remote/host/commands"))
-            .bearer_auth(&config.host_token)
-            .query(&[
-                ("after", command_cursor.to_string()),
-                ("wait_seconds", "20".to_string()),
-                ("protocol", "1".to_string()),
-            ])
-            .send();
-        let response = tokio::select! {
-            response = request => Some(response),
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() {
-                    None
-                } else {
-                    continue;
-                }
-            }
-        };
-        let Some(response) = response else {
-            // Run one final loop so every journaled event, including the
-            // terminal status, is durably uploaded before this task exits.
-            shutdown_flush_pending = true;
-            continue;
-        };
-        let response = match response {
-            Ok(response) if response.status().is_success() => {
-                command_poll_backoff.reset();
-                response
-            }
-            Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                bail!("remote host token was rejected; enroll this host again");
-            }
-            Ok(response) if response.status() == StatusCode::CONFLICT => {
-                bail!(
-                    "remote event replay conflicted with the durable remote journal: {}",
-                    response.text().await.unwrap_or_default()
-                );
-            }
-            Ok(response) => {
-                let retry_delay = command_poll_backoff.next_delay(response_retry_after(&response));
-                tracing::warn!(
-                    status = %response.status(),
-                    retry_seconds = retry_delay.as_secs(),
-                    "local session command poll failed"
-                );
-                if wait_for_mirror_shutdown(&mut shutdown, retry_delay).await {
-                    continue;
-                }
-                continue;
-            }
-            Err(error) => {
-                let retry_delay = command_poll_backoff.next_delay(None);
-                tracing::warn!(
-                    %error,
-                    retry_seconds = retry_delay.as_secs(),
-                    "local session command poll failed"
-                );
-                if wait_for_mirror_shutdown(&mut shutdown, retry_delay).await {
-                    continue;
-                }
-                continue;
-            }
-        };
-        let response: CommandsResponse = response
-            .json()
-            .await
-            .context("Borg returned invalid remote commands")?;
-        for wire in response.commands {
-            let envelope = wire
-                .into_legacy()
-                .context("Borg returned an invalid agent runtime command envelope")?;
-            let sequence = envelope.sequence;
-            let claim_token = envelope.claim_token;
-            command_cursor = command_cursor.max(sequence);
-            if envelope.command.session_id() == Some(session_id)
-                && commands.send(envelope.command).await.is_err()
-            {
+            .await?;
+            // A shutdown can arrive after this iteration read an empty suffix but
+            // before the actor commits its terminal status. Only finish after one
+            // complete upload pass that began after shutdown was observed.
+            if shutdown_flush_pending && caught_up && workspace_caught_up {
                 return Ok(());
             }
-            let (acknowledged_sequence, acknowledged_token) = update_acknowledged_command(
-                command_cursor,
-                command_claim_token,
-                sequence,
-                claim_token,
-            );
-            command_cursor = acknowledged_sequence;
-            command_claim_token = acknowledged_token;
+            if *shutdown.borrow() {
+                shutdown_flush_pending = true;
+                let retry_delay = event_retry_at.saturating_duration_since(Instant::now());
+                if retry_delay.is_zero() {
+                    tokio::task::yield_now().await;
+                } else {
+                    tokio::time::sleep(retry_delay).await;
+                }
+                continue;
+            }
+            if wait_for_mirror_shutdown(&mut shutdown, Duration::from_millis(250)).await {
+                shutdown_flush_pending = true;
+                continue;
+            }
         }
+    };
+    tokio::select! {
+        () = presence => unreachable!(),
+        result = control => result,
+        result = journal => result,
     }
 }
 
@@ -2422,9 +2516,17 @@ async fn heartbeat(
     capabilities: HostCapabilities,
     acknowledged_command_sequence: u64,
     acknowledged_command_claim_token: Option<Uuid>,
+    active_session_ids: Vec<Uuid>,
+    session_id: Option<Uuid>,
 ) -> Result<()> {
     let response = client
         .post(endpoint(&config.server, "/api/remote/host/heartbeat"))
+        .query(
+            &session_id
+                .into_iter()
+                .map(|id| ("session_id", id))
+                .collect::<Vec<_>>(),
+        )
         .bearer_auth(&config.host_token)
         .json(&HostHeartbeat {
             name: config.name.clone(),
@@ -2433,6 +2535,7 @@ async fn heartbeat(
             capabilities,
             acknowledged_command_sequence,
             acknowledged_command_claim_token,
+            active_session_ids,
             identity: Some(RemoteHostIdentity {
                 host_id: config.host_id,
                 hostname: hostname(),
@@ -2753,7 +2856,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
 }
 
 async fn admit_remote_prompt(
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     session_id: Uuid,
     message_id: Uuid,
     text: &str,
@@ -4919,26 +5022,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mirror_shutdown_flushes_a_terminal_event_committed_during_the_caught_up_wait() {
+    async fn mirror_streams_during_command_long_poll_and_flushes_shutdown() {
+        exercise_mirror_streaming(true).await;
+    }
+
+    #[tokio::test]
+    async fn legacy_relay_mirroring_never_consumes_or_acknowledges_shared_commands() {
+        exercise_mirror_streaming(false).await;
+    }
+
+    async fn exercise_mirror_streaming(scoped: bool) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let session_id = Uuid::new_v4();
         let (first_upload_tx, first_upload_rx) = tokio::sync::oneshot::channel();
+        let (poll_started_tx, poll_started_rx) = tokio::sync::oneshot::channel();
+        let (second_upload_tx, second_upload_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
+            let mut poll_started_tx = Some(poll_started_tx);
+            let mut second_upload_tx = Some(second_upload_tx);
+            let mut held_polls = Vec::new();
             let mut first_upload_tx = Some(first_upload_tx);
             let mut uploads = Vec::new();
             let mut messages = Vec::new();
-            while uploads.len() < 2 || messages.is_empty() {
+            while uploads.len() < 3 || messages.is_empty() {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let (path, body) = read_http_request(&mut stream).await;
                 let response = match path.split_once('?').map_or(path.as_str(), |(path, _)| path) {
+                    "/api/remote/host/commands" => {
+                        assert!(
+                            scoped,
+                            "a legacy relay must not be polled for shared commands"
+                        );
+                        let url = Url::parse(&format!("http://localhost{path}")).unwrap();
+                        assert!(
+                            url.query_pairs().any(|(key, value)| key == "session_id"
+                                && value == session_id.to_string())
+                        );
+                        held_polls.push(stream);
+                        if let Some(started) = poll_started_tx.take() {
+                            started.send(()).unwrap();
+                        }
+                        continue;
+                    }
                     "/api/remote/host/sessions" => {
-                        let body = r#"{"command_cursor":0,"event_cursor":0,"live_revision":0}"#;
+                        let registration: serde_json::Value =
+                            serde_json::from_slice(&body).unwrap();
+                        assert_eq!(registration["command_scope"], "session_v1");
+                        let body = if scoped {
+                            r#"{"command_scope":"session_v1","command_cursor":1234,"event_cursor":0,"live_revision":0}"#
+                        } else {
+                            r#"{"command_cursor":1234,"event_cursor":0,"live_revision":0}"#
+                        };
                         format!(
                             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                             body.len()
                         )
                     }
                     "/api/remote/host/heartbeat" => {
+                        let heartbeat: HostHeartbeat = serde_json::from_slice(&body).unwrap();
+                        assert_eq!(heartbeat.active_session_ids, vec![session_id]);
+                        let url = Url::parse(&format!("http://localhost{path}")).unwrap();
+                        assert_eq!(
+                            url.query_pairs().any(|(key, value)| key == "session_id"
+                                && value == session_id.to_string()),
+                            scoped
+                        );
+                        assert_eq!(
+                            heartbeat.acknowledged_command_sequence,
+                            if scoped { 1234 } else { 0 }
+                        );
                         "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                             .to_string()
                     }
@@ -4978,6 +5131,11 @@ mod tests {
                         {
                             first_upload_tx.send(()).unwrap();
                         }
+                        if uploads.len() == 2
+                            && let Some(uploaded) = second_upload_tx.take()
+                        {
+                            uploaded.send(()).unwrap();
+                        }
                         "HTTP/1.1 204 No Content\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
                             .to_string()
                     }
@@ -4994,7 +5152,6 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let session_id = Uuid::new_v4();
         let remote_recipient = Uuid::new_v4();
         store.create_session(session_id).await.unwrap();
         let workspace = store.workspace_store().await.unwrap().unwrap();
@@ -5092,7 +5249,30 @@ mod tests {
             .await
         });
 
-        first_upload_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(20), first_upload_rx)
+            .await
+            .expect("mirror should register and upload its initial journal")
+            .unwrap();
+        if scoped {
+            tokio::time::timeout(Duration::from_secs(3), poll_started_rx)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                crate::SessionEventKind::Error {
+                    message: "output produced during a pending command poll".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), second_upload_rx)
+            .await
+            .expect("journal output must not wait for the command long poll")
+            .unwrap();
         store
             .append(SessionEvent::new(
                 session_id,
@@ -5112,7 +5292,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let (uploads, messages) = server.await.unwrap();
-        assert_eq!(uploads, vec![vec![1], vec![2]]);
+        assert_eq!(uploads, vec![vec![1], vec![2], vec![3]]);
         assert_eq!(messages.len(), 1);
         assert_eq!(
             messages[0]["recipient_participant_ids"],

@@ -2791,6 +2791,10 @@ pub struct HostHeartbeat {
     /// Fence for the highest claimed command acknowledged by this host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acknowledged_command_claim_token: Option<Uuid>,
+    /// Renewable presence for sessions owned by this sender. Disjoint host and
+    /// terminal senders must not clear one another's session leases.
+    #[serde(default)]
+    pub active_session_ids: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<RemoteHostIdentity>,
 }

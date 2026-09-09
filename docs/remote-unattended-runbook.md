@@ -99,6 +99,46 @@ config and state files mode `0600`.
 After a network interruption, allow up to a few minutes for DNS, network
 readiness, backoff, and presence propagation before intervening.
 
+## Web session reliability and upgrades
+
+Host presence, session presence, event delivery, and command delivery are separate
+checks. An online host does not prove that a particular terminal session is
+mirroring output or accepting controls.
+
+Current terminal mirrors negotiate `command_scope: session_v1` at registration.
+Their command polls and acknowledgements are session-scoped; the background
+host cannot consume those commands. Output upload and presence renewal continue
+independently of command long-polls. Prompts are journaled locally before the
+mirror acknowledges delivery.
+
+Upgrade the relay before the agent for full remote controls. Against a relay
+that does not confirm session-scoped commands, the new mirror still uploads
+output and renews presence, but deliberately does not poll or acknowledge the
+shared command queue. Its log reports read-only mirroring and the need for a
+relay upgrade. Updating a binary does not upgrade already-running terminal
+sessions; do not restart active work just to refresh discovery. `borg remote
+sync --session SESSION_UUID` refreshes discovery/inbox state, not the process
+version or its event mirror.
+
+Before considering a rollout verified, exercise an isolated test session:
+
+1. Keep two terminal sessions and the background host online. Send distinct
+   prompts from the browser and verify each reaches only its intended journal.
+2. Leave a command long-poll pending while output is generated. Verify output
+   continues appearing, including the terminal status when the session closes.
+3. Disconnect/reconnect the browser and briefly interrupt relay connectivity.
+   Verify missed output catches up, queued prompts survive, and no prompt or
+   old stop command is replayed after reconnection.
+4. Leave the session idle beyond the presence window and verify it remains
+   controllable. Check both the host and the session, not just the fleet badge.
+5. Launch a session while discovery refresh is delayed, then switch sessions
+   with text in the composer. Verify selection and drafts stay with the intended
+   session, and failed controls produce a visible error.
+
+Use disposable sessions for stop/restart and connectivity fault tests. Never
+kill active user work to prove recovery, and never expose host tokens while
+collecting evidence.
+
 ## Diagnose through an independent connection
 
 If borg.ml still shows the host offline, use the independently tested access
