@@ -1399,6 +1399,7 @@ async fn run_agent_session_store_kernel(
     let mut usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
     let mut network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
     let mut network_retry_message_id = None;
+    let mut auth_lookup_retries = 0_usize;
     let mut at_turn_boundary = !pending.is_empty();
     let mut projection_repair_started = false;
     let mut next_ready_detail = (!fresh).then(|| "Resumed".to_string());
@@ -1592,6 +1593,7 @@ async fn run_agent_session_store_kernel(
                     )
                     .await?;
                     network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+                    auth_lookup_retries = 0;
                     next_ready_detail = Some("Reconnection cancelled. Your work is saved.".into());
                 }
                 pause_active_goal(
@@ -1958,6 +1960,7 @@ async fn run_agent_session_store_kernel(
                         }
                         retry_not_before = None;
                         network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+                        auth_lookup_retries = 0;
                         pause_active_goal(
                             &mut journal,
                             &events,
@@ -3069,7 +3072,7 @@ async fn run_agent_session_store_kernel(
                         if matches!(
                             &kind,
                             SessionEventKind::Error { message }
-                                if is_safe_automatic_retry_error(message) || provider_error_is_connection_lost(message)
+                                if is_safe_automatic_retry_error(message) || provider_error_is_connection_lost(message) || provider_error_is_auth_lookup_unavailable(message)
                         ) {
                             retryable_provider_errors.push(kind);
                             continue;
@@ -3144,6 +3147,7 @@ async fn run_agent_session_store_kernel(
                                 }).await?;
                             }
                             network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+                            auth_lookup_retries = 0;
                             usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
                             retry_not_before = None;
                             goal_turn_failures.reset();
@@ -3207,7 +3211,13 @@ async fn run_agent_session_store_kernel(
                             let usage_limit_retry = launch.capabilities.auto_resume_usage_limits
                                 && provider_supports_usage_limit_resume(launch.provider)
                                 && provider_error_is_temporary_usage_limited(&error);
-                            let network_retry = !interrupted && provider_error_is_connection_lost(&error);
+                            let auth_lookup_failure = provider_error_is_auth_lookup_unavailable(&error);
+                            if network_retry_message_id != Some(prompt.message_id) {
+                                auth_lookup_retries = 0;
+                            }
+                            let auth_lookup_exhausted = auth_lookup_failure && auth_lookup_retries >= 10;
+                            let network_retry = !interrupted && (provider_error_is_connection_lost(&error)
+                                || (auth_lookup_failure && !auth_lookup_exhausted));
                             let retry = network_retry || usage_limit_retry || automatic_retry_allowed(
                                 &error,
                                 interrupted,
@@ -3222,6 +3232,7 @@ async fn run_agent_session_store_kernel(
                             if !retry {
                                 network_retry_message_id = None;
                                 network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+                                auth_lookup_retries = 0;
                                 retry_not_before = None;
                                 for kind in retryable_provider_errors.drain(..) {
                                     turn_reported_error = true;
@@ -3235,7 +3246,9 @@ async fn run_agent_session_store_kernel(
                                 autonomy_result = Some(Err(anyhow::anyhow!(error.clone())));
                             }
                             let ready_detail = if retry {
-                                if network_retry {
+                                if network_retry && auth_lookup_failure {
+                                    format!("Codex authentication lookup unavailable · retry {}/10 in {}s · Esc to cancel. Your work is saved.", auth_lookup_retries + 1, network_retry_delay.as_secs())
+                                } else if network_retry {
                                     format!("Connection interrupted · retrying in {}s · Esc to cancel. Your work is saved.", network_retry_delay.as_secs())
                                 } else if usage_limit_retry {
                                     "The provider usage limit was reached; Borg preserved this work and will resume it automatically when capacity is available."
@@ -3264,13 +3277,14 @@ async fn run_agent_session_store_kernel(
                                 format!("Turn failed; the session remains available: {error}")
                             };
                             if network_retry {
+                                if auth_lookup_failure { auth_lookup_retries += 1; }
                                 goal_turn_failures.reset();
                                 network_retry_message_id = Some(prompt.message_id);
                                 retry_not_before = Some(Instant::now() + network_retry_delay);
                                 record(&mut journal, &events, session_id, SessionEventKind::ProviderEvent {
                                     provider: launch.provider,
                                     kind: "network_retry".into(),
-                                    payload: serde_json::json!({"delay_ms": network_retry_delay.as_millis() as u64}),
+                                    payload: serde_json::json!({"delay_ms": network_retry_delay.as_millis() as u64, "auth_lookup_retry": auth_lookup_failure.then_some(auth_lookup_retries)}),
                                 }).await?;
                                 network_retry_delay = network_retry_delay.saturating_mul(2).min(NETWORK_RETRY_MAX_DELAY);
                             } else if usage_limit_retry {
@@ -3302,7 +3316,7 @@ async fn run_agent_session_store_kernel(
                                     &mut goal_active_since,
                                 )
                                 .await?;
-                            } else if goal_turn_failures.record(&error) >= 3 {
+                            } else if auth_lookup_exhausted || goal_turn_failures.record(&error) >= 3 {
                                 block_active_goal(
                                     &mut journal,
                                     &events,
@@ -3390,7 +3404,7 @@ async fn run_agent_session_store_kernel(
                     if matches!(
                         &kind,
                         SessionEventKind::Error { message }
-                            if is_safe_automatic_retry_error(message) || provider_error_is_connection_lost(message)
+                            if is_safe_automatic_retry_error(message) || provider_error_is_connection_lost(message) || provider_error_is_auth_lookup_unavailable(message)
                     ) {
                         retryable_provider_errors.push(kind);
                         continue;
@@ -4880,7 +4894,7 @@ fn native_conversation(
             }
             SessionEventKind::TurnCompleted {
                 error: Some(error), ..
-            } if provider_error_is_connection_lost(error) => {
+            } if provider_error_is_connection_lost(error) || provider_error_is_auth_lookup_unavailable(error) => {
                 let partial = &pending_generic;
                 if !partial.is_empty() {
                     conversation.push(borg_provider::provider::ModelMessage::user(format!(
@@ -7508,6 +7522,10 @@ async fn cancel_connection_retry(
         .await?;
     }
     Ok(())
+}
+
+fn provider_error_is_auth_lookup_unavailable(error: &str) -> bool {
+    error.contains("Codex subscription authentication lookup unavailable")
 }
 
 fn provider_error_is_connection_lost(error: &str) -> bool {

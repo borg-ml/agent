@@ -10656,6 +10656,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
 
 struct NetworkThenSuccessExecutor {
     calls: Arc<AtomicUsize>,
+    failures: usize,
     error: &'static str,
 }
 
@@ -10691,9 +10692,9 @@ impl AgentTurnExecutor for NetworkThenSuccessExecutor {
                 .unwrap();
         } else {
             assert!(turn.prompt.contains("Do not repeat completed actions"));
-            assert!(turn.prompt.contains("completed-work") || turn.prompt.contains("git status"));
+            assert!(turn.prompt.contains("completed-work") || turn.prompt.contains("git status"), "attempt {attempt}, error {}, prompt {}", self.error, turn.prompt);
         }
-        if attempt < 3 {
+        if attempt < self.failures {
             anyhow::bail!(self.error);
         }
         Ok(AgentTurnResult {
@@ -10728,20 +10729,73 @@ fn connection_retry_does_not_retry_authentication_or_command_failures() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt() {
-    for (error, expected_attempts) in [
-        ("Codex subscription connection failed", 4),
-        ("Codex model catalog disconnected", 4),
-        ("authentication failed", 1),
+    for (error, failures, expected_attempts) in [
+        ("Codex subscription connection failed", 3, 4),
+        ("Codex model catalog disconnected", 3, 4),
+        ("authentication failed", 3, 1),
+        (
+            "Codex subscription credentials rejected; reconnect Codex",
+            3,
+            1,
+        ),
+        (
+            "Codex subscription authentication lookup unavailable",
+            9,
+            10,
+        ),
+        (
+            "Codex subscription authentication lookup unavailable",
+            99,
+            11,
+        ),
     ] {
         let root = tempdir().unwrap();
         let session_id = Uuid::new_v4();
         let message_id = Uuid::new_v4();
+        if failures > 10 {
+            let (_store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+            journal
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    SessionEventKind::SessionStarted,
+                ))
+                .await
+                .unwrap();
+            journal
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    SessionEventKind::SessionConfigured {
+                        cwd: root.path().to_path_buf(),
+                        provider: CodingProvider::Codex,
+                        model: None,
+                        effort: None,
+                        fast: false,
+                        response_language: crate::ResponseLanguage::Auto,
+                        permission_mode: PermissionMode::FullAccess,
+                    },
+                ))
+                .await
+                .unwrap();
+            journal
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    SessionEventKind::GoalUpdated {
+                        goal: SessionGoal::new("Finish the task".into(), None),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(128);
         let calls = Arc::new(AtomicUsize::new(0));
         let executor = Arc::new(NetworkThenSuccessExecutor {
             calls: Arc::clone(&calls),
             error,
+            failures,
         });
         let actor = tokio::spawn({
             let journal_path = root.path().join("session.lock");
@@ -10758,7 +10812,7 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
                         effort: None,
                         fast: Some(false),
                         response_language: crate::ResponseLanguage::Auto,
-                        permission_mode: PermissionMode::Manual,
+                        permission_mode: PermissionMode::FullAccess,
                         name: None,
                         initial_prompt: Some("finish this task".to_string()),
                         capabilities: Default::default(),
@@ -10777,11 +10831,17 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
         let mut completions = 0;
         let mut visible_errors = 0;
         let mut completed_tools = 0;
+        let mut retry_delays = Vec::new();
         while completions < expected_attempts {
-            let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            let event = tokio::time::timeout(Duration::from_secs(60), event_rx.recv())
                 .await
                 .expect("network retry completes")
                 .expect("session remains attached");
+            if let SessionEventKind::ProviderEvent { kind, payload, .. } = &event.kind {
+                if kind == "network_retry" {
+                    retry_delays.push(payload["delay_ms"].as_u64().unwrap());
+                }
+            }
             if matches!(&event.kind, SessionEventKind::Error { message } if message == error) {
                 visible_errors += 1;
             }
@@ -10807,11 +10867,25 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
         actor.await.unwrap().unwrap();
         assert_eq!(calls.load(Ordering::Acquire), expected_attempts);
         assert_eq!(completed_tools, 1);
-        assert_eq!(visible_errors, usize::from(expected_attempts == 1));
+        assert_eq!(retry_delays.len(), expected_attempts - 1);
+        for (index, delay) in retry_delays.iter().enumerate() {
+            assert_eq!(
+                *delay,
+                (NETWORK_RETRY_INITIAL_DELAY.as_millis() as u64 * (1 << index))
+                    .min(NETWORK_RETRY_MAX_DELAY.as_millis() as u64)
+            );
+        }
+        assert_eq!(visible_errors, usize::from(failures >= expected_attempts));
 
         let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
             .await
             .unwrap();
+        if failures > 10 {
+            assert_eq!(
+                store.state(session_id).await.unwrap().goal.unwrap().status,
+                GoalStatus::Blocked
+            );
+        }
         assert_eq!(
             store
                 .action(session_id, message_id)
@@ -10819,7 +10893,7 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
                 .unwrap()
                 .unwrap()
                 .state,
-            if expected_attempts == 1 {
+            if failures >= expected_attempts {
                 crate::SessionActionState::Failed
             } else {
                 crate::SessionActionState::Completed
@@ -10948,7 +11022,8 @@ async fn escape_cancels_connection_retry_without_losing_the_prompt() {
     let calls = Arc::new(AtomicUsize::new(0));
     let executor = Arc::new(NetworkThenSuccessExecutor {
         calls: Arc::clone(&calls),
-        error: "Codex subscription connection failed",
+        error: "Codex subscription authentication lookup unavailable",
+        failures: 3,
     });
     let actor = tokio::spawn({
         let journal_path = root.path().join("session.lock");

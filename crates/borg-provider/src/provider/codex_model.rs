@@ -233,9 +233,25 @@ impl SubscriptionAccess {
             ),
         )
         .await
-        .context("Codex subscription authentication timed out")?
-        .map_err(|_| {
-            anyhow::anyhow!("Codex subscription authentication failed; reconnect Codex")
+        .context("Codex subscription authentication lookup unavailable: timed out")?
+        .map_err(|error| {
+            let error = error.to_string().to_ascii_lowercase();
+            if [
+                "refresh_token_expired",
+                "refresh_token_reused",
+                "refresh_token_invalidated",
+                "invalid_grant",
+                "refresh token has expired",
+                "refresh token has already been used",
+                "refresh token has been revoked",
+            ]
+            .iter()
+            .any(|reason| error.contains(reason))
+            {
+                anyhow::anyhow!("Codex subscription credentials rejected; reconnect Codex")
+            } else {
+                anyhow::anyhow!("Codex subscription authentication lookup unavailable")
+            }
         })?;
         let auth = &response["result"];
         ensure!(

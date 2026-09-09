@@ -2612,7 +2612,14 @@ impl BorgTerminal {
                         .unwrap_or(0);
                     self.connection_retry_at =
                         Some(event.created_at + chrono::Duration::milliseconds(delay));
-                    self.set_notice("Connection interrupted · work saved · reconnecting automatically · Esc to cancel");
+                    if let Some(attempt) = payload
+                        .get("auth_lookup_retry")
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        self.set_notice(format!("Codex authentication lookup unavailable · retry {attempt}/10 · work saved · Esc to cancel"));
+                    } else {
+                        self.set_notice("Connection interrupted · work saved · reconnecting automatically · Esc to cancel");
+                    }
                 }
                 SessionEventKind::ProviderEvent { kind, .. } if kind == "network_recovered" => {
                     self.connection_retry_at = None;
