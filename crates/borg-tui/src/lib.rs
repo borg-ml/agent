@@ -11923,75 +11923,31 @@ fn keybinding_lines(keymap: &KeyMap, width: usize) -> Vec<Line<'static>> {
         .add_modifier(Modifier::BOLD);
     let separator_style = Style::default().fg(Color::DarkGray);
 
-    if width >= 76 {
-        let action_width = |column: usize| {
-            bindings
-                .iter()
-                .skip(column)
-                .step_by(2)
-                .map(|(action, _)| action.width())
-                .max()
-                .unwrap_or(0)
-        };
-        let left_action_width = action_width(0);
-        let right_action_width = action_width(1);
-        let key_width = |column: usize| {
-            bindings
-                .iter()
-                .skip(column)
-                .step_by(2)
-                .map(|(_, key)| key.width())
-                .max()
-                .unwrap_or(0)
-        };
-        let left_width = left_action_width + 1 + key_width(0);
-        let right_width = right_action_width + 1 + key_width(1);
-
-        if left_width + 3 + right_width <= width {
-            let mut lines = Vec::new();
-            for pair in bindings.chunks(2) {
-                let left = &pair[0];
-                let right = pair.get(1);
-                let mut spans =
-                    vec![
-                        Span::styled(left.0.to_string(), action_style),
-                        Span::raw(" ".repeat(left_action_width.saturating_sub(left.0.width()))),
-                        Span::raw(" "),
-                        Span::styled(left.1.clone(), key_style),
-                        Span::raw(" ".repeat(
-                            left_width.saturating_sub(left_action_width + 1 + left.1.width()),
-                        )),
-                    ];
-                if let Some(right) = right {
-                    spans.extend([
-                        Span::styled(" │ ", separator_style),
-                        Span::styled(right.0.to_string(), action_style),
-                        Span::raw(" ".repeat(right_action_width.saturating_sub(right.0.width()))),
-                        Span::raw(" "),
-                        Span::styled(right.1.clone(), key_style),
-                    ]);
-                }
-                lines.push(Line::from(spans));
-            }
-            return lines;
-        }
-    }
-
+    let key_width = bindings
+        .iter()
+        .map(|(_, key)| key.width())
+        .max()
+        .unwrap_or(0)
+        .min(width.saturating_sub(4) / 2)
+        .max(1);
+    let action_width = width.saturating_sub(key_width + 3).max(1);
     bindings
         .iter()
-        .flat_map(|binding| {
-            let label = format!("{} {}", binding.0, binding.1);
-            if label.width() <= width.max(1) {
-                return vec![Line::from(vec![
-                    Span::styled(binding.0.to_string(), action_style),
-                    Span::raw(" "),
-                    Span::styled(binding.1.clone(), key_style),
-                ])];
-            }
-            wrap_display(&label, width.max(1))
-                .into_iter()
-                .map(|line| Line::from(vec![Span::styled(line, action_style)]))
-                .collect()
+        .flat_map(|(action, key)| {
+            let keys = wrap_display(key, key_width);
+            let actions = wrap_display(action, action_width);
+            (0..keys.len().max(actions.len()))
+                .map(|row| {
+                    let key = keys.get(row).cloned().unwrap_or_default();
+                    let action = actions.get(row).cloned().unwrap_or_default();
+                    Line::from(vec![
+                        Span::styled(key.clone(), key_style),
+                        Span::raw(" ".repeat(key_width.saturating_sub(key.width()))),
+                        Span::styled(" │ ", separator_style),
+                        Span::styled(action, action_style),
+                    ])
+                })
+                .collect::<Vec<_>>()
         })
         .collect()
 }

@@ -1279,7 +1279,7 @@ fn model_picker_none_yields_no_open_ended_placeholder() {
 }
 
 #[test]
-fn keybinding_help_is_action_first_and_uses_configuration() {
+fn keybinding_help_is_key_first_and_uses_configuration() {
     let config = borg_ui::KeybindingConfig {
         send: vec!["ctrl+s".to_string()],
         ..Default::default()
@@ -1302,7 +1302,9 @@ fn keybinding_help_is_action_first_and_uses_configuration() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(help.contains("send"));
-    assert!(help.find("send").unwrap() < help.find("ctrl+s").unwrap());
+    assert!(help.find("ctrl+s").unwrap() < help.find("send").unwrap());
+    let separators = help.lines().map(|line| line.find("│").unwrap()).collect::<Vec<_>>();
+    assert!(separators.iter().all(|column| *column == separators[0]));
     assert!(help.contains("send after current turn"));
     assert!(help.contains("start/stop dictation"));
     assert!(help.contains("alt+v"));
