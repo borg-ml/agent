@@ -2746,22 +2746,50 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             tracing::error!(%error, %session_id, "failed to persist remote session launch");
             return false;
         }
-        {
+        let at_capacity = {
             let sessions_guard = sessions.lock().await;
             if sessions_guard.contains_key(&session_id) {
                 return true;
             }
-            if sessions_guard.len() >= config.resource_limits.max_concurrent_sessions as usize {
-                tracing::warn!(
-                    %session_id,
-                    active = sessions_guard.len(),
-                    limit = config.resource_limits.max_concurrent_sessions,
-                    "remote host session admission is at capacity"
-                );
-                // Leave the durable command unacknowledged so the relay can
-                // retry it after another session releases its slot.
+            sessions_guard.len() >= config.resource_limits.max_concurrent_sessions as usize
+        };
+        match stored_host_session_state(&session_store, session_id).await {
+            Ok(Some(state))
+                if state.started_at.is_none()
+                    && matches!(
+                        state.status,
+                        Some(crate::SessionStatus::Failed | crate::SessionStatus::Stopped)
+                    ) =>
+            {
+                return reject_host_launch(
+                    &client,
+                    &config,
+                    &session_root,
+                    &session_store,
+                    session_id,
+                    "launch already rejected",
+                )
+                .await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, %session_id, "failed to read launch state; retaining command for retry");
                 return false;
             }
+        }
+        let rejection = validate_host_cwd(&config.roots, &request.cwd)
+            .err().map(|error| error.to_string())
+            .or_else(|| at_capacity.then(|| format!("remote host is at its {} session limit; stop another session and submit a new launch", config.resource_limits.max_concurrent_sessions)));
+        if let Some(reason) = rejection {
+            return reject_host_launch(
+                &client,
+                &config,
+                &session_root,
+                &session_store,
+                session_id,
+                &reason,
+            )
+            .await;
         }
         spawn_host_session(
             client,
@@ -2801,6 +2829,30 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             // unacknowledged would make the relay retry the same denied
             // command forever and head-of-line block every later command.
             return true;
+        }
+        match stored_host_session_state(&session_store, session_id).await {
+            Ok(Some(state))
+                if state.started_at.is_none()
+                    && matches!(
+                        state.status,
+                        Some(crate::SessionStatus::Failed | crate::SessionStatus::Stopped)
+                    ) =>
+            {
+                return reject_host_launch(
+                    &client,
+                    &config,
+                    &session_root,
+                    &session_store,
+                    session_id,
+                    "launch already rejected",
+                )
+                .await;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, %session_id, "failed to read launch state; retaining command for retry");
+                return false;
+            }
         }
         let existing = { sessions.lock().await.get(&session_id).cloned() };
         let session = match existing {
@@ -2866,6 +2918,84 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
         return true;
     }
     true
+}
+
+async fn stored_host_session_state(
+    store: &SqliteSessionStore,
+    session_id: Uuid,
+) -> Result<Option<crate::SessionState>> {
+    if store.contains_session(session_id).await? {
+        Ok(Some(store.state(session_id).await?))
+    } else {
+        Ok(None)
+    }
+}
+
+async fn reject_host_launch(
+    client: &Client,
+    config: &HostConfig,
+    session_root: &Path,
+    store: &SqliteSessionStore,
+    session_id: Uuid,
+    reason: &str,
+) -> bool {
+    let result: Result<bool> = async {
+        let _writer = SessionWriterLease::acquire(session_root.join(format!("{session_id}.lock")))?;
+        if !store.contains_session(session_id).await? {
+            store.create_session(session_id).await?;
+        }
+        let state = store.state(session_id).await?;
+        ensure!(
+            state.started_at.is_none(),
+            "cannot reject an already-started session"
+        );
+        if !matches!(
+            state.status,
+            Some(crate::SessionStatus::Failed | crate::SessionStatus::Stopped)
+        ) {
+            store
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    crate::SessionEventKind::StatusChanged {
+                        status: crate::SessionStatus::Failed,
+                        detail: Some(reason.to_string()),
+                    },
+                ))
+                .await?;
+        }
+        // Do not acknowledge rejection until the browser can observe it. An
+        // exact retry replays the same journal instead of starting the launch.
+        let mut cursor = 0;
+        loop {
+            let events = store.events_after(session_id, cursor, 1_024).await?;
+            if !matches!(
+                upload_event_page(
+                    client,
+                    config,
+                    store,
+                    &events,
+                    &mut cursor,
+                    Duration::from_secs(5)
+                )
+                .await?,
+                EventUploadOutcome::Complete
+            ) {
+                return Ok(false);
+            }
+            if events.len() < 1_024 {
+                return Ok(true);
+            }
+        }
+    }
+    .await;
+    match result {
+        Ok(handled) => handled,
+        Err(error) => {
+            tracing::warn!(%error, %session_id, "failed to publish rejected launch; retaining command for retry");
+            false
+        }
+    }
 }
 
 async fn admit_remote_prompt(
@@ -6372,6 +6502,147 @@ mod tests {
             "a denied command must be acknowledged as handled"
         );
         assert!(sessions.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejected_launch_is_durable_replayable_and_does_not_block_stop() {
+        let root = tempdir().unwrap();
+        let (server_url, server) = event_server(vec![
+            "503 Service Unavailable",
+            "200 OK",
+            "200 OK",
+            "200 OK",
+            "200 OK",
+        ])
+        .await;
+        let mut config = test_config(root.path());
+        config.server = server_url;
+        config.resource_limits.max_concurrent_sessions = 1;
+        let session_id = Uuid::new_v4();
+        let active_id = Uuid::new_v4();
+        let launch = LaunchSession {
+            request_id: Uuid::new_v4(),
+            cwd: root.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: Some(false),
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: crate::PermissionMode::Manual,
+            name: None,
+            initial_prompt: Some("must not run after rejection".to_string()),
+            capabilities: Default::default(),
+            subagent_concurrency_limit: None,
+            extension_skill_roots: Vec::new(),
+            team_policy: None,
+        };
+        let session_store = Arc::new(
+            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let (active_tx, mut active_rx) = mpsc::channel(1);
+        sessions.lock().await.insert(active_id, active_tx);
+        let receipts = Arc::new(sqlite_receipts().await);
+        let context = |store: &Arc<SqliteSessionStore>| DispatchContext {
+            client: Client::new(),
+            config: config.clone(),
+            session_root: root.path().to_path_buf(),
+            sessions: Arc::clone(&sessions),
+            session_store: Arc::clone(store),
+            receipts: Arc::clone(&receipts),
+            executor_factory: Arc::new(|_, _| panic!("rejected launch must not execute")),
+        };
+        let launch_command = || HostCommand::Launch {
+            session_id,
+            request: Box::new(launch.clone()),
+            attachment: None,
+        };
+        assert!(
+            !dispatch(context(&session_store), launch_command()).await,
+            "failed failure upload must retain the launch for retry"
+        );
+        let failure = session_store.events_after(session_id, 0, 10).await.unwrap();
+        assert_eq!(failure.len(), 1);
+        assert!(matches!(
+            &failure[0].kind,
+            crate::SessionEventKind::StatusChanged {
+                status: crate::SessionStatus::Failed,
+                detail: Some(_),
+            }
+        ));
+        assert!(dispatch(context(&session_store), launch_command()).await);
+        assert!(
+            dispatch(
+                context(&session_store),
+                HostCommand::Stop {
+                    session_id: active_id
+                }
+            )
+            .await
+        );
+        assert!(
+            matches!(active_rx.try_recv(), Ok(HostCommand::Stop { session_id }) if session_id == active_id)
+        );
+        sessions.lock().await.clear();
+        drop(session_store);
+
+        // Reopen the durable journal after the slot is free: rejection must not
+        // turn into a deferred launch or accept a new prompt into an actor.
+        let session_store = Arc::new(
+            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        assert!(dispatch(context(&session_store), launch_command()).await);
+        assert!(
+            dispatch(
+                context(&session_store),
+                HostCommand::Prompt {
+                    session_id,
+                    message_id: Uuid::new_v4(),
+                    text: "already queued before failure reached relay".to_string(),
+                    attachments: Vec::new(),
+                    output_schema: None,
+                    delivery: crate::PromptDelivery::Queue,
+                }
+            )
+            .await
+        );
+        let replay = session_store.events_after(session_id, 0, 10).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(&replay).unwrap(),
+            serde_json::to_value(&failure).unwrap()
+        );
+        assert!(sessions.lock().await.is_empty());
+
+        let invalid_id = Uuid::new_v4();
+        let mut invalid_launch = launch.clone();
+        invalid_launch.request_id = Uuid::new_v4();
+        invalid_launch.cwd = root.path().join("does-not-exist");
+        assert!(
+            dispatch(
+                context(&session_store),
+                HostCommand::Launch {
+                    session_id: invalid_id,
+                    request: Box::new(invalid_launch),
+                    attachment: None,
+                }
+            )
+            .await
+        );
+        let state = session_store.state(invalid_id).await.unwrap();
+        assert_eq!(state.status, Some(crate::SessionStatus::Failed));
+        assert!(state.started_at.is_none());
+        assert!(sessions.lock().await.is_empty());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap(),
+            vec![vec![1]; 5]
+        );
     }
 
     #[tokio::test]

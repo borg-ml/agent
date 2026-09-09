@@ -94,7 +94,7 @@ config and state files mode `0600`.
 | Borg process hangs | Missing watchdog notifications cause systemd to replace it. |
 | borg.ml or the network is unavailable | The host keeps running, retries with bounded backoff, and reconnects without exhausting the systemd watchdog. |
 | User logs out or the machine reboots | User lingering starts the enabled service without an interactive login. |
-| Host dies while accepting a command | A command is acknowledged only after durable admission; the persisted cursor and pending action allow startup recovery without silently skipping it. |
+| Host dies after durably admitting a prompt | The persisted cursor and pending action allow startup recovery without silently skipping the admitted prompt. This does not establish recovery of every launch/bootstrap or host-shell failure. |
 
 After a network interruption, allow up to a few minutes for DNS, network
 readiness, backoff, and presence propagation before intervening.
@@ -115,6 +115,14 @@ After a lost command-poll response, delivery can wait for the outstanding
 60-second claim lease to expire. Later commands must not bypass that lease: a
 claim proves reservation, not receipt or execution. Arbitrary controls are not
 exactly-once; prompt retries use durable message identities.
+
+A new hosted launch that exceeds the host session limit or uses an invalid
+working directory is durably marked Failed and published before acknowledgement.
+It does not wait at the head of the command queue, where it could prevent Stop
+from freeing a slot. Retrying the same launch replays the failure, even after a
+slot opens; stop another session or correct the directory and create a new
+session instead. If failure publication cannot reach the relay, the launch
+remains unacknowledged until publication succeeds.
 
 Upgrade the relay before the agent for full remote controls. Against a relay
 that does not confirm session-scoped commands, the new mirror still uploads
@@ -139,6 +147,10 @@ Before considering a rollout verified, exercise an isolated test session:
 5. Launch a session while discovery refresh is delayed, then switch sessions
    with text in the composer. Verify selection and drafts stay with the intended
    session, and failed controls produce a visible error.
+6. Fill a disposable host to its configured session limit, attempt one more
+   launch, then Stop an existing session. Verify the extra launch is visibly
+   Failed, Stop reaches its target, and the rejected launch does not start when
+   capacity opens. An invalid working directory must also fail visibly.
 
 Use disposable sessions for stop/restart and connectivity fault tests. Never
 kill active user work to prove recovery, and never expose host tokens while
