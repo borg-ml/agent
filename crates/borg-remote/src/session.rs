@@ -1684,15 +1684,7 @@ async fn run_agent_session_store_kernel(
                 session_id,
             );
             loop {
-                let usage_limit_wait = async {
-                    match retry_not_before {
-                        Some(deadline) => {
-                            tokio::time::sleep(deadline.saturating_duration_since(Instant::now()))
-                                .await
-                        }
-                        None => std::future::pending().await,
-                    }
-                };
+                let usage_limit_wait = wait_for_retry_deadline(retry_not_before);
                 let command = tokio::select! {
                     biased;
                     _ = usage_limit_wait, if retry_not_before.is_some() => {
@@ -6179,6 +6171,14 @@ fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
     combined.batch = batch;
     pending.push_back(combined);
     pending.append(&mut retained);
+}
+
+async fn wait_for_retry_deadline(deadline: Option<Instant>) {
+    // Recreating a relative zero-duration sleep can starve behind busy inbox maintenance.
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn next_host_command(

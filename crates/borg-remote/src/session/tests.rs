@@ -11413,3 +11413,22 @@ async fn imported_relay_message_wakes_the_actor_as_system_provenance() {
         "imported author attribution survives the relay import: {prompts:?}"
     );
 }
+
+#[tokio::test]
+async fn expired_connection_retry_is_not_starved_by_busy_maintenance() {
+    let deadline = Instant::now();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    tokio::time::timeout(Duration::from_millis(100), async {
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_for_retry_deadline(Some(deadline)) => break,
+                _ = std::future::ready(()) => {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            }
+        }
+    })
+    .await
+    .expect("expired retry must beat continuously ready maintenance");
+}
