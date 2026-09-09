@@ -4518,6 +4518,34 @@ async fn resume_pending_host_sessions(
             .await;
             continue;
         }
+        if state.as_ref().is_some_and(|state| {
+            state.started_at.is_some()
+                && remaining_host_session_duration(config, Some(state)).is_zero()
+        }) {
+            // Deadline settlement is not actor restoration: it needs neither a
+            // fresh presence lease nor an execution slot, but still needs the writer.
+            let expired: Result<()> = async {
+                let writer =
+                    SessionWriterLease::acquire(session_root.join(format!("{session_id}.lock")))?;
+                ensure!(
+                    session_store.host_launch_owner(session_id).await?.is_some(),
+                    "unverified session cannot expire offline"
+                );
+                let state = stored_host_session_state(session_store, session_id).await?;
+                if state.as_ref().is_some_and(|state| {
+                    state.started_at.is_some()
+                        && remaining_host_session_duration(config, Some(state)).is_zero()
+                }) {
+                    expire_host_session(config, session_store, session_id, &writer).await?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = expired {
+                tracing::warn!(%error, %session_id, "cannot settle expired inactive session; retaining work for retry");
+            }
+            continue;
+        }
         let metadata = match serde_json::from_value::<StoredHostLaunch>(value) {
             Ok(StoredHostLaunch::Launch(metadata)) => metadata,
             Ok(StoredHostLaunch::Rejected { rejected_launch }) => {
@@ -7934,6 +7962,244 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn inactive_duration_expiry_settles_before_capacity_and_attachment_restoration() {
+        for expired_attachment in [false, true] {
+            let root = tempdir().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = test_config(root.path());
+            config.server = format!("http://{}", listener.local_addr().unwrap());
+            config.resource_limits.max_session_seconds = 10;
+            config.resource_limits.max_concurrent_sessions = 1;
+            let path = root.path().join("sessions.sqlite3");
+            let store = SqliteSessionStore::open(&path).await.unwrap();
+            let id = Uuid::new_v4();
+            let launch = bootstrap_test_launch(root.path());
+            let metadata = serde_json::to_value(PersistedLaunchMetadata {
+                request: launch.clone(),
+                attachment: expired_attachment.then(|| WorkspaceAttachment {
+                    workspace_id: None,
+                    participant_id: None,
+                    command_authority: None,
+                    host_identity: None,
+                    host_capabilities: None,
+                    presence_lease: Some(crate::RemotePresenceLease {
+                        lease_id: Uuid::new_v4(),
+                        expires_at: Utc::now() - ChronoDuration::minutes(1),
+                    }),
+                    approval_provenance: None,
+                    reconnect_sync_cursors: None,
+                }),
+            })
+            .unwrap();
+            store
+                .persist_owned_host_launch_metadata(
+                    id,
+                    &metadata,
+                    config.host_id,
+                    &host_relay_origin(&config).unwrap(),
+                )
+                .await
+                .unwrap();
+            store.begin_host_bootstrap(id).await.unwrap();
+            store.create_session(id).await.unwrap();
+            let mut start = SessionEvent::new(id, 0, crate::SessionEventKind::SessionStarted);
+            start.created_at = Utc::now() - ChronoDuration::seconds(60);
+            store.append(start).await.unwrap();
+            store
+                .append(SessionEvent::new(
+                    id,
+                    0,
+                    crate::SessionEventKind::SessionConfigured {
+                        cwd: launch.cwd.clone(),
+                        provider: launch.provider,
+                        model: None,
+                        effort: None,
+                        fast: false,
+                        response_language: launch.response_language,
+                        permission_mode: launch.permission_mode,
+                    },
+                ))
+                .await
+                .unwrap();
+            admit_remote_prompt(
+                &store,
+                id,
+                launch.request_id,
+                "expired unfinished work",
+                &[],
+                crate::PromptDelivery::Queue,
+            )
+            .await
+            .unwrap();
+            drop(store);
+            let store = SqliteSessionStore::open(&path).await.unwrap();
+            let original = serde_json::to_value(store.read(id).await.unwrap()).unwrap();
+            let sessions = Arc::new(Mutex::new(HashMap::new()));
+            let (tx, _rx) = mpsc::channel(1);
+            let active_id = Uuid::new_v4();
+            sessions.lock().await.insert(active_id, tx.clone());
+            let executor: HostExecutorFactory =
+                Arc::new(|_, _| panic!("local expiry cannot construct a provider"));
+            let client = Client::new();
+            let mut foreign = config.clone();
+            foreign.host_id = Uuid::new_v4();
+            resume_pending_host_sessions(
+                0,
+                &client,
+                &foreign,
+                root.path(),
+                &sessions,
+                &store,
+                &executor,
+            )
+            .await
+            .unwrap();
+            foreign = config.clone();
+            foreign.server = "https://another-relay.invalid".into();
+            resume_pending_host_sessions(
+                0,
+                &client,
+                &foreign,
+                root.path(),
+                &sessions,
+                &store,
+                &executor,
+            )
+            .await
+            .unwrap();
+            sessions.lock().await.insert(id, tx);
+            resume_pending_host_sessions(
+                0,
+                &client,
+                &config,
+                root.path(),
+                &sessions,
+                &store,
+                &executor,
+            )
+            .await
+            .unwrap();
+            sessions.lock().await.remove(&id);
+            let other_due = Uuid::new_v4();
+            store
+                .persist_owned_host_launch_metadata(
+                    other_due,
+                    &metadata,
+                    config.host_id,
+                    &host_relay_origin(&config).unwrap(),
+                )
+                .await
+                .unwrap();
+            store.begin_host_bootstrap(other_due).await.unwrap();
+            store.create_session(other_due).await.unwrap();
+            let mut start =
+                SessionEvent::new(other_due, 0, crate::SessionEventKind::SessionStarted);
+            start.created_at = Utc::now() - ChronoDuration::seconds(60);
+            store.append(start).await.unwrap();
+            let writer =
+                SessionWriterLease::acquire(root.path().join(format!("{id}.lock"))).unwrap();
+            resume_pending_host_sessions(
+                0,
+                &client,
+                &config,
+                root.path(),
+                &sessions,
+                &store,
+                &executor,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(store.read(id).await.unwrap()).unwrap(),
+                original
+            );
+            assert_eq!(store.pending_actions(id, 8).await.unwrap().len(), 1);
+            assert_eq!(
+                store.state(other_due).await.unwrap().status,
+                Some(crate::SessionStatus::Failed),
+                "a held writer must not prevent another overdue candidate from settling"
+            );
+            drop(writer);
+            let mut extended = config.clone();
+            extended.resource_limits.max_session_seconds = 120;
+            resume_pending_host_sessions(
+                0,
+                &client,
+                &extended,
+                root.path(),
+                &sessions,
+                &store,
+                &executor,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(store.read(id).await.unwrap()).unwrap(),
+                original
+            );
+            resume_pending_host_sessions(
+                0,
+                &client,
+                &config,
+                root.path(),
+                &sessions,
+                &store,
+                &executor,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                store.state(id).await.unwrap().status,
+                Some(crate::SessionStatus::Failed),
+                "expired work must settle even when capacity or attachment prevents restoration"
+            );
+            assert!(store.pending_actions(id, 8).await.unwrap().is_empty());
+            assert!(
+                store
+                    .pending_host_launch_metadata(8)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .pending_host_journals(None, 8)
+                    .await
+                    .unwrap()
+                    .contains(&id)
+            );
+            let settled = serde_json::to_value(store.read(id).await.unwrap()).unwrap();
+            drop(store);
+            let store = SqliteSessionStore::open(&path).await.unwrap();
+            resume_pending_host_sessions(
+                0,
+                &client,
+                &config,
+                root.path(),
+                &sessions,
+                &store,
+                &executor,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(store.read(id).await.unwrap()).unwrap(),
+                settled
+            );
+            assert_eq!(
+                store.load_host_launch_metadata(id).await.unwrap(),
+                Some(metadata)
+            );
+            assert_eq!(sessions.lock().await.len(), 1);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        }
     }
 
     #[tokio::test]

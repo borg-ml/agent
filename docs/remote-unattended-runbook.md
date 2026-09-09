@@ -331,9 +331,14 @@ expiry does not wait for a relay response before releasing the execution slot.
 Recovery subtracts elapsed wall time since the original durable SessionStarted
 from the currently configured host limit; restart does not grant a fresh full
 budget. An already-expired, verified-owned session settles locally before
-runtime-context/provider startup, including with an unavailable relay. Ownership
-and writer fencing still apply, and legacy ownership verification can still
-require relay access. Downtime and idle time count toward the recovered budget;
+runtime-context/provider startup, including with an unavailable relay. The pending
+recovery scan performs this settlement before presence-lease and capacity gates,
+so expired work does not need an execution slot or a renewed attachment to be
+marked Failed locally. It rereads the deadline under the writer lock; a busy
+writer defers only that candidate. Active actors remain supervised by their
+existing duration timer. Ownership and writer fencing still apply, and legacy
+ownership verification can still require relay access. Downtime and idle time
+count toward the recovered budget;
 clock changes and deliberate host-limit changes affect this calculation.
 
 This is not an idle-session discovery sweep: inactive sessions with no pending
