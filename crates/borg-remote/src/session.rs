@@ -5375,6 +5375,22 @@ pub(crate) fn prune_conversation_for_compaction(
         })
         .collect::<HashMap<_, _>>();
     let mut projected = conversation.to_vec();
+    // Compaction needs visible evidence, not the reasoning/replay state used
+    // to continue a provider turn. In particular, Responses replay includes
+    // encrypted reasoning that would otherwise bypass the neutral projection.
+    for message in &mut projected {
+        if let ModelMessage::Assistant {
+            reasoning_content,
+            reasoning_details,
+            provider_state,
+            ..
+        } = message
+        {
+            *reasoning_content = None;
+            *reasoning_details = None;
+            *provider_state = None;
+        }
+    }
     let mut user_turns = 0;
     let mut protected_tool_chars = 0;
 

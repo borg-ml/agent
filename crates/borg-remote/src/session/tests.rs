@@ -8377,6 +8377,46 @@ fn provider_neutral_replay_carries_subscription_tools_across_provider_switches()
 }
 
 #[test]
+fn compaction_drops_provider_reasoning_without_mutating_durable_evidence() {
+    use borg_provider::provider::{ModelMessage, ModelToolCall};
+
+    let call = ModelToolCall::function(
+        "call-1".into(),
+        "exec".into(),
+        r#"{"cmd":"cargo check"}"#.into(),
+    );
+    let conversation = vec![
+        ModelMessage::user("Fix the build without changing the public API"),
+        ModelMessage::Assistant {
+            content: Some("Checking the build".into()),
+            reasoning_content: Some("Private working reasoning".into()),
+            reasoning_details: Some(json!([{ "type": "reasoning" }])),
+            provider_state: Some(
+                serde_json::from_value(json!({
+                    "protocol": "open_ai_responses",
+                    "output": [{"type": "reasoning", "encrypted_content": "opaque replay"}]
+                }))
+                .unwrap(),
+            ),
+            tool_calls: vec![call.clone()],
+        },
+        ModelMessage::Tool {
+            tool_call_id: "call-1".into(),
+            content: "Build succeeded".into(),
+        },
+    ];
+    let original = conversation.clone();
+    let projected = prune_conversation_for_compaction(&conversation);
+    let expected = vec![
+        conversation[0].clone(),
+        ModelMessage::assistant(Some("Checking the build".into()), None, None, vec![call]),
+        conversation[2].clone(),
+    ];
+    assert_eq!(projected, expected);
+    assert_eq!(conversation, original);
+}
+
+#[test]
 fn subscription_compaction_projection_truncates_large_tool_results() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
