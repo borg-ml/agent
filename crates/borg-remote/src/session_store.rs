@@ -39,7 +39,7 @@ const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const SQLITE_MMAP_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 const SQLITE_CACHE_KIB: u64 = 8 * 1024;
-const MAX_HOST_LAUNCH_METADATA_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_HOST_LAUNCH_METADATA_BYTES: usize = 512 * 1024;
 // Cap fork replay at 255 local events without duplicating SessionState in every row.
 const FORK_PROJECTION_CHECKPOINT_INTERVAL: u64 = 256;
 pub const SESSION_PROJECTION_VERSION: i32 = 3;

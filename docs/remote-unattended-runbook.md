@@ -116,13 +116,33 @@ After a lost command-poll response, delivery can wait for the outstanding
 claim proves reservation, not receipt or execution. Arbitrary controls are not
 exactly-once; prompt retries use durable message identities.
 
-A new hosted launch that exceeds the host session limit or uses an invalid
-working directory is durably marked Failed and published before acknowledgement.
+A new hosted launch that exceeds the host session limit, uses an invalid
+working directory, or exceeds the 512 KiB serialized launch-metadata limit is
+durably marked Failed and published before acknowledgement.
 It does not wait at the head of the command queue, where it could prevent Stop
 from freeing a slot. Retrying the same launch replays the failure, even after a
 slot opens; stop another session or correct the directory and create a new
 session instead. If failure publication cannot reach the relay, the launch
 remains unacknowledged until publication succeeds.
+
+Oversized launches keep a bounded rejection record with a SHA-256 fingerprint of
+all decoded launch metadata (request and attachment), atomically owned by the
+host UUID and relay origin. The oversized payload is not retained or executed.
+An exact retry replays rejection; a different request cannot replace it, even
+if the replacement is small enough. This also handles oversized commands already
+queued by an older relay. A restart between saving the rejection and creating
+its failure journal relies on the still-unacknowledged command being replayed;
+once the journal exists, background upload recovery can publish it too.
+Later controls for a rejected session settle locally once its terminal journal
+exists, rather than restore an actor or require another upload. If only the
+rejection metadata exists, controls remain unacknowledged until launch replay
+creates the failure journal.
+Older host binaries cannot read these new rejection records and may retain
+related commands instead of making progress; use an updated host to drain them.
+Other permanent errors before admission (such as invalid workspace attachments)
+and relay publication failures can still block the host command queue. There is
+not yet a relay-side launch-size check, so this is a host-visible Failed result,
+not an immediate HTTP validation error in the launch form.
 
 New hosted launches also persist an unfinished-bootstrap record before
 acknowledgement. Recovery can therefore find a launch even before its session
@@ -174,7 +194,8 @@ Before considering a rollout verified, exercise an isolated test session:
 6. Fill a disposable host to its configured session limit, attempt one more
    launch, then Stop an existing session. Verify the extra launch is visibly
    Failed, Stop reaches its target, and the rejected launch does not start when
-   capacity opens. An invalid working directory must also fail visibly.
+   capacity opens. An invalid working directory and a launch over the 512 KiB
+   metadata limit must also fail visibly without blocking the later Stop.
 
 Use disposable sessions for stop/restart and connectivity fault tests. Never
 kill active user work to prove recovery, and never expose host tokens while
