@@ -111,6 +111,11 @@ host cannot consume those commands. Output upload and presence renewal continue
 independently of command long-polls. Prompts are journaled locally before the
 mirror acknowledges delivery.
 
+After a lost command-poll response, delivery can wait for the outstanding
+60-second claim lease to expire. Later commands must not bypass that lease: a
+claim proves reservation, not receipt or execution. Arbitrary controls are not
+exactly-once; prompt retries use durable message identities.
+
 Upgrade the relay before the agent for full remote controls. Against a relay
 that does not confirm session-scoped commands, the new mirror still uploads
 output and renews presence, but deliberately does not poll or acknowledge the

@@ -2375,7 +2375,7 @@ pub async fn mirror_local_session(
                     ..
                 } = &envelope.command
                 {
-                    admit_remote_prompt(
+                    if let Err(error) = admit_remote_prompt(
                         store.as_ref(),
                         session_id,
                         *message_id,
@@ -2383,7 +2383,13 @@ pub async fn mirror_local_session(
                         attachments,
                         *delivery,
                     )
-                    .await?;
+                    .await
+                    {
+                        tracing::warn!(%error, %session_id, %message_id, "remote prompt admission failed; retaining command for retry");
+                        wait_for_mirror_shutdown(&mut command_shutdown, Duration::from_secs(2))
+                            .await;
+                        break;
+                    }
                 }
                 if commands.send(envelope.command).await.is_err() {
                     return Ok(());
@@ -2402,6 +2408,13 @@ pub async fn mirror_local_session(
                 };
             }
         }
+    };
+    let control = async {
+        if let Err(error) = control.await {
+            tracing::warn!(%error, %session_id, "remote controls stopped; journal mirroring remains active");
+        }
+        // Closing the command receiver must not cancel the terminal journal flush.
+        std::future::pending::<()>().await
     };
     let journal = async {
         let mut event_retry_at = Instant::now();
@@ -2482,7 +2495,7 @@ pub async fn mirror_local_session(
     };
     tokio::select! {
         () = presence => unreachable!(),
-        result = control => result,
+        () = control => unreachable!(),
         result = journal => result,
     }
 }
@@ -5023,15 +5036,20 @@ mod tests {
 
     #[tokio::test]
     async fn mirror_streams_during_command_long_poll_and_flushes_shutdown() {
-        exercise_mirror_streaming(true).await;
+        exercise_mirror_streaming(true, false).await;
     }
 
     #[tokio::test]
     async fn legacy_relay_mirroring_never_consumes_or_acknowledges_shared_commands() {
-        exercise_mirror_streaming(false).await;
+        exercise_mirror_streaming(false, false).await;
     }
 
-    async fn exercise_mirror_streaming(scoped: bool) {
+    #[tokio::test]
+    async fn closing_remote_controls_does_not_cancel_the_terminal_journal_flush() {
+        exercise_mirror_streaming(true, true).await;
+    }
+
+    async fn exercise_mirror_streaming(scoped: bool, close_control: bool) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let session_id = Uuid::new_v4();
@@ -5059,9 +5077,26 @@ mod tests {
                             url.query_pairs().any(|(key, value)| key == "session_id"
                                 && value == session_id.to_string())
                         );
-                        held_polls.push(stream);
                         if let Some(started) = poll_started_tx.take() {
                             started.send(()).unwrap();
+                        }
+                        if close_control {
+                            let body = serde_json::json!({"commands": [HostCommandEnvelope {
+                                id: Uuid::new_v4(), sequence: 1235, created_at: Utc::now(),
+                                claim_token: Some(Uuid::new_v4()), command: HostCommand::Stop { session_id },
+                            }]}).to_string();
+                            stream
+                                .write_all(
+                                    format!(
+                                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                        body.len()
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await
+                                .unwrap();
+                        } else {
+                            held_polls.push(stream);
                         }
                         continue;
                     }
@@ -5234,7 +5269,13 @@ mod tests {
             extension_skill_roots: Vec::new(),
             team_policy: None,
         };
-        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let _command_rx = if close_control {
+            drop(command_rx);
+            None
+        } else {
+            Some(command_rx)
+        };
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mirror_store: Arc<dyn SessionStore> = store.clone();
         let mirror = tokio::spawn(async move {
