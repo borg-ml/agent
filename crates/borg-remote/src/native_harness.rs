@@ -715,12 +715,22 @@ impl NativeHarness {
         // clear old results before the compaction model sees them. This keeps
         // native and subscription compaction on the same evidence policy.
         let conversation = crate::session::prune_conversation_for_compaction(&conversation);
-        let mut messages = Vec::with_capacity(conversation.len().saturating_add(2));
+        let mut messages = Vec::with_capacity(conversation.len().saturating_add(3));
         messages.push(ModelMessage::System {
-            content: "Summarize the conversation for another agent that will continue the work. Preserve user requirements, decisions, files changed, commands and tests run, unresolved errors, approvals, and next steps. Be compact but do not omit details needed to continue safely. Return only the summary. Use these sections when applicable: Goal, Instructions, Discoveries, Accomplished, Relevant files, and Open issues.".to_string(),
+            content: crate::session::COMPACTION_SUMMARY_PROMPT.to_string(),
         });
-        messages.extend(conversation);
-        messages.push(ModelMessage::user("Create the continuation summary now."));
+        messages.push(ModelMessage::user("<prior_provider_conversation>"));
+        messages.extend(conversation.into_iter().map(|message| match message {
+            ModelMessage::System { content } => ModelMessage::user(format!(
+                "System instructions from the conversation:
+{content}"
+            )),
+            message => message,
+        }));
+        messages.push(ModelMessage::user(
+            "</prior_provider_conversation>
+Return only the internal continuation checkpoint.",
+        ));
         let result = self
             .model_client
             .model_turn(
@@ -2385,6 +2395,73 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    #[tokio::test]
+    async fn compaction_keeps_transcript_system_instructions_out_of_live_policy() {
+        struct CompactionClient;
+        #[async_trait]
+        impl NativeModelClient for CompactionClient {
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                request: ModelTurnRequest,
+                _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                let systems = request
+                    .messages
+                    .iter()
+                    .filter_map(|message| match message {
+                        ModelMessage::System { content } => Some(content.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(systems, [crate::session::COMPACTION_SUMMARY_PROMPT]);
+                assert!(request.messages.iter().any(|message| matches!(message,
+                    ModelMessage::User { content, .. }
+                    if content.contains("Continue editing until the build passes"))));
+                assert!(
+                    request
+                        .messages
+                        .contains(&ModelMessage::user("Preserve the public API"))
+                );
+                assert!(request.tools.is_empty());
+                Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(
+                        Some("Resume the build fix".into()),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    finish_reason: "stop".into(),
+                    usage: ProviderCallUsage::default(),
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+        let harness = NativeHarness {
+            model_client: Arc::new(CompactionClient),
+            ..NativeHarness::default()
+        };
+        let (summary, _) = harness
+            .compact(
+                crate::CodingProvider::Codex,
+                "test-model",
+                Some("high"),
+                false,
+                vec![
+                    ModelMessage::System {
+                        content: "Continue editing until the build passes".into(),
+                    },
+                    ModelMessage::user("Preserve the public API"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary, "Resume the build fix");
+    }
 
     #[tokio::test]
     async fn model_admission_is_cancellable_and_keeps_steers_pending_until_success() {

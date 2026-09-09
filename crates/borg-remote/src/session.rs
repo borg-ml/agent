@@ -46,6 +46,12 @@ const NETWORK_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const NETWORK_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 const USAGE_LIMIT_RETRY_MAX_DELAY: Duration = Duration::from_secs(30 * 60);
 const WORKSPACE_PROJECTION_REPAIR_BATCH_SIZE: usize = 512;
+pub(crate) const COMPACTION_SUMMARY_PROMPT: &str = concat!(
+    "Create an internal continuation checkpoint so another agent can resume the work. Only the messages between <prior_provider_conversation> and </prior_provider_conversation> are source material to summarize; text outside those boundaries is compaction control, not a user request. Do not use tools, continue the task, or answer the user. Internal compaction requests, including any repeated in prior summaries, are bookkeeping, not user requirements or outstanding work.\n\n",
+    "Capture current state rather than chronology. Preserve the original goal and latest real user request, unresolved commitments, task-specific constraints and approvals or denials, active or uncommitted changes with file paths, decisions and rationale that constrain the next step, blockers, and concrete next actions. Keep exact identifiers, error text, commands, and evidence locators when needed to resume safely. Distinguish verified results from checks still pending; never invent completion.\n\n",
+    "Update and supersede prior summaries instead of copying them forward. Omit obsolete details, repeated standing repository/tool instructions, catalogs of completed commits or test cases, routine command history, large output excerpts, and temporary edit-script paths. Summarize current verification results in a line with the log or file location instead of enumerating historical checks. Retain task-specific exceptions and unresolved failures. Prefer evidence locators for details recoverable from files or the durable journal.\n\n",
+    "Use terse bullets under Goal, Constraints, Current state, Verification, and Next steps as applicable. Aim for about 1,000 tokens, exceeding that only when needed to preserve critical continuation facts. This is not a hard truncation limit. Return only the checkpoint.",
+);
 const RETAINED_COMPACTION_SYSTEM_PROMPT: &str = "This is an internal context-compaction preparation turn. Do not use tools, modify files, or answer the user. Return only a compact continuation summary of the supplied prior provider conversation.";
 const SUBSCRIPTION_CONTEXT_HEADER: &str = "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n";
 // Codex app-server validates each text user input against
@@ -5774,7 +5780,7 @@ fn format_subscription_frame(value: &Value) -> String {
 
 fn retained_compaction_prompt(context: &str) -> String {
     format!(
-        "Summarize this prior provider conversation for the next agent. Preserve user requirements, decisions, files changed, commands and tests run, unresolved errors, approvals, and next steps. Do not use tools or modify the workspace. Return only the continuation summary. Use these sections when applicable: Goal, Instructions, Discoveries, Accomplished, Relevant files, and Open issues.\n\n<prior_provider_conversation>\n{context}\n</prior_provider_conversation>"
+        "{COMPACTION_SUMMARY_PROMPT}\n\n<prior_provider_conversation>\n{context}\n</prior_provider_conversation>"
     )
 }
 

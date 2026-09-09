@@ -411,3 +411,47 @@ exhausted-account recovery remains unverified.
 - OpenAI source inspected at `7dc7c7a7566a970f6d4d09e1384f854aebaf39e0`:
   `codex-rs/codex-api`, `codex-rs/login`, and
   `codex-rs/core/src/session/turn.rs` (`ResponseEvent::ToolCallInputDelta`).
+
+### Compaction checkpoints and latency (2026-09-09)
+
+Borg-owned compaction produces a current-state checkpoint, not a chronological
+report. Native and retained-context summarizers share the same policy: supersede
+old summaries, retain unresolved work and task-specific constraints, distinguish
+verified results from pending checks, and use evidence locations instead of
+cataloging historical commits, tests, and command output. The roughly 1,000-token
+prompt target is deliberately soft; critical continuation facts take precedence.
+There is no new output-token cap, timeout, model downgrade, or billing fallback.
+
+The summarizer receives a delimited source conversation. Native source system
+instructions become quoted user-role material rather than competing live policy;
+internal compaction controls must not become the user task for the next agent.
+Opaque reasoning/replay state is excluded from this projection, not from the
+durable journal or normal provider continuation. Existing semantic tool-output
+pruning and account-bound subscription admission remain in place.
+
+A controlled journal-replay benchmark used two frozen, tool-heavy native
+conversation segments through the subscription model adapter, before and after
+these changes. All calls used `gpt-6-astra`, high effort, standard service tier,
+the original bound account, no tools, and zero cached input tokens:
+
+| Sample | Before input/output tokens | After input/output tokens | Before | After |
+| --- | --- | --- | --- | --- |
+| A | 200,779 / 4,926 | 164,208 / 1,596 | 162.2 s | 57.3 s |
+| B | 148,850 / 5,297 | 114,719 / 2,420 | 171.4 s | 79.7 s |
+
+Output tokens include any generated reasoning. Across 13 historical paired
+measurements, output-token count explained 97.8% of duration variance. Replay
+stripping alone took 110.4 s on sample A; the checkpoint policy and explicit
+source/control boundary were needed for the final result. Review of both final
+summaries confirmed the real ongoing task, uncommitted changes, critical design
+constraints, verification failures/pending checks, and concrete next steps.
+
+These are small-sample model-call measurements, not a latency guarantee or a
+benchmark of the dynamic system appendix used by a live actor. A request-contract
+test separately verifies that original system instructions cannot override the
+summarizer. Compatibility runtimes still own their native compactions; this
+change neither migrates those sessions nor claims to control upstream latency.
+
+Final-source validation passed all 19 compaction tests and the default-executor
+`codex_native_probe`: manual approval, account-bound compaction, exact-value
+recovery after restart, and isolated subscription consultation.
