@@ -1847,7 +1847,7 @@ fn edit_preparation_waits_for_the_first_diff_before_promotion() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        preparing.contains("Generating edit session retry policy…"),
+        preparing.contains("Generating tool call · edit session retry policy…"),
         "{preparing}"
     );
     assert!(
@@ -1873,7 +1873,7 @@ fn edit_preparation_waits_for_the_first_diff_before_promotion() {
         .join("\n");
     assert_eq!(transcript.order.len(), 1);
     assert!(
-        editing.contains("Generating edit session retry policy…"),
+        editing.contains("Generating tool call · edit session retry policy…"),
         "{editing}"
     );
     assert!(!editing.contains("Editing…"), "{editing}");
@@ -1901,7 +1901,7 @@ fn edit_preparation_waits_for_the_first_diff_before_promotion() {
         .join("\n");
     assert_eq!(transcript.order.len(), 1);
     assert!(editing.contains("Editing…"), "{editing}");
-    assert!(!editing.contains("Generating edit"), "{editing}");
+    assert!(!editing.contains("Generating tool call · edit"), "{editing}");
 }
 
 #[test]
@@ -1924,7 +1924,7 @@ fn hiding_action_descriptions_keeps_generation_feedback_visible() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(preparing.contains("Generating…"), "{preparing}");
+    assert!(preparing.contains("Generating tool call…"), "{preparing}");
     assert!(!preparing.contains("edit src/main.rs"), "{preparing}");
 
     transcript.apply(&SessionEvent::new(
@@ -1944,7 +1944,7 @@ fn hiding_action_descriptions_keeps_generation_feedback_visible() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(rendered.contains("Editing…"), "{rendered}");
-    assert!(!rendered.contains("Generating edit"), "{rendered}");
+    assert!(!rendered.contains("Generating tool call · edit"), "{rendered}");
 }
 
 #[test]
@@ -1983,7 +1983,7 @@ fn turn_end_does_not_claim_an_unexecuted_preparation_ran() {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            rendered.contains("Stopped generating command"),
+            rendered.contains("Stopped generating tool call"),
             "{rendered}"
         );
         assert!(!rendered.contains("Ran command"), "{rendered}");
@@ -1992,7 +1992,7 @@ fn turn_end_does_not_claim_an_unexecuted_preparation_ran() {
         assert!(!entries[0].running);
         assert_eq!(
             borg_ui::timeline::tool_lifecycle_label(&entries[0].title, true),
-            "Stopped generating command"
+            "Stopped generating tool call · command"
         );
     }
 }
@@ -2031,7 +2031,7 @@ fn action_preparation_completes_when_the_start_event_is_missing() {
         .join("\n");
     assert_eq!(transcript.order.len(), 1);
     assert!(completed.contains("Ran command"), "{completed}");
-    assert!(!completed.contains("Generating command"), "{completed}");
+    assert!(!completed.contains("Generating tool call · command"), "{completed}");
     assert!(!transcript.has_running_tool());
 }
 
@@ -2101,7 +2101,7 @@ fn late_completion_does_not_consume_new_action_preparation() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(rendered.contains("Ran"), "{rendered}");
-    assert!(rendered.contains("Generating command"), "{rendered}");
+    assert!(rendered.contains("Generating tool call · command"), "{rendered}");
 }
 
 #[test]
@@ -2132,7 +2132,7 @@ fn consecutive_unmatched_action_preparations_preserve_audit_rows() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        rendered.contains("Stopped generating inspect first target"),
+        rendered.contains("Stopped generating tool call · inspect first target"),
         "{rendered}"
     );
     assert!(!rendered.contains("Ran inspect first target"), "{rendered}");
@@ -2164,7 +2164,7 @@ fn matching_tool_action_updates_refine_one_live_card() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(generic.contains("Generating…"), "{generic}");
+    assert!(generic.contains("Generating tool call…"), "{generic}");
 
     for (sequence, label) in [(2, ""), (3, "edit")] {
         let mut refinement = SessionEvent::new(
@@ -2197,8 +2197,8 @@ fn matching_tool_action_updates_refine_one_live_card() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("Generating edit"), "{rendered}");
-    assert!(!rendered.contains("Generating command"), "{rendered}");
+    assert!(rendered.contains("Generating tool call · edit"), "{rendered}");
+    assert!(!rendered.contains("Generating tool call · command"), "{rendered}");
 }
 
 #[test]
@@ -2286,7 +2286,7 @@ fn generation_status_hides_action_description_and_preserves_the_card() {
             rendered.contains(if waiting {
                 "Waiting for provider…"
             } else {
-                "Generating…"
+                "Generating tool call…"
             }),
             "{rendered}"
         );
@@ -2506,7 +2506,7 @@ fn thread_find_advances_and_wraps_through_regex_matches() {
 #[test]
 fn running_tool_timing_column_never_rewraps_action_text() {
     let summary =
-        "12:10  ↗ Generating wait for corrected full editor build · Running in background";
+        "12:10  ↗ Generating tool call · wait for corrected full editor build · Running in background";
     let short = tool_summary_lines(summary, Some("0.1s"), "  ", 88);
     let long = tool_summary_lines(summary, Some("1m 00s"), "  ", 88);
 
@@ -2671,13 +2671,13 @@ fn action_status_updates_refresh_cached_transcript_text() {
             1,
             "action/preparing",
             serde_json::json!({"label": ""}),
-            "Generating…",
+            "Generating tool call…",
         ),
         (
             2,
             "action/preparing",
             serde_json::json!({"label": "edit retry policy"}),
-            "Generating edit retry policy",
+            "Generating tool call · edit retry policy",
         ),
         (
             3,
@@ -2689,7 +2689,7 @@ fn action_status_updates_refresh_cached_transcript_text() {
             4,
             "action/generation_status",
             serde_json::json!({"waiting": false, "label": "edit retry policy"}),
-            "Generating edit retry policy",
+            "Generating tool call · edit retry policy",
         ),
         (5, "action/preparing_cancelled", serde_json::json!({}), ""),
     ] {

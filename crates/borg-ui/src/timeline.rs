@@ -13,9 +13,19 @@ pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
     if complete && name == "Wait for provider" {
         return Cow::Borrowed("Stopped waiting for provider");
     }
-    if complete && (name == "Generate" || name.starts_with("Generate ")) {
-        let label = name.strip_prefix("Generate ").unwrap_or("command");
-        return Cow::Owned(format!("Stopped generating {label}"));
+    if name == "Generate" || name.starts_with("Generate ") {
+        let label = name.strip_prefix("Generate ").unwrap_or("");
+        let state = if complete {
+            "Stopped generating tool call"
+        } else {
+            "Generating tool call"
+        };
+        return Cow::Owned(format!(
+            "{state}{}{}{}",
+            if label.is_empty() { "" } else { " · " },
+            label,
+            if complete { "" } else { "…" }
+        ));
     }
     if name == "Git add" {
         return Cow::Borrowed(if complete {
@@ -38,7 +48,6 @@ pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
         "Check" => Some(("Checking", "Checked")),
         "Find" => Some(("Finding", "Found")),
         "Go" => Some(("Going", "Went")),
-        "Generate" => Some(("Generating", "Stopped generating")),
         "View" => Some(("Viewing", "Viewed")),
         "Create" => Some(("Creating", "Created")),
         "Delete" => Some(("Deleting", "Deleted")),
@@ -706,7 +715,7 @@ mod tests {
         assert!(!entries[0].running);
         assert_eq!(
             tool_lifecycle_label(&entries[0].title, true),
-            "Stopped generating inspect first"
+            "Stopped generating tool call · inspect first"
         );
         assert_eq!(entries[1].title, "Generate inspect second");
         assert!(entries[1].running);
@@ -969,7 +978,7 @@ mod tests {
         assert!(!projector.entries[0].running);
         assert_eq!(
             tool_lifecycle_label(&projector.entries[0].title, true),
-            "Stopped generating read"
+            "Stopped generating tool call · read"
         );
         assert_eq!(projector.entries[1].title, promoted_title);
     }
