@@ -3192,11 +3192,6 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
         attachment,
     } = command
     {
-        if let Err(error) = validate_workspace_attachment(&config, session_id, attachment.as_ref())
-        {
-            tracing::error!(%error, %session_id, "failed to persist remote session launch");
-            return false;
-        }
         let rejection = match persist_launch_metadata(
             &config,
             &session_store,
@@ -3212,17 +3207,6 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                 return false;
             }
         };
-        if let Some(reason) = rejection {
-            return reject_host_launch(
-                &client,
-                &config,
-                &session_root,
-                &session_store,
-                session_id,
-                &reason,
-            )
-            .await;
-        }
         let at_capacity = {
             let sessions_guard = sessions.lock().await;
             if sessions_guard.contains_key(&session_id) {
@@ -3273,8 +3257,8 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                 return false;
             }
         }
-        let rejection = validate_host_cwd(&config.roots, &request.cwd)
-            .err().map(|error| error.to_string())
+        let rejection = rejection.or_else(|| validate_host_cwd(&config.roots, &request.cwd)
+            .err().map(|error| error.to_string()))
             .or_else(|| at_capacity.then(|| format!("remote host is at its {} session limit; stop another session and submit a new launch", config.resource_limits.max_concurrent_sessions)));
         if let Some(reason) = rejection {
             return reject_host_launch(
@@ -3377,6 +3361,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                         &config,
                         session_id,
                         metadata.attachment.as_ref(),
+                        !matches!(command, HostCommand::Stop { .. }),
                     ) {
                         tracing::error!(%error, %session_id, "stored launch attachment is invalid");
                         return false;
@@ -4203,6 +4188,7 @@ fn validate_workspace_attachment(
     config: &HostConfig,
     session_id: Uuid,
     attachment: Option<&WorkspaceAttachment>,
+    require_live_lease: bool,
 ) -> Result<()> {
     let Some(attachment) = attachment else {
         return Ok(());
@@ -4224,7 +4210,8 @@ fn validate_workspace_attachment(
     {
         bail!("workspace attachment host identity does not match enrolled host");
     }
-    if let Some(lease) = &attachment.presence_lease
+    if require_live_lease
+        && let Some(lease) = &attachment.presence_lease
         && !presence_lease_is_active(lease, Utc::now())
     {
         bail!("workspace presence lease has expired");
@@ -4345,29 +4332,53 @@ async fn persist_launch_metadata(
     request: &LaunchSession,
     attachment: Option<&WorkspaceAttachment>,
 ) -> Result<Option<String>> {
+    if let Some(identity) = attachment.and_then(|attachment| attachment.host_identity.as_ref()) {
+        ensure!(
+            identity.host_id == config.host_id,
+            "workspace attachment host identity does not match enrolled host"
+        );
+    }
     let current = PersistedLaunchMetadata {
         request: request.clone(),
         attachment: attachment.cloned(),
     };
     let mut metadata = serde_json::to_value(current)?;
     let bytes = serde_json::to_vec(&metadata)?;
-    let rejection = if bytes.len() > crate::session_store::MAX_HOST_LAUNCH_METADATA_BYTES {
-        let reason = format!(
+    let mut rejection = if bytes.len() > crate::session_store::MAX_HOST_LAUNCH_METADATA_BYTES {
+        Some(format!(
             "host launch metadata exceeds {} bytes; submit a smaller launch",
             crate::session_store::MAX_HOST_LAUNCH_METADATA_BYTES,
+        ))
+    } else {
+        validate_workspace_attachment(config, session_id, attachment, true)
+            .err()
+            .map(|error| error.to_string())
+    };
+    let existing = store.load_host_launch_metadata(session_id).await?;
+    if let Some(existing) = existing.as_ref()
+        && let StoredHostLaunch::Rejected { rejected_launch } =
+            serde_json::from_value::<StoredHostLaunch>(existing.clone())?
+    {
+        let fingerprint: [u8; 32] = Sha256::digest(&bytes).into();
+        ensure!(
+            rejected_launch.metadata_sha256 == fingerprint,
+            "session launch metadata already exists for a different launch request"
         );
-        // Retain immutable request identity without storing or later executing
-        // the oversized payload. Ownership is committed in the same transaction.
+        // Replay the original decision even if time-dependent validation changed.
+        rejection = Some(rejected_launch.reason);
+        metadata = existing.clone();
+    } else if existing.as_ref() != Some(&metadata)
+        && let Some(reason) = rejection.as_ref()
+    {
+        // Never replace already-admitted executable metadata as its lease ages.
+        // New invalid requests keep only their immutable identity and rejection.
         metadata = serde_json::to_value(StoredHostLaunch::Rejected {
             rejected_launch: RejectedHostLaunch {
                 metadata_sha256: Sha256::digest(&bytes).into(),
                 reason: reason.clone(),
             },
         })?;
-        Some(reason)
-    } else {
-        None
-    };
+    }
     store
         .persist_owned_host_launch_metadata(
             session_id,
@@ -4492,7 +4503,7 @@ async fn resume_pending_host_sessions(
             continue;
         }
         if let Err(error) =
-            validate_workspace_attachment(config, session_id, metadata.attachment.as_ref())
+            validate_workspace_attachment(config, session_id, metadata.attachment.as_ref(), true)
         {
             tracing::error!(%error, %session_id, "cannot recover remote session with an invalid workspace attachment");
             continue;
@@ -7544,12 +7555,16 @@ mod tests {
                 live_revision: 8,
             }),
         };
-        assert!(validate_workspace_attachment(&config, Uuid::new_v4(), Some(&attachment)).is_ok());
+        assert!(
+            validate_workspace_attachment(&config, Uuid::new_v4(), Some(&attachment), true).is_ok()
+        );
 
         let mut expired = attachment;
         expired.presence_lease.as_mut().unwrap().expires_at =
             Utc::now() - ChronoDuration::seconds(1);
-        assert!(validate_workspace_attachment(&config, Uuid::new_v4(), Some(&expired)).is_err());
+        assert!(
+            validate_workspace_attachment(&config, Uuid::new_v4(), Some(&expired), true).is_err()
+        );
     }
 
     #[test]
@@ -10573,7 +10588,8 @@ connection: close
 
     #[tokio::test]
     async fn rejected_launch_is_durable_replayable_and_does_not_block_stop() {
-        for oversized in [false, true] {
+        for rejection in ["capacity", "oversized", "malformed", "expired"] {
+            let oversized = rejection == "oversized";
             let root = tempdir().unwrap();
             let (server_url, server) = event_server(vec![
                 "503 Service Unavailable",
@@ -10607,6 +10623,22 @@ connection: close
                 extension_skill_roots: Vec::new(),
                 team_policy: None,
             };
+            let attachment = match rejection {
+                "malformed" | "expired" => Some(WorkspaceAttachment {
+                    workspace_id: Some(Uuid::new_v4()),
+                    participant_id: (rejection != "malformed").then_some(session_id),
+                    command_authority: None,
+                    host_identity: None,
+                    host_capabilities: None,
+                    presence_lease: Some(crate::RemotePresenceLease {
+                        lease_id: Uuid::new_v4(),
+                        expires_at: Utc::now() - ChronoDuration::minutes(1),
+                    }),
+                    approval_provenance: None,
+                    reconnect_sync_cursors: None,
+                }),
+                _ => None,
+            };
             let session_store = Arc::new(
                 SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
                     .await
@@ -10625,10 +10657,173 @@ connection: close
                 receipts: Arc::clone(&receipts),
                 executor_factory: Arc::new(|_, _| panic!("rejected launch must not execute")),
             };
+            if rejection == "expired" {
+                let mut foreign_attachment = attachment.clone().unwrap();
+                foreign_attachment.host_identity = Some(RemoteHostIdentity {
+                    host_id: Uuid::new_v4(),
+                    hostname: "other".into(),
+                    platform: "test".into(),
+                });
+                let foreign_id = Uuid::new_v4();
+                assert!(
+                    !dispatch(
+                        context(&session_store),
+                        HostCommand::Launch {
+                            session_id: foreign_id,
+                            request: Box::new(launch.clone()),
+                            attachment: Some(foreign_attachment),
+                        }
+                    )
+                    .await
+                );
+                assert!(
+                    session_store
+                        .load_host_launch_metadata(foreign_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    session_store
+                        .host_launch_owner(foreign_id)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(!session_store.contains_session(foreign_id).await.unwrap());
+
+                // A lease can expire after executable metadata and an actor were admitted.
+                let admitted_id = Uuid::new_v4();
+                let admitted = serde_json::to_value(PersistedLaunchMetadata {
+                    request: launch.clone(),
+                    attachment: attachment.clone(),
+                })
+                .unwrap();
+                session_store
+                    .persist_owned_host_launch_metadata(
+                        admitted_id,
+                        &admitted,
+                        config.host_id,
+                        &host_relay_origin(&config).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                session_store.create_session(admitted_id).await.unwrap();
+                session_store
+                    .append(SessionEvent::new(
+                        admitted_id,
+                        0,
+                        crate::SessionEventKind::SessionStarted,
+                    ))
+                    .await
+                    .unwrap();
+                let (tx, _rx) = mpsc::channel(1);
+                sessions.lock().await.insert(admitted_id, tx);
+                assert!(
+                    dispatch(
+                        context(&session_store),
+                        HostCommand::Launch {
+                            session_id: admitted_id,
+                            request: Box::new(launch.clone()),
+                            attachment: attachment.clone(),
+                        }
+                    )
+                    .await,
+                    "exact replay cannot invalidate an already-admitted actor"
+                );
+                sessions.lock().await.remove(&admitted_id);
+                assert!(
+                    !dispatch(
+                        context(&session_store),
+                        HostCommand::Prompt {
+                            session_id: admitted_id,
+                            message_id: Uuid::new_v4(),
+                            text: "expired".into(),
+                            attachments: vec![],
+                            output_schema: None,
+                            delivery: crate::PromptDelivery::Queue,
+                        }
+                    )
+                    .await,
+                    "an expired lease must not authorize actor restoration"
+                );
+                assert!(
+                    dispatch(
+                        context(&session_store),
+                        HostCommand::Stop {
+                            session_id: admitted_id
+                        }
+                    )
+                    .await
+                );
+                assert_eq!(
+                    session_store.state(admitted_id).await.unwrap().status,
+                    Some(crate::SessionStatus::Stopped)
+                );
+                assert_eq!(
+                    session_store
+                        .load_host_launch_metadata(admitted_id)
+                        .await
+                        .unwrap(),
+                    Some(admitted)
+                );
+
+                // Snapshot a rejected lease that appears valid after the wall clock moves back.
+                let rejected_id = Uuid::new_v4();
+                let mut future_attachment = attachment.clone().unwrap();
+                future_attachment
+                    .presence_lease
+                    .as_mut()
+                    .unwrap()
+                    .expires_at = Utc::now() + ChronoDuration::hours(1);
+                let original = serde_json::to_value(PersistedLaunchMetadata {
+                    request: launch.clone(),
+                    attachment: Some(future_attachment.clone()),
+                })
+                .unwrap();
+                let fingerprint: [u8; 32] =
+                    Sha256::digest(serde_json::to_vec(&original).unwrap()).into();
+                let rejected = serde_json::to_value(StoredHostLaunch::Rejected {
+                    rejected_launch: RejectedHostLaunch {
+                        metadata_sha256: fingerprint,
+                        reason: "workspace presence lease has expired".into(),
+                    },
+                })
+                .unwrap();
+                session_store
+                    .persist_owned_host_launch_metadata(
+                        rejected_id,
+                        &rejected,
+                        config.host_id,
+                        &host_relay_origin(&config).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    persist_launch_metadata(
+                        &config,
+                        &session_store,
+                        rejected_id,
+                        &launch,
+                        Some(&future_attachment)
+                    )
+                    .await
+                    .unwrap(),
+                    Some("workspace presence lease has expired".into())
+                );
+                assert_eq!(
+                    session_store
+                        .load_host_launch_metadata(rejected_id)
+                        .await
+                        .unwrap(),
+                    Some(rejected)
+                );
+                assert!(!session_store.contains_session(rejected_id).await.unwrap());
+            }
             let launch_command = || HostCommand::Launch {
                 session_id,
                 request: Box::new(launch.clone()),
-                attachment: None,
+                attachment: attachment.clone(),
             };
             if oversized {
                 assert!(
@@ -10676,9 +10871,15 @@ connection: close
                 let mut changed = launch.clone();
                 changed.initial_prompt = initial_prompt;
                 assert!(
-                    persist_launch_metadata(&config, &session_store, session_id, &changed, None)
-                        .await
-                        .is_err(),
+                    persist_launch_metadata(
+                        &config,
+                        &session_store,
+                        session_id,
+                        &changed,
+                        attachment.as_ref()
+                    )
+                    .await
+                    .is_err(),
                     "different launch cannot overwrite admitted identity"
                 );
             }
@@ -10933,7 +11134,17 @@ connection: close
             approval_provenance: None,
             reconnect_sync_cursors: None,
         };
-        assert!(validate_workspace_attachment(&config, Uuid::new_v4(), Some(&attachment)).is_err());
+        for require_live_lease in [false, true] {
+            assert!(
+                validate_workspace_attachment(
+                    &config,
+                    Uuid::new_v4(),
+                    Some(&attachment),
+                    require_live_lease
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

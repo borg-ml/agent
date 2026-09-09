@@ -117,17 +117,19 @@ claim proves reservation, not receipt or execution. Arbitrary controls are not
 exactly-once; prompt retries use durable message identities.
 
 A new hosted launch that exceeds the host session limit, uses an invalid
-working directory, or exceeds the 512 KiB serialized launch-metadata limit is
-durably marked Failed and published before acknowledgement.
+working directory, exceeds the 512 KiB serialized launch-metadata limit, or has
+an invalid same-host workspace attachment is durably marked Failed and published
+before acknowledgement.
 It does not wait at the head of the command queue, where it could prevent Stop
 from freeing a slot. Retrying the same launch replays the failure, even after a
 slot opens; stop another session or correct the directory and create a new
 session instead. If failure publication cannot reach the relay, the launch
 remains unacknowledged until publication succeeds.
 
-Oversized launches keep a bounded rejection record with a SHA-256 fingerprint of
+Oversized launches and newly rejected same-host attachments keep a bounded
+rejection record with a SHA-256 fingerprint of
 all decoded launch metadata (request and attachment), atomically owned by the
-host UUID and relay origin. The oversized payload is not retained or executed.
+host UUID and relay origin. The rejected payload is not retained or executed.
 An exact retry replays rejection; a different request cannot replace it, even
 if the replacement is small enough. This also handles oversized commands already
 queued by an older relay. A restart between saving the rejection and creating
@@ -139,10 +141,25 @@ rejection metadata exists, controls remain unacknowledged until launch replay
 creates the failure journal.
 Older host binaries cannot read these new rejection records and may retain
 related commands instead of making progress; use an updated host to drain them.
-Other permanent errors before admission (such as invalid workspace attachments)
-and relay publication failures can still block the host command queue. There is
-not yet a relay-side launch-size check, so this is a host-visible Failed result,
+Attachments naming another host still fail the ownership fence without writing
+metadata or a failure journal; they are not converted into locally owned
+rejections. Ownership conflicts and relay publication failures can still block
+the host command queue. There is not yet a relay-side launch-size check, so
+oversized admission is a host-visible Failed result,
 not an immediate HTTP validation error in the launch form.
+
+Rejection replays preserve the original reason and fingerprint even when a clock
+change makes a previously expired lease appear valid. Already-admitted executable
+metadata remains immutable when its lease expires. An exact launch replay can
+acknowledge the existing actor or settle its terminal state without starting new
+work; an unstarted launch replay with an expired lease fails visibly. Restoration of a
+nonterminal actor still requires a valid attachment. Stop may settle that inactive
+session locally despite lease expiry, but only after host ownership, structural
+attachment identity, and any explicit Stop grant have been checked. This neither renews the lease nor starts
+an actor. A queued prompt requiring restoration with an expired lease can still
+block a later Stop. Already-acknowledged bootstrap recovery with an expired
+attachment still defers restoration; lease renewal and general queue fairness
+remain open.
 
 New hosted launches also persist an unfinished-bootstrap record before
 acknowledgement. Recovery can therefore find a launch even before its session
