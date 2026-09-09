@@ -293,8 +293,9 @@ regress on stale checkpoints. A cursor is an upload/disposition boundary, not
 proof the recipient actor consumed the message. Existing permanent private
 message rejection policy remains: most HTTP 4xx responses record Failed locally;
 401 and 429 are not treated as delivered. Shared-workspace 404 retains the
-message and schedules a 300-second retry. Other transient failures retain their
-normal backoff. Worker attempts are bounded to ten seconds per session and scan
+message and schedules a 300-second retry for that workspace, not its sender.
+Other transient upload failures retain a two-second per-workspace backoff.
+Worker attempts are bounded to ten seconds per session and scan
 past deferred/active sessions, independently of journal and command polling.
 
 Successful old-binary uploads have no local durable cursor, so the first new
@@ -308,12 +309,23 @@ A shared-workspace 404 or transient message upload failure no longer ends the
 entire upload pass: other workspaces, including private conversations from the
 same sender, are still attempted. The failed workspace retains its cursor and
 FIFO order; successfully handled workspaces checkpoint their own progress. A 401
-still aborts the pass without acknowledging the rejected message. This is not
-fully independent scheduling: session-wide retry delays (including the shared
-404 backoff), a slow request exhausting the ten-second recovery budget, or a
-large earlier workspace can still delay later messages. It is not a general
-per-recipient outbox or a guarantee that unavailable/deleted recipients accept
-output.
+still aborts the pass without acknowledging the rejected message.
+
+Message-upload retry timers are scoped to each workspace and are independent
+of the session journal retry timer. Inactive recovery retains them across
+worker passes and cancelled attempts, so a new private message can upload while
+an unrelated shared workspace remains in its five-minute backoff. Recovery
+reloads confirmed SQLite cursors on every attempt; a cancelled cursor checkpoint
+cannot make uncommitted in-memory progress authoritative. Expired timer entries
+are discarded. Timers are process-local: a host restart can retry earlier, with
+unchanged durable message identities and cursor/idempotency protection.
+
+This is not fully independent scheduling: authorization/storage errors still
+back off the sender session, a slow request can exhaust the ten-second recovery
+budget, and a large earlier workspace can delay later messages. Directory and
+roster availability gates also retain their existing behavior. It is not a
+general per-recipient outbox or a guarantee that unavailable/deleted recipients
+accept output.
 
 ## Stored host identity after re-enrollment
 

@@ -2286,8 +2286,14 @@ async fn run_host_workspace_recovery_loop(
     };
     let mut after = None;
     let mut retry_at = HashMap::new();
+    let mut syncs: HashMap<Uuid, JournalSync> = HashMap::new();
     loop {
         retry_at.retain(|_, retry| *retry > Instant::now());
+        syncs.retain(|_, sync| {
+            sync.workspace_retry_at
+                .retain(|_, retry| *retry > Instant::now());
+            !sync.workspace_retry_at.is_empty()
+        });
         let pending = match store
             .pending_host_workspace_messages(config.host_id, after, 32)
             .await
@@ -2312,20 +2318,28 @@ async fn run_host_workspace_recovery_loop(
             {
                 continue;
             }
+            let sync = syncs.entry(session_id).or_insert_with(|| {
+                JournalSync::new(
+                    SessionSyncResponse {
+                        event_cursor: 0,
+                        live_revision: 0,
+                    },
+                    false,
+                )
+            });
             let result = tokio::time::timeout(
                 Duration::from_secs(10),
-                recover_host_workspace_messages(&client, &config, &store, &workspace, session_id),
+                recover_host_workspace_messages(
+                    &client, &config, &store, &workspace, session_id, sync,
+                ),
             )
             .await;
-            let retry = match result {
-                Ok(Ok(retry)) => retry,
+            match result {
+                Ok(Ok(())) => {}
                 error => {
                     tracing::warn!(?error, %session_id, "hosted message recovery deferred");
-                    Instant::now() + Duration::from_secs(10)
+                    retry_at.insert(session_id, Instant::now() + Duration::from_secs(10));
                 }
-            };
-            if retry > Instant::now() {
-                retry_at.insert(session_id, retry);
             }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -2338,7 +2352,8 @@ async fn recover_host_workspace_messages(
     store: &SqliteSessionStore,
     workspace: &SqliteWorkspaceStore,
     session_id: Uuid,
-) -> Result<Instant> {
+    sync: &mut JournalSync,
+) -> Result<()> {
     ensure_host_launch_owner(client, config, store, session_id).await?;
     let binding = store
         .workspace_binding(session_id)
@@ -2383,19 +2398,16 @@ async fn recover_host_workspace_messages(
     }
     // Upload only: no inbox import, actor startup, provider admission, or lease renewal.
     let later = Instant::now() + Duration::from_secs(60);
-    let mut sync = JournalSync {
-        uploaded_sequence: 0,
-        uploaded_live_revision: 0,
-        uploaded_workspace_sequences: store
-            .host_workspace_cursors(config.host_id, session_id)
-            .await?,
-        workspace_relay_available: execution_workspace.is_some(),
-        instance_relay_available: true,
-        next_workspace_roster_sync: later,
-        next_instance_directory_sync: later,
-        next_inbox_sync: later,
-        retry_at: Instant::now(),
-    };
+    // Reload durable cursors after every attempt, including a cancelled checkpoint.
+    // The caller keeps workspace backoffs across attempts/timeouts.
+    sync.uploaded_workspace_sequences = store
+        .host_workspace_cursors(config.host_id, session_id)
+        .await?;
+    sync.workspace_relay_available = execution_workspace.is_some();
+    sync.instance_relay_available = true;
+    sync.next_workspace_roster_sync = later;
+    sync.next_instance_directory_sync = later;
+    sync.next_inbox_sync = later;
     flush_host_workspace_messages(
         client,
         config,
@@ -2403,13 +2415,10 @@ async fn recover_host_workspace_messages(
         Some(workspace),
         session_id,
         execution_workspace,
-        &mut sync,
+        sync,
     )
     .await?;
-    if execution_workspace.is_some() && !sync.workspace_relay_available {
-        return Ok(Instant::now() + Duration::from_secs(300));
-    }
-    Ok(sync.retry_at)
+    Ok(())
 }
 
 async fn flush_host_workspace_messages(
@@ -2661,6 +2670,7 @@ pub async fn mirror_local_session(
     let mut workspace_sync = JournalSync {
         uploaded_sequence: 0,
         uploaded_live_revision: 0,
+        workspace_retry_at: HashMap::new(),
         uploaded_workspace_sequences: HashMap::new(),
         workspace_relay_available: false,
         instance_relay_available: true,
@@ -5111,6 +5121,7 @@ fn isolated_mcp_command_allowed(command: &str, allowlist: &[String]) -> bool {
 struct JournalSync {
     uploaded_sequence: u64,
     uploaded_live_revision: u64,
+    workspace_retry_at: HashMap<Uuid, Instant>,
     uploaded_workspace_sequences: HashMap<Uuid, u64>,
     workspace_relay_available: bool,
     instance_relay_available: bool,
@@ -5125,6 +5136,7 @@ impl JournalSync {
         Self {
             uploaded_sequence: cursor.event_cursor,
             uploaded_live_revision: cursor.live_revision,
+            workspace_retry_at: HashMap::new(),
             uploaded_workspace_sequences: HashMap::new(),
             workspace_relay_available,
             instance_relay_available: true,
@@ -5221,6 +5233,7 @@ pub async fn sync_remote_session(
         let mut sync = JournalSync {
             uploaded_sequence: 0,
             uploaded_live_revision: 0,
+            workspace_retry_at: HashMap::new(),
             uploaded_workspace_sequences: HashMap::new(),
             workspace_relay_available: false,
             instance_relay_available: true,
@@ -5309,9 +5322,8 @@ async fn flush_workspace_messages(
     execution_workspace_id: Option<Uuid>,
     sync: &mut JournalSync,
 ) -> Result<bool> {
-    if Instant::now() < sync.retry_at {
-        return Ok(false);
-    }
+    sync.workspace_retry_at
+        .retain(|_, retry| *retry > Instant::now());
     let Some(store) = workspace_store else {
         return Ok(true);
     };
@@ -5407,6 +5419,10 @@ async fn flush_workspace_messages(
         .list_workspaces_for_participant(participant_id)
         .await?
     {
+        if sync.workspace_retry_at.contains_key(&workspace.id) {
+            caught_up = false;
+            continue;
+        }
         let shared_workspace = execution_workspace_id == Some(workspace.id);
         if (shared_workspace && !sync.workspace_relay_available)
             || (!shared_workspace && !sync.instance_relay_available)
@@ -5541,9 +5557,10 @@ async fn flush_workspace_messages(
                         {
                             tracing::warn!(
                                 shared_workspace,
-                                "borg.ml does not expose the message relay endpoint; disabling it for this session"
+                                "workspace message route unavailable; deferring this workspace"
                             );
-                            sync.workspace_relay_available = false;
+                            sync.workspace_retry_at
+                                .insert(workspace.id, Instant::now() + Duration::from_secs(300));
                             caught_up = false;
                             continue 'workspaces;
                         }
@@ -5553,7 +5570,8 @@ async fn flush_workspace_messages(
                                 workspace_event_id = %event.id,
                                 "workspace message relay rejected an event"
                             );
-                            sync.retry_at = Instant::now() + Duration::from_secs(2);
+                            sync.workspace_retry_at
+                                .insert(workspace.id, Instant::now() + Duration::from_secs(2));
                             caught_up = false;
                             continue 'workspaces;
                         }
@@ -5563,7 +5581,8 @@ async fn flush_workspace_messages(
                                 workspace_event_id = %event.id,
                                 "workspace message relay upload failed"
                             );
-                            sync.retry_at = Instant::now() + Duration::from_secs(2);
+                            sync.workspace_retry_at
+                                .insert(workspace.id, Instant::now() + Duration::from_secs(2));
                             caught_up = false;
                             continue 'workspaces;
                         }
@@ -6590,6 +6609,7 @@ mod tests {
         let mut sync = JournalSync {
             uploaded_sequence: 0,
             uploaded_live_revision: 0,
+            workspace_retry_at: HashMap::new(),
             uploaded_workspace_sequences: HashMap::new(),
             workspace_relay_available: false,
             instance_relay_available: true,
@@ -6625,7 +6645,7 @@ mod tests {
             .await
             .unwrap()
         );
-        sync.retry_at = Instant::now();
+        sync.workspace_retry_at.clear();
         assert!(
             flush_workspace_messages(
                 &Client::new(),
@@ -7124,6 +7144,7 @@ mod tests {
             let mut sync = JournalSync {
                 uploaded_sequence: 0,
                 uploaded_live_revision: 0,
+                workspace_retry_at: HashMap::new(),
                 uploaded_workspace_sequences: HashMap::new(),
                 workspace_relay_available: shared,
                 instance_relay_available: !shared,
@@ -9246,6 +9267,8 @@ connection: close
                 .host_workspace_cursors(config.host_id, session_id)
                 .await
                 .unwrap();
+            // A blocked session journal must not suppress independent messages.
+            sync.retry_at = Instant::now() + Duration::from_secs(300);
             sync.next_inbox_sync = later;
             sync.next_instance_directory_sync = later;
             sync.next_workspace_roster_sync = later;
@@ -9260,7 +9283,10 @@ connection: close
             )
             .await
             .unwrap();
-            let rejected = received.recv().await.unwrap();
+            let rejected = tokio::time::timeout(Duration::from_secs(2), received.recv())
+                .await
+                .expect("message uploads must progress during journal backoff")
+                .unwrap();
             assert!(rejected.0);
             if let Some(first) = &first_shared {
                 assert_eq!(
@@ -9479,12 +9505,17 @@ connection: close
                     "recovery must only upload messages: {path}"
                 );
                 sent.send((
-                    path,
+                    path.clone(),
                     serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
                 ))
                 .await
                 .unwrap();
                 let status = server_status.load(Ordering::SeqCst);
+                let status = if status == 404 && !path.ends_with("/workspace/messages") {
+                    204
+                } else {
+                    status
+                };
                 if status == 0 {
                     continue;
                 } // Accepted by relay, response lost.
@@ -9495,11 +9526,24 @@ connection: close
             .timeout(Duration::from_secs(3))
             .build()
             .unwrap();
-        let retry =
-            recover_host_workspace_messages(&client, &config, &store, &workspace, session_id)
-                .await
-                .unwrap();
-        assert!(retry > Instant::now());
+        let mut recovery_sync = JournalSync::new(
+            SessionSyncResponse {
+                event_cursor: 0,
+                live_revision: 0,
+            },
+            false,
+        );
+        recover_host_workspace_messages(
+            &client,
+            &config,
+            &store,
+            &workspace,
+            session_id,
+            &mut recovery_sync,
+        )
+        .await
+        .unwrap();
+        assert!(recovery_sync.workspace_retry_at[&direct] > Instant::now());
         let original = received.recv().await.unwrap();
         assert_eq!(original.1["text"], "final private report");
         assert_eq!(
@@ -9515,9 +9559,23 @@ connection: close
         let workspace = store.workspace_store().await.unwrap().unwrap();
         for rejected in [0, 401] {
             status.store(rejected, Ordering::SeqCst);
-            let result =
-                recover_host_workspace_messages(&client, &config, &store, &workspace, session_id)
-                    .await;
+            recovery_sync.workspace_retry_at.clear();
+            // Simulate a prior upload whose in-memory cursor never checkpointed.
+            recovery_sync.uploaded_workspace_sequences.insert(
+                direct,
+                original.1["metadata"]["local_workspace_sequence"]
+                    .as_u64()
+                    .unwrap(),
+            );
+            let result = recover_host_workspace_messages(
+                &client,
+                &config,
+                &store,
+                &workspace,
+                session_id,
+                &mut recovery_sync,
+            )
+            .await;
             if rejected == 401 {
                 assert_eq!(
                     result
@@ -9528,7 +9586,8 @@ connection: close
                     Some(StatusCode::UNAUTHORIZED)
                 );
             } else {
-                assert!(result.unwrap() > Instant::now());
+                result.unwrap();
+                assert!(recovery_sync.workspace_retry_at[&direct] > Instant::now());
             }
             assert_eq!(
                 received.recv().await.unwrap(),
@@ -9614,9 +9673,17 @@ connection: close
                 .unwrap(),
             acknowledged
         );
-        recover_host_workspace_messages(&client, &config, &store, &workspace, session_id)
-            .await
-            .unwrap();
+        recovery_sync.workspace_retry_at.clear();
+        recover_host_workspace_messages(
+            &client,
+            &config,
+            &store,
+            &workspace,
+            session_id,
+            &mut recovery_sync,
+        )
+        .await
+        .unwrap();
         assert!(
             received.try_recv().is_err(),
             "acknowledged output stays caught up after reopen"
@@ -9638,9 +9705,16 @@ connection: close
                 .is_empty()
         );
         assert!(
-            recover_host_workspace_messages(&client, &other_host, &store, &workspace, session_id)
-                .await
-                .is_err()
+            recover_host_workspace_messages(
+                &client,
+                &other_host,
+                &store,
+                &workspace,
+                session_id,
+                &mut recovery_sync
+            )
+            .await
+            .is_err()
         );
         assert!(received.try_recv().is_err());
         workspace
@@ -9658,11 +9732,21 @@ connection: close
             .await
             .unwrap();
         status.store(404, Ordering::SeqCst);
-        let retry =
-            recover_host_workspace_messages(&client, &config, &store, &workspace, session_id)
-                .await
-                .unwrap();
-        assert!(retry > Instant::now() + Duration::from_secs(290));
+        recovery_sync.workspace_retry_at.clear();
+        recover_host_workspace_messages(
+            &client,
+            &config,
+            &store,
+            &workspace,
+            session_id,
+            &mut recovery_sync,
+        )
+        .await
+        .unwrap();
+        assert!(
+            recovery_sync.workspace_retry_at[&binding.workspace_id]
+                > Instant::now() + Duration::from_secs(290)
+        );
         let shared = received.recv().await.unwrap();
         assert!(shared.0.ends_with("/workspace/messages"));
         assert_eq!(
@@ -9673,9 +9757,17 @@ connection: close
             [session_id]
         );
         status.store(204, Ordering::SeqCst);
-        recover_host_workspace_messages(&client, &config, &store, &workspace, session_id)
-            .await
-            .unwrap();
+        recovery_sync.workspace_retry_at.clear();
+        recover_host_workspace_messages(
+            &client,
+            &config,
+            &store,
+            &workspace,
+            session_id,
+            &mut recovery_sync,
+        )
+        .await
+        .unwrap();
         assert_eq!(received.recv().await.unwrap(), shared);
         assert!(
             store
@@ -9683,6 +9775,120 @@ connection: close
                 .await
                 .unwrap()
                 .is_empty()
+        );
+        // A later private message must not inherit the shared route backoff.
+        let store = Arc::new(store);
+        workspace
+            .append_message(crate::NewWorkspaceMessage {
+                workspace_id: binding.workspace_id,
+                author_id: session_id,
+                text: "shared route unavailable".to_string(),
+                mentions: Vec::new(),
+                audience: Audience::Workspace,
+                mode: crate::DeliveryMode::NextTurn,
+                thread_id: None,
+                reply_to_message_id: None,
+                idempotency_key: "shared-backoff".to_string(),
+            })
+            .await
+            .unwrap();
+        let private = |text: &str| crate::NewWorkspaceMessage {
+            workspace_id: direct,
+            author_id: session_id,
+            text: text.to_string(),
+            mentions: Vec::new(),
+            audience: Audience::Direct {
+                participant: recipient,
+            },
+            mode: crate::DeliveryMode::NextTurn,
+            thread_id: None,
+            reply_to_message_id: None,
+            idempotency_key: text.to_string(),
+        };
+        workspace
+            .append_message(private("before backoff"))
+            .await
+            .unwrap();
+        status.store(404, Ordering::SeqCst);
+        let mut worker = AbortTask(tokio::spawn(run_host_workspace_recovery_loop(
+            client.clone(),
+            config.clone(),
+            Arc::clone(&store),
+            Arc::clone(&sessions),
+        )));
+        let first = tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let initial_private = if first.0.ends_with("/workspace/messages") {
+            second
+        } else {
+            first
+        };
+        assert_eq!(initial_private.1["text"], "before backoff");
+        let sequence = initial_private.1["metadata"]["local_workspace_sequence"]
+            .as_u64()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while store
+                .host_workspace_cursors(config.host_id, session_id)
+                .await
+                .unwrap()
+                .get(&direct)
+                .copied()
+                .unwrap_or_default()
+                < sequence
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        workspace
+            .append_message(private("during shared backoff"))
+            .await
+            .unwrap();
+        let next = tokio::time::timeout(Duration::from_secs(5), received.recv())
+            .await
+            .expect("shared-workspace backoff must not defer a newly queued private message")
+            .unwrap();
+        assert!(
+            !next.0.ends_with("/workspace/messages"),
+            "shared retries must still respect their backoff"
+        );
+        assert_eq!(next.1["text"], "during shared backoff");
+        let sequence = next.1["metadata"]["local_workspace_sequence"]
+            .as_u64()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while store
+                .host_workspace_cursors(config.host_id, session_id)
+                .await
+                .unwrap()
+                .get(&direct)
+                .copied()
+                .unwrap_or_default()
+                < sequence
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        worker.0.abort();
+        let _ = (&mut worker.0).await;
+        assert_eq!(
+            store.state(session_id).await.unwrap().status,
+            Some(crate::SessionStatus::Stopped)
+        );
+        assert_eq!(
+            sessions.lock().await.len(),
+            1,
+            "message recovery must not consume another actor slot"
         );
     }
 
