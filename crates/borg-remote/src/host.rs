@@ -3363,7 +3363,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                         &config,
                         session_id,
                         metadata.attachment.as_ref(),
-                        !matches!(command, HostCommand::Stop { .. }),
+                        false,
                     ) {
                         tracing::error!(%error, %session_id, "stored launch attachment is invalid");
                         return false;
@@ -3378,9 +3378,16 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                         )
                         .await;
                     }
-                    if sessions.lock().await.len()
-                        >= config.resource_limits.max_concurrent_sessions as usize
-                    {
+                    let attachment_error = validate_workspace_attachment(
+                        &config,
+                        session_id,
+                        metadata.attachment.as_ref(),
+                        true,
+                    )
+                    .err();
+                    let at_capacity = sessions.lock().await.len()
+                        >= config.resource_limits.max_concurrent_sessions as usize;
+                    if attachment_error.is_some() || at_capacity {
                         if let HostCommand::Prompt {
                             message_id,
                             text,
@@ -3418,11 +3425,11 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                                 Ok(true) => return true,
                                 Ok(false) => {}
                                 Err(error) => {
-                                    tracing::warn!(%error, %session_id, "cannot defer prompt at capacity")
+                                    tracing::warn!(%error, %session_id, "cannot durably defer remote prompt")
                                 }
                             }
                         }
-                        tracing::warn!(%session_id, "host is at session capacity; retaining command until it can be delivered safely");
+                        tracing::warn!(%session_id, at_capacity, ?attachment_error, "session restoration is unavailable; retaining non-deferable command");
                         return false;
                     }
                     Some(
@@ -8695,6 +8702,215 @@ mod tests {
                 .0,
             unstarted
         );
+    }
+
+    #[tokio::test]
+    async fn expired_attachment_defers_plain_prompts_without_blocking_stop_or_starting_an_actor() {
+        for (capacity, delivery) in [
+            (1, crate::PromptDelivery::Queue),
+            (2, crate::PromptDelivery::Steer),
+        ] {
+            let root = tempdir().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = test_config(root.path());
+            config.server = format!("http://{}", listener.local_addr().unwrap());
+            config.resource_limits.max_concurrent_sessions = capacity;
+            let path = root.path().join("sessions.sqlite3");
+            let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+            let session_id = Uuid::new_v4();
+            let active_id = Uuid::new_v4();
+            let launch = bootstrap_test_launch(root.path());
+            let metadata = serde_json::to_value(PersistedLaunchMetadata {
+                request: launch.clone(),
+                attachment: Some(WorkspaceAttachment {
+                    workspace_id: None,
+                    participant_id: None,
+                    command_authority: None,
+                    host_identity: None,
+                    host_capabilities: None,
+                    presence_lease: Some(crate::RemotePresenceLease {
+                        lease_id: Uuid::new_v4(),
+                        expires_at: Utc::now() - ChronoDuration::minutes(1),
+                    }),
+                    approval_provenance: None,
+                    reconnect_sync_cursors: None,
+                }),
+            })
+            .unwrap();
+            // Persisted snapshot of a previously admitted session, now inactive with an expired lease.
+            store
+                .persist_owned_host_launch_metadata(
+                    session_id,
+                    &metadata,
+                    config.host_id,
+                    &host_relay_origin(&config).unwrap(),
+                )
+                .await
+                .unwrap();
+            store.create_session(session_id).await.unwrap();
+            for kind in [
+                crate::SessionEventKind::SessionStarted,
+                crate::SessionEventKind::SessionConfigured {
+                    cwd: launch.cwd.clone(),
+                    provider: launch.provider,
+                    model: None,
+                    effort: None,
+                    fast: false,
+                    response_language: launch.response_language,
+                    permission_mode: launch.permission_mode,
+                },
+                crate::SessionEventKind::StatusChanged {
+                    status: crate::SessionStatus::Ready,
+                    detail: None,
+                },
+            ] {
+                store
+                    .append(SessionEvent::new(session_id, 0, kind))
+                    .await
+                    .unwrap();
+            }
+            let sessions = Arc::new(Mutex::new(HashMap::new()));
+            let (tx, mut rx) = mpsc::channel(1);
+            sessions.lock().await.insert(active_id, tx);
+            let executor: HostExecutorFactory =
+                Arc::new(|_, _| panic!("expired lease cannot authorize actor restoration"));
+            let client = Client::new();
+            let receipts = Arc::new(sqlite_receipts().await);
+            let context = |store: &Arc<SqliteSessionStore>| DispatchContext {
+                client: client.clone(),
+                config: config.clone(),
+                session_root: root.path().to_path_buf(),
+                sessions: Arc::clone(&sessions),
+                session_store: Arc::clone(store),
+                receipts: Arc::clone(&receipts),
+                executor_factory: Arc::clone(&executor),
+            };
+            let message_id = Uuid::new_v4();
+            let prompt = || HostCommand::Prompt {
+                session_id,
+                message_id,
+                text: "retain while authorization is expired".into(),
+                attachments: vec![root.path().join("note.txt")],
+                output_schema: None,
+                delivery,
+            };
+            assert!(
+                dispatch(context(&store), prompt()).await,
+                "durable admission must allow the host queue to reach later controls"
+            );
+            assert_eq!(
+                sessions.lock().await.len(),
+                1,
+                "admission must not start another actor"
+            );
+            let admitted =
+                serde_json::to_value(store.events_after(session_id, 0, 20).await.unwrap()).unwrap();
+            assert!(
+                store
+                    .contains_message(session_id, message_id)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(store.pending_actions(session_id, 8).await.unwrap().len(), 1);
+            assert!(
+                dispatch(
+                    context(&store),
+                    HostCommand::Stop {
+                        session_id: active_id
+                    }
+                )
+                .await
+            );
+            assert!(
+                matches!(rx.try_recv(), Ok(HostCommand::Stop { session_id }) if session_id == active_id)
+            );
+            drop(store);
+            let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+            assert!(dispatch(context(&store), prompt()).await);
+            assert_eq!(
+                serde_json::to_value(store.events_after(session_id, 0, 20).await.unwrap()).unwrap(),
+                admitted
+            );
+            assert_eq!(store.pending_actions(session_id, 8).await.unwrap().len(), 1);
+            sessions.lock().await.clear();
+            resume_pending_host_sessions(
+                &client,
+                &config,
+                root.path(),
+                &sessions,
+                &store,
+                &executor,
+            )
+            .await
+            .unwrap();
+            assert!(
+                sessions.lock().await.is_empty(),
+                "free capacity must not bypass lease authorization"
+            );
+            assert_eq!(
+                store.state(session_id).await.unwrap().status,
+                Some(crate::SessionStatus::Ready)
+            );
+            let schema_id = Uuid::new_v4();
+            assert!(
+                !dispatch(
+                    context(&store),
+                    HostCommand::Prompt {
+                        session_id,
+                        message_id: schema_id,
+                        text: "requires schema".into(),
+                        attachments: vec![],
+                        output_schema: Some(serde_json::json!({"type":"object"})),
+                        delivery: crate::PromptDelivery::Queue,
+                    }
+                )
+                .await
+            );
+            assert!(!store.contains_message(session_id, schema_id).await.unwrap());
+            let writer =
+                SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock")))
+                    .unwrap();
+            assert!(!dispatch(context(&store), HostCommand::Stop { session_id }).await);
+            drop(writer);
+            assert!(dispatch(context(&store), HostCommand::Stop { session_id }).await);
+            assert_eq!(
+                store.state(session_id).await.unwrap().status,
+                Some(crate::SessionStatus::Stopped)
+            );
+            assert!(
+                store
+                    .pending_actions(session_id, 8)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .pending_host_launch_metadata(8)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                store
+                    .pending_host_journals(None, 8)
+                    .await
+                    .unwrap()
+                    .contains(&session_id)
+            );
+            assert!(dispatch(context(&store), prompt()).await);
+            assert!(sessions.lock().await.is_empty());
+            assert_eq!(
+                store.load_host_launch_metadata(session_id).await.unwrap(),
+                Some(metadata)
+            );
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err(),
+                "durable deferral and inactive Stop must not contact the relay"
+            );
+        }
     }
 
     #[tokio::test]

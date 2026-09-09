@@ -156,8 +156,9 @@ work; an unstarted launch replay with an expired lease fails visibly. Restoratio
 nonterminal actor still requires a valid attachment. Stop may settle that inactive
 session locally despite lease expiry, but only after host ownership, structural
 attachment identity, and any explicit Stop grant have been checked. This neither renews the lease nor starts
-an actor. A queued prompt requiring restoration with an expired lease can still
-block a later Stop; lease renewal for started sessions and general queue
+an actor. Eligible plain prompts can be durably deferred while the lease is
+expired, allowing later Stop commands through. Non-deferable commands can still
+block later controls; lease renewal for started sessions and general queue
 fairness remain open.
 
 New hosted launches also persist an unfinished-bootstrap record before
@@ -233,17 +234,24 @@ collecting evidence.
 ## Inactive-session capacity and Stop
 
 Restoring an inactive hosted session from a command now respects the same
-process-local execution limit as Launch and restart recovery. At capacity, a
-plain prompt (no output schema) for an already configured session can be
-acknowledged without starting an actor **only when both its local journal
-message and action are durable**. The pending-action scan schedules it when a
-slot opens, without needing another relay command. Exact retries reuse the
-same message/action rather than creating a second turn.
+process-local execution limit as Launch and restart recovery. At capacity or
+with an expired attachment presence lease, a plain prompt (no output schema)
+for an already started/configured session can be acknowledged without starting
+an actor **only when both its local journal message and action are durable**.
+Stored host/relay ownership, structural attachment identity, and any explicit
+Prompt grant must still pass before admission. This is durable input retention,
+not execution permission or a renewed lease. Queue/Steer delivery and attachment
+paths are retained in the journal. The pending-action scan schedules the prompt
+only once capacity and a valid attachment allow restoration, without needing
+another relay command. Exact retries reuse the same message/action rather than
+creating a second turn. A later Stop can cancel the deferred action locally;
+no actor is created merely to admit or cancel it.
 
 This is deliberately not a general deferred-control queue. Schema-bearing
 prompts, sessions without durable startup/configuration, workspace-only or
 inherited messages without a local action, and other inactive-session controls
-remain unacknowledged at capacity. They can still block later relay commands.
+remain unacknowledged when capacity or lease expiry prevents restoration. They
+can still block later relay commands.
 Do not mistake a workspace message existing for proof of local prompt replay,
 or silently drop an output schema to admit a request.
 
