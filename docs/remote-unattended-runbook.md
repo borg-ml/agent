@@ -323,9 +323,20 @@ unchanged durable message identities and cursor/idempotency protection.
 This is not fully independent scheduling: authorization/storage errors still
 back off the sender session, a slow request can exhaust the ten-second recovery
 budget, and a large earlier workspace can delay later messages. Directory and
-roster availability gates also retain their existing behavior. It is not a
-general per-recipient outbox or a guarantee that unavailable/deleted recipients
-accept output.
+roster requests are still awaited before outgoing messages. It is not a general
+per-recipient outbox or a guarantee that unavailable/deleted recipients accept
+output.
+
+For running shared-workspace sessions, a roster 404 disables shared uploads but
+no longer permanently disables discovery. Roster probes continue every thirty
+seconds even while unavailable. A successful response must decode and persist
+its roster before re-enabling a previously disabled route; queued messages then
+resume with their original identities. Transient HTTP/network errors, malformed
+rosters, and roster projection failures retry after five seconds while retaining
+previous availability. A fresh successful roster is refreshed after thirty
+seconds, not on every upload tick. This does not change roster membership-pruning
+or authorization/revocation policy, and it does not require an actor restart.
+Inactive upload-only recovery still does not fetch rosters or renew presence.
 
 ## Stored host identity after re-enrollment
 

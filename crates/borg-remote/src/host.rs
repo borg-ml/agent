@@ -5363,8 +5363,7 @@ async fn flush_workspace_messages(
             }
         }
     }
-    if sync.workspace_relay_available
-        && let Some(workspace_id) = execution_workspace_id
+    if let Some(workspace_id) = execution_workspace_id
         && Instant::now() >= sync.next_workspace_roster_sync
     {
         let response = client
@@ -5377,28 +5376,42 @@ async fn flush_workspace_messages(
             .await;
         match response {
             Ok(response) if response.status().is_success() => {
-                let roster: RelayWorkspaceRoster = response
-                    .json()
-                    .await
-                    .context("borg.ml returned an invalid workspace roster")?;
-                for remote in roster.participants {
-                    store
-                        .upsert_relay_roster_entry(
-                            workspace_id,
-                            Participant {
-                                id: remote.id,
-                                display_name: remote.display_name,
-                                kind: remote.kind,
-                                created_at: remote.created_at,
-                            },
-                            remote.role,
-                        )
-                        .await?;
+                let persisted: Result<()> = async {
+                    let roster: RelayWorkspaceRoster = response
+                        .json()
+                        .await
+                        .context("borg.ml returned an invalid workspace roster")?;
+                    for remote in roster.participants {
+                        store
+                            .upsert_relay_roster_entry(
+                                workspace_id,
+                                Participant {
+                                    id: remote.id,
+                                    display_name: remote.display_name,
+                                    kind: remote.kind,
+                                    created_at: remote.created_at,
+                                },
+                                remote.role,
+                            )
+                            .await?;
+                    }
+                    Ok(())
                 }
-                sync.next_workspace_roster_sync = Instant::now() + Duration::from_secs(30);
+                .await;
+                match persisted {
+                    Ok(()) => {
+                        sync.workspace_relay_available = true;
+                        sync.next_workspace_roster_sync = Instant::now() + Duration::from_secs(30);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "workspace roster synchronization failed; retaining previous availability");
+                        sync.next_workspace_roster_sync = Instant::now() + Duration::from_secs(5);
+                    }
+                }
             }
             Ok(response) if response.status() == StatusCode::NOT_FOUND => {
                 sync.workspace_relay_available = false;
+                sync.next_workspace_roster_sync = Instant::now() + Duration::from_secs(30);
             }
             Ok(response) => {
                 tracing::warn!(
@@ -9141,6 +9154,177 @@ connection: close
         assert!(
             reason.is_some(),
             "unsupported command is retained, not executed or silently deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_roster_recovers_without_restarting_or_losing_queued_messages() {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        let root = tempdir().unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let id = Uuid::new_v4();
+        store.create_session(id).await.unwrap();
+        let binding = store.workspace_binding(id).await.unwrap().unwrap();
+        let workspace = store.workspace_store().await.unwrap().unwrap();
+        workspace
+            .ensure_execution_workspace(
+                binding.workspace_id,
+                "Shared",
+                crate::local_human_participant_id("Human"),
+                "Human",
+                id,
+                "Sender",
+            )
+            .await
+            .unwrap();
+        workspace
+            .append_message(crate::NewWorkspaceMessage {
+                workspace_id: binding.workspace_id,
+                author_id: id,
+                text: "queued through roster recovery".to_string(),
+                mentions: Vec::new(),
+                audience: Audience::Workspace,
+                mode: crate::DeliveryMode::NextTurn,
+                thread_id: None,
+                reply_to_message_id: None,
+                idempotency_key: "roster-recovery".to_string(),
+            })
+            .await
+            .unwrap();
+        let original = workspace
+            .replay(binding.workspace_id, id, 0, 256)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| matches!(event.kind, WorkspaceEventKind::Message { .. }))
+            .unwrap();
+        let peer = Uuid::new_v4();
+        let roster = serde_json::json!({"participants": [{
+            "id": peer, "kind": "agent", "role": "contributor",
+            "display_name": "Recovered peer", "created_at": Utc::now(),
+        }]})
+        .to_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = HostConfig {
+            server: format!("http://{}", listener.local_addr().unwrap()),
+            ..test_config(root.path())
+        };
+        let status = Arc::new(AtomicU16::new(404));
+        let server_status = Arc::clone(&status);
+        let (sent, mut requests) = mpsc::channel(8);
+        let _server = AbortTask(tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (path, body) = read_http_request(&mut socket).await;
+                let participants = path.ends_with("/workspace/participants");
+                assert!(participants || path.ends_with("/workspace/messages"));
+                sent.send((path, body)).await.unwrap();
+                let mode = server_status.load(Ordering::SeqCst);
+                let (code, response) = if !participants {
+                    (204, "")
+                } else if mode == 200 {
+                    (200, roster.as_str())
+                } else if mode == 1 {
+                    (200, "{")
+                } else {
+                    (mode, "")
+                };
+                socket.write_all(format!("HTTP/1.1 {code} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",response.len()).as_bytes()).await.unwrap();
+            }
+        }));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let mut sync = JournalSync::new(
+            SessionSyncResponse {
+                event_cursor: 0,
+                live_revision: 0,
+            },
+            true,
+        );
+        sync.next_inbox_sync = Instant::now() + Duration::from_secs(60);
+        sync.next_instance_directory_sync = Instant::now() + Duration::from_secs(60);
+        for mode in [404, 503, 1, 200] {
+            status.store(mode, Ordering::SeqCst);
+            sync.next_workspace_roster_sync = Instant::now();
+            flush_workspace_messages(
+                &client,
+                &config,
+                &store,
+                Some(&workspace),
+                id,
+                Some(binding.workspace_id),
+                &mut sync,
+            )
+            .await
+            .unwrap();
+            let request = requests
+                .try_recv()
+                .expect("an unavailable roster must be probed again when its retry is due");
+            assert!(request.0.ends_with("/workspace/participants"));
+            if mode == 200 {
+                break;
+            }
+            assert!(!sync.workspace_relay_available);
+            assert!(
+                requests.try_recv().is_err(),
+                "unverified roster recovery must not release shared messages"
+            );
+            assert!(
+                sync.uploaded_workspace_sequences
+                    .get(&binding.workspace_id)
+                    .copied()
+                    .unwrap_or_default()
+                    < original.sequence
+            );
+            // Normal poll ticks before the retry time must not hammer discovery.
+            flush_workspace_messages(
+                &client,
+                &config,
+                &store,
+                Some(&workspace),
+                id,
+                Some(binding.workspace_id),
+                &mut sync,
+            )
+            .await
+            .unwrap();
+            assert!(requests.try_recv().is_err());
+        }
+        let upload = requests
+            .try_recv()
+            .expect("queued shared message must upload after roster recovery");
+        assert!(upload.0.ends_with("/workspace/messages"));
+        let body: serde_json::Value = serde_json::from_slice(&upload.1).unwrap();
+        assert_eq!(body["text"], "queued through roster recovery");
+        assert_eq!(body["idempotency_key"], original.id.to_string());
+        assert!(
+            workspace
+                .workspace_roster(binding.workspace_id, id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|entry| entry.participant.id == peer
+                    && entry.role == WorkspaceRole::Contributor)
+        );
+        assert!(sync.uploaded_workspace_sequences[&binding.workspace_id] >= original.sequence);
+        flush_workspace_messages(
+            &client,
+            &config,
+            &store,
+            Some(&workspace),
+            id,
+            Some(binding.workspace_id),
+            &mut sync,
+        )
+        .await
+        .unwrap();
+        assert!(
+            requests.try_recv().is_err(),
+            "caught-up messages and a fresh roster must not repeat"
         );
     }
 
