@@ -257,8 +257,8 @@ journal history. Reopening the database preserves acknowledged progress.
 
 Only sessions with durable hosted launch metadata and a workspace binding to
 the current enrolled host are scanned. A binding/launch identity mismatch is
-retained for diagnosis, not silently reassigned. This does not repair historical
-host-ownership reassignment in other startup paths. Local CLI mirrors without
+retained for diagnosis, not silently reassigned. Stored host identity is also
+checked on hosted startup, control, and journal recovery paths. Local CLI mirrors without
 hosted launch metadata are outside this worker; their mirror or explicit
 `borg remote sync --session SESSION_UUID --send-pending` remains responsible.
 
@@ -280,6 +280,33 @@ recovery until a capable binary returns. Never delete workspace events or
 cursor rows to force recovery. A failing workspace may still delay other
 messages from the same sender; this is not a general per-recipient outbox or a
 guarantee that unavailable/deleted recipients will accept output.
+
+## Stored host identity after re-enrollment
+
+Hosted startup, command dispatch, inactive Stop/terminal settlement, launch
+rejection cleanup, and journal recovery check the stored workspace binding and
+any host identity in the original launch attachment. If either names another
+host, they retain the work and reject the operation instead of rewriting its
+binding, settling its actions, or uploading with the new host credentials.
+Startup checks before fetching runtime context and again under the session
+writer lease after that await. Local settlement also rechecks under the writer
+lease. The original owner can still Stop its inactive session while the relay
+is unavailable.
+
+Pending-launch recovery filters known foreign identities before applying its
+bounded result limit, so an old enrollment does not fill that recovery page and
+hide eligible work for the current host. Foreign relay commands remain
+unacknowledged and can still block later commands on that relay queue; this is
+not a command-transfer or remote rejection-result protocol.
+
+These checks use existing durable evidence; they do not invent an owner for a
+legacy/pre-start launch that has neither a bound host nor an attachment host
+identity. `host_launches` still lacks a required immutable host owner, so those
+unbound rows remain a recovery gap. This checkpoint also does not repair a
+binding already overwritten by an older binary, establish ownership across
+relay-origin changes, or change local CLI mirror enrollment behavior. Do not
+edit host IDs in the database or restart active actors as an automatic repair.
+A complete re-enrollment migration/authorization policy remains required.
 
 ## Deferred shell and workspace commands
 

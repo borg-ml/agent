@@ -2242,6 +2242,7 @@ async fn recover_host_journal(
     store: &SqliteSessionStore,
     session_id: Uuid,
 ) -> Result<Instant> {
+    validate_stored_host_identity(config, store, session_id).await?;
     // The relay is authoritative after a lost response or a host restart.
     // This path only publishes journals; it never constructs a session actor.
     let cursor = load_session_sync(client, config, session_id).await?;
@@ -3137,6 +3138,12 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             }
         };
     }
+    if let Some(session_id) = command.session_id()
+        && let Err(error) = validate_stored_host_identity(&config, &session_store, session_id).await
+    {
+        tracing::warn!(%error, %session_id, "stored session host identity rejected command; retaining it");
+        return false;
+    }
     if let HostCommand::Launch {
         session_id,
         request,
@@ -3190,6 +3197,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                 ) =>
             {
                 return settle_inactive_host_session(
+                    &config,
                     &session_store,
                     &session_root,
                     session_id,
@@ -3284,6 +3292,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                     });
                     if terminal {
                         return settle_inactive_host_session(
+                            &config,
                             &session_store,
                             &session_root,
                             session_id,
@@ -3301,6 +3310,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                     }
                     if matches!(command, HostCommand::Stop { .. }) {
                         return settle_inactive_host_session(
+                            &config,
                             &session_store,
                             &session_root,
                             session_id,
@@ -3409,6 +3419,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
 }
 
 async fn settle_inactive_host_session(
+    config: &HostConfig,
     store: &SqliteSessionStore,
     session_root: &Path,
     session_id: Uuid,
@@ -3416,6 +3427,7 @@ async fn settle_inactive_host_session(
 ) -> bool {
     let result: Result<()> = async {
         let _writer = SessionWriterLease::acquire(session_root.join(format!("{session_id}.lock")))?;
+        validate_stored_host_identity(config, store, session_id).await?;
         if !store.contains_session(session_id).await? {
             ensure!(stop, "missing terminal session");
             store.create_session(session_id).await?;
@@ -3476,6 +3488,7 @@ async fn reject_host_launch(
 ) -> bool {
     let result: Result<bool> = async {
         let _writer = SessionWriterLease::acquire(session_root.join(format!("{session_id}.lock")))?;
+        validate_stored_host_identity(config, store, session_id).await?;
         if !store.contains_session(session_id).await? {
             store.create_session(session_id).await?;
         }
@@ -4193,6 +4206,32 @@ fn authorize_workspace_command(
     Ok(())
 }
 
+async fn validate_stored_host_identity(
+    config: &HostConfig,
+    store: &SqliteSessionStore,
+    session_id: Uuid,
+) -> Result<()> {
+    if let Some(binding) = store.workspace_binding(session_id).await?
+        && let Some(host_id) = binding.host_id
+    {
+        ensure!(
+            host_id == config.host_id,
+            "session workspace belongs to another enrolled host"
+        );
+    }
+    if let Some(metadata) = load_launch_metadata(store, session_id).await?
+        && let Some(identity) = metadata
+            .attachment
+            .and_then(|attachment| attachment.host_identity)
+    {
+        ensure!(
+            identity.host_id == config.host_id,
+            "session launch belongs to another enrolled host"
+        );
+    }
+    Ok(())
+}
+
 async fn persist_launch_metadata(
     store: &SqliteSessionStore,
     session_id: Uuid,
@@ -4252,7 +4291,14 @@ async fn resume_pending_host_sessions(
         .resource_limits
         .max_concurrent_sessions
         .saturating_sub(sessions.lock().await.len() as u32) as usize;
-    for (session_id, value) in session_store.pending_host_launch_metadata(256).await? {
+    for (session_id, value) in session_store
+        .pending_host_launch_metadata_for_host(Some(config.host_id), 256)
+        .await?
+    {
+        if let Err(error) = validate_stored_host_identity(config, session_store, session_id).await {
+            tracing::warn!(%error, %session_id, "skipping recovery for incompatible stored host identity");
+            continue;
+        }
         if sessions.lock().await.contains_key(&session_id) {
             continue;
         }
@@ -4392,13 +4438,15 @@ async fn run_session(
     } = launch_request;
     launch.cwd = validate_host_cwd(&config.roots, &launch.cwd)?;
     discard_serialized_extension_roots(&mut launch);
+    let sqlite_store =
+        Arc::new(SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await?);
+    validate_stored_host_identity(&config, &sqlite_store, session_id).await?;
     if let Some(context) = fetch_runtime_mcp_context(&client, &config, session_id).await? {
         launch.capabilities.runtime_mcp_context = Some(context);
     }
     let lock_path = session_root.join(format!("{session_id}.lock"));
     let writer = SessionWriterLease::acquire(&lock_path)?;
-    let sqlite_store =
-        Arc::new(SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await?);
+    validate_stored_host_identity(&config, &sqlite_store, session_id).await?;
     // Another host may have stopped this session while startup awaited the relay.
     // Recheck under writer ownership before constructing an actor or provider.
     if stored_host_session_state(&sqlite_store, session_id)
@@ -7610,6 +7658,245 @@ mod tests {
                     .is_some()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn reenrolled_host_cannot_rebind_or_settle_another_host_session() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let root = tempdir().unwrap();
+        let store = Arc::new(
+            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        let session_id = Uuid::new_v4();
+        let original_host = Uuid::new_v4();
+        let launch = bootstrap_test_launch(root.path());
+        persist_launch_metadata(&store, session_id, &launch, None)
+            .await
+            .unwrap();
+        store.create_session(session_id).await.unwrap();
+        let binding = store.workspace_binding(session_id).await.unwrap().unwrap();
+        let binding = crate::SessionWorkspaceBinding {
+            host_id: Some(original_host),
+            ..binding
+        };
+        store.attach_workspace(binding.clone()).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                crate::SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        store.begin_host_bootstrap(session_id).await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config(root.path());
+        assert_ne!(config.host_id, original_host);
+        config.server = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&requests);
+        let _server = AbortTask(tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_http_request(&mut socket).await;
+                seen.fetch_add(1, Ordering::SeqCst);
+                socket
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        }));
+        let executor: HostExecutorFactory = Arc::new(|_, _| bail!("must not construct a provider"));
+        let (_tx, rx) = mpsc::channel(1);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                run_session(
+                    Client::new(),
+                    config.clone(),
+                    root.path().to_path_buf(),
+                    Arc::clone(&executor),
+                    HostSessionLaunch {
+                        session_id,
+                        request: launch.clone(),
+                        attachment: None
+                    },
+                    rx,
+                )
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+        assert_eq!(
+            store.workspace_binding(session_id).await.unwrap().unwrap(),
+            binding,
+            "relay rejection must not come after silently rewriting the original host binding"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "foreign durable identity must be rejected before network/provider startup"
+        );
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let receipts = Arc::new(
+            SqliteReceiptStore::open(store.pool().clone())
+                .await
+                .unwrap(),
+        );
+        let command_context = |config: &HostConfig| DispatchContext {
+            client: Client::new(),
+            config: config.clone(),
+            session_root: root.path().to_path_buf(),
+            sessions: Arc::clone(&sessions),
+            session_store: Arc::clone(&store),
+            receipts: Arc::clone(&receipts),
+            executor_factory: Arc::clone(&executor),
+        };
+        for command in [
+            HostCommand::Stop { session_id },
+            HostCommand::Launch {
+                session_id,
+                request: Box::new(launch.clone()),
+                attachment: None,
+            },
+        ] {
+            assert!(!dispatch(command_context(&config), command).await);
+        }
+        resume_pending_host_sessions(
+            &Client::new(),
+            &config,
+            root.path(),
+            &sessions,
+            &store,
+            &executor,
+        )
+        .await
+        .unwrap();
+        assert!(sessions.lock().await.is_empty());
+        assert_eq!(
+            store.workspace_binding(session_id).await.unwrap().unwrap(),
+            binding
+        );
+        assert_eq!(
+            store.events_after(session_id, 0, 10).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store.pending_host_launch_metadata(8).await.unwrap().len(),
+            1
+        );
+        assert!(
+            recover_host_journal(&Client::new(), &config, &store, session_id)
+                .await
+                .is_err()
+        );
+
+        // A pre-start launch may carry its owner even before a workspace binding exists.
+        let unstarted = Uuid::new_v4();
+        let attachment = WorkspaceAttachment {
+            workspace_id: None,
+            participant_id: None,
+            command_authority: None,
+            host_identity: Some(RemoteHostIdentity {
+                host_id: original_host,
+                hostname: "original".to_string(),
+                platform: "test".to_string(),
+            }),
+            host_capabilities: None,
+            presence_lease: None,
+            approval_provenance: None,
+            reconnect_sync_cursors: None,
+        };
+        persist_launch_metadata(&store, unstarted, &launch, Some(&attachment))
+            .await
+            .unwrap();
+        store.begin_host_bootstrap(unstarted).await.unwrap();
+        assert!(
+            !reject_host_launch(
+                &Client::new(),
+                &config,
+                root.path(),
+                &store,
+                unstarted,
+                "wrong host startup failed"
+            )
+            .await
+        );
+        assert!(!store.contains_session(unstarted).await.unwrap());
+        assert!(
+            !dispatch(
+                command_context(&config),
+                HostCommand::Stop {
+                    session_id: unstarted
+                }
+            )
+            .await
+        );
+        resume_pending_host_sessions(
+            &Client::new(),
+            &config,
+            root.path(),
+            &sessions,
+            &store,
+            &executor,
+        )
+        .await
+        .unwrap();
+        assert!(sessions.lock().await.is_empty());
+        assert_eq!(
+            store.pending_host_launch_metadata(8).await.unwrap().len(),
+            2
+        );
+
+        let mut owner_config = config.clone();
+        owner_config.host_id = original_host;
+        assert!(
+            dispatch(
+                command_context(&owner_config),
+                HostCommand::Stop { session_id }
+            )
+            .await,
+            "the owning host can still durably stop its session without relay availability"
+        );
+        assert_eq!(
+            store.state(session_id).await.unwrap().status,
+            Some(crate::SessionStatus::Stopped)
+        );
+        assert!(!dispatch(command_context(&config), HostCommand::Stop { session_id }).await);
+        assert_eq!(
+            store.workspace_binding(session_id).await.unwrap().unwrap(),
+            binding
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        let current = Uuid::new_v4();
+        let mut current_attachment = attachment.clone();
+        current_attachment.host_identity.as_mut().unwrap().host_id = config.host_id;
+        persist_launch_metadata(&store, current, &launch, Some(&current_attachment))
+            .await
+            .unwrap();
+        store.begin_host_bootstrap(current).await.unwrap();
+        assert_eq!(
+            store
+                .pending_host_launch_metadata_for_host(Some(config.host_id), 1)
+                .await
+                .unwrap()[0]
+                .0,
+            current,
+            "foreign entries must not consume the bounded recovery page"
+        );
+        assert_eq!(
+            store
+                .pending_host_launch_metadata_for_host(Some(original_host), 1)
+                .await
+                .unwrap()[0]
+                .0,
+            unstarted
+        );
     }
 
     #[tokio::test]

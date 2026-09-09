@@ -2282,14 +2282,28 @@ impl SqliteSessionStore {
         &self,
         limit: usize,
     ) -> Result<Vec<(Uuid, serde_json::Value)>> {
+        self.pending_host_launch_metadata_for_host(None, limit)
+            .await
+    }
+
+    pub(crate) async fn pending_host_launch_metadata_for_host(
+        &self,
+        host_id: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, serde_json::Value)>> {
         let rows = sqlx::query(
             "select h.session_id, h.metadata_json from host_launches h \
-             where exists (select 1 from host_bootstraps b where b.session_id=h.session_id) \
+             left join session_workspace_bindings w on w.session_id=h.session_id \
+             where (exists (select 1 from host_bootstraps b where b.session_id=h.session_id) \
                 or exists (select 1 from session_actions a \
                  where a.session_id=h.session_id \
-                   and a.state not in ('completed','failed','cancelled')) \
-             order by h.created_at asc limit ?",
+                   and a.state not in ('completed','failed','cancelled'))) \
+               and (?1 is null or ((w.host_id is null or w.host_id=?1) \
+                 and (json_extract(h.metadata_json,'$.attachment.host_identity.host_id') is null \
+                   or json_extract(h.metadata_json,'$.attachment.host_identity.host_id')=?1))) \
+             order by h.created_at asc limit ?2",
         )
+        .bind(host_id.map(|id| id.to_string()))
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
         .fetch_all(&self.pool)
         .await?;
