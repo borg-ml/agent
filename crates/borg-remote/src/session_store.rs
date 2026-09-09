@@ -1300,8 +1300,12 @@ impl SqliteSessionStore {
         let has_host_bootstraps: i64 = sqlx::query_scalar(
             "select exists(select 1 from sqlite_master where type='table' and name='host_bootstraps')",
         ).fetch_one(&self.pool).await?;
+        let has_host_journal_cursors: i64 = sqlx::query_scalar(
+            "select exists(select 1 from sqlite_master where type='table' and name='host_journal_cursors')",
+        ).fetch_one(&self.pool).await?;
         Ok(version == Some(SESSION_SCHEMA_VERSION)
             && has_host_bootstraps != 0
+            && has_host_journal_cursors != 0
             && has_access_bindings != 0
             && has_harness_routes != 0)
     }
@@ -2086,6 +2090,50 @@ impl SqliteSessionStore {
                     .context("host launch metadata contains invalid JSON")
             })
             .transpose()
+    }
+
+    pub(crate) async fn pending_host_journals(
+        &self,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<Uuid>> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "select h.session_id from host_launches h \
+             join sessions s on s.id=h.session_id \
+             left join host_journal_cursors c on c.session_id=h.session_id \
+             where h.session_id > coalesce(?, '') \
+               and (s.next_sequence-1 > coalesce(c.event_cursor,0) \
+                 or exists(select 1 from session_live_state l where l.session_id=h.session_id \
+                   and l.revision > coalesce(c.live_revision,0))) \
+             order by h.session_id limit ?",
+        )
+        .bind(after.map(|id| id.to_string()))
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(|id| parse_uuid(&id)).collect()
+    }
+
+    pub(crate) async fn acknowledge_host_journal(
+        &self,
+        session_id: Uuid,
+        event_cursor: u64,
+        live_revision: u64,
+    ) -> Result<()> {
+        let mut transaction = self.begin_write().await?;
+        sqlx::query(
+            "insert into host_journal_cursors(session_id,event_cursor,live_revision) values(?,?,?) \
+             on conflict(session_id) do update set \
+               event_cursor=max(event_cursor,excluded.event_cursor), \
+               live_revision=max(live_revision,excluded.live_revision)",
+        )
+        .bind(session_id.to_string())
+        .bind(i64::try_from(event_cursor).context("host event cursor exceeds SQLite integer")?)
+        .bind(i64::try_from(live_revision).context("host live revision exceeds SQLite integer")?)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     pub(crate) async fn begin_host_bootstrap(&self, session_id: Uuid) -> Result<()> {
@@ -3093,6 +3141,12 @@ impl SqliteSessionStore {
                 metadata_json text not null,
                 created_at text not null,
                 updated_at text not null
+            );
+
+            create table if not exists host_journal_cursors (
+                session_id text primary key references host_launches(session_id) on delete cascade,
+                event_cursor integer not null default 0,
+                live_revision integer not null default 0
             );
 
             create table if not exists host_bootstraps (

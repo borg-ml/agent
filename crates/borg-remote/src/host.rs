@@ -1922,6 +1922,12 @@ pub async fn run_host_with_executor_factory(
         Arc::clone(&sessions),
         capabilities,
     )));
+    let _journal_recovery = AbortTask(tokio::spawn(run_host_journal_recovery_loop(
+        client.clone(),
+        config.clone(),
+        Arc::clone(&session_store),
+        Arc::clone(&sessions),
+    )));
     let mut command_poll_backoff = RemoteRetryBackoff::default();
     loop {
         resume_pending_host_sessions(
@@ -2009,6 +2015,92 @@ pub async fn run_host_with_executor_factory(
             .await?;
         }
     }
+}
+
+async fn run_host_journal_recovery_loop(
+    client: Client,
+    config: HostConfig,
+    store: Arc<SqliteSessionStore>,
+    sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
+) {
+    let mut after = None;
+    let mut retry_at = HashMap::new();
+    loop {
+        retry_at.retain(|_, retry| *retry > Instant::now());
+        let pending = match store.pending_host_journals(after, 32).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(%error, "cannot scan pending host journals; retrying");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                continue;
+            }
+        };
+        // Page past failed and active sessions so they cannot starve later journals.
+        after = if pending.len() == 32 {
+            pending.last().copied()
+        } else {
+            None
+        };
+        for session_id in pending {
+            if sessions.lock().await.contains_key(&session_id)
+                || retry_at
+                    .get(&session_id)
+                    .is_some_and(|retry| Instant::now() < *retry)
+            {
+                continue;
+            }
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                recover_host_journal(&client, &config, &store, session_id),
+            )
+            .await;
+            match result {
+                Ok(Ok(retry)) => {
+                    if retry > Instant::now() {
+                        retry_at.insert(session_id, retry);
+                    } else {
+                        retry_at.remove(&session_id);
+                    }
+                }
+                error => {
+                    let unavailable = matches!(&error, Ok(Err(error))
+                        if error.downcast_ref::<reqwest::Error>().is_some_and(|error|
+                            matches!(error.status(), Some(StatusCode::NOT_FOUND | StatusCode::GONE))));
+                    tracing::warn!(?error, %session_id, "host journal recovery deferred");
+                    retry_at.insert(
+                        session_id,
+                        Instant::now() + Duration::from_secs(if unavailable { 300 } else { 10 }),
+                    );
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn recover_host_journal(
+    client: &Client,
+    config: &HostConfig,
+    store: &SqliteSessionStore,
+    session_id: Uuid,
+) -> Result<Instant> {
+    // The relay is authoritative after a lost response or a host restart.
+    // This path only publishes journals; it never constructs a session actor.
+    let cursor = load_session_sync(client, config, session_id).await?;
+    store
+        .acknowledge_host_journal(session_id, cursor.event_cursor, cursor.live_revision)
+        .await?;
+    let mut sync = JournalSync::new(cursor, false);
+    let result = flush_pending(client, config, store, session_id, &mut sync).await;
+    store
+        .acknowledge_host_journal(
+            session_id,
+            sync.uploaded_sequence,
+            sync.uploaded_live_revision,
+        )
+        .await?;
+    result?;
+    Ok(sync.retry_at)
 }
 
 async fn run_host_heartbeat_loop(
@@ -2580,6 +2672,10 @@ async fn load_session_sync(
         .context("failed to load remote session sync cursor")?;
     if response.status() == StatusCode::UNAUTHORIZED {
         bail!("remote host token was rejected; enroll this host again");
+    }
+    if matches!(response.status(), StatusCode::NOT_FOUND | StatusCode::GONE) {
+        return Err(response.error_for_status().unwrap_err())
+            .context("remote session journal is unavailable on the relay");
     }
     if !response.status().is_success() {
         bail!(
@@ -3930,17 +4026,7 @@ async fn run_session(
     }
     let store: Arc<dyn SessionStore> = sqlite_store.clone();
     let cursor = load_session_sync(&client, &config, session_id).await?;
-    let mut sync = JournalSync {
-        uploaded_sequence: cursor.event_cursor,
-        uploaded_live_revision: cursor.live_revision,
-        uploaded_workspace_sequences: HashMap::new(),
-        workspace_relay_available: attachment.is_some(),
-        instance_relay_available: true,
-        next_workspace_roster_sync: Instant::now(),
-        next_instance_directory_sync: Instant::now(),
-        next_inbox_sync: Instant::now(),
-        retry_at: Instant::now(),
-    };
+    let mut sync = JournalSync::new(cursor, attachment.is_some());
     flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
     flush_workspace_messages(
         &client,
@@ -4393,6 +4479,22 @@ struct JournalSync {
     next_instance_directory_sync: Instant,
     next_inbox_sync: Instant,
     retry_at: Instant,
+}
+
+impl JournalSync {
+    fn new(cursor: SessionSyncResponse, workspace_relay_available: bool) -> Self {
+        Self {
+            uploaded_sequence: cursor.event_cursor,
+            uploaded_live_revision: cursor.live_revision,
+            uploaded_workspace_sequences: HashMap::new(),
+            workspace_relay_available,
+            instance_relay_available: true,
+            next_workspace_roster_sync: Instant::now(),
+            next_instance_directory_sync: Instant::now(),
+            next_inbox_sync: Instant::now(),
+            retry_at: Instant::now(),
+        }
+    }
 }
 
 async fn sync_instance_directory(
@@ -6635,6 +6737,174 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_journal_recovers_after_restart_and_lost_upload_response() {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config(root.path());
+        config.server = format!("http://{}", listener.local_addr().unwrap());
+        config.resource_limits.max_concurrent_sessions = 1;
+        let (confirmed_tx, confirmed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut uploads = Vec::new();
+            for step in 0..5 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (path, body) = read_http_request(&mut stream).await;
+                if step == 0 || step == 2 {
+                    assert!(path.starts_with("/api/remote/host/events"));
+                    uploads.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
+                    if step == 2 {
+                        // Relay accepted the retry, but its response was lost.
+                        continue;
+                    }
+                    stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await.unwrap();
+                } else {
+                    assert_eq!(path, format!("/api/remote/host/sessions/{session_id}/sync"));
+                    if step == 3 {
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found
+content-length: 0
+connection: close
+
+",
+                            )
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                    let cursor = if step == 4 { 2 } else { 0 };
+                    let body = format!("{{\"event_cursor\":{cursor},\"live_revision\":0}}");
+                    stream.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            }
+            confirmed_tx.send(()).unwrap();
+            uploads
+        });
+        let path = root.path().join("sessions.sqlite3");
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        persist_launch_metadata(
+            &store,
+            session_id,
+            &bootstrap_test_launch(root.path()),
+            None,
+        )
+        .await
+        .unwrap();
+        store.create_session(session_id).await.unwrap();
+        for kind in [
+            crate::SessionEventKind::SessionStarted,
+            crate::SessionEventKind::StatusChanged {
+                status: crate::SessionStatus::Stopped,
+                detail: Some("final output".to_string()),
+            },
+        ] {
+            store
+                .append(SessionEvent::new(session_id, 0, kind))
+                .await
+                .unwrap();
+        }
+        assert!(
+            store
+                .pending_host_launch_metadata(8)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a completed journal has neither bootstrap nor unfinished action recovery"
+        );
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let mut sync = JournalSync::new(
+            SessionSyncResponse {
+                event_cursor: 0,
+                live_revision: 0,
+            },
+            false,
+        );
+        flush_pending(&client, &config, &store, session_id, &mut sync)
+            .await
+            .unwrap();
+        assert_eq!(
+            sync.uploaded_sequence, 0,
+            "Ok may only mean a retry was scheduled"
+        );
+        assert_eq!(
+            store.pending_host_journals(None, 8).await.unwrap(),
+            [session_id]
+        );
+        drop(store);
+
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        recover_host_journal(&client, &config, &store, session_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.pending_host_journals(None, 8).await.unwrap(),
+            [session_id],
+            "a lost success response is not yet a local acknowledgement"
+        );
+        let unavailable = recover_host_journal(&client, &config, &store, session_id)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            unavailable
+                .downcast_ref::<reqwest::Error>()
+                .unwrap()
+                .status(),
+            Some(StatusCode::NOT_FOUND)
+        );
+        assert_eq!(
+            store.pending_host_journals(None, 8).await.unwrap(),
+            [session_id],
+            "a missing relay session must not be silently treated as delivered"
+        );
+        drop(store);
+
+        let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let active_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(1);
+        sessions.lock().await.insert(active_id, tx);
+        let _recovery = AbortTask(tokio::spawn(run_host_journal_recovery_loop(
+            client,
+            config,
+            Arc::clone(&store),
+            Arc::clone(&sessions),
+        )));
+        tokio::time::timeout(Duration::from_secs(5), confirmed_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !store
+                .pending_host_journals(None, 8)
+                .await
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            sessions.lock().await.keys().copied().collect::<Vec<_>>(),
+            [active_id]
+        );
+        assert_eq!(
+            store.events_after(session_id, 0, 10).await.unwrap().len(),
+            2
+        );
+        let uploads = server.await.unwrap();
+        assert_eq!(
+            uploads[0], uploads[1],
+            "failed upload replays identical events"
+        );
+    }
+
+    #[tokio::test]
     async fn acknowledged_bootstrap_failure_replays_after_restart_without_execution() {
         let root = tempdir().unwrap();
         let session_id = Uuid::new_v4();
@@ -6770,6 +7040,10 @@ mod tests {
             .await
             .unwrap();
         // Simulate the previous current schema: additive upgrade must preserve metadata.
+        sqlx::query("drop table host_journal_cursors")
+            .execute(store.pool())
+            .await
+            .unwrap();
         sqlx::query("drop table host_bootstraps")
             .execute(store.pool())
             .await

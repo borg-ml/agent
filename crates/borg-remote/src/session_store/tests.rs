@@ -15,6 +15,178 @@ async fn store() -> (tempfile::TempDir, SqliteSessionStore) {
 }
 
 #[tokio::test]
+async fn host_journal_cursors_preserve_late_events_live_state_and_pagination() {
+    let (directory, store) = store().await;
+    let first = Uuid::from_u128(1);
+    let second = Uuid::from_u128(2);
+    let local = Uuid::from_u128(3);
+    for id in [first, second, local] {
+        store.create_session(id).await.unwrap();
+        store
+            .append(SessionEvent::new(id, 0, SessionEventKind::SessionStarted))
+            .await
+            .unwrap();
+        if id != local {
+            store
+                .persist_host_launch_metadata(id, &serde_json::json!({"request_id": id}))
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(store.pending_host_journals(None, 1).await.unwrap(), [first]);
+    assert_eq!(
+        store.pending_host_journals(Some(first), 1).await.unwrap(),
+        [second]
+    );
+    assert!(
+        store
+            .pending_host_journals(Some(second), 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store.acknowledge_host_journal(first, 1, 0).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            first,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
+    store.acknowledge_host_journal(first, 1, 0).await.unwrap();
+    assert_eq!(
+        store.pending_host_journals(None, 1).await.unwrap(),
+        [first],
+        "a stale acknowledgement cannot hide a concurrently appended event"
+    );
+    store.acknowledge_host_journal(first, 2, 0).await.unwrap();
+    store.acknowledge_host_journal(first, 1, 0).await.unwrap();
+    assert_eq!(
+        store.pending_host_journals(None, 8).await.unwrap(),
+        [second],
+        "old acknowledgements must not rewind confirmed cursors"
+    );
+    store
+        .append(SessionEvent::new(
+            first,
+            0,
+            SessionEventKind::ContextWindowUpdated {
+                context_tokens: 80,
+                context_window_tokens: 100,
+            },
+        ))
+        .await
+        .unwrap();
+    let revision = store.live_events_after(first, 0).await.unwrap()[0].revision;
+    assert_eq!(store.pending_host_journals(None, 1).await.unwrap(), [first]);
+    store
+        .acknowledge_host_journal(first, 2, revision)
+        .await
+        .unwrap();
+    store.acknowledge_host_journal(second, 1, 0).await.unwrap();
+    drop(store);
+    let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .pending_host_journals(None, 8)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .append(SessionEvent::new(
+            first,
+            0,
+            SessionEventKind::ContextWindowUpdated {
+                context_tokens: 90,
+                context_window_tokens: 100,
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(store.pending_host_journals(None, 8).await.unwrap(), [first]);
+    let revision = store.live_events_after(first, 0).await.unwrap()[0].revision;
+    store
+        .acknowledge_host_journal(first, 2, revision)
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            first,
+            0,
+            SessionEventKind::ReasoningDelta {
+                text: "transient output".to_string(),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(store.pending_host_journals(None, 8).await.unwrap(), [first]);
+    let cleared = store
+        .append(SessionEvent::new(
+            first,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Stopped,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .acknowledge_host_journal(first, cleared.sequence, revision)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .pending_host_journals(None, 8)
+            .await
+            .unwrap()
+            .is_empty(),
+        "cleared live rows must not stay dirty merely because the revision counter is higher"
+    );
+    let fork_id = Uuid::from_u128(4);
+    store
+        .append(SessionEvent::new(
+            local,
+            0,
+            message(Uuid::new_v4(), "inherited output"),
+        ))
+        .await
+        .unwrap();
+    let fork = store.fork_before(local, fork_id, 3).await.unwrap();
+    assert!(fork.inherited_event_count > 0);
+    store
+        .persist_host_launch_metadata(fork_id, &serde_json::json!({"request_id": fork_id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.pending_host_journals(None, 8).await.unwrap(),
+        [fork_id]
+    );
+    let events = store.events_after(fork_id, 0, 8).await.unwrap();
+    assert_eq!(events.len() as u64, fork.inherited_event_count);
+    assert!(events.iter().all(|event| event.session_id == fork_id));
+    store
+        .acknowledge_host_journal(fork_id, events.last().unwrap().sequence, 0)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .pending_host_journals(None, 8)
+            .await
+            .unwrap()
+            .is_empty(),
+        "inherited events are uploadable even without local event rows"
+    );
+}
+
+#[tokio::test]
 async fn codex_harness_route_survives_restart_clear_fork_and_child_registration() {
     let (directory, store) = store().await;
     let mut expected = Vec::new();

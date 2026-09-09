@@ -133,9 +133,20 @@ diagnostic, and a fresh launch is required after correcting the cause. Failed
 publication is retried by the host recovery loop, including after restart.
 Already-terminal sessions replay their journal rather than execute again.
 
-This is an additive SQLite change, not a database reset. It does not establish
-full recovery for idle sessions, every failure inside actor initialization, or
-final output after an otherwise completed actor; those need separate acceptance.
+An independent upload-only recovery loop also scans inactive hosted journals
+against durable, confirmed relay cursors. Final session events and remaining
+live-state snapshots are retried even if the actor already exited, including
+after host restart or a lost successful-upload response. Recovery does not
+restart the actor or consume an execution slot. It pages past active or failing
+sessions and preserves upload backoff, independently of host command polling.
+On the first upgraded start, historical hosted journals are checked too; they
+are not assumed delivered. Missing relay sessions (404/410) retain their local
+journal and retry with a five-minute backoff.
+
+These are additive SQLite changes, not a database reset. They do not establish
+full recovery for idle actors, every failure inside actor initialization,
+workspace/private-message final delivery, or loss of the relay database itself;
+those need separate acceptance.
 
 Upgrade the relay before the agent for full remote controls. Against a relay
 that does not confirm session-scoped commands, the new mirror still uploads
