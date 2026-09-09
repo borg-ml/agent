@@ -2156,6 +2156,43 @@ impl SqliteSessionStore {
         Ok(())
     }
 
+    /// The host must hold the session writer lease before settling abandoned work.
+    pub(crate) async fn settle_terminal_host_session(&self, session_id: Uuid) -> Result<()> {
+        loop {
+            let mut transaction = self.begin_write().await?;
+            let terminal: i64 = sqlx::query_scalar(
+                "select exists(select 1 from sessions where id=? and json_extract(state_json,?) in (?,?,?))",
+            ).bind(session_id.to_string()).bind("$.status")
+                .bind("failed").bind("stopped").bind("completed")
+                .fetch_one(&mut *transaction).await?;
+            ensure!(terminal != 0, "cannot settle a non-terminal host session");
+            let rows = sqlx::query("select * from session_actions where session_id=? and state not in (?,?,?) order by action_id limit 128")
+                .bind(session_id.to_string()).bind("completed").bind("failed").bind("cancelled")
+                .fetch_all(&mut *transaction).await?;
+            for row in &rows {
+                let action = decode_action(row)?;
+                transition_action_in_transaction(
+                    &mut transaction,
+                    session_id,
+                    action.action_id,
+                    Some(action.state),
+                    SessionActionState::Cancelled,
+                    Some("host session is terminal".to_string()),
+                )
+                .await?;
+            }
+            if rows.len() < 128 {
+                sqlx::query("delete from host_bootstraps where session_id=?")
+                    .bind(session_id.to_string())
+                    .execute(&mut *transaction)
+                    .await?;
+                transaction.commit().await?;
+                return Ok(());
+            }
+            transaction.commit().await?;
+        }
+    }
+
     /// Return host-owned launches with unfinished bootstrap or session actions.
     /// The remote host calls this after a process restart so an acknowledged
     /// prompt cannot remain stranded until another command happens to arrive.

@@ -15,6 +15,124 @@ async fn store() -> (tempfile::TempDir, SqliteSessionStore) {
 }
 
 #[tokio::test]
+async fn terminal_host_settlement_cancels_abandoned_actions_and_fences_old_leases() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .persist_host_launch_metadata(session_id, &serde_json::json!({"request_id": session_id}))
+        .await
+        .unwrap();
+    store.begin_host_bootstrap(session_id).await.unwrap();
+    let mut first = None;
+    for _ in 0..129 {
+        let id = Uuid::new_v4();
+        store
+            .enqueue_action(SessionAction::new(
+                id,
+                session_id,
+                crate::SessionActionKind::Workflow,
+                crate::ActionDeliveryPolicy::WhenRunIdle,
+                crate::ActionWakePolicy::Immediate,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        first.get_or_insert(id);
+    }
+    let first = first.unwrap();
+    let leased = store
+        .claim_action(
+            session_id,
+            first,
+            "abandoned-worker",
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        store
+            .settle_terminal_host_session(session_id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store.pending_actions(session_id, 256).await.unwrap().len(),
+        129
+    );
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Stopped,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .settle_terminal_host_session(session_id)
+        .await
+        .unwrap();
+    let reopened = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    reopened
+        .settle_terminal_host_session(session_id)
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .pending_actions(session_id, 256)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        reopened
+            .pending_host_launch_metadata(8)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let action = reopened.action(session_id, first).await.unwrap().unwrap();
+    assert_eq!(action.state, SessionActionState::Cancelled);
+    assert!(action.lease_token.is_none());
+    assert!(
+        reopened
+            .heartbeat_action(
+                session_id,
+                first,
+                "abandoned-worker",
+                leased.lease_token.unwrap(),
+                Duration::from_secs(60)
+            )
+            .await
+            .is_err()
+    );
+    let transitions = reopened
+        .action_transitions(session_id, first)
+        .await
+        .unwrap();
+    assert_eq!(
+        transitions
+            .iter()
+            .filter(|t| t.to == SessionActionState::Cancelled)
+            .count(),
+        1
+    );
+    assert!(
+        reopened
+            .pending_host_journals(None, 8)
+            .await
+            .unwrap()
+            .contains(&session_id)
+    );
+}
+
+#[tokio::test]
 async fn host_journal_cursors_preserve_late_events_live_state_and_pagination() {
     let (directory, store) = store().await;
     let first = Uuid::from_u128(1);

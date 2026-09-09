@@ -2992,6 +2992,24 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                 )
                 .await;
             }
+            Ok(Some(state))
+                if matches!(
+                    state.status,
+                    Some(
+                        crate::SessionStatus::Failed
+                            | crate::SessionStatus::Stopped
+                            | crate::SessionStatus::Completed
+                    )
+                ) =>
+            {
+                return settle_inactive_host_session(
+                    &session_store,
+                    &session_root,
+                    session_id,
+                    false,
+                )
+                .await;
+            }
             Ok(_) => {}
             Err(error) => {
                 tracing::warn!(%error, %session_id, "failed to read launch state; retaining command for retry");
@@ -3055,41 +3073,99 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             // command forever and head-of-line block every later command.
             return true;
         }
-        match stored_host_session_state(&session_store, session_id).await {
-            Ok(Some(state))
-                if state.started_at.is_none()
-                    && matches!(
-                        state.status,
-                        Some(crate::SessionStatus::Failed | crate::SessionStatus::Stopped)
-                    ) =>
-            {
-                return reject_host_launch(
-                    &client,
-                    &config,
-                    &session_root,
-                    &session_store,
-                    session_id,
-                    "launch already rejected",
-                )
-                .await;
-            }
-            Ok(_) => {}
+        let state = match stored_host_session_state(&session_store, session_id).await {
+            Ok(state) => state,
             Err(error) => {
                 tracing::warn!(%error, %session_id, "failed to read launch state; retaining command for retry");
                 return false;
             }
-        }
+        };
         let existing = { sessions.lock().await.get(&session_id).cloned() };
         let session = match existing {
             Some(session) => Some(session),
             None => {
                 if let Some(metadata) = metadata {
+                    let terminal = state.as_ref().is_some_and(|state| {
+                        matches!(
+                            state.status,
+                            Some(
+                                crate::SessionStatus::Failed
+                                    | crate::SessionStatus::Stopped
+                                    | crate::SessionStatus::Completed
+                            )
+                        )
+                    });
+                    if terminal {
+                        return settle_inactive_host_session(
+                            &session_store,
+                            &session_root,
+                            session_id,
+                            false,
+                        )
+                        .await;
+                    }
                     if let Err(error) = validate_workspace_attachment(
                         &config,
                         session_id,
                         metadata.attachment.as_ref(),
                     ) {
                         tracing::error!(%error, %session_id, "stored launch attachment is invalid");
+                        return false;
+                    }
+                    if matches!(command, HostCommand::Stop { .. }) {
+                        return settle_inactive_host_session(
+                            &session_store,
+                            &session_root,
+                            session_id,
+                            true,
+                        )
+                        .await;
+                    }
+                    if sessions.lock().await.len()
+                        >= config.resource_limits.max_concurrent_sessions as usize
+                    {
+                        if let HostCommand::Prompt {
+                            message_id,
+                            text,
+                            attachments,
+                            delivery,
+                            output_schema: None,
+                            ..
+                        } = &command
+                            && state.as_ref().is_some_and(|state| {
+                                state.started_at.is_some() && state.configuration.is_some()
+                            })
+                        {
+                            let admitted: Result<bool> = async {
+                                admit_remote_prompt(
+                                    session_store.as_ref(),
+                                    session_id,
+                                    *message_id,
+                                    text,
+                                    attachments,
+                                    *delivery,
+                                )
+                                .await?;
+                                // Workspace-only and inherited messages need not have a
+                                // local action that restart recovery can discover.
+                                Ok(session_store
+                                    .contains_message(session_id, *message_id)
+                                    .await?
+                                    && session_store
+                                        .action(session_id, *message_id)
+                                        .await?
+                                        .is_some())
+                            }
+                            .await;
+                            match admitted {
+                                Ok(true) => return true,
+                                Ok(false) => {}
+                                Err(error) => {
+                                    tracing::warn!(%error, %session_id, "cannot defer prompt at capacity")
+                                }
+                            }
+                        }
+                        tracing::warn!(%session_id, "host is at session capacity; retaining command until it can be delivered safely");
                         return false;
                     }
                     Some(
@@ -3143,6 +3219,53 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
         return true;
     }
     true
+}
+
+async fn settle_inactive_host_session(
+    store: &SqliteSessionStore,
+    session_root: &Path,
+    session_id: Uuid,
+    stop: bool,
+) -> bool {
+    let result: Result<()> = async {
+        let _writer = SessionWriterLease::acquire(session_root.join(format!("{session_id}.lock")))?;
+        if !store.contains_session(session_id).await? {
+            ensure!(stop, "missing terminal session");
+            store.create_session(session_id).await?;
+        }
+        let state = store.state(session_id).await?;
+        if !matches!(
+            state.status,
+            Some(
+                crate::SessionStatus::Failed
+                    | crate::SessionStatus::Stopped
+                    | crate::SessionStatus::Completed
+            )
+        ) {
+            ensure!(stop, "session is no longer terminal");
+            store
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    crate::SessionEventKind::StatusChanged {
+                        status: crate::SessionStatus::Stopped,
+                        detail: None,
+                    },
+                ))
+                .await?;
+        }
+        // The independent hosted-journal worker owns final publication, even
+        // when execution capacity is full or the relay is unavailable.
+        store.settle_terminal_host_session(session_id).await
+    }
+    .await;
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, %session_id, "cannot settle inactive session; retaining command for retry");
+            false
+        }
+    }
 }
 
 async fn stored_host_session_state(
@@ -3214,7 +3337,7 @@ async fn reject_host_launch(
                 return Ok(false);
             }
             if events.len() < 1_024 {
-                store.finish_host_bootstrap(session_id).await?;
+                store.settle_terminal_host_session(session_id).await?;
                 return Ok(true);
             }
         }
@@ -4085,16 +4208,36 @@ async fn run_session(
     if let Some(context) = fetch_runtime_mcp_context(&client, &config, session_id).await? {
         launch.capabilities.runtime_mcp_context = Some(context);
     }
+    let lock_path = session_root.join(format!("{session_id}.lock"));
+    let writer = SessionWriterLease::acquire(&lock_path)?;
+    let sqlite_store =
+        Arc::new(SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await?);
+    // Another host may have stopped this session while startup awaited the relay.
+    // Recheck under writer ownership before constructing an actor or provider.
+    if stored_host_session_state(&sqlite_store, session_id)
+        .await?
+        .is_some_and(|state| {
+            matches!(
+                state.status,
+                Some(
+                    crate::SessionStatus::Failed
+                        | crate::SessionStatus::Stopped
+                        | crate::SessionStatus::Completed
+                )
+            )
+        })
+    {
+        sqlite_store
+            .settle_terminal_host_session(session_id)
+            .await?;
+        return Ok(());
+    }
     // The controller may have sent a stale or malicious capability snapshot.
     // Authentication is a host-local fact, so refresh it after the workspace
     // boundary and before constructing the child coordinator.
     launch.capabilities.provider_capabilities =
         probe_provider_admission_capabilities_with_managed_kimi(true).await;
     launch.capabilities.resource_limits = Some(config.resource_limits.clone());
-    let lock_path = session_root.join(format!("{session_id}.lock"));
-    let writer = SessionWriterLease::acquire(&lock_path)?;
-    let sqlite_store =
-        Arc::new(SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await?);
     let workspace_attachment = attachment
         .as_ref()
         .and_then(|attachment| attachment.workspace_id.zip(attachment.participant_id));
@@ -6861,6 +7004,272 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn inactive_commands_respect_capacity_and_stop_without_starting_an_actor() {
+        let root = tempdir().unwrap();
+        let mut config = test_config(root.path());
+        config.resource_limits.max_concurrent_sessions = 1;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.server = format!("http://{}", listener.local_addr().unwrap());
+        let path = root.path().join("sessions.sqlite3");
+        let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let session_id = Uuid::new_v4();
+        let launch = bootstrap_test_launch(root.path());
+        persist_launch_metadata(&store, session_id, &launch, None)
+            .await
+            .unwrap();
+        store.create_session(session_id).await.unwrap();
+        for kind in [
+            crate::SessionEventKind::SessionStarted,
+            crate::SessionEventKind::SessionConfigured {
+                cwd: launch.cwd.clone(),
+                provider: launch.provider,
+                model: None,
+                effort: None,
+                fast: false,
+                response_language: launch.response_language,
+                permission_mode: launch.permission_mode,
+            },
+            crate::SessionEventKind::StatusChanged {
+                status: crate::SessionStatus::Ready,
+                detail: None,
+            },
+        ] {
+            store
+                .append(SessionEvent::new(session_id, 0, kind))
+                .await
+                .unwrap();
+        }
+        let receipts = Arc::new(
+            SqliteReceiptStore::open(store.pool().clone())
+                .await
+                .unwrap(),
+        );
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let active_id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(2);
+        sessions.lock().await.insert(active_id, tx.clone());
+        let client = Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let context = |store: &Arc<SqliteSessionStore>| DispatchContext {
+            client: client.clone(),
+            config: config.clone(),
+            session_root: root.path().to_path_buf(),
+            sessions: Arc::clone(&sessions),
+            session_store: Arc::clone(store),
+            receipts: Arc::clone(&receipts),
+            executor_factory: Arc::new(|_, _| {
+                panic!("capacity or inactive Stop must not construct a provider")
+            }),
+        };
+        let message_id = Uuid::new_v4();
+        let prompt = || HostCommand::Prompt {
+            session_id,
+            message_id,
+            text: "wait for an execution slot".to_string(),
+            attachments: vec![],
+            output_schema: None,
+            delivery: crate::PromptDelivery::Queue,
+        };
+        assert!(dispatch(context(&store), prompt()).await);
+        assert_eq!(
+            sessions.lock().await.len(),
+            1,
+            "restoration must not bypass execution capacity"
+        );
+        assert_eq!(
+            store.pending_host_launch_metadata(8).await.unwrap()[0].0,
+            session_id
+        );
+        assert!(
+            dispatch(
+                context(&store),
+                HostCommand::Stop {
+                    session_id: active_id
+                }
+            )
+            .await
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(HostCommand::Stop { session_id }) if session_id == active_id)
+        );
+        let reopened = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        assert!(
+            reopened
+                .contains_message(session_id, message_id)
+                .await
+                .unwrap()
+        );
+        assert!(dispatch(context(&reopened), prompt()).await);
+        assert_eq!(
+            reopened.pending_actions(session_id, 8).await.unwrap().len(),
+            1
+        );
+        let executor: HostExecutorFactory =
+            Arc::new(|_, _| panic!("recovery probe must fail before provider construction"));
+        resume_pending_host_sessions(
+            &client,
+            &config,
+            root.path(),
+            &sessions,
+            &reopened,
+            &executor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sessions.lock().await.len(), 1);
+        let schema_id = Uuid::new_v4();
+        assert!(
+            !dispatch(
+                context(&reopened),
+                HostCommand::Prompt {
+                    session_id,
+                    message_id: schema_id,
+                    text: "requires a schema".to_string(),
+                    attachments: vec![],
+                    output_schema: Some(serde_json::json!({"type":"object"})),
+                    delivery: crate::PromptDelivery::Queue
+                }
+            )
+            .await
+        );
+        assert!(
+            !reopened
+                .contains_message(session_id, schema_id)
+                .await
+                .unwrap()
+        );
+        assert!(!dispatch(context(&reopened), HostCommand::Interrupt { session_id }).await);
+        // A free slot schedules the durable prompt without another relay command.
+        sessions.lock().await.clear();
+        resume_pending_host_sessions(
+            &client,
+            &config,
+            root.path(),
+            &sessions,
+            &reopened,
+            &executor,
+        )
+        .await
+        .unwrap();
+        assert!(sessions.lock().await.contains_key(&session_id));
+        let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let (path, _) = read_http_request(&mut stream).await;
+        assert!(path.ends_with("/runtime-context"));
+        stream
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while sessions.lock().await.contains_key(&session_id) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened.pending_actions(session_id, 8).await.unwrap().len(),
+            1,
+            "failed startup must not erase the deferred prompt"
+        );
+        sessions.lock().await.insert(active_id, tx);
+        // A second host can already be awaiting context before this host stops the session.
+        let (_stale_tx, stale_rx) = mpsc::channel(1);
+        let stale_startup = tokio::spawn(run_session(
+            client.clone(),
+            config.clone(),
+            root.path().to_path_buf(),
+            Arc::clone(&executor),
+            HostSessionLaunch {
+                session_id,
+                request: launch.clone(),
+                attachment: None,
+            },
+            stale_rx,
+        ));
+        let (mut stale_stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = read_http_request(&mut stale_stream).await;
+        let writer =
+            SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
+        assert!(
+            !dispatch(context(&reopened), HostCommand::Stop { session_id }).await,
+            "an inactive map entry is not proof that another process released the writer"
+        );
+        drop(writer);
+        assert!(dispatch(context(&reopened), HostCommand::Stop { session_id }).await);
+        stale_stream
+            .write_all(
+                b"HTTP/1.1 404 Not Found
+content-length: 0
+connection: close
+
+",
+            )
+            .await
+            .unwrap();
+        drop(stale_stream);
+        tokio::time::timeout(Duration::from_secs(5), stale_startup)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reopened.state(session_id).await.unwrap().status,
+            Some(crate::SessionStatus::Stopped)
+        );
+        assert!(
+            reopened
+                .pending_actions(session_id, 8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .pending_host_launch_metadata(8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .pending_host_journals(None, 8)
+                .await
+                .unwrap()
+                .contains(&session_id),
+            "terminal output must remain independently uploadable"
+        );
+        sessions.lock().await.clear();
+        assert!(dispatch(context(&reopened), HostCommand::Stop { session_id }).await);
+        assert!(dispatch(context(&reopened), prompt()).await);
+        assert!(
+            dispatch(
+                context(&reopened),
+                HostCommand::Launch {
+                    session_id,
+                    request: Box::new(launch),
+                    attachment: None
+                }
+            )
+            .await
+        );
+        assert!(
+            sessions.lock().await.is_empty(),
+            "terminal retry cannot resurrect an actor after capacity frees"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn queued_shell_does_not_block_controls_and_recovers_results_without_reexecution() {
@@ -7609,7 +8018,6 @@ connection: close
             "200 OK",
             "200 OK",
             "200 OK",
-            "200 OK",
         ])
         .await;
         let mut config = test_config(root.path());
@@ -7738,7 +8146,7 @@ connection: close
                 .await
                 .unwrap()
                 .unwrap(),
-            vec![vec![1]; 5]
+            vec![vec![1]; 4]
         );
     }
 

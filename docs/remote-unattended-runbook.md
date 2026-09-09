@@ -180,6 +180,40 @@ Use disposable sessions for stop/restart and connectivity fault tests. Never
 kill active user work to prove recovery, and never expose host tokens while
 collecting evidence.
 
+## Inactive-session capacity and Stop
+
+Restoring an inactive hosted session from a command now respects the same
+process-local execution limit as Launch and restart recovery. At capacity, a
+plain prompt (no output schema) for an already configured session can be
+acknowledged without starting an actor **only when both its local journal
+message and action are durable**. The pending-action scan schedules it when a
+slot opens, without needing another relay command. Exact retries reuse the
+same message/action rather than creating a second turn.
+
+This is deliberately not a general deferred-control queue. Schema-bearing
+prompts, sessions without durable startup/configuration, workspace-only or
+inherited messages without a local action, and other inactive-session controls
+remain unacknowledged at capacity. They can still block later relay commands.
+Do not mistake a workspace message existing for proof of local prompt replay,
+or silently drop an output schema to admit a request.
+
+Stop for an inactive session does not start an actor or provider. With the
+session writer lease held, the host persists Stopped, cancels unfinished local
+actions (retaining transition history and invalidating their leases), and
+settles its bootstrap marker. A busy writer retains the command for retry;
+an empty local actor map alone is not proof that another process has stopped.
+The independent journal worker publishes terminal output, including after
+restart or relay outage. Acknowledgement here means durable local settlement,
+not immediate browser visibility.
+
+An inactive terminal session is not resurrected by a late command or duplicate
+Launch. Startup rechecks terminal state under writer ownership as well, so a
+Stop recorded while startup awaited the relay wins over that stale startup.
+Historical queue events are retained. These host checks do not establish
+explicit local CLI reopening behavior or workspace/private-message delivery
+settlement.
+Terminal launch rejection still uploads its failure before acknowledgement.
+
 ## Deferred shell and workspace commands
 
 Shell and workspace command acknowledgements mean **durable local admission**,
