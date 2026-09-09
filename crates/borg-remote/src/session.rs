@@ -3010,6 +3010,7 @@ async fn run_agent_session_store_kernel(
         let mut interrupted = false;
         let mut turn_had_side_effects = false;
         let mut retryable_provider_errors = Vec::new();
+        let mut turn_reported_error = false;
         let mut batch_pending_after_interrupt = false;
         let mut interrupt_deadline: Option<Pin<Box<Sleep>>> = None;
         let mut turn_phase = TurnPhase::AwaitingProvider;
@@ -3073,6 +3074,7 @@ async fn run_agent_session_store_kernel(
                             retryable_provider_errors.push(kind);
                             continue;
                         }
+                        turn_reported_error |= matches!(&kind, SessionEventKind::Error { .. });
                         turn_had_side_effects |= provider_event_has_side_effect(&kind);
                         if turn_phase == TurnPhase::AwaitingProvider {
                             turn_phase = TurnPhase::Active;
@@ -3222,8 +3224,12 @@ async fn run_agent_session_store_kernel(
                                 network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
                                 retry_not_before = None;
                                 for kind in retryable_provider_errors.drain(..) {
+                                    turn_reported_error = true;
                                     record(&mut journal, &events, session_id, kind).await?;
                                 }
+                            }
+                            if !retry && !interrupted && !turn_reported_error {
+                                record(&mut journal, &events, session_id, SessionEventKind::Error { message: error.clone() }).await?;
                             }
                             if autonomy_result_sender.is_some() {
                                 autonomy_result = Some(Err(anyhow::anyhow!(error.clone())));
@@ -3389,6 +3395,7 @@ async fn run_agent_session_store_kernel(
                         retryable_provider_errors.push(kind);
                         continue;
                     }
+                    turn_reported_error |= matches!(&kind, SessionEventKind::Error { .. });
                     turn_had_side_effects |= provider_event_has_side_effect(&kind);
                     if turn_phase == TurnPhase::AwaitingProvider {
                         turn_phase = TurnPhase::Active;
@@ -7519,6 +7526,8 @@ fn provider_error_is_connection_lost(error: &str) -> bool {
         return false;
     }
     [
+        "codex subscription connection failed",
+        "codex model catalog disconnected",
         "connection timed out",
         "request timed out",
         "stream ended before",
