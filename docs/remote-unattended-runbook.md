@@ -278,9 +278,18 @@ recovery pass can replay historical messages with their original IDs. Relay
 idempotency is required for that replay and concurrent uploaders. Rollback to
 an old binary leaves the new cursor table intact but removes inactive message
 recovery until a capable binary returns. Never delete workspace events or
-cursor rows to force recovery. A failing workspace may still delay other
-messages from the same sender; this is not a general per-recipient outbox or a
-guarantee that unavailable/deleted recipients will accept output.
+cursor rows to force recovery.
+
+A shared-workspace 404 or transient message upload failure no longer ends the
+entire upload pass: other workspaces, including private conversations from the
+same sender, are still attempted. The failed workspace retains its cursor and
+FIFO order; successfully handled workspaces checkpoint their own progress. A 401
+still aborts the pass without acknowledging the rejected message. This is not
+fully independent scheduling: session-wide retry delays (including the shared
+404 backoff), a slow request exhausting the ten-second recovery budget, or a
+large earlier workspace can still delay later messages. It is not a general
+per-recipient outbox or a guarantee that unavailable/deleted recipients accept
+output.
 
 ## Stored host identity after re-enrollment
 

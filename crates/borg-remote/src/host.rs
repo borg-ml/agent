@@ -5357,7 +5357,8 @@ async fn flush_workspace_messages(
         }
     }
     const PAGE_SIZE: usize = 256;
-    for workspace in store
+    let mut caught_up = true;
+    'workspaces: for workspace in store
         .list_workspaces_for_participant(participant_id)
         .await?
     {
@@ -5376,7 +5377,7 @@ async fn flush_workspace_messages(
             let events = store
                 .replay(workspace.id, participant_id, uploaded_sequence, PAGE_SIZE)
                 .await?;
-            let caught_up = events.len() < PAGE_SIZE;
+            let last_page = events.len() < PAGE_SIZE;
             for event in events {
                 if event.author_id == participant_id
                     && let WorkspaceEventKind::Message { message, mode } = &event.kind
@@ -5498,7 +5499,8 @@ async fn flush_workspace_messages(
                                 "borg.ml does not expose the message relay endpoint; disabling it for this session"
                             );
                             sync.workspace_relay_available = false;
-                            return Ok(true);
+                            caught_up = false;
+                            continue 'workspaces;
                         }
                         Ok(response) => {
                             tracing::warn!(
@@ -5507,7 +5509,8 @@ async fn flush_workspace_messages(
                                 "workspace message relay rejected an event"
                             );
                             sync.retry_at = Instant::now() + Duration::from_secs(2);
-                            return Ok(false);
+                            caught_up = false;
+                            continue 'workspaces;
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -5516,7 +5519,8 @@ async fn flush_workspace_messages(
                                 "workspace message relay upload failed"
                             );
                             sync.retry_at = Instant::now() + Duration::from_secs(2);
-                            return Ok(false);
+                            caught_up = false;
+                            continue 'workspaces;
                         }
                     }
                 }
@@ -5524,12 +5528,12 @@ async fn flush_workspace_messages(
                 sync.uploaded_workspace_sequences
                     .insert(workspace.id, uploaded_sequence);
             }
-            if caught_up {
+            if last_page {
                 break;
             }
         }
     }
-    Ok(true)
+    Ok(caught_up)
 }
 
 async fn flush_pending(
@@ -8779,6 +8783,229 @@ connection: close
         assert!(
             reason.is_some(),
             "unsupported command is retained, not executed or silently deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_shared_upload_does_not_skip_private_messages_or_advance_its_cursor() {
+        use std::sync::atomic::{AtomicU16, Ordering};
+        let root = tempdir().unwrap();
+        let path = root.path().join("sessions.sqlite3");
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        let binding = store.workspace_binding(session_id).await.unwrap().unwrap();
+        let workspace = store.workspace_store().await.unwrap().unwrap();
+        workspace
+            .ensure_execution_workspace(
+                binding.workspace_id,
+                "Sender",
+                crate::local_human_participant_id("Human"),
+                "Human",
+                session_id,
+                "Sender",
+            )
+            .await
+            .unwrap();
+        let recipient = Uuid::new_v4();
+        workspace
+            .upsert_instance(
+                Participant {
+                    id: recipient,
+                    display_name: "Remote".to_string(),
+                    kind: ParticipantKind::Agent,
+                    created_at: Utc::now(),
+                },
+                Some(Uuid::new_v4()),
+                None,
+            )
+            .await
+            .unwrap();
+        let direct = workspace
+            .ensure_direct_workspace(session_id, recipient)
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = HostConfig {
+            server: format!("http://{}", listener.local_addr().unwrap()),
+            ..test_config(root.path())
+        };
+        persist_launch_metadata(
+            &config,
+            &store,
+            session_id,
+            &bootstrap_test_launch(root.path()),
+            None,
+        )
+        .await
+        .unwrap();
+        let status = Arc::new(AtomicU16::new(503));
+        let server_status = Arc::clone(&status);
+        let (sent, mut received) = mpsc::channel(32);
+        let _server = AbortTask(tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (path, body) = read_http_request(&mut socket).await;
+                let shared = path.ends_with("/workspace/messages");
+                assert!(path.ends_with("/messages"));
+                sent.send((
+                    shared,
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+                ))
+                .await
+                .unwrap();
+                let status = if shared {
+                    server_status.load(Ordering::SeqCst)
+                } else {
+                    204
+                };
+                if status == 0 {
+                    continue;
+                } // Lost response, not an acknowledged upload.
+                socket.write_all(format!("HTTP/1.1 {status} Response\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").as_bytes()).await.unwrap();
+            }
+        }));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let mut first_shared = None;
+        for (attempt, rejection) in [503, 0, 404].into_iter().enumerate() {
+            status.store(rejection, Ordering::SeqCst);
+            for (workspace_id, audience, text) in [
+                (binding.workspace_id, Audience::Workspace, "shared"),
+                (
+                    direct,
+                    Audience::Direct {
+                        participant: recipient,
+                    },
+                    "private",
+                ),
+            ] {
+                workspace
+                    .append_message(crate::NewWorkspaceMessage {
+                        workspace_id,
+                        author_id: session_id,
+                        text: format!("{text}-{attempt}"),
+                        mentions: Vec::new(),
+                        audience,
+                        mode: crate::DeliveryMode::NextTurn,
+                        thread_id: None,
+                        reply_to_message_id: None,
+                        idempotency_key: format!("{text}-{attempt}"),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let later = Instant::now() + Duration::from_secs(60);
+            let mut sync = JournalSync::new(
+                SessionSyncResponse {
+                    event_cursor: 0,
+                    live_revision: 0,
+                },
+                true,
+            );
+            sync.uploaded_workspace_sequences = store
+                .host_workspace_cursors(config.host_id, session_id)
+                .await
+                .unwrap();
+            sync.next_inbox_sync = later;
+            sync.next_instance_directory_sync = later;
+            sync.next_workspace_roster_sync = later;
+            flush_host_workspace_messages(
+                &client,
+                &config,
+                &store,
+                Some(&workspace),
+                session_id,
+                Some(binding.workspace_id),
+                &mut sync,
+            )
+            .await
+            .unwrap();
+            let rejected = received.recv().await.unwrap();
+            assert!(rejected.0);
+            if let Some(first) = &first_shared {
+                assert_eq!(
+                    &rejected.1, first,
+                    "retry must keep the original event and FIFO order"
+                );
+            } else {
+                first_shared = Some(rejected.1.clone());
+            }
+            let delivered = received.try_recv().expect(
+                "a failed shared upload must not skip an unrelated private message in the same pass");
+            assert!(!delivered.0);
+            assert_eq!(delivered.1["text"], format!("private-{attempt}"));
+            assert!(
+                received.try_recv().is_err(),
+                "later shared messages must not overtake the failed one"
+            );
+            let cursors = store
+                .host_workspace_cursors(config.host_id, session_id)
+                .await
+                .unwrap();
+            let rejected_sequence = rejected.1["metadata"]["local_workspace_sequence"]
+                .as_u64()
+                .unwrap();
+            assert!(
+                cursors
+                    .get(&binding.workspace_id)
+                    .copied()
+                    .unwrap_or_default()
+                    < rejected_sequence
+            );
+            assert!(
+                cursors[&direct]
+                    >= delivered.1["metadata"]["local_workspace_sequence"]
+                        .as_u64()
+                        .unwrap()
+            );
+        }
+        drop(workspace);
+        drop(store);
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let workspace = store.workspace_store().await.unwrap().unwrap();
+        status.store(204, Ordering::SeqCst);
+        let later = Instant::now() + Duration::from_secs(60);
+        let mut sync = JournalSync::new(
+            SessionSyncResponse {
+                event_cursor: 0,
+                live_revision: 0,
+            },
+            true,
+        );
+        sync.uploaded_workspace_sequences = store
+            .host_workspace_cursors(config.host_id, session_id)
+            .await
+            .unwrap();
+        sync.next_inbox_sync = later;
+        sync.next_instance_directory_sync = later;
+        sync.next_workspace_roster_sync = later;
+        assert!(
+            flush_host_workspace_messages(
+                &client,
+                &config,
+                &store,
+                Some(&workspace),
+                session_id,
+                Some(binding.workspace_id),
+                &mut sync
+            )
+            .await
+            .unwrap()
+        );
+        for attempt in 0..3 {
+            let uploaded = received.recv().await.unwrap();
+            assert!(uploaded.0);
+            assert_eq!(uploaded.1["text"], format!("shared-{attempt}"));
+            if attempt == 0 {
+                assert_eq!(Some(uploaded.1), first_shared);
+            }
+        }
+        assert!(
+            received.try_recv().is_err(),
+            "acknowledged private messages must not replay after reopen"
         );
     }
 
