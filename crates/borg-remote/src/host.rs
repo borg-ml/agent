@@ -2019,8 +2019,16 @@ pub async fn run_host_with_executor_factory(
                 continue;
             }
         };
+        let commands = match commands.into_ordered() {
+            Ok(commands) => commands,
+            Err(error) => {
+                tracing::warn!(%error, "invalid remote command envelope; retrying without advancing cursor");
+                tokio::time::sleep(command_poll_backoff.next_delay(None)).await;
+                continue;
+            }
+        };
         command_poll_backoff.reset();
-        for envelope in commands.into_ordered()? {
+        for envelope in commands {
             let sequence = envelope.sequence;
             let claim_token = envelope.claim_token;
             let handled = dispatch(
@@ -2831,8 +2839,20 @@ pub async fn mirror_local_session(
                     continue;
                 }
             };
+            let ordered_commands = match response.into_ordered() {
+                Ok(commands) => commands,
+                Err(error) => {
+                    tracing::warn!(%error, "invalid remote command envelope; retrying without advancing cursor");
+                    wait_for_mirror_shutdown(
+                        &mut command_shutdown,
+                        command_poll_backoff.next_delay(None),
+                    )
+                    .await;
+                    continue;
+                }
+            };
             command_poll_backoff.reset();
-            for envelope in response.into_ordered()? {
+            for envelope in ordered_commands {
                 let sequence = envelope.sequence;
                 let claim_token = envelope.claim_token;
                 ensure!(
@@ -6134,6 +6154,177 @@ mod tests {
         assert_eq!(adapted.command.session_id(), Some(session_id));
         assert_eq!(adapted.claim_token, Some(claim_token));
         assert_eq!(legacy.id, request_id);
+    }
+
+    #[tokio::test]
+    async fn invalid_runtime_envelopes_retry_without_partial_delivery_or_cursor_advance() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for mirrored in [false, true] {
+            let root = tempdir().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut config = test_config(root.path());
+            config.server = format!("http://{}", listener.local_addr().unwrap());
+            let config_path = root.path().join("host.json");
+            write_config(&config_path, &config).unwrap();
+            let store = Arc::new(
+                SqliteSessionStore::open(root.path().join("sessions/sessions.sqlite3"))
+                    .await
+                    .unwrap(),
+            );
+            let id = Uuid::new_v4();
+            let launch = bootstrap_test_launch(root.path());
+            persist_launch_metadata(&config, &store, id, &launch, None)
+                .await
+                .unwrap();
+            store.create_session(id).await.unwrap();
+            for kind in [
+                crate::SessionEventKind::SessionStarted,
+                crate::SessionEventKind::StatusChanged {
+                    status: crate::SessionStatus::Stopped,
+                    detail: None,
+                },
+            ] {
+                store.append(SessionEvent::new(id, 0, kind)).await.unwrap();
+            }
+            let journal = serde_json::to_value(store.read(id).await.unwrap()).unwrap();
+            let first = AgentRuntimeCommandEnvelope::from_legacy(HostCommandEnvelope {
+                id: Uuid::new_v4(),
+                sequence: 1,
+                created_at: Utc::now(),
+                claim_token: Some(Uuid::new_v4()),
+                command: HostCommand::Interrupt { session_id: id },
+            });
+            let second = AgentRuntimeCommandEnvelope::from_legacy(HostCommandEnvelope {
+                id: Uuid::new_v4(),
+                sequence: 2,
+                created_at: Utc::now(),
+                claim_token: Some(Uuid::new_v4()),
+                command: HostCommand::Stop { session_id: id },
+            });
+            let final_claim = second.claim_token;
+            let mut unsupported = second.clone();
+            unsupported.version += 1;
+            let mut empty_key = second.clone();
+            empty_key.idempotency_key.clear();
+            let bodies = [
+                serde_json::json!({"commands": [first.clone(), unsupported]}).to_string(),
+                serde_json::json!({"commands": [first.clone(), empty_key]}).to_string(),
+                serde_json::json!({"commands": [second, first]}).to_string(),
+            ];
+            let (polls_tx, mut polls) = mpsc::channel(8);
+            let _server = AbortTask(tokio::spawn(async move {
+                let mut count = 0;
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let (path, _) = read_http_request(&mut socket).await;
+                    let url = Url::parse(&format!("http://localhost{path}")).unwrap();
+                    let (status, body) = match url.path() {
+                        "/api/remote/host/commands" => {
+                            assert_eq!(
+                                url.query_pairs()
+                                    .any(|(key, value)| key == "session_id"
+                                        && value == id.to_string()),
+                                mirrored
+                            );
+                            let after = url
+                                .query_pairs()
+                                .find(|(key, _)| key == "after")
+                                .unwrap()
+                                .1
+                                .parse::<u64>()
+                                .unwrap();
+                            polls_tx.send(after).await.unwrap();
+                            count += 1;
+                            if count <= bodies.len() {
+                                (200, bodies[count - 1].as_str())
+                            } else {
+                                (401, "")
+                            }
+                        }
+                        "/api/remote/host/sessions" => (
+                            200,
+                            "{\"command_scope\":\"session_v1\",\"command_cursor\":0,\"event_cursor\":0,\"live_revision\":0}",
+                        ),
+                        "/api/remote/host/events"
+                        | "/api/remote/host/live-state"
+                        | "/api/remote/host/heartbeat" => (200, ""),
+                        path if path.ends_with("/sync") => {
+                            (200, "{\"event_cursor\":0,\"live_revision\":0}")
+                        }
+                        _ => (404, ""),
+                    };
+                    socket.write_all(format!("HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            }));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let factory_calls = Arc::clone(&calls);
+            let factory: HostExecutorFactory = Arc::new(move |_, _| {
+                factory_calls.fetch_add(1, Ordering::SeqCst);
+                bail!("terminal commands must not construct a provider")
+            });
+            let worker_config = config_path.clone();
+            let worker_store: Arc<dyn SessionStore> = store.clone();
+            let (commands, mut received) = mpsc::channel(4);
+            let (shutdown, stopped) = watch::channel(false);
+            let mut worker = AbortTask(tokio::spawn(async move {
+                if mirrored {
+                    mirror_local_session(
+                        &worker_config,
+                        worker_store,
+                        id,
+                        launch,
+                        commands,
+                        stopped,
+                    )
+                    .await
+                } else {
+                    run_host_with_executor_factory(&worker_config, factory).await
+                }
+            }));
+            for expected in [0, 0, 0, 2] {
+                let after = tokio::time::timeout(Duration::from_secs(30), polls.recv())
+                    .await
+                    .expect("invalid canonical envelopes must not permanently stop command polling")
+                    .unwrap();
+                assert_eq!(
+                    after, expected,
+                    "an invalid batch must not acknowledge its valid prefix"
+                );
+            }
+            if mirrored {
+                assert!(
+                    matches!(received.try_recv(), Ok(HostCommand::Interrupt { session_id }) if session_id == id)
+                );
+                assert!(
+                    matches!(received.try_recv(), Ok(HostCommand::Stop { session_id }) if session_id == id)
+                );
+                assert!(
+                    received.try_recv().is_err(),
+                    "retry must deliver the valid prefix only once"
+                );
+                shutdown.send(true).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), &mut worker.0)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            } else {
+                let error = tokio::time::timeout(Duration::from_secs(5), &mut worker.0)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert!(error.to_string().contains("token was rejected"));
+                let ack = load_host_acknowledgement(&host_state_path(&config_path), config.host_id);
+                assert_eq!(ack.sequence, 2);
+                assert_eq!(ack.claim_token, final_claim);
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                serde_json::to_value(store.read(id).await.unwrap()).unwrap(),
+                journal
+            );
+        }
     }
 
     fn error_events(session_id: Uuid, count: usize, message_bytes: usize) -> Vec<SessionEvent> {

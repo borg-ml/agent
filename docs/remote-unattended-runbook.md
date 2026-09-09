@@ -116,6 +116,16 @@ After a lost command-poll response, delivery can wait for the outstanding
 claim proves reservation, not receipt or execution. Arbitrary controls are not
 exactly-once; prompt retries use durable message identities.
 
+Malformed command responses and invalid canonical runtime envelopes retry with
+bounded backoff in both hosted and mirrored command polling. The entire batch
+must decode and pass canonical-envelope validation before any command is delivered
+or the cursor advances; a valid prefix is not acknowledged ahead of an invalid
+command. A corrected response can
+resume delivery without restarting the host or mirror. Persistent protocol or
+metadata errors still block that command queue until corrected; commands are
+neither skipped nor downgraded to bypass validation. Authentication rejection
+and mirror session-scope violations retain their existing fatal handling.
+
 A new hosted launch that exceeds the host session limit, uses an invalid
 working directory, exceeds the 512 KiB serialized launch-metadata limit, or has
 an invalid same-host workspace attachment is durably marked Failed and published
