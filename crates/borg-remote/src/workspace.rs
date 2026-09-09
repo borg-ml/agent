@@ -1059,6 +1059,11 @@ impl SqliteWorkspaceStore {
         crate::SqliteSessionStore::begin_sqlite_write(&self.pool).await
     }
     async fn schema(&self) -> Result<()> {
+        let mut transaction = crate::SqliteSessionStore::begin_sqlite_write_with_timeout(
+            &self.pool,
+            crate::session_store::SQLITE_SCHEMA_WAIT_TIMEOUT,
+        )
+        .await?;
         sqlx::raw_sql(r#"
       create table if not exists borg_workspace_schema (id integer primary key check(id=1), version integer not null);
       create table if not exists workspace_participants (id text primary key, display_name text not null, kind text not null, created_at text not null);
@@ -1075,9 +1080,9 @@ impl SqliteWorkspaceStore {
       create index if not exists idx_workspace_delivery_recipient on workspace_deliveries(workspace_id,recipient_id,sequence);
       create index if not exists idx_workspace_events_id on workspace_events(workspace_id,id);
       create index if not exists idx_workspace_events_messages on workspace_events(workspace_id,sequence) where json_extract(event_json, '$.kind.type')='message';
-    "#).execute(&self.pool).await?;
+    "#).execute(&mut *transaction).await?;
         let columns = sqlx::query("pragma table_info(workspace_deliveries)")
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *transaction)
             .await?;
         ensure!(
             columns
@@ -1087,7 +1092,7 @@ impl SqliteWorkspaceStore {
         );
         let version: Option<i64> =
             sqlx::query_scalar("select version from borg_workspace_schema where id=1")
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *transaction)
                 .await?;
         match version {
             Some(version) => ensure!(
@@ -1097,7 +1102,7 @@ impl SqliteWorkspaceStore {
             None => {
                 sqlx::query("insert into borg_workspace_schema(id,version) values(1,?)")
                     .bind(WORKSPACE_SCHEMA_VERSION)
-                    .execute(&self.pool)
+                    .execute(&mut *transaction)
                     .await?;
             }
         }
@@ -1106,8 +1111,9 @@ impl SqliteWorkspaceStore {
                on workspace_deliveries(workspace_id,recipient_id,sequence)
                where is_message=1 and state='"pending"';"#,
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(())
     }
     async fn members(

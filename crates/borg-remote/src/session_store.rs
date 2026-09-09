@@ -32,7 +32,7 @@ pub(crate) const SESSION_PAYLOAD_PREVIEW_BYTES: usize = 4 * 1024;
 // admission loop below owns the longer wait; keeping that wait in SQLite
 // would strand a pooled connection and starve unrelated reads.
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
-const SQLITE_SCHEMA_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const SQLITE_SCHEMA_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_WRITE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROMPT_ADMISSION_SESSION_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
@@ -1243,11 +1243,14 @@ impl SqliteSessionStore {
         let store = Self { pool };
         let schema_deadline = std::time::Instant::now() + SQLITE_SCHEMA_WAIT_TIMEOUT;
         let schema_result = loop {
-            let result = if interactive && store.has_current_schema().await? {
-                store.validate_current_schema().await
-            } else {
-                store.ensure_schema().await
-            };
+            let result = async {
+                if interactive && store.has_current_schema().await? {
+                    store.validate_current_schema().await
+                } else {
+                    store.ensure_schema().await
+                }
+            }
+            .await;
             match result {
                 Ok(()) => break Ok(()),
                 Err(error)
@@ -2633,7 +2636,7 @@ impl SqliteSessionStore {
         }
     }
 
-    async fn begin_sqlite_write_with_timeout(
+    pub(crate) async fn begin_sqlite_write_with_timeout(
         pool: &SqlitePool,
         timeout: Duration,
     ) -> Result<Transaction<'static, Sqlite>, sqlx::Error> {
@@ -6193,20 +6196,27 @@ impl SessionStore for SqliteSessionStore {
         &self,
         binding: SessionWorkspaceBinding,
     ) -> Result<SessionWorkspaceBinding> {
-        anyhow::ensure!(
-            self.contains_session(binding.session_id).await?,
-            "session {} does not exist",
-            binding.session_id
-        );
-        let existing = self.workspace_binding(binding.session_id).await?;
-        if let Some(existing) = &existing {
+        let mut transaction = self.begin_write().await?;
+        let exists: bool = sqlx::query_scalar("select exists(select 1 from sessions where id=?)")
+            .bind(binding.session_id.to_string())
+            .fetch_one(&mut *transaction)
+            .await?;
+        anyhow::ensure!(exists, "session {} does not exist", binding.session_id);
+        let existing = sqlx::query(
+            "select workspace_id, participant_id from session_workspace_bindings where session_id=?",
+        )
+        .bind(binding.session_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(existing) = existing {
+            let workspace_id = parse_uuid(existing.try_get("workspace_id")?)?;
+            let participant_id = parse_uuid(existing.try_get("participant_id")?)?;
             anyhow::ensure!(
-                existing.workspace_id == binding.workspace_id
-                    && existing.participant_id == binding.participant_id,
+                workspace_id == binding.workspace_id && participant_id == binding.participant_id,
                 "session {} is already attached to workspace {} as participant {}",
                 binding.session_id,
-                existing.workspace_id,
-                existing.participant_id
+                workspace_id,
+                participant_id
             );
         }
         sqlx::query(
@@ -6221,8 +6231,9 @@ impl SessionStore for SqliteSessionStore {
         .bind(binding.participant_id.to_string())
         .bind(binding.host_id.map(|id| id.to_string()))
         .bind(binding.attached_at.to_rfc3339())
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(binding)
     }
 

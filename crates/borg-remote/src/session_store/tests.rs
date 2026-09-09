@@ -413,6 +413,125 @@ async fn session_creation_waits_through_extended_writer_contention() {
 }
 
 #[tokio::test]
+async fn workspace_attachment_waits_through_extended_writer_contention() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let original = store.workspace_binding(session_id).await.unwrap().unwrap();
+    let expected = SessionWorkspaceBinding {
+        host_id: Some(Uuid::new_v4()),
+        ..original.clone()
+    };
+    let other = SqliteSessionStore::open_interactive(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    let blocker = other.begin_write().await.unwrap();
+    let attach_store = store.clone();
+    let binding = expected.clone();
+    let attach = tokio::spawn(async move { attach_store.attach_workspace(binding).await });
+
+    tokio::time::sleep(SQLITE_BUSY_TIMEOUT + Duration::from_millis(250)).await;
+    assert!(
+        !attach.is_finished(),
+        "mirror attachment must wait instead of failing on the busy timeout"
+    );
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            store.workspace_binding(session_id)
+        )
+        .await
+        .expect("binding reads must remain available during writer contention")
+        .unwrap(),
+        Some(original)
+    );
+    blocker.rollback().await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), attach)
+            .await
+            .expect("attachment did not resume after the writer lock cleared")
+            .unwrap()
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        other.workspace_binding(session_id).await.unwrap(),
+        Some(expected)
+    );
+}
+
+#[tokio::test]
+async fn workspace_attachment_validates_identity_after_writer_admission() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let stale_binding = store.workspace_binding(session_id).await.unwrap().unwrap();
+    let workspace_id = Uuid::new_v4();
+    let mut blocker = store.begin_write().await.unwrap();
+    // Child registration can replace the initial standalone workspace while
+    // a mirror is starting. Its stale attachment must not report success.
+    sqlx::query("update session_workspace_bindings set workspace_id=? where session_id=?")
+        .bind(workspace_id.to_string())
+        .bind(session_id.to_string())
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let attach_store = store.clone();
+    let attach = tokio::spawn(async move { attach_store.attach_workspace(stale_binding).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    blocker.commit().await.unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(2), attach)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("already attached"));
+    let actual = store.workspace_binding(session_id).await.unwrap().unwrap();
+    assert_eq!(actual.workspace_id, workspace_id);
+    assert_eq!(actual.host_id, None);
+}
+
+#[tokio::test]
+async fn workspace_initialization_serializes_after_extended_writer_contention() {
+    let (directory, store) = store().await;
+    let other = SqliteSessionStore::open_interactive(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    let blocker = store.begin_write().await.unwrap();
+    let initializers = (0..4)
+        .map(|index| {
+            let store = if index % 2 == 0 {
+                store.clone()
+            } else {
+                other.clone()
+            };
+            tokio::spawn(async move { store.workspace_store().await })
+        })
+        .collect::<Vec<_>>();
+    tokio::time::sleep(SQLITE_BUSY_TIMEOUT + Duration::from_millis(250)).await;
+    assert!(
+        initializers.iter().all(|task| !task.is_finished()),
+        "workspace initialization must wait instead of failing on the busy timeout"
+    );
+    blocker.rollback().await.unwrap();
+    for initializer in initializers {
+        let workspace = tokio::time::timeout(Duration::from_secs(3), initializer)
+            .await
+            .expect("workspace initialization did not resume")
+            .unwrap()
+            .expect("concurrent workspace initialization must be idempotent")
+            .unwrap();
+        assert!(
+            workspace
+                .list_workspaces_for_participant(Uuid::new_v4())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
 async fn writer_contention_has_a_bounded_escape_hatch() {
     let (_directory, store) = store().await;
     let blocker = store.begin_write().await.unwrap();
