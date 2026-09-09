@@ -953,7 +953,7 @@ pub async fn run_agent_session_with_store_and_writer(
         events,
         executor,
         store,
-        _writer,
+        &_writer,
         crate::LspPathPolicy::unrestricted(),
     )
     .await
@@ -970,7 +970,7 @@ pub(crate) async fn run_agent_session_with_store_and_writer_and_lsp_policy(
     events: mpsc::Sender<SessionEvent>,
     executor: Arc<dyn AgentTurnExecutor>,
     store: Arc<dyn SessionStore>,
-    _writer: SessionWriterLease,
+    _writer: &SessionWriterLease,
     lsp_policy: crate::LspPathPolicy,
 ) -> Result<()> {
     anyhow::ensure!(

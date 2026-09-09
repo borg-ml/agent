@@ -4491,6 +4491,50 @@ async fn spawn_host_session(
     tx
 }
 
+fn remaining_host_session_duration(
+    config: &HostConfig,
+    state: Option<&crate::SessionState>,
+) -> Duration {
+    let elapsed = state
+        .and_then(|state| state.started_at)
+        .map(|started| (Utc::now() - started).to_std().unwrap_or_default())
+        .unwrap_or_default();
+    Duration::from_secs(config.resource_limits.max_session_seconds).saturating_sub(elapsed)
+}
+
+async fn expire_host_session(
+    config: &HostConfig,
+    store: &SqliteSessionStore,
+    session_id: Uuid,
+    _writer: &SessionWriterLease,
+) -> Result<()> {
+    validate_stored_host_identity(config, store, session_id).await?;
+    let state = store.state(session_id).await?;
+    if !matches!(
+        state.status,
+        Some(
+            crate::SessionStatus::Failed
+                | crate::SessionStatus::Stopped
+                | crate::SessionStatus::Completed
+        )
+    ) {
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                crate::SessionEventKind::StatusChanged {
+                    status: crate::SessionStatus::Failed,
+                    detail: Some(format!(
+                        "host session exceeded the configured {} second limit",
+                        config.resource_limits.max_session_seconds
+                    )),
+                },
+            ))
+            .await?;
+    }
+    store.settle_terminal_host_session(session_id).await
+}
+
 async fn run_session(
     client: Client,
     config: HostConfig,
@@ -4509,11 +4553,24 @@ async fn run_session(
     let sqlite_store =
         Arc::new(SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await?);
     ensure_host_launch_owner(&client, &config, &sqlite_store, session_id).await?;
+    // Expired recovery must not depend on relay availability or create a provider.
+    if stored_host_session_state(&sqlite_store, session_id)
+        .await?
+        .as_ref()
+        .is_some_and(|state| remaining_host_session_duration(&config, Some(state)).is_zero())
+    {
+        let writer = SessionWriterLease::acquire(session_root.join(format!("{session_id}.lock")))?;
+        let state = stored_host_session_state(&sqlite_store, session_id).await?;
+        if remaining_host_session_duration(&config, state.as_ref()).is_zero() {
+            expire_host_session(&config, &sqlite_store, session_id, &writer).await?;
+            return Ok(());
+        }
+    }
     if let Some(context) = fetch_runtime_mcp_context(&client, &config, session_id).await? {
         launch.capabilities.runtime_mcp_context = Some(context);
     }
     let lock_path = session_root.join(format!("{session_id}.lock"));
-    let writer = SessionWriterLease::acquire(&lock_path)?;
+    let writer = Arc::new(SessionWriterLease::acquire(&lock_path)?);
     validate_stored_host_identity(&config, &sqlite_store, session_id).await?;
     // Another host may have stopped this session while startup awaited the relay.
     // Recheck under writer ownership before constructing an actor or provider.
@@ -4615,6 +4672,13 @@ async fn run_session(
     let (event_tx, mut event_rx) = mpsc::channel(256);
     let actor_session_root = session_root.clone();
     let actor_store = Arc::clone(&sqlite_store);
+    let remaining =
+        remaining_host_session_duration(&config, Some(&sqlite_store.state(session_id).await?));
+    if remaining.is_zero() {
+        expire_host_session(&config, &sqlite_store, session_id, &writer).await?;
+        return Ok(());
+    }
+    let session_deadline = tokio::time::Instant::now() + remaining;
     let executor = executor_factory(&config, &launch)?;
     let lsp_policy = match config.execution_profile {
         HostExecutionProfile::IsolatedHosted => LspPathPolicy::session_workspace(),
@@ -4626,6 +4690,7 @@ async fn run_session(
         .filter(|prompt| !prompt.trim().is_empty())
         .map(|_| launch.request_id);
     let mut bootstrap_finished = false;
+    let actor_writer = Arc::clone(&writer);
     let mut actor = AbortTask(tokio::spawn(async move {
         run_agent_session_with_store_and_writer_and_lsp_policy(
             &actor_session_root,
@@ -4635,93 +4700,73 @@ async fn run_session(
             event_tx,
             executor,
             actor_store,
-            writer,
+            &actor_writer,
             lsp_policy,
         )
         .await
     }));
-    let session_deadline = tokio::time::sleep(Duration::from_secs(
-        config.resource_limits.max_session_seconds,
-    ));
-    tokio::pin!(session_deadline);
-    let mut session_expired = false;
-    loop {
-        tokio::select! {
-            event = event_rx.recv() => {
-                if event.is_none() {
-                    break;
+    let supervised = tokio::time::timeout_at(session_deadline, async {
+        loop {
+            tokio::select! {
+                event = event_rx.recv() => {
+                    if event.is_none() {
+                        break;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            }
+            if !bootstrap_finished {
+                match finish_ready_host_bootstrap(&sqlite_store, session_id, initial_prompt_id).await {
+                    Ok(finished) => bootstrap_finished = finished,
+                    Err(error) => {
+                        tracing::warn!(%error, %session_id, "cannot settle host bootstrap; retaining recovery marker")
+                    }
                 }
             }
-            _ = &mut session_deadline => {
-                // The host-owned duration is a hard ceiling. Abort the actor
-                // so a controller cannot keep an admitted session alive by
-                // withholding prompts; the local journal remains available
-                // for the normal recovery path.
-                session_expired = true;
-                actor.0.abort();
-                break;
-            }
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-        }
-        if !bootstrap_finished {
-            match finish_ready_host_bootstrap(&sqlite_store, session_id, initial_prompt_id).await {
-                Ok(finished) => bootstrap_finished = finished,
-                Err(error) => {
-                    tracing::warn!(%error, %session_id, "cannot settle host bootstrap; retaining recovery marker")
-                }
-            }
-        }
-        let synchronized: Result<()> = async {
-            flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
-            flush_host_workspace_messages(
-                &client,
-                &config,
-                sqlite_store.as_ref(),
-                workspace_store.as_ref(),
-                session_id,
-                workspace_attachment.map(|(workspace_id, _)| workspace_id),
-                &mut sync,
-            )
-            .await?;
-            Ok(())
-        }
-        .await;
-        if let Err(error) = synchronized {
-            if error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
-                matches!(
-                    error.status(),
-                    Some(StatusCode::UNAUTHORIZED | StatusCode::CONFLICT)
+            let synchronized: Result<()> = async {
+                flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
+                flush_host_workspace_messages(
+                    &client,
+                    &config,
+                    sqlite_store.as_ref(),
+                    workspace_store.as_ref(),
+                    session_id,
+                    workspace_attachment.map(|(workspace_id, _)| workspace_id),
+                    &mut sync,
                 )
-            }) {
-                actor.0.abort();
-                let _ = (&mut actor.0).await;
-                return Err(error);
+                .await?;
+                Ok(())
             }
-            tracing::warn!(%error, %session_id, "session synchronization failed; keeping actor and controls alive for retry");
-            sync.retry_at = Instant::now() + Duration::from_secs(2);
+            .await;
+            if let Err(error) = synchronized {
+                if error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+                    matches!(
+                        error.status(),
+                        Some(StatusCode::UNAUTHORIZED | StatusCode::CONFLICT)
+                    )
+                }) {
+                    actor.0.abort();
+                    let _ = (&mut actor.0).await;
+                    return Err(error);
+                }
+                tracing::warn!(%error, %session_id, "session synchronization failed; keeping actor and controls alive for retry");
+                sync.retry_at = Instant::now() + Duration::from_secs(2);
+            }
         }
-    }
-    if session_expired {
+        (&mut actor.0).await.context("agent session task failed")?
+    })
+    .await;
+    if let Ok(result) = supervised {
+        result?;
+    } else {
+        actor.0.abort();
         let _ = (&mut actor.0).await;
-        flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
-        flush_host_workspace_messages(
-            &client,
-            &config,
-            sqlite_store.as_ref(),
-            workspace_store.as_ref(),
-            session_id,
-            workspace_attachment.map(|(workspace_id, _)| workspace_id),
-            &mut sync,
-        )
-        .await?;
-        bail!(
-            "host session exceeded the configured {} second limit",
-            config.resource_limits.max_session_seconds
-        );
+        // Keep writer ownership through settlement; final publication belongs
+        // to the independent journal/message workers, not an unavailable relay.
+        expire_host_session(&config, &sqlite_store, session_id, &writer).await?;
+        tracing::warn!(%session_id, "host session duration expired; terminal output queued for recovery");
+        return Ok(());
     }
-    (&mut actor.0)
-        .await
-        .context("agent session task failed")??;
     finish_ready_host_bootstrap(&sqlite_store, session_id, initial_prompt_id).await?;
     flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
     flush_host_workspace_messages(
@@ -7524,6 +7569,298 @@ mod tests {
             extension_skill_roots: Vec::new(),
             team_policy: None,
         }
+    }
+
+    #[tokio::test]
+    async fn hosted_duration_limit_settles_work_even_during_a_blocked_upload() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use tokio::sync::Notify;
+        struct PendingExecutor(Arc<Notify>, Arc<Notify>);
+        struct NotifyDrop(Arc<Notify>);
+        impl Drop for NotifyDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        #[async_trait::async_trait]
+        impl AgentTurnExecutor for PendingExecutor {
+            async fn execute(
+                &self,
+                _turn: crate::AgentTurn,
+                _events: mpsc::Sender<crate::SessionEventKind>,
+                _controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
+            ) -> Result<crate::AgentTurnResult> {
+                let _drop = NotifyDrop(Arc::clone(&self.1));
+                self.0.notify_one();
+                std::future::pending().await
+            }
+        }
+        let root = tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config(root.path());
+        config.server = format!("http://{}", listener.local_addr().unwrap());
+        config.resource_limits.max_session_seconds = 8;
+        let block = Arc::new(AtomicBool::new(false));
+        let blocked = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let uploaded = Arc::new(AtomicU64::new(0));
+        let (server_block, server_blocked, server_release, server_uploaded) = (
+            Arc::clone(&block),
+            Arc::clone(&blocked),
+            Arc::clone(&release),
+            Arc::clone(&uploaded),
+        );
+        let _server = AbortTask(tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (path, body) = read_http_request(&mut socket).await;
+                let path = path.split("?").next().unwrap();
+                let (status, response) = if path.ends_with("/sync") {
+                    (200, "{\"event_cursor\":0,\"live_revision\":0}")
+                } else if path == "/api/remote/host/events" {
+                    if server_block.swap(false, Ordering::SeqCst) {
+                        server_blocked.notify_one();
+                        server_release.notified().await;
+                        (503, "")
+                    } else {
+                        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        for event in body["events"].as_array().unwrap() {
+                            let seq = event["sequence"]
+                                .as_u64()
+                                .or_else(|| event["event"]["sequence"].as_u64())
+                                .unwrap();
+                            server_uploaded.fetch_max(seq, Ordering::SeqCst);
+                        }
+                        (200, "")
+                    }
+                } else if path == "/api/remote/host/live-state" {
+                    (200, "")
+                } else {
+                    (404, "")
+                };
+                let _ = socket.write_all(format!("HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",response.len()).as_bytes()).await;
+            }
+        }));
+        let client = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .unwrap();
+        let id = Uuid::new_v4();
+        let launch = bootstrap_test_launch(root.path());
+        let path = root.path().join("sessions.sqlite3");
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        persist_launch_metadata(&config, &store, id, &launch, None)
+            .await
+            .unwrap();
+        store.begin_host_bootstrap(id).await.unwrap();
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let executor: Arc<dyn AgentTurnExecutor> =
+            Arc::new(PendingExecutor(Arc::clone(&started), Arc::clone(&dropped)));
+        let factory: HostExecutorFactory = Arc::new(move |_, _| Ok(Arc::clone(&executor)));
+        let (_commands, rx) = mpsc::channel(8);
+        let mut supervisor = AbortTask(tokio::spawn(run_session(
+            client.clone(),
+            config.clone(),
+            root.path().to_path_buf(),
+            factory,
+            HostSessionLaunch {
+                session_id: id,
+                request: launch,
+                attachment: None,
+            },
+            rx,
+        )));
+        tokio::time::timeout(Duration::from_secs(30), started.notified())
+            .await
+            .unwrap();
+        block.store(true, Ordering::SeqCst);
+        store
+            .append(SessionEvent::new(
+                id,
+                0,
+                crate::SessionEventKind::Error {
+                    message: "force a blocked event upload".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), blocked.notified())
+            .await
+            .unwrap();
+        assert!(
+            SessionWriterLease::try_acquire(root.path().join(format!("{id}.lock")))
+                .unwrap()
+                .is_none()
+        );
+        tokio::time::timeout(Duration::from_secs(10), &mut supervisor.0)
+            .await
+            .expect("a blocked relay upload must not postpone duration settlement")
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+            .await
+            .expect("expiry must cancel the provider turn before releasing ownership");
+        assert!(
+            SessionWriterLease::try_acquire(root.path().join(format!("{id}.lock")))
+                .unwrap()
+                .is_some()
+        );
+        drop(store);
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let state = store.state(id).await.unwrap();
+        assert_eq!(
+            state.status,
+            Some(crate::SessionStatus::Failed),
+            "duration expiry must be durable, not restartable unfinished work"
+        );
+        assert!(store.pending_actions(id, 8).await.unwrap().is_empty());
+        assert!(
+            store
+                .pending_host_launch_metadata(8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .pending_host_journals(None, 8)
+                .await
+                .unwrap()
+                .contains(&id)
+        );
+        let sessions = Arc::new(Mutex::new(HashMap::new()));
+        let forbidden: HostExecutorFactory =
+            Arc::new(|_, _| panic!("expired work must not restart"));
+        resume_pending_host_sessions(&client, &config, root.path(), &sessions, &store, &forbidden)
+            .await
+            .unwrap();
+        assert!(sessions.lock().await.is_empty());
+        release.notify_one();
+        recover_host_journal(&client, &config, &store, id)
+            .await
+            .unwrap();
+        assert!(uploaded.load(Ordering::SeqCst) >= state.latest_sequence);
+        assert!(
+            store
+                .pending_host_journals(None, 8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_host_session_cannot_reset_its_elapsed_duration_budget() {
+        let root = tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config(root.path());
+        config.server = format!("http://{}", listener.local_addr().unwrap());
+        config.resource_limits.max_session_seconds = 10;
+        let id = Uuid::new_v4();
+        let launch = bootstrap_test_launch(root.path());
+        let path = root.path().join("sessions.sqlite3");
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        persist_launch_metadata(&config, &store, id, &launch, None)
+            .await
+            .unwrap();
+        store.create_session(id).await.unwrap();
+        let mut start = SessionEvent::new(id, 0, crate::SessionEventKind::SessionStarted);
+        start.created_at = Utc::now() - chrono::Duration::seconds(60);
+        store.append(start).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                id,
+                0,
+                crate::SessionEventKind::SessionConfigured {
+                    cwd: launch.cwd.clone(),
+                    provider: launch.provider,
+                    model: None,
+                    effort: None,
+                    fast: false,
+                    response_language: launch.response_language,
+                    permission_mode: launch.permission_mode,
+                },
+            ))
+            .await
+            .unwrap();
+        admit_remote_prompt(
+            &store,
+            id,
+            launch.request_id,
+            "unfinished work",
+            &[],
+            crate::PromptDelivery::Queue,
+        )
+        .await
+        .unwrap();
+        drop(store);
+        let writer = SessionWriterLease::acquire(root.path().join(format!("{id}.lock"))).unwrap();
+        let (_held_tx, held_rx) = mpsc::channel(1);
+        assert!(
+            run_session(
+                Client::new(),
+                config.clone(),
+                root.path().to_path_buf(),
+                Arc::new(|_, _| panic!("a live writer must fence expiry")),
+                HostSessionLaunch {
+                    session_id: id,
+                    request: launch.clone(),
+                    attachment: None
+                },
+                held_rx,
+            )
+            .await
+            .is_err()
+        );
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        assert_ne!(
+            store.state(id).await.unwrap().status,
+            Some(crate::SessionStatus::Failed)
+        );
+        assert_eq!(store.pending_actions(id, 8).await.unwrap().len(), 1);
+        drop(store);
+        drop(writer);
+        let (_commands, rx) = mpsc::channel(1);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            run_session(
+                Client::new(),
+                config.clone(),
+                root.path().to_path_buf(),
+                Arc::new(|_, _| panic!("an expired session must not construct a provider")),
+                HostSessionLaunch {
+                    session_id: id,
+                    request: launch,
+                    attachment: None,
+                },
+                rx,
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "expired recovery must settle locally before contacting an unavailable relay"
+        );
+        result.unwrap().unwrap();
+        let store = SqliteSessionStore::open(&path).await.unwrap();
+        assert_eq!(
+            store.state(id).await.unwrap().status,
+            Some(crate::SessionStatus::Failed)
+        );
+        assert!(store.pending_actions(id, 8).await.unwrap().is_empty());
+        assert!(
+            store
+                .pending_host_launch_metadata(8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

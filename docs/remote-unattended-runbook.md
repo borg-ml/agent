@@ -239,11 +239,35 @@ Disposable localhost tests cover sync fault recovery, Stop after recovery,
 upload rejection, supervisor cancellation, provider-future cancellation, and
 cessation of action-lease heartbeats. They use a pending fake executor, not a
 live model. Owned Rust task cancellation does not prove cleanup of every
-external provider process or detached helper. Actor errors and duration limits
-can still leave nonterminal durable work eligible for later recovery. Initial
-and final synchronization retain their existing behavior; independent recovery
-workers publish retained session output and hosted workspace/private messages
-after the actor exits. Production acceptance remains required.
+external provider process or detached helper. Actor errors can still leave
+nonterminal durable work eligible for later recovery. Normal startup and final
+synchronization retain their existing behavior; independent recovery workers
+publish retained session output and hosted workspace/private messages after the
+actor exits. Production acceptance remains required.
+
+## Hosted duration expiry
+
+The host duration timer covers the actor supervision loop, including awaited
+journal/message synchronization: a slow relay cannot defer cancellation until
+its HTTP timeout. On expiry the supervisor aborts and joins its actor, retains
+the session writer lease, records Failed with a duration-limit reason, and
+settles unfinished actions/bootstrap markers. Already-terminal status is not
+overwritten. Final publication is left to the independent recovery workers;
+expiry does not wait for a relay response before releasing the execution slot.
+
+Recovery subtracts elapsed wall time since the original durable SessionStarted
+from the currently configured host limit; restart does not grant a fresh full
+budget. An already-expired, verified-owned session settles locally before
+runtime-context/provider startup, including with an unavailable relay. Ownership
+and writer fencing still apply, and legacy ownership verification can still
+require relay access. Downtime and idle time count toward the recovered budget;
+clock changes and deliberate host-limit changes affect this calculation.
+
+This is not an idle-session discovery sweep: inactive sessions with no pending
+work are checked when restoration is attempted. Storage failures can defer
+terminal settlement, and cooperative Rust task cancellation does not prove that
+all external provider processes or detached helpers have stopped. Production
+acceptance remains required.
 
 ## Final hosted workspace and private messages
 
