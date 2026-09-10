@@ -10745,8 +10745,8 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
         ),
         (
             "Codex subscription authentication lookup unavailable",
-            99,
-            11,
+            12,
+            13,
         ),
     ] {
         let root = tempdir().unwrap();
@@ -10881,7 +10881,7 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
             .await
             .unwrap();
         if failures > 10 {
-            assert_eq!(
+            assert_ne!(
                 store.state(session_id).await.unwrap().goal.unwrap().status,
                 GoalStatus::Blocked
             );

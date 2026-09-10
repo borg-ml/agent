@@ -3215,9 +3215,8 @@ async fn run_agent_session_store_kernel(
                             if network_retry_message_id != Some(prompt.message_id) {
                                 auth_lookup_retries = 0;
                             }
-                            let auth_lookup_exhausted = auth_lookup_failure && auth_lookup_retries >= 10;
                             let network_retry = !interrupted && (provider_error_is_connection_lost(&error)
-                                || (auth_lookup_failure && !auth_lookup_exhausted));
+                                || auth_lookup_failure);
                             let retry = network_retry || usage_limit_retry || automatic_retry_allowed(
                                 &error,
                                 interrupted,
@@ -3247,7 +3246,7 @@ async fn run_agent_session_store_kernel(
                             }
                             let ready_detail = if retry {
                                 if network_retry && auth_lookup_failure {
-                                    format!("Codex authentication lookup unavailable · retry {}/10 in {}s · Esc to cancel. Your work is saved.", auth_lookup_retries + 1, network_retry_delay.as_secs())
+                                    format!("Codex authentication lookup unavailable · retry {} in {}s · Esc to cancel. Your work is saved.", auth_lookup_retries.saturating_add(1), network_retry_delay.as_secs())
                                 } else if network_retry {
                                     format!("Connection interrupted · retrying in {}s · Esc to cancel. Your work is saved.", network_retry_delay.as_secs())
                                 } else if usage_limit_retry {
@@ -3277,7 +3276,7 @@ async fn run_agent_session_store_kernel(
                                 format!("Turn failed; the session remains available: {error}")
                             };
                             if network_retry {
-                                if auth_lookup_failure { auth_lookup_retries += 1; }
+                                if auth_lookup_failure { auth_lookup_retries = auth_lookup_retries.saturating_add(1); }
                                 goal_turn_failures.reset();
                                 network_retry_message_id = Some(prompt.message_id);
                                 retry_not_before = Some(Instant::now() + network_retry_delay);
@@ -3316,7 +3315,7 @@ async fn run_agent_session_store_kernel(
                                     &mut goal_active_since,
                                 )
                                 .await?;
-                            } else if auth_lookup_exhausted || goal_turn_failures.record(&error) >= 3 {
+                            } else if goal_turn_failures.record(&error) >= 3 {
                                 block_active_goal(
                                     &mut journal,
                                     &events,
