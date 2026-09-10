@@ -69,6 +69,10 @@ pub fn codex_product_model() -> &'static str {
     CODEX_MODEL_CATALOG.default_model
 }
 
+pub fn claude_default_effort() -> &'static str {
+    "high"
+}
+
 pub fn codex_default_effort() -> &'static str {
     "low"
 }

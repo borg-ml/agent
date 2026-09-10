@@ -2128,8 +2128,8 @@ fn cross_provider_peer_does_not_inherit_an_incompatible_model_or_effort() {
         None
     );
     assert_eq!(
-        default_effort_for_cross_provider_peer(CodingProvider::Claude),
-        None
+        default_effort_for_cross_provider_peer(CodingProvider::Claude).as_deref(),
+        Some(borg_provider::claude_default_effort())
     );
     assert_eq!(
         default_model_for_cross_provider_peer(CodingProvider::Codex).as_deref(),

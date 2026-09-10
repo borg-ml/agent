@@ -1283,6 +1283,14 @@ async fn run_agent_session_store_kernel(
             SessionEventKind::SessionStarted,
         )
         .await?;
+    }
+    if fresh
+        || (launch.provider == CodingProvider::Claude
+            && initial_state
+                .configuration
+                .as_ref()
+                .is_some_and(|config| config.effort != launch.effort))
+    {
         record(
             &mut journal,
             &events,
@@ -4574,7 +4582,8 @@ fn default_consultation_effort(provider: CodingProvider) -> Option<String> {
         CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
         CodingProvider::Glm => Some(borg_provider::kimi_default_effort().to_string()),
         CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => Some("medium".to_string()),
-        CodingProvider::Claude | CodingProvider::OpenCode => None,
+        CodingProvider::Claude => Some(borg_provider::claude_default_effort().to_string()),
+        CodingProvider::OpenCode => None,
     }
 }
 
@@ -4585,6 +4594,9 @@ fn default_consultation_effort(provider: CodingProvider) -> Option<String> {
 /// empty list remains safe for legacy and resumed sessions.  A non-empty list
 /// is deliberately strict: missing roots are rejected rather than ignored.
 fn validate_launch_session(launch: &mut LaunchSession) -> Result<()> {
+    if launch.provider == CodingProvider::Claude && launch.effort.is_none() {
+        launch.effort = Some(borg_provider::claude_default_effort().to_string());
+    }
     anyhow::ensure!(
         launch.subagent_concurrency_limit != Some(0),
         "subagent concurrency limit must be positive"
@@ -6778,6 +6790,9 @@ async fn apply_session_config(
         crate::SessionConfigAction::SetResponseLanguage { language } => {
             launch.response_language = language;
         }
+    }
+    if launch.provider == CodingProvider::Claude && launch.effort.is_none() {
+        launch.effort = Some(borg_provider::claude_default_effort().to_string());
     }
     record(
         journal,

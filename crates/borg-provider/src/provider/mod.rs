@@ -588,6 +588,7 @@ pub fn default_model_for_backend(backend: &str) -> Option<String> {
 
 pub fn default_effort_for_backend(backend: &str) -> Option<String> {
     match backend {
+        "claude" => Some(crate::claude_default_effort().to_string()),
         "codex" => Some(crate::codex_default_effort().to_string()),
         "openrouter" | "openai-compatible" => Some("medium".to_string()),
         _ => None,

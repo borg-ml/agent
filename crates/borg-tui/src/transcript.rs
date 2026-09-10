@@ -2888,7 +2888,7 @@ impl Transcript {
             rows.push(AgentRosterEntry {
                 name: "director".to_string(),
                 model: model.to_string(),
-                effort: config.effort.as_deref().unwrap_or("default").to_string(),
+                effort: config.effort.as_deref().unwrap_or("—").to_string(),
                 state: "main thread".to_string(),
                 usage: format_subagent_usage(&self.session_usage)
                     .trim_start()
@@ -2899,7 +2899,7 @@ impl Transcript {
             rows.push(AgentRosterEntry {
                 name: "director".to_string(),
                 model: "model pending".to_string(),
-                effort: "default".to_string(),
+                effort: "—".to_string(),
                 state: "main thread".to_string(),
                 usage: "—".to_string(),
                 child_id: None,
@@ -2914,7 +2914,7 @@ impl Transcript {
         rows.extend(agents.into_iter().map(|agent| {
             let name = display_agent_name(&agent.task_name);
             let model = display_subagent_model(agent);
-            let effort = agent.effort.as_deref().unwrap_or("default");
+            let effort = agent.effort.as_deref().unwrap_or("—");
             let usage = format_subagent_usage(&agent.usage);
             let usage = usage
                 .trim_start()

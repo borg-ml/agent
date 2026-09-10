@@ -1889,7 +1889,8 @@ async fn run_local_agent_session(
         // optional reasoning parameter after an explicit user selection.
         CodingProvider::OpenRouter => None,
         CodingProvider::OpenAiCompatible => None,
-        CodingProvider::Claude | CodingProvider::OpenCode => None,
+        CodingProvider::Claude => Some(borg_provider::claude_default_effort().to_string()),
+        CodingProvider::OpenCode => None,
         CodingProvider::Kimi | CodingProvider::Glm => {
             Some(borg_provider::kimi_default_effort().to_string())
         }

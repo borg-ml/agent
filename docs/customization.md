@@ -74,6 +74,13 @@ Launch with `BORG_TUI_SHOW_SUBAGENT_MESSAGES=1 borg` to show subagent messages
 in the parent transcript too. The values `true`, `yes`, and `on` also enable
 this option. It applies to both live events and replayed history.
 
+## Reasoning effort
+
+When no Claude effort is selected or inherited, Borg explicitly requests `high`.
+Explicit effort selections and team worker presets take precedence. The team
+roster shows the recorded effort level, never `default`; older sessions without
+a recorded level show `—` until their configuration is resolved.
+
 ## Dictation model
 
 Borg downloads Parakeet TDT 0.6B V2 by default. To use a smaller or otherwise

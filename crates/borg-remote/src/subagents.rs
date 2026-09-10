@@ -5123,10 +5123,8 @@ fn default_effort_for_cross_provider_peer(provider: CodingProvider) -> Option<St
         CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
         CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
         CodingProvider::Glm => Some(borg_provider::kimi_default_effort().to_string()),
-        CodingProvider::Claude
-        | CodingProvider::OpenCode
-        | CodingProvider::OpenRouter
-        | CodingProvider::OpenAiCompatible => None,
+        CodingProvider::Claude => Some(borg_provider::claude_default_effort().to_string()),
+        CodingProvider::OpenCode | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => None,
     }
 }
 
@@ -5470,6 +5468,7 @@ fn effective_worker_effort(
             launch.team_policy.as_ref().map(|_| "low".to_string())
         })
         .or_else(|| launch.effort.clone())
+        .or_else(|| default_effort_for_cross_provider_peer(launch.provider))
 }
 
 pub fn agent_tool_specs(provider: CodingProvider) -> Vec<Value> {
@@ -6965,6 +6964,16 @@ async fn update_from_session_event(
         return;
     };
     match &event.kind {
+        SessionEventKind::SessionConfigured {
+            provider, model, effort, ..
+        }
+        | SessionEventKind::TurnStarted {
+            provider, model, effort, ..
+        } => {
+            entry.snapshot.provider = *provider;
+            entry.snapshot.model = model.clone();
+            entry.snapshot.effort = effort.clone();
+        }
         SessionEventKind::StatusChanged { status, detail } => {
             entry.assignment_claimed = false;
             entry.snapshot.status = match status {
@@ -7040,6 +7049,11 @@ fn project_child_state(snapshot: &mut SubagentSnapshot, state: &crate::SessionSt
     }
     if let Some(updated_at) = state.activity_at {
         snapshot.updated_at = updated_at;
+    }
+    if let Some(config) = &state.configuration {
+        snapshot.provider = config.provider;
+        snapshot.model = config.model.clone();
+        snapshot.effort = config.effort.clone();
     }
     snapshot.final_text = state.latest_response.clone();
     snapshot.usage = SubagentUsage {

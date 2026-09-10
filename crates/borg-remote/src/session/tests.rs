@@ -5782,7 +5782,7 @@ async fn initial_mixed_provider_peer_starts_with_isolated_provider_configuration
     assert!(turns.iter().any(|(provider, model, effort, prompt)| {
         *provider == CodingProvider::Claude
             && model.is_none()
-            && effort.is_none()
+            && effort.as_deref() == Some(borg_provider::claude_default_effort())
             && subscription_prompt_ends_with(prompt, "peer topic")
     }));
 

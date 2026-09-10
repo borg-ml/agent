@@ -5798,6 +5798,10 @@ fn persistent_peers_follow_ordinary_agent_visibility() {
     assert_eq!(running_rows[1].name, "Claude");
     assert_eq!(running_rows[1].model, "claude-opus-5");
     assert_eq!(running_rows[1].effort, "high");
+    peer.effort = None;
+    transcript.upsert_subagent_snapshot(&peer);
+    assert_eq!(transcript.agent_roster_entries()[1].effort, "—");
+    assert_eq!(transcript.agent_roster_entries()[0].effort, "—");
     assert_eq!(running_rows[1].state, "running");
     assert_eq!(transcript.active_subagent_count(), 1);
     assert_eq!(
