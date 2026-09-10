@@ -587,6 +587,33 @@ impl ScreenMode {
     }
 }
 
+fn subagent_messages_visible_from_environment() -> bool {
+    std::env::var("BORG_TUI_SHOW_SUBAGENT_MESSAGES")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+}
+
+fn root_transcript_from_environment() -> Transcript {
+    Transcript {
+        show_subagent_messages: subagent_messages_visible_from_environment(),
+        ..Transcript::default()
+    }
+}
+
+fn new_child_transcript() -> Transcript {
+    let mut transcript = Transcript {
+        show_subagent_messages: true,
+        ..Transcript::default()
+    };
+    transcript.show_director_context_boundary();
+    transcript
+}
+
 fn rich_terminal_supported(term: Option<&str>, borg_tui: Option<&str>) -> bool {
     if borg_tui.is_some_and(|value| {
         matches!(
@@ -1973,7 +2000,7 @@ impl BorgTerminal {
             input: TerminalInput::spawn(),
             mode,
             keyboard_enhanced,
-            transcript: Transcript::default(),
+            transcript: root_transcript_from_environment(),
             director_transcript: None,
             child_transcripts: HashMap::new(),
             child_unhydrated_events: HashMap::new(),
@@ -2132,7 +2159,7 @@ impl BorgTerminal {
     ) -> Result<()> {
         self.attachment_store = AttachmentStore::for_session(sessions_dir, session_id)?;
         self.keymap = KeyMap::from_config(keybindings)?;
-        self.transcript = Transcript::default();
+        self.transcript = root_transcript_from_environment();
         self.director_transcript = None;
         self.child_transcripts.clear();
         self.child_unhydrated_events.clear();
@@ -2967,11 +2994,9 @@ impl BorgTerminal {
     }
 
     fn child_transcript_mut(&mut self, child_id: Uuid) -> &mut Transcript {
-        self.child_transcripts.entry(child_id).or_insert_with(|| {
-            let mut transcript = Transcript::default();
-            transcript.show_director_context_boundary();
-            transcript
-        })
+        self.child_transcripts
+            .entry(child_id)
+            .or_insert_with(new_child_transcript)
     }
 
     fn focus_child_transcript(&mut self, child_id: Uuid) {
@@ -8351,6 +8376,7 @@ fn fresh_transcript_like(previous: &Transcript) -> Transcript {
     Transcript {
         diff_expansion: previous.diff_expansion,
         auto_expand_tools: previous.auto_expand_tools,
+        show_subagent_messages: previous.show_subagent_messages,
         follow_tail: previous.follow_tail,
         user_label: previous.user_label.clone(),
         assistant_label: previous.assistant_label.clone(),
@@ -8657,11 +8683,9 @@ fn switch_to_child_transcript(
     child_transcripts: &mut HashMap<Uuid, Transcript>,
     child_id: Uuid,
 ) {
-    let child = child_transcripts.remove(&child_id).unwrap_or_else(|| {
-        let mut transcript = Transcript::default();
-        transcript.show_director_context_boundary();
-        transcript
-    });
+    let child = child_transcripts
+        .remove(&child_id)
+        .unwrap_or_else(new_child_transcript);
     *director_transcript = Some(Box::new(std::mem::replace(transcript, child)));
 }
 
@@ -8671,11 +8695,9 @@ fn switch_between_child_transcripts(
     previous_child: Uuid,
     next_child: Uuid,
 ) {
-    let next = child_transcripts.remove(&next_child).unwrap_or_else(|| {
-        let mut transcript = Transcript::default();
-        transcript.show_director_context_boundary();
-        transcript
-    });
+    let next = child_transcripts
+        .remove(&next_child)
+        .unwrap_or_else(new_child_transcript);
     child_transcripts.insert(previous_child, std::mem::replace(transcript, next));
 }
 

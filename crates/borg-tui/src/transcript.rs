@@ -138,6 +138,7 @@ struct Transcript {
     diff_expansion: DiffExpansionPolicy,
     auto_expand_tools: bool,
     action_descriptors: bool,
+    show_subagent_messages: bool,
     user_label: String,
     assistant_label: String,
     user_label_color: Color,
@@ -233,6 +234,7 @@ impl Default for Transcript {
             diff_expansion: DiffExpansionPolicy::Expanded,
             auto_expand_tools: false,
             action_descriptors: true,
+            show_subagent_messages: false,
             user_label: "user".to_string(),
             assistant_label: "borg".to_string(),
             user_label_color: USER_LABEL_BLUE,
@@ -1862,19 +1864,21 @@ impl Transcript {
                 if self.agent_messages.insert(*message_id) {
                     self.agent_message_senders.insert(*sender_id);
                     self.hide_received_subagent_report(*sender_id);
-                    self.order.push(TranscriptEntry::Action {
-                        kind: TranscriptActionKind::Agent,
-                        label: "Agent".to_string(),
-                        detail: if sender_name.trim().is_empty() {
-                            sender_id.to_string()
-                        } else {
-                            sender_name.clone()
-                        },
-                        body: Some(text.clone()),
-                        time: local_event_time(event),
-                        state: TranscriptActionState::Complete,
-                        expanded: true,
-                    });
+                    if self.show_subagent_messages {
+                        self.order.push(TranscriptEntry::Action {
+                            kind: TranscriptActionKind::Agent,
+                            label: "Agent".to_string(),
+                            detail: if sender_name.trim().is_empty() {
+                                sender_id.to_string()
+                            } else {
+                                sender_name.clone()
+                            },
+                            body: Some(text.clone()),
+                            time: local_event_time(event),
+                            state: TranscriptActionState::Complete,
+                            expanded: true,
+                        });
+                    }
                 }
             }
             SessionEventKind::SubagentActivity {
@@ -1888,6 +1892,16 @@ impl Transcript {
                 if let Some((label, detail, body, state)) =
                     subagent_action_projection(*activity, agent, child_event.as_deref())
                 {
+                    let body = if !self.show_subagent_messages
+                        && matches!(
+                            state,
+                            TranscriptActionState::Complete | TranscriptActionState::Stopped
+                        )
+                    {
+                        None
+                    } else {
+                        body
+                    };
                     let time = local_event_time(event);
                     if let Some(index) = self.subagent_entries.get(&agent.session_id).copied() {
                         match self.order.get_mut(index) {

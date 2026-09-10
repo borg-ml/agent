@@ -64,6 +64,16 @@ bell is audible follows the terminal and operating-system settings. Terminals
 that support focus reporting let `unfocused` distinguish foreground from
 background windows. Replayed session history never produces alerts.
 
+## Subagent messages
+
+The parent/director transcript hides subagent messages and report bodies by
+default. Lifecycle indicators, approval and failure details remain visible,
+and focused child transcripts retain their full conversations.
+
+Launch with `BORG_TUI_SHOW_SUBAGENT_MESSAGES=1 borg` to show subagent messages
+in the parent transcript too. The values `true`, `yes`, and `on` also enable
+this option. It applies to both live events and replayed history.
+
 ## Dictation model
 
 Borg downloads Parakeet TDT 0.6B V2 by default. To use a smaller or otherwise

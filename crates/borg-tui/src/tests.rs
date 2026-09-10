@@ -5979,7 +5979,11 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
             },
         )
     };
-    let mut transcript = Transcript::default();
+    // Legacy opt-in: mirror subagent bodies and the received agent-message row.
+    let mut transcript = Transcript {
+        show_subagent_messages: true,
+        ..Transcript::default()
+    };
     transcript.apply(&activity(1, SubagentActivityKind::Started, &agent, None));
     assert_eq!(transcript.order.len(), 1);
     transcript.apply(&activity(
@@ -6108,6 +6112,134 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
         .collect::<Vec<_>>()
         .join("\n");
     assert_eq!(rendered.matches("Found the renderer issue.").count(), 1);
+}
+
+#[test]
+fn subagent_bodies_and_received_agent_message_rows_are_hidden_by_default() {
+    let parent_id = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let agent = SubagentSnapshot {
+        session_id: child_id,
+        parent_session_id: parent_id,
+        task_name: "inspect_ui".to_string(),
+        status: SubagentStatus::Running,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        cwd: PathBuf::from("/workspace"),
+        created_at: now,
+        updated_at: now,
+        detail: None,
+        final_text: None,
+        usage: borg_remote::SubagentUsage::default(),
+    };
+    let activity = |sequence, activity, event| {
+        SessionEvent::new(
+            parent_id,
+            sequence,
+            SessionEventKind::SubagentActivity {
+                activity,
+                agent: agent.clone(),
+                event,
+            },
+        )
+    };
+    let mut transcript = Transcript::default();
+    assert!(!transcript.show_subagent_messages);
+
+    transcript.apply(&activity(1, SubagentActivityKind::Started, None));
+    transcript.apply(&activity(
+        2,
+        SubagentActivityKind::Updated,
+        Some(Box::new(SessionEvent::new(
+            child_id,
+            1,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: "Found the renderer issue without another user prompt.".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ))),
+    ));
+
+    // The lifecycle indicator row survives, but its mirrored report body does not.
+    assert_eq!(transcript.order.len(), 1);
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Action {
+            kind: TranscriptActionKind::Agent,
+            detail,
+            body: None,
+            state: TranscriptActionState::Complete,
+            ..
+        } if detail == "inspect_ui · report ready"
+    ));
+    assert!(!transcript.action_is_expandable(0));
+
+    let receipt_id = Uuid::new_v4();
+    let receipt = SessionEvent::new(
+        parent_id,
+        3,
+        SessionEventKind::AgentMessageReceived {
+            message_id: receipt_id,
+            sender_id: child_id,
+            sender_name: "inspect_ui".to_string(),
+            text: "Found the renderer issue.".to_string(),
+        },
+    );
+    transcript.apply(&receipt);
+
+    // No explicit received-message row is added, yet delivery/dedup tracking runs.
+    assert_eq!(transcript.order.len(), 1);
+    assert!(transcript.agent_messages.contains(&receipt_id));
+    assert!(transcript.agent_message_senders.contains(&child_id));
+
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!rendered.contains("Found the renderer issue"), "{rendered}");
+    assert!(rendered.contains("report ready"), "{rendered}");
+
+    let mut child = new_child_transcript();
+    child.apply(&receipt);
+    assert!(child.order.iter().any(|entry| matches!(
+        entry,
+        TranscriptEntry::Action { body: Some(body), .. }
+            if body == "Found the renderer issue."
+    )));
+    assert!(fresh_transcript_like(&child).show_subagent_messages);
+    assert!(!fresh_transcript_like(&transcript).show_subagent_messages);
+
+    for kind in [
+        SessionEventKind::ApprovalRequested {
+            approval_id: "approval".to_string(),
+            title: "Review command".to_string(),
+            detail: "Needs your attention".to_string(),
+            command: None,
+        },
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: Some("turn failed: Needs your attention".to_string()),
+        },
+    ] {
+        transcript.apply(&activity(
+            4,
+            SubagentActivityKind::Updated,
+            Some(Box::new(SessionEvent::new(child_id, 2, kind))),
+        ));
+        assert!(matches!(
+            &transcript.order[0],
+            TranscriptEntry::Action { body: Some(body), .. }
+                if body.contains("Needs your attention")
+        ));
+    }
 }
 
 #[test]
@@ -7718,7 +7850,11 @@ fn agent_message_is_visible_while_stopped_once_on_replay_and_never_human_pending
     let replay: SessionEvent =
         serde_json::from_value(serde_json::to_value(&receipt).unwrap()).unwrap();
     let events = [stopped, receipt, replay];
-    let mut transcript = Transcript::default();
+    // The received agent-message row is opt-in.
+    let mut transcript = Transcript {
+        show_subagent_messages: true,
+        ..Transcript::default()
+    };
     let mut pending = Vec::new();
     for event in &events {
         transcript.apply(event);
