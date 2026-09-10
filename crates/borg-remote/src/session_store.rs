@@ -1353,7 +1353,7 @@ impl SqliteSessionStore {
                  select s.parent_session_id from sessions s join lineage l on s.id=l.id \
                  where s.parent_session_id is not null) \
                  select exists(select 1 from session_model_access where session_id=? and provider='codex') \
-                 or exists(select 1 from session_events e join lineage l on e.session_id=l.id \
+                 or exists(select 1 from lineage l cross join session_events e on e.session_id=l.id \
                  where json_extract(e.event_json, '$.kind.provider')='codex' \
                  and json_extract(e.event_json, '$.kind.kind')='native_model_message')",
             )
@@ -1431,11 +1431,13 @@ impl SqliteSessionStore {
             );
         } else {
             // Pre-binding prototype history has no trustworthy account provenance.
+            // Keep lineage outermost so SQLite seeks by session instead of scanning
+            // every session’s JSON history while holding the writer lock.
             let has_unbound_history: i64 = sqlx::query_scalar(
                 "with recursive lineage(id) as (select ? union all \
                  select s.parent_session_id from sessions s join lineage l on s.id=l.id \
                  where s.parent_session_id is not null) \
-                 select exists(select 1 from session_events e join lineage l on e.session_id=l.id \
+                 select exists(select 1 from lineage l cross join session_events e on e.session_id=l.id \
                  where json_extract(e.event_json, '$.kind.provider')=? \
                  and (json_extract(e.event_json, '$.kind.kind')='native_model_message' \
                  or (json_extract(e.event_json, '$.kind.type')='turn_started' and exists( \
