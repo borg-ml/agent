@@ -5124,7 +5124,9 @@ fn default_effort_for_cross_provider_peer(provider: CodingProvider) -> Option<St
         CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
         CodingProvider::Glm => Some(borg_provider::kimi_default_effort().to_string()),
         CodingProvider::Claude => Some(borg_provider::claude_default_effort().to_string()),
-        CodingProvider::OpenCode | CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => None,
+        CodingProvider::OpenCode
+        | CodingProvider::OpenRouter
+        | CodingProvider::OpenAiCompatible => None,
     }
 }
 
@@ -6965,10 +6967,16 @@ async fn update_from_session_event(
     };
     match &event.kind {
         SessionEventKind::SessionConfigured {
-            provider, model, effort, ..
+            provider,
+            model,
+            effort,
+            ..
         }
         | SessionEventKind::TurnStarted {
-            provider, model, effort, ..
+            provider,
+            model,
+            effort,
+            ..
         } => {
             entry.snapshot.provider = *provider;
             entry.snapshot.model = model.clone();

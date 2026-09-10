@@ -1303,7 +1303,10 @@ fn keybinding_help_is_key_first_and_uses_configuration() {
         .join("\n");
     assert!(help.contains("send"));
     assert!(help.find("ctrl+s").unwrap() < help.find("send").unwrap());
-    let separators = help.lines().map(|line| line.find("│").unwrap()).collect::<Vec<_>>();
+    let separators = help
+        .lines()
+        .map(|line| line.find("│").unwrap())
+        .collect::<Vec<_>>();
     assert!(separators.iter().all(|column| *column == separators[0]));
     assert!(help.contains("send after current turn"));
     assert!(help.contains("start/stop dictation"));
@@ -1901,7 +1904,10 @@ fn edit_preparation_waits_for_the_first_diff_before_promotion() {
         .join("\n");
     assert_eq!(transcript.order.len(), 1);
     assert!(editing.contains("Editing…"), "{editing}");
-    assert!(!editing.contains("Generating tool call · edit"), "{editing}");
+    assert!(
+        !editing.contains("Generating tool call · edit"),
+        "{editing}"
+    );
 }
 
 #[test]
@@ -1944,7 +1950,10 @@ fn hiding_action_descriptions_keeps_generation_feedback_visible() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(rendered.contains("Editing…"), "{rendered}");
-    assert!(!rendered.contains("Generating tool call · edit"), "{rendered}");
+    assert!(
+        !rendered.contains("Generating tool call · edit"),
+        "{rendered}"
+    );
 }
 
 #[test]
@@ -2031,7 +2040,10 @@ fn action_preparation_completes_when_the_start_event_is_missing() {
         .join("\n");
     assert_eq!(transcript.order.len(), 1);
     assert!(completed.contains("Ran command"), "{completed}");
-    assert!(!completed.contains("Generating tool call · command"), "{completed}");
+    assert!(
+        !completed.contains("Generating tool call · command"),
+        "{completed}"
+    );
     assert!(!transcript.has_running_tool());
 }
 
@@ -2101,7 +2113,10 @@ fn late_completion_does_not_consume_new_action_preparation() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(rendered.contains("Ran"), "{rendered}");
-    assert!(rendered.contains("Generating tool call · command"), "{rendered}");
+    assert!(
+        rendered.contains("Generating tool call · command"),
+        "{rendered}"
+    );
 }
 
 #[test]
@@ -2197,8 +2212,14 @@ fn matching_tool_action_updates_refine_one_live_card() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("Generating tool call · edit"), "{rendered}");
-    assert!(!rendered.contains("Generating tool call · command"), "{rendered}");
+    assert!(
+        rendered.contains("Generating tool call · edit"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("Generating tool call · command"),
+        "{rendered}"
+    );
 }
 
 #[test]
@@ -2505,8 +2526,7 @@ fn thread_find_advances_and_wraps_through_regex_matches() {
 
 #[test]
 fn running_tool_timing_column_never_rewraps_action_text() {
-    let summary =
-        "12:10  ↗ Generating tool call · wait for corrected full editor build · Running in background";
+    let summary = "12:10  ↗ Generating tool call · wait for corrected full editor build · Running in background";
     let short = tool_summary_lines(summary, Some("0.1s"), "  ", 88);
     let long = tool_summary_lines(summary, Some("1m 00s"), "  ", 88);
 

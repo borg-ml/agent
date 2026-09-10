@@ -4897,7 +4897,9 @@ fn native_conversation(
             }
             SessionEventKind::TurnCompleted {
                 error: Some(error), ..
-            } if provider_error_is_connection_lost(error) || provider_error_is_auth_lookup_unavailable(error) => {
+            } if provider_error_is_connection_lost(error)
+                || provider_error_is_auth_lookup_unavailable(error) =>
+            {
                 let partial = &pending_generic;
                 if !partial.is_empty() {
                     conversation.push(borg_provider::provider::ModelMessage::user(format!(

@@ -3439,7 +3439,11 @@ async fn user_stop_gate_holds_background_turns_until_a_human_prompt() {
             .is_err(),
         "a stopped session must not admit a background team turn"
     );
-    assert_eq!(seen.lock().unwrap().len(), 2, "provider saw only the human turns");
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "provider saw only the human turns"
+    );
 
     // A fresh human prompt after the stop clears the gate.
     command_tx
@@ -3504,10 +3508,9 @@ async fn user_stop_gate_holds_background_turns_until_a_human_prompt() {
     assert!(stop_index < clear_index);
     let between = &events[stop_index..clear_index];
     assert!(
-        between.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::TurnStarted { .. }
-        )),
+        between
+            .iter()
+            .any(|event| matches!(&event.kind, SessionEventKind::TurnStarted { .. })),
         "the prompt queued before Escape runs while the gate is still latched"
     );
     assert!(
@@ -10692,7 +10695,12 @@ impl AgentTurnExecutor for NetworkThenSuccessExecutor {
                 .unwrap();
         } else {
             assert!(turn.prompt.contains("Do not repeat completed actions"));
-            assert!(turn.prompt.contains("completed-work") || turn.prompt.contains("git status"), "attempt {attempt}, error {}, prompt {}", self.error, turn.prompt);
+            assert!(
+                turn.prompt.contains("completed-work") || turn.prompt.contains("git status"),
+                "attempt {attempt}, error {}, prompt {}",
+                self.error,
+                turn.prompt
+            );
         }
         if attempt < self.failures {
             anyhow::bail!(self.error);

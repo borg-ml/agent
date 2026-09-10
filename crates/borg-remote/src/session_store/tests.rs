@@ -125,7 +125,11 @@ async fn host_launch_owner_is_atomic_immutable_and_scoped_across_reopen() {
             .unwrap();
         assert_eq!(
             page.into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
-            expected.get(offset).copied().into_iter().collect::<Vec<_>>()
+            expected
+                .get(offset)
+                .copied()
+                .into_iter()
+                .collect::<Vec<_>>()
         );
     }
     drop(store);
@@ -176,7 +180,12 @@ async fn terminal_host_settlement_cancels_abandoned_actions_and_fences_old_lease
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
     store
-        .persist_owned_host_launch_metadata(session_id, &serde_json::json!({"request_id": session_id}), Uuid::nil(), "https://relay.invalid")
+        .persist_owned_host_launch_metadata(
+            session_id,
+            &serde_json::json!({"request_id": session_id}),
+            Uuid::nil(),
+            "https://relay.invalid",
+        )
         .await
         .unwrap();
     store.begin_host_bootstrap(session_id).await.unwrap();
@@ -302,7 +311,12 @@ async fn host_journal_cursors_preserve_late_events_live_state_and_pagination() {
             .unwrap();
         if id != local {
             store
-                .persist_owned_host_launch_metadata(id, &serde_json::json!({"request_id": id}), Uuid::nil(), "https://relay.invalid")
+                .persist_owned_host_launch_metadata(
+                    id,
+                    &serde_json::json!({"request_id": id}),
+                    Uuid::nil(),
+                    "https://relay.invalid",
+                )
                 .await
                 .unwrap();
         }
@@ -436,7 +450,12 @@ async fn host_journal_cursors_preserve_late_events_live_state_and_pagination() {
     let fork = store.fork_before(local, fork_id, 3).await.unwrap();
     assert!(fork.inherited_event_count > 0);
     store
-        .persist_owned_host_launch_metadata(fork_id, &serde_json::json!({"request_id": fork_id}), Uuid::nil(), "https://relay.invalid")
+        .persist_owned_host_launch_metadata(
+            fork_id,
+            &serde_json::json!({"request_id": fork_id}),
+            Uuid::nil(),
+            "https://relay.invalid",
+        )
         .await
         .unwrap();
     assert_eq!(
