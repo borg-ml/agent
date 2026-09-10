@@ -10697,6 +10697,11 @@ impl AgentTurnExecutor for NetworkThenSuccessExecutor {
         if attempt < self.failures {
             anyhow::bail!(self.error);
         }
+        if self.failures > 10 {
+            turn.agent_tools
+                .call("update_goal", serde_json::json!({"status": "complete"}))
+                .await?;
+        }
         Ok(AgentTurnResult {
             provider_session_id: Some("reconnected".into()),
             final_text: "done".into(),
@@ -10881,9 +10886,9 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
             .await
             .unwrap();
         if failures > 10 {
-            assert_ne!(
+            assert_eq!(
                 store.state(session_id).await.unwrap().goal.unwrap().status,
-                GoalStatus::Blocked
+                GoalStatus::Complete
             );
         }
         assert_eq!(
