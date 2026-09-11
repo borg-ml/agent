@@ -1500,7 +1500,7 @@ fn git_invocation_detail(action: GitAction, arguments: &[String]) -> String {
         }
         details.push(argument.clone());
     }
-    compact_text(&details.join(" · "), 160)
+    compact_text(&details.join(" "), 160)
 }
 
 fn git_option_takes_value(action: GitAction, option: &str) -> bool {
@@ -2769,12 +2769,12 @@ mod tests {
             (
                 "git add src/lib.rs src/main.rs",
                 "Git add",
-                "src/lib.rs · src/main.rs",
+                "src/lib.rs src/main.rs",
             ),
             (
                 "git worktree add -b topic ../topic main",
                 "Add worktree",
-                "topic · ../topic · main",
+                "topic ../topic main",
             ),
             (
                 "bash -lc 'git worktree list --porcelain'",
