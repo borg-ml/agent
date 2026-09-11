@@ -6928,7 +6928,12 @@ fn optional_tool_text(value: Option<String>) -> Option<String> {
 }
 
 fn attributed_team_message(actor: &str, message: &str) -> String {
-    format!("Team message from {actor}:\n\n{message}")
+    format!(
+        "Team message from {actor}:\n\n{message}\n\n\
+         ({actor} is another Borg instance, not the human user. Address your plain-text \
+         reply to your own operator; to reply to {actor}, call send_message with \
+         target \"{actor}\".)"
+    )
 }
 
 fn child_lock_path(root: &Path, session_id: Uuid) -> PathBuf {
