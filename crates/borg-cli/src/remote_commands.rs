@@ -2475,7 +2475,6 @@ async fn run_local_agent_session(
     let mut pending_prompt_ids = HashSet::new();
     let mut stop_sent = false;
     let mut user_requested_exit = false;
-    let mut force_exit_requested = false;
     let mut exit_notice = None;
     let mut detached_from_terminal = false;
     let mut detached_prompt = None;
@@ -5037,14 +5036,7 @@ async fn run_local_agent_session(
                         }
                     }
                     UiAction::ForceQuit => {
-                        // Repeated Ctrl-C means "give the shell back now".
-                        // In particular, never keep this foreground process
-                        // alive merely because a remote viewer is attached.
-                        user_requested_exit = true;
-                        force_exit_requested = true;
-                        shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
-                        let _ = session_command_tx.try_send(HostCommand::Stop { session_id });
-                        break;
+                        force_quit(&mut terminal, &crash_context.tui_active);
                     }
                     UiAction::Quit => {
                         user_requested_exit = true;
@@ -6573,11 +6565,7 @@ async fn run_local_agent_session(
             }
             _ = tokio::signal::ctrl_c(), if interactive => {
                 if repeated_ctrl_c(&mut last_ctrl_c, std::time::Instant::now()) {
-                    user_requested_exit = true;
-                    force_exit_requested = true;
-                    shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
-                    let _ = session_command_tx.try_send(HostCommand::Stop { session_id });
-                    break;
+                    force_quit(&mut terminal, &crash_context.tui_active);
                 } else if let Some(terminal) = terminal.as_mut() {
                     terminal.handle_external_interrupt();
                     terminal_dirty = true;
@@ -6689,46 +6677,23 @@ async fn run_local_agent_session(
     payload_hydration_task.abort();
     drop(terminal_io_tx);
     drop(editor_preferences_tx);
-    if force_exit_requested {
-        editor_preferences_task.abort();
-    } else if let Err(error) = editor_preferences_task.await {
+    if let Err(error) = editor_preferences_task.await {
         tracing::warn!(%session_id, %error, "editor preferences writer stopped unexpectedly");
     }
     drop(ui_interaction_tx);
-    if force_exit_requested {
-        ui_interaction_task.abort();
-    } else if let Err(error) = ui_interaction_task.await {
+    if let Err(error) = ui_interaction_task.await {
         tracing::warn!(%session_id, %error, "UI interaction dispatcher stopped unexpectedly");
     }
     drop(session_events);
-    let mut actor = actor;
-    if force_exit_requested {
-        actor.abort();
-    }
-    let actor_result = if force_exit_requested {
-        match tokio::time::timeout(std::time::Duration::from_millis(500), &mut actor).await {
-            Ok(result) => Some(result),
-            Err(_) => {
-                tracing::warn!(%session_id, "forced exit detached an actor that did not cancel within 500ms");
-                None
-            }
-        }
-    } else {
-        Some(actor.await)
-    };
     let mut actor_panicked = false;
-    let actor_error = match actor_result {
-        Some(Ok(result)) => result.err(),
-        Some(Err(join_error)) if force_exit_requested && join_error.is_cancelled() => None,
-        Some(Err(join_error)) => {
+    let actor_error = match actor.await {
+        Ok(result) => result.err(),
+        Err(join_error) => {
             actor_panicked = join_error.is_panic();
             Some(anyhow::anyhow!("agent session task failed: {join_error}"))
         }
-        None => None,
     };
-    let discarded_empty_session = if !force_exit_requested
-        && session_access == LocalSessionAccess::Owned
-        && !args.ephemeral
+    let discarded_empty_session = if session_access == LocalSessionAccess::Owned && !args.ephemeral
     {
         match sqlite_store.discard_empty_session(session_id).await {
             Ok(discarded) => discarded,
@@ -6776,27 +6741,17 @@ async fn run_local_agent_session(
     if let Some(shutdown) = mirror_shutdown {
         shutdown.send(true).ok();
     }
-    if force_exit_requested {
-        // The terminal is already restored. Do not keep the foreground shell
-        // behind remote-mirror or child-process teardown after double Ctrl-C.
-        drop(collab_child);
-        if let Some(task) = mirror_task {
-            task.abort();
-        }
-        drop(local_server);
-    } else {
-        if let Some(mut child) = collab_child {
-            child.kill().await.ok();
-        }
-        if let Some(task) = mirror_task {
-            task.await.context("remote mirror task failed")?;
-        }
-        if let Some(server) = local_server {
-            server
-                .shutdown()
-                .await
-                .context("failed to stop Borg-owned local llama-server")?;
-        }
+    if let Some(mut child) = collab_child {
+        child.kill().await.ok();
+    }
+    if let Some(task) = mirror_task {
+        task.await.context("remote mirror task failed")?;
+    }
+    if let Some(server) = local_server {
+        server
+            .shutdown()
+            .await
+            .context("failed to stop Borg-owned local llama-server")?;
     }
     if resume_session == Some(session_id)
         && !user_requested_exit
@@ -6933,6 +6888,16 @@ fn read_hidden_line() -> Result<String> {
     discard_pending_terminal_input();
     println!();
     result
+}
+
+fn force_quit(terminal: &mut Option<BorgTerminal>, tui_active: &AtomicBool) -> ! {
+    tui_active.store(false, Ordering::Release);
+    // Restore modes without dropping the potentially large transcript or
+    // waiting for task/runtime teardown on the second Ctrl-C.
+    if let Some(terminal) = terminal.as_mut() {
+        terminal.restore_terminal();
+    }
+    std::process::exit(130);
 }
 
 async fn shutdown_terminal(terminal: &mut Option<BorgTerminal>, tui_active: &AtomicBool) {

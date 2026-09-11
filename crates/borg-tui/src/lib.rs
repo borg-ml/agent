@@ -7669,21 +7669,14 @@ impl BorgTerminal {
         }
         let ctrl_c = is_ctrl_c(&key);
         if ctrl_c {
-            if self.picker.is_some()
-                || self.focused_tool.is_some()
-                || self.keybindings_open
-                || self.pending_approval
-                || !self.composer.text.is_empty()
-                || !self.composer.attachments.is_empty()
-                || matches!(
-                    self.active_status(),
-                    SessionStatus::Starting
-                        | SessionStatus::Running
-                        | SessionStatus::WaitingForApproval
+            if key.kind == KeyEventKind::Press
+                && repeated_ctrl_c(
+                    &mut self.last_ctrl_c,
+                    &mut self.ctrl_c_count,
+                    Instant::now(),
                 )
             {
-                self.last_ctrl_c = None;
-                self.ctrl_c_count = 0;
+                return Ok(UiAction::ForceQuit);
             }
             key.code = KeyCode::Esc;
             key.modifiers = KeyModifiers::NONE;
@@ -7926,8 +7919,6 @@ impl BorgTerminal {
         if ctrl_c && (!self.composer.text.is_empty() || !self.composer.attachments.is_empty()) {
             self.composer.clear();
             self.composer_selection = None;
-            self.last_ctrl_c = None;
-            self.ctrl_c_count = 0;
             self.notice = Some("Prompt cleared".to_string());
             return Ok(UiAction::None);
         }
@@ -7940,15 +7931,6 @@ impl BorgTerminal {
                     | SessionStatus::WaitingForApproval
             )
         {
-            if key.kind == KeyEventKind::Press
-                && repeated_ctrl_c(
-                    &mut self.last_ctrl_c,
-                    &mut self.ctrl_c_count,
-                    Instant::now(),
-                )
-            {
-                return Ok(UiAction::ForceQuit);
-            }
             self.rewind_primed = false;
             self.notice = Some("Press Ctrl-C again to exit".to_string());
             return Ok(UiAction::None);
@@ -8335,7 +8317,7 @@ fn completion_alert_policy_from_picker(value: &str) -> CompletionAlertPolicy {
 }
 
 impl BorgTerminal {
-    fn restore_terminal(&mut self) {
+    pub fn restore_terminal(&mut self) {
         if self.terminal_restored {
             return;
         }

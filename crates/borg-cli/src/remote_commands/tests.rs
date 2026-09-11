@@ -6,6 +6,43 @@ use tempfile::tempdir;
 use tokio::io::AsyncReadExt;
 
 #[test]
+fn force_quit_does_not_wait_for_runtime_teardown() {
+    const CHILD: &str = "BORG_TEST_FORCE_QUIT_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let (started, ready) = std::sync::mpsc::channel();
+        runtime.spawn_blocking(move || {
+            started.send(()).expect("started");
+            std::thread::sleep(Duration::from_secs(60));
+        });
+        ready.recv().expect("blocking task started");
+        force_quit(&mut None, &AtomicBool::new(false));
+    }
+
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "remote_commands::tests::force_quit_does_not_wait_for_runtime_teardown",
+        ])
+        .env(CHILD, "1")
+        .spawn()
+        .expect("start force-quit child");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().expect("child status") {
+            assert_eq!(status.code(), Some(130));
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("kill stuck child");
+            child.wait().expect("reap stuck child");
+            panic!("force quit waited for runtime teardown");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn tool_click_behavior_accepts_fullscreen_and_inline_modes() {
     assert_eq!(
         parse_tool_click_behavior("fullscreen"),
