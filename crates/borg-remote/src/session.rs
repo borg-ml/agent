@@ -6352,6 +6352,7 @@ fn defer_root_inbox_behind_current_command(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_input_at_turn_boundary(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,

@@ -401,7 +401,7 @@ struct LiveStateBatch<'a> {
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum StoredHostLaunch {
-    Launch(PersistedLaunchMetadata),
+    Launch(Box<PersistedLaunchMetadata>),
     Rejected { rejected_launch: RejectedHostLaunch },
 }
 
@@ -475,8 +475,8 @@ async fn upload_event_payloads(
             match response {
                 Ok(response) if response.status().is_success() => Ok(true),
                 Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-                    return Err(response.error_for_status().unwrap_err())
-                        .context("remote host token was rejected; enroll this host again");
+                    Err(response.error_for_status().unwrap_err())
+                        .context("remote host token was rejected; enroll this host again")
                 }
                 Ok(response) => {
                     tracing::warn!(
@@ -868,8 +868,8 @@ async fn upload_live_state(
             Ok(true)
         }
         Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-            return Err(response.error_for_status().unwrap_err())
-                .context("remote host token was rejected; enroll this host again");
+            Err(response.error_for_status().unwrap_err())
+                .context("remote host token was rejected; enroll this host again")
         }
         Ok(response) => {
             tracing::warn!(
@@ -2472,20 +2472,19 @@ async fn flush_host_workspace_messages(
         sync,
     )
     .await;
-    if sync.uploaded_workspace_sequences != before {
-        if let Err(error) = store
+    if sync.uploaded_workspace_sequences != before
+        && let Err(error) = store
             .acknowledge_host_workspaces(
                 config.host_id,
                 session_id,
                 &sync.uploaded_workspace_sequences,
             )
             .await
-        {
-            sync.uploaded_workspace_sequences = before;
-            // Retry the checkpoint without masking a fatal upload rejection.
-            result?;
-            return Err(error);
-        }
+    {
+        sync.uploaded_workspace_sequences = before;
+        // Retry the checkpoint without masking a fatal upload rejection.
+        result?;
+        return Err(error);
     }
     result
 }
@@ -2877,8 +2876,7 @@ pub async fn mirror_local_session(
                     delivery,
                     ..
                 } = &envelope.command
-                {
-                    if let Err(error) = admit_remote_prompt(
+                    && let Err(error) = admit_remote_prompt(
                         store.as_ref(),
                         session_id,
                         *message_id,
@@ -2887,12 +2885,10 @@ pub async fn mirror_local_session(
                         *delivery,
                     )
                     .await
-                    {
-                        tracing::warn!(%error, %session_id, %message_id, "remote prompt admission failed; retaining command for retry");
-                        wait_for_mirror_shutdown(&mut command_shutdown, Duration::from_secs(2))
-                            .await;
-                        break;
-                    }
+                {
+                    tracing::warn!(%error, %session_id, %message_id, "remote prompt admission failed; retaining command for retry");
+                    wait_for_mirror_shutdown(&mut command_shutdown, Duration::from_secs(2)).await;
+                    break;
                 }
                 if commands.send(envelope.command).await.is_err() {
                     return Ok(());
@@ -3333,7 +3329,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
     }
     if let Some(session_id) = command.session_id() {
         let metadata = match load_launch_metadata(&session_store, session_id).await {
-            Ok(Some(StoredHostLaunch::Launch(metadata))) => Some(metadata),
+            Ok(Some(StoredHostLaunch::Launch(metadata))) => Some(*metadata),
             Ok(Some(StoredHostLaunch::Rejected { .. })) => {
                 return settle_inactive_host_session(
                     &config,
@@ -4503,7 +4499,7 @@ async fn resume_pending_host_sessions(
     let pending = session_store
         .pending_host_launch_metadata_for_host(
             offset,
-            Some((config.host_id, &host_relay_origin(&config)?)),
+            Some((config.host_id, &host_relay_origin(config)?)),
             256,
         )
         .await?;

@@ -4647,22 +4647,24 @@ async fn compaction_defers_steers_preserves_next_attachments_and_respects_stop()
                 "stop, accepted steers, and Next input must not be retried on later boundaries"
             );
             active.finish.send(()).unwrap();
-            if !stop {
-                let queued = next(&mut turns).await;
-                assert_eq!(queued.turn.message_id, queued_id);
-                assert_eq!(
-                    queued.turn.attachments,
-                    vec![PathBuf::from("screenshot.png")]
-                );
-                queued.finish.send(()).unwrap();
-            } else {
+            // Escape cancels the active turn, not already-queued human input.
+            // Rejected steers join that input without clearing the stop gate.
+            let queued = next(&mut turns).await;
+            assert_eq!(queued.turn.message_id, queued_id);
+            assert_eq!(
+                queued.turn.attachments,
+                vec![PathBuf::from("screenshot.png"); if stop { 3 } else { 1 }]
+            );
+            if stop {
                 assert!(
-                    tokio::time::timeout(Duration::from_millis(50), turns.recv())
-                        .await
-                        .is_err(),
-                    "compaction completion cannot resume a stopped session"
+                    std::iter::from_fn(|| event_rx.try_recv().ok()).all(|event| !matches!(
+                        event.kind,
+                        SessionEventKind::UserStopChanged { engaged: false }
+                    )),
+                    "pre-stop human input must not clear the background-work stop gate"
                 );
             }
+            queued.finish.send(()).unwrap();
             command_tx
                 .send(HostCommand::Stop { session_id })
                 .await
@@ -11086,10 +11088,10 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
                 .await
                 .expect("network retry completes")
                 .expect("session remains attached");
-            if let SessionEventKind::ProviderEvent { kind, payload, .. } = &event.kind {
-                if kind == "network_retry" {
-                    retry_delays.push(payload["delay_ms"].as_u64().unwrap());
-                }
+            if let SessionEventKind::ProviderEvent { kind, payload, .. } = &event.kind
+                && kind == "network_retry"
+            {
+                retry_delays.push(payload["delay_ms"].as_u64().unwrap());
             }
             if matches!(&event.kind, SessionEventKind::Error { message } if message == error) {
                 visible_errors += 1;

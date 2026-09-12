@@ -776,7 +776,7 @@ impl ResponseState {
                         payload: json!({"text": text}),
                         raw_payload: Box::new(None),
                         stream_channel: Some("reasoning".into()),
-                        content_text: Some(text.into()),
+                        content_text: Some(text),
                         provider_item_id: event["item_id"].as_str().map(str::to_owned),
                         tool_use_id: None,
                         tool_name: None,
