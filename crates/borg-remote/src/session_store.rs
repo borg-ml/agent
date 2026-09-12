@@ -4456,12 +4456,14 @@ impl SqliteSessionStore {
         Box::pin(async move {
             let session = self.session_row(session_id).await?;
             let limit = before_or_at.unwrap_or(session.next_sequence.saturating_sub(1));
+            // A sequence bound can otherwise make SQLite scan the entire session
+            // for every absent inbox message instead of seeking its message ID.
             let found: i64 = sqlx::query_scalar(if inherited_only {
-                "select exists(select 1 from session_events \
+                "select exists(select 1 from session_events indexed by idx_session_events_message \
                  where session_id = ? and message_id = ? and sequence <= ? \
                    and fork_inheritable = 1)"
             } else {
-                "select exists(select 1 from session_events \
+                "select exists(select 1 from session_events indexed by idx_session_events_message \
                  where session_id = ? and message_id = ? and sequence <= ?)"
             })
             .bind(session_id.to_string())

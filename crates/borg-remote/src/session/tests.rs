@@ -4437,6 +4437,242 @@ async fn rejected_codex_steer_retries_at_the_next_tool_boundary() {
 }
 
 #[tokio::test]
+async fn compaction_defers_steers_preserves_next_attachments_and_respects_stop() {
+    struct ControlledTurn {
+        turn: AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        controls: mpsc::Receiver<AgentTurnControl>,
+        finish: oneshot::Sender<()>,
+    }
+    struct ControlledExecutor(mpsc::Sender<ControlledTurn>);
+    #[async_trait::async_trait]
+    impl AgentTurnExecutor for ControlledExecutor {
+        async fn execute(
+            &self,
+            turn: AgentTurn,
+            events: mpsc::Sender<SessionEventKind>,
+            controls: Option<mpsc::Receiver<AgentTurnControl>>,
+        ) -> Result<AgentTurnResult> {
+            let (finish, finished) = oneshot::channel();
+            self.0
+                .send(ControlledTurn {
+                    turn,
+                    events,
+                    controls: controls.unwrap(),
+                    finish,
+                })
+                .await
+                .unwrap();
+            finished.await?;
+            Ok(AgentTurnResult {
+                provider_session_id: Some("provider-session".to_string()),
+                final_text: String::new(),
+            })
+        }
+    }
+    async fn next<T>(rx: &mut mpsc::Receiver<T>) -> T {
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("session makes progress")
+            .expect("channel remains open")
+    }
+    async fn observe(rx: &mut mpsc::Receiver<SessionEvent>, kind: &SessionEventKind) {
+        loop {
+            if serde_json::to_value(next(rx).await.kind).unwrap()
+                == serde_json::to_value(kind).unwrap()
+            {
+                break;
+            }
+        }
+    }
+    let tool_boundary = || SessionEventKind::ToolCompleted {
+        tool_call_id: "tool-1".to_string(),
+        output: "done".to_string(),
+        output_ref: None,
+        is_error: false,
+        input: None,
+        input_ref: None,
+    };
+    for completion_kind in ["context_compaction", "item/completed:contextCompaction"] {
+        for stop in [false, true] {
+            let root = tempdir().unwrap();
+            let journal_path = root.path().join("session.lock");
+            let session_id = Uuid::new_v4();
+            let (command_tx, command_rx) = mpsc::channel(8);
+            let (event_tx, mut event_rx) = mpsc::channel(128);
+            let (turn_tx, mut turns) = mpsc::channel(8);
+            let actor = tokio::spawn(async move {
+                run_agent_session_with_executor(
+                    &journal_path,
+                    session_id,
+                    LaunchSession {
+                        request_id: Uuid::new_v4(),
+                        cwd: root.path().to_path_buf(),
+                        provider: CodingProvider::Codex,
+                        model: None,
+                        effort: None,
+                        fast: Some(false),
+                        response_language: crate::ResponseLanguage::Auto,
+                        permission_mode: PermissionMode::Manual,
+                        name: None,
+                        initial_prompt: None,
+                        capabilities: Default::default(),
+                        subagent_concurrency_limit: None,
+                        extension_skill_roots: Vec::new(),
+                        team_policy: None,
+                    },
+                    command_rx,
+                    event_tx,
+                    Arc::new(ControlledExecutor(turn_tx)),
+                )
+                .await
+            });
+            let prompt = |message_id, delivery| HostCommand::Prompt {
+                session_id,
+                message_id,
+                text: "follow up".to_string(),
+                attachments: vec![PathBuf::from("screenshot.png")],
+                output_schema: None,
+                delivery,
+            };
+            command_tx
+                .send(prompt(Uuid::new_v4(), PromptDelivery::Steer))
+                .await
+                .unwrap();
+            let mut active = next(&mut turns).await;
+            let rejected_id = Uuid::new_v4();
+            command_tx
+                .send(prompt(rejected_id, PromptDelivery::Steer))
+                .await
+                .unwrap();
+            let AgentTurnControl::Steer {
+                ack: rejected_ack, ..
+            } = next(&mut active.controls).await
+            else {
+                panic!("initial steer");
+            };
+            // A boundary passes while the first acknowledgement is still outstanding.
+            active.events.send(tool_boundary()).await.unwrap();
+            let started = SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "item/started:contextCompaction".to_string(),
+                payload: json!({}),
+            };
+            active.events.send(started.clone()).await.unwrap();
+            observe(&mut event_rx, &started).await;
+            let steer_id = Uuid::new_v4();
+            let queued_id = Uuid::new_v4();
+            for (message_id, delivery) in [
+                (steer_id, PromptDelivery::Steer),
+                (queued_id, PromptDelivery::Queue),
+            ] {
+                command_tx.send(prompt(message_id, delivery)).await.unwrap();
+                observe(
+                    &mut event_rx,
+                    &SessionEventKind::Message {
+                        message_id,
+                        actor: EventActor::User,
+                        text: "follow up".to_string(),
+                        attachments: vec![PathBuf::from("screenshot.png")],
+                        status: MessageStatus::Queued,
+                        delivery: Some(delivery),
+                    },
+                )
+                .await;
+            }
+            rejected_ack.send(Err("compacting".to_string())).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), active.controls.recv())
+                    .await
+                    .is_err(),
+                "late rejection must not retry during compaction"
+            );
+            if stop {
+                command_tx
+                    .send(HostCommand::Interrupt { session_id })
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    next(&mut active.controls).await,
+                    AgentTurnControl::Interrupt
+                ));
+            }
+            let completed = SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: completion_kind.to_string(),
+                payload: if completion_kind == "context_compaction" {
+                    json!({"status": "completed"})
+                } else {
+                    json!({})
+                },
+            };
+            active.events.send(completed.clone()).await.unwrap();
+            observe(&mut event_rx, &completed).await;
+            if !stop {
+                for expected_id in [rejected_id, steer_id] {
+                    let AgentTurnControl::Steer {
+                        message_id,
+                        attachments,
+                        admission,
+                        ack,
+                        ..
+                    } = next(&mut active.controls).await
+                    else {
+                        panic!("compaction completion retries the pending steer");
+                    };
+                    assert_eq!(message_id, expected_id);
+                    assert_eq!(attachments, vec![PathBuf::from("screenshot.png")]);
+                    assert!(admission.accept());
+                    ack.send(Ok(())).unwrap();
+                    observe(
+                        &mut event_rx,
+                        &SessionEventKind::Message {
+                            message_id,
+                            actor: EventActor::User,
+                            text: "follow up".to_string(),
+                            attachments,
+                            status: MessageStatus::Complete,
+                            delivery: Some(PromptDelivery::Steer),
+                        },
+                    )
+                    .await;
+                }
+            }
+            active.events.send(completed).await.unwrap();
+            active.events.send(tool_boundary()).await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), active.controls.recv())
+                    .await
+                    .is_err(),
+                "stop, accepted steers, and Next input must not be retried on later boundaries"
+            );
+            active.finish.send(()).unwrap();
+            if !stop {
+                let queued = next(&mut turns).await;
+                assert_eq!(queued.turn.message_id, queued_id);
+                assert_eq!(
+                    queued.turn.attachments,
+                    vec![PathBuf::from("screenshot.png")]
+                );
+                queued.finish.send(()).unwrap();
+            } else {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), turns.recv())
+                        .await
+                        .is_err(),
+                    "compaction completion cannot resume a stopped session"
+                );
+            }
+            command_tx
+                .send(HostCommand::Stop { session_id })
+                .await
+                .unwrap();
+            actor.await.unwrap().unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");

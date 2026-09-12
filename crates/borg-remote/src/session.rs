@@ -3444,7 +3444,7 @@ async fn run_agent_session_store_kernel(
                         provider_context_usage_valid = true;
                     }
                     record(&mut journal, &events, session_id, kind).await?;
-                    if retry_steers && !context_compaction_in_progress {
+                    if retry_steers && !context_compaction_in_progress && !user_stop && !interrupted {
                         steer_boundary_generation = steer_boundary_generation.saturating_add(1);
                         retry_pending_steers(
                             &control_tx,
@@ -3670,7 +3670,7 @@ async fn run_agent_session_store_kernel(
                                 PendingSteerState::RetryAtBoundary { error };
                             let boundary_already_passed = pending_steers[index].attempt_boundary
                                 < steer_boundary_generation;
-                            if boundary_already_passed {
+                            if boundary_already_passed && !context_compaction_in_progress && !user_stop && !interrupted {
                                 retry_pending_steers(
                                     &control_tx,
                                     &steer_result_tx,
