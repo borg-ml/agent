@@ -18,7 +18,7 @@ use borg_remote::{
     AgentTurnExecutor, ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus,
     HostCommand, HostConfig, HostExecutionProfile, HostExecutorFactory, LaunchSession,
     LocalAgentSettings, LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus,
-    PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage,
+    PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, RecoveryParts, ResponseLanguage,
     SessionConfigAction, SessionEvent, SessionEventKind, SessionGoal, SessionState, SessionStatus,
     SessionStore, SessionWriterLease, SpawnSubagent, SqliteSessionStore, SubagentAction,
     SubagentSnapshot, SubagentStatus, TodoAction, default_host_config_path, enroll_host,
@@ -30,7 +30,7 @@ use borg_remote::{
     run_host_with_executor_factory, send_local_session_command, session_control_socket_path,
 };
 use chrono::{Local, TimeZone, Utc};
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 use pulldown_cmark::{Event as MarkdownEvent, Parser as MarkdownParser};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
@@ -80,6 +80,11 @@ const RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT: usize = 512;
 const RICH_TUI_HISTORY_MESSAGE_LIMIT: usize = 8;
 const RICH_TUI_HISTORY_PAGE_SIZE: usize = 512;
 const RICH_TUI_PROMPT_HISTORY_LIMIT: usize = 64;
+/// Bounded fan-out for per-child resume reads.
+///
+/// Matched to the SQLite pool so a large team saturates the available
+/// connections without queueing work the store cannot start anyway.
+const SUBAGENT_HYDRATION_CONCURRENCY: usize = 4;
 type BluDiscoveryResult = Result<(
     crate::extensions::ExtensionCatalog,
     Vec<borg_provider::mcp::ExternalMcpServer>,
@@ -2397,12 +2402,15 @@ async fn run_local_agent_session(
     let mut displayed_update_notice = startup_update_notice;
     // Pending prompts are durable queue state, not part of the bounded
     // transcript bootstrap. Hydrate them after first paint so a long queue
-    // cannot make resume wait on the full recovery projection.
+    // cannot make resume wait on the full recovery projection, and ask the
+    // store for the queue slice alone: the context slice carries every tool
+    // payload in the session and is only needed by the agent actor's own
+    // replay, not by the composer.
     let mut pending_prompt_task = (resuming && terminal.is_some()).then(|| {
         let pending_store = Arc::clone(&store);
         tokio::spawn(async move {
             pending_store
-                .recovery(session_id)
+                .recovery_parts(session_id, RecoveryParts::QUEUE)
                 .await
                 .map(|recovery| recovery.queue_events)
         })
@@ -2420,9 +2428,9 @@ async fn run_local_agent_session(
                 .await
         })
     });
-    // Team recovery can involve the entire root projection plus one child-tail
-    // query per roster entry. Start it only after the latest root tail is on
-    // screen so it can never delay the first frame.
+    // Team recovery reads the roster slice plus one bounded child-tail query
+    // per roster entry. Start it only after the latest root tail is on screen
+    // so it can never delay the first frame.
     let mut team_state_task = (resuming && terminal.is_some()).then(|| {
         let team_store = Arc::clone(&store);
         let team_sessions_dir = sessions_dir.clone();
@@ -7618,24 +7626,43 @@ async fn load_subagent_thread_state(
     Vec<SubagentSnapshot>,
     HashMap<Uuid, Vec<SessionEvent>>,
 )> {
-    let team_history = store.recovery(session_id).await?.subagent_events;
+    let team_history = store
+        .recovery_parts(session_id, RecoveryParts::SUBAGENTS)
+        .await?
+        .subagent_events;
     let mut team_snapshots = latest_subagent_snapshots(&team_history);
     reconcile_subagent_snapshots(store, sessions_dir, &mut team_snapshots).await;
-    let mut child_histories = HashMap::new();
-    for agent in &mut team_snapshots {
-        match child_authored_history(store, agent.session_id).await {
-            Ok(events) => {
-                child_histories.insert(agent.session_id, events);
+    // A large team hydrates one bounded tail per child. Run those reads with
+    // bounded concurrency instead of one round trip at a time: a session with
+    // two dozen subagents otherwise serialises dozens of SQLite queries behind
+    // each other before the team panel can leave its hydrating state.
+    let child_histories = futures_util::stream::iter(
+        team_snapshots
+            .iter()
+            .map(|agent| agent.session_id)
+            .collect::<Vec<_>>(),
+    )
+    .map(|child_id| async move { (child_id, child_authored_history(store, child_id).await) })
+    .buffer_unordered(SUBAGENT_HYDRATION_CONCURRENCY)
+    .fold(
+        HashMap::new(),
+        |mut histories, (child_id, result)| async move {
+            match result {
+                Ok(events) => {
+                    histories.insert(child_id, events);
+                }
+                Err(store_error) => {
+                    tracing::warn!(
+                        child_session_id = %child_id,
+                        %store_error,
+                        "could not load subagent transcript history"
+                    );
+                }
             }
-            Err(store_error) => {
-                tracing::warn!(
-                    child_session_id = %agent.session_id,
-                    %store_error,
-                    "could not load subagent transcript history"
-                );
-            }
-        }
-    }
+            histories
+        },
+    )
+    .await;
     Ok((team_history, team_snapshots, child_histories))
 }
 
@@ -7644,13 +7671,25 @@ async fn reconcile_subagent_snapshots(
     sessions_dir: &Path,
     agents: &mut [SubagentSnapshot],
 ) {
+    // Parent SubagentActivity is a durable mirror, not the child's status
+    // authority. A crash can happen after the child journals Stopped but
+    // before the parent mirrors it. Resolve the child ledger before the
+    // hydrated roster is exposed so it cannot advertise stale work. The reads
+    // are independent per child, so issue them with bounded concurrency and
+    // apply the results in roster order.
+    let states = futures_util::stream::iter(
+        agents
+            .iter()
+            .map(|agent| agent.session_id)
+            .collect::<Vec<_>>(),
+    )
+    .map(|child_id| async move { (child_id, store.state(child_id).await.ok()) })
+    .buffer_unordered(SUBAGENT_HYDRATION_CONCURRENCY)
+    .collect::<HashMap<_, _>>()
+    .await;
     for agent in agents {
-        // Parent SubagentActivity is a durable mirror, not the child's status
-        // authority. A crash can happen after the child journals Stopped but
-        // before the parent mirrors it. Resolve the child ledger before the
-        // hydrated roster is exposed so it cannot advertise stale work.
-        if let Ok(state) = store.state(agent.session_id).await {
-            reconcile_subagent_snapshot(agent, &state);
+        if let Some(Some(state)) = states.get(&agent.session_id) {
+            reconcile_subagent_snapshot(agent, state);
         }
         reconcile_dormant_subagent_snapshot(sessions_dir, agent);
     }

@@ -955,24 +955,102 @@ pub struct SessionLiveEvent {
     pub event: SessionEvent,
 }
 
+/// Which slices of a recovery projection a caller actually needs.
+///
+/// Recovery is the widest read in the store: on a long session it matches
+/// every context, queue, and subagent row, and the context slice carries the
+/// tool payloads. Resume only needs the queue slice to restore pending prompts
+/// and the subagent slice to seed the team roster, so let those callers narrow
+/// the scan instead of materialising hundreds of megabytes they drop anyway.
+/// Narrowing never changes which events a slice contains, only which slices
+/// are populated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryParts {
+    pub context: bool,
+    pub queue: bool,
+    pub subagents: bool,
+}
+
+impl RecoveryParts {
+    /// The full projection an agent session needs to rebuild provider context.
+    pub const ALL: Self = Self {
+        context: true,
+        queue: true,
+        subagents: true,
+    };
+    /// Pending-prompt recovery only.
+    pub const QUEUE: Self = Self {
+        context: false,
+        queue: true,
+        subagents: false,
+    };
+    /// Team-roster recovery only.
+    pub const SUBAGENTS: Self = Self {
+        context: false,
+        queue: false,
+        subagents: true,
+    };
+}
+
+impl Default for RecoveryParts {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
 impl SessionRecovery {
-    fn from_events(events: Vec<SessionEvent>) -> Self {
+    fn from_events(events: Vec<SessionEvent>, parts: RecoveryParts) -> Self {
         let mut recovery = Self::default();
         for event in events {
-            if matches!(event.kind, SessionEventKind::ContextCleared) {
-                recovery.context_events.clear();
+            if parts.context {
+                if matches!(event.kind, SessionEventKind::ContextCleared) {
+                    recovery.context_events.clear();
+                }
+                if event.kind.is_context_relevant() {
+                    recovery.context_events.push(event.clone());
+                }
             }
-            if event.kind.is_context_relevant() {
-                recovery.context_events.push(event.clone());
-            }
-            if event.kind.is_queue_relevant() {
+            if parts.queue && event.kind.is_queue_relevant() {
                 recovery.queue_events.push(event.clone());
             }
-            if event.kind.is_subagent_relevant() {
+            if parts.subagents && event.kind.is_subagent_relevant() {
                 recovery.subagent_events.push(event);
             }
         }
         recovery
+    }
+}
+
+/// SQL predicate restricting a recovery scan to the requested slices.
+///
+/// The context slice spans many event kinds with no cheap column expression,
+/// so it keeps using the `recovery_relevant` partial index unchanged. Queue-
+/// and subagent-only callers add an `event_kind` narrowing on top of that same
+/// index, which is what keeps the multi-hundred-megabyte tool payloads out of
+/// the result set.
+fn recovery_scan_predicate(parts: RecoveryParts, alias: &str) -> String {
+    if parts.context {
+        return format!("{alias}recovery_relevant = 1");
+    }
+    let mut kinds: Vec<&str> = Vec::new();
+    if parts.queue {
+        kinds.push("'message'");
+        kinds.push("'prompt_recalled'");
+    }
+    if parts.subagents {
+        kinds.push("'subagent_activity'");
+    }
+    match kinds.as_slice() {
+        [] => "0 = 1".to_string(),
+        // Every `subagent_activity` row is recovery-relevant by construction,
+        // so dropping the redundant flag lets SQLite plan the roster read
+        // through `idx_session_events_subagent_recovery` instead of walking
+        // the whole recovery index.
+        ["'subagent_activity'"] => format!("{alias}event_kind = 'subagent_activity'"),
+        kinds => format!(
+            "{alias}recovery_relevant = 1 and {alias}event_kind in ({})",
+            kinds.join(", ")
+        ),
     }
 }
 
@@ -1099,6 +1177,19 @@ pub trait SessionStore: Send + Sync {
         Ok(0)
     }
     async fn recovery(&self, session_id: Uuid) -> Result<SessionRecovery>;
+    /// Recover only the requested slices.
+    ///
+    /// Resume needs the queue and subagent slices long before (and without)
+    /// the context slice that carries every tool payload in the session, so
+    /// this lets a caller pay for exactly the rows it will use. The default
+    /// falls back to the full projection, which is a superset of every slice.
+    async fn recovery_parts(
+        &self,
+        session_id: Uuid,
+        _parts: RecoveryParts,
+    ) -> Result<SessionRecovery> {
+        self.recovery(session_id).await
+    }
     async fn recovery_from_provider_checkpoint(
         &self,
         _session_id: Uuid,
@@ -3405,6 +3496,11 @@ impl SqliteSessionStore {
                     sequence desc
                 ) where event_kind = 'subagent_activity';
 
+            create index if not exists idx_session_events_context_compaction
+                on session_events (session_id, sequence desc)
+                where event_kind = 'provider_event'
+                  and json_extract(event_json, '$.kind.kind') = 'context_compaction';
+
             create index if not exists idx_session_events_context_clear
                 on session_events (session_id, sequence desc)
                 where event_kind = 'context_cleared';
@@ -4004,7 +4100,7 @@ impl SqliteSessionStore {
                 .min(session.next_sequence.saturating_sub(1));
             if logical_limit > session.inherited_event_count {
                 let event = sqlx::query_scalar::<_, String>(
-                    "select event_json from session_events \
+                    "select event_json from session_events indexed by idx_session_events_context_compaction \
                      where session_id = ? and sequence > ? and sequence <= ? \
                      and event_kind = 'provider_event' \
                      and json_extract(event_json, '$.kind.kind') = 'context_compaction' \
@@ -4056,6 +4152,7 @@ impl SqliteSessionStore {
         &'a self,
         session_id: Uuid,
         before_or_at: Option<u64>,
+        parts: RecoveryParts,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<StoredEvent>>> + Send + 'a>> {
         Box::pin(async move {
             let session = self.session_row(session_id).await?;
@@ -4073,12 +4170,21 @@ impl SqliteSessionStore {
                     // Recurse through the recovery-only path instead; it
                     // preserves the same cut while letting each generation
                     // apply its indexed recovery filter.
-                    let mut inherited = self.composed_recovery_events(parent, Some(cut)).await?;
+                    let mut inherited = self
+                        .composed_recovery_events(parent, Some(cut), RecoveryParts::ALL)
+                        .await?;
                     inherited.retain(|event| event.fork_inheritable);
                     inherited.truncate(usize::try_from(inherited_limit).unwrap_or(usize::MAX));
+                    inherited.retain(|stored| {
+                        (parts.context && stored.event.kind.is_context_relevant())
+                            || (parts.queue && stored.event.kind.is_queue_relevant())
+                            || (parts.subagents && stored.event.kind.is_subagent_relevant())
+                    });
                     inherited
                 } else {
-                    let mut inherited = self.composed_recovery_events(parent, Some(cut)).await?;
+                    let mut inherited = self
+                        .composed_recovery_events(parent, Some(cut), parts)
+                        .await?;
                     inherited.retain(|event| event.fork_inheritable);
                     inherited
                 }
@@ -4086,25 +4192,49 @@ impl SqliteSessionStore {
                 Vec::new()
             };
             if logical_limit > session.inherited_event_count {
-                let rows = sqlx::query(
-                    "select event_json, fork_inheritable from session_events \
-                     where session_id = ? and sequence > ? and sequence <= ? \
-                     and recovery_relevant = 1 \
-                     and (event_kind != 'subagent_activity' or sequence in ( \
-                       select max(sequence) from session_events \
-                       where session_id = ? and sequence > ? and sequence <= ? \
-                       and event_kind = 'subagent_activity' \
-                       group by json_extract(event_json, '$.kind.agent.session_id') \
-                     )) order by sequence",
-                )
-                .bind(session_id.to_string())
-                .bind(i64::try_from(session.inherited_event_count).unwrap_or(i64::MAX))
-                .bind(i64::try_from(logical_limit).unwrap_or(i64::MAX))
-                .bind(session_id.to_string())
-                .bind(i64::try_from(session.inherited_event_count).unwrap_or(i64::MAX))
-                .bind(i64::try_from(logical_limit).unwrap_or(i64::MAX))
-                .fetch_all(&self.pool)
-                .await?;
+                let after = i64::try_from(session.inherited_event_count).unwrap_or(i64::MAX);
+                let until = i64::try_from(logical_limit).unwrap_or(i64::MAX);
+                let rows = if parts == RecoveryParts::SUBAGENTS {
+                    // CROSS JOIN keeps SQLite on the covering roster index first,
+                    // followed by one primary-key lookup per child, rather than
+                    // scanning every session event in the outer loop.
+                    sqlx::query(
+                        "select e.event_json, e.fork_inheritable from \
+                         (select max(sequence) as sequence from session_events \
+                               where session_id = ? and sequence > ? and sequence <= ? \
+                               and event_kind = 'subagent_activity' \
+                               group by json_extract(event_json, '$.kind.agent.session_id') \
+                              ) latest cross join session_events e \
+                         where e.session_id = ? and e.sequence = latest.sequence order by e.sequence",
+                    )
+                    .bind(session_id.to_string())
+                    .bind(after)
+                    .bind(until)
+                    .bind(session_id.to_string())
+                    .fetch_all(&self.pool)
+                    .await?
+                } else {
+                    sqlx::query(sqlx::AssertSqlSafe(format!(
+                        "select event_json, fork_inheritable from session_events \
+                         where session_id = ? and sequence > ? and sequence <= ? \
+                         and {predicate} \
+                         and (event_kind != 'subagent_activity' or sequence in ( \
+                           select max(sequence) from session_events \
+                           where session_id = ? and sequence > ? and sequence <= ? \
+                           and event_kind = 'subagent_activity' \
+                           group by json_extract(event_json, '$.kind.agent.session_id') \
+                         )) order by sequence",
+                        predicate = recovery_scan_predicate(parts, ""),
+                    )))
+                    .bind(session_id.to_string())
+                    .bind(after)
+                    .bind(until)
+                    .bind(session_id.to_string())
+                    .bind(after)
+                    .bind(until)
+                    .fetch_all(&self.pool)
+                    .await?
+                };
                 for row in rows {
                     events.push(StoredEvent {
                         event: serde_json::from_str(row.try_get("event_json")?)?,
@@ -4121,26 +4251,57 @@ impl SqliteSessionStore {
         session_id: Uuid,
         recovery_start_sequence: i64,
         resolved_message_id: Option<Uuid>,
+        parts: RecoveryParts,
     ) -> Result<SessionRecovery> {
         // A replay boundary does not discard unresolved prompts or the latest
         // durable state of existing subagents.
         let session_key = session_id.to_string();
         let resolved_message_id = resolved_message_id.map(|id| id.to_string());
-        let suffix = sqlx::query(
-            "select e.event_json from session_events e \
-                 where e.session_id = ? and e.sequence >= ? and e.recovery_relevant = 1 \
+        let suffix_sql = if parts == RecoveryParts::SUBAGENTS {
+            // Same index-shape reasoning as `composed_recovery_events`: drive
+            // the roster read from the dedup subquery, not the primary key.
+            sqlx::AssertSqlSafe(
+                "select e.event_json from \
+                 (select max(sequence) as sequence from session_events \
+                       where session_id = ? and event_kind = 'subagent_activity' \
+                       group by json_extract(event_json, '$.kind.agent.session_id') \
+                      ) latest cross join session_events e \
+                 where e.session_id = ? and e.sequence = latest.sequence and e.sequence >= ? order by e.sequence"
+                    .to_string(),
+            )
+        } else {
+            sqlx::AssertSqlSafe(format!(
+                "select e.event_json from session_events e \
+                 where e.session_id = ? and e.sequence >= ? and {predicate} \
                  and (e.event_kind != 'subagent_activity' or e.sequence in ( \
                    select max(sequence) from session_events \
                    where session_id = ? and event_kind = 'subagent_activity' \
                    group by json_extract(event_json, '$.kind.agent.session_id') \
                  )) order by e.sequence",
-        )
-        .bind(&session_key)
-        .bind(recovery_start_sequence)
-        .bind(&session_key)
+                predicate = recovery_scan_predicate(parts, "e."),
+            ))
+        };
+        let suffix = if parts == RecoveryParts::SUBAGENTS {
+            sqlx::query(suffix_sql)
+                .bind(&session_key)
+                .bind(&session_key)
+                .bind(recovery_start_sequence)
+        } else {
+            sqlx::query(suffix_sql)
+                .bind(&session_key)
+                .bind(recovery_start_sequence)
+                .bind(&session_key)
+        }
         .fetch_all(&self.pool);
-        let legacy_messages = sqlx::query(
-            "select e.event_json from session_events e \
+        // Each pre-boundary query below reconstructs one slice. Skipping the
+        // slices a caller did not ask for is what keeps a queue-only or
+        // roster-only resume read off the unrelated scans.
+        let legacy_messages = async {
+            if !parts.queue {
+                return Ok(Vec::new());
+            }
+            sqlx::query(
+                "select e.event_json from session_events e \
                  left join session_actions a \
                    on a.session_id = e.session_id and a.action_id = e.message_id \
                  where e.session_id = ? and e.sequence < ? \
@@ -4150,40 +4311,54 @@ impl SqliteSessionStore {
                  and (a.action_id is null \
                    or a.state not in ('completed', 'failed', 'cancelled')) \
                  order by e.sequence",
-        )
-        .bind(&session_key)
-        .bind(recovery_start_sequence)
-        .bind(&resolved_message_id)
-        .bind(&resolved_message_id)
-        .fetch_all(&self.pool);
-        let legacy_recalls = sqlx::query(
-            "select e.event_json from session_events e \
+            )
+            .bind(&session_key)
+            .bind(recovery_start_sequence)
+            .bind(&resolved_message_id)
+            .bind(&resolved_message_id)
+            .fetch_all(&self.pool)
+            .await
+        };
+        let legacy_recalls = async {
+            if !parts.queue {
+                return Ok(Vec::new());
+            }
+            sqlx::query(
+                "select e.event_json from session_events e \
                  where e.session_id = ? and e.sequence < ? \
                  and e.event_kind = 'prompt_recalled' order by e.sequence",
-        )
-        .bind(&session_key)
-        .bind(recovery_start_sequence)
-        .fetch_all(&self.pool);
-        let prior_subagents = sqlx::query(
-            "select e.event_json from session_events e \
+            )
+            .bind(&session_key)
+            .bind(recovery_start_sequence)
+            .fetch_all(&self.pool)
+            .await
+        };
+        let prior_subagents = async {
+            if !parts.subagents {
+                return Ok(Vec::new());
+            }
+            sqlx::query(
+                "select e.event_json from session_events e \
                  where e.session_id = ? and e.sequence < ? \
                  and e.event_kind = 'subagent_activity' and e.sequence in ( \
                    select max(sequence) from session_events \
                    where session_id = ? and event_kind = 'subagent_activity' \
                    group by json_extract(event_json, '$.kind.agent.session_id') \
                  ) order by e.sequence",
-        )
-        .bind(&session_key)
-        .bind(recovery_start_sequence)
-        .bind(&session_key)
-        .fetch_all(&self.pool);
+            )
+            .bind(&session_key)
+            .bind(recovery_start_sequence)
+            .bind(&session_key)
+            .fetch_all(&self.pool)
+            .await
+        };
         let (suffix, legacy_messages, legacy_recalls, prior_subagents) =
             tokio::try_join!(suffix, legacy_messages, legacy_recalls, prior_subagents)?;
         let suffix = suffix
             .into_iter()
             .map(|row| serde_json::from_str(row.try_get("event_json")?).map_err(Into::into))
             .collect::<Result<Vec<SessionEvent>>>()?;
-        let mut recovery = SessionRecovery::from_events(suffix);
+        let mut recovery = SessionRecovery::from_events(suffix, parts);
         let mut queue_events = legacy_messages
             .into_iter()
             .chain(legacy_recalls)
@@ -4230,19 +4405,28 @@ impl SqliteSessionStore {
             unreachable!("provider checkpoint query returned a non-terminal event");
         };
         Ok(Some(
-            self.recovery_projection_from_sequence(session_id, sequence, Some(message_id))
-                .await?,
+            self.recovery_projection_from_sequence(
+                session_id,
+                sequence,
+                Some(message_id),
+                RecoveryParts::ALL,
+            )
+            .await?,
         ))
     }
 
-    async fn recovery_projection(&self, session_id: Uuid) -> Result<SessionRecovery> {
+    async fn recovery_projection(
+        &self,
+        session_id: Uuid,
+        parts: RecoveryParts,
+    ) -> Result<SessionRecovery> {
         let boundary = sqlx::query(
             "select s.inherited_event_count, ( \
                select e.sequence from session_events e \
                where e.session_id = s.id and e.event_kind = 'context_cleared' \
                order by e.sequence desc limit 1 \
              ) as context_clear_sequence, ( \
-               select e.sequence from session_events e \
+               select e.sequence from session_events e indexed by idx_session_events_context_compaction \
                where e.session_id = s.id and e.event_kind = 'provider_event' \
                  and json_extract(e.event_json, '$.kind.kind') = 'context_compaction' \
                  and (json_extract(e.event_json, '$.kind.payload.status') = 'completed' \
@@ -4296,11 +4480,11 @@ impl SqliteSessionStore {
             && let Some(recovery_start_sequence) = recovery_start_sequence
         {
             return self
-                .recovery_projection_from_sequence(session_id, recovery_start_sequence, None)
+                .recovery_projection_from_sequence(session_id, recovery_start_sequence, None, parts)
                 .await;
         }
         let events = self
-            .composed_recovery_events(session_id, None)
+            .composed_recovery_events(session_id, None, parts)
             .await?
             .into_iter()
             .map(|stored| {
@@ -4312,7 +4496,7 @@ impl SqliteSessionStore {
                 event
             })
             .collect();
-        Ok(SessionRecovery::from_events(events))
+        Ok(SessionRecovery::from_events(events, parts))
     }
 
     async fn fork_projection(
@@ -6399,7 +6583,16 @@ impl SessionStore for SqliteSessionStore {
     }
 
     async fn recovery(&self, session_id: Uuid) -> Result<SessionRecovery> {
-        self.recovery_projection(session_id).await
+        self.recovery_projection(session_id, RecoveryParts::ALL)
+            .await
+    }
+
+    async fn recovery_parts(
+        &self,
+        session_id: Uuid,
+        parts: RecoveryParts,
+    ) -> Result<SessionRecovery> {
+        self.recovery_projection(session_id, parts).await
     }
 
     async fn recovery_from_provider_checkpoint(

@@ -110,11 +110,11 @@ pub use session_action::{
 };
 pub use session_lock::SessionWriterLease;
 pub use session_store::{
-    ClaimedActionTransition, EventPersistence, SESSION_PROJECTION_VERSION, SessionConfiguration,
-    SessionHistoryHit, SessionHistoryIndexDocument, SessionHistoryPage, SessionHistoryPayload,
-    SessionHistoryQuery, SessionHistorySearchMode, SessionLiveEvent, SessionRecovery, SessionState,
-    SessionStore, SessionStoreFork, SessionStoreHealth, SessionSummary, SessionUsage,
-    SessionWorkspaceBinding, SqliteSessionStore,
+    ClaimedActionTransition, EventPersistence, RecoveryParts, SESSION_PROJECTION_VERSION,
+    SessionConfiguration, SessionHistoryHit, SessionHistoryIndexDocument, SessionHistoryPage,
+    SessionHistoryPayload, SessionHistoryQuery, SessionHistorySearchMode, SessionLiveEvent,
+    SessionRecovery, SessionState, SessionStore, SessionStoreFork, SessionStoreHealth,
+    SessionSummary, SessionUsage, SessionWorkspaceBinding, SqliteSessionStore,
 };
 pub use subagents::{
     AgentToolDispatcher, AgentToolServer, DEFAULT_MAX_SUBAGENTS, SpawnSubagent, SubagentActivity,

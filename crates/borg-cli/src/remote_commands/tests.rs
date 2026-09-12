@@ -2704,3 +2704,69 @@ fn usage_screen_keeps_account_limits_and_session_usage_distinct() {
     assert!(claude_summary.contains("Account limits · Claude"));
     assert!(claude_summary.contains("[░░░░░░░░░░░░░░░░░░░░] 0% left"));
 }
+
+/// Run against a database copy: opening the store may apply schema updates.
+#[tokio::test]
+#[ignore = "explicit real-session resume performance benchmark"]
+async fn resume_hydration_over_a_real_session_store_is_bounded() {
+    let path = std::env::var_os("BORG_RESUME_BENCH_DB")
+        .expect("set BORG_RESUME_BENCH_DB to a database copy");
+    let session =
+        std::env::var_os("BORG_RESUME_BENCH_SESSION").expect("set BORG_RESUME_BENCH_SESSION");
+    let path = PathBuf::from(path);
+    let session_id: Uuid = session
+        .to_string_lossy()
+        .parse()
+        .expect("BORG_RESUME_BENCH_SESSION must be a session uuid");
+    let sessions_dir = path.parent().expect("sessions directory").to_path_buf();
+    let store = SqliteSessionStore::open(&path)
+        .await
+        .expect("session store");
+    let events = store
+        .state(session_id)
+        .await
+        .expect("state")
+        .latest_sequence;
+
+    let bootstrap_started = Instant::now();
+    let bootstrap = recent_tui_history(&store, session_id, events)
+        .await
+        .expect("bootstrap history");
+    eprintln!(
+        "initial history bootstrap: {:?}, {} events",
+        bootstrap_started.elapsed(),
+        bootstrap.events.len()
+    );
+
+    let team_started = Instant::now();
+    let (team_history, snapshots, child_histories) =
+        load_subagent_thread_state(&store, &sessions_dir, session_id)
+            .await
+            .expect("team state");
+    let team_elapsed = team_started.elapsed();
+
+    let queue_started = Instant::now();
+    let queue = store
+        .recovery_parts(session_id, borg_remote::RecoveryParts::QUEUE)
+        .await
+        .expect("queue recovery")
+        .queue_events;
+    let queue_elapsed = queue_started.elapsed();
+
+    assert!(bootstrap.events.len() <= RICH_TUI_HISTORY_EVENT_LIMIT + 2);
+    assert_eq!(
+        latest_subagent_snapshots(&team_history).len(),
+        snapshots.len()
+    );
+    assert!(
+        child_histories
+            .values()
+            .all(|events| events.len() <= RICH_TUI_HISTORY_EVENT_LIMIT),
+        "child transcripts must stay bounded"
+    );
+    eprintln!(
+        "session {session_id} ({events} events, {} subagents): team hydration {team_elapsed:?}; queue hydration {queue_elapsed:?} ({} queue events)",
+        snapshots.len(),
+        queue.len(),
+    );
+}

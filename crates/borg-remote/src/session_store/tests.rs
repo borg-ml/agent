@@ -4739,3 +4739,300 @@ fn duration_p95(samples: &mut [Duration]) -> Duration {
     samples.sort_unstable();
     samples[(samples.len() * 95).div_ceil(100).saturating_sub(1)]
 }
+
+fn subagent_activity(
+    child_id: Uuid,
+    parent_id: Uuid,
+    task: &str,
+    status: crate::SubagentStatus,
+) -> SessionEventKind {
+    SessionEventKind::SubagentActivity {
+        activity: crate::SubagentActivityKind::Updated,
+        agent: crate::SubagentSnapshot {
+            session_id: child_id,
+            parent_session_id: parent_id,
+            task_name: task.to_string(),
+            status,
+            provider: crate::CodingProvider::Claude,
+            model: None,
+            effort: None,
+            cwd: std::path::PathBuf::from("/tmp"),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            detail: None,
+            final_text: None,
+            usage: crate::SubagentUsage::default(),
+        },
+        event: None,
+    }
+}
+
+async fn seed_recovery_fixture(store: &SqliteSessionStore, session_id: Uuid, children: &[Uuid]) {
+    for (index, child) in children.iter().enumerate() {
+        for status in [
+            crate::SubagentStatus::Starting,
+            crate::SubagentStatus::Running,
+        ] {
+            store
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    subagent_activity(*child, session_id, &format!("task_{index}"), status),
+                ))
+                .await
+                .unwrap();
+        }
+    }
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            message(Uuid::new_v4(), "queued prompt"),
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::PromptRecalled {
+                message_id: Uuid::new_v4(),
+                text: "recalled prompt".into(),
+                attachments: Vec::new(),
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "tool-1".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "/tmp/a"}),
+                input_ref: None,
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ToolCompleted {
+                tool_call_id: "tool-1".into(),
+                output: "ok".into(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+            },
+        ))
+        .await
+        .unwrap();
+}
+
+fn event_ids(events: &[SessionEvent]) -> Vec<Uuid> {
+    events.iter().map(|event| event.id).collect()
+}
+
+#[tokio::test]
+async fn narrowed_recovery_parts_match_the_full_projection() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let children = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    seed_recovery_fixture(&store, session_id, &children).await;
+
+    let full = store.recovery(session_id).await.unwrap();
+    assert_eq!(
+        full.subagent_events.len(),
+        children.len(),
+        "recovery keeps only the latest activity per child"
+    );
+    assert!(!full.queue_events.is_empty());
+    assert!(!full.context_events.is_empty());
+
+    let queue = store
+        .recovery_parts(session_id, RecoveryParts::QUEUE)
+        .await
+        .unwrap();
+    assert_eq!(
+        event_ids(&queue.queue_events),
+        event_ids(&full.queue_events)
+    );
+    assert!(queue.context_events.is_empty());
+    assert!(queue.subagent_events.is_empty());
+
+    let subagents = store
+        .recovery_parts(session_id, RecoveryParts::SUBAGENTS)
+        .await
+        .unwrap();
+    assert_eq!(
+        event_ids(&subagents.subagent_events),
+        event_ids(&full.subagent_events)
+    );
+    assert!(subagents.context_events.is_empty());
+    assert!(subagents.queue_events.is_empty());
+
+    let all = store
+        .recovery_parts(session_id, RecoveryParts::ALL)
+        .await
+        .unwrap();
+    assert_eq!(
+        event_ids(&all.context_events),
+        event_ids(&full.context_events)
+    );
+    assert_eq!(event_ids(&all.queue_events), event_ids(&full.queue_events));
+    assert_eq!(
+        event_ids(&all.subagent_events),
+        event_ids(&full.subagent_events)
+    );
+}
+
+#[tokio::test]
+async fn narrowed_recovery_preserves_a_cut_inside_inherited_history() {
+    let (_directory, store) = store().await;
+    let parent = Uuid::new_v4();
+    store.create_session(parent).await.unwrap();
+    for index in 0..2 {
+        store
+            .append(SessionEvent::new(
+                parent,
+                0,
+                SessionEventKind::ToolCompleted {
+                    tool_call_id: format!("tool-{index}"),
+                    output: "result".into(),
+                    output_ref: None,
+                    is_error: false,
+                    input: None,
+                    input_ref: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let mut prompt = message(Uuid::new_v4(), "completed prompt");
+        if let SessionEventKind::Message { status, .. } = &mut prompt {
+            *status = crate::MessageStatus::Complete;
+        }
+        store
+            .append(SessionEvent::new(parent, 0, prompt))
+            .await
+            .unwrap();
+    }
+    let child = Uuid::new_v4();
+    store.fork_before(parent, child, 5).await.unwrap();
+    let grandchild = Uuid::new_v4();
+    store.fork_before(child, grandchild, 3).await.unwrap();
+    let full = store.recovery(grandchild).await.unwrap();
+    let queue = store
+        .recovery_parts(grandchild, RecoveryParts::QUEUE)
+        .await
+        .unwrap();
+    assert_eq!(full.queue_events.len(), 1);
+    assert_eq!(
+        event_ids(&queue.queue_events),
+        event_ids(&full.queue_events)
+    );
+}
+
+#[tokio::test]
+async fn narrowed_recovery_parts_match_the_full_projection_across_a_context_boundary() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let children = [Uuid::new_v4(), Uuid::new_v4()];
+    seed_recovery_fixture(&store, session_id, &children).await;
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ContextCleared,
+        ))
+        .await
+        .unwrap();
+    seed_recovery_fixture(&store, session_id, &children).await;
+
+    let full = store.recovery(session_id).await.unwrap();
+    let queue = store
+        .recovery_parts(session_id, RecoveryParts::QUEUE)
+        .await
+        .unwrap();
+    let subagents = store
+        .recovery_parts(session_id, RecoveryParts::SUBAGENTS)
+        .await
+        .unwrap();
+    assert_eq!(
+        event_ids(&queue.queue_events),
+        event_ids(&full.queue_events)
+    );
+    assert!(queue.context_events.is_empty());
+    assert_eq!(
+        event_ids(&subagents.subagent_events),
+        event_ids(&full.subagent_events)
+    );
+    assert!(subagents.context_events.is_empty());
+    assert!(subagents.queue_events.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "explicit recovery performance benchmark"]
+async fn narrowed_recovery_skips_the_context_payloads_a_resume_never_reads() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    let children = (0..20).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+    seed_recovery_fixture(&store, session_id, &children).await;
+    // A long session is mostly tool traffic. Recovery has to match all of it
+    // for provider replay, which is exactly the cost resume should not pay to
+    // seed a roster or a prompt queue.
+    let payload = "x".repeat(4_096);
+    for index in 0..2_000 {
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ToolCompleted {
+                    tool_call_id: format!("tool-{index}"),
+                    output: payload.clone(),
+                    output_ref: None,
+                    is_error: false,
+                    input: None,
+                    input_ref: None,
+                },
+            ))
+            .await
+            .unwrap();
+    }
+
+    let full_started = Instant::now();
+    let full = store.recovery(session_id).await.unwrap();
+    let full_elapsed = full_started.elapsed();
+    let subagents_started = Instant::now();
+    let subagents = store
+        .recovery_parts(session_id, RecoveryParts::SUBAGENTS)
+        .await
+        .unwrap();
+    let subagents_elapsed = subagents_started.elapsed();
+    let queue_started = Instant::now();
+    let queue = store
+        .recovery_parts(session_id, RecoveryParts::QUEUE)
+        .await
+        .unwrap();
+    let queue_elapsed = queue_started.elapsed();
+
+    assert!(full.context_events.len() > 2_000);
+    assert_eq!(
+        event_ids(&subagents.subagent_events),
+        event_ids(&full.subagent_events)
+    );
+    assert_eq!(
+        event_ids(&queue.queue_events),
+        event_ids(&full.queue_events)
+    );
+    eprintln!(
+        "recovery over {} context events: full {full_elapsed:?}; roster-only {subagents_elapsed:?}; queue-only {queue_elapsed:?}",
+        full.context_events.len()
+    );
+}
