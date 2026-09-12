@@ -413,6 +413,7 @@ async fn accepted_steers_settle_in_fifo_order_when_acknowledgements_arrive_out_o
             },
             admission,
             state: PendingSteerState::AwaitingAcknowledgement,
+            acknowledgement_id: Uuid::new_v4(),
             attempt_boundary: 0,
         }
     };
@@ -4138,7 +4139,7 @@ async fn escape_flush_keeps_the_turn_running_after_admission_and_steers_queued_i
 
     loop {
         let notified = steer_seen.notified();
-        if steers.lock().unwrap().len() >= 3 {
+        if steers.lock().unwrap().len() >= 2 {
             break;
         }
         if tokio::time::timeout(Duration::from_secs(1), notified)
@@ -4156,7 +4157,7 @@ async fn escape_flush_keeps_the_turn_running_after_admission_and_steers_queued_i
     }
     assert_eq!(
         *steers.lock().unwrap(),
-        ["already admitted before escape", "queued one", "queued two"]
+        ["already admitted before escape", "queued one\n\nqueued two"]
     );
     assert!(
         !interrupted.load(Ordering::Acquire),
@@ -4609,28 +4610,28 @@ async fn compaction_defers_steers_preserves_next_attachments_and_respects_stop()
             active.events.send(completed.clone()).await.unwrap();
             observe(&mut event_rx, &completed).await;
             if !stop {
+                let AgentTurnControl::Steer {
+                    message_id,
+                    attachments,
+                    admission,
+                    ack,
+                    ..
+                } = next(&mut active.controls).await
+                else {
+                    panic!("compaction completion retries the pending steer");
+                };
+                assert_eq!(message_id, rejected_id);
+                assert_eq!(attachments, vec![PathBuf::from("screenshot.png"); 2]);
+                assert!(admission.accept());
+                ack.send(Ok(())).unwrap();
                 for expected_id in [rejected_id, steer_id] {
-                    let AgentTurnControl::Steer {
-                        message_id,
-                        attachments,
-                        admission,
-                        ack,
-                        ..
-                    } = next(&mut active.controls).await
-                    else {
-                        panic!("compaction completion retries the pending steer");
-                    };
-                    assert_eq!(message_id, expected_id);
-                    assert_eq!(attachments, vec![PathBuf::from("screenshot.png")]);
-                    assert!(admission.accept());
-                    ack.send(Ok(())).unwrap();
                     observe(
                         &mut event_rx,
                         &SessionEventKind::Message {
-                            message_id,
+                            message_id: expected_id,
                             actor: EventActor::User,
                             text: "follow up".to_string(),
-                            attachments,
+                            attachments: vec![PathBuf::from("screenshot.png")],
                             status: MessageStatus::Complete,
                             delivery: Some(PromptDelivery::Steer),
                         },
@@ -6637,6 +6638,7 @@ fn only_an_uncommitted_steer_is_withdrawable_from_the_active_turn() {
             },
             admission,
             state,
+            acknowledgement_id: Uuid::new_v4(),
             attempt_boundary: 0,
         };
     let accepted = SteerAdmission::pending();
@@ -11682,4 +11684,128 @@ async fn expired_connection_retry_is_not_starved_by_busy_maintenance() {
     })
     .await
     .expect("expired retry must beat continuously ready maintenance");
+}
+
+#[tokio::test]
+async fn shared_steer_batch_retries_and_targeted_recall_preserve_siblings() {
+    let (control_tx, mut controls) = mpsc::channel(16);
+    let (result_tx, _results) = mpsc::channel(16);
+    let mut pending = VecDeque::new();
+    for text in ["first", "second"] {
+        pending.push_back(PendingSteer {
+            prompt: QueuedPrompt {
+                message_id: Uuid::new_v4(),
+                text: text.into(),
+                actor: EventActor::User,
+                attachments: vec![PathBuf::from(format!("{text}.png"))],
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+                visible: true,
+                interrupt_batch: true,
+                batch: Vec::new(),
+            },
+            acknowledgement_id: Uuid::new_v4(),
+            admission: SteerAdmission::pending(),
+            state: PendingSteerState::RetryAtBoundary {
+                error: "compacting".into(),
+            },
+            attempt_boundary: 0,
+        });
+    }
+    retry_pending_steers(&control_tx, &result_tx, &mut pending, 1).await;
+    let AgentTurnControl::Steer {
+        text,
+        attachments,
+        admission: old_admission,
+        ack: old_ack,
+        ..
+    } = controls.recv().await.unwrap()
+    else {
+        panic!("expected steer")
+    };
+    assert_eq!(
+        text,
+        "first
+
+second"
+    );
+    assert_eq!(
+        attachments,
+        [PathBuf::from("first.png"), PathBuf::from("second.png")]
+    );
+    let old_attempt = pending[0].acknowledgement_id;
+    assert_eq!(old_attempt, pending[1].acknowledgement_id);
+    retry_pending_steers(&control_tx, &result_tx, &mut pending, 2).await;
+    assert!(
+        controls.try_recv().is_err(),
+        "a shared attempt must not revoke itself"
+    );
+    let mut third = pending[1].prompt.clone();
+    third.message_id = Uuid::new_v4();
+    third.text = "third".into();
+    third.attachments.clear();
+    pending.push_back(PendingSteer {
+        prompt: third,
+        acknowledgement_id: Uuid::new_v4(),
+        admission: SteerAdmission::pending(),
+        state: PendingSteerState::RetryAtBoundary {
+            error: "new input".into(),
+        },
+        attempt_boundary: 2,
+    });
+    retry_pending_steers(&control_tx, &result_tx, &mut pending, 2).await;
+    assert!(!old_admission.accept());
+    let _ = old_ack.send(Err("rebatched".into()));
+    let AgentTurnControl::Steer {
+        text,
+        admission: old_admission,
+        ack: old_ack,
+        ..
+    } = controls.recv().await.unwrap()
+    else {
+        panic!("expected expanded batch")
+    };
+    assert_eq!(
+        text,
+        "first
+
+second
+
+third"
+    );
+    let old_attempt = pending[0].acknowledgement_id;
+    assert!(
+        pending
+            .iter()
+            .all(|steer| steer.acknowledgement_id == old_attempt)
+    );
+    let target = pending[0].prompt.message_id;
+    let sibling = pending[1].prompt.message_id;
+    let recalled = recall_withdrawable_steers(&mut pending, Some(target));
+    assert_eq!(recalled.len(), 1);
+    assert_eq!(recalled[0].message_id, target);
+    assert!(!old_admission.accept(), "recalled batch cannot be admitted");
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].prompt.message_id, sibling);
+    assert_ne!(pending[0].acknowledgement_id, old_attempt);
+    let _ = old_ack.send(Err("withdrawn".into()));
+    retry_pending_steers(&control_tx, &result_tx, &mut pending, 3).await;
+    let AgentTurnControl::Steer {
+        text,
+        attachments,
+        admission,
+        ..
+    } = controls.recv().await.unwrap()
+    else {
+        panic!("expected sibling retry")
+    };
+    assert_eq!(
+        text,
+        "second
+
+third"
+    );
+    assert_eq!(attachments, [PathBuf::from("second.png")]);
+    assert!(admission.accept());
+    assert!(recall_withdrawable_steers(&mut pending, None).is_empty());
 }

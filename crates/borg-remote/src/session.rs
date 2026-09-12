@@ -228,6 +228,7 @@ impl QueuedPrompt {
 
 struct PendingSteer {
     prompt: QueuedPrompt,
+    acknowledgement_id: Uuid,
     admission: SteerAdmission,
     state: PendingSteerState,
     attempt_boundary: u64,
@@ -3633,17 +3634,19 @@ async fn run_agent_session_store_kernel(
                     break;
                 }
                 steer_result = steer_results.recv(), if !pending_steers.is_empty() => {
-                    let Some((message_id, acknowledgement)) = steer_result else {
+                    let Some((acknowledgement_id, acknowledgement)) = steer_result else {
                         continue;
                     };
                     let Some(index) = pending_steers
                         .iter()
-                        .position(|steer| steer.prompt.message_id == message_id)
+                        .position(|steer| steer.acknowledgement_id == acknowledgement_id)
                     else {
                         continue;
                     };
                     if pending_steers[index].admission.is_accepted() {
-                        pending_steers[index].state = PendingSteerState::Accepted;
+                        for steer in pending_steers.iter_mut().filter(|steer| steer.acknowledgement_id == acknowledgement_id) {
+                            steer.state = PendingSteerState::Accepted;
+                        }
                         settle_accepted_steers(
                             &mut journal,
                             &events,
@@ -3658,7 +3661,7 @@ async fn run_agent_session_store_kernel(
                         });
                         {
                             tracing::warn!(
-                                %message_id,
+                                %acknowledgement_id,
                                 %error,
                                 "provider rejected active-turn steer; retaining it for the next boundary"
                             );
@@ -3666,8 +3669,9 @@ async fn run_agent_session_store_kernel(
                             // at the next boundary, so it keeps its steer
                             // delivery. It is nonetheless unconsumed, which is
                             // what makes it honestly recallable meanwhile.
-                            pending_steers[index].state =
-                                PendingSteerState::RetryAtBoundary { error };
+                            for steer in pending_steers.iter_mut().filter(|steer| steer.acknowledgement_id == acknowledgement_id) {
+                                steer.state = PendingSteerState::RetryAtBoundary { error: error.clone() };
+                            }
                             let boundary_already_passed = pending_steers[index].attempt_boundary
                                 < steer_boundary_generation;
                             if boundary_already_passed && !context_compaction_in_progress && !user_stop && !interrupted {
@@ -3836,7 +3840,9 @@ async fn run_agent_session_store_kernel(
                                 .await?;
                             }
                             let admission = SteerAdmission::pending();
-                            let sent = if context_compaction_in_progress {
+                            let acknowledgement_id = Uuid::new_v4();
+                            let has_pending = pending_steers.iter().any(|steer| !steer.admission.is_accepted());
+                            let sent = if context_compaction_in_progress || has_pending {
                                 false
                             } else {
                                 dispatch_steer(
@@ -3844,11 +3850,13 @@ async fn run_agent_session_store_kernel(
                                     &steer_result_tx,
                                     &prompt,
                                     admission.clone(),
+                                    acknowledgement_id,
                                 )
                                 .await
                             };
                             pending_steers.push_back(PendingSteer {
                                 prompt,
+                                acknowledgement_id,
                                 admission,
                                 state: if sent {
                                     PendingSteerState::AwaitingAcknowledgement
@@ -3863,6 +3871,9 @@ async fn run_agent_session_store_kernel(
                                 },
                                 attempt_boundary: steer_boundary_generation,
                             });
+                            if has_pending && !context_compaction_in_progress && !user_stop && !interrupted {
+                                retry_pending_steers(&control_tx, &steer_result_tx, &mut pending_steers, steer_boundary_generation).await;
+                            }
                         }
                         HostCommand::Prompt {
                             message_id,
@@ -6032,20 +6043,38 @@ fn recall_withdrawable_steers(
     pending_steers: &mut VecDeque<PendingSteer>,
     message_id: Option<Uuid>,
 ) -> Vec<QueuedPrompt> {
+    let cancelled = pending_steers
+        .iter()
+        .filter_map(|steer| {
+            (matches!(
+                steer.state,
+                PendingSteerState::AwaitingAcknowledgement
+                    | PendingSteerState::RetryAtBoundary { .. }
+            ) && steer.prompt.visible
+                && message_id.is_none_or(|target| target == steer.prompt.message_id)
+                && steer.admission.recall())
+            .then_some(steer.acknowledgement_id)
+        })
+        .collect::<HashSet<_>>();
     let mut recalled = Vec::new();
     let mut retained = VecDeque::with_capacity(pending_steers.len());
-    while let Some(steer) = pending_steers.pop_front() {
-        let recallable = matches!(
-            steer.state,
-            PendingSteerState::AwaitingAcknowledgement | PendingSteerState::RetryAtBoundary { .. }
-        ) && steer.prompt.visible
-            && message_id.is_none_or(|target| target == steer.prompt.message_id)
-            && steer.admission.recall();
-        if recallable {
-            recalled.push(steer.prompt);
-        } else {
-            retained.push_back(steer);
+    while let Some(mut steer) = pending_steers.pop_front() {
+        if cancelled.contains(&steer.acknowledgement_id) {
+            if steer.prompt.visible
+                && message_id.is_none_or(|target| target == steer.prompt.message_id)
+            {
+                recalled.push(steer.prompt);
+                continue;
+            }
+            // A recalled batch cannot consume its remaining members. Keep them
+            // eligible under a new attempt so the old acknowledgement is stale.
+            steer.acknowledgement_id = Uuid::new_v4();
+            steer.admission = SteerAdmission::pending();
+            steer.state = PendingSteerState::RetryAtBoundary {
+                error: "batch member recalled".into(),
+            };
         }
+        retained.push_back(steer);
     }
     *pending_steers = retained;
     recalled
@@ -6497,6 +6526,7 @@ async fn dispatch_steer(
     steer_result_tx: &mpsc::Sender<(Uuid, std::result::Result<(), String>)>,
     prompt: &QueuedPrompt,
     admission: SteerAdmission,
+    acknowledgement_id: Uuid,
 ) -> bool {
     let (ack, result) = oneshot::channel();
     if control_tx
@@ -6513,13 +6543,14 @@ async fn dispatch_steer(
         return false;
     }
 
-    let message_id = prompt.message_id;
     let steer_result_tx = steer_result_tx.clone();
     tokio::spawn(async move {
         let acknowledgement = result.await.unwrap_or_else(|_| {
             Err("provider turn ended before the steer was acknowledged".to_string())
         });
-        let _ = steer_result_tx.send((message_id, acknowledgement)).await;
+        let _ = steer_result_tx
+            .send((acknowledgement_id, acknowledgement))
+            .await;
     });
     true
 }
@@ -6530,27 +6561,65 @@ async fn retry_pending_steers(
     pending_steers: &mut VecDeque<PendingSteer>,
     boundary_generation: u64,
 ) {
-    for steer in pending_steers.iter_mut() {
-        let PendingSteerState::RetryAtBoundary { error } = &steer.state else {
+    let attempts = pending_steers
+        .iter()
+        .filter(|steer| !steer.admission.is_accepted())
+        .map(|steer| steer.acknowledgement_id)
+        .collect::<HashSet<_>>();
+    let mut indices = Vec::new();
+    let mut withdrawn = HashSet::new();
+    for (index, steer) in pending_steers.iter_mut().enumerate() {
+        if steer.admission.is_accepted() {
             continue;
+        }
+        match &steer.state {
+            PendingSteerState::RetryAtBoundary { error } => {
+                tracing::debug!(message_id = %steer.prompt.message_id, previous_error = %error,
+                    "batching pending steer at provider boundary");
+            }
+            PendingSteerState::AwaitingAcknowledgement
+                if attempts.len() > 1
+                    && (withdrawn.contains(&steer.acknowledgement_id)
+                        || steer.admission.recall()) =>
+            {
+                withdrawn.insert(steer.acknowledgement_id);
+            }
+            _ => continue,
+        }
+        steer.state = PendingSteerState::RetryAtBoundary {
+            error: "waiting for batch admission".into(),
         };
-        tracing::debug!(
-            message_id = %steer.prompt.message_id,
-            previous_error = %error,
-            "retrying active-turn steer at provider boundary"
-        );
-        let admission = SteerAdmission::pending();
-        if dispatch_steer(
-            control_tx,
-            steer_result_tx,
-            &steer.prompt,
-            admission.clone(),
-        )
-        .await
-        {
-            steer.admission = admission;
-            steer.state = PendingSteerState::AwaitingAcknowledgement;
-            steer.attempt_boundary = boundary_generation;
+        indices.push(index);
+    }
+    let Some(&first) = indices.first() else {
+        return;
+    };
+    let mut prompt = pending_steers[first].prompt.clone();
+    for &index in indices.iter().skip(1) {
+        let next = &pending_steers[index].prompt;
+        prompt.text.push_str("\n\n");
+        prompt.text.push_str(&next.text);
+        prompt.attachments.extend(next.attachments.iter().cloned());
+    }
+    let admission = SteerAdmission::pending();
+    let acknowledgement_id = Uuid::new_v4();
+    for &index in &indices {
+        let steer = &mut pending_steers[index];
+        steer.admission = admission.clone();
+        steer.acknowledgement_id = acknowledgement_id;
+        steer.attempt_boundary = boundary_generation;
+    }
+    if dispatch_steer(
+        control_tx,
+        steer_result_tx,
+        &prompt,
+        admission,
+        acknowledgement_id,
+    )
+    .await
+    {
+        for index in indices {
+            pending_steers[index].state = PendingSteerState::AwaitingAcknowledgement;
         }
     }
 }
@@ -6576,22 +6645,12 @@ async fn flush_pending_input_into_active_turn(
             continue;
         }
         prompt.delivery = PromptDelivery::Steer;
-        let admission = SteerAdmission::pending();
-        let sent = !context_compaction_in_progress
-            && dispatch_steer(control_tx, steer_result_tx, &prompt, admission.clone()).await;
         pending_steers.push_back(PendingSteer {
             prompt,
-            admission,
-            state: if sent {
-                PendingSteerState::AwaitingAcknowledgement
-            } else {
-                PendingSteerState::RetryAtBoundary {
-                    error: if context_compaction_in_progress {
-                        "provider is compacting context".to_string()
-                    } else {
-                        "provider turn control was unavailable".to_string()
-                    },
-                }
+            acknowledgement_id: Uuid::new_v4(),
+            admission: SteerAdmission::pending(),
+            state: PendingSteerState::RetryAtBoundary {
+                error: "explicit pending-input flush".into(),
             },
             attempt_boundary: boundary_generation,
         });
@@ -6695,6 +6754,7 @@ async fn settle_accepted_steers(
     session_id: Uuid,
     pending_steers: &mut VecDeque<PendingSteer>,
 ) -> Result<()> {
+    let mut receipts = Vec::new();
     while matches!(
         pending_steers.front().map(|steer| &steer.state),
         Some(PendingSteerState::Accepted)
@@ -6702,24 +6762,41 @@ async fn settle_accepted_steers(
         let steer = pending_steers
             .pop_front()
             .expect("accepted steer was at the front");
-        record_prompt_status(
-            journal,
+        let mut entries = steer.prompt.batch.clone();
+        entries.push(steer.prompt.batch_entry());
+        for status in [MessageStatus::InProgress, MessageStatus::Complete] {
+            for entry in &entries {
+                receipts.extend(journal.take_projection_diagnostics());
+                receipts.push(
+                    journal
+                        .append(SessionEvent::new(
+                            session_id,
+                            0,
+                            SessionEventKind::Message {
+                                message_id: entry.message_id,
+                                actor: entry.actor,
+                                text: entry.text.clone(),
+                                attachments: entry.attachments.clone(),
+                                status,
+                                delivery: Some(PromptDelivery::Steer),
+                            },
+                        ))
+                        .await?,
+                );
+                receipts.extend(journal.take_projection_diagnostics());
+            }
+        }
+    }
+    // Persist the whole accepted run before emitting receipts, so storage and
+    // projection latency cannot make one admission trickle into the transcript.
+    for receipt in receipts {
+        deliver_recorded_event(
             events,
             session_id,
-            &steer.prompt,
-            MessageStatus::InProgress,
-            PromptDelivery::Steer,
+            receipt,
+            crate::EventPersistence::Durable,
         )
-        .await?;
-        record_prompt_status(
-            journal,
-            events,
-            session_id,
-            &steer.prompt,
-            MessageStatus::Complete,
-            PromptDelivery::Steer,
-        )
-        .await?;
+        .await;
     }
     Ok(())
 }
