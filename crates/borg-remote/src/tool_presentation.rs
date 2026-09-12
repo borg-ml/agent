@@ -96,7 +96,9 @@ pub fn project_tool_presentation(
         }),
         result: output.and_then(|output| summarize_tool_result(name, input, output, is_error)),
         body_rows: tool_detail_rows(name, input),
-        backgrounded: output.is_some_and(|output| !is_error && tool_output_is_backgrounded(output)),
+        backgrounded: (tool_can_start_background_process(name)
+            || matches!(tool_leaf_name(name).as_str(), "wait" | "write_stdin"))
+            && output.is_some_and(|output| !is_error && tool_output_is_backgrounded(output)),
         hidden: is_internal_tool(name),
         label,
         detail,
@@ -2963,6 +2965,32 @@ mod tests {
     fn background_process_helpers_share_provider_handle_and_output_contracts() {
         assert!(tool_can_start_background_process("functions.exec"));
         assert!(!tool_can_start_background_process("spawn_agent"));
+        let child_result = json!({
+            "structuredContent": {
+                "session_id": "child-1",
+                "parent_session_id": "root-1",
+                "status": "ready",
+                "reused": true
+            }
+        })
+        .to_string();
+        assert!(
+            !project_tool_presentation(
+                "mcp__borg_agent__spawn_agent",
+                &json!({}),
+                Some(&child_result),
+                false
+            )
+            .backgrounded
+        );
+        let process_result = json!({"session_id": "process-1", "running": true}).to_string();
+        for tool in ["functions.exec", "functions.wait", "functions.write_stdin"] {
+            assert!(
+                project_tool_presentation(tool, &json!({}), Some(&process_result), false)
+                    .backgrounded
+            );
+        }
+
         assert_eq!(
             tool_output_background_handle("Script running with cell ID build-1"),
             Some("build-1".to_string())

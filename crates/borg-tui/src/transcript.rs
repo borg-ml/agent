@@ -845,13 +845,13 @@ impl Transcript {
             SessionPayloadKind::ToolOutput => {
                 let output =
                     String::from_utf8(bytes).context("stored tool output is not valid UTF-8")?;
-                *backgrounded = !*error && tool_output_is_backgrounded(&output);
                 let hydrated_presentation = project_tool_presentation(
                     source_name,
                     &serde_json::Value::Null,
                     Some(&output),
                     *error,
                 );
+                *backgrounded = hydrated_presentation.backgrounded;
                 let edit_diff = (!*error)
                     .then(|| hydrated_presentation.output.clone())
                     .flatten()
@@ -1507,7 +1507,7 @@ impl Transcript {
                     *complete = true;
                     *completed_at = Some(event.created_at);
                     *error = *is_error;
-                    *backgrounded = !*is_error && tool_output_is_backgrounded(output);
+                    *backgrounded = completion_presentation.backgrounded;
                     if completion_presentation.category == ToolPresentationCategory::Read
                         && !completion_presentation.detail.is_empty()
                     {

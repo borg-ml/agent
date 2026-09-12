@@ -29,8 +29,8 @@ use borg_remote::{
     ToolPresentationCategory, compact_text, edit_is_awaiting_diff, is_diff_language, is_edit_tool,
     is_mcp_resource_probe, is_subagent_tool, project_tool_presentation, tool_action_is_instant,
     tool_can_start_background_process, tool_has_rich_ui, tool_output_background_handle,
-    tool_output_code_view, tool_output_is_backgrounded, tool_process_followup_handle,
-    tool_process_output_text, web_search_query,
+    tool_output_code_view, tool_process_followup_handle, tool_process_output_text,
+    web_search_query,
 };
 #[cfg(test)]
 use borg_remote::{tool_call_summary, tool_code_view};
