@@ -689,6 +689,17 @@ impl Transcript {
         )
     }
 
+    fn inspector_heading(&self, index: usize) -> Option<(&str, bool)> {
+        match self.order.get(index)? {
+            TranscriptEntry::Tool { name, complete, .. } => Some((name, *complete)),
+            TranscriptEntry::Action { label, state, .. } => Some((label, !matches!(state,
+                TranscriptActionState::Running | TranscriptActionState::Waiting))),
+            TranscriptEntry::Plan { .. } => Some(("Plan", true)),
+            TranscriptEntry::Compaction { complete, .. } => Some(("Compaction", *complete)),
+            _ => None,
+        }
+    }
+
     fn action_is_expandable(&self, index: usize) -> bool {
         matches!(
             self.order.get(index),
@@ -3343,9 +3354,9 @@ impl Transcript {
         let tool_run_windows = self.tool_run_windows();
         let running_tool = self.has_running_tool();
         if let Some(index) = focused_tool
-            && let Some(TranscriptEntry::Tool { name, complete, .. }) = self.order.get(index)
+            && let Some((name, complete)) = self.inspector_heading(index)
         {
-            lines.push(Line::from(vec![
+            lines.extend(markdown::wrap_markdown_spans(&[
                 Span::styled(
                     "  Action details",
                     Style::default()
@@ -3355,12 +3366,12 @@ impl Transcript {
                 Span::styled(
                     format!(
                         " · {name} · {}",
-                        if *complete { "complete" } else { "live" }
+                        if complete { "complete" } else { "live" }
                     ),
                     Style::default().fg(Color::Gray),
                 ),
                 Span::styled(" · Esc to return", Style::default().fg(Color::DarkGray)),
-            ]));
+            ], width));
             lines.push(Line::default());
         }
         for (index, entry) in self.order.iter().enumerate() {
@@ -3662,7 +3673,7 @@ impl Transcript {
                     } else {
                         format!("{time}  {glyph} {label}  {detail}")
                     };
-                    if body.as_deref().is_some_and(|body| !body.trim().is_empty()) {
+                    if focused_tool.is_none() && body.as_deref().is_some_and(|body| !body.trim().is_empty()) {
                         summary.push_str(if *expanded {
                             " · click to collapse"
                         } else {
@@ -3676,7 +3687,7 @@ impl Transcript {
                             Span::styled(line, Style::default().fg(color)),
                         ]));
                     }
-                    if *expanded
+                    if (*expanded || focused_tool == Some(index))
                         && let Some(body) = body.as_deref().filter(|body| !body.trim().is_empty())
                     {
                         for line in wrap_display(body, width.saturating_sub(prefix.len() + 6)) {
@@ -3728,7 +3739,7 @@ impl Transcript {
                         ),
                     ]));
                     let display_items = ordered_plan_items(items);
-                    let clipped = !*expanded && items.len() > MAX_COLLAPSED_PLAN_ITEMS;
+                    let clipped = !*expanded && focused_tool != Some(index) && items.len() > MAX_COLLAPSED_PLAN_ITEMS;
                     let display_limit = if clipped {
                         MAX_COLLAPSED_PLAN_ITEMS
                     } else {
@@ -3898,7 +3909,7 @@ impl Transcript {
                 } => {
                     let time = display_local_time(time, &today_prefix);
                     let expandable = *complete && compaction_has_expandable_detail(summary);
-                    let action_hint = if expandable {
+                    let action_hint = if expandable && focused_tool.is_none() {
                         if *expanded {
                             " · click to collapse · right-click for actions"
                         } else {
@@ -3909,7 +3920,7 @@ impl Transcript {
                     };
                     lines.push(Line::from(vec![
                         Span::styled(
-                            format!("▌ {}", compact_text(summary, 180)),
+                            if focused_tool == Some(index) { "▌ Compacted context".to_string() } else { format!("▌ {}", compact_text(summary, 180)) },
                             Style::default()
                                 .fg(BORG_ORANGE)
                                 .add_modifier(Modifier::BOLD),
@@ -3919,7 +3930,7 @@ impl Transcript {
                             Style::default().fg(Color::DarkGray),
                         ),
                     ]));
-                    if *expanded && expandable {
+                    if (*expanded || focused_tool == Some(index)) && expandable {
                         let detail = summary
                             .strip_prefix("Compacted context: ")
                             .unwrap_or(summary);
@@ -4042,7 +4053,7 @@ impl Transcript {
                         || code_view
                             .as_ref()
                             .is_some_and(|(language, _)| is_diff_language(language));
-                    let mut summary = if detail.is_empty() {
+                    let mut summary = if detail.is_empty() || focused_tool == Some(index) {
                         format!("{time}  {glyph} {display_name}")
                     } else {
                         format!("{time}  {glyph} {display_name}  {detail}")
@@ -4120,7 +4131,9 @@ impl Transcript {
                         } else {
                             "  │ "
                         };
-                        if *complete {
+                        if focused_tool == Some(index) {
+                            lines.extend(rendering::tool_detail_lines(language, source, width, body_prefix));
+                        } else if *complete {
                             let key = (index, width, false, tool_window.is_some());
                             let mut cache = self.tool_body_cache.borrow_mut();
                             #[cfg(test)]
@@ -4175,7 +4188,9 @@ impl Transcript {
                         } else {
                             "  │ "
                         };
-                        if *complete {
+                        if focused_tool == Some(index) {
+                            lines.extend(rendering::tool_detail_lines(language, source, width, body_prefix));
+                        } else if *complete {
                             let key = (index, width, true, tool_window.is_some());
                             let mut cache = self.tool_body_cache.borrow_mut();
                             #[cfg(test)]

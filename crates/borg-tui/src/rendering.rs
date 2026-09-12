@@ -73,7 +73,7 @@ pub(super) fn code_block_lines(language: &str, source: &str, width: usize) -> Ve
         "reasoning" => reasoning_lines(source, width),
         "command" => plain_lines(source, width),
         "subagent" => colored_plain_lines(source, width, super::SUBAGENT_PINK),
-        _ => syntax_lines(language, source, width),
+        _ => syntax_lines(language, source, width, false),
     }
 }
 
@@ -85,6 +85,45 @@ pub(super) fn tool_body_lines(
 ) -> Vec<Line<'static>> {
     let prefix_width = UnicodeWidthStr::width(prefix);
     code_block_lines(language, source, width.saturating_sub(prefix_width).max(1))
+        .into_iter()
+        .map(|mut line| {
+            line.spans.insert(
+                0,
+                Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+            );
+            line
+        })
+        .collect()
+}
+
+pub(super) fn tool_detail_lines(
+    language: &str,
+    source: &str,
+    width: usize,
+    prefix: &str,
+) -> Vec<Line<'static>> {
+    let content_width = width.saturating_sub(UnicodeWidthStr::width(prefix)).max(1);
+    let (language, source_language) = language
+        .split_once(":")
+        .map_or((language, None), |(kind, source)| (kind, Some(source)));
+    let lines = match language {
+        "diff" | "patch" | "udiff" => {
+            unified_diff_lines(source, content_width, source_language, true)
+        }
+        "command" => plain_lines(source, content_width),
+        "reasoning" => reasoning_lines(source, content_width),
+        "subagent" => plain_lines(source, content_width)
+            .into_iter()
+            .map(|mut line| {
+                for span in &mut line.spans {
+                    span.style = span.style.fg(super::SUBAGENT_PINK);
+                }
+                line
+            })
+            .collect(),
+        _ => syntax_lines(language, source, content_width, true),
+    };
+    lines
         .into_iter()
         .map(|mut line| {
             line.spans.insert(
@@ -194,7 +233,7 @@ fn colored_plain_lines(source: &str, width: usize, color: Color) -> Vec<Line<'st
         .collect()
 }
 
-fn syntax_lines(language: &str, source: &str, width: usize) -> Vec<Line<'static>> {
+fn syntax_lines(language: &str, source: &str, width: usize, wrap: bool) -> Vec<Line<'static>> {
     let (syntaxes, theme) = syntax_assets();
     let syntax = syntax_for_language(syntaxes, language)
         .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
@@ -223,9 +262,27 @@ fn syntax_lines(language: &str, source: &str, width: usize) -> Vec<Line<'static>
                 Style::default().fg(terminal_color(style.foreground)),
             ));
         }
-        // Code is intentionally clipped rather than softly wrapped: line
-        // structure, diagnostics, and diff alignment remain trustworthy.
-        output.push(clip_line(spans, content_width, gutter_width));
+        if wrap {
+            for (row, mut line) in super::markdown::wrap_markdown_spans(&spans[1..], content_width)
+                .into_iter()
+                .enumerate()
+            {
+                line.spans.insert(
+                    0,
+                    if row == 0 {
+                        spans[0].clone()
+                    } else {
+                        Span::styled(
+                            " ".repeat(gutter_width),
+                            Style::default().fg(Color::DarkGray),
+                        )
+                    },
+                );
+                output.push(line);
+            }
+        } else {
+            output.push(clip_line(spans, content_width, gutter_width));
+        }
     }
     if source.is_empty() {
         output.push(Line::from(Span::styled(
@@ -274,7 +331,7 @@ fn diff_lines(source: &str, width: usize, source_language: Option<&str>) -> Vec<
     {
         split_diff_lines(source, width, source_language)
     } else {
-        unified_diff_lines(source, width, source_language)
+        unified_diff_lines(source, width, source_language, false)
     }
 }
 
@@ -299,6 +356,7 @@ fn unified_diff_lines(
     source: &str,
     width: usize,
     source_language: Option<&str>,
+    wrap: bool,
 ) -> Vec<Line<'static>> {
     let mut output = Vec::new();
     let (mut old_line, mut new_line) = (None, None);
@@ -310,6 +368,9 @@ fn unified_diff_lines(
     let show_line_numbers = source.lines().any(|line| hunk_starts(line).is_some());
     for raw in source.lines() {
         if let Some(path) = diff_file_path(raw) {
+            if wrap {
+                output.extend(plain_lines(path, width));
+            }
             highlighter = path
                 .rsplit_once('.')
                 .and_then(|(_, extension)| syntax_for_language(syntaxes, extension))
@@ -325,10 +386,14 @@ fn unified_diff_lines(
             continue;
         }
         if raw.starts_with("---") || raw.starts_with("+++") {
-            output.push(Line::from(Span::styled(
-                pad_cells(raw, width),
-                Style::default().fg(Color::DarkGray),
-            )));
+            if wrap {
+                output.extend(plain_lines(raw, width));
+            } else {
+                output.push(Line::from(Span::styled(
+                    pad_cells(raw, width),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
             continue;
         }
         let (old_number, new_number, marker, text, background) =
@@ -352,7 +417,7 @@ fn unified_diff_lines(
                     None,
                 )
             };
-        output.push(highlighted_diff_line(
+        let line = highlighted_diff_line(
             old_number,
             new_number,
             marker,
@@ -360,10 +425,22 @@ fn unified_diff_lines(
             background,
             highlighter.as_mut(),
             syntaxes,
-            width,
+            if wrap {
+                width.max(UnicodeWidthStr::width(text) + 2 * number_width + 6)
+            } else {
+                width
+            },
             show_line_numbers,
             number_width,
-        ));
+        );
+        if wrap {
+            output.extend(super::markdown::wrap_markdown_spans(
+                &line.spans,
+                width.max(1),
+            ));
+        } else {
+            output.push(line);
+        }
     }
     output
 }
@@ -972,7 +1049,7 @@ mod tests {
 
     #[test]
     fn syntax_renderer_preserves_code_line_structure() {
-        let lines = syntax_lines("rust", "fn main() {\n    println!(\"hi\");\n}", 80);
+        let lines = syntax_lines("rust", "fn main() {\n    println!(\"hi\");\n}", 80, false);
         assert_eq!(lines.len(), 3);
         assert!(lines[0].to_string().contains("fn main"));
     }

@@ -892,7 +892,7 @@ fn flush_markdown_line(
     current.clear();
 }
 
-fn wrap_markdown_spans(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
+pub(super) fn wrap_markdown_spans(spans: &[Span<'static>], width: usize) -> Vec<Line<'static>> {
     let source = spans
         .iter()
         .map(|span| span.content.as_ref())

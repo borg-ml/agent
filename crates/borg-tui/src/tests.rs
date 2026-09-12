@@ -12090,3 +12090,217 @@ fn exec_poll_completion_renders_command_and_readable_output() {
         assert!(!rendered.contains("\"session_id\""));
     }
 }
+
+#[test]
+fn fullscreen_message_details_preserve_long_json_and_control_text() {
+    let session_id = Uuid::new_v4();
+    let message = format!("{} MESSAGE_TAIL", "界message ".repeat(100));
+    let input = serde_json::json!({"target": "participant:child", "message": message});
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "send".into(),
+            name: "mcp__borg_agent__send_message".into(),
+            input: input.clone(),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "send".into(),
+            input: Some(input),
+            input_ref: None,
+            output: "{}".into(),
+            output_ref: None,
+            is_error: false,
+        },
+    ));
+    let lines = transcript.render_tool_for_cache(0, 60, 8).0;
+    let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>().join(
+        "
+",
+    );
+    assert!(!rendered.contains("…"), "{rendered}");
+    assert_eq!(
+        rendered.matches("界").count(),
+        200,
+        "input and result must both retain the full message"
+    );
+    assert!(rendered.contains("MESSAGE_TAIL"), "{rendered}");
+    assert!(lines.iter().all(|line| line.width() <= 60));
+}
+
+#[test]
+fn fullscreen_non_tool_details_expand_without_mutating_inline_state() {
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Action {
+        kind: TranscriptActionKind::Agent,
+        label: "Agent".into(),
+        detail: "summary".into(),
+        body: Some("ACTION_BODY".into()),
+        time: "12:00".into(),
+        state: TranscriptActionState::Complete,
+        expanded: false,
+    });
+    transcript.order.push(TranscriptEntry::Plan {
+        items: (0..20)
+            .map(|index| PlanItem {
+                id: Uuid::new_v4(),
+                content: format!("plan item {index}"),
+                status: PlanItemStatus::Pending,
+            })
+            .collect(),
+        time: "12:00".into(),
+        expanded: false,
+    });
+    transcript.order.push(TranscriptEntry::Compaction {
+        summary: format!(
+            "Compacted context: {} COMPACTION_TAIL",
+            "detail ".repeat(100)
+        ),
+        time: "12:00".into(),
+        sequence: 1,
+        expanded: false,
+        complete: true,
+    });
+    for (index, expected) in [
+        (0, "ACTION_BODY"),
+        (1, "plan item 19"),
+        (2, "COMPACTION_TAIL"),
+    ] {
+        let rendered = transcript
+            .render_tool_for_cache(index, 80, 8)
+            .0
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
+        assert!(rendered.contains(expected), "{rendered}");
+    }
+    let inline = transcript
+        .lines(80)
+        .iter()
+        .map(Line::to_string)
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        );
+    assert!(!inline.contains("ACTION_BODY"));
+    assert!(!inline.contains("COMPACTION_TAIL"));
+    assert!(!inline.contains("plan item 19"));
+}
+
+#[test]
+fn fullscreen_diff_preserves_wide_changed_lines() {
+    let source = format!(
+        "@@ -12 +12 @@
+-{} OLD_TAIL
++{} NEW_TAIL",
+        "界".repeat(100),
+        "x".repeat(120)
+    );
+    let lines = rendering::tool_detail_lines("diff:rust", &source, 60, "  │ ");
+    let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>().join(
+        "
+",
+    );
+    assert_eq!(rendered.matches("界").count(), 100);
+    assert_eq!(rendered.matches("x").count(), 120);
+    assert!(rendered.contains("OLD_TAIL"));
+    assert!(rendered.contains("NEW_TAIL"));
+    assert!(lines.iter().all(|line| line.width() <= 60));
+}
+
+#[tokio::test]
+#[ignore = "requires a PTY; verifies global timeline click behavior and fullscreen return"]
+async fn timeline_detail_click_policy_applies_to_every_expandable_entry() {
+    let directory = tempfile::tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        session_id,
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    terminal.transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "read".into(),
+            name: "read_file".into(),
+            input: serde_json::json!({"path": "source.rs"}),
+            input_ref: None,
+        },
+    ));
+    if let TranscriptEntry::Tool { expanded, .. } = &mut terminal.transcript.order[0] {
+        *expanded = false;
+    }
+    terminal.transcript.order.push(TranscriptEntry::Action {
+        kind: TranscriptActionKind::Agent,
+        label: "Agent".into(),
+        detail: "detail".into(),
+        body: Some("ACTION_BODY".into()),
+        time: "12:00".into(),
+        state: TranscriptActionState::Complete,
+        expanded: false,
+    });
+    terminal.transcript.order.push(TranscriptEntry::Plan {
+        items: (0..20)
+            .map(|index| PlanItem {
+                id: Uuid::new_v4(),
+                content: format!("plan item {index}"),
+                status: PlanItemStatus::Pending,
+            })
+            .collect(),
+        time: "12:00".into(),
+        expanded: false,
+    });
+    terminal.transcript.order.push(TranscriptEntry::Compaction {
+        summary: "Compacted context: Full durable summary contents".into(),
+        time: "12:00".into(),
+        sequence: 1,
+        expanded: false,
+        complete: true,
+    });
+    for policy in [ToolClickBehavior::Fullscreen, ToolClickBehavior::Inline] {
+        terminal.set_tool_click_behavior(policy);
+        for index in 0..4 {
+            terminal.scroll_from_bottom = 7;
+            terminal.transcript.follow_tail = false;
+            terminal.run_pending_transcript_click(if index == 0 {
+                PendingTranscriptClick::Tool { index, run: None }
+            } else {
+                PendingTranscriptClick::Entry(index)
+            });
+            match policy {
+                ToolClickBehavior::Fullscreen => {
+                    assert_eq!(terminal.focused_tool, Some(index));
+                    terminal.draw().unwrap();
+                    terminal.close_tool_inspector();
+                    assert_eq!(terminal.scroll_from_bottom, 7);
+                    assert!(!terminal.transcript.follow_tail);
+                }
+                ToolClickBehavior::Inline => {
+                    assert!(terminal.focused_tool.is_none());
+                    let expanded = match &terminal.transcript.order[index] {
+                        TranscriptEntry::Tool { expanded, .. }
+                        | TranscriptEntry::Action { expanded, .. }
+                        | TranscriptEntry::Plan { expanded, .. }
+                        | TranscriptEntry::Compaction { expanded, .. } => *expanded,
+                        _ => unreachable!(),
+                    };
+                    assert!(expanded, "entry {index} must expand inline");
+                }
+            }
+        }
+    }
+}

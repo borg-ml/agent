@@ -3243,9 +3243,8 @@ impl BorgTerminal {
     }
 
     fn open_tool_inspector(&mut self, index: usize) -> Vec<SessionPayloadRef> {
-        let complete = match self.transcript.order.get(index) {
-            Some(TranscriptEntry::Tool { complete, .. }) => *complete,
-            _ => return Vec::new(),
+        let Some((_, complete)) = self.transcript.inspector_heading(index) else {
+            return Vec::new();
         };
         if self.focused_tool == Some(index) {
             return Vec::new();
@@ -4400,11 +4399,12 @@ impl BorgTerminal {
                                 .get(row)
                                 .and_then(|(_, tool_index)| *tool_index)
                         {
-                            let payloads = self.open_tool_inspector(tool_index);
-                            if !payloads.is_empty() {
-                                return Ok(UiAction::LoadPayloads(payloads));
-                            }
-                            return Ok(UiAction::None);
+                            return Ok(self.run_pending_transcript_click(
+                                PendingTranscriptClick::Tool {
+                                    index: tool_index,
+                                    run: None,
+                                },
+                            ));
                         }
                         if self
                             .todo_status_area
@@ -4989,7 +4989,13 @@ impl BorgTerminal {
                 return self.open_entry_actions(index);
             }
             PendingTranscriptClick::Entry(index) => {
-                if self.transcript.compaction_is_expandable(index) {
+                if self.tool_click_behavior == ToolClickBehavior::Fullscreen
+                    && (self.transcript.compaction_is_expandable(index)
+                        || self.transcript.action_is_expandable(index)
+                        || self.transcript.plan_is_clippable(index))
+                {
+                    self.open_tool_inspector(index);
+                } else if self.transcript.compaction_is_expandable(index) {
                     self.capture_transcript_anchor_for_collapse();
                     self.transcript.toggle_compaction_expansion(index);
                     self.invalidate_transcript_render_cache();
@@ -12570,7 +12576,7 @@ fn borg_control_tool_output_view(
             messages.len(),
             if messages.len() == 1 { "" } else { "s" }
         ));
-        for message in messages.iter().take(12) {
+        for message in messages.iter() {
             let delivery = json_text(message, &["delivery"]).unwrap_or("queued");
             let sender = json_text(message, &["sender", "from", "actor"]);
             let text = json_text(message, &["text", "message"]).unwrap_or("empty message");
@@ -12578,7 +12584,7 @@ fn borg_control_tool_output_view(
                 || format!("  {delivery:>10}  "),
                 |sender| format!("  {delivery:>10}  {sender} · "),
             );
-            rows.push(format!("{prefix}{}", compact_text(text, 140)));
+            rows.push(format!("{prefix}{}", text));
         }
     } else if tool.ends_with("list_agents") || value.get("agents").is_some() || value.is_array() {
         let agents = value
@@ -12590,7 +12596,7 @@ fn borg_control_tool_output_view(
             agents.len(),
             if agents.len() == 1 { "" } else { "s" }
         ));
-        for agent in agents.iter().take(12) {
+        for agent in agents.iter() {
             let id = json_text(agent, &["task_name", "name", "id", "agent_id"]).unwrap_or("agent");
             let status = json_text(agent, &["status", "state"]).unwrap_or("unknown");
             let model = json_text(agent, &["model", "provider"]);
@@ -12605,7 +12611,7 @@ fn borg_control_tool_output_view(
             }
             rows.push(line);
             if let Some(task) = task {
-                rows.push(format!("              {}", compact_text(task, 100)));
+                rows.push(format!("              {}", task));
             }
         }
     } else if tool.ends_with("get_plan")
@@ -12624,11 +12630,11 @@ fn borg_control_tool_output_view(
             steps.len(),
             if steps.len() == 1 { "" } else { "s" }
         ));
-        for step in steps.iter().take(12) {
+        for step in steps.iter() {
             let status = json_text(step, &["status"]).unwrap_or("pending");
             let text = json_text(step, &["step", "content", "title", "description"])
                 .unwrap_or("unnamed step");
-            rows.push(format!("  {status:>10}  {}", compact_text(text, 120)));
+            rows.push(format!("  {status:>10}  {}", text));
         }
     } else if tool.ends_with("get_goal")
         || tool.ends_with("update_goal")
@@ -12637,10 +12643,7 @@ fn borg_control_tool_output_view(
         let goal = value.get("goal").unwrap_or(&value);
         let status = json_text(goal, &["status"]).unwrap_or("current");
         let objective = json_text(goal, &["objective", "title"]).unwrap_or("goal");
-        rows.push(format!(
-            "GOAL · {status} · {}",
-            compact_text(objective, 140)
-        ));
+        rows.push(format!("GOAL · {status} · {}", objective));
     } else if tool.ends_with("wait_agent") || tool.ends_with("spawn_agent") {
         let agent = value.get("agent").unwrap_or(&value);
         let id = json_text(agent, &["task_name", "name", "id", "agent_id"])
@@ -12664,7 +12667,7 @@ fn borg_control_tool_output_view(
             agent,
             &["message", "update", "final_text", "task", "objective"],
         ) {
-            rows.push(format!("  {}", compact_text(text, 140)));
+            rows.push(format!("  {}", text));
         }
     } else {
         let target = input
@@ -12682,7 +12685,7 @@ fn borg_control_tool_output_view(
         };
         rows.push(format!("{action} · {target}"));
         if let Some(message) = message {
-            rows.push(format!("  {}", compact_text(message, 140)));
+            rows.push(format!("  {}", message));
         }
     }
     Some(rows.join("\n"))
