@@ -6834,6 +6834,91 @@ fn transcript_width_is_stable_when_activity_crosses_scrollbar_threshold() {
     assert_eq!(transcript_width_for_viewport(4, 25, 24), 4);
 }
 
+#[tokio::test]
+#[ignore = "requires a PTY; verifies input redraw under live transcript invalidation"]
+async fn streaming_input_redraw_keeps_committed_history_snapshot() {
+    let session_id = Uuid::new_v4();
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        session_id,
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    let mut last_id = Uuid::new_v4();
+    for sequence in 1..=200 {
+        last_id = Uuid::new_v4();
+        terminal.apply_session_event(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id: last_id,
+                actor: EventActor::Assistant,
+                text: "A long **formatted** transcript paragraph. ".repeat(50),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: None,
+            },
+        ));
+    }
+    terminal.draw().unwrap();
+    let committed = Arc::clone(&terminal.last_committed_viewport_render.as_ref().unwrap().5);
+    terminal.transcript.follow_tail = false;
+    terminal.scroll_from_bottom = 10;
+    let mut samples = Vec::new();
+    for sequence in 201..=220 {
+        terminal.apply_session_event(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id: last_id,
+                actor: EventActor::Assistant,
+                text: format!("Streaming update {sequence}"),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: None,
+            },
+        ));
+        assert!(terminal.transcript_render_cache.is_none());
+        terminal.composer.text.push('x');
+        terminal.composer.cursor = terminal.composer.text.len();
+        let started = Instant::now();
+        terminal.draw_for_input().unwrap();
+        samples.push(started.elapsed());
+        assert!(terminal.pending_scroll_anchor_height.is_some());
+        assert!(Arc::ptr_eq(
+            &committed,
+            terminal.active_transcript_render.as_ref().unwrap()
+        ));
+        assert!(
+            terminal.transcript_render_cache.is_none(),
+            "input must not rebuild history"
+        );
+    }
+    terminal.draw().unwrap();
+    assert!(terminal.transcript_render_cache.is_some());
+    assert!(!Arc::ptr_eq(
+        &committed,
+        terminal.active_transcript_render.as_ref().unwrap()
+    ));
+    let mut rebuild_samples = Vec::new();
+    for _ in 0..20 {
+        terminal.transcript_render_cache = None;
+        terminal.transcript_full_render_cache = None;
+        let started = Instant::now();
+        terminal.draw().unwrap();
+        rebuild_samples.push(started.elapsed());
+    }
+    rebuild_samples.sort_unstable();
+    drop(terminal);
+    samples.sort_unstable();
+    eprintln!(
+        "streaming input redraw p95: {:?}; full history redraw p95: {:?}",
+        samples[18], rebuild_samples[18]
+    );
+}
+
 #[test]
 fn input_redraw_reuses_the_last_committed_viewport_snapshot() {
     assert_eq!(select_transcript_snapshot(true, true, Some(97), || 100), 97);

@@ -2856,6 +2856,16 @@ impl BorgTerminal {
             } else {
                 transcript.apply(event)
             };
+            let changed = focused_child_transcript_changed
+                || (changed
+                    && (transcript.show_subagent_messages
+                        || match &event.kind {
+                            SessionEventKind::SubagentActivity { agent, .. } => {
+                                transcript.subagent_entries.contains_key(&agent.session_id)
+                            }
+                            SessionEventKind::AgentMessageReceived { .. } => false,
+                            _ => true,
+                        }));
             (
                 removed_entry,
                 changed || transcript.order.len() != entries_before,
@@ -2870,7 +2880,14 @@ impl BorgTerminal {
             {
                 self.pending_scroll_anchor_height = Some(self.rendered_transcript_height);
             }
-            self.invalidate_transcript_render_cache();
+            if removed_entry.is_some() || matches!(event.kind, SessionEventKind::ContextCleared) {
+                self.invalidate_transcript_render_cache();
+            } else {
+                // Streaming dirties layout, not the last painted viewport.
+                // Input can reuse it until an ordinary frame commits the update.
+                self.transcript_render_cache = None;
+                self.transcript_full_render_cache = None;
+            }
         }
         if self.transcript.follow_tail {
             self.scroll_from_bottom = 0;
@@ -5630,17 +5647,19 @@ impl BorgTerminal {
         let render_time = Utc::now();
         let current_tool_elapsed = self.transcript.running_tool_elapsed_labels_at(render_time);
         let local_date = Local::now().date_naive();
-        let transcript_snapshot_current = self.transcript_render_cache.is_some();
-        // Input redraws reuse the last complete viewport snapshot. Transcript
-        // content always uses the stable scrollbar-safe width, so tool growth
-        // cannot trigger a second whole-history layout at a narrower width.
-        let committed_viewport_render = if input_fast_path && transcript_snapshot_current {
+        let committed_viewport_render = if input_fast_path {
             self.last_committed_viewport_render
                 .as_ref()
+                .filter(|(width, height, ..)| {
+                    *width == full_transcript_width && *height == tool_run_viewport_height
+                })
                 .map(|(_, _, _, _, _, render)| Arc::clone(render))
         } else {
             None
         };
+        let using_committed_snapshot = committed_viewport_render.is_some();
+        let transcript_snapshot_current =
+            self.transcript_render_cache.is_some() || using_committed_snapshot;
         let stale_full_transcript_render = if input_fast_path && transcript_snapshot_current {
             self.transcript_full_render_cache
                 .as_ref()
@@ -6096,7 +6115,11 @@ impl BorgTerminal {
         self.scroll_from_bottom = resolve_pending_scroll_anchor(
             self.transcript.follow_tail,
             self.scroll_from_bottom,
-            self.pending_scroll_anchor_height.take(),
+            if using_committed_snapshot {
+                None
+            } else {
+                self.pending_scroll_anchor_height.take()
+            },
             transcript_height,
         );
         if self.transcript.follow_tail {
@@ -6137,7 +6160,11 @@ impl BorgTerminal {
         let mut next_dictation_button_area = None;
         let dictation_state = self.dictation_state;
         let dictation_button_hovered = self.dictation_button_hovered;
-        let pending_transcript_anchor = self.pending_transcript_anchor.take();
+        let pending_transcript_anchor = if using_committed_snapshot {
+            None
+        } else {
+            self.pending_transcript_anchor.take()
+        };
         let mut restored_scroll_from_bottom = None;
         let cursor_visible = cursor_blink_visible(self.cursor_blink_started_at.elapsed());
         // Ratatui flushes changed cells before it applies the frame's cursor
