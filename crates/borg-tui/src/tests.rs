@@ -6139,7 +6139,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
 }
 
 #[test]
-fn subagent_bodies_and_received_agent_message_rows_are_hidden_by_default() {
+fn subagent_activity_updates_roster_without_transcript_rows_by_default() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
     let now = chrono::Utc::now();
@@ -6190,19 +6190,18 @@ fn subagent_bodies_and_received_agent_message_rows_are_hidden_by_default() {
         ))),
     ));
 
-    // The lifecycle indicator row survives, but its mirrored report body does not.
-    assert_eq!(transcript.order.len(), 1);
-    assert!(matches!(
-        &transcript.order[0],
-        TranscriptEntry::Action {
-            kind: TranscriptActionKind::Agent,
-            detail,
-            body: None,
-            state: TranscriptActionState::Complete,
-            ..
-        } if detail == "inspect_ui · report ready"
-    ));
-    assert!(!transcript.action_is_expandable(0));
+    assert!(transcript.order.is_empty());
+    assert_eq!(transcript.active_subagent_count(), 1);
+    assert_eq!(
+        transcript.subagent_snapshots[&child_id].task_name,
+        "inspect_ui"
+    );
+    assert!(
+        transcript
+            .agent_roster_entries()
+            .iter()
+            .any(|row| row.child_id == Some(child_id))
+    );
 
     let receipt_id = Uuid::new_v4();
     let receipt = SessionEvent::new(
@@ -6218,7 +6217,7 @@ fn subagent_bodies_and_received_agent_message_rows_are_hidden_by_default() {
     transcript.apply(&receipt);
 
     // No explicit received-message row is added, yet delivery/dedup tracking runs.
-    assert_eq!(transcript.order.len(), 1);
+    assert!(transcript.order.is_empty());
     assert!(transcript.agent_messages.contains(&receipt_id));
     assert!(transcript.agent_message_senders.contains(&child_id));
 
@@ -6229,7 +6228,15 @@ fn subagent_bodies_and_received_agent_message_rows_are_hidden_by_default() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(!rendered.contains("Found the renderer issue"), "{rendered}");
-    assert!(rendered.contains("report ready"), "{rendered}");
+    assert!(!rendered.contains("report ready"), "{rendered}");
+
+    transcript.apply(&activity(4, SubagentActivityKind::Completed, None));
+    assert!(transcript.order.is_empty());
+    assert_eq!(transcript.active_subagent_count(), 0);
+    assert_eq!(
+        transcript.subagent_snapshots[&child_id].status,
+        SubagentStatus::Ready
+    );
 
     let mut child = new_child_transcript();
     child.apply(&receipt);
@@ -6267,7 +6274,7 @@ fn subagent_bodies_and_received_agent_message_rows_are_hidden_by_default() {
 }
 
 #[test]
-fn ready_subagent_status_always_notifies_the_director() {
+fn ready_subagent_status_updates_roster_without_notifying_the_director() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
     let now = Utc::now();
@@ -6334,15 +6341,12 @@ fn ready_subagent_status_always_notifies_the_director() {
     );
     transcript.apply(&ready);
 
-    assert!(matches!(
-        &transcript.order[0],
-        TranscriptEntry::Action {
-            detail,
-            state: TranscriptActionState::Complete,
-            body: None,
-            ..
-        } if detail == "/root/peer · done · waiting for input"
-    ));
+    assert!(transcript.order.is_empty());
+    assert_eq!(transcript.active_subagent_count(), 0);
+    assert_eq!(
+        transcript.subagent_snapshots[&child_id].status,
+        SubagentStatus::Ready
+    );
 }
 
 #[test]
