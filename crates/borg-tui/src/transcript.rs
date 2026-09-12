@@ -1891,13 +1891,18 @@ impl Transcript {
                 self.upsert_subagent_snapshot_with_status(agent, status);
                 if let Some((label, detail, body, state)) =
                     subagent_action_projection(*activity, agent, child_event.as_deref())
+                    && (self.show_subagent_messages
+                        || self.subagent_entries.contains_key(&agent.session_id)
+                        || matches!(
+                            state,
+                            TranscriptActionState::Waiting | TranscriptActionState::Failed
+                        ))
                 {
                     let body = if !self.show_subagent_messages
                         && matches!(
                             state,
                             TranscriptActionState::Complete | TranscriptActionState::Stopped
-                        )
-                    {
+                        ) {
                         None
                     } else {
                         body
