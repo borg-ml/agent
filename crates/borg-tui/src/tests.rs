@@ -8480,22 +8480,26 @@ fn context_percentage_matches_codex_compaction_headroom() {
 }
 
 #[test]
-fn active_terminal_title_identifies_borg_and_the_first_prompt() {
-    let title = terminal_title(
-        SessionStatus::Running,
-        Some("  polish   the terminal\ninteraction  "),
-    );
-
-    assert!(title.contains("Borg Agent - polish the terminal interaction..."));
-    assert!(
-        title
-            .chars()
-            .next()
-            .is_some_and(|glyph| "⠋⠙⠹⠸⠼⠴⠦⠧".contains(glyph))
-    );
+fn terminal_title_identifies_the_project_without_prompt_or_activity() {
+    let home = Some(Path::new("/Users/person"));
+    for (cwd, expected) in [
+        ("/Users/person/project", "Borg Agent • ~/project"),
+        (
+            "/Users/person/repos/project",
+            "Borg Agent • ~/repos/project",
+        ),
+        ("/Users/person", "Borg Agent • ~"),
+        ("/opt/project", "Borg Agent • /opt/project"),
+        (
+            "/Users/person2/project",
+            "Borg Agent • /Users/person2/project",
+        ),
+    ] {
+        assert_eq!(terminal_title(Path::new(cwd), home), expected);
+    }
     assert_eq!(
-        terminal_title(SessionStatus::Ready, None),
-        "Borg Agent".to_string()
+        terminal_title(Path::new("/opt/project"), None),
+        "Borg Agent • /opt/project"
     );
 }
 

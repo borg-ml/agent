@@ -5639,7 +5639,14 @@ impl BorgTerminal {
         if picker_open || self.keybindings_open {
             self.hovered_team_roster = None;
         }
-        let title = terminal_title(self.active_status(), self.transcript.first_prompt());
+        let cwd = self
+            .transcript
+            .config
+            .as_ref()
+            .map(|config| config.cwd.as_path())
+            .unwrap_or(&self.cwd);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let title = terminal_title(cwd, home.as_deref());
         if self.last_terminal_title.as_deref() != Some(&title) {
             execute!(self.terminal.backend_mut(), SetTitle(&title))?;
             self.last_terminal_title = Some(title);
@@ -13320,17 +13327,17 @@ fn permission_status_color(permission: &str) -> Color {
     }
 }
 
-fn terminal_title(status: SessionStatus, first_prompt: Option<&str>) -> String {
-    let prompt = first_prompt
-        .map(|prompt| prompt.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|prompt| !prompt.is_empty())
-        .map(|prompt| prompt.chars().take(48).collect::<String>());
-    let prefix = if matches!(status, SessionStatus::Starting | SessionStatus::Running) {
-        format!("{} Borg Agent", activity_glyph(status))
-    } else {
-        "Borg Agent".to_string()
+fn terminal_title(cwd: &Path, home: Option<&Path>) -> String {
+    let path = match home
+        .filter(|home| !home.as_os_str().is_empty())
+        .and_then(|home| cwd.strip_prefix(home).ok())
+    {
+        Some(relative) if relative.as_os_str().is_empty() => "~".to_string(),
+        Some(relative) => format!("~/{}", relative.display()),
+        None => cwd.display().to_string(),
     };
-    prompt.map_or(prefix.clone(), |prompt| format!("{prefix} - {prompt}..."))
+    let path: String = path.chars().filter(|ch| !ch.is_control()).collect();
+    format!("Borg Agent • {path}")
 }
 
 fn borging_for_run(seed: Uuid) -> bool {

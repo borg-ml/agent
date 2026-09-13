@@ -3218,18 +3218,6 @@ impl Transcript {
         )
     }
 
-    fn first_prompt(&self) -> Option<&str> {
-        self.order.iter().find_map(|entry| match entry {
-            TranscriptEntry::Message {
-                actor: EventActor::User,
-                text,
-                status: MessageStatus::Complete,
-                ..
-            } => Some(text.as_str()),
-            _ => None,
-        })
-    }
-
     #[cfg(test)]
     fn lines(&self, width: usize) -> Vec<Line<'static>> {
         self.render(width, None, None, None).0
