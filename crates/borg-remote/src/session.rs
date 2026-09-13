@@ -38,7 +38,7 @@ const ROOT_INBOX_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(not(test))]
 const USAGE_LIMIT_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5 * 60);
 #[cfg(test)]
-const USAGE_LIMIT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
+const USAGE_LIMIT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
 const NETWORK_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
 #[cfg(test)]
@@ -1984,7 +1984,20 @@ async fn run_agent_session_store_kernel(
                         )
                         .await?;
                     }
-                    Some(HostCommand::RecallQueuedPrompt { .. }) => {}
+                    Some(HostCommand::RecallQueuedPrompt { message_id, .. }) => {
+                        for recalled in recall_visible_queued_prompts(&mut pending, message_id) {
+                            if network_retry_message_id == Some(recalled.message_id) {
+                                network_retry_message_id = None;
+                                network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+                                auth_lookup_retries = 0;
+                            }
+                            record_recalled_prompt(&mut journal, &events, session_id, &recalled)
+                                .await?;
+                        }
+                        if pending.is_empty() {
+                            retry_not_before = None;
+                        }
+                    }
                     Some(HostCommand::FlushPendingInput { .. }) => {}
                     Some(HostCommand::ExtensionCommand {
                         session_id: command_session_id,

@@ -2027,6 +2027,93 @@ async fn usage_limited_prompt_resumes_automatically_after_the_retry_delay() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn queued_retry_can_be_recalled_while_waiting_without_later_delivery() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(UsageLimitThenSuccessExecutor {
+        calls: Arc::clone(&calls),
+    });
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: Some("finish this task".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        }
+    });
+
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(event.kind, SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready, detail: Some(ref detail),
+        } if detail.contains("usage limit"))
+        {
+            break;
+        }
+    }
+    command_tx
+        .send(HostCommand::RecallQueuedPrompt {
+            session_id,
+            message_id: Some(message_id),
+        })
+        .await
+        .unwrap();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("idle retry recall is acknowledged")
+            .unwrap();
+        if let SessionEventKind::PromptRecalled {
+            message_id: recalled,
+            text,
+            ..
+        } = event.kind
+        {
+            assert_eq!(recalled, message_id);
+            assert_eq!(text, "finish this task");
+            break;
+        }
+    }
+    tokio::time::sleep(USAGE_LIMIT_RETRY_INITIAL_DELAY * 3).await;
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn ready_is_emitted_only_after_all_queued_turn_events_are_complete() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
