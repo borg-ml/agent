@@ -1047,15 +1047,14 @@ pub fn run_claude_local_chat_stream_pooled(
     {
         let (events, receiver) = mpsc::channel(64);
         tokio::spawn(async move {
-            if let Err(error) = run_claude_subscription_process_pooled(
-                request,
-                controls,
-                permission,
-                events.clone(),
-                pool,
-            )
-            .await
-            {
+            let result = tokio::select! {
+                biased;
+                _ = events.closed() => return,
+                result = run_claude_subscription_process_pooled(
+                    request, controls, permission, events.clone(), pool,
+                ) => result,
+            };
+            if let Err(error) = result {
                 let _ = events
                     .send(ChatStreamEvent::Failed {
                         error: format!("{error:#}"),
@@ -1130,15 +1129,14 @@ pub fn run_codex_local_chat_stream_pooled(
     {
         let (events, receiver) = mpsc::channel(64);
         tokio::spawn(async move {
-            if let Err(error) = run_codex_subscription_process_pooled(
-                request,
-                controls,
-                permission,
-                events.clone(),
-                pool,
-            )
-            .await
-            {
+            let result = tokio::select! {
+                biased;
+                _ = events.closed() => return,
+                result = run_codex_subscription_process_pooled(
+                    request, controls, permission, events.clone(), pool,
+                ) => result,
+            };
+            if let Err(error) = result {
                 let _ = events
                     .send(ChatStreamEvent::Failed {
                         error: format!("{error:#}"),
@@ -1164,9 +1162,14 @@ fn run_subscription_stream(
 ) -> mpsc::Receiver<ChatStreamEvent> {
     let (events, receiver) = mpsc::channel(64);
     tokio::spawn(async move {
-        if let Err(error) =
-            run_subscription_process(request, controls, provider, permission, events.clone()).await
-        {
+        let result = tokio::select! {
+            biased;
+            _ = events.closed() => return,
+            result = run_subscription_process(
+                request, controls, provider, permission, events.clone(),
+            ) => result,
+        };
+        if let Err(error) = result {
             let _ = events
                 .send(ChatStreamEvent::Failed {
                     error: format!("{error:#}"),
@@ -1314,6 +1317,14 @@ async fn run_claude_subscription_process_pooled(
     .await
 }
 
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn relay_claude_runtime(
     claude_request: claude_agents::ChatStreamRequest,
     controls: Option<mpsc::Receiver<ChatStreamControl>>,
@@ -1386,6 +1397,10 @@ async fn relay_claude_runtime(
             None => claude_agents::run(claude_request, native_events, native_controls).await,
         }
     }));
+    let _runner_guard = AbortOnDrop(runner.as_ref().unwrap().abort_handle());
+    let _forwarder_guard = control_forwarder
+        .as_ref()
+        .map(|task| AbortOnDrop(task.abort_handle()));
     let mut tool_generation = ClaudeToolGenerationState::default();
 
     loop {
