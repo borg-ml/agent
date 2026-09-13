@@ -366,6 +366,7 @@ pub fn is_subagent_tool(display_name: &str) -> bool {
     matches!(
         display_name.to_ascii_lowercase().as_str(),
         "spawn agent"
+            | "delegate task"
             | "list agents"
             | "follow up"
             | "message agent"
