@@ -1285,12 +1285,16 @@ fn should_use_detached_session_host(args: &LocalAgentCliArgs) -> bool {
         && args.session_host.is_none()
 }
 
+// Every caller runs on the interactive launch path before the first frame, so
+// this must not take the global SQLite writer lock merely to re-verify a schema
+// that is already current: a busy journal would otherwise stall the menu behind
+// the writer wait.
 async fn open_local_session_store() -> Result<SqliteSessionStore> {
     let sessions_dir = default_host_config_path()
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("sessions");
-    SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await
+    SqliteSessionStore::open_interactive(sessions_dir.join("sessions.sqlite3")).await
 }
 
 async fn prepare_detached_session(args: &LocalAgentCliArgs) -> Result<Uuid> {
