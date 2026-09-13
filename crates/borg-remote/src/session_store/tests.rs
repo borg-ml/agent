@@ -997,6 +997,76 @@ async fn workspace_initialization_serializes_after_extended_writer_contention() 
 }
 
 #[tokio::test]
+async fn sqlite_full_does_not_poison_subsequent_writes() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(directory.path().join("full.sqlite3"))
+                .create_if_missing(true)
+                .journal_mode(SqliteJournalMode::Wal),
+        )
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE durable (value BLOB NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO durable VALUES ('committed')")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut transaction = SqliteSessionStore::begin_sqlite_write(&pool).await.unwrap();
+    let pages: i64 = sqlx::query_scalar("PRAGMA page_count")
+        .fetch_one(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "PRAGMA max_page_count = {pages}"
+    )))
+    .execute(&mut *transaction)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO durable VALUES ('uncommitted')")
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let error = sqlx::query("INSERT INTO durable VALUES (zeroblob(1048576))")
+        .execute(&mut *transaction)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("13")
+    );
+    drop(transaction);
+
+    let mut recovered =
+        SqliteSessionStore::begin_sqlite_write_with_timeout(&pool, Duration::from_secs(2))
+            .await
+            .unwrap();
+    sqlx::query("INSERT INTO durable VALUES ('recovered')")
+        .execute(&mut *recovered)
+        .await
+        .unwrap();
+    recovered.commit().await.unwrap();
+    let mut rolled_back = SqliteSessionStore::begin_sqlite_write(&pool).await.unwrap();
+    sqlx::query("INSERT INTO durable VALUES ('rolled back')")
+        .execute(&mut *rolled_back)
+        .await
+        .unwrap();
+    drop(rolled_back);
+    let values: Vec<String> = sqlx::query_scalar("SELECT value FROM durable ORDER BY rowid")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(values, ["committed", "recovered"]);
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn writer_contention_has_a_bounded_escape_hatch() {
     let (_directory, store) = store().await;
     let blocker = store.begin_write().await.unwrap();

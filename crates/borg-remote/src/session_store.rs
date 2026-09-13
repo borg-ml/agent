@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Connection, QueryBuilder, Row, SqlSafeStr, Sqlite, SqlitePool, Transaction};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -3119,19 +3119,37 @@ impl SqliteSessionStore {
                 );
                 return Err(sqlx::Error::PoolTimedOut);
             }
-            let result =
-                match tokio::time::timeout(remaining, pool.begin_with(SQLITE_WRITE_TRANSACTION))
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        warn!(
-                            timeout_seconds = timeout.as_secs(),
-                            "SQLite session journal writer wait timed out"
-                        );
-                        return Err(sqlx::Error::PoolTimedOut);
+            let result = match tokio::time::timeout(remaining, async {
+                loop {
+                    let mut connection = pool.acquire().await?;
+                    // Flush queued rollback before inspecting SQLx's depth. SQLITE_FULL
+                    // can auto-rollback SQLite while SQLx retains a nonzero depth;
+                    // ping alone considers that connection healthy. Never reuse it
+                    // for a new transaction or try to repair it with a commit.
+                    connection.ping().await?;
+                    if connection.is_in_transaction() {
+                        warn!("Discarding SQLite journal connection with stale transaction depth");
+                        connection.close().await?;
+                        continue;
                     }
-                };
+                    return Transaction::begin(
+                        connection,
+                        Some(SQLITE_WRITE_TRANSACTION.into_sql_str()),
+                    )
+                    .await;
+                }
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    warn!(
+                        timeout_seconds = timeout.as_secs(),
+                        "SQLite session journal writer wait timed out"
+                    );
+                    return Err(sqlx::Error::PoolTimedOut);
+                }
+            };
             match result {
                 Ok(transaction) => return Ok(transaction),
                 Err(error) if sqlite_lock_text(&error.to_string()) => {
