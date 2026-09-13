@@ -1229,7 +1229,10 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
                 tracing::error!(session_id = ?args.session_host, error = %error,
                     "detached session host failed; retrying from the durable journal");
                 if resume_retry_delay == LOCAL_RESUME_RETRY_INITIAL_DELAY {
-                    let _ = writeln!(io::stderr(), "Session host is waiting for recovery: {error:#}");
+                    let _ = writeln!(
+                        io::stderr(),
+                        "Session host is waiting for recovery: {error:#}"
+                    );
                 }
                 selected_session = args.session_host;
                 tokio::time::sleep(resume_retry_delay).await;
