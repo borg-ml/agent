@@ -232,9 +232,77 @@ fn resume_retries_sqlite_contention_but_not_permanent_errors() {
     assert!(local_resume_error_is_retryable(&anyhow::anyhow!(
         "database is locked"
     )));
+    assert!(local_resume_error_is_retryable(&anyhow::anyhow!(
+        "error returned from database: (code: 13) database or disk is full"
+    )));
     assert!(!local_resume_error_is_retryable(&anyhow::anyhow!(
         "recorded project directory no longer exists"
     )));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn detached_host_waits_past_notice_interval_without_replacing_live_child() {
+    let mut child = TokioCommand::new("sleep")
+        .arg("30")
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn slow host");
+    let pid = child.id();
+    let started = tokio::time::Instant::now();
+    let mut notices = 0;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        wait_for_detached_session_host(
+            &mut child,
+            || {
+                if started.elapsed() < Duration::from_millis(50) {
+                    anyhow::bail!("transient owner metadata read failure");
+                }
+                Ok(started.elapsed() >= Duration::from_millis(100))
+            },
+            |_| notices += 1,
+            Duration::from_millis(10),
+            &mut None,
+        ),
+    )
+    .await
+    .expect("host became ready")
+    .expect("slow startup must not terminate attachment");
+    assert!(notices > 0, "slow startup must be visible");
+    assert_eq!(child.id(), pid);
+    assert!(child.try_wait().expect("check child").is_none());
+    child.kill().await.expect("clean up host");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn detached_host_death_requires_a_surviving_owner() {
+    let mut child = TokioCommand::new("sh")
+        .args(["-c", "exit 17"])
+        .spawn()
+        .expect("spawn failing host");
+    child.wait().await.expect("wait for host exit");
+    let error = wait_for_detached_session_host(
+        &mut child,
+        || Ok(false),
+        |_| panic!("dead host must not keep waiting"),
+        Duration::from_millis(10),
+        &mut None,
+    )
+    .await
+    .expect_err("stale socket must not hide child exit");
+    assert!(error.to_string().contains("17"));
+    let result = wait_for_detached_session_host(
+        &mut child,
+        || Ok(true),
+        |_| panic!("surviving owner is already ready"),
+        Duration::from_millis(10),
+        &mut None,
+    )
+    .await
+    .expect("attach to the winner of a concurrent startup");
+    assert!(matches!(result, DetachedHostWait::Ready));
 }
 
 #[test]

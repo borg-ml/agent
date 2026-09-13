@@ -67,7 +67,7 @@ const IDLE_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 const MAX_RENDER_BACKOFF_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const LOCAL_RESUME_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 const LOCAL_RESUME_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
-const SESSION_HOST_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const SESSION_HOST_START_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 const SESSION_HOST_IDLE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const EXTENSION_DISCOVERY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// Keep first paint bounded while retaining enough context to include a real
@@ -1155,7 +1155,7 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
         None
     };
     let mut selected_session = detached_session;
-    let mut include_initial_host_prompt = if let Some(session_id) = detached_session {
+    let include_initial_host_prompt = if let Some(session_id) = detached_session {
         let store = open_local_session_store().await?;
         store.state(session_id).await?.latest_sequence == 0
     } else {
@@ -1166,11 +1166,34 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
     let mut resume_retry_delay = LOCAL_RESUME_RETRY_INITIAL_DELAY;
     loop {
         if let Some(session_id) = detached_session {
-            ensure_detached_session_host(&args, session_id, include_initial_host_prompt).await?;
-            include_initial_host_prompt = false;
+            match ensure_detached_session_host(
+                &args,
+                session_id,
+                include_initial_host_prompt,
+                &mut reusable_terminal,
+            )
+            .await
+            {
+                Ok(DetachedHostWait::Detach) => return Ok(()),
+                Ok(DetachedHostWait::Ready) => {}
+                Err(error) if local_resume_error_is_retryable(&error) => {
+                    let notice = format!(
+                        "Session {session_id} is waiting for its host; retrying in {:.1}s: {error:#}",
+                        resume_retry_delay.as_secs_f32()
+                    );
+                    crash_context.set_retry_notice(notice.clone());
+                    show_session_recovery_notice(&mut reusable_terminal, &notice);
+                    tokio::time::sleep(resume_retry_delay).await;
+                    resume_retry_delay = next_local_resume_retry_delay(resume_retry_delay);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        let resume_requested =
-            args.resume.is_some() || args.continue_latest || selected_session.is_some();
+        let resume_requested = args.resume.is_some()
+            || args.continue_latest
+            || selected_session.is_some()
+            || args.session_host.is_some();
         let result = AssertUnwindSafe(run_local_agent_session(
             &args,
             selected_session,
@@ -1199,6 +1222,18 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
             Ok(Ok(None)) => {
                 crash_context.tui_active.store(false, Ordering::Release);
                 return Ok(());
+            }
+            Ok(Err(error))
+                if args.session_host.is_some() && local_resume_error_is_retryable(&error) =>
+            {
+                tracing::error!(session_id = ?args.session_host, error = %error,
+                    "detached session host failed; retrying from the durable journal");
+                if resume_retry_delay == LOCAL_RESUME_RETRY_INITIAL_DELAY {
+                    let _ = writeln!(io::stderr(), "Session host is waiting for recovery: {error:#}");
+                }
+                selected_session = args.session_host;
+                tokio::time::sleep(resume_retry_delay).await;
+                resume_retry_delay = next_local_resume_retry_delay(resume_retry_delay);
             }
             Ok(Err(error)) if resume_requested && local_resume_error_is_retryable(&error) => {
                 crash_context.tui_active.store(false, Ordering::Release);
@@ -1287,18 +1322,25 @@ async fn prepare_detached_session(args: &LocalAgentCliArgs) -> Result<Uuid> {
     Ok(session_id)
 }
 
+#[derive(Debug)]
+enum DetachedHostWait {
+    Ready,
+    Detach,
+}
+
 async fn ensure_detached_session_host(
     args: &LocalAgentCliArgs,
     session_id: Uuid,
     include_initial_prompt: bool,
-) -> Result<()> {
+    terminal: &mut Option<BorgTerminal>,
+) -> Result<DetachedHostWait> {
     let sessions_dir = default_host_config_path()
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("sessions");
     let lock_path = sessions_dir.join(format!("{session_id}.lock"));
     let Some(writer) = SessionWriterLease::try_acquire(&lock_path)? else {
-        return Ok(());
+        return Ok(DetachedHostWait::Ready);
     };
     drop(writer);
 
@@ -1308,6 +1350,20 @@ async fn ensure_detached_session_host(
         "this session is owned by the background Borg remote host"
     );
 
+    let diagnostics_path = sessions_dir.join(format!("{session_id}.host.log"));
+    let mut diagnostics_options = fs::OpenOptions::new();
+    diagnostics_options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        diagnostics_options.mode(0o600);
+    }
+    let diagnostics_file = diagnostics_options
+        .open(&diagnostics_path)
+        .context("could not open detached host diagnostics")?;
+    if diagnostics_file.metadata()?.len() > 64 * 1024 {
+        diagnostics_file.set_len(0)?;
+    }
     let executable = std::env::current_exe().context("failed to locate the Borg executable")?;
     let mut command = TokioCommand::new(&executable);
     command
@@ -1316,7 +1372,7 @@ async fn ensure_detached_session_host(
         .arg(session_id.to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(diagnostics_file);
     append_session_host_arguments(&mut command, args, include_initial_prompt)?;
     detach_session_host_command(&mut command);
     let mut child = command
@@ -1324,24 +1380,118 @@ async fn ensure_detached_session_host(
         .with_context(|| format!("failed to start detached session host with {executable:?}"))?;
 
     let socket_path = session_control_socket_path(&sessions_dir, session_id);
-    let deadline = tokio::time::Instant::now() + SESSION_HOST_START_TIMEOUT;
-    loop {
-        if socket_path.exists() && local_session_owner_is_active(&sessions_dir, session_id)? {
-            tokio::spawn(async move {
-                if let Err(error) = child.wait().await {
-                    tracing::debug!(%error, "detached session host reaper stopped");
-                }
-            });
-            return Ok(());
+    let result = wait_for_detached_session_host(
+        &mut child,
+        || Ok(socket_path.exists() && local_session_owner_is_active(&sessions_dir, session_id)?),
+        |terminal| show_session_recovery_notice(terminal,
+            &format!("Session {session_id} is still starting or recovering. Ctrl-C detaches; the host keeps recovering. {}", session_host_diagnostics(&diagnostics_path))),
+        SESSION_HOST_START_NOTICE_INTERVAL,
+        terminal,
+    ).await;
+    let result = result.map_err(|error| {
+        let detail = session_host_diagnostics(&diagnostics_path);
+        if detail.is_empty() {
+            error
+        } else {
+            error.context(detail)
         }
+    });
+    tokio::spawn(async move {
+        let status = child.wait().await;
+        if !matches!(status, Ok(status) if status.success()) {
+            tracing::warn!(?status, diagnostics = %session_host_diagnostics(&diagnostics_path),
+                "detached session host exited");
+        }
+    });
+    result
+}
+
+fn session_host_diagnostics(path: &Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let read_tail = || -> io::Result<String> {
+        let mut file = fs::File::open(path)?;
+        let start = file.metadata()?.len().saturating_sub(4096);
+        file.seek(SeekFrom::Start(start))?;
+        let mut tail = Vec::new();
+        file.take(4096).read_to_end(&mut tail)?;
+        Ok(String::from_utf8_lossy(&tail).trim().to_string())
+    };
+    read_tail().unwrap_or_else(|error| format!("Host diagnostics unavailable: {error}"))
+}
+
+fn show_session_recovery_notice(terminal: &mut Option<BorgTerminal>, notice: &str) {
+    tracing::warn!("{notice}");
+    if let Some(terminal) = terminal.as_mut() {
+        terminal.set_notice(notice);
+        if let Err(error) = terminal.draw() {
+            tracing::warn!(%error, "could not draw session recovery notice");
+        }
+    } else {
+        eprintln!("{notice}");
+    }
+}
+
+async fn wait_for_detached_session_host(
+    child: &mut Child,
+    mut ready: impl FnMut() -> Result<bool>,
+    mut waiting: impl FnMut(&mut Option<BorgTerminal>),
+    notice_interval: std::time::Duration,
+    terminal: &mut Option<BorgTerminal>,
+) -> Result<DetachedHostWait> {
+    let mut last_ctrl_c = None;
+    let mut next_notice = tokio::time::Instant::now() + notice_interval;
+    loop {
         if let Some(status) = child.try_wait()? {
+            if matches!(ready(), Ok(true)) {
+                return Ok(DetachedHostWait::Ready);
+            }
             anyhow::bail!("detached session host exited during startup with {status}");
         }
-        anyhow::ensure!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for the detached session host"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let readiness = ready();
+        if matches!(readiness, Ok(true)) {
+            return Ok(DetachedHostWait::Ready);
+        }
+        // A live child may be replaying a large journal or waiting for storage.
+        // Timing out here strands it and lets a retry launch a second child.
+        if tokio::time::Instant::now() >= next_notice {
+            if let Err(error) = readiness {
+                tracing::warn!(%error, "could not check detached session host readiness; retaining live child");
+            }
+            waiting(terminal);
+            next_notice = tokio::time::Instant::now() + notice_interval;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+            _ = tokio::signal::ctrl_c(), if terminal.is_none() => {
+                return Ok(DetachedHostWait::Detach);
+            }
+            event = recv_terminal_event(terminal), if terminal.is_some() => {
+                let Some(Ok(event)) = event else {
+                    return Ok(DetachedHostWait::Detach);
+                };
+                let tui = terminal.as_mut().expect("recovery terminal");
+                let draft = tui.composer_draft();
+                match tui.handle_event(event)? {
+                    UiAction::Quit => return Ok(DetachedHostWait::Detach),
+                    UiAction::Interrupt { .. } => {
+                        if repeated_ctrl_c(&mut last_ctrl_c, std::time::Instant::now()) {
+                            return Ok(DetachedHostWait::Detach);
+                        }
+                        tui.set_notice("Host is recovering. Press Ctrl-C again to detach without stopping the host.");
+                    }
+                    UiAction::Submit { .. } => {
+                        if let Some((text, attachments)) = draft {
+                            tui.restore_composer(text, attachments);
+                        }
+                        tui.set_notice("Host is recovering; your draft has not been submitted.");
+                    }
+                    _ => {}
+                }
+                if let Err(error) = tui.draw() {
+                    tracing::warn!(%error, "could not redraw recovering terminal");
+                }
+            }
+        }
     }
 }
 
@@ -2099,9 +2249,14 @@ async fn run_local_agent_session(
     } else {
         (Vec::new(), Vec::new())
     };
-    let request_id = initial_prompt
-        .as_ref()
-        .map_or(session_id, |_| Uuid::new_v4());
+    // The initial host prompt keeps its admission key across startup retries.
+    let request_id = if args.session_host.is_some() {
+        session_id
+    } else {
+        initial_prompt
+            .as_ref()
+            .map_or(session_id, |_| Uuid::new_v4())
+    };
     let launch = LaunchSession {
         request_id,
         cwd: cwd.clone(),
@@ -6701,7 +6856,9 @@ async fn run_local_agent_session(
             Some(anyhow::anyhow!("agent session task failed: {join_error}"))
         }
     };
-    let discarded_empty_session = if session_access == LocalSessionAccess::Owned && !args.ephemeral
+    let discarded_empty_session = if session_access == LocalSessionAccess::Owned
+        && !args.ephemeral
+        && !(args.session_host.is_some() && actor_error.is_some())
     {
         match sqlite_store.discard_empty_session(session_id).await {
             Ok(discarded) => discarded,
@@ -6714,6 +6871,10 @@ async fn run_local_agent_session(
         false
     };
     if let Some(error) = actor_error {
+        if args.session_host.is_some() && user_requested_exit {
+            tracing::warn!(%session_id, %error, "session stopped by user despite shutdown error");
+            return Ok(None);
+        }
         if discarded_empty_session {
             return Err(error);
         }
@@ -7014,6 +7175,8 @@ fn local_resume_error_is_retryable(error: &anyhow::Error) -> bool {
         || message.contains("database table is locked")
         || message.contains("database is busy")
         || message.contains("pool timed out")
+        || message.contains("database or disk is full")
+        || message.contains("no space left on device")
 }
 
 fn next_local_resume_retry_delay(delay: std::time::Duration) -> std::time::Duration {
