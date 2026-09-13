@@ -516,10 +516,10 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
 
     if tool == "spawn_agent" {
         let task = string_field(input, "task_name").unwrap_or("child");
-        let provider = string_field(input, "provider")
-            .map(|provider| format!(" · {provider}"))
+        let model = string_field(input, "model")
+            .map(|model| format!(" · {model}"))
             .unwrap_or_default();
-        return ("Delegate task".to_string(), format!("{task}{provider}"));
+        return ("Delegate task".to_string(), format!("{task}{model}"));
     }
 
     if tool == "list_agents" {

@@ -1,0 +1,30 @@
+[
+  {
+    "path": "/private/tmp/fr-farm-stock-interleave.zlVbFY",
+    "allocated_kib": 80
+  },
+  {
+    "path": "/private/tmp/fr-farm-stock-capacity.dqvquQ",
+    "allocated_kib": 80
+  },
+  {
+    "path": "/private/tmp/fr-farm-stock-old.FPYLFk",
+    "allocated_kib": 80
+  },
+  {
+    "path": "/private/tmp/borg-agent-inspect.eG9Z63",
+    "allocated_kib": 33324
+  },
+  {
+    "path": "/Users/sashaduke/Library/Application Support/Zed/node/cache",
+    "allocated_kib": 504172
+  },
+  {
+    "path": "/Users/sashaduke/Library/Application Support/Epic/UnrealEngine/Common/DerivedDataCache",
+    "allocated_kib": 1296436
+  },
+  {
+    "path": "/Users/sashaduke/agent/target/debug",
+    "allocated_kib": 9403888
+  }
+]

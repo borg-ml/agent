@@ -5647,6 +5647,14 @@ impl BorgTerminal {
             .unwrap_or(&self.cwd);
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let title = terminal_title(cwd, home.as_deref());
+        let title = if matches!(
+            self.status,
+            SessionStatus::Starting | SessionStatus::Running
+        ) {
+            format!("{} {title}", activity_glyph(self.status))
+        } else {
+            title
+        };
         if self.last_terminal_title.as_deref() != Some(&title) {
             execute!(self.terminal.backend_mut(), SetTitle(&title))?;
             self.last_terminal_title = Some(title);

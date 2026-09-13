@@ -413,8 +413,58 @@ impl SqliteWorkspaceStore {
     /// WAL and one transaction boundary.
     pub async fn from_pool(pool: SqlitePool) -> Result<Self> {
         let store = Self { pool };
-        store.schema().await?;
+        // Attaching to an already-current database must not take the single
+        // SQLite writer lock. `SessionStore::workspace_store` builds one of
+        // these per call, including on the local-control prompt path, so an
+        // unconditional schema transaction queues interactive callers behind
+        // whatever large session currently holds the writer. Probe with reads
+        // first and only fall back to the writing path when the database is
+        // actually new, stale, or incomplete.
+        if !store.has_current_schema().await? {
+            store.schema().await?;
+        }
         Ok(store)
+    }
+
+    /// Read-only probe for an already-current workspace schema.
+    ///
+    /// Mirrors `SqliteSessionStore::has_current_schema`. Anything unexpected —
+    /// including a stale database — reports false so that [`Self::schema`]
+    /// stays the single place deciding whether to create or reject a database.
+    async fn has_current_schema(&self) -> Result<bool> {
+        let has_marker: i64 = sqlx::query_scalar(
+            "select exists(select 1 from sqlite_master where type='table' and name='borg_workspace_schema')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if has_marker == 0 {
+            return Ok(false);
+        }
+        let version: Option<i64> =
+            sqlx::query_scalar("select version from borg_workspace_schema where id=1")
+                .fetch_optional(&self.pool)
+                .await?;
+        if version != Some(WORKSPACE_SCHEMA_VERSION) {
+            return Ok(false);
+        }
+        let has_pending_message_index: i64 = sqlx::query_scalar(
+            "select exists(select 1 from sqlite_master where type='index' \
+             and name='idx_workspace_pending_message_deliveries')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if has_pending_message_index == 0 {
+            return Ok(false);
+        }
+        // A current version marker still has to agree with the stale-database
+        // guard in `schema`, so re-check the column that guard inspects rather
+        // than trusting the marker alone.
+        let columns = sqlx::query("pragma table_info(workspace_deliveries)")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(columns
+            .iter()
+            .any(|column| column.get::<String, _>("name") == "is_message"))
     }
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
@@ -2552,6 +2602,30 @@ mod tests {
             plan.contains("idx_workspace_pending_message_deliveries"),
             "unexpected query plan: {plan}"
         );
+    }
+
+    #[tokio::test]
+    async fn attaching_to_a_current_schema_does_not_wait_for_the_sqlite_writer() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteWorkspaceStore::open(file.path()).await.unwrap();
+        let pool = store.pool().clone();
+
+        // Hold the single SQLite writer the way a large session does while it
+        // commits its journal.
+        let writer = crate::SqliteSessionStore::begin_sqlite_write(&pool)
+            .await
+            .unwrap();
+
+        let attached = tokio::time::timeout(
+            Duration::from_secs(5),
+            SqliteWorkspaceStore::from_pool(pool.clone()),
+        )
+        .await;
+
+        let attached = attached
+            .expect("attaching to a current workspace schema blocked on the SQLite writer lock");
+        attached.unwrap();
+        writer.rollback().await.unwrap();
     }
 
     #[tokio::test]

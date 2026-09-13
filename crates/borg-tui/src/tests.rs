@@ -5451,10 +5451,7 @@ fn tool_call_summaries_cover_cli_display_contract() {
                 "provider": "codex"
             })
         ),
-        (
-            "Delegate task".to_string(),
-            "inspect_ui · codex".to_string()
-        )
+        ("Delegate task".to_string(), "inspect_ui".to_string())
     );
     assert_eq!(
         tool_call_summary(

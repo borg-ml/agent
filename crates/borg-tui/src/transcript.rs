@@ -4108,7 +4108,7 @@ impl Transcript {
                         Style::default()
                             .fg(USER_LABEL_BLUE)
                             .add_modifier(Modifier::BOLD)
-                    } else if is_subagent_tool(name) {
+                    } else if is_subagent_tool(source_name) {
                         Style::default()
                             .fg(SUBAGENT_PINK)
                             .add_modifier(Modifier::BOLD)

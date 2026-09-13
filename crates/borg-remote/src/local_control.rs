@@ -665,6 +665,51 @@ async fn handle_control_connection(
                     .insert(*message_id);
             }
         }
+        if matches!(command, HostCommand::FlushPendingInput { .. }) {
+            let store = store
+                .as_ref()
+                .context("session owner cannot recover pending input without a durable journal")?;
+            // Admission can succeed before the original control handoff fails.
+            // Re-send those identities before flushing; the actor deduplicates
+            // prompts already present in its queue or active turn.
+            for action in store.pending_actions(session_id, usize::MAX).await? {
+                if !matches!(
+                    action.kind,
+                    crate::SessionActionKind::Prompt
+                        | crate::SessionActionKind::Steering
+                        | crate::SessionActionKind::FollowUp
+                ) || !matches!(
+                    action.state,
+                    crate::SessionActionState::Queued | crate::SessionActionState::Admitted
+                ) {
+                    continue;
+                }
+                let text = action
+                    .payload
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .context("pending prompt is missing its text")?
+                    .to_owned();
+                let attachments = serde_json::from_value(
+                    action
+                        .payload
+                        .get("attachments")
+                        .cloned()
+                        .context("pending prompt is missing its attachments")?,
+                )?;
+                commands
+                    .send(HostCommand::Prompt {
+                        session_id,
+                        message_id: action.action_id,
+                        text,
+                        attachments,
+                        output_schema: action.payload.get("output_schema").cloned(),
+                        delivery: crate::PromptDelivery::Steer,
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("session owner stopped"))?;
+            }
+        }
         commands
             .send(command)
             .await
@@ -1232,6 +1277,102 @@ mod tests {
                 .contains("durable journal")
         );
         assert!(owner_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn flush_recovers_admitted_prompt_with_attachments_before_flushing_owner() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let lock_path = root.path().join("session.lock");
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let writer = SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .unwrap();
+        let store: Arc<dyn SessionStore> = Arc::new(
+            crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                .await
+                .unwrap(),
+        );
+        store.create_session(session_id).await.unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionConfigured {
+                    cwd: root.path().to_path_buf(),
+                    provider: crate::CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: false,
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: crate::PermissionMode::Manual,
+                },
+            ))
+            .await
+            .unwrap();
+        let attachments = vec![root.path().join("original.png")];
+        store
+            .admit_prompt(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::User,
+                    text: "use this image".into(),
+                    attachments: attachments.clone(),
+                    status: MessageStatus::Queued,
+                    delivery: Some(PromptDelivery::Queue),
+                },
+            ))
+            .await
+            .unwrap();
+        let (owner_tx, mut owner_rx) = mpsc::channel(4);
+        let _server = LocalSessionControlServer::start_with_durable_prompt_admissions(
+            socket_path.clone(),
+            session_id,
+            &writer,
+            owner_tx,
+            None,
+            store,
+        )
+        .unwrap();
+        assert!(
+            !forward_attached_command(
+                &lock_path,
+                &socket_path,
+                HostCommand::FlushPendingInput { session_id }
+            )
+            .await
+            .unwrap()
+        );
+        match owner_rx.recv().await.unwrap() {
+            HostCommand::Prompt {
+                message_id: actual,
+                text,
+                attachments: actual_files,
+                delivery,
+                ..
+            } => {
+                assert_eq!(actual, message_id);
+                assert_eq!(text, "use this image");
+                assert_eq!(actual_files, attachments);
+                assert_eq!(delivery, PromptDelivery::Steer);
+            }
+            command => panic!("expected recovered prompt, got {command:?}"),
+        }
+        assert!(matches!(
+            owner_rx.recv().await.unwrap(),
+            HostCommand::FlushPendingInput { .. }
+        ));
     }
 
     #[tokio::test]
