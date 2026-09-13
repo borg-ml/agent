@@ -770,6 +770,7 @@ fn transcript_attachment_rows_link_to_the_local_image() {
         time: "2026-08-26 12:00".to_string(),
         status: MessageStatus::Complete,
         complete: true,
+        user_interrupted: false,
     });
 
     let rendered = transcript.render(100, None, None, None);
@@ -6468,6 +6469,7 @@ fn transcript_copy_selection_can_move_beyond_last_assistant_message() {
         time: "12:00".to_string(),
         status: MessageStatus::Complete,
         complete: true,
+        user_interrupted: false,
     });
     transcript.order.push(TranscriptEntry::Activity {
         text: "subagent · completed".to_string(),
@@ -6501,6 +6503,7 @@ fn last_assistant_message_copy_ignores_later_activity_and_selection() {
         time: "12:00".to_string(),
         status: MessageStatus::Complete,
         complete: true,
+        user_interrupted: false,
     });
     transcript.order.push(TranscriptEntry::Activity {
         text: "finished".to_string(),
@@ -6531,6 +6534,7 @@ fn copied_markdown_message_omits_fenced_code_markers() {
         time: "12:00".to_string(),
         status: MessageStatus::Complete,
         complete: true,
+        user_interrupted: false,
     };
     assert_eq!(
         entry.copy_text_owned().as_deref(),
@@ -6562,6 +6566,7 @@ fn assistant_message_actions_stay_out_of_the_transcript() {
         time: "12:00".to_string(),
         status: MessageStatus::Complete,
         complete: true,
+        user_interrupted: false,
     });
 
     let idle = transcript.lines(80);
@@ -6598,6 +6603,7 @@ fn message_hover_shows_copy_hint_for_user_and_assistant() {
             time: "12:00".to_string(),
             status: MessageStatus::Complete,
             complete: false,
+            user_interrupted: false,
         },
         TranscriptEntry::Message {
             actor: EventActor::User,
@@ -6608,6 +6614,7 @@ fn message_hover_shows_copy_hint_for_user_and_assistant() {
             time: "12:01".to_string(),
             status: MessageStatus::Complete,
             complete: true,
+            user_interrupted: false,
         },
     ];
 
@@ -8991,6 +8998,7 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         time: "12:00".to_string(),
         status: MessageStatus::Complete,
         complete: true,
+        user_interrupted: false,
     });
     transcript.order.push(TranscriptEntry::Tool {
         source_name: "command_execution".to_string(),
@@ -9017,6 +9025,7 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         time: "12:02".to_string(),
         status: MessageStatus::Complete,
         complete: true,
+        user_interrupted: false,
     });
     transcript.order.push(TranscriptEntry::Tool {
         source_name: "command_execution".to_string(),
@@ -9165,6 +9174,7 @@ fn adjacent_tool_calls_are_compact_but_leave_gap_before_following_message() {
         time: "12:01".to_string(),
         status: MessageStatus::Complete,
         complete: true,
+        user_interrupted: false,
     });
 
     let rendered = transcript.render(80, None, None, None);
@@ -9194,6 +9204,7 @@ fn message_tool_message_edges_have_one_separator_row_each() {
         time: time.to_string(),
         status: MessageStatus::Complete,
         complete: true,
+        user_interrupted: false,
     };
     transcript
         .order
@@ -9285,6 +9296,7 @@ fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
         time: "12:01".to_string(),
         status: MessageStatus::Complete,
         complete: true,
+        user_interrupted: false,
     });
 
     let lines = transcript.lines(80);
@@ -12307,4 +12319,220 @@ async fn timeline_detail_click_policy_applies_to_every_expandable_entry() {
             }
         }
     }
+}
+
+fn action_preparing(session_id: Uuid, sequence: u64) -> SessionEvent {
+    SessionEvent::new(
+        session_id,
+        sequence,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "action/preparing".into(),
+            payload: serde_json::json!({"label": "", "tool_call_id": null}),
+        },
+    )
+}
+
+fn turn_started(session_id: Uuid, sequence: u64, message_id: Uuid) -> SessionEvent {
+    SessionEvent::new(
+        session_id,
+        sequence,
+        SessionEventKind::TurnStarted {
+            message_id,
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+        },
+    )
+}
+
+fn spinning_tool_rows(transcript: &Transcript) -> usize {
+    transcript
+        .order
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                TranscriptEntry::Tool {
+                    complete: false,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
+#[test]
+fn a_preparation_flushed_after_the_turn_closed_never_strands_a_spinner() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&turn_started(session_id, 1, Uuid::new_v4()));
+    transcript.apply(&action_preparing(session_id, 2));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: Some("interrupted".to_string()),
+        },
+    ));
+    assert_eq!(
+        spinning_tool_rows(&transcript),
+        0,
+        "the interrupt must settle the preparation it cancelled"
+    );
+
+    // The aborted provider stream can still flush a trailing preparation frame
+    // after the boundary. Nothing in this turn will ever resolve it.
+    transcript.apply(&action_preparing(session_id, 4));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        5,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "action/generation_status".into(),
+            payload: serde_json::json!({"tool_call_id": null, "waiting": true, "label": ""}),
+        },
+    ));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(spinning_tool_rows(&transcript), 0, "{rendered}");
+    assert!(!rendered.contains("Waiting for provider"), "{rendered}");
+}
+
+#[test]
+fn a_new_turn_retires_the_previous_turns_action_preparation() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&turn_started(session_id, 1, Uuid::new_v4()));
+    transcript.apply(&action_preparing(session_id, 2));
+    // The previous turn ends without its terminal event reaching this
+    // transcript, then the user prompts again.
+    transcript.apply(&turn_started(session_id, 3, Uuid::new_v4()));
+    assert_eq!(
+        spinning_tool_rows(&transcript),
+        0,
+        "a new turn id must retire the previous turn's spinner"
+    );
+}
+
+#[test]
+fn a_live_preparation_survives_a_mid_turn_running_refresh() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&turn_started(session_id, 1, message_id));
+    transcript.apply(&action_preparing(session_id, 2));
+    // An approval returning to Running is not a turn boundary; generation that
+    // is still in flight must keep spinning.
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Running,
+            detail: None,
+        },
+    ));
+    assert_eq!(spinning_tool_rows(&transcript), 1);
+    // A redundant TurnStarted for the same turn is not a boundary either.
+    transcript.apply(&turn_started(session_id, 4, message_id));
+    assert_eq!(spinning_tool_rows(&transcript), 1);
+}
+
+#[test]
+fn interrupted_partial_commentary_is_marked_instead_of_reading_as_final() {
+    let session_id = Uuid::new_v4();
+    let assistant_id = Uuid::new_v4();
+    let render = |transcript: &Transcript| {
+        transcript
+            .lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let partial = |sequence: u64, status: MessageStatus, text: &str| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id: assistant_id,
+                actor: EventActor::Assistant,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                status,
+                delivery: None,
+            },
+        )
+    };
+
+    let mut transcript = Transcript::default();
+    transcript.apply(&turn_started(session_id, 1, Uuid::new_v4()));
+    transcript.apply(&partial(2, MessageStatus::InProgress, "That adds a"));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: Some("interrupted".to_string()),
+        },
+    ));
+    let rendered = render(&transcript);
+    assert!(rendered.contains("That adds a"), "{rendered}");
+    assert!(rendered.contains("user interrupted"), "{rendered}");
+    assert!(!rendered.contains("responding"), "{rendered}");
+
+    // A durable redelivery of the same message carries the text the provider
+    // really ended on, so the row is no longer a stranded fragment.
+    transcript.apply(&partial(
+        4,
+        MessageStatus::Complete,
+        "That adds a retry budget.",
+    ));
+    let rendered = render(&transcript);
+    assert!(rendered.contains("That adds a retry budget."), "{rendered}");
+    assert!(!rendered.contains("user interrupted"), "{rendered}");
+}
+
+#[test]
+fn a_cleanly_completed_response_is_not_marked_interrupted() {
+    let session_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&turn_started(session_id, 1, user_id));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "Done.".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::TurnCompleted {
+            message_id: user_id,
+            provider_session_id: None,
+            final_text: String::new(),
+            error: None,
+        },
+    ));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Done."), "{rendered}");
+    assert!(!rendered.contains("user interrupted"), "{rendered}");
 }

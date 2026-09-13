@@ -305,6 +305,10 @@ enum TranscriptEntry {
         time: String,
         status: MessageStatus,
         complete: bool,
+        /// A live assistant message the user cut off mid-stream. The contract
+        /// status can only say the row is settled, so the partial text would
+        /// otherwise read as a finished answer.
+        user_interrupted: bool,
     },
     Activity {
         text: String,
@@ -1019,26 +1023,56 @@ impl Transcript {
             self.active_turn = None;
         }
         match &event.kind {
-            SessionEventKind::TurnStarted { .. }
-            | SessionEventKind::StatusChanged {
+            // A new turn id retires every action preparation the previous turn
+            // left behind. Those spinners describe generation this stream will
+            // never report on again, so nothing downstream can ever settle them.
+            SessionEventKind::TurnStarted { message_id, .. } => {
+                if self
+                    .active_turn
+                    .as_ref()
+                    .is_none_or(|turn| turn.message_id != *message_id)
+                {
+                    self.settle_stale_preparations(event.created_at);
+                }
+                self.live_turn_closed = false;
+            }
+            SessionEventKind::StatusChanged {
                 status:
                     SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval,
                 ..
-            } => self.live_turn_closed = false,
+            } => {
+                // Only a genuine closed→live transition retires preparations;
+                // a mid-turn Running refresh (an approval returning) must not
+                // cancel generation that is still in flight.
+                if self.live_turn_closed {
+                    self.settle_stale_preparations(event.created_at);
+                }
+                self.live_turn_closed = false;
+            }
             SessionEventKind::StatusChanged {
                 status:
                     SessionStatus::Ready
                     | SessionStatus::Completed
                     | SessionStatus::Failed
                     | SessionStatus::Stopped,
-                ..
+                detail,
             } => {
                 self.live_turn_closed = true;
-                self.finish_live_assistant_messages(event.created_at);
+                self.finish_live_assistant_messages(
+                    event.created_at,
+                    detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.eq_ignore_ascii_case("interrupted")),
+                );
             }
-            SessionEventKind::TurnCompleted { .. } => {
+            SessionEventKind::TurnCompleted { error, .. } => {
                 self.live_turn_closed = true;
-                self.finish_live_assistant_messages(event.created_at);
+                self.finish_live_assistant_messages(
+                    event.created_at,
+                    error
+                        .as_deref()
+                        .is_some_and(|error| error.to_ascii_lowercase().contains("interrupted")),
+                );
             }
             _ => {}
         }
@@ -1265,6 +1299,7 @@ impl Transcript {
                         attachments: stored_attachments,
                         status: stored_status,
                         complete,
+                        user_interrupted,
                         ..
                     } = &mut self.order[index]
                     {
@@ -1273,6 +1308,10 @@ impl Transcript {
                         *stored_status = *status;
                         *complete =
                             matches!(*status, MessageStatus::Complete | MessageStatus::Failed);
+                        // A durable redelivery of the same message carries the
+                        // text the provider really ended on, so the row is no
+                        // longer a stranded fragment.
+                        *user_interrupted = false;
                         if let Some(attachments) = numbered_attachments {
                             *stored_attachments = attachments;
                         }
@@ -1332,6 +1371,7 @@ impl Transcript {
                                 *status,
                                 MessageStatus::Complete | MessageStatus::Failed
                             ),
+                            user_interrupted: false,
                         },
                     );
                 }
@@ -2479,6 +2519,13 @@ impl Transcript {
                     })
                     .flatten()
             });
+        // A closed turn can still flush a trailing preparation frame after the
+        // interrupt or completion boundary has been projected. Materializing a
+        // fresh row for it strands a spinner that no later event of this turn
+        // can resolve, so only an already-tracked row may still be refreshed.
+        if self.live_turn_closed && existing.is_none() {
+            return;
+        }
         if provider_tool_id.is_none()
             && !label.is_empty()
             && existing.is_none()
@@ -2514,6 +2561,40 @@ impl Transcript {
             *backgrounded = false;
         }
         self.foreground_tool = Some(tool_call_id);
+    }
+
+    /// Settle every still-spinning action preparation, including rows whose
+    /// tracking entry was already dropped by an interrupt sweep. Only the
+    /// synthetic `action_preparing` rows are touched; a real tool that is
+    /// legitimately still running across the boundary keeps its own lifecycle.
+    fn settle_stale_preparations(&mut self, completed_at: DateTime<Utc>) {
+        self.preparing_tools.clear();
+        self.unkeyed_preparing_tools.clear();
+        let foreground_index = self
+            .foreground_tool
+            .as_deref()
+            .and_then(|tool_call_id| self.tools.get(tool_call_id).copied());
+        for (index, entry) in self.order.iter_mut().enumerate() {
+            let TranscriptEntry::Tool {
+                source_name,
+                complete,
+                completed_at: stored_completed_at,
+                backgrounded,
+                ..
+            } = entry
+            else {
+                continue;
+            };
+            if source_name != "action_preparing" || *complete {
+                continue;
+            }
+            *complete = true;
+            *stored_completed_at = Some(completed_at);
+            *backgrounded = false;
+            if foreground_index == Some(index) {
+                self.foreground_tool = None;
+            }
+        }
     }
 
     fn finish_preparing_tool(&mut self, preparing_id: &str, completed_at: DateTime<Utc>) {
@@ -2743,12 +2824,17 @@ impl Transcript {
         }
     }
 
-    fn finish_live_assistant_messages(&mut self, completed_at: DateTime<Utc>) {
+    fn finish_live_assistant_messages(
+        &mut self,
+        completed_at: DateTime<Utc>,
+        user_interrupted_turn: bool,
+    ) {
         for (index, entry) in self.order.iter_mut().enumerate() {
             let TranscriptEntry::Message {
                 actor: EventActor::Assistant,
                 status,
                 complete,
+                user_interrupted,
                 ..
             } = entry
             else {
@@ -2759,6 +2845,9 @@ impl Transcript {
             }
             *status = MessageStatus::Complete;
             *complete = true;
+            // The stream stopped mid-sentence. Settling the row silently would
+            // present the fragment as the assistant's finished answer.
+            *user_interrupted = user_interrupted_turn;
             self.message_markdown_cache
                 .get_mut()
                 .messages
@@ -3431,6 +3520,7 @@ impl Transcript {
                     time,
                     status,
                     complete,
+                    user_interrupted,
                 } => {
                     if *status == MessageStatus::Queued {
                         continue;
@@ -3577,6 +3667,11 @@ impl Transcript {
                         lines.push(Line::from(Span::styled(
                             "    ◌ responding",
                             Style::default().fg(Color::Cyan),
+                        )));
+                    } else if *actor == EventActor::Assistant && *user_interrupted {
+                        lines.push(Line::from(Span::styled(
+                            "    ■ user interrupted",
+                            Style::default().fg(Color::Red),
                         )));
                     }
                     while lines.len() > message_content_start
