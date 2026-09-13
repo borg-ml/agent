@@ -39,3 +39,9 @@
   work merely to create a commit.
 - Keep the working tree recoverable: do not leave a long-running task with a
   large, uncommitted change set when a coherent checkpoint can be committed.
+
+## Scratch and storage
+
+- Follow host-local disk guidance in `~/AGENTS.md` when present. Check headroom before large builds or copies; do not exhaust the space needed for durable journals.
+- Prefer reusable build directories, temporary Git worktrees/local clones, and APFS copy-on-write copies over recursively copying repositories with `.git`, build outputs, and saved work.
+- Keep delivery patches and evidence separate from disposable verification checkouts. Retire owned scratch only after verifying delivery is retained and no active process or pending workflow needs its paths. Never delete work owned by another worker, project saves, or session history as cache cleanup.
