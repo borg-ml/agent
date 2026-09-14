@@ -1428,10 +1428,7 @@ impl AgentTurnExecutor for UsageLimitThenSuccessExecutor {
         events: mpsc::Sender<SessionEventKind>,
         _controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
-        self.prompts
-            .lock()
-            .unwrap()
-            .push(turn.prompt.clone());
+        self.prompts.lock().unwrap().push(turn.prompt.clone());
         if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
             if self.side_effects_before_limit {
                 let _ = events
@@ -2187,7 +2184,9 @@ async fn usage_limit_after_side_effects_continues_instead_of_replaying_the_promp
             .expect("continuation turn completes")
         else {
             let result = actor.await.unwrap();
-            panic!("session exited early after {completions} completion(s): {result:?}; statuses {user_statuses:?}");
+            panic!(
+                "session exited early after {completions} completion(s): {result:?}; statuses {user_statuses:?}"
+            );
         };
         match &event.kind {
             SessionEventKind::Message {
@@ -7241,9 +7240,16 @@ async fn inactive_team_reports_settle_without_starting_a_provider_turn() {
         batch: Vec::new(),
     }]);
 
-    settle_inactive_team_notifications(&mut runtime, &event_tx, session_id, &mut pending, false, None)
-        .await
-        .unwrap();
+    settle_inactive_team_notifications(
+        &mut runtime,
+        &event_tx,
+        session_id,
+        &mut pending,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert!(pending.is_empty());
     let event = event_rx.recv().await.unwrap();
@@ -7284,9 +7290,16 @@ async fn inactive_wake_report_is_retained_for_the_root_provider_turn() {
         batch: Vec::new(),
     }]);
 
-    settle_inactive_team_notifications(&mut runtime, &event_tx, session_id, &mut pending, false, None)
-        .await
-        .unwrap();
+    settle_inactive_team_notifications(
+        &mut runtime,
+        &event_tx,
+        session_id,
+        &mut pending,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].message_id, message_id);
@@ -12638,4 +12651,46 @@ async fn a_pending_provider_interaction_suspends_the_watchdog() {
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+}
+
+#[test]
+fn retry_prompts_carry_prior_checkpoints_without_repeating_completed_work() {
+    let checkpoint = |key: &str, state: serde_json::Value| crate::AutonomyCheckpoint {
+        checkpoint_id: Uuid::new_v4(),
+        job_id: Uuid::new_v4(),
+        checkpoint_key: key.to_string(),
+        session_id: None,
+        goal_id: None,
+        kind: "tool-result".to_string(),
+        state,
+        evidence: serde_json::json!({}),
+        content_hash: "hash".to_string(),
+        created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+    };
+    let none = autonomy_retry_prompt("Deploy the service".to_string(), 2, &[]);
+    assert!(none.starts_with("Deploy the service"));
+    assert!(none.contains("attempt 2"), "{none}");
+    assert!(none.contains("no checkpoints"), "{none}");
+
+    let with = autonomy_retry_prompt(
+        "Deploy the service".to_string(),
+        3,
+        &[
+            checkpoint("build", serde_json::json!({"artifact": "svc-1.2.3"})),
+            checkpoint("upload", serde_json::json!({"huge": "x".repeat(5_000)})),
+        ],
+    );
+    assert!(with.contains("attempt 3"), "{with}");
+    assert!(
+        with.contains(
+            "- build [tool-result] at 2023-11-14T22:13:20+00:00: {\"artifact\":\"svc-1.2.3\"}"
+        ),
+        "{with}"
+    );
+    assert!(with.contains("- upload [tool-result]"), "{with}");
+    assert!(
+        with.contains("…"),
+        "long checkpoint state is truncated: {with}"
+    );
+    assert!(with.len() < 3_000, "{}", with.len());
 }

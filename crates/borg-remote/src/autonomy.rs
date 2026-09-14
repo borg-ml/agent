@@ -585,7 +585,7 @@ impl SqliteAutonomyStore {
             let job_id = parse_uuid(row.try_get::<String, _>("job_id")?, "job_id")?;
             let token = Uuid::new_v4();
             let updated = sqlx::query(
-                "update autonomy_jobs set state='claimed', attempt=attempt+1, \
+                "update autonomy_jobs set state='claimed', \
                  lease_owner=?, lease_token=?, lease_heartbeat_at_ms=?, lease_expires_at_ms=?, \
                  updated_at_ms=? where job_id=? and state='queued' and due_at_ms <= ? \
                  and attempt < max_attempts and (? is null or session_id = ?)",
@@ -704,6 +704,19 @@ impl SqliteAutonomyStore {
                 "job {job_id} has exhausted its retry-attempt budget"
             );
         }
+        // An attempt is consumed when the job starts executing, not when it
+        // is claimed: a worker that claims and dies before running must not
+        // burn the budget of a job that never ran (with `max_attempts = 1`
+        // that made the job Failed forever without a single execution).
+        let next_attempt = if next == AutonomyJobState::Running {
+            ensure!(
+                current.attempt < current.max_attempts,
+                "job {job_id} has exhausted its execution-attempt budget"
+            );
+            current.attempt + 1
+        } else {
+            current.attempt
+        };
         let lease_owner = lease.map(|value| value.owner.clone());
         let clear_lease = matches!(
             next,
@@ -713,11 +726,12 @@ impl SqliteAutonomyStore {
                 | AutonomyJobState::Cancelled
         );
         sqlx::query(
-            "update autonomy_jobs set state=?, due_at_ms=?, lease_owner=?, lease_token=?, \
+            "update autonomy_jobs set state=?, attempt=?, due_at_ms=?, lease_owner=?, lease_token=?, \
              lease_heartbeat_at_ms=?, lease_expires_at_ms=?, last_error=?, updated_at_ms=? \
              where job_id=? and state=?",
         )
         .bind(next.as_str())
+        .bind(i64::from(next_attempt))
         .bind(to_millis(if next == AutonomyJobState::Queued {
             now
         } else {
@@ -1419,7 +1433,10 @@ mod tests {
             .await
             .expect("claim");
         assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].attempt, 1);
+        assert_eq!(
+            claimed[0].attempt, 0,
+            "claiming does not consume an attempt"
+        );
         let lease = claimed[0].lease().expect("claim lease");
 
         let wrong = AutonomyLease {
@@ -1596,31 +1613,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expired_claims_requeue_then_fail_at_attempt_budget() {
+    async fn expired_runs_requeue_then_fail_at_attempt_budget() {
         let store = store().await;
         let job = store
             .enqueue(enqueue("recovery", at(1_700_000_000), 2))
             .await
             .expect("enqueue");
+        let start = |claimed: &AutonomyJob, when| {
+            let lease = claimed.lease().expect("claim lease");
+            let job_id = claimed.job_id;
+            let store = store.clone();
+            async move {
+                store
+                    .transition(
+                        job_id,
+                        AutonomyJobState::Claimed,
+                        AutonomyJobState::Running,
+                        Some(&lease),
+                        None,
+                        when,
+                    )
+                    .await
+                    .expect("start running")
+            }
+        };
         let first = store
             .claim_due(at(1_700_000_001), "worker-a", Duration::from_secs(5), 1)
             .await
             .expect("first claim");
-        assert_eq!(first[0].attempt, 1);
+        assert_eq!(first[0].attempt, 0);
+        let running = start(&first[0], at(1_700_000_002)).await;
+        assert_eq!(running.attempt, 1, "execution consumes the attempt");
         let requeued = store
-            .recover_expired(at(1_700_000_007), 1)
+            .recover_expired(at(1_700_000_008), 1)
             .await
             .expect("recovery");
         assert_eq!(requeued[0].state, AutonomyJobState::Queued);
         assert_eq!(requeued[0].attempt, 1);
 
         let second = store
-            .claim_due(at(1_700_000_008), "worker-b", Duration::from_secs(5), 1)
+            .claim_due(at(1_700_000_009), "worker-b", Duration::from_secs(5), 1)
             .await
             .expect("second claim");
-        assert_eq!(second[0].attempt, 2);
+        assert_eq!(second[0].attempt, 1);
+        let running = start(&second[0], at(1_700_000_010)).await;
+        assert_eq!(running.attempt, 2);
         let failed = store
-            .recover_expired(at(1_700_000_014), 1)
+            .recover_expired(at(1_700_000_016), 1)
             .await
             .expect("terminal recovery");
         assert_eq!(failed[0].state, AutonomyJobState::Failed);
@@ -1632,13 +1671,66 @@ mod tests {
         );
         assert_eq!(
             store
-                .claim_due(at(1_700_000_015), "worker-c", Duration::from_secs(5), 1)
+                .claim_due(at(1_700_000_017), "worker-c", Duration::from_secs(5), 1)
                 .await
                 .expect("terminal job is not claimable")
                 .len(),
             0
         );
-        assert_eq!(store.list_transitions(job.job_id).await.unwrap().len(), 5);
+        assert_eq!(store.list_transitions(job.job_id).await.unwrap().len(), 7);
+    }
+
+    #[tokio::test]
+    async fn a_claim_that_never_ran_does_not_consume_the_attempt_budget() {
+        let store = store().await;
+        let job = store
+            .enqueue(enqueue("never-ran", at(1_700_000_000), 1))
+            .await
+            .expect("enqueue");
+        let claimed = store
+            .claim_due(at(1_700_000_001), "worker-a", Duration::from_secs(5), 1)
+            .await
+            .expect("claim");
+        assert_eq!(claimed[0].attempt, 0);
+        // The worker dies before entering Running; its lease expires.
+        let recovered = store
+            .recover_expired(at(1_700_000_007), 1)
+            .await
+            .expect("recovery");
+        assert_eq!(recovered[0].state, AutonomyJobState::Queued);
+        assert_eq!(recovered[0].attempt, 0);
+        let again = store
+            .claim_due(at(1_700_000_008), "worker-b", Duration::from_secs(5), 1)
+            .await
+            .expect("a job that never ran stays claimable");
+        assert_eq!(again.len(), 1);
+        let lease = again[0].lease().expect("lease");
+        let running = store
+            .transition(
+                job.job_id,
+                AutonomyJobState::Claimed,
+                AutonomyJobState::Running,
+                Some(&lease),
+                None,
+                at(1_700_000_009),
+            )
+            .await
+            .expect("first real execution");
+        assert_eq!(running.attempt, 1);
+        assert!(
+            store
+                .transition(
+                    job.job_id,
+                    AutonomyJobState::Running,
+                    AutonomyJobState::Queued,
+                    Some(&lease),
+                    Some("transient".to_owned()),
+                    at(1_700_000_010),
+                )
+                .await
+                .is_err(),
+            "the single execution attempt is spent"
+        );
     }
 
     #[tokio::test]

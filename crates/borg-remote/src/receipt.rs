@@ -436,6 +436,14 @@ impl SqliteReceiptStore {
         )
         .execute(&self.pool)
         .await?;
+        // The dispatch poll reads the oldest live entry per host; without
+        // this index that is a full scan of an unbounded table on every tick.
+        sqlx::query(
+            "create index if not exists idx_host_operation_queue_host_live \
+             on host_operation_queue (host_id, sequence) where quarantine_reason is null",
+        )
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 

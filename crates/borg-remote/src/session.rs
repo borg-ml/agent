@@ -149,6 +149,54 @@ fn autonomy_job_prompt(job: &crate::AutonomyJob, session_id: Uuid) -> Result<Str
     Ok(prompt.to_string())
 }
 
+const MAX_RETRY_PROMPT_CHECKPOINTS: usize = 32;
+const MAX_RETRY_PROMPT_CHECKPOINT_CHARS: usize = 2_000;
+
+/// A retried job must not repeat completed work. Prior checkpoints are the
+/// durable evidence of what earlier attempts already did, so they are put in
+/// front of the model instead of staying write-only in the store.
+fn autonomy_retry_prompt(
+    prompt: String,
+    attempt: u32,
+    checkpoints: &[crate::AutonomyCheckpoint],
+) -> String {
+    use std::fmt::Write as _;
+
+    if checkpoints.is_empty() {
+        return format!(
+            "{prompt}\n\nThis is attempt {attempt} of this job; earlier attempts recorded no checkpoints. Inspect current state before repeating any side effect."
+        );
+    }
+    let mut text = format!(
+        "{prompt}\n\nThis is attempt {attempt} of this job. Earlier attempts recorded these checkpoints; do not repeat completed work:\n"
+    );
+    for checkpoint in checkpoints.iter().take(MAX_RETRY_PROMPT_CHECKPOINTS) {
+        let mut state = serde_json::to_string(&checkpoint.state).unwrap_or_default();
+        if state.chars().count() > MAX_RETRY_PROMPT_CHECKPOINT_CHARS {
+            state = state
+                .chars()
+                .take(MAX_RETRY_PROMPT_CHECKPOINT_CHARS)
+                .collect::<String>()
+                + "…";
+        }
+        let _ = writeln!(
+            text,
+            "- {} [{}] at {}: {state}",
+            checkpoint.checkpoint_key,
+            checkpoint.kind,
+            checkpoint.created_at.to_rfc3339()
+        );
+    }
+    if checkpoints.len() > MAX_RETRY_PROMPT_CHECKPOINTS {
+        let _ = writeln!(
+            text,
+            "- … {} more; list the job's checkpoints for the full record.",
+            checkpoints.len() - MAX_RETRY_PROMPT_CHECKPOINTS
+        );
+    }
+    text
+}
+
 fn autonomy_blu_workflow(
     job: &crate::AutonomyJob,
     session_id: Uuid,
@@ -2160,13 +2208,33 @@ async fn run_agent_session_store_kernel(
                             continue;
                         }
                         let job_id = dispatch.job.job_id;
-                        let text = match autonomy_job_prompt(&dispatch.job, session_id) {
+                        let mut text = match autonomy_job_prompt(&dispatch.job, session_id) {
                             Ok(text) => text,
                             Err(error) => {
                                 let _ = dispatch.result.send(Err(error));
                                 continue;
                             }
                         };
+                        if dispatch.job.attempt > 1
+                            && let Some(autonomy_store) = workflow_autonomy_store.as_ref()
+                        {
+                            match autonomy_store.list_checkpoints(job_id).await {
+                                Ok(checkpoints) => {
+                                    text = autonomy_retry_prompt(
+                                        text,
+                                        dispatch.job.attempt,
+                                        &checkpoints,
+                                    );
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %job_id,
+                                        %error,
+                                        "autonomy checkpoints unavailable for the retry prompt"
+                                    );
+                                }
+                            }
+                        }
                         autonomy_prompt_ids.insert(job_id);
                         autonomy_completions.insert(job_id, dispatch.result);
                         Some(HostCommand::Prompt {

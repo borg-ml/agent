@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -148,10 +149,11 @@ impl WorkspaceSnapshot {
                     .unwrap_or("file"),
                 Uuid::new_v4().simple()
             ));
-            fs::write(&temp, &file.bytes)?;
+            write_file_durably(&temp, &file.bytes)?;
             fs::rename(&temp, &destination).with_context(|| {
                 format!("replace restored workspace file {}", file.path.display())
             })?;
+            fsync_directory(parent)?;
             paths.insert(file.path.clone());
             restored_files += 1;
         }
@@ -183,6 +185,34 @@ impl WorkspaceSnapshot {
             removed_files,
         })
     }
+}
+
+/// A restore is only durable once the bytes, the rename, and the directory
+/// entry have all reached disk; otherwise a power loss can leave an empty or
+/// missing file behind a restore that already reported success.
+fn write_file_durably(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = fs::File::create(path)
+        .with_context(|| format!("create restore temp file {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()
+        .with_context(|| format!("sync restore temp file {}", path.display()))?;
+    Ok(())
+}
+
+fn fsync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("sync directory {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        // Directory handles cannot be fsync'd on Windows; the file's own
+        // sync_all before the rename is the strongest guarantee available.
+        let _ = path;
+    }
+    Ok(())
 }
 
 fn collect_files(
