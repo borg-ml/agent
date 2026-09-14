@@ -12888,3 +12888,31 @@ async fn action_inspector_stays_on_its_entry_when_late_messages_arrive() {
     assert_eq!(terminal.focused_tool, focused);
     terminal.shutdown().await;
 }
+
+#[test]
+fn empty_thinking_row_is_not_expandable_or_hinted() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    for (sequence, kind) in ["item/started:reasoning", "item/completed:reasoning"]
+        .into_iter()
+        .enumerate()
+    {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence as u64 + 1,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Claude,
+                kind: kind.to_string(),
+                payload: serde_json::json!({"item": {"type": "reasoning"}}),
+            },
+        ));
+    }
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Tool { name, complete: true, .. } if name == "Thinking"
+    ));
+    assert_eq!(transcript.tool_copy_hint(0), None);
+    assert!(!transcript.tool_is_expandable(0));
+    assert!(transcript.toggle_tool(0).is_empty());
+    assert!(!transcript.tool_is_expanded(0));
+}

@@ -3280,6 +3280,15 @@ impl BorgTerminal {
         let Some((_, complete)) = self.transcript.inspector_heading(index) else {
             return Vec::new();
         };
+        // A tool row with nothing to show (an empty Thinking window, a probe
+        // with no body) has no inspector; treat the click as a no-op.
+        if matches!(
+            self.transcript.order.get(index),
+            Some(TranscriptEntry::Tool { .. })
+        ) && !self.transcript.tool_is_expandable(index)
+        {
+            return Vec::new();
+        }
         if self.focused_tool == Some(index) {
             return Vec::new();
         }
