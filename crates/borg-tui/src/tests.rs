@@ -7451,6 +7451,7 @@ fn accepted_steer_moves_from_pending_input_into_the_timeline() {
             status: MessageStatus::InProgress,
             delivery: Some(PromptDelivery::Steer),
         },
+        &mut None,
     );
     assert!(queue.is_empty());
 
@@ -7464,6 +7465,7 @@ fn accepted_steer_moves_from_pending_input_into_the_timeline() {
             status: MessageStatus::Queued,
             delivery: Some(PromptDelivery::Steer),
         },
+        &mut None,
     );
     assert_eq!(
         queue,
@@ -7484,6 +7486,7 @@ fn accepted_steer_moves_from_pending_input_into_the_timeline() {
             status: MessageStatus::InProgress,
             delivery: Some(PromptDelivery::Steer),
         },
+        &mut None,
     );
     assert!(queue.is_empty());
 
@@ -7497,6 +7500,7 @@ fn accepted_steer_moves_from_pending_input_into_the_timeline() {
             status: MessageStatus::Queued,
             delivery: Some(PromptDelivery::Queue),
         },
+        &mut None,
     );
     assert_eq!(queue.len(), 1);
     assert_eq!(queue[0].message_id, message_id);
@@ -7511,6 +7515,7 @@ fn accepted_steer_moves_from_pending_input_into_the_timeline() {
             status: MessageStatus::Complete,
             delivery: Some(PromptDelivery::Steer),
         },
+        &mut None,
     );
     assert!(queue.is_empty());
 }
@@ -7558,6 +7563,7 @@ fn turn_start_promotes_a_resumed_steer_out_of_pending_input() {
             status: MessageStatus::InProgress,
             delivery: Some(PromptDelivery::Steer),
         },
+        &mut None,
     );
     update_queued_prompts(
         &mut queue,
@@ -7568,6 +7574,7 @@ fn turn_start_promotes_a_resumed_steer_out_of_pending_input() {
             effort: None,
             fast: false,
         },
+        &mut None,
     );
     assert!(queue.is_empty());
 }
@@ -8218,9 +8225,10 @@ fn agent_message_is_visible_while_stopped_once_on_replay_and_never_human_pending
         ..Transcript::default()
     };
     let mut pending = Vec::new();
+    let mut cursor = None;
     for event in &events {
         transcript.apply(event);
-        update_queued_prompts(&mut pending, &event.kind);
+        update_queued_prompts(&mut pending, &event.kind, &mut cursor);
     }
     let rendered = transcript
         .lines(100)
@@ -8294,6 +8302,7 @@ fn internal_team_delivery_never_renders_or_enters_user_prompt_history() {
             status: MessageStatus::Queued,
             delivery: Some(PromptDelivery::Queue),
         },
+        &mut None,
     );
     assert!(pending.is_empty());
 }
@@ -8411,6 +8420,7 @@ fn committed_steer_does_not_hide_a_separate_next_turn_queue() {
                 status,
                 delivery: Some(delivery),
             },
+            &mut None,
         );
     }
 
@@ -8446,9 +8456,9 @@ fn queue_projection_preserves_fifo_and_discards_bypassed_stale_entries() {
     };
 
     let mut queue = Vec::new();
-    update_queued_prompts(&mut queue, &queued(first, "first"));
-    update_queued_prompts(&mut queue, &queued(second, "second"));
-    update_queued_prompts(&mut queue, &admitted(first, "first"));
+    update_queued_prompts(&mut queue, &queued(first, "first"), &mut None);
+    update_queued_prompts(&mut queue, &queued(second, "second"), &mut None);
+    update_queued_prompts(&mut queue, &admitted(first, "first"), &mut None);
     assert_eq!(
         queue,
         vec![PendingPromptProjection {
@@ -8458,12 +8468,12 @@ fn queue_projection_preserves_fifo_and_discards_bypassed_stale_entries() {
         }]
     );
 
-    update_queued_prompts(&mut queue, &queued(first, "stale first"));
-    update_queued_prompts(&mut queue, &admitted(first, "stale first"));
+    update_queued_prompts(&mut queue, &queued(first, "stale first"), &mut None);
+    update_queued_prompts(&mut queue, &admitted(first, "stale first"), &mut None);
     assert!(queue.is_empty());
 
-    update_queued_prompts(&mut queue, &queued(first, "bypassed"));
-    update_queued_prompts(&mut queue, &admitted(second, "later prompt"));
+    update_queued_prompts(&mut queue, &queued(first, "bypassed"), &mut None);
+    update_queued_prompts(&mut queue, &admitted(second, "later prompt"), &mut None);
     assert!(queue.is_empty());
 }
 

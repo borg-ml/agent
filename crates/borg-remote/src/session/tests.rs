@@ -6895,13 +6895,28 @@ fn escape_batch_coalesces_queued_prompts_in_fifo_order() {
     );
     assert_eq!(pending[0].attachments, [first_image, last_image]);
     assert_eq!(pending[0].delivery, PromptDelivery::Queue);
+    // Every durable message keeps its own identity and original text; the
+    // combined text is provider input only and is never journaled as a
+    // user message under the last member's id.
     assert_eq!(
         pending[0]
             .batch
             .iter()
+            .map(|entry| (entry.message_id, entry.text.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (first_id, "first [Image 1]"),
+            (second_id, "second"),
+            (last_id, "last [Image 2]")
+        ]
+    );
+    assert_eq!(
+        pending[0]
+            .batch_entries()
+            .iter()
             .map(|entry| entry.message_id)
             .collect::<Vec<_>>(),
-        [first_id, second_id]
+        [first_id, second_id, last_id]
     );
 }
 

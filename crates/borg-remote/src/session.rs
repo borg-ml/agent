@@ -224,6 +224,18 @@ impl QueuedPrompt {
             attachments: self.attachments.clone(),
         }
     }
+
+    /// The durable user messages this prompt stands for. A coalesced batch
+    /// already carries every member, including the prompt's own original
+    /// message; its combined `text` is provider input only and must never be
+    /// journaled as a user message.
+    fn batch_entries(&self) -> Vec<PromptBatchEntry> {
+        if self.batch.is_empty() {
+            vec![self.batch_entry()]
+        } else {
+            self.batch.clone()
+        }
+    }
 }
 
 struct PendingSteer {
@@ -3527,9 +3539,29 @@ async fn run_agent_session_store_kernel(
                                 provider_fork_turn_id = None;
                                 executor.stop_session(session_id).await?;
                             }
+                            let usage_limit_reset_delay =
+                                provider_error_usage_limit_reset_delay(&error);
+                            // A reset further out than the retry ceiling is an
+                            // exhausted plan window, not a transient limit:
+                            // waiting silently would leave the session looking
+                            // stuck for hours or days.
+                            let usage_limit_exhausted = provider_error_is_usage_limited(&error)
+                                && usage_limit_reset_delay
+                                    .is_some_and(|delay| delay > USAGE_LIMIT_RETRY_MAX_DELAY);
                             let usage_limit_retry = launch.capabilities.auto_resume_usage_limits
                                 && provider_supports_usage_limit_resume(launch.provider)
-                                && provider_error_is_temporary_usage_limited(&error);
+                                && provider_error_is_temporary_usage_limited(&error)
+                                && !usage_limit_exhausted;
+                            let usage_limit_wait = usage_limit_retry
+                                .then(|| usage_limit_reset_delay.unwrap_or(usage_limit_retry_delay));
+                            let error = if usage_limit_exhausted {
+                                usage_limit_exhausted_message(
+                                    launch.provider,
+                                    usage_limit_reset_delay.unwrap_or_default(),
+                                )
+                            } else {
+                                error
+                            };
                             let auth_lookup_failure = provider_error_is_auth_lookup_unavailable(&error);
                             if network_retry_message_id != Some(prompt.message_id) {
                                 auth_lookup_retries = 0;
@@ -3568,9 +3600,11 @@ async fn run_agent_session_store_kernel(
                                     format!("Codex authentication lookup unavailable · retry {} in {}s · Esc to cancel. Your work is saved.", auth_lookup_retries.saturating_add(1), network_retry_delay.as_secs())
                                 } else if network_retry {
                                     format!("Connection interrupted · retrying in {}s · Esc to cancel. Your work is saved.", network_retry_delay.as_secs())
-                                } else if usage_limit_retry {
-                                    "The provider usage limit was reached; Borg preserved this work and will resume it automatically when capacity is available."
-                                        .to_string()
+                                } else if let Some(wait) = usage_limit_wait {
+                                    format!(
+                                        "The provider usage limit was reached; Borg preserved this work and will resume it automatically in {} · Esc to cancel.",
+                                        format_reset_delay(wait)
+                                    )
                                 } else if provider_isolation_recovery {
                                     "Borg blocked a provider-native delegation attempt and is continuing automatically on a clean provider thread."
                                         .to_string()
@@ -3591,6 +3625,8 @@ async fn run_agent_session_store_kernel(
                                     "Borg blocked a provider-native delegation attempt. The turn was not retried because doing so could repeat work."
                                         .to_string()
                                 }
+                            } else if usage_limit_exhausted {
+                                error.clone()
                             } else {
                                 format!("Turn failed; the session remains available: {error}")
                             };
@@ -3605,13 +3641,14 @@ async fn run_agent_session_store_kernel(
                                     payload: serde_json::json!({"delay_ms": network_retry_delay.as_millis() as u64, "auth_lookup_retry": auth_lookup_failure.then_some(auth_lookup_retries)}),
                                 }).await?;
                                 network_retry_delay = network_retry_delay.saturating_mul(2).min(NETWORK_RETRY_MAX_DELAY);
-                            } else if usage_limit_retry {
+                            } else if let Some(wait) = usage_limit_wait {
                                 goal_turn_failures.reset();
-                                retry_not_before =
-                                    Some(Instant::now() + usage_limit_retry_delay);
-                                usage_limit_retry_delay = usage_limit_retry_delay
-                                    .saturating_mul(2)
-                                    .min(USAGE_LIMIT_RETRY_MAX_DELAY);
+                                retry_not_before = Some(Instant::now() + wait);
+                                if usage_limit_reset_delay.is_none() {
+                                    usage_limit_retry_delay = usage_limit_retry_delay
+                                        .saturating_mul(2)
+                                        .min(USAGE_LIMIT_RETRY_MAX_DELAY);
+                                }
                             } else if retry {
                                 goal_turn_failures.reset();
                             } else if provider_isolation_recovery {
@@ -4122,6 +4159,10 @@ async fn run_agent_session_store_kernel(
                             ..
                         } if steers_active_provider_turn(launch.provider, delivery) => {
                             if prompt.message_id == message_id
+                                || prompt
+                                    .batch
+                                    .iter()
+                                    .any(|entry| entry.message_id == message_id)
                                 || pending
                                     .iter()
                                     .any(|queued| queued.message_id == message_id)
@@ -6378,8 +6419,7 @@ async fn record_recalled_prompt(
     session_id: Uuid,
     prompt: &QueuedPrompt,
 ) -> Result<()> {
-    let mut entries = prompt.batch.clone();
-    entries.push(prompt.batch_entry());
+    let entries = prompt.batch_entries();
     for entry in entries {
         record(
             journal,
@@ -6555,8 +6595,7 @@ fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
         }
         attachments.extend(prompt.attachments.iter().cloned());
         visible |= prompt.visible;
-        batch.extend(prompt.batch.iter().cloned());
-        batch.push(prompt.batch_entry());
+        batch.extend(prompt.batch_entries());
     }
     if !combined.text.is_empty() {
         if !text.is_empty() {
@@ -6565,7 +6604,7 @@ fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
         text.push_str(&combined.text);
     }
     attachments.append(&mut combined.attachments);
-    batch.append(&mut combined.batch);
+    batch.extend(combined.batch_entries());
     combined.text = text;
     combined.attachments = attachments;
     combined.delivery = PromptDelivery::Queue;
@@ -7036,8 +7075,7 @@ async fn record_prompt_status(
     status: MessageStatus,
     delivery: PromptDelivery,
 ) -> Result<()> {
-    let mut entries = prompt.batch.clone();
-    entries.push(prompt.batch_entry());
+    let entries = prompt.batch_entries();
     for entry in entries {
         record(
             journal,
@@ -7123,8 +7161,7 @@ async fn settle_accepted_steers(
         let steer = pending_steers
             .pop_front()
             .expect("accepted steer was at the front");
-        let mut entries = steer.prompt.batch.clone();
-        entries.push(steer.prompt.batch_entry());
+        let entries = steer.prompt.batch_entries();
         for status in [MessageStatus::InProgress, MessageStatus::Complete] {
             for entry in &entries {
                 receipts.extend(journal.take_projection_diagnostics());
@@ -8047,6 +8084,50 @@ fn provider_error_is_usage_limited(error: &str) -> bool {
         || compact.contains("quotaexceeded")
         || compact.contains("toomanyrequests")
         || compact.contains("hityourlimit")
+}
+
+/// Reset delay a subscription adapter attached to its normalized usage-limit
+/// error, when the provider reported one.
+fn provider_error_usage_limit_reset_delay(error: &str) -> Option<Duration> {
+    if let Some(seconds) = error
+        .split("Provider-reported retry delay: ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+    {
+        return Some(Duration::from_secs(seconds));
+    }
+    let stamp = error
+        .split("Provider-reported reset: ")
+        .nth(1)?
+        .split(" UTC")
+        .next()?;
+    let reset = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S")
+        .ok()?
+        .and_utc();
+    Some((reset - Utc::now()).to_std().unwrap_or_default())
+}
+
+fn format_reset_delay(delay: Duration) -> String {
+    let seconds = delay.as_secs();
+    if seconds >= 86_400 {
+        format!("{}d {}h", seconds / 86_400, (seconds % 86_400) / 3600)
+    } else if seconds >= 3600 {
+        format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60)
+    } else if seconds >= 60 {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn usage_limit_exhausted_message(provider: CodingProvider, reset_in: Duration) -> String {
+    let reset_at = Utc::now() + chrono::Duration::from_std(reset_in).unwrap_or_default();
+    format!(
+        "{provider:?} subscription usage limit exhausted; it resets in {} ({}). Your message was not sent: wait for the reset or switch provider/model, then retry.",
+        format_reset_delay(reset_in),
+        reset_at.format("%Y-%m-%d %H:%M UTC")
+    )
 }
 
 fn provider_error_is_temporary_usage_limited(error: &str) -> bool {

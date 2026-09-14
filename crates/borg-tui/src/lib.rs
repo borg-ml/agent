@@ -953,6 +953,7 @@ pub struct BorgTerminal {
     hydrated_children: HashSet<Uuid>,
     child_history_hydration_complete: bool,
     child_queued_prompts: HashMap<Uuid, Vec<PendingPromptProjection>>,
+    child_requeue_cursors: HashMap<Uuid, Option<usize>>,
     child_statuses: HashMap<Uuid, SessionStatus>,
     child_active_since: HashMap<Uuid, DateTime<Utc>>,
     child_pending_approvals: HashSet<Uuid>,
@@ -1070,6 +1071,9 @@ pub struct BorgTerminal {
     last_ctrl_c: Option<Instant>,
     ctrl_c_count: u8,
     queued_prompts: Vec<PendingPromptProjection>,
+    /// Insertion point for prompts the session re-queues right after a failed
+    /// turn; they precede everything queued while that turn ran.
+    requeue_cursor: Option<usize>,
     active_turn_followup: bool,
     child_active_turn_followups: HashSet<Uuid>,
     replaying_history: bool,
@@ -2007,6 +2011,7 @@ impl BorgTerminal {
             hydrated_children: HashSet::new(),
             child_history_hydration_complete: false,
             child_queued_prompts: HashMap::new(),
+            child_requeue_cursors: HashMap::new(),
             child_statuses: HashMap::new(),
             child_active_since: HashMap::new(),
             child_pending_approvals: HashSet::new(),
@@ -2118,6 +2123,7 @@ impl BorgTerminal {
             last_ctrl_c: None,
             ctrl_c_count: 0,
             queued_prompts: Vec::new(),
+            requeue_cursor: None,
             active_turn_followup: false,
             child_active_turn_followups: HashSet::new(),
             replaying_history: false,
@@ -2766,7 +2772,11 @@ impl BorgTerminal {
         if event.sequence > 0 {
             self.session_state_sequence = self.session_state_sequence.max(event.sequence);
         }
-        update_queued_prompts(&mut self.queued_prompts, &event.kind);
+        update_queued_prompts(
+            &mut self.queued_prompts,
+            &event.kind,
+            &mut self.requeue_cursor,
+        );
         if let SessionEventKind::Message {
             message_id,
             actor: EventActor::User,
@@ -2997,6 +3007,7 @@ impl BorgTerminal {
         update_queued_prompts(
             self.child_queued_prompts.entry(child_id).or_default(),
             &child_event.kind,
+            self.child_requeue_cursors.entry(child_id).or_default(),
         );
         match &child_event.kind {
             SessionEventKind::ApprovalRequested { .. } => {
@@ -3147,6 +3158,7 @@ impl BorgTerminal {
             update_queued_prompts(
                 self.child_queued_prompts.entry(child_id).or_default(),
                 &event.kind,
+                self.child_requeue_cursors.entry(child_id).or_default(),
             );
             match event.kind {
                 SessionEventKind::ApprovalRequested { .. } => {
@@ -10501,18 +10513,15 @@ fn normalize_terminal_capture_paste(value: &str) -> Cow<'_, str> {
 fn update_queued_prompts(
     queued_prompts: &mut Vec<PendingPromptProjection>,
     event: &SessionEventKind,
+    requeue_cursor: &mut Option<usize>,
 ) {
     match event {
-        SessionEventKind::TurnStarted { message_id, .. } => {
-            queued_prompts.retain(|queued| queued.message_id != *message_id);
+        SessionEventKind::TurnCompleted { error: Some(_), .. } => {
+            // The session re-queues a failed turn's prompts at the head of its
+            // FIFO, ahead of anything queued while that turn ran.
+            *requeue_cursor = Some(0);
+            return;
         }
-        SessionEventKind::Message {
-            message_id,
-            actor: EventActor::User,
-            status: MessageStatus::InProgress,
-            delivery: Some(PromptDelivery::Steer),
-            ..
-        } => queued_prompts.retain(|queued| queued.message_id != *message_id),
         SessionEventKind::Message {
             message_id,
             actor: EventActor::User,
@@ -10521,7 +10530,37 @@ fn update_queued_prompts(
             delivery: Some(delivery),
             ..
         } => {
-            push_queued_prompt(queued_prompts, *message_id, text.clone(), *delivery);
+            if let Some(cursor) = requeue_cursor {
+                queued_prompts.retain(|queued| queued.message_id != *message_id);
+                let at = (*cursor).min(queued_prompts.len());
+                queued_prompts.insert(
+                    at,
+                    PendingPromptProjection {
+                        message_id: *message_id,
+                        text: text.clone(),
+                        delivery: *delivery,
+                    },
+                );
+                *cursor = at + 1;
+            } else {
+                push_queued_prompt(queued_prompts, *message_id, text.clone(), *delivery);
+            }
+            return;
+        }
+        _ => {}
+    }
+    *requeue_cursor = None;
+    match event {
+        SessionEventKind::TurnStarted { message_id, .. }
+        | SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            status: MessageStatus::InProgress,
+            ..
+        } => {
+            // An in-progress user message is admitted (as a turn prompt, a
+            // batch member, or a steer) and is no longer pending input.
+            queued_prompts.retain(|queued| queued.message_id != *message_id);
         }
         SessionEventKind::Message {
             message_id,
@@ -10568,8 +10607,9 @@ fn turn_completion_clears_followup_marker(
 
 fn pending_prompt_projection_from_events(events: &[SessionEvent]) -> Vec<PendingPromptProjection> {
     let mut queued_prompts = Vec::new();
+    let mut requeue_cursor = None;
     for event in events {
-        update_queued_prompts(&mut queued_prompts, &event.kind);
+        update_queued_prompts(&mut queued_prompts, &event.kind, &mut requeue_cursor);
     }
     queued_prompts
 }
