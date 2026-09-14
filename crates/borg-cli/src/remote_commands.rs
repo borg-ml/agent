@@ -1815,11 +1815,16 @@ async fn stop_stale_local_owner_and_acquire(
     )
     .await
     {
-        let control_endpoint_gone = !control_socket_path.exists()
-            && error
+        let control_endpoint_gone =
+            error
                 .root_cause()
                 .downcast_ref::<io::Error>()
-                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound);
+                .is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                    )
+                });
         let safely_obsolete =
             obsolete_local_session_owner_pid(sessions_dir, session_id, lock_path)?.is_some();
         if !control_endpoint_gone && !safely_obsolete {
@@ -1831,8 +1836,8 @@ async fn stop_stale_local_owner_and_acquire(
                 "obsolete local session owner did not accept the graceful stop command; will escalate after the handoff grace period"
             );
         }
-        // The owner can remove its control socket just before its process
-        // releases the writer lease. Keep polling the authoritative lock
+        // The owner can close or remove its control socket just before its
+        // process releases the writer lease. Keep polling the authoritative lock
         // instead of turning that handoff race into a failed resume.
     }
     loop {

@@ -2022,6 +2022,36 @@ async fn obsolete_owner_handoff_waits_for_a_lease_after_its_socket_disappears() 
     drop(replacement);
 }
 
+#[tokio::test]
+#[cfg(unix)]
+async fn obsolete_owner_handoff_waits_for_a_lease_after_connection_refused() {
+    let root = short_socket_tempdir();
+    let session_id = Uuid::new_v4();
+    let lock_path = root.path().join(format!("{session_id}.lock"));
+    let socket_path = session_control_socket_path(root.path(), session_id);
+    let writer = SessionWriterLease::try_acquire(&lock_path)
+        .unwrap()
+        .unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    drop(listener);
+    assert_eq!(
+        std::os::unix::net::UnixStream::connect(&socket_path)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::ConnectionRefused
+    );
+
+    let handoff = tokio::spawn(async move {
+        stop_stale_local_owner_and_acquire(&lock_path, &socket_path, session_id).await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!handoff.is_finished());
+    drop(writer);
+
+    let replacement = handoff.await.unwrap().unwrap();
+    drop(replacement);
+}
+
 #[test]
 fn active_session_survives_terminal_hangup_but_idle_session_stops() {
     assert!(should_detach_on_terminal_loss(
