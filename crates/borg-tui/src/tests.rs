@@ -1362,6 +1362,53 @@ fn composer_deletes_the_previous_unicode_word() {
 }
 
 #[test]
+fn command_backspace_encodings_delete_the_line_prefix_instead_of_inserting_u() {
+    for key in [
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER),
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::META),
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char('\u{15}'), KeyModifiers::NONE),
+    ] {
+        assert!(deletes_line_prefix(&key), "{key:?}");
+        assert!(!composer_inserts_character(&key), "{key:?}");
+        let mut composer = Composer::default();
+        composer.insert("previous line\nпривет keep this");
+        composer.cursor = "previous line\nпривет ".len();
+        composer.backspace_line();
+        assert_eq!(composer.text, "previous line\nkeep this");
+        assert_eq!(composer.cursor, "previous line\n".len());
+        composer.backspace_line();
+        assert_eq!(composer.text, "previous line\nkeep this");
+    }
+    let plain_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE);
+    assert!(!deletes_line_prefix(&plain_u));
+    assert!(composer_inserts_character(&plain_u));
+    for modifier in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::SUPER,
+        KeyModifiers::META,
+    ] {
+        assert!(!composer_inserts_character(&KeyEvent::new(
+            plain_u.code,
+            modifier
+        )));
+    }
+}
+
+#[test]
+fn deleting_a_line_prefix_removes_only_its_inline_attachments() {
+    let mut composer = Composer::default();
+    composer.insert_attachment(PathBuf::from("keep.png"));
+    composer.insert("\nremove ");
+    composer.insert_attachment(PathBuf::from("remove.png"));
+    composer.backspace_line();
+    assert_eq!(composer.text, "[Image 1]\n");
+    assert_eq!(composer.cursor, composer.text.len());
+    assert_eq!(composer.attachments.len(), 1);
+    assert_eq!(composer.attachments[0].path, PathBuf::from("keep.png"));
+}
+
+#[test]
 fn terminal_word_delete_shortcuts_cover_common_encodings() {
     for event in [
         KeyEvent::new(KeyCode::Backspace, KeyModifiers::CONTROL),

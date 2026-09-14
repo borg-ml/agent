@@ -8027,6 +8027,13 @@ impl BorgTerminal {
                 UiAction::None
             });
         }
+        if deletes_line_prefix(&key) {
+            self.composer_selection = None;
+            self.composer.backspace_line();
+            self.slash_selection = 0;
+            self.update_slash_notice();
+            return Ok(UiAction::None);
+        }
         if deletes_previous_word(&key) {
             self.composer_selection = None;
             self.composer.backspace_word();
@@ -8177,7 +8184,7 @@ impl BorgTerminal {
             });
         }
         match key.code {
-            KeyCode::Char(character) => {
+            KeyCode::Char(character) if composer_inserts_character(&key) => {
                 self.keybindings_open = false;
                 self.composer.insert(&character.to_string());
                 self.slash_selection = 0;
@@ -9132,7 +9139,21 @@ impl Composer {
     fn backspace_word(&mut self) {
         let end = self.cursor;
         self.move_word_left();
-        let mut start = self.cursor;
+        let start = self.cursor;
+        self.cursor = end;
+        self.backspace_to(start);
+    }
+
+    fn backspace_line(&mut self) {
+        let end = self.cursor;
+        self.move_line_start();
+        let start = self.cursor;
+        self.cursor = end;
+        self.backspace_to(start);
+    }
+
+    fn backspace_to(&mut self, mut start: usize) {
+        let end = self.cursor;
         for attachment in &self.attachments {
             if attachment.start < end && attachment.end > start {
                 start = start.min(attachment.start);
@@ -9570,6 +9591,22 @@ fn repeated_ctrl_c(last: &mut Option<Instant>, count: &mut u8, now: Instant) -> 
     *last = None;
     *count = 0;
     true
+}
+
+fn deletes_line_prefix(key: &KeyEvent) -> bool {
+    (key.code == KeyCode::Backspace
+        && key
+            .modifiers
+            .intersects(KeyModifiers::SUPER | KeyModifiers::META))
+        || (key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::CONTROL))
+        || key.code == KeyCode::Char('\u{15}')
+}
+
+fn composer_inserts_character(key: &KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(character) if !character.is_control())
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::META)
 }
 
 fn deletes_previous_word(key: &KeyEvent) -> bool {
