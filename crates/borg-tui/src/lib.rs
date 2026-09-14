@@ -8091,6 +8091,12 @@ impl BorgTerminal {
             self.update_slash_notice();
             return Ok(UiAction::None);
         }
+        if deletes_next_word(&key) {
+            self.composer_selection = None;
+            self.composer.delete_word();
+            self.update_slash_notice();
+            return Ok(UiAction::None);
+        }
         if self.keymap.matches(KeyAction::Exit, &key) {
             return Ok(UiAction::Quit);
         }
@@ -9324,14 +9330,35 @@ impl Composer {
         self.preferred_column = None;
     }
 
+    /// Moves to the end of the current or next word, mirroring `move_word_left`
+    /// (which moves to a word start) so Option/Ctrl+Right, Alt+f, and forward
+    /// word deletion all agree on the same boundary.
     fn move_word_right(&mut self) {
         self.cursor = self
             .text
             .unicode_word_indices()
-            .map(|(start, _)| start)
-            .find(|start| *start > self.cursor)
+            .map(|(start, word)| start + word.len())
+            .find(|end| *end > self.cursor)
             .unwrap_or(self.text.len());
         self.preferred_column = None;
+    }
+
+    fn delete_word(&mut self) {
+        let start = self.cursor;
+        self.move_word_right();
+        // Inline tokens (attachments, pasted blocks) are deleted whole.
+        let token_end = self
+            .attachments
+            .iter()
+            .map(|attachment| (attachment.start, attachment.end))
+            .chain(self.pasted_texts.iter().map(|pasted| (pasted.start, pasted.end)))
+            .filter(|(token_start, token_end)| *token_start < self.cursor && *token_end > self.cursor)
+            .map(|(_, token_end)| token_end)
+            .max();
+        if let Some(token_end) = token_end {
+            self.cursor = token_end;
+        }
+        self.backspace_to(start);
     }
 
     fn move_line_start(&mut self) {
@@ -9667,6 +9694,14 @@ fn deletes_previous_word(key: &KeyEvent) -> bool {
             KeyCode::Backspace | KeyCode::Char('h' | 'w') | KeyCode::Char('\u{8}' | '\u{17}')
         ))
         || (key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Backspace)
+}
+
+fn deletes_next_word(key: &KeyEvent) -> bool {
+    (key.code == KeyCode::Delete
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT))
+        || (key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('d'))
 }
 
 include!("transcript.rs");

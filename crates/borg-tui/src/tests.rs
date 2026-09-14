@@ -4087,7 +4087,12 @@ fn composer_moves_by_unicode_words() {
     composer.move_word_left();
     assert_eq!(&composer.text[composer.cursor..], "beta gamma");
     composer.move_word_right();
-    assert_eq!(&composer.text[composer.cursor..], "gamma");
+    assert_eq!(&composer.text[composer.cursor..], " gamma");
+    composer.delete_word();
+    assert_eq!(composer.text, "alpha beta");
+    composer.cursor = 0;
+    composer.delete_word();
+    assert_eq!(composer.text, " beta");
 }
 
 #[test]
