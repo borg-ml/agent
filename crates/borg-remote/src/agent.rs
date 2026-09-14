@@ -36,7 +36,7 @@ source is not already available, inspect or clone that public repository as need
 Write simple mathematical notation as readable Unicode or plain text. For complex notation, use \
 valid Markdown math delimiters (`$...$` or `$$...$$`); never emit bare TeX commands in prose. \
 Use the tools from the borg_agent MCP server for durable goals, plans, and subagents. \
-Never invoke provider-native delegation tools such as `subAgentActivity` or `collabAgentToolCall`; \
+Never invoke provider-native delegation tools such as `subAgentActivity`, `collabAgentToolCall`, `Agent`, or `Task`; \
 delegate only through `mcp__borg_agent__spawn_agent`. \
 For work involving another Borg instance or machine, discover peers with `list_instances` first. \
 Use `send_message` for notifications; `wake: true` or `followup_task` requests an agent turn. \
@@ -78,7 +78,10 @@ pub(crate) const PROVIDER_CONTEXT_CONTRACT_VERSION: u32 = 1;
 const MAX_RESIDENT_CODEX_SUBSCRIPTION_POOLS: usize = 4;
 
 fn provider_native_agent_tool(name: &str) -> bool {
-    matches!(name, "subAgentActivity" | "collabAgentToolCall")
+    matches!(
+        name,
+        "subAgentActivity" | "collabAgentToolCall" | "Agent" | "Task"
+    )
 }
 
 #[derive(Clone)]
@@ -1808,7 +1811,8 @@ async fn run_borg_provider_turn(
             ChatStreamEvent::ToolCall { id, name, input } => {
                 anyhow::ensure!(
                     !provider_native_agent_tool(&name),
-                    "Codex exposed a forbidden provider-native agent tool: {name}"
+                    "{:?} exposed a forbidden provider-native agent tool: {name}",
+                    turn.provider
                 );
                 flush_pending_reasoning(&events, &mut pending_reasoning).await;
                 reasoning_text.clear();

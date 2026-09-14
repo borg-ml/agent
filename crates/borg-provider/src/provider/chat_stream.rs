@@ -2808,6 +2808,10 @@ fn claude_command_args(
         "stream-json".to_string(),
         "--verbose".to_string(),
         "--include-partial-messages".to_string(),
+        // Borg owns delegation: Claude Code's native subagent tools must not
+        // be offered to the model at all.
+        "--disallowedTools".to_string(),
+        "Agent,Task".to_string(),
     ];
     if permission == LocalAgentPermission::FullAccess {
         args.push("--dangerously-skip-permissions".to_string());
