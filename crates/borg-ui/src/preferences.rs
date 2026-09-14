@@ -109,6 +109,10 @@ pub struct InteractionPreferences {
     pub prevent_sleep: bool,
     pub completion_notifications: CompletionAlertPolicy,
     pub completion_sound: CompletionAlertPolicy,
+    /// Set once the user has completed the enable-dictation flow (which also
+    /// grants microphone access). Until then, the dictation key opens that
+    /// flow instead of recording.
+    pub dictation_enabled: bool,
 }
 
 impl Default for InteractionPreferences {
@@ -118,6 +122,7 @@ impl Default for InteractionPreferences {
             prevent_sleep: true,
             completion_notifications: CompletionAlertPolicy::Unfocused,
             completion_sound: CompletionAlertPolicy::Unfocused,
+            dictation_enabled: false,
         }
     }
 }
@@ -135,6 +140,12 @@ pub struct PresentationPreferences {
     pub action_descriptors: bool,
     pub running_sweeps: bool,
     pub dictation_icon: Option<DictationIconStyle>,
+    /// Selected managed dictation model id (e.g. "parakeet-v2"); `None` uses
+    /// the built-in default.
+    pub dictation_model: Option<String>,
+    /// Selected dictation inference accelerator id (e.g. "auto", "nvidia",
+    /// "vulkan"); `None` uses the per-platform default.
+    pub dictation_accelerator: Option<String>,
 }
 
 impl Default for PresentationPreferences {
@@ -149,6 +160,8 @@ impl Default for PresentationPreferences {
             action_descriptors: true,
             running_sweeps: true,
             dictation_icon: None,
+            dictation_model: None,
+            dictation_accelerator: None,
         }
     }
 }
@@ -323,6 +336,7 @@ mod tests {
                 prevent_sleep: false,
                 completion_notifications: CompletionAlertPolicy::Always,
                 completion_sound: CompletionAlertPolicy::Off,
+                dictation_enabled: true,
             },
             presentation: PresentationPreferences {
                 ui_language: UiLanguage::SimplifiedChinese,
@@ -334,6 +348,8 @@ mod tests {
                 action_descriptors: false,
                 running_sweeps: false,
                 dictation_icon: Some(DictationIconStyle::NerdFont),
+                dictation_model: Some("lightweight".to_string()),
+                dictation_accelerator: Some("auto".to_string()),
             },
             layout: LayoutPreferences {
                 horizontal_margin: 5,

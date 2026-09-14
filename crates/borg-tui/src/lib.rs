@@ -123,6 +123,23 @@ const TRANSCRIPT_SCROLLBAR_GUTTER_WIDTH: u16 = 3;
 const DICTATION_BUTTON_WIDTH: u16 = 6;
 const DICTATION_EMOJI_ICON: &str = "🎤";
 const DICTATION_NERD_FONT_ICON: &str = "󰍬";
+
+/// Selectable managed dictation models (value id, human label). Values mirror
+/// `borg_dictation::DictationModelId::id`; the CLI maps them back.
+const DICTATION_MODEL_OPTIONS: &[(&str, &str)] = &[
+    ("parakeet-v2", "Parakeet V2 · balanced, recommended (~609 MB)"),
+    ("parakeet-v3", "Parakeet V3 · newest, most accurate (~644 MB)"),
+    ("lightweight", "Lightweight · faster CTC decoding (~582 MB)"),
+];
+
+/// Selectable dictation accelerators (value id, human label). Values mirror
+/// `borg_dictation::DictationAccelerator::id`; only shown where a GPU runtime
+/// exists for the platform.
+const DICTATION_ACCELERATOR_OPTIONS: &[(&str, &str)] = &[
+    ("auto", "Automatic · CPU on this platform"),
+    ("nvidia", "NVIDIA GPU · CUDA 12 (~891 MB)"),
+    ("vulkan", "GPU · Vulkan, cross-vendor (~35 MB)"),
+];
 const SELECTION_AUTOSCROLL_LINES_PER_FRAME: usize = 2;
 type RowRange = (usize, usize, usize);
 type ToolRunRowRange = (usize, usize, usize, usize, bool);
@@ -835,6 +852,14 @@ pub enum UiAction {
     SetCompletionNotifications(CompletionAlertPolicy),
     SetCompletionSound(CompletionAlertPolicy),
     SetDictationIcon(DictationIconStyle),
+    /// Completes the enable-dictation flow: persist model/accelerator/icon,
+    /// mark dictation enabled, and begin recording (which prompts the OS for
+    /// microphone access).
+    EnableDictation {
+        model: String,
+        accelerator: String,
+        icon: DictationIconStyle,
+    },
     ToggleDictation,
     TerminalIo(TerminalIoRequest),
     LoadPayloads(Vec<SessionPayloadRef>),
@@ -1083,6 +1108,17 @@ pub struct BorgTerminal {
     /// Model the user picked from a provider that still needs credentials;
     /// applied once the auth picker resolves.
     pending_auth_model: Option<String>,
+    /// True once the enable-dictation flow has completed (mirrors the durable
+    /// preference); gates whether the dictation key records or opens the flow.
+    dictation_enabled: bool,
+    /// Set while the model/accelerator/icon pickers are chained together as the
+    /// enable-dictation flow, so the final icon choice emits one combined
+    /// EnableDictation action instead of a bare icon change.
+    dictation_enable_flow: bool,
+    /// The durable model preference, used to preselect the enable-flow picker.
+    dictation_model: Option<String>,
+    pending_dictation_model: Option<String>,
+    pending_dictation_accelerator: Option<String>,
     keybindings_open: bool,
     slash_selection: usize,
     rewind_targets: Vec<RewindTarget>,
@@ -1255,6 +1291,8 @@ enum PickerKind {
     RunningSweeps,
     CompletionNotifications,
     CompletionSound,
+    DictationModel,
+    DictationAccelerator,
     DictationIcon,
     Rewind,
     MessageActions,
@@ -2131,6 +2169,11 @@ impl BorgTerminal {
             history_page_loading: false,
             picker: None,
             pending_auth_model: None,
+            dictation_enabled: false,
+            dictation_enable_flow: false,
+            dictation_model: None,
+            pending_dictation_model: None,
+            pending_dictation_accelerator: None,
             keybindings_open: false,
             slash_selection: 0,
             rewind_targets: Vec::new(),
@@ -2268,6 +2311,7 @@ impl BorgTerminal {
         self.history_page_loading = false;
         self.picker = None;
         self.pending_auth_model = None;
+        self.dictation_enable_flow = false;
         self.keybindings_open = false;
         self.slash_selection = 0;
         self.rewind_targets.clear();
@@ -4041,6 +4085,71 @@ impl BorgTerminal {
         ui_text(self.ui_language, english)
     }
 
+    pub fn set_dictation_settings(&mut self, enabled: bool, model: Option<String>) {
+        self.dictation_enabled = enabled;
+        self.dictation_model = model;
+    }
+
+    /// Whether the platform publishes a GPU dictation runtime beyond the
+    /// automatic default. Mirrors `DictationAccelerator::available_on_platform`
+    /// without a dependency on the dictation crate: parakeet.cpp ships NVIDIA
+    /// and Vulkan builds only for Linux and Windows on x86_64.
+    fn dictation_gpu_runtime_available() -> bool {
+        cfg!(all(
+            any(target_os = "linux", target_os = "windows"),
+            target_arch = "x86_64"
+        ))
+    }
+
+    /// Open the enable-dictation flow: choose a model, then (where a GPU
+    /// runtime exists) an accelerator, then the mic icon, then begin recording.
+    pub fn open_enable_dictation_picker(&mut self) {
+        self.dictation_enable_flow = true;
+        self.pending_dictation_model = None;
+        self.pending_dictation_accelerator = None;
+        let selected = DICTATION_MODEL_OPTIONS
+            .iter()
+            .position(|(value, _)| *value == self.dictation_model_default())
+            .unwrap_or(0);
+        self.picker = Some(Picker {
+            kind: PickerKind::DictationModel,
+            title: "Enable dictation · choose a model",
+            options: DICTATION_MODEL_OPTIONS
+                .iter()
+                .map(|(value, label)| PickerOption::new(*label, *value))
+                .collect(),
+            selected,
+            query: None,
+            viewport_offset: Cell::new(0),
+        });
+        self.notice = Some(
+            "Local speech-to-text · the model downloads once, then transcription stays on-device"
+                .into(),
+        );
+    }
+
+    fn dictation_model_default(&self) -> &'static str {
+        DICTATION_MODEL_OPTIONS
+            .iter()
+            .find(|(value, _)| Some(*value) == self.dictation_model.as_deref())
+            .map_or(DICTATION_MODEL_OPTIONS[0].0, |(value, _)| *value)
+    }
+
+    fn open_dictation_accelerator_picker(&mut self) {
+        self.picker = Some(Picker {
+            kind: PickerKind::DictationAccelerator,
+            title: "Enable dictation · choose an accelerator",
+            options: DICTATION_ACCELERATOR_OPTIONS
+                .iter()
+                .map(|(value, label)| PickerOption::new(*label, *value))
+                .collect(),
+            selected: 0,
+            query: None,
+            viewport_offset: Cell::new(0),
+        });
+        self.notice = Some("NVIDIA/Vulkan builds run on your GPU; Automatic uses CPU here".into());
+    }
+
     pub fn open_dictation_icon_picker(&mut self) {
         let options = vec![
             PickerOption::new(
@@ -4392,7 +4501,11 @@ impl BorgTerminal {
                 }
                 if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                     if self.dictation_button_hovered {
-                        return Ok(UiAction::ToggleDictation);
+                        if self.dictation_enabled {
+                            return Ok(UiAction::ToggleDictation);
+                        }
+                        self.open_enable_dictation_picker();
+                        return Ok(UiAction::None);
                     }
                     if self.picker.is_none()
                         && !self.keybindings_open
@@ -5641,11 +5754,50 @@ impl BorgTerminal {
             PickerKind::CompletionSound => UiAction::SetCompletionSound(
                 completion_alert_policy_from_picker(&picker.selected_value()),
             ),
-            PickerKind::DictationIcon => match picker.selected_value().as_str() {
-                "nerd_font" => UiAction::SetDictationIcon(DictationIconStyle::NerdFont),
-                "emoji" => UiAction::SetDictationIcon(DictationIconStyle::Emoji),
-                _ => UiAction::None,
-            },
+            PickerKind::DictationModel => {
+                self.pending_dictation_model = Some(picker.selected_value());
+                // Only offer the accelerator step where a GPU runtime exists;
+                // otherwise Automatic is the only choice.
+                if Self::dictation_gpu_runtime_available() {
+                    self.open_dictation_accelerator_picker();
+                } else {
+                    self.pending_dictation_accelerator = Some("auto".to_string());
+                    self.open_dictation_icon_picker();
+                }
+                UiAction::None
+            }
+            PickerKind::DictationAccelerator => {
+                self.pending_dictation_accelerator = Some(picker.selected_value());
+                self.open_dictation_icon_picker();
+                UiAction::None
+            }
+            PickerKind::DictationIcon => {
+                let icon = match picker.selected_value().as_str() {
+                    "nerd_font" => DictationIconStyle::NerdFont,
+                    "emoji" => DictationIconStyle::Emoji,
+                    _ => self.dictation_icon,
+                };
+                if self.dictation_enable_flow {
+                    self.dictation_enable_flow = false;
+                    let model = self
+                        .pending_dictation_model
+                        .take()
+                        .unwrap_or_else(|| DICTATION_MODEL_OPTIONS[0].0.to_string());
+                    let accelerator = self
+                        .pending_dictation_accelerator
+                        .take()
+                        .unwrap_or_else(|| "auto".to_string());
+                    self.dictation_enabled = true;
+                    self.dictation_model = Some(model.clone());
+                    UiAction::EnableDictation {
+                        model,
+                        accelerator,
+                        icon,
+                    }
+                } else {
+                    UiAction::SetDictationIcon(icon)
+                }
+            }
             PickerKind::Goal => {
                 let value = picker.selected_value();
                 match value.as_str() {
@@ -7835,6 +7987,7 @@ impl BorgTerminal {
                 KeyCode::Esc => {
                     self.picker = None;
                     self.pending_auth_model = None;
+                    self.dictation_enable_flow = false;
                     Ok(UiAction::None)
                 }
                 KeyCode::Backspace => {
@@ -8130,7 +8283,11 @@ impl BorgTerminal {
             )));
         }
         if self.keymap.matches(KeyAction::Dictate, &key) {
-            return Ok(UiAction::ToggleDictation);
+            if self.dictation_enabled {
+                return Ok(UiAction::ToggleDictation);
+            }
+            self.open_enable_dictation_picker();
+            return Ok(UiAction::None);
         }
         if self.keymap.matches(KeyAction::Copy, &key) {
             if let Some(request) = self.copy_text_selection_request() {

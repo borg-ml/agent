@@ -41,8 +41,8 @@ use uuid::Uuid;
 use crate::agent_config::AgentConfig;
 use crate::cli::{LocalAgentCliArgs, RemoteCommand};
 use crate::dictation::{
-    LocalDictationBackend, LocalDictationConfig, LocalDictationRecorder, ensure_backend,
-    parakeet_is_installed,
+    DictationAccelerator, DictationModelId, LocalDictationBackend, LocalDictationConfig,
+    LocalDictationRecorder, ensure_backend, parakeet_is_installed,
 };
 use crate::editor_preferences::{
     ActiveMessageBehavior, CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy,
@@ -267,6 +267,33 @@ fn notification_prime_marker() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".borg"))
         .join("state")
         .join("notifications-primed")
+}
+
+/// Build the dictation config from the environment, then overlay the saved
+/// model/accelerator preferences. Explicit environment overrides still win, so
+/// an operator-pinned model or accelerator is never shadowed by the UI choice.
+fn dictation_config_with_preferences(preferences: &EditorPreferences) -> LocalDictationConfig {
+    let mut config = LocalDictationConfig::from_env();
+    if std::env::var_os("BORG_CLI_DICTATION_MODEL_CHOICE").is_none()
+        && std::env::var_os("BORG_DICTATION_MODEL_CHOICE").is_none()
+        && let Some(model) = preferences
+            .presentation
+            .dictation_model
+            .as_deref()
+            .and_then(DictationModelId::from_id)
+    {
+        config = config.with_model_choice(model);
+    }
+    if std::env::var_os("BORG_CLI_DICTATION_ACCELERATOR").is_none()
+        && let Some(accelerator) = preferences
+            .presentation
+            .dictation_accelerator
+            .as_deref()
+            .and_then(DictationAccelerator::from_id)
+    {
+        config = config.with_accelerator(accelerator);
+    }
+    config
 }
 
 fn spawn_editor_preferences_writer() -> (
@@ -1908,10 +1935,10 @@ async fn run_local_agent_session(
     let startup_started = std::time::Instant::now();
     let mut agent_config = AgentConfig::load(args.config.as_deref())?;
     let _local_provider_env = agent_config.apply_local_provider_env();
-    let dictation_config = LocalDictationConfig::from_env();
     let agent_config_path = AgentConfig::path(args.config.as_deref());
     let mut agent_config_signature = agent_config_file_signature(agent_config_path.as_deref());
     let mut editor_preferences = EditorPreferences::load()?;
+    let mut dictation_config = dictation_config_with_preferences(&editor_preferences);
     let host_config_path = default_host_config_path();
     let sessions_dir = session_root_override.map_or_else(
         || {
@@ -2536,11 +2563,12 @@ async fn run_local_agent_session(
         let icon =
             dictation_icon_style_for_preference(editor_preferences.presentation.dictation_icon);
         terminal.set_dictation_icon(icon);
-        if editor_preferences.presentation.dictation_icon.is_none() {
-            editor_preferences.presentation.dictation_icon = Some(icon);
-            dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
-            terminal.open_dictation_icon_picker();
-        }
+        // The mic icon is now chosen inside the enable-dictation flow rather
+        // than in a picker forced open on first boot.
+        terminal.set_dictation_settings(
+            editor_preferences.interaction.dictation_enabled,
+            editor_preferences.presentation.dictation_model.clone(),
+        );
         terminal.set_diff_expansion(editor_preferences.presentation.effective_diff_expansion());
         terminal.set_auto_expand_tools(editor_preferences.presentation.auto_expand_tools);
         terminal.set_tool_click_behavior(editor_preferences.presentation.tool_click_behavior);
@@ -5184,6 +5212,59 @@ async fn run_local_agent_session(
                                 DictationIconStyle::Emoji => "emoji 🎤",
                             }
                         ));
+                    }
+                    UiAction::EnableDictation {
+                        model,
+                        accelerator,
+                        icon,
+                    } => {
+                        editor_preferences.interaction.dictation_enabled = true;
+                        editor_preferences.presentation.dictation_model = Some(model.clone());
+                        editor_preferences.presentation.dictation_accelerator =
+                            Some(accelerator.clone());
+                        editor_preferences.presentation.dictation_icon = Some(icon);
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
+                        // Rebuild from the just-saved preferences and drop any
+                        // backend prepared for a previous model/accelerator so
+                        // the next start pulls the chosen ones.
+                        dictation_config = dictation_config_with_preferences(&editor_preferences);
+                        dictation_backend = None;
+                        let model_mib = DictationModelId::from_id(&model)
+                            .unwrap_or(DictationModelId::DEFAULT)
+                            .download_mib();
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_dictation_icon(icon);
+                        terminal.set_dictation_settings(true, Some(model));
+                        if dictation_task.is_none()
+                            && dictation_setup_task.is_none()
+                            && dictation_start_task.is_none()
+                        {
+                            terminal.set_dictation_state(DictationState::Installing);
+                            if dictation_config.requires_setup() {
+                                terminal.set_notice(format!(
+                                    "Dictation enabled · preparing the model (~{model_mib} MB) · allow microphone access when your OS asks"
+                                ));
+                                let config = dictation_config.clone();
+                                dictation_setup_task =
+                                    Some(tokio::spawn(
+                                        async move { ensure_backend(config).await },
+                                    ));
+                            } else {
+                                terminal.set_notice(
+                                    "Dictation enabled · starting microphone · allow access when your OS asks".to_string(),
+                                );
+                                dictation_start_task =
+                                    Some(spawn_dictation_start(dictation_config.clone()));
+                            }
+                        } else {
+                            terminal.set_notice(
+                                "Dictation enabled · press the dictation key to start recording"
+                                    .to_string(),
+                            );
+                        }
                     }
                     UiAction::ToggleDictation => {
                         if dictation_task.is_some()

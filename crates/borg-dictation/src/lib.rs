@@ -15,13 +15,144 @@ use tokio::time::{Instant, sleep, timeout};
 
 const DEFAULT_LOCAL_DICTATION_BASE_URL: &str = "http://127.0.0.1:5092";
 const DEFAULT_DICTATION_MODEL: &str = "whisper-1";
-const PARAKEET_MODEL_NAME: &str = "parakeet-tdt-0.6b-v2";
+// Shared cache directory for every managed model; individual `.gguf` files and
+// per-accelerator runtimes live side by side inside it. The key is retained
+// from the original single-model install so existing downloads are reused.
 const PARAKEET_CACHE_KEY: &str = "parakeet-v2";
-const PARAKEET_MODEL_FILE: &str = "tdt-0.6b-v2-q4_k.gguf";
-const PARAKEET_MODEL_URL: &str = "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/5dd91ce04815f74f50f86a4ceb56a2a76fd46bf4/tdt-0.6b-v2-q4_k.gguf";
-const PARAKEET_MODEL_SIZE: u64 = 638_373_152;
-const PARAKEET_MODEL_SHA256: &str =
-    "417e8a8e994ec4bcce7010ab1e205f8b88291a4535ddd3152d24d0e19517bfc8";
+// Models are pinned to this immutable Hugging Face commit so a moved branch
+// can never change the bytes a released Borg downloads.
+const PARAKEET_MODEL_COMMIT: &str = "bf0af9f425fa01809cadec671b3cb672709d13e9";
+
+/// A selectable managed dictation model. All entries run on the same
+/// parakeet.cpp server; only the loaded `.gguf` differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DictationModelId {
+    /// Parakeet TDT 0.6B v2 — the balanced default.
+    ParakeetV2,
+    /// Parakeet TDT 0.6B v3 — newer, most accurate.
+    ParakeetV3,
+    /// Parakeet CTC 0.6B — lighter, faster decoding.
+    Lightweight,
+}
+
+struct DictationModelAsset {
+    /// Sent as the request's `model` field; the server transcribes with the
+    /// loaded `.gguf` regardless, so this is only a label.
+    logical_name: &'static str,
+    file: &'static str,
+    url: String,
+    size: u64,
+    sha256: &'static str,
+}
+
+impl DictationModelId {
+    pub const DEFAULT: Self = Self::ParakeetV2;
+    pub const ALL: [Self; 3] = [Self::ParakeetV2, Self::ParakeetV3, Self::Lightweight];
+
+    pub fn from_id(value: &str) -> Option<Self> {
+        Some(match value {
+            "parakeet-v2" => Self::ParakeetV2,
+            "parakeet-v3" => Self::ParakeetV3,
+            "lightweight" => Self::Lightweight,
+            _ => return None,
+        })
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::ParakeetV2 => "parakeet-v2",
+            Self::ParakeetV3 => "parakeet-v3",
+            Self::Lightweight => "lightweight",
+        }
+    }
+
+    /// Approximate download size in MiB, for setup messaging.
+    pub fn download_mib(self) -> u64 {
+        self.asset().size / (1024 * 1024)
+    }
+
+    fn logical_name(self) -> &'static str {
+        match self {
+            Self::ParakeetV2 => "parakeet-tdt-0.6b-v2",
+            Self::ParakeetV3 => "parakeet-tdt-0.6b-v3",
+            Self::Lightweight => "parakeet-ctc-0.6b",
+        }
+    }
+
+    fn asset(self) -> DictationModelAsset {
+        let (file, size, sha256) = match self {
+            Self::ParakeetV2 => (
+                "tdt-0.6b-v2-q4_k.gguf",
+                638_373_152,
+                "417e8a8e994ec4bcce7010ab1e205f8b88291a4535ddd3152d24d0e19517bfc8",
+            ),
+            Self::ParakeetV3 => (
+                "tdt-0.6b-v3-q4_k.gguf",
+                675_200_864,
+                "993d73feb4206dadda865ab25bd64b50c48dc4d013c3bf6126a721f28b1d5ee8",
+            ),
+            Self::Lightweight => (
+                "ctc-0.6b-q4_k.gguf",
+                609_898_048,
+                "439499ecceacae8309f6581f45dc2decb17e3d61e5112de4b4e4fece7483fc0e",
+            ),
+        };
+        DictationModelAsset {
+            logical_name: self.logical_name(),
+            file,
+            url: format!(
+                "https://huggingface.co/mudler/parakeet-cpp-gguf/resolve/{PARAKEET_MODEL_COMMIT}/{file}"
+            ),
+            size,
+            sha256,
+        }
+    }
+}
+
+/// A selectable inference accelerator. `Auto` keeps the per-platform default
+/// (Metal on Apple Silicon, CPU elsewhere); the GPU variants pull a dedicated
+/// parakeet.cpp runtime build where one is published for the platform.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DictationAccelerator {
+    Auto,
+    Nvidia,
+    Vulkan,
+}
+
+impl DictationAccelerator {
+    pub const DEFAULT: Self = Self::Auto;
+
+    pub fn from_id(value: &str) -> Option<Self> {
+        Some(match value {
+            "auto" => Self::Auto,
+            "nvidia" => Self::Nvidia,
+            "vulkan" => Self::Vulkan,
+            _ => return None,
+        })
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Nvidia => "nvidia",
+            Self::Vulkan => "vulkan",
+        }
+    }
+
+    /// Whether this platform publishes a runtime for the accelerator, so the
+    /// UI can hide choices that would only fail to download.
+    pub fn available_on_platform(self) -> bool {
+        runtime_asset_for(self).is_ok()
+    }
+
+    fn runtime_subdir(self) -> &'static str {
+        match self {
+            Self::Auto => "runtime",
+            Self::Nvidia => "runtime-nvidia",
+            Self::Vulkan => "runtime-vulkan",
+        }
+    }
+}
 const DICTATION_TIMEOUT: Duration = Duration::from_secs(120);
 const DICTATION_SETUP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const DICTATION_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -66,6 +197,8 @@ pub struct LocalDictationConfig {
     model_explicit: bool,
     auto_setup: bool,
     managed_model_path: Option<PathBuf>,
+    model_choice: DictationModelId,
+    accelerator: DictationAccelerator,
 }
 
 impl LocalDictationConfig {
@@ -90,7 +223,28 @@ impl LocalDictationConfig {
             model_explicit: model.is_some(),
             auto_setup: env_bool("BORG_CLI_DICTATION_AUTO_SETUP").unwrap_or(true),
             managed_model_path: env_value("BORG_CLI_DICTATION_MODEL_PATH").map(PathBuf::from),
+            model_choice: env_value("BORG_CLI_DICTATION_MODEL_CHOICE")
+                .as_deref()
+                .and_then(DictationModelId::from_id)
+                .unwrap_or(DictationModelId::DEFAULT),
+            accelerator: env_value("BORG_CLI_DICTATION_ACCELERATOR")
+                .as_deref()
+                .and_then(DictationAccelerator::from_id)
+                .unwrap_or(DictationAccelerator::DEFAULT),
         }
+    }
+
+    /// Select the managed model to download and load. Ignored once an explicit
+    /// endpoint/model/path override is in force.
+    pub fn with_model_choice(mut self, model: DictationModelId) -> Self {
+        self.model_choice = model;
+        self
+    }
+
+    /// Select the inference accelerator for the managed runtime.
+    pub fn with_accelerator(mut self, accelerator: DictationAccelerator) -> Self {
+        self.accelerator = accelerator;
+        self
     }
 
     pub fn requires_setup(&self) -> bool {
@@ -104,13 +258,15 @@ impl LocalDictationConfig {
     fn for_managed_backend(&self) -> Self {
         Self {
             base_url: DEFAULT_LOCAL_DICTATION_BASE_URL.to_string(),
-            model: PARAKEET_MODEL_NAME.to_string(),
+            model: self.model_choice.logical_name().to_string(),
             api_key: None,
             record_command: self.record_command.clone(),
             base_url_explicit: false,
             model_explicit: false,
             auto_setup: true,
             managed_model_path: self.managed_model_path.clone(),
+            model_choice: self.model_choice,
+            accelerator: self.accelerator,
         }
     }
 }
@@ -151,6 +307,8 @@ pub async fn ensure_backend(config: LocalDictationConfig) -> Result<LocalDictati
         DICTATION_SETUP_TIMEOUT,
         ensure_installed(
             config.managed_model_path.as_deref(),
+            config.model_choice,
+            config.accelerator,
             config.record_command.is_none(),
         ),
     )
@@ -190,9 +348,11 @@ pub async fn ensure_backend(config: LocalDictationConfig) -> Result<LocalDictati
 
 async fn ensure_installed(
     configured_model_path: Option<&Path>,
+    model_choice: DictationModelId,
+    accelerator: DictationAccelerator,
     install_recorder: bool,
 ) -> Result<InstalledDictation> {
-    let asset = runtime_asset()?;
+    let asset = runtime_asset_for(accelerator)?;
     let install_dir = dictation_install_dir()?;
     fs::create_dir_all(&install_dir).with_context(|| {
         format!(
@@ -207,7 +367,9 @@ async fn ensure_installed(
     }
 
     let archive_path = install_dir.join(asset.archive_name);
-    let server_dir = install_dir.join("runtime");
+    // Each accelerator's runtime lives in its own subdirectory so switching
+    // between them never reuses the wrong parakeet-server binary.
+    let server_dir = install_dir.join(accelerator.runtime_subdir());
     let server_bin = find_file(&server_dir, runtime_binary_name())?;
     if server_bin.is_none() {
         let runtime_url = format!("{PARAKEET_RUNTIME_URL_PREFIX}{}", asset.archive_name);
@@ -232,13 +394,15 @@ async fn ensure_installed(
         );
         path.to_path_buf()
     } else {
-        let path = install_dir.join(PARAKEET_MODEL_FILE);
+        let model = model_choice.asset();
+        // Distinct filenames let multiple models coexist in the shared dir.
+        let path = install_dir.join(model.file);
         download_verified(
-            PARAKEET_MODEL_URL,
+            &model.url,
             &path,
-            PARAKEET_MODEL_SIZE,
-            PARAKEET_MODEL_SHA256,
-            "Parakeet V2 model",
+            model.size,
+            model.sha256,
+            model.logical_name,
         )
         .await?;
         path
@@ -494,6 +658,51 @@ fn runtime_asset() -> Result<RuntimeAsset> {
     bail!("automatic Parakeet dictation setup is not supported on this platform")
 }
 
+/// Resolve the runtime archive for an accelerator. `Auto` keeps the
+/// per-platform default; the GPU variants only resolve on platforms that
+/// publish a matching parakeet.cpp build (NVIDIA/Vulkan on Linux and Windows
+/// x86_64), so [`DictationAccelerator::available_on_platform`] can hide the
+/// rest.
+#[allow(unreachable_code, unused_variables)]
+fn runtime_asset_for(accelerator: DictationAccelerator) -> Result<RuntimeAsset> {
+    if accelerator == DictationAccelerator::Auto {
+        return runtime_asset();
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        return Ok(match accelerator {
+            DictationAccelerator::Nvidia => RuntimeAsset {
+                archive_name: "parakeet-v0.5.0-bin-linux-cuda12-x64.tar.gz",
+                sha256: "098abf4f2f065523749efdbc5abef2c8f2d14dc10bc3db1cd5aa603b0b98b684",
+                size: 934_327_741,
+            },
+            DictationAccelerator::Vulkan => RuntimeAsset {
+                archive_name: "parakeet-v0.5.0-bin-linux-vulkan-x64.tar.gz",
+                sha256: "36c8d4b93594ec18928c9c76b02e04b2d738e859deda8b5e3944bb34fc0646eb",
+                size: 36_864_577,
+            },
+            DictationAccelerator::Auto => unreachable!("handled above"),
+        });
+    }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        return Ok(match accelerator {
+            DictationAccelerator::Nvidia => RuntimeAsset {
+                archive_name: "parakeet-v0.5.0-bin-win-cuda-x64.zip",
+                sha256: "0c90f619a368e67418596231470e916fda60118180879e4334d29d9b0df93b21",
+                size: 312_914_549,
+            },
+            DictationAccelerator::Vulkan => RuntimeAsset {
+                archive_name: "parakeet-v0.5.0-bin-win-vulkan-x64.zip",
+                sha256: "717c416fab299755e8140137e3a0115121ce1acb6379d13c60f2f0613f6c13a3",
+                size: 35_828_324,
+            },
+            DictationAccelerator::Auto => unreachable!("handled above"),
+        });
+    }
+    bail!("no {} dictation runtime is published for this platform", accelerator.id())
+}
+
 #[cfg(windows)]
 fn runtime_binary_name() -> &'static str {
     "parakeet-server.exe"
@@ -529,10 +738,13 @@ async fn migrate_legacy_install_from(legacy_dir: &Path, install_dir: &Path) -> R
     }
     let _legacy_lock = CacheLock::acquire(legacy_dir).await?;
     let asset = runtime_asset()?;
+    // Legacy installs only ever held the default (V2) model and CPU/Metal
+    // runtime.
+    let legacy_model_file = DictationModelId::ParakeetV2.asset().file;
     for name in [
-        PARAKEET_MODEL_FILE.to_string(),
-        format!("{PARAKEET_MODEL_FILE}.sha256"),
-        format!("{PARAKEET_MODEL_FILE}.part"),
+        legacy_model_file.to_string(),
+        format!("{legacy_model_file}.sha256"),
+        format!("{legacy_model_file}.part"),
         asset.archive_name.to_string(),
         format!("{}.sha256", asset.archive_name),
     ] {
@@ -566,27 +778,30 @@ pub fn parakeet_is_installed(config: &LocalDictationConfig) -> bool {
     let Ok(install_dir) = dictation_install_dir() else {
         return false;
     };
+    let model = config.model_choice;
     let model_installed = config.managed_model_path.as_ref().map_or_else(
         || {
-            install_is_complete(&install_dir)
-                || dictation_cache_dir().is_ok_and(|dir| install_is_complete(&dir))
+            install_is_complete(&install_dir, model)
+                || dictation_cache_dir().is_ok_and(|dir| install_is_complete(&dir, model))
         },
         |path| path.is_file(),
     );
+    let runtime_subdir = config.accelerator.runtime_subdir();
     model_installed
-        && (find_file(&install_dir.join("runtime"), runtime_binary_name())
+        && (find_file(&install_dir.join(runtime_subdir), runtime_binary_name())
             .is_ok_and(|path| path.is_some())
             || dictation_cache_dir().is_ok_and(|dir| {
-                find_file(&dir.join("runtime"), runtime_binary_name())
+                find_file(&dir.join(runtime_subdir), runtime_binary_name())
                     .is_ok_and(|path| path.is_some())
             }))
 }
 
-fn install_is_complete(dir: &Path) -> bool {
-    let model_path = dir.join(PARAKEET_MODEL_FILE);
-    fs::metadata(&model_path).is_ok_and(|metadata| metadata.len() == PARAKEET_MODEL_SIZE)
+fn install_is_complete(dir: &Path, model: DictationModelId) -> bool {
+    let asset = model.asset();
+    let model_path = dir.join(asset.file);
+    fs::metadata(&model_path).is_ok_and(|metadata| metadata.len() == asset.size)
         && fs::read_to_string(verification_marker(&model_path))
-            .is_ok_and(|marker| marker.trim() == PARAKEET_MODEL_SHA256)
+            .is_ok_and(|marker| marker.trim() == asset.sha256)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1326,8 +1541,9 @@ mod tests {
     use tokio::process::Command;
 
     use super::{
-        LocalDictationConfig, LocalDictationRecorder, ensure_safe_archive_path, extract_ffmpeg,
-        ffmpeg_asset_for, transcription_response_text, transcription_text, wait_for_endpoint,
+        DictationAccelerator, DictationModelId, LocalDictationConfig, LocalDictationRecorder,
+        ensure_safe_archive_path, extract_ffmpeg, ffmpeg_asset_for, transcription_response_text,
+        transcription_text, wait_for_endpoint,
     };
 
     fn default_config() -> LocalDictationConfig {
@@ -1340,6 +1556,8 @@ mod tests {
             model_explicit: false,
             auto_setup: true,
             managed_model_path: None,
+            model_choice: DictationModelId::DEFAULT,
+            accelerator: DictationAccelerator::DEFAULT,
         }
     }
 
@@ -1554,5 +1772,43 @@ mod tests {
             elapsed < Duration::from_millis(100),
             "managed dictation readiness exceeded 100 ms: {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn dictation_model_catalog_is_consistent_and_distinct() {
+        assert_eq!(DictationModelId::DEFAULT, DictationModelId::ParakeetV2);
+        let mut files = std::collections::HashSet::new();
+        for model in DictationModelId::ALL {
+            // The persisted id must round-trip, since preferences store it.
+            assert_eq!(DictationModelId::from_id(model.id()), Some(model));
+            let asset = model.asset();
+            assert!(asset.url.starts_with("https://huggingface.co/"));
+            assert!(asset.url.ends_with(asset.file));
+            assert_eq!(asset.sha256.len(), 64);
+            assert!(asset.size > 0);
+            assert!(files.insert(asset.file), "duplicate model file {}", asset.file);
+        }
+        assert_eq!(DictationModelId::from_id("nonsense"), None);
+    }
+
+    #[test]
+    fn dictation_accelerator_ids_round_trip_and_subdirs_are_distinct() {
+        let mut subdirs = std::collections::HashSet::new();
+        for accelerator in [
+            DictationAccelerator::Auto,
+            DictationAccelerator::Nvidia,
+            DictationAccelerator::Vulkan,
+        ] {
+            assert_eq!(
+                DictationAccelerator::from_id(accelerator.id()),
+                Some(accelerator)
+            );
+            assert!(
+                subdirs.insert(accelerator.runtime_subdir()),
+                "duplicate runtime subdir"
+            );
+        }
+        assert_eq!(DictationAccelerator::DEFAULT, DictationAccelerator::Auto);
+        assert!(DictationAccelerator::Auto.available_on_platform());
     }
 }
