@@ -31,6 +31,14 @@ and continue until the requested outcome is implemented and verified. \
 For any request that requires tools, first send the user a concise visible progress update before \
 emitting an action summary or calling a tool. While work is ongoing, send further visible progress \
 updates at meaningful milestones and do not leave the user without one for more than about 60 seconds. \
+Concretely: after every two or three tool calls, or whenever a single step took more than about 30 \
+seconds, write one or two plain sentences saying what you just learned or did and what comes next; \
+narrating intent for a tool call does not count as an update, and finishing the whole task is not \
+the first acceptable moment to speak. \
+When a message from the user arrives while you are working (it is marked as a mid-turn message), \
+answer it directly in your very next assistant text before running more tools, even if the answer is \
+one line; then say whether it changes your plan and continue. Never let a mid-turn user message go \
+unanswered until the end of the turn. \
 The Borg Agent source is https://github.com/borg-ml/agent; when diagnosing Borg Agent behavior and the \
 source is not already available, inspect or clone that public repository as needed. \
 Write simple mathematical notation as readable Unicode or plain text. For complex notation, use \
@@ -76,6 +84,16 @@ separate action-summary narration item.";
 pub(crate) const PROVIDER_CONTEXT_CONTRACT_VERSION: u32 = 1;
 
 const MAX_RESIDENT_CODEX_SUBSCRIPTION_POOLS: usize = 4;
+
+/// Mark a steer as a mid-turn interjection. Delivered as a plain user message
+/// it is indistinguishable from the turn's original prompt, and models keep
+/// working through their tool plan instead of answering it; the system prompt
+/// binds the marker to "answer this in your next message".
+fn frame_mid_turn_user_message(text: &str) -> String {
+    format!(
+        "[Mid-turn message from the user: answer it directly in your next message before continuing.]\n\n{text}"
+    )
+}
 
 fn provider_native_agent_tool(name: &str) -> bool {
     matches!(
@@ -2331,6 +2349,7 @@ fn map_controls(
                         admission,
                         ack,
                     } => {
+                        let text = frame_mid_turn_user_message(&text);
                         match tx
                             .send(ChatStreamControl::Steer {
                                 client_user_message_id: Some(message_id.to_string()),
@@ -2509,6 +2528,8 @@ mod tests {
         assert!(CODING_SYSTEM_PROMPT.contains("one- or two-word lowercase summary"));
         assert!(CODING_SYSTEM_PROMPT.contains("Do not emit a separate action-summary"));
         assert!(CODING_SYSTEM_PROMPT.contains("more than about 60 seconds"));
+        assert!(CODING_SYSTEM_PROMPT.contains("marked as a mid-turn message"));
+        assert!(frame_mid_turn_user_message("why?").starts_with("[Mid-turn message from the user"));
     }
 
     #[test]
