@@ -109,16 +109,11 @@ where
         .spawn()
         .with_context(|| format!("spawn {program}"))?;
 
-    if let (Some(bytes), Some(mut handle)) = (stdin, child.stdin.take()) {
-        use std::io::Write;
-        handle
-            .write_all(bytes)
-            .with_context(|| format!("pipe stdin to {program}"))?;
-        drop(handle);
-    }
-
-    // Reader threads; keeps the child's pipes draining so large
-    // outputs don't deadlock on a full pipe buffer.
+    // Reader threads first; they keep the child's pipes draining so large
+    // outputs don't deadlock on a full pipe buffer while we are still feeding
+    // stdin. Then stdin is written from its own thread so a child that fills
+    // stdout before consuming its input (`git apply` on a multi-megabyte
+    // diff) cannot wedge the parent, and the deadline below covers the write.
     let stdout_reader = child
         .stdout
         .take()
@@ -127,6 +122,22 @@ where
         .stderr
         .take()
         .map(|err| std::thread::spawn(move || read_pipe_lossy(err)));
+    let stdin_writer = match (stdin, child.stdin.take()) {
+        (Some(bytes), Some(mut handle)) => {
+            let bytes = bytes.to_vec();
+            Some(std::thread::spawn(move || -> io::Result<()> {
+                use std::io::Write;
+                match handle.write_all(&bytes) {
+                    // The child closed stdin before reading all of it (`head`,
+                    // or an early exit); its own status and stderr explain that
+                    // better than a pipe error would.
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+                    result => result,
+                }
+            }))
+        }
+        _ => None,
+    };
 
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     let mut timed_out = false;
@@ -153,6 +164,12 @@ where
 
     let stdout = collect_pipe_reader(stdout_reader, program, "stdout")?;
     let stderr = collect_pipe_reader(stderr_reader, program, "stderr")?;
+    if let Some(writer) = stdin_writer {
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("stdin writer thread for {program} panicked"))?
+            .with_context(|| format!("pipe stdin to {program}"))?;
+    }
     if let Some(error) = kill_wait_error {
         return Err(error).with_context(|| format!("wait on killed {program} after timeout"));
     }
@@ -437,6 +454,45 @@ mod tests {
         .expect("spawn");
         assert!(out.success);
         assert_eq!(out.stdout.trim(), "hello from test");
+    }
+
+    #[test]
+    fn large_stdin_to_a_chatty_child_does_not_deadlock() {
+        // `cat` echoes stdin to stdout. Writing all of stdin before draining
+        // stdout wedges both sides once the 64 KiB pipe buffer fills.
+        let payload = vec![b'x'; 4 * 1024 * 1024];
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let out = run_with_timeout(
+                "cat",
+                &[] as &[&str],
+                None,
+                Some(&payload),
+                Duration::from_secs(30),
+            );
+            let _ = done_tx.send(out);
+        });
+        let out = done_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("stdin write and stdout drain must overlap instead of deadlocking")
+            .expect("spawn");
+        assert!(out.success);
+        assert_eq!(out.stdout.len(), 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn child_that_ignores_stdin_reports_its_own_status() {
+        let payload = vec![b'x'; 4 * 1024 * 1024];
+        let out = run_with_timeout(
+            "sh",
+            ["-c", "exit 3"],
+            None,
+            Some(&payload),
+            Duration::from_secs(30),
+        )
+        .expect("a closed stdin pipe must not turn into a spawn error");
+        assert!(!out.success);
+        assert_eq!(out.status_code, Some(3));
     }
 
     #[test]
