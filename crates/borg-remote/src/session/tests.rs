@@ -651,6 +651,82 @@ async fn durable_session_events_project_once_into_the_bound_workspace() {
 }
 
 #[tokio::test]
+async fn pending_prompt_admission_does_not_wait_for_workspace_repair() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let session_store = Arc::new(
+        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap(),
+    );
+    session_store.create_session(session_id).await.unwrap();
+    let binding = session_store
+        .workspace_binding(session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let workspace = session_store.workspace_store().await.unwrap().unwrap();
+    let human = crate::local_human_participant_id("Human");
+    workspace
+        .ensure_execution_workspace(
+            binding.workspace_id,
+            "test",
+            human,
+            "Human",
+            binding.participant_id,
+            "Agent",
+        )
+        .await
+        .unwrap();
+    let projection = WorkspaceProjection::new(
+        workspace,
+        binding.workspace_id,
+        binding.participant_id,
+        human,
+        0,
+        0,
+    );
+    let message_id = Uuid::new_v4();
+    let queued = session_store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "next request".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ))
+        .await
+        .unwrap();
+    let runtime = RuntimeSessionStore::new(session_store, Vec::new(), true)
+        .with_workspace_projection(projection.clone());
+    let blocked_repair = projection.projected_sequence.lock().await;
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            runtime.prompt_admission_state(session_id, message_id),
+        )
+        .await
+        .expect("admission waited for background repair")
+        .unwrap(),
+        PromptAdmissionState::Pending,
+    );
+    assert_eq!(*blocked_repair, 0);
+    drop(blocked_repair);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while *projection.projected_sequence.lock().await < queued.sequence {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("deferred repair must still project the queued prompt");
+}
+
+#[tokio::test]
 async fn projection_delivery_failure_is_durable_and_does_not_fail_the_session_append() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();

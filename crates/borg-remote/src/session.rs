@@ -592,15 +592,19 @@ impl RuntimeSessionStore {
             _ => PromptAdmissionState::Settled,
         };
         if state == PromptAdmissionState::Pending
-            && let Some(projection) = &self.workspace_projection
-            && let Err(error) = projection.repair(Arc::clone(&self.store), session_id).await
+            && let Some(projection) = self.workspace_projection.clone()
         {
-            tracing::warn!(
-                %session_id,
-                %message_id,
-                %error,
-                "workspace projection could not catch up to externally admitted prompt"
-            );
+            let store = Arc::clone(&self.store);
+            // The canonical action already proves admission. Catching up the
+            // workspace projection must not hold the prompt behind old events.
+            tokio::spawn(async move {
+                if let Err(error) = projection.repair(store, session_id).await {
+                    tracing::warn!(
+                        %session_id, %message_id, %error,
+                        "workspace projection could not catch up to externally admitted prompt"
+                    );
+                }
+            });
         }
         Ok(state)
     }
