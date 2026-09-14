@@ -22,7 +22,7 @@ persisted to `editor.toml`.
 | --- | --- | --- |
 | Interface language | `/ui-language` | `presentation.ui_language = "auto"`, `"en"`, `"zh-Hans"`, `"es"`, or `"ru"` |
 | Active-turn messages | `/followups` | `interaction.active_messages = "steer"` or `"queue"` |
-| Keep machine awake | `/sleep` | `interaction.prevent_sleep = true` or `false` |
+| Keep machine awake | `/sleep lid`, `/sleep idle`, `/sleep off` | `interaction.prevent_sleep = true` or `false`; `interaction.prevent_lid_sleep = true` (default) also blocks lid-close sleep — on macOS this needs a one-time admin approval (Touch ID or password), tracked in `interaction.lid_sleep_setup = "ask"`, `"authorized"`, or `"declined"` |
 | Desktop completion notification | `/notifications` | `interaction.completion_notifications = "off"`, `"unfocused"`, or `"always"` |
 | Completion sound | `/sound` | `interaction.completion_sound = "off"`, `"unfocused"`, or `"always"` |
 | Refresh rate | `/refresh` | `presentation.refresh_rate_fps = 15..240` |

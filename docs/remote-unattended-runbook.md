@@ -26,10 +26,15 @@ to refresh the service. Linux uses the systemd service described below.
 Other platforms can enroll with `borg remote enroll` and run
 `borg remote host` under their own login service.
 
-Borg's `/sleep` option (enabled by default; `/sleep on` or `/sleep off`)
-prevents idle sleep during active terminal turns. It does not keep an idle
-remote host awake, and on macOS it does not override lid-close sleep. Configure
-the computer's power settings for unattended availability.
+Borg's `/sleep` option (enabled by default; `/sleep lid`, `/sleep idle`, or
+`/sleep off`) prevents sleep during active terminal turns. It does not keep an
+idle remote host awake. On macOS, `lid` mode additionally blocks lid-close
+sleep while work runs: it needs a one-time admin approval (Touch ID or
+password) that installs a `/etc/sudoers.d/borg-lid-sleep` rule allowing only
+`pmset -a disablesleep 0|1`, and it stays off while on battery so a closed
+laptop in a bag does not overheat. A detached watcher clears the override if
+Borg exits abnormally. Configure the computer's power settings for unattended
+availability beyond active turns.
 
 ## Linux unattended operation
 

@@ -127,8 +127,14 @@ const DICTATION_NERD_FONT_ICON: &str = "󰍬";
 /// Selectable managed dictation models (value id, human label). Values mirror
 /// `borg_dictation::DictationModelId::id`; the CLI maps them back.
 const DICTATION_MODEL_OPTIONS: &[(&str, &str)] = &[
-    ("parakeet-v2", "Parakeet V2 · balanced, recommended (~609 MB)"),
-    ("parakeet-v3", "Parakeet V3 · newest, most accurate (~644 MB)"),
+    (
+        "parakeet-v2",
+        "Parakeet V2 · balanced, recommended (~609 MB)",
+    ),
+    (
+        "parakeet-v3",
+        "Parakeet V3 · newest, most accurate (~644 MB)",
+    ),
     ("lightweight", "Lightweight · faster CTC decoding (~582 MB)"),
 ];
 
@@ -517,6 +523,13 @@ struct ThreadFindState {
     row: usize,
 }
 
+pub const PREVENT_SLEEP_LID: &str = "On, even with the lid closed";
+pub const PREVENT_SLEEP_IDLE: &str = "On, idle sleep only";
+pub const PREVENT_SLEEP_OFF: &str = "Off";
+const LID_AUTH_AUTHORIZE: &str = "Authorize once (Touch ID or password)";
+const LID_AUTH_NOT_NOW: &str = "Not now";
+const LID_AUTH_NEVER: &str = "Never ask again";
+
 const ACTIVE_MESSAGES_SEND_NOW: &str = "Send now and redirect the current turn";
 const ACTIVE_MESSAGES_WAIT: &str = "Wait and send after the current turn finishes";
 
@@ -549,7 +562,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "choose message delivery: redirect now or wait for this turn to finish",
     ),
     ("/refresh", "choose terminal refresh rate"),
-    ("/sleep", "keep the machine awake during active turns"),
+    ("/sleep", "keep the machine awake, even with the lid down"),
     ("/expand-edits", "auto-expand edit diffs"),
     ("/expand-tools", "auto-expand other tool details"),
     ("/tool-click", "choose full-screen or inline action opening"),
@@ -791,6 +804,14 @@ impl TerminalIoRequest {
     }
 }
 
+/// Outcome of the one-time "keep awake with the lid closed" admin prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LidSleepAuthorizationChoice {
+    Authorize,
+    NotNow,
+    Never,
+}
+
 #[derive(Debug)]
 pub enum UiAction {
     None,
@@ -842,7 +863,11 @@ pub enum UiAction {
     SetUiLanguage(UiLanguage),
     SetFast(bool),
     SetRefreshRate(u64),
-    SetPreventSleep(bool),
+    SetPreventSleep {
+        enabled: bool,
+        lid: bool,
+    },
+    LidSleepAuthorization(LidSleepAuthorizationChoice),
     SetSteerActive(bool),
     SetDiffExpansion(DiffExpansionPolicy),
     SetAutoExpandTools(bool),
@@ -1283,6 +1308,7 @@ enum PickerKind {
     Fast,
     RefreshRate,
     PreventSleep,
+    LidSleepAuthorization,
     ActiveMessages,
     AutoExpandEdits,
     AutoExpandTools,
@@ -3946,12 +3972,28 @@ impl BorgTerminal {
         ));
     }
 
-    pub fn open_prevent_sleep_picker(&mut self, enabled: bool) {
+    pub fn open_prevent_sleep_picker(&mut self, enabled: bool, lid: bool) {
+        let current = match (enabled, lid) {
+            (true, true) => PREVENT_SLEEP_LID,
+            (true, false) => PREVENT_SLEEP_IDLE,
+            (false, _) => PREVENT_SLEEP_OFF,
+        };
         self.picker = Some(Picker::new(
             PickerKind::PreventSleep,
-            "Keep machine awake during active turns",
-            ["On", "Off"],
-            Some(if enabled { "On" } else { "Off" }),
+            "Keep machine awake while Borg works",
+            [PREVENT_SLEEP_LID, PREVENT_SLEEP_IDLE, PREVENT_SLEEP_OFF],
+            Some(current),
+        ));
+    }
+
+    /// One-time macOS prompt: lid-close sleep can only be vetoed by root, so
+    /// the user is asked once whether Borg may install a narrow sudo rule.
+    pub fn open_lid_sleep_authorization_picker(&mut self) {
+        self.picker = Some(Picker::new(
+            PickerKind::LidSleepAuthorization,
+            "Keep this Mac awake with the lid closed while Borg works? Needs admin approval once.",
+            [LID_AUTH_AUTHORIZE, LID_AUTH_NOT_NOW, LID_AUTH_NEVER],
+            Some(LID_AUTH_AUTHORIZE),
         ));
     }
 
@@ -5720,7 +5762,20 @@ impl BorgTerminal {
                     .parse()
                     .expect("FPS options are numeric"),
             ),
-            PickerKind::PreventSleep => UiAction::SetPreventSleep(picker.selected_value() == "On"),
+            PickerKind::PreventSleep => {
+                let value = picker.selected_value();
+                UiAction::SetPreventSleep {
+                    enabled: value != PREVENT_SLEEP_OFF,
+                    lid: value == PREVENT_SLEEP_LID,
+                }
+            }
+            PickerKind::LidSleepAuthorization => {
+                UiAction::LidSleepAuthorization(match picker.selected_value().as_str() {
+                    LID_AUTH_AUTHORIZE => LidSleepAuthorizationChoice::Authorize,
+                    LID_AUTH_NEVER => LidSleepAuthorizationChoice::Never,
+                    _ => LidSleepAuthorizationChoice::NotNow,
+                })
+            }
             PickerKind::ActiveMessages => {
                 UiAction::SetSteerActive(picker.selected_value() == ACTIVE_MESSAGES_SEND_NOW)
             }
@@ -9576,8 +9631,14 @@ impl Composer {
             .attachments
             .iter()
             .map(|attachment| (attachment.start, attachment.end))
-            .chain(self.pasted_texts.iter().map(|pasted| (pasted.start, pasted.end)))
-            .filter(|(token_start, token_end)| *token_start < self.cursor && *token_end > self.cursor)
+            .chain(
+                self.pasted_texts
+                    .iter()
+                    .map(|pasted| (pasted.start, pasted.end)),
+            )
+            .filter(|(token_start, token_end)| {
+                *token_start < self.cursor && *token_end > self.cursor
+            })
             .map(|(_, token_end)| token_end)
             .max();
         if let Some(token_end) = token_end {
