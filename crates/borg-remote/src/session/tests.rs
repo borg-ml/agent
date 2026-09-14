@@ -1413,17 +1413,45 @@ struct EmptyThenSuccessExecutor {
 
 struct UsageLimitThenSuccessExecutor {
     calls: Arc<AtomicUsize>,
+    /// Emit a tool call before the first failure so the turn counts as having
+    /// side effects, and record every prompt text the executor receives.
+    side_effects_before_limit: bool,
+    prompts: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait::async_trait]
 impl AgentTurnExecutor for UsageLimitThenSuccessExecutor {
     async fn execute(
         &self,
-        _turn: AgentTurn,
-        _events: mpsc::Sender<SessionEventKind>,
+        turn: AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
         _controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
+        self.prompts
+            .lock()
+            .unwrap()
+            .push(turn.prompt.clone());
         if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            if self.side_effects_before_limit {
+                let _ = events
+                    .send(SessionEventKind::ToolStarted {
+                        tool_call_id: "call-1".into(),
+                        name: "shell".into(),
+                        input: serde_json::json!({"command": "git commit"}),
+                        input_ref: None,
+                    })
+                    .await;
+                let _ = events
+                    .send(SessionEventKind::ToolCompleted {
+                        tool_call_id: "call-1".into(),
+                        output: "committed".into(),
+                        output_ref: None,
+                        is_error: false,
+                        input: None,
+                        input_ref: None,
+                    })
+                    .await;
+            }
             return Err(anyhow::anyhow!(
                 "You've hit your usage limit. Try again later."
             ));
@@ -2032,6 +2060,8 @@ async fn usage_limited_prompt_resumes_automatically_after_the_retry_delay() {
     let calls = Arc::new(AtomicUsize::new(0));
     let executor = Arc::new(UsageLimitThenSuccessExecutor {
         calls: Arc::clone(&calls),
+        side_effects_before_limit: false,
+        prompts: Arc::default(),
     });
     let actor = tokio::spawn({
         let journal_path = root.path().join("session.lock");
@@ -2103,6 +2133,102 @@ async fn usage_limited_prompt_resumes_automatically_after_the_retry_delay() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn usage_limit_after_side_effects_continues_instead_of_replaying_the_prompt() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let prompts = Arc::new(Mutex::new(Vec::new()));
+    let executor = Arc::new(UsageLimitThenSuccessExecutor {
+        calls: Arc::clone(&calls),
+        side_effects_before_limit: true,
+        prompts: Arc::clone(&prompts),
+    });
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: Some("finish this task".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        }
+    });
+
+    let mut completions = 0;
+    let mut user_statuses = Vec::new();
+    let mut continuation_message_id = None;
+    while completions < 2 {
+        let Some(event) = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("continuation turn completes")
+        else {
+            let result = actor.await.unwrap();
+            panic!("session exited early after {completions} completion(s): {result:?}; statuses {user_statuses:?}");
+        };
+        match &event.kind {
+            SessionEventKind::Message {
+                message_id: id,
+                actor: EventActor::User,
+                status,
+                ..
+            } if *id == message_id => user_statuses.push(*status),
+            SessionEventKind::TurnCompleted { message_id: id, .. } => {
+                completions += 1;
+                if *id != message_id {
+                    continuation_message_id = Some(*id);
+                }
+            }
+            _ => {}
+        }
+    }
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    // The delivered message is settled as complete, never re-queued into
+    // pending input, and the resume is a distinct internal continuation turn.
+    assert_eq!(calls.load(Ordering::Acquire), 2);
+    assert_eq!(user_statuses.last(), Some(&MessageStatus::Complete));
+    assert!(
+        !user_statuses
+            .iter()
+            .skip(2)
+            .any(|status| *status == MessageStatus::Queued),
+        "user prompt must not return to the queue: {user_statuses:?}"
+    );
+    assert!(continuation_message_id.is_some());
+    let prompts = prompts.lock().unwrap();
+    assert!(prompts[0].contains("finish this task"));
+    assert!(prompts[1].contains("Continue from exactly where it left off"));
+    assert!(prompts[1].contains("finish this task"));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn queued_retry_can_be_recalled_while_waiting_without_later_delivery() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
@@ -2112,6 +2238,8 @@ async fn queued_retry_can_be_recalled_while_waiting_without_later_delivery() {
     let calls = Arc::new(AtomicUsize::new(0));
     let executor = Arc::new(UsageLimitThenSuccessExecutor {
         calls: Arc::clone(&calls),
+        side_effects_before_limit: false,
+        prompts: Arc::default(),
     });
     let actor = tokio::spawn({
         let journal_path = root.path().join("session.lock");
@@ -7112,7 +7240,7 @@ async fn inactive_team_reports_settle_without_starting_a_provider_turn() {
         batch: Vec::new(),
     }]);
 
-    settle_inactive_team_notifications(&mut runtime, &event_tx, session_id, &mut pending, false)
+    settle_inactive_team_notifications(&mut runtime, &event_tx, session_id, &mut pending, false, None)
         .await
         .unwrap();
 
@@ -7155,7 +7283,7 @@ async fn inactive_wake_report_is_retained_for_the_root_provider_turn() {
         batch: Vec::new(),
     }]);
 
-    settle_inactive_team_notifications(&mut runtime, &event_tx, session_id, &mut pending, false)
+    settle_inactive_team_notifications(&mut runtime, &event_tx, session_id, &mut pending, false, None)
         .await
         .unwrap();
 

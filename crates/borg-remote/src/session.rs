@@ -1724,6 +1724,7 @@ async fn run_agent_session_store_kernel(
     let mut usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
     let mut network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
     let mut network_retry_message_id = None;
+    let mut usage_limit_continuation_id: Option<Uuid> = None;
     let mut auth_lookup_retries = 0_usize;
     let mut at_turn_boundary = !pending.is_empty();
     let mut projection_repair_started = false;
@@ -1892,6 +1893,7 @@ async fn run_agent_session_store_kernel(
                 session_id,
                 &mut pending,
                 user_stop,
+                usage_limit_continuation_id,
             )
             .await?;
         }
@@ -1930,6 +1932,12 @@ async fn run_agent_session_store_kernel(
                 )
                 .await?;
                 set_user_stop(&mut journal, &events, session_id, &mut user_stop, true).await?;
+                if usage_limit_continuation_id.is_some() {
+                    drop_usage_limit_continuation(&mut pending, &mut usage_limit_continuation_id);
+                    next_ready_detail.get_or_insert_with(|| {
+                        "Automatic continuation cancelled. Your work is saved.".to_string()
+                    });
+                }
                 retry_not_before = None;
             }
             // Queue-mode user prompts can arrive while the previous turn is
@@ -1953,6 +1961,7 @@ async fn run_agent_session_store_kernel(
                     session_id,
                     &mut pending,
                     user_stop,
+                    usage_limit_continuation_id,
                 )
                 .await?;
             }
@@ -1965,7 +1974,7 @@ async fn run_agent_session_store_kernel(
         let next = if !usage_limit_retry_waiting
             && let Some(prompt) = pop_next_pending_prompt(
                 &mut pending,
-                goal_is_active || network_retry_message_id.is_some(),
+                goal_is_active || network_retry_message_id.is_some() || usage_limit_continuation_id.is_some(),
             ) {
             Some(prompt)
         } else if !usage_limit_retry_waiting && let Ok(text) = monitor_events_rx.try_recv() {
@@ -2015,7 +2024,7 @@ async fn run_agent_session_store_kernel(
                     _ = usage_limit_wait, if retry_not_before.is_some() => {
                         retry_not_before = None;
                         let goal_is_active = goal.as_ref().is_some_and(|goal| goal.status == GoalStatus::Active);
-                        break pop_next_pending_prompt(&mut pending, goal_is_active || network_retry_message_id.is_some()).or_else(|| {
+                        break pop_next_pending_prompt(&mut pending, goal_is_active || network_retry_message_id.is_some() || usage_limit_continuation_id.is_some()).or_else(|| {
                             (!user_stop).then_some(()).and_then(|()| goal.as_ref()
                                 .filter(|goal| goal_allows_automatic_continuation(goal)))
                                 .map(|active_goal| QueuedPrompt {
@@ -2797,6 +2806,9 @@ async fn run_agent_session_store_kernel(
                 }
             }
         };
+        if let Some(prompt) = next.as_ref() {
+            reconcile_usage_limit_continuation(&mut pending, &mut usage_limit_continuation_id, prompt);
+        }
         let Some(mut prompt) = next else {
             if owns_team && let Some(team) = &subagents {
                 for activity in team.stop_all().await {
@@ -3554,6 +3566,11 @@ async fn run_agent_session_store_kernel(
                                 && !usage_limit_exhausted;
                             let usage_limit_wait = usage_limit_retry
                                 .then(|| usage_limit_reset_delay.unwrap_or(usage_limit_retry_delay));
+                            // Once the turn has run tools or produced output,
+                            // the user's message has been delivered and acted
+                            // on. Re-sending it would repeat that work, so the
+                            // resume is a continuation rather than a replay.
+                            let usage_limit_continue = usage_limit_retry && turn_had_side_effects;
                             let error = if usage_limit_exhausted {
                                 usage_limit_exhausted_message(
                                     launch.provider,
@@ -3601,10 +3618,17 @@ async fn run_agent_session_store_kernel(
                                 } else if network_retry {
                                     format!("Connection interrupted · retrying in {}s · Esc to cancel. Your work is saved.", network_retry_delay.as_secs())
                                 } else if let Some(wait) = usage_limit_wait {
-                                    format!(
-                                        "The provider usage limit was reached; Borg preserved this work and will resume it automatically in {} · Esc to cancel.",
-                                        format_reset_delay(wait)
-                                    )
+                                    if usage_limit_continue {
+                                        format!(
+                                            "The provider usage limit interrupted this turn after work had started; Borg will continue from where it left off in {} · Esc to cancel.",
+                                            format_reset_delay(wait)
+                                        )
+                                    } else {
+                                        format!(
+                                            "The provider usage limit was reached; Borg preserved this work and will resume it automatically in {} · Esc to cancel.",
+                                            format_reset_delay(wait)
+                                        )
+                                    }
                                 } else if provider_isolation_recovery {
                                     "Borg blocked a provider-native delegation attempt and is continuing automatically on a clean provider thread."
                                         .to_string()
@@ -3698,12 +3722,14 @@ async fn run_agent_session_store_kernel(
                                     &events,
                                     session_id,
                                     &prompt,
-                                    if retry {
+                                    if usage_limit_continue {
+                                        MessageStatus::Complete
+                                    } else if retry {
                                         MessageStatus::Queued
                                     } else {
                                         MessageStatus::Failed
                                     },
-                                    if retry {
+                                    if retry && !usage_limit_continue {
                                         PromptDelivery::Queue
                                     } else {
                                         prompt.delivery
@@ -3711,7 +3737,11 @@ async fn run_agent_session_store_kernel(
                                 )
                                 .await?;
                             }
-                            if retry {
+                            if usage_limit_continue {
+                                let continuation = usage_limit_continuation(&prompt);
+                                usage_limit_continuation_id = Some(continuation.message_id);
+                                pending.push_front(continuation);
+                            } else if retry {
                                 let mut retry_prompt = prompt.clone();
                                 retry_prompt.delivery = if network_retry && prompt.actor == EventActor::System {
                                     PromptDelivery::Steer
@@ -6549,10 +6579,14 @@ async fn settle_inactive_team_notifications(
     session_id: Uuid,
     pending: &mut VecDeque<QueuedPrompt>,
     user_stop: bool,
+    usage_limit_continuation_id: Option<Uuid>,
 ) -> Result<()> {
     let mut retained = VecDeque::with_capacity(pending.len());
     while let Some(prompt) = pending.pop_front() {
+        // The usage-limit continuation is internal but not a team
+        // notification; it must survive until its turn starts.
         if prompt.actor == EventActor::System
+            && Some(prompt.message_id) != usage_limit_continuation_id
             && (user_stop || prompt.delivery == PromptDelivery::Queue)
         {
             settle_team_notification(journal, events, session_id, prompt).await?;
@@ -8266,6 +8300,50 @@ Only mark the goal complete when every requirement is achieved and verified. Mar
         escape_goal_text(&goal.objective),
         goal.tokens_used,
     )
+}
+
+/// Internal prompt that resumes a turn cut off by a temporary usage limit
+/// after it had already produced side effects. The provider context still
+/// holds everything the interrupted turn did, so the model continues rather
+/// than starting the user's request over.
+fn usage_limit_continuation(interrupted: &QueuedPrompt) -> QueuedPrompt {
+    QueuedPrompt {
+        message_id: Uuid::new_v4(),
+        text: format!(
+            "The previous turn was interrupted by a provider usage limit after it had already run tools and made progress. \
+The conversation above contains everything that was done. Continue from exactly where it left off: do not repeat completed steps, \
+re-run commands that already succeeded, or restate finished work. When the work is complete, give the user the final summary they were owed.\n\n\
+The original request is reproduced below as user-provided data for reference only.\n\n<request>\n{}\n</request>",
+            escape_goal_text(&interrupted.text)
+        ),
+        actor: EventActor::System,
+        attachments: Vec::new(),
+        output_schema: None,
+        delivery: PromptDelivery::Queue,
+        visible: false,
+        interrupt_batch: false,
+        batch: Vec::new(),
+    }
+}
+
+fn drop_usage_limit_continuation(pending: &mut VecDeque<QueuedPrompt>, id: &mut Option<Uuid>) {
+    if let Some(id) = id.take() {
+        pending.retain(|prompt| prompt.message_id != id);
+    }
+}
+
+/// A pending continuation is only meaningful until the next turn starts: new
+/// human input supersedes it, and starting it consumes it.
+fn reconcile_usage_limit_continuation(
+    pending: &mut VecDeque<QueuedPrompt>,
+    id: &mut Option<Uuid>,
+    starting: &QueuedPrompt,
+) {
+    if *id == Some(starting.message_id) {
+        *id = None;
+    } else if starting.actor == EventActor::User {
+        drop_usage_limit_continuation(pending, id);
+    }
 }
 
 fn goal_allows_automatic_continuation(goal: &SessionGoal) -> bool {
