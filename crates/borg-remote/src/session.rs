@@ -656,10 +656,40 @@ const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_secs(3);
 const PROVIDER_SETUP_LIVENESS_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(test)]
 const PROVIDER_SETUP_LIVENESS_TIMEOUT: Duration = Duration::from_millis(200);
+/// Ceiling for an `Active` turn that is silent because a tool call is running.
+/// Long builds and test suites emit nothing for a long time, so they get a far
+/// larger budget than a silent model, still bounded so a tool that died with
+/// the host terminalizes.
 #[cfg(not(test))]
-const PROVIDER_ACTIVE_LIVENESS_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+const PROVIDER_ACTIVE_TOOL_LIVENESS_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+// Distinct from the stall budget so a test cannot pass by conflating the two.
+#[cfg(test)]
+const PROVIDER_ACTIVE_TOOL_LIVENESS_TIMEOUT: Duration = Duration::from_secs(15);
+/// `Active` budget under test; production reads the provider stall policy.
 #[cfg(test)]
 const PROVIDER_ACTIVE_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(test))]
+const PROVIDER_CANCEL_LIVENESS_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(test)]
+const PROVIDER_CANCEL_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often idleness is re-evaluated. Far shorter than any budget: the
+/// monotonic clock stops while the host sleeps, so a suspended worker is only
+/// noticed by waking soon after the host does and comparing wall-clock time.
+#[cfg(not(test))]
+const TURN_WATCHDOG_POLL_INTERVAL: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const TURN_WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Idle time after which a visible "no output" status is published.
+#[cfg(not(test))]
+const TURN_WATCHDOG_WARNING_AFTER: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const TURN_WATCHDOG_WARNING_AFTER: Duration = Duration::from_millis(50);
+/// A provider that stopped answering can also refuse to die; the terminal
+/// boundary must not wait on it.
+#[cfg(not(test))]
+const TURN_WATCHDOG_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const TURN_WATCHDOG_STOP_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(not(test))]
 const PROVIDER_DRAIN_LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -686,12 +716,236 @@ impl TurnPhase {
             Self::Cancelling => "turn phase: cancelling",
         }
     }
+}
 
-    fn liveness_timeout(self) -> Duration {
-        match self {
-            Self::AwaitingProvider => PROVIDER_SETUP_LIVENESS_TIMEOUT,
-            Self::Active | Self::Cancelling => PROVIDER_ACTIVE_LIVENESS_TIMEOUT,
-            Self::Draining => PROVIDER_DRAIN_LIVENESS_TIMEOUT,
+/// Semantic-progress watchdog for a single turn.
+///
+/// Two clocks: `Instant` is monotonic but stops while the host sleeps, so a
+/// suspended worker looks healthy to it; `SystemTime` survives sleep but can
+/// jump backwards. Idleness is the larger of the two, so neither a suspended
+/// host nor a clock adjustment can hide a stall.
+struct TurnWatchdog {
+    phase: TurnPhase,
+    stall_timeout: Option<Duration>,
+    last_output_mono: tokio::time::Instant,
+    last_output_wall: std::time::SystemTime,
+    active_tools: HashSet<String>,
+    warned: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum WatchdogVerdict {
+    Healthy,
+    /// Worth telling the user about; not yet a failure. Once per stall episode.
+    Stalling(String),
+    /// Budget exhausted; the turn must terminalize.
+    Expired(String),
+}
+
+impl TurnWatchdog {
+    fn new(phase: TurnPhase) -> Self {
+        Self {
+            phase,
+            // Operator knob for "how long may a provider say nothing at all".
+            // `None` means stall failure is disabled.
+            stall_timeout: Self::default_stall_timeout(),
+            last_output_mono: tokio::time::Instant::now(),
+            last_output_wall: std::time::SystemTime::now(),
+            active_tools: HashSet::new(),
+            warned: false,
+        }
+    }
+
+    #[cfg(not(test))]
+    fn default_stall_timeout() -> Option<Duration> {
+        borg_provider::provider::provider_stall_timeout()
+    }
+
+    #[cfg(test)]
+    fn default_stall_timeout() -> Option<Duration> {
+        Some(PROVIDER_ACTIVE_LIVENESS_TIMEOUT)
+    }
+
+    fn phase(&self) -> TurnPhase {
+        self.phase
+    }
+
+    fn set_phase(&mut self, phase: TurnPhase) -> bool {
+        self.phase = phase;
+        self.note_output()
+    }
+
+    /// Record provider liveness. True when this ends a reported stall episode,
+    /// so the caller can publish the recovery.
+    fn note_output(&mut self) -> bool {
+        self.last_output_mono = tokio::time::Instant::now();
+        self.last_output_wall = std::time::SystemTime::now();
+        std::mem::take(&mut self.warned)
+    }
+
+    /// Track in-flight tool calls so a long-running tool is not mistaken for a
+    /// silent model. `progress` is classified from the raw provider event, so
+    /// bookkeeping traffic cannot refresh liveness.
+    fn observe(&mut self, kind: &SessionEventKind, progress: bool) -> bool {
+        match kind {
+            SessionEventKind::ToolStarted { tool_call_id, .. } => {
+                self.active_tools.insert(tool_call_id.clone());
+            }
+            SessionEventKind::ToolCompleted { tool_call_id, .. } => {
+                self.active_tools.remove(tool_call_id);
+            }
+            SessionEventKind::TurnCompleted { .. } => self.active_tools.clear(),
+            _ => {}
+        }
+        progress && self.note_output()
+    }
+
+    fn idle(&self) -> Duration {
+        let monotonic = self.last_output_mono.elapsed();
+        let wall = std::time::SystemTime::now()
+            .duration_since(self.last_output_wall)
+            .unwrap_or_default();
+        monotonic.max(wall)
+    }
+
+    /// `None` disables failure (stall policy set to `0`); idleness is still
+    /// reported.
+    fn budget(&self) -> Option<Duration> {
+        match self.phase {
+            TurnPhase::AwaitingProvider => Some(PROVIDER_SETUP_LIVENESS_TIMEOUT),
+            TurnPhase::Draining => Some(PROVIDER_DRAIN_LIVENESS_TIMEOUT),
+            TurnPhase::Cancelling => Some(PROVIDER_CANCEL_LIVENESS_TIMEOUT),
+            TurnPhase::Active if !self.active_tools.is_empty() => {
+                Some(PROVIDER_ACTIVE_TOOL_LIVENESS_TIMEOUT)
+            }
+            TurnPhase::Active => self.stall_timeout,
+        }
+    }
+
+    fn activity(&self) -> String {
+        match self.phase {
+            TurnPhase::Active if !self.active_tools.is_empty() => {
+                format!("{} tool call(s) still running", self.active_tools.len())
+            }
+            TurnPhase::Active => "the model has not responded".to_string(),
+            TurnPhase::AwaitingProvider => "the provider has not started".to_string(),
+            TurnPhase::Draining => "the provider has not finished draining".to_string(),
+            TurnPhase::Cancelling => "cancellation has not completed".to_string(),
+        }
+    }
+
+    fn verdict(&mut self) -> WatchdogVerdict {
+        let idle = self.idle();
+        let budget = self.budget();
+        if budget.is_some_and(|budget| idle >= budget) {
+            return WatchdogVerdict::Expired(format!(
+                "turn liveness timeout while {}: {}; {}",
+                self.phase.detail().trim_start_matches("turn phase: "),
+                humanize_idle(idle),
+                self.activity(),
+            ));
+        }
+        // Only an active turn is worth narrating; the other phases are short
+        // and already publish a phase status of their own.
+        if self.phase != TurnPhase::Active {
+            return WatchdogVerdict::Healthy;
+        }
+        // Warn early rather than halfway: on a short budget half of it is still
+        // a long silence, and on a long one a minute is enough to be useful.
+        let warn_after = budget
+            .map(|budget| (budget / 2).min(TURN_WATCHDOG_WARNING_AFTER))
+            .unwrap_or(TURN_WATCHDOG_WARNING_AFTER);
+        if idle < warn_after || self.warned {
+            return WatchdogVerdict::Healthy;
+        }
+        self.warned = true;
+        WatchdogVerdict::Stalling(format!(
+            "{}; {}; {}",
+            self.phase.detail(),
+            humanize_idle(idle),
+            self.activity(),
+        ))
+    }
+}
+
+/// Whether a raw provider event is evidence the turn is advancing.
+///
+/// An allowlist on purpose: anything unrecognised is bookkeeping until proven
+/// otherwise, so a new metadata event cannot silently start holding stalled
+/// turns open. Classified before coalescing, so a streaming fragment counts
+/// even though it never becomes a durable event.
+fn provider_event_is_progress(event: &SessionEventKind) -> bool {
+    match event {
+        // Model output.
+        SessionEventKind::Message { .. }
+        | SessionEventKind::ReasoningDelta { .. }
+        | SessionEventKind::ReasoningCompleted
+        // Tool calls.
+        | SessionEventKind::ToolStarted { .. }
+        | SessionEventKind::ToolUpdated { .. }
+        | SessionEventKind::ToolCompleted { .. }
+        // Session-owned processes and workflows.
+        | SessionEventKind::RuntimeProcessStarted { .. }
+        | SessionEventKind::RuntimeProcessOutput { .. }
+        | SessionEventKind::RuntimeProcessCompleted { .. }
+        | SessionEventKind::BluWorkflowStarted { .. }
+        | SessionEventKind::BluWorkflowCallRequested { .. }
+        | SessionEventKind::BluWorkflowCallCompleted { .. }
+        | SessionEventKind::BluWorkflowCompleted { .. }
+        | SessionEventKind::RuntimeWorkflowStarted { .. }
+        | SessionEventKind::RuntimeWorkflowCallRequested { .. }
+        | SessionEventKind::RuntimeWorkflowCallCompleted { .. }
+        | SessionEventKind::RuntimeWorkflowCompleted { .. }
+        // Turns of the conversation that need a human or end the turn.
+        | SessionEventKind::ApprovalRequested { .. }
+        | SessionEventKind::ApprovalResolved { .. }
+        | SessionEventKind::ProviderInteractionRequested { .. }
+        | SessionEventKind::ProviderInteractionResolved { .. }
+        | SessionEventKind::TurnCompleted { .. } => true,
+        // Raw provider traffic is metadata unless it is a streaming fragment
+        // of model output or a real context-compaction boundary. Heartbeats,
+        // retry notices and replay diagnostics deliberately do not count.
+        SessionEventKind::ProviderEvent { kind, .. } => {
+            matches!(kind.as_str(), "action/preparing" | "action/input_delta")
+                || context_compaction_status(event).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn humanize_idle(idle: Duration) -> String {
+    let seconds = idle.as_secs();
+    if seconds >= 120 {
+        format!("no provider output for {}m", seconds / 60)
+    } else {
+        format!("no provider output for {seconds}s")
+    }
+}
+
+/// Stop a session's provider processes without letting an unresponsive provider
+/// hold the turn's terminal boundary hostage. Returns a reportable reason when
+/// cleanup did not finish, so the failure reaches the user instead of a log.
+async fn stop_session_bounded(
+    executor: &Arc<dyn AgentTurnExecutor>,
+    session_id: Uuid,
+) -> Option<String> {
+    match tokio::time::timeout(
+        TURN_WATCHDOG_STOP_TIMEOUT,
+        executor.stop_session(session_id),
+    )
+    .await
+    {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => {
+            tracing::warn!(%session_id, %error, "stopping a stalled provider session failed");
+            Some(format!("provider cleanup failed: {error}"))
+        }
+        Err(_) => {
+            tracing::warn!(%session_id, "stopping a stalled provider session timed out");
+            Some(format!(
+                "provider cleanup did not finish within {}s; its processes may still be running",
+                TURN_WATCHDOG_STOP_TIMEOUT.as_secs_f32()
+            ))
         }
     }
 }
@@ -3030,10 +3284,12 @@ async fn run_agent_session_store_kernel(
         let mut turn_reported_error = false;
         let mut batch_pending_after_interrupt = false;
         let mut interrupt_deadline: Option<Pin<Box<Sleep>>> = None;
-        let mut turn_phase = TurnPhase::AwaitingProvider;
         let mut generation = crate::generation_activity::GenerationActivity::new(launch.provider);
-        let liveness_deadline = tokio::time::sleep(turn_phase.liveness_timeout());
-        tokio::pin!(liveness_deadline);
+        let mut watchdog = TurnWatchdog::new(TurnPhase::AwaitingProvider);
+        let mut watchdog_poll = tokio::time::interval(TURN_WATCHDOG_POLL_INTERVAL);
+        // A sleeping host freezes the monotonic clock, so ticks would otherwise
+        // pile up and fire in a burst on wake. One tick on wake is all we need.
+        watchdog_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = generation.wait(), if !interrupted => {
@@ -3052,15 +3308,14 @@ async fn run_agent_session_store_kernel(
                         approval_id: approval_id.clone(), title: request.title, detail: request.detail, command: None,
                     }).await?;
                     pending_approval = Some(PendingApproval { id: approval_id, response: Some(request.response) });
-                    turn_phase = TurnPhase::Active;
-                    liveness_deadline.as_mut().reset(tokio::time::Instant::now() + turn_phase.liveness_timeout());
+                    watchdog.set_phase(TurnPhase::Active);
                 }
                 _ = tool_approval_caller_closed(&mut pending_approval) => {
                     deny_pending_approval(&mut journal, &events, session_id, &mut pending_approval).await?;
                     record(&mut journal, &events, session_id, SessionEventKind::StatusChanged {
                         status: SessionStatus::Running, detail: None,
                     }).await?;
-                    liveness_deadline.as_mut().reset(tokio::time::Instant::now() + turn_phase.liveness_timeout());
+                    watchdog.note_output();
                 }
                 result = &mut running.0 => {
                     let result = match result {
@@ -3093,15 +3348,15 @@ async fn run_agent_session_store_kernel(
                         }
                         turn_reported_error |= matches!(&kind, SessionEventKind::Error { .. });
                         turn_had_side_effects |= provider_event_has_side_effect(&kind);
-                        if turn_phase == TurnPhase::AwaitingProvider {
-                            turn_phase = TurnPhase::Active;
+                        if watchdog.phase() == TurnPhase::AwaitingProvider {
+                            watchdog.set_phase(TurnPhase::Active);
                             record(
                                 &mut journal,
                                 &events,
                                 session_id,
                                 SessionEventKind::StatusChanged {
                                     status: SessionStatus::Running,
-                                    detail: Some(turn_phase.detail().to_string()),
+                                    detail: Some(TurnPhase::Active.detail().to_string()),
                                 },
                             )
                             .await?;
@@ -3401,16 +3656,28 @@ async fn run_agent_session_store_kernel(
                         push_coalesced_provider_event(&mut provider_batch, kind);
                     }
                     for kind in provider_batch {
+                    // Classify liveness on the raw event: coalescing drops
+                    // streaming fragments, which are still real progress.
+                    let progress = provider_event_is_progress(&kind);
                     let Some(kind) = generation.observe(kind, tokio::time::Instant::now()) else {
-                        liveness_deadline.as_mut().reset(tokio::time::Instant::now() + turn_phase.liveness_timeout());
+                        // Fragments end a stall episode like any other output,
+                        // so the reported stall has to be withdrawn here too.
+                        if progress && watchdog.note_output() {
+                            record(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                SessionEventKind::StatusChanged {
+                                    status: SessionStatus::Running,
+                                    detail: Some(watchdog.phase().detail().to_string()),
+                                },
+                            ).await?;
+                        }
                         continue;
                     };
                     if is_executor_lifecycle_status(&kind) {
                         if executor_reports_provider_drained(&kind) {
-                            turn_phase = TurnPhase::Draining;
-                            liveness_deadline.as_mut().reset(
-                                tokio::time::Instant::now() + turn_phase.liveness_timeout()
-                            );
+                            watchdog.set_phase(TurnPhase::Draining);
                         }
                         continue;
                     }
@@ -3424,21 +3691,29 @@ async fn run_agent_session_store_kernel(
                     }
                     turn_reported_error |= matches!(&kind, SessionEventKind::Error { .. });
                     turn_had_side_effects |= provider_event_has_side_effect(&kind);
-                    if turn_phase == TurnPhase::AwaitingProvider {
-                        turn_phase = TurnPhase::Active;
+                    if watchdog.phase() == TurnPhase::AwaitingProvider {
+                        watchdog.set_phase(TurnPhase::Active);
                         record(
                             &mut journal,
                             &events,
                             session_id,
                             SessionEventKind::StatusChanged {
                                 status: SessionStatus::Running,
-                                detail: Some(turn_phase.detail().to_string()),
+                                detail: Some(TurnPhase::Active.detail().to_string()),
                             },
                         ).await?;
                     }
-                    liveness_deadline.as_mut().reset(
-                        tokio::time::Instant::now() + turn_phase.liveness_timeout()
-                    );
+                    if watchdog.observe(&kind, progress) {
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::StatusChanged {
+                                status: SessionStatus::Running,
+                                detail: Some(watchdog.phase().detail().to_string()),
+                            },
+                        ).await?;
+                    }
                     let compaction_status = context_compaction_status(&kind);
                     if compaction_status == Some("started") {
                         context_compaction_in_progress = true;
@@ -3578,12 +3853,38 @@ async fn run_agent_session_store_kernel(
                     next_ready_detail = Some("Interrupted".to_string());
                     break;
                 }
-                _ = &mut liveness_deadline, if pending_approval.is_none() => {
-                    let timed_out_phase = turn_phase;
+                // Suspended while a human owns the turn: an operator may sit on
+                // an approval or a provider question indefinitely without the
+                // worker being stalled.
+                _ = watchdog_poll.tick(), if pending_approval.is_none()
+                    && pending_provider_interaction.is_none() => {
+                    let error = match watchdog.verdict() {
+                        WatchdogVerdict::Healthy => continue,
+                        WatchdogVerdict::Stalling(detail) => {
+                            // Visible, non-terminal: the user learns the worker
+                            // went quiet long before we give up on it.
+                            record(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                SessionEventKind::StatusChanged {
+                                    status: SessionStatus::Running,
+                                    detail: Some(detail),
+                                },
+                            ).await?;
+                            continue;
+                        }
+                        WatchdogVerdict::Expired(error) => error,
+                    };
                     subscription_context_reusable = false;
                     running.0.abort();
                     let _ = (&mut running.0).await;
-                    executor.stop_session(session_id).await?;
+                    // Cleanup failure is part of the user-visible story: it is
+                    // why processes may still be alive after the turn ends.
+                    let error = match stop_session_bounded(&executor, session_id).await {
+                        Some(cleanup) => format!("{error}; {cleanup}"),
+                        None => error,
+                    };
                     deny_pending_approval(
                         &mut journal,
                         &events,
@@ -3609,10 +3910,6 @@ async fn run_agent_session_store_kernel(
                         &mut pending_steers,
                     )
                     .await?;
-                    let error = format!(
-                        "turn liveness timeout while {}",
-                        timed_out_phase.detail().trim_start_matches("turn phase: ")
-                    );
                     record(
                         &mut journal,
                         &events,
@@ -4074,7 +4371,7 @@ async fn run_agent_session_store_kernel(
                                     .await
                                     .ok();
                             }
-                            liveness_deadline.as_mut().reset(tokio::time::Instant::now() + turn_phase.liveness_timeout());
+                            watchdog.note_output();
                         }
                         HostCommand::RespondToProviderInteraction {
                             interaction_id,
@@ -4084,6 +4381,7 @@ async fn run_agent_session_store_kernel(
                             == Some(interaction_id.as_str()) =>
                         {
                             pending_provider_interaction = None;
+                            watchdog.note_output();
                             record(
                                 &mut journal,
                                 &events,
@@ -4182,7 +4480,7 @@ async fn run_agent_session_store_kernel(
                             if pending_approval.as_ref().is_some_and(|pending| pending.response.is_some()) {
                                 deny_pending_approval(&mut journal, &events, session_id, &mut pending_approval).await?;
                             }
-                            turn_phase = TurnPhase::Cancelling;
+                            watchdog.set_phase(TurnPhase::Cancelling);
                             interrupt_deadline =
                                 Some(Box::pin(tokio::time::sleep(INTERRUPT_GRACE_PERIOD)));
                             record(
@@ -4191,7 +4489,7 @@ async fn run_agent_session_store_kernel(
                                 session_id,
                                 SessionEventKind::StatusChanged {
                                     status: SessionStatus::Running,
-                                    detail: Some(turn_phase.detail().to_string()),
+                                    detail: Some(TurnPhase::Cancelling.detail().to_string()),
                                 },
                             ).await?;
                             interrupted = true;

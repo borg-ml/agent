@@ -37,12 +37,11 @@ use tokio::sync::{Mutex, mpsc::UnboundedSender};
 pub(crate) use crate::env::nonempty_var as nonempty_env;
 use crate::runtime::{CostBasis, ProviderCallUsage};
 
-/// If a provider process emits no stdout/stderr for this long, we treat it as
-/// stalled and kill it. Override with `BORG_PROVIDER_STALL_TIMEOUT_SECS` (set
-/// to `0` to disable). 20 min default: covers legitimately long model thinking
-/// and first-byte queueing under parallel load without keeping a truly dead
-/// process locked up overnight.
-const PROVIDER_STALL_TIMEOUT_DEFAULT_SECS: u64 = 1200;
+/// Maximum silence while the session is waiting for model output, excluding
+/// in-flight tools and human approval/interaction waits. The session watchdog
+/// reports quiet providers before this deadline and accounts for host sleep.
+/// Override with `BORG_PROVIDER_STALL_TIMEOUT_SECS`; `0` disables stall failure.
+const PROVIDER_STALL_TIMEOUT_DEFAULT_SECS: u64 = 300;
 
 /// Absolute wall-clock ceiling for a single provider call. This is deliberately
 /// separate from the stall timeout: app-server streams can emit internal

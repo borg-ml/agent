@@ -11896,3 +11896,471 @@ third"
     assert!(admission.accept());
     assert!(recall_withdrawable_steers(&mut pending, None).is_empty());
 }
+
+// Turn watchdog regressions.
+//
+// The clock and budget semantics below are covered as unit tests on
+// `TurnWatchdog` on purpose: a suspended host, a backwards wall clock, and a
+// two-hour tool budget cannot be produced deterministically (or quickly)
+// through the session actor, and driving them through a fake provider would
+// only re-test the loop wiring that the two integration tests below already
+// cover. The integration tests are reserved for behaviour that lives in the
+// loop itself: publishing a visible stall status, and suspending the watchdog
+// while a human owns the turn.
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_suspended_host_expires_the_watchdog_on_wall_clock_time() {
+    let mut watchdog = TurnWatchdog::new(TurnPhase::Active);
+    // A sleeping host freezes the monotonic clock, so the worker still looks
+    // busy to it long after the provider stopped existing.
+    watchdog.last_output_wall = std::time::SystemTime::now() - Duration::from_secs(6 * 60 * 60);
+    assert!(
+        watchdog.last_output_mono.elapsed() < Duration::from_secs(1),
+        "the monotonic clock must still look fresh for this to be a regression"
+    );
+    assert!(matches!(
+        watchdog.verdict(),
+        WatchdogVerdict::Expired(error)
+            if error.contains("no provider output for 360m")
+                && error.contains("the model has not responded")
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_backwards_wall_clock_cannot_hide_a_stall() {
+    let mut watchdog = TurnWatchdog::new(TurnPhase::Active);
+    watchdog.last_output_wall = std::time::SystemTime::now() + Duration::from_secs(60 * 60);
+    watchdog.last_output_mono =
+        tokio::time::Instant::now() - PROVIDER_ACTIVE_LIVENESS_TIMEOUT - Duration::from_secs(1);
+    assert!(matches!(watchdog.verdict(), WatchdogVerdict::Expired(_)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_in_flight_tool_call_extends_the_active_budget_without_removing_it() {
+    let mut watchdog = TurnWatchdog::new(TurnPhase::Active);
+    assert_eq!(watchdog.budget(), Some(PROVIDER_ACTIVE_LIVENESS_TIMEOUT));
+
+    watchdog.observe(
+        &SessionEventKind::ToolStarted {
+            tool_call_id: "tool-1".to_string(),
+            name: "bash".to_string(),
+            input: json!({ "command": "cargo test" }),
+            input_ref: None,
+        },
+        true,
+    );
+    assert_eq!(
+        watchdog.budget(),
+        Some(PROVIDER_ACTIVE_TOOL_LIVENESS_TIMEOUT),
+        "a legitimately long tool call must not be killed at the stall budget"
+    );
+
+    // The larger budget is still a budget: a tool that died with the host
+    // terminalizes rather than pinning the turn forever.
+    watchdog.last_output_wall =
+        std::time::SystemTime::now() - PROVIDER_ACTIVE_TOOL_LIVENESS_TIMEOUT;
+    assert!(matches!(
+        watchdog.verdict(),
+        WatchdogVerdict::Expired(error) if error.contains("1 tool call(s) still running")
+    ));
+
+    watchdog.observe(
+        &SessionEventKind::ToolCompleted {
+            tool_call_id: "tool-1".to_string(),
+            output: "done".to_string(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+        },
+        true,
+    );
+    assert_eq!(watchdog.budget(), Some(PROVIDER_ACTIVE_LIVENESS_TIMEOUT));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn bookkeeping_traffic_cannot_keep_a_zombie_turn_alive() {
+    let usage = SessionEventKind::UsageUpdated {
+        provider_duration_ms: 1,
+        turn_id: None,
+        provider_context_reused: None,
+        input_tokens: 10,
+        output_tokens: 0,
+        cached_input_tokens: 0,
+        cache_creation_input_tokens: 0,
+        total_tokens: 10,
+        cost_microusd: None,
+        cost_basis: String::new(),
+        cost_usd: None,
+        context_tokens: Some(10),
+        context_window_tokens: Some(100),
+    };
+    assert!(!provider_event_is_progress(&usage));
+    assert!(!provider_event_is_progress(
+        &SessionEventKind::ContextWindowUpdated {
+            context_tokens: 10,
+            context_window_tokens: 100,
+        }
+    ));
+    assert!(provider_event_is_progress(
+        &SessionEventKind::ReasoningDelta {
+            text: "thinking".to_string(),
+        }
+    ));
+
+    let mut watchdog = TurnWatchdog::new(TurnPhase::Active);
+    watchdog.last_output_wall = std::time::SystemTime::now() - PROVIDER_ACTIVE_LIVENESS_TIMEOUT;
+    assert!(
+        !watchdog.observe(&usage, provider_event_is_progress(&usage)),
+        "usage telemetry is not progress"
+    );
+    assert!(
+        matches!(watchdog.verdict(), WatchdogVerdict::Expired(_)),
+        "a provider that only reports token counts is still stalled"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_metadata_events_cannot_extend_the_liveness_timer() {
+    let metadata = |kind: &str| SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Codex,
+        kind: kind.to_string(),
+        payload: json!({}),
+    };
+    for kind in [
+        "network_retry",
+        "network_recovered",
+        "provider_retry",
+        "background_task_live",
+        "context_replay_projected",
+        "action/generation_status",
+    ] {
+        assert!(
+            !provider_event_is_progress(&metadata(kind)),
+            "{kind} is provider metadata, not progress"
+        );
+    }
+    // Streaming fragments and a real compaction boundary still count.
+    assert!(provider_event_is_progress(&metadata("action/input_delta")));
+    assert!(provider_event_is_progress(&metadata("action/preparing")));
+    assert!(provider_event_is_progress(
+        &SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: json!({ "status": "started" }),
+        }
+    ));
+
+    let mut watchdog = TurnWatchdog::new(TurnPhase::Active);
+    watchdog.last_output_wall = std::time::SystemTime::now() - PROVIDER_ACTIVE_LIVENESS_TIMEOUT;
+    let heartbeat = metadata("background_task_live");
+    assert!(!watchdog.observe(&heartbeat, provider_event_is_progress(&heartbeat)));
+    assert!(
+        matches!(watchdog.verdict(), WatchdogVerdict::Expired(_)),
+        "a heartbeat cannot hold a stalled turn open"
+    );
+}
+
+struct NeverStoppingExecutor;
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for NeverStoppingExecutor {
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        std::future::pending().await
+    }
+
+    async fn stop_session(&self, _session_id: Uuid) -> Result<()> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unstoppable_provider_cleanup_is_bounded_and_reported() {
+    let executor: Arc<dyn AgentTurnExecutor> = Arc::new(NeverStoppingExecutor);
+    let reason = tokio::time::timeout(
+        TURN_WATCHDOG_STOP_TIMEOUT * 4,
+        stop_session_bounded(&executor, Uuid::new_v4()),
+    )
+    .await
+    .expect("cleanup cannot outlive its bound");
+    let reason = reason.expect("a cleanup that never finishes is reportable");
+    assert!(
+        reason.contains("may still be running"),
+        "the user learns processes may have survived: {reason}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_disabled_stall_policy_reports_idleness_without_failing_the_turn() {
+    let mut watchdog = TurnWatchdog::new(TurnPhase::Active);
+    watchdog.stall_timeout = None;
+    watchdog.last_output_wall = std::time::SystemTime::now() - Duration::from_secs(24 * 60 * 60);
+    assert!(matches!(watchdog.verdict(), WatchdogVerdict::Stalling(_)));
+    assert!(
+        matches!(watchdog.verdict(), WatchdogVerdict::Healthy),
+        "a stall is reported once per episode, not once per tick"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn provider_output_closes_a_reported_stall_episode_once() {
+    let mut watchdog = TurnWatchdog::new(TurnPhase::Active);
+    watchdog.last_output_wall = std::time::SystemTime::now() - PROVIDER_ACTIVE_LIVENESS_TIMEOUT / 2;
+    assert!(matches!(watchdog.verdict(), WatchdogVerdict::Stalling(_)));
+    assert!(
+        watchdog.note_output(),
+        "recovering from a reported stall must be publishable"
+    );
+    assert!(
+        !watchdog.note_output(),
+        "an unreported stall must not publish a recovery"
+    );
+}
+
+/// A provider that starts normally and then goes silent: the shape of a worker
+/// whose host went to sleep mid-turn.
+struct ActiveThenSilentExecutor;
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for ActiveThenSilentExecutor {
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        events
+            .send(SessionEventKind::ReasoningDelta {
+                text: "thinking".to_string(),
+            })
+            .await
+            .unwrap();
+        std::future::pending().await
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_provider_stall_is_visible_before_the_turn_fails() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let actor = tokio::spawn({
+        let journal_path = journal_path.clone();
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: Some("hang".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                Arc::new(ActiveThenSilentExecutor),
+            )
+            .await
+        }
+    });
+
+    let mut observed = Vec::new();
+    loop {
+        let event = tokio::time::timeout(PROVIDER_ACTIVE_LIVENESS_TIMEOUT * 3, event_rx.recv())
+            .await
+            .expect("the watchdog terminalizes a stalled turn")
+            .expect("actor remains attached");
+        let ready = matches!(
+            event.kind,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                ..
+            }
+        );
+        observed.push(event.kind);
+        if ready {
+            break;
+        }
+    }
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    let stalled = observed
+        .iter()
+        .position(|kind| {
+            matches!(
+                kind,
+                SessionEventKind::StatusChanged {
+                    status: SessionStatus::Running,
+                    detail: Some(detail),
+                } if detail.contains("no provider output")
+                    && detail.contains("the model has not responded")
+            )
+        })
+        .expect("a silent worker is reported before it is failed");
+    let failed = observed
+        .iter()
+        .position(|kind| {
+            matches!(
+                kind,
+                SessionEventKind::TurnCompleted {
+                    error: Some(error),
+                    ..
+                } if error.contains("liveness timeout")
+            )
+        })
+        .expect("the stalled turn reaches a terminal boundary");
+    assert!(
+        stalled < failed,
+        "the stall status must precede the terminal failure"
+    );
+}
+
+struct InteractionThenHungExecutor;
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for InteractionThenHungExecutor {
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        events
+            .send(SessionEventKind::ProviderInteractionRequested {
+                interaction_id: "interaction-1".to_string(),
+                kind: "question".to_string(),
+                title: "Which branch?".to_string(),
+                detail: "The provider needs a human answer".to_string(),
+                payload: json!({}),
+            })
+            .await
+            .unwrap();
+        std::future::pending().await
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_pending_provider_interaction_suspends_the_watchdog() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let actor = tokio::spawn({
+        let journal_path = journal_path.clone();
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: Some("ask me".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                Arc::new(InteractionThenHungExecutor),
+            )
+            .await
+        }
+    });
+
+    let mut observed = Vec::new();
+    let deadline =
+        tokio::time::Instant::now() + PROVIDER_ACTIVE_LIVENESS_TIMEOUT + Duration::from_secs(1);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, event_rx.recv()).await {
+            Ok(Some(event)) => observed.push(event.kind),
+            Ok(None) => panic!("actor detached while a human owned the turn"),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        observed
+            .iter()
+            .any(|kind| matches!(kind, SessionEventKind::ProviderInteractionRequested { .. })),
+        "the provider asked the human a question"
+    );
+    assert!(
+        !observed
+            .iter()
+            .any(|kind| matches!(kind, SessionEventKind::TurnCompleted { error: Some(_), .. })),
+        "a human sitting on a provider question is not a stalled worker"
+    );
+
+    // Answering hands the turn back to the provider, which re-arms the
+    // watchdog so a worker that stays silent still terminalizes.
+    command_tx
+        .send(HostCommand::RespondToProviderInteraction {
+            session_id,
+            interaction_id: "interaction-1".to_string(),
+            response: json!("main"),
+        })
+        .await
+        .unwrap();
+    let failed = tokio::time::timeout(PROVIDER_ACTIVE_LIVENESS_TIMEOUT * 3, async {
+        loop {
+            let Some(event) = event_rx.recv().await else {
+                panic!("actor detached before terminalizing the stalled turn");
+            };
+            if matches!(
+                &event.kind,
+                SessionEventKind::TurnCompleted { error: Some(error), .. }
+                    if error.contains("liveness timeout")
+            ) {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        failed.is_ok(),
+        "the watchdog resumes once the human answers"
+    );
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+}
