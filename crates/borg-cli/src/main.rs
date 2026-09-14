@@ -53,6 +53,10 @@ async fn main() -> Result<()> {
         Command::Import(args) => importer::run(args).await,
         Command::Agent(args) => run_local_agent(args).await,
         Command::Resume { session } => run_local_agent(LocalAgentCliArgs::resume(session)).await,
+        Command::Login { provider, api_key } => {
+            remote_commands::login_command(provider, api_key).await
+        }
+        Command::Config { command } => agent_config::run_config(command),
         Command::Gui { session } => run_gui(session).await,
         Command::Remote { command } => run_remote_command(command).await,
         Command::Update(args) => updater::run(args).await,

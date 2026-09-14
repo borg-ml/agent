@@ -903,6 +903,66 @@ impl AgentConfig {
     }
 }
 
+/// `borg config {path|init|edit|validate}`.
+pub(crate) fn run_config(command: crate::cli::ConfigCommand) -> Result<()> {
+    use crate::cli::ConfigCommand;
+    let path = default_path().context("cannot locate a configuration directory for this user")?;
+    match command {
+        ConfigCommand::Path => println!("{}", path.display()),
+        ConfigCommand::Init { force } => {
+            if path.exists() && !force {
+                anyhow::bail!(
+                    "{} already exists; pass --force to replace it",
+                    path.display()
+                );
+            }
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+            fs::write(&path, include_str!("../../../configs/agent.example.toml"))
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            println!("Wrote {}", path.display());
+        }
+        ConfigCommand::Edit => {
+            let editor = std::env::var_os("VISUAL")
+                .or_else(|| std::env::var_os("EDITOR"))
+                .filter(|value| !value.is_empty());
+            let Some(editor) = editor else {
+                anyhow::bail!(
+                    "set $VISUAL or $EDITOR to open the configuration, or edit {} directly",
+                    path.display()
+                );
+            };
+            if !path.exists() {
+                anyhow::bail!(
+                    "{} does not exist yet; run `borg config init` first",
+                    path.display()
+                );
+            }
+            let status = std::process::Command::new(&editor)
+                .arg(&path)
+                .status()
+                .with_context(|| format!("failed to start {}", editor.to_string_lossy()))?;
+            anyhow::ensure!(status.success(), "editor exited with {status}");
+            AgentConfig::load(Some(&path))?;
+            println!("{} is valid", path.display());
+        }
+        ConfigCommand::Validate => {
+            if !path.exists() {
+                println!(
+                    "{} does not exist; Borg is running with defaults (`borg config init` writes a starter)",
+                    path.display()
+                );
+                return Ok(());
+            }
+            AgentConfig::load(Some(&path))?;
+            println!("{} is valid", path.display());
+        }
+    }
+    Ok(())
+}
+
 fn default_path() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)

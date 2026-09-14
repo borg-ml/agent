@@ -4,10 +4,23 @@ use std::{env, ffi::OsString};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
+const QUICKSTART: &str = "\
+Quickstart:
+  borg                       start a session in the current directory
+  borg login codex           connect a ChatGPT/Codex subscription (or: claude, opencode)
+  borg login claude --api-key   store an Anthropic API key instead of a subscription
+  borg --provider claude     start with a specific provider (codex, claude, opencode, kimi, glm, openrouter)
+  borg resume                pick up the latest session; `borg resume <id>` for a specific one
+  borg config init           write a commented agent.toml; `borg config path` shows where
+  borg doctor                check durable storage and provider readiness
+
+Inside a session: type a request, `/help` lists controls, Ctrl-C twice exits (the session stays resumable).";
+
 #[derive(Debug, Parser)]
 #[command(name = "borg")]
 #[command(about = "A high-performance, open-source agent harness and orchestrator")]
 #[command(version)]
+#[command(after_help = QUICKSTART)]
 pub(crate) struct Cli {
     /// Start this invocation without configured local resource limits.
     #[arg(long, global = true)]
@@ -34,6 +47,8 @@ impl Cli {
             command,
             "__agent"
                 | "resume"
+                | "login"
+                | "config"
                 | "gui"
                 | "remote"
                 | "update"
@@ -79,6 +94,20 @@ pub(crate) enum Command {
     Agent(LocalAgentCliArgs),
     /// Resume the latest local session, or a specific session by id.
     Resume { session: Option<Uuid> },
+    /// Connect a provider: a subscription sign-in, or an API key with --api-key.
+    Login {
+        /// Provider to connect. Omit to list providers and their status.
+        #[arg(value_enum)]
+        provider: Option<RemoteProviderArg>,
+        /// Store an API key instead of signing in to a subscription.
+        #[arg(long)]
+        api_key: bool,
+    },
+    /// Locate, create, open, or validate the agent configuration file.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Open the native GPUI frontend.
     Gui {
         /// Open a specific durable session by id.
@@ -1047,6 +1076,22 @@ pub(crate) enum RemoteCommand {
         #[arg(long = "root")]
         roots: Vec<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ConfigCommand {
+    /// Print the agent configuration path.
+    Path,
+    /// Write a commented starter agent.toml at the configuration path.
+    Init {
+        /// Replace an existing file.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Open the agent configuration in $VISUAL or $EDITOR.
+    Edit,
+    /// Parse and validate the agent configuration.
+    Validate,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

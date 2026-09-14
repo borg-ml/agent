@@ -565,7 +565,7 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
             );
         }
         RemoteCommand::Login { provider } => {
-            login_provider(provider.into()).await?;
+            login_command(Some(provider), false).await?;
         }
         RemoteCommand::Status { roots } => {
             let roots = roots
@@ -2413,6 +2413,13 @@ async fn run_local_agent_session(
             );
         } else if interactive && !has_initial_prompt {
             println!("  Type a request. /help shows controls.\n");
+            if !provider_credentials_present(provider) {
+                println!(
+                    "  {} is not connected yet: {}\n",
+                    provider.label(),
+                    credential_guidance(provider)
+                );
+            }
         } else if interactive {
             println!("  Running the initial turn. Type to steer or queue.\n");
         } else {
@@ -2588,6 +2595,39 @@ async fn run_local_agent_session(
         if let Some((text, attachments)) = restored_prompt {
             terminal.restore_composer(text, attachments);
         }
+        // Credential pre-flight: a fresh session on a provider with no usable
+        // credential must offer the sign-in flow now, not fail the first turn
+        // with a raw provider error.
+        let configured_route = model
+            .as_deref()
+            .is_some_and(|model| agent_config.has_configured_model(model));
+        let credential_preflight_shown = !resuming
+            && !has_initial_prompt
+            && !configured_route
+            && !provider_credentials_present(provider);
+        if credential_preflight_shown {
+            if provider.uses_native_harness() {
+                terminal.set_notice(format!(
+                    "{} is not connected yet · {}",
+                    provider.label(),
+                    credential_guidance(provider)
+                ));
+            } else {
+                let model = model.clone().or_else(|| {
+                    provider
+                        .model_catalog()
+                        .map(|catalog| catalog.default_model.to_string())
+                });
+                if let Some(model) = model {
+                    terminal.open_provider_auth_picker(provider, model);
+                }
+                terminal.set_notice(format!(
+                    "{} is not connected yet · choose how to sign in, or run `borg login {}`",
+                    provider.label(),
+                    provider_name(provider)
+                ));
+            }
+        }
         // First boot: emit one notification so the host terminal asks the OS
         // for notification permission (the popup a bare CLI cannot raise
         // itself). Do it once, only when notifications are not turned off, and
@@ -2602,7 +2642,8 @@ async fn run_local_agent_session(
                 let startup_notice_shown = startup_update_notice.is_some()
                     || retry_notice.is_some()
                     || stale_local_owner
-                    || extension_catalog.has_errors();
+                    || extension_catalog.has_errors()
+                    || credential_preflight_shown;
                 if !startup_notice_shown {
                     terminal.set_notice(
                         "If your OS asks, allow notifications for this terminal so Borg can alert you when a turn finishes.".to_string(),
@@ -7185,6 +7226,84 @@ fn model_selection_command(
 
 /// Reads an API key from the terminal without echoing it and stores it in the
 /// borg credential store. Must run with the TUI torn down.
+/// `borg login [PROVIDER] [--api-key]`: connect a provider the way it actually
+/// authenticates, and never dead-end on a provider that has no sign-in flow.
+pub(crate) async fn login_command(
+    provider: Option<crate::cli::RemoteProviderArg>,
+    api_key: bool,
+) -> Result<()> {
+    let Some(provider) = provider else {
+        println!("Providers on this machine:\n");
+        for provider in [
+            CodingProvider::Codex,
+            CodingProvider::Claude,
+            CodingProvider::OpenCode,
+            CodingProvider::OpenRouter,
+            CodingProvider::Kimi,
+            CodingProvider::Glm,
+            CodingProvider::OpenAiCompatible,
+        ] {
+            let state = if provider_credentials_present(provider) {
+                "connected"
+            } else {
+                "not connected"
+            };
+            println!(
+                "  {:<18} {state:<14} {}",
+                provider_name(provider),
+                credential_guidance(provider)
+            );
+        }
+        println!("\nRun `borg login <provider>` to connect one.");
+        return Ok(());
+    };
+    let provider: CodingProvider = provider.into();
+    match provider {
+        CodingProvider::Codex | CodingProvider::OpenCode if api_key => anyhow::bail!(
+            "{} authenticates with a subscription sign-in; {}",
+            provider.label(),
+            credential_guidance(provider)
+        ),
+        CodingProvider::OpenRouter => {
+            let path = prompt_and_store_api_key(provider)?;
+            println!("{} API key saved to {}.", provider.label(), path.display());
+        }
+        CodingProvider::Claude if api_key => {
+            let path = prompt_and_store_api_key(provider)?;
+            println!("{} API key saved to {}.", provider.label(), path.display());
+        }
+        CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
+            login_provider(provider).await?;
+            println!("Connected {}.", provider.label());
+        }
+        CodingProvider::Kimi | CodingProvider::Glm | CodingProvider::OpenAiCompatible => {
+            anyhow::bail!(
+                "{} has no sign-in flow; {}",
+                provider.label(),
+                credential_guidance(provider)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// One line telling a user how a provider gets its credentials.
+fn credential_guidance(provider: CodingProvider) -> &'static str {
+    match provider {
+        CodingProvider::Codex => "`borg login codex` (ChatGPT subscription) or set OPENAI_API_KEY",
+        CodingProvider::Claude => {
+            "`borg login claude` (Claude subscription) or `borg login claude --api-key`"
+        }
+        CodingProvider::OpenCode => "`borg login opencode` (runs `opencode providers login`)",
+        CodingProvider::OpenRouter => "`borg login openrouter` stores an OpenRouter API key",
+        CodingProvider::Kimi => "set BORG_KIMI_API_KEY (or MOONSHOT_API_KEY)",
+        CodingProvider::Glm => "set BORG_GLM_API_KEY, or select the GLM Coding Plan",
+        CodingProvider::OpenAiCompatible => {
+            "set BORG_OPENAI_COMPATIBLE_BASE_URL (and BORG_OPENAI_COMPATIBLE_API_KEY if required)"
+        }
+    }
+}
+
 fn prompt_and_store_api_key(provider: CodingProvider) -> Result<PathBuf> {
     let credential = match provider {
         CodingProvider::Claude => borg_provider::credentials::ApiKeyCredential::Anthropic,
