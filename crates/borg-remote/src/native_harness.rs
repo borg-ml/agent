@@ -1197,6 +1197,11 @@ async fn call_model_streaming(
     // foreground result become a Ready status until that event stream closes.
     let mut completed = None;
     loop {
+        // Live assistant text is rate limited, so the tail of a burst is often
+        // still unpublished when the model moves on. Give that tail its own
+        // deadline instead of letting it wait for an unrelated boundary event.
+        let pending_text_flush = (text.len() != emitted_text_len)
+            .then(|| crate::agent::live_output_interval().saturating_sub(last_text_emit.elapsed()));
         tokio::select! {
             result = &mut call, if completed.is_none() => {
                 completed = Some(result
@@ -1204,21 +1209,22 @@ async fn call_model_streaming(
                     .map(NativeModelOutcome::Completed)
                     .map_err(|error| anyhow::anyhow!(error.message)));
             }
+            () = tokio::time::sleep(pending_text_flush.unwrap_or_default()),
+                if pending_text_flush.is_some() =>
+            {
+                send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
+                emitted_text_len = text.len();
+                last_text_emit = Instant::now();
+            }
             progress = progress_rx.recv(), if progress_open => {
+                // The model wrote this text before whatever comes next, so it
+                // has to reach the screen first. Publishing the other event
+                // while a tail is withheld strands a truncated message until
+                // some later boundary happens to flush it.
                 if text.len() != emitted_text_len
-                    && matches!(&progress,
-                        Some(ProviderProgress::ToolCallGenerating { .. }
-                            | ProviderProgress::ToolCallStarted { .. }
-                            | ProviderProgress::ToolCallAction { .. }))
+                    && progress.as_ref().is_some_and(progress_follows_live_text)
                 {
-                    send(context.events, SessionEventKind::Message {
-                        message_id: context.assistant_message_id,
-                        actor: EventActor::Assistant,
-                        text: text.clone(),
-                        attachments: Vec::new(),
-                        status: MessageStatus::InProgress,
-                        delivery: None,
-                    }).await;
+                    send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
                     emitted_text_len = text.len();
                     last_text_emit = Instant::now();
                 }
@@ -1231,14 +1237,7 @@ async fn call_model_streaming(
                     if last_text_emit.elapsed() >= crate::agent::live_output_interval()
                         || chunk.ends_with(b"\n")
                     {
-                        send(context.events, SessionEventKind::Message {
-                            message_id: context.assistant_message_id,
-                            actor: EventActor::Assistant,
-                            text: text.clone(),
-                            attachments: Vec::new(),
-                            status: MessageStatus::InProgress,
-                            delivery: None,
-                        }).await;
+                        send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
                         emitted_text_len = text.len();
                         last_text_emit = Instant::now();
                     }
@@ -1349,6 +1348,11 @@ async fn call_model_streaming(
         }
 
         if completed.is_some() && !progress_open {
+            // Nothing will arrive to force the throttled tail out now, and the
+            // durable message can trail the stream close by a tool round.
+            if text.len() != emitted_text_len {
+                send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
+            }
             if !pending_reasoning.is_empty() {
                 send(
                     context.events,
@@ -1363,6 +1367,39 @@ async fn call_model_streaming(
                 .expect("completed native model result is present");
         }
     }
+}
+
+async fn send_live_assistant_text(
+    events: &mpsc::Sender<SessionEventKind>,
+    assistant_message_id: Uuid,
+    text: &str,
+) {
+    send(
+        events,
+        SessionEventKind::Message {
+            message_id: assistant_message_id,
+            actor: EventActor::Assistant,
+            text: text.to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    )
+    .await;
+}
+
+/// Progress that becomes its own visible live event, so any assistant text the
+/// model already wrote has to be published ahead of it. Stdout bytes are
+/// excluded because they extend that same text rather than following it.
+fn progress_follows_live_text(progress: &ProviderProgress) -> bool {
+    matches!(
+        progress,
+        ProviderProgress::ProviderEvent { .. }
+            | ProviderProgress::ToolCallGenerating { .. }
+            | ProviderProgress::ToolCallInputDelta { .. }
+            | ProviderProgress::ToolCallStarted { .. }
+            | ProviderProgress::ToolCallAction { .. }
+    )
 }
 
 fn normalize_reasoning_delta(accumulated: &mut String, incoming: &str) -> Option<String> {
@@ -2993,6 +3030,142 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Streams a throttled commentary tail and then whatever the model turned
+    /// to next, which is how a real turn strands the tail: the rate limiter
+    /// holds it and only a tool boundary used to force it out.
+    struct CommentaryTailClient {
+        follow_up: Option<ProviderProgress>,
+    }
+
+    #[async_trait]
+    impl NativeModelClient for CommentaryTailClient {
+        async fn model_turn(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+            _request: ModelTurnRequest,
+            progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+        ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+            let progress = progress.unwrap();
+            for text in ["The", " lifecycle regression passed."] {
+                progress
+                    .send(ProviderProgress::Bytes {
+                        stream: ProviderProgressStream::Stdout,
+                        chunk: text.as_bytes().to_vec(),
+                    })
+                    .unwrap();
+            }
+            if let Some(follow_up) = self.follow_up.clone() {
+                progress.send(follow_up).unwrap();
+            }
+            std::future::pending().await
+        }
+    }
+
+    fn reasoning_progress(text: &str) -> ProviderProgress {
+        ProviderProgress::ProviderEvent {
+            kind: "reasoning_delta".into(),
+            payload: json!({"text": text}),
+            raw_payload: Box::new(None),
+            stream_channel: None,
+            content_text: Some(text.to_string()),
+            provider_item_id: None,
+            tool_use_id: None,
+            tool_name: None,
+            model: None,
+            effort: None,
+        }
+    }
+
+    async fn next_live_commentary(
+        events: &mut mpsc::Receiver<SessionEventKind>,
+        message_id: Uuid,
+    ) -> String {
+        match events.recv().await {
+            Some(SessionEventKind::Message {
+                message_id: id,
+                text,
+                status: MessageStatus::InProgress,
+                ..
+            }) if id == message_id => text,
+            other => panic!("expected a live commentary snapshot, got {other:?}"),
+        }
+    }
+
+    async fn drive_commentary_tail(
+        follow_up: Option<ProviderProgress>,
+        observe: impl AsyncFnOnce(&mut mpsc::Receiver<SessionEventKind>, Uuid),
+    ) {
+        let client = CommentaryTailClient { follow_up };
+        let (events_tx, mut events_rx) = mpsc::channel(16);
+        let message_id = Uuid::new_v4();
+        let mut controls = None;
+        let call = call_model_streaming(
+            &client,
+            crate::CodingProvider::Codex,
+            "test-model",
+            None,
+            ModelTurnRequest {
+                fast: false,
+                request_id: None,
+                session_id: None,
+                prompt_cache_key: None,
+                messages: vec![ModelMessage::user("hello")],
+                tools: Vec::new(),
+                output_schema: None,
+            },
+            ModelStreamContext {
+                coding_provider: crate::CodingProvider::Codex,
+                assistant_message_id: message_id,
+                events: &events_tx,
+                controls: &mut controls,
+            },
+        );
+        tokio::pin!(call);
+        let observe = observe(&mut events_rx, message_id);
+        tokio::select! {
+            _ = &mut call => panic!("model must remain unfinished while generating"),
+            result = tokio::time::timeout(Duration::from_secs(5), observe) => {
+                result.expect("commentary must reach the stream while the turn continues");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn commentary_tail_precedes_the_reasoning_that_follows_it() {
+        drive_commentary_tail(
+            Some(reasoning_progress("weighing the next step")),
+            async |events, message_id| {
+                assert_eq!(next_live_commentary(events, message_id).await, "The");
+                // The model wrote this before it started reasoning again, so a
+                // reader must not meet the thinking disclosure first.
+                assert_eq!(
+                    next_live_commentary(events, message_id).await,
+                    "The lifecycle regression passed."
+                );
+                assert!(matches!(
+                    events.recv().await,
+                    Some(SessionEventKind::ReasoningDelta { text })
+                        if text == "weighing the next step"
+                ));
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn commentary_tail_is_published_without_a_following_event() {
+        drive_commentary_tail(None, async |events, message_id| {
+            assert_eq!(next_live_commentary(events, message_id).await, "The");
+            assert_eq!(
+                next_live_commentary(events, message_id).await,
+                "The lifecycle regression passed."
+            );
+        })
+        .await;
     }
 
     #[derive(Clone)]
