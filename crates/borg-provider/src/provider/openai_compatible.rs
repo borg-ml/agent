@@ -1242,11 +1242,27 @@ async fn read_compatible_model_stream(
         }
     }
 
-    if !saw_done {
-        return Err("stream ended before the required data: [DONE] marker".to_string());
-    }
-    let finish_reason =
-        finish_reason.ok_or_else(|| "stream ended without a finish_reason".to_string())?;
+    // Termination contract: a `finish_reason` is the model's own statement
+    // that the turn is complete, so a stream carrying one that closes before
+    // `data: [DONE]` (proxies and local servers do this) is complete, and
+    // `[DONE]` without a `finish_reason` is a complete stream from a server
+    // that omits the field. Only a stream that ends with neither is truncated.
+    let finish_reason = match (finish_reason, saw_done) {
+        (Some(reason), _) => reason,
+        (None, true) => if tool_calls.is_empty() {
+            "stop"
+        } else {
+            "tool_calls"
+        }
+        .to_string(),
+        (None, false) => {
+            return Err(format!(
+                "stream ended before a finish_reason or data: [DONE] marker ({} content characters and {} tool calls received)",
+                content.chars().count(),
+                tool_calls.len()
+            ));
+        }
+    };
     let tool_calls = tool_calls
         .into_values()
         .map(|call| {
@@ -1871,6 +1887,92 @@ mod tests {
             streamed_tool_action(r#"{"payload":{"action":"nested"},"action":"edit","#).as_deref(),
             Some("edit")
         );
+    }
+
+    async fn serve_sse_body(body: String) -> reqwest::Response {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 2048];
+            let _ = socket.read(&mut request).await.expect("read request");
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write response");
+        });
+        reqwest::get(format!("http://{address}"))
+            .await
+            .expect("request test stream")
+    }
+
+    #[tokio::test]
+    async fn stream_termination_requires_a_finish_reason_or_done_marker_not_both() {
+        // finish_reason without [DONE]: complete.
+        let streamed = read_compatible_model_stream(
+            serve_sse_body(
+                [
+                    r#"data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}"#,
+                    "",
+                ]
+                .join("\n"),
+            )
+            .await,
+            None,
+            "local-model",
+            None,
+        )
+        .await
+        .expect("finish_reason alone completes the turn");
+        assert_eq!(streamed.finish_reason, "stop");
+
+        // [DONE] without finish_reason: complete, reason inferred.
+        let streamed = read_compatible_model_stream(
+            serve_sse_body(
+                [
+                    r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":null}]}"#,
+                    "data: [DONE]",
+                    "",
+                ]
+                .join("\n"),
+            )
+            .await,
+            None,
+            "local-model",
+            None,
+        )
+        .await
+        .expect("[DONE] alone completes the turn");
+        assert_eq!(streamed.finish_reason, "tool_calls");
+
+        // Neither: truncated, never reported as a complete turn.
+        let error = read_compatible_model_stream(
+            serve_sse_body(
+                [
+                    r#"data: {"choices":[{"delta":{"content":"half"},"finish_reason":null}]}"#,
+                    "",
+                ]
+                .join("\n"),
+            )
+            .await,
+            None,
+            "local-model",
+            None,
+        )
+        .await;
+        let Err(error) = error else {
+            panic!("a stream with neither marker is truncated");
+        };
+        assert!(error.contains("4 content characters"), "{error}");
     }
 
     #[tokio::test]

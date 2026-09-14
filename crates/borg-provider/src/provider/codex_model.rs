@@ -359,9 +359,16 @@ impl CodexModelProvider {
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
                 let has_tools = matches!(&message, ModelMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty());
+                let finish_reason = if response_hit_output_limit(&raw_response) {
+                    "length"
+                } else if has_tools {
+                    "tool_calls"
+                } else {
+                    "stop"
+                };
                 Ok(ModelTurnResult {
                     message,
-                    finish_reason: if has_tools { "tool_calls" } else { "stop" }.into(),
+                    finish_reason: finish_reason.into(),
                     usage: ProviderCallUsage {
                         duration_ms: crate::runtime::elapsed_millis_u64(started),
                         input_tokens: input - cached,
@@ -792,6 +799,12 @@ impl ResponseState {
                 self.output.insert(index, event["item"].clone());
             }
             "response.completed" => return Ok(Some(event["response"].clone())),
+            // A reply cut at `max_output_tokens` still carries its output
+            // items; it is surfaced as a `length` finish so the harness can
+            // keep the text and continue, instead of discarding it.
+            "response.incomplete" if response_hit_output_limit(&event["response"]) => {
+                return Ok(Some(event["response"].clone()));
+            }
             "response.failed" | "response.incomplete" | "error" => {
                 bail!(subscription_failure_message(
                     event
@@ -808,7 +821,7 @@ impl ResponseState {
 
     fn finish(self, mut response: Value) -> Result<(ModelMessage, Value)> {
         ensure!(
-            response["status"] == "completed",
+            response["status"] == "completed" || response_hit_output_limit(&response),
             "Codex model response was not completed"
         );
         let output = response["output"]
@@ -874,6 +887,14 @@ impl ResponseState {
             response,
         ))
     }
+}
+
+fn response_hit_output_limit(response: &Value) -> bool {
+    response["status"] == "incomplete"
+        && response
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            == Some("max_output_tokens")
 }
 
 #[cfg(test)]
@@ -1339,10 +1360,30 @@ mod tests {
         partial["arguments"] = json!("{");
         for response in [
             json!({"status":"incomplete","output":[call.clone()]}),
+            json!({"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[call.clone()]}),
             json!({"status":"completed","output":[call.clone(),call.clone()]}),
-            json!({"status":"completed","output":[partial]}),
+            json!({"status":"completed","output":[partial.clone()]}),
+            json!({"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[partial]}),
         ] {
             assert!(ResponseState::default().finish(response).is_err());
         }
+    }
+
+    #[test]
+    fn output_limit_truncation_keeps_the_partial_text_as_a_length_finish() {
+        let response = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "half of the"}]}],
+        });
+        assert!(response_hit_output_limit(&response));
+        let (message, raw) = ResponseState::default()
+            .finish(response)
+            .expect("a max_output_tokens response keeps its text");
+        assert!(
+            matches!(message, ModelMessage::Assistant { content: Some(text), .. } if text == "half of the")
+        );
+        assert!(response_hit_output_limit(&raw));
+        assert!(!response_hit_output_limit(&json!({"status": "completed"})));
     }
 }

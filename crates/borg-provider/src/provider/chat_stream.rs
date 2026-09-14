@@ -2608,16 +2608,26 @@ async fn run_codex_subscription_process(
             Vec::new()
         }
     };
-    if !turn_completed && status.is_some_and(|status| !status.success()) {
+    // Only `turn/completed` (or the consumer going away) ends a turn. An
+    // app server that closes stdout first, even with exit status 0, has
+    // truncated the turn; reporting its streamed text as a finished answer
+    // would journal a partial reply as complete.
+    if !turn_completed {
         let detail = String::from_utf8_lossy(&stderr).trim().to_string();
         let status_detail = status.map_or_else(
             || "shutdown timed out".to_string(),
             |status| status.to_string(),
         );
+        let streamed = text.chars().count();
         bail!(
-            "{} exited with {}{}",
+            "{} exited with {} before completing the turn{}{}",
             SubscriptionProvider::Codex.executable(),
             status_detail,
+            if streamed == 0 {
+                String::new()
+            } else {
+                format!(" ({streamed} streamed characters are not a final answer)")
+            },
             if detail.is_empty() {
                 String::new()
             } else {
