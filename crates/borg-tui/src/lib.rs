@@ -5671,8 +5671,13 @@ impl BorgTerminal {
         let committed_viewport_render = if input_fast_path {
             self.last_committed_viewport_render
                 .as_ref()
-                .filter(|(width, height, ..)| {
-                    *width == full_transcript_width && *height == tool_run_viewport_height
+                .filter(|cached| {
+                    committed_viewport_is_reusable(
+                        cached,
+                        full_transcript_width,
+                        tool_run_viewport_height,
+                        &current_tool_elapsed,
+                    )
                 })
                 .map(|(_, _, _, _, _, render)| Arc::clone(render))
         } else {
@@ -12112,6 +12117,23 @@ fn cached_transcript_render(
             ));
             render
         })
+}
+
+/// Fast-path draws reuse this snapshot verbatim and only refresh timers through
+/// `refresh_tool_elapsed_line`, which resolves labels by transcript order index
+/// and rewrites equal-length text. So it stays reusable only while its label set
+/// still matches the live one: a renumbered index (goal/plan upsert, message
+/// insert or removal) or a changed width both strand the timer.
+fn committed_viewport_is_reusable(
+    cached: &CachedTranscriptRender,
+    width: usize,
+    tool_run_viewport_height: usize,
+    current_tool_elapsed: &[(usize, Option<String>)],
+) -> bool {
+    let (cached_width, cached_tool_run_viewport_height, _, _, _, render) = cached;
+    *cached_width == width
+        && *cached_tool_run_viewport_height == tool_run_viewport_height
+        && tool_elapsed_widths_match(&render.7, current_tool_elapsed)
 }
 
 fn tool_elapsed_widths_match(

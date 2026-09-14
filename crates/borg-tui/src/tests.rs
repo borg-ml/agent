@@ -2681,6 +2681,204 @@ fn cached_transcript_reuses_history_for_same_width_timer_updates() {
     assert!(!Arc::ptr_eq(&first, &reflowed));
 }
 
+/// A silent tool emits no events, so every frame reuses the committed viewport.
+/// `refresh_tool_elapsed_line` only rewrites equal-length labels and this
+/// snapshot's own labels never advance, so reusing it across a width boundary
+/// freezes the timer until an unrelated event forces a redraw.
+#[test]
+fn committed_viewport_snapshot_is_dropped_when_the_timer_label_widens() {
+    let started_at = DateTime::from_timestamp(0, 0).expect("valid epoch timestamp");
+    let width = 100;
+    let viewport_height = DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT;
+    let date = started_at.date_naive();
+    let mut transcript = Transcript::default();
+    let mut started = SessionEvent::new(
+        Uuid::new_v4(),
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "timed-1".to_string(),
+            name: "command_execution".to_string(),
+            input: serde_json::json!({"command": "sleep 900"}),
+            input_ref: None,
+        },
+    );
+    started.created_at = started_at;
+    transcript.apply(&started);
+    let at = |ms| started_at + chrono::Duration::milliseconds(ms);
+
+    // Commit, a same-width tick, then the widening label, at every boundary.
+    for (commit_ms, commit, tick_ms, tick, widen_ms, widened) in [
+        (9_800, "9.8s", 9_900, "9.9s", 10_000, "10.0s"),
+        (59_800, "59.8s", 59_900, "59.9s", 60_000, "1m 00s"),
+        (598_000, "9m 58s", 599_000, "9m 59s", 600_000, "10m 00s"),
+    ] {
+        let commit_labels = transcript.running_tool_elapsed_labels_at(at(commit_ms));
+        let tick_labels = transcript.running_tool_elapsed_labels_at(at(tick_ms));
+        let widened_labels = transcript.running_tool_elapsed_labels_at(at(widen_ms));
+        assert_eq!(commit_labels[0].1.as_deref(), Some(commit));
+        assert_eq!(tick_labels[0].1.as_deref(), Some(tick));
+        assert_eq!(widened_labels[0].1.as_deref(), Some(widened));
+
+        let mut cache = None;
+        let render = cached_transcript_render(
+            &transcript,
+            &mut cache,
+            width,
+            viewport_height,
+            None,
+            &commit_labels,
+            date,
+            at(commit_ms),
+        );
+        let committed: CachedTranscriptRender = (width, viewport_height, None, None, date, render);
+
+        assert!(
+            committed_viewport_is_reusable(&committed, width, viewport_height, &tick_labels),
+            "{commit} -> {tick} is patchable in place and must reuse the snapshot"
+        );
+        assert!(
+            !committed_viewport_is_reusable(&committed, width, viewport_height, &widened_labels),
+            "{commit} -> {widened} must invalidate the committed viewport snapshot"
+        );
+
+        // The re-render that invalidation forces must show the live label.
+        let mut fresh = None;
+        let rerender = cached_transcript_render(
+            &transcript,
+            &mut fresh,
+            width,
+            viewport_height,
+            None,
+            &widened_labels,
+            date,
+            at(widen_ms),
+        );
+        let (_, row, _) = rerender.1[0];
+        assert!(
+            rerender.0[row].to_string().ends_with(widened),
+            "the forced re-render must paint {widened}, not the frozen {commit}"
+        );
+    }
+}
+
+/// Repro for the arbitrary timer freeze. A goal update renumbers transcript
+/// entries, so the tool's live order index no longer matches the one baked
+/// into the committed viewport snapshot. `refresh_tool_elapsed_line` resolves
+/// both labels by that index, finds no live label, and silently gives up --
+/// every fast-path frame repaints the same stale row while the spinner and
+/// input keep animating. Labels here are same-width, so no width boundary is
+/// involved.
+#[test]
+fn committed_snapshot_freezes_the_timer_after_an_order_shift() {
+    let session_id = Uuid::new_v4();
+    let started_at = DateTime::from_timestamp(0, 0).expect("valid epoch timestamp");
+    let width = 100;
+    let viewport_height = DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT;
+    let date = started_at.date_naive();
+    let at = |ms| started_at + chrono::Duration::milliseconds(ms);
+
+    // A goal entry ahead of the tool, so a later goal update renumbers it.
+    let mut transcript = Transcript::default();
+    let mut goal = SessionGoal::new("ship the fix".to_string(), None);
+    goal.status = GoalStatus::Active;
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        0,
+        SessionEventKind::GoalUpdated { goal: goal.clone() },
+    ));
+    let mut started = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "timed-1".to_string(),
+            name: "command_execution".to_string(),
+            input: serde_json::json!({"command": "sleep 900"}),
+            input_ref: None,
+        },
+    );
+    started.created_at = started_at;
+    transcript.apply(&started);
+
+    // Commit the viewport snapshot while the goal still sits ahead of the tool.
+    let committed_labels = transcript.running_tool_elapsed_labels_at(at(3_000));
+    assert_eq!(committed_labels[0].1.as_deref(), Some("3.0s"));
+    let mut cache = None;
+    let render = cached_transcript_render(
+        &transcript,
+        &mut cache,
+        width,
+        viewport_height,
+        None,
+        &committed_labels,
+        date,
+        at(3_000),
+    );
+    let committed: CachedTranscriptRender = (
+        width,
+        viewport_height,
+        None,
+        None,
+        date,
+        Arc::clone(&render),
+    );
+    let (snapshot_tool_index, snapshot_row, _) = render.1[0];
+
+    // The real order-mutating event: upsert_goal removes the goal entry and
+    // pushes it to the end, renumbering every entry that followed it.
+    goal.objective = "ship the fix, carefully".to_string();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::GoalUpdated { goal },
+    ));
+
+    // Repeated same-width ticks after the shift: the live index has moved, so
+    // the in-place patch can never rewrite the committed row again.
+    for (tick_ms, tick) in [(3_100, "3.1s"), (3_200, "3.2s"), (3_300, "3.3s")] {
+        let live = transcript.running_tool_elapsed_labels_at(at(tick_ms));
+        assert_eq!(live[0].1.as_deref(), Some(tick));
+        assert_eq!(
+            live[0].1.as_deref().map(str::len),
+            committed_labels[0].1.as_deref().map(str::len),
+            "{tick} must be the same width as the committed label"
+        );
+        assert_ne!(
+            live[0].0, snapshot_tool_index,
+            "the goal update must renumber the tool"
+        );
+
+        let mut row = render.0[snapshot_row].clone();
+        refresh_tool_elapsed_line(&mut row, snapshot_tool_index, &render.7, &live);
+        assert!(
+            row.to_string().ends_with("3.0s"),
+            "the in-place patch cannot reach the renumbered tool, so the row stays frozen"
+        );
+
+        // The fix: the snapshot must be rejected once its label set no longer
+        // matches the live one, so the next frame re-renders the real elapsed.
+        assert!(
+            !committed_viewport_is_reusable(&committed, width, viewport_height, &live),
+            "a renumbered label set must invalidate the committed viewport snapshot"
+        );
+        let mut fresh = None;
+        let rerender = cached_transcript_render(
+            &transcript,
+            &mut fresh,
+            width,
+            viewport_height,
+            None,
+            &live,
+            date,
+            at(tick_ms),
+        );
+        let (_, fresh_row, _) = rerender.1[0];
+        assert!(
+            rerender.0[fresh_row].to_string().ends_with(tick),
+            "the forced re-render must paint {tick}"
+        );
+    }
+}
+
 #[test]
 fn action_status_updates_refresh_cached_transcript_text() {
     let session_id = Uuid::new_v4();
