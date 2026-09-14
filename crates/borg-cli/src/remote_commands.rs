@@ -5509,69 +5509,9 @@ async fn run_local_agent_session(
                             }
                             continue;
                         }
-                        if let Some(target) = target {
-                            let message_id = Uuid::new_v4();
-                            let active_provider = terminal
-                                .as_ref()
-                                .and_then(BorgTerminal::session_provider)
-                                .unwrap_or(provider);
-                            let delivery =
-                                default_active_delivery(active_provider, steer_active_turn);
-                            terminal
-                                .as_mut()
-                                .expect("terminal")
-                                .project_pending_prompt(
-                                    Some(target),
-                                    message_id,
-                                    text.clone(),
-                                    delivery,
-                                );
-                            let command = HostCommand::Subagent {
-                                session_id,
-                                action: SubagentAction::Prompt {
-                                    request_id: Uuid::new_v4(),
-                                    target: target.to_string(),
-                                    message_id,
-                                    text: text.clone(),
-                                    attachments: attachments.clone(),
-                                    delivery,
-                                },
-                            };
-                            let submission = UiPromptSubmission {
-                                journal_session_id: target,
-                                target: Some(target),
-                                message_id,
-                                rejected_text: text.clone(),
-                                text,
-                                attachments,
-                                delivery,
-                                command: Some(command),
-                                kind: PromptSubmissionKind::Send,
-                                started_idle_turn: false,
-                            };
-                            if let Err(submission) = dispatch_ui_prompt(
-                                &ui_interaction_tx,
-                                &mut pending_prompt_ids,
-                                submission,
-                            ) {
-                                let terminal = terminal.as_mut().expect("terminal");
-                                terminal.reject_optimistic_prompt(
-                                    Some(target),
-                                    submission.message_id,
-                                    submission.rejected_text,
-                                    submission.attachments,
-                                );
-                                terminal.set_notice(
-                                    "Could not queue the prompt for durable storage".to_string(),
-                                );
-                                interaction_dirty = true;
-                                terminal_dirty = true;
-                                continue;
-                            }
-                            continue;
-                        }
                         if let Some((interaction_id, kind, payload)) =
                             pending_provider_interaction.clone()
+                            && target.is_none()
                         {
                             if !attachments.is_empty() {
                                 terminal.as_mut().expect("terminal").restore_composer(
@@ -6629,6 +6569,67 @@ async fn run_local_agent_session(
                                     );
                                 }
                                 _ => {
+                                    if let Some(target) = target {
+                                        let message_id = Uuid::new_v4();
+                                        let active_provider = terminal
+                                            .as_ref()
+                                            .and_then(BorgTerminal::session_provider)
+                                            .unwrap_or(provider);
+                                        let delivery =
+                                            default_active_delivery(active_provider, steer_active_turn);
+                                        terminal
+                                            .as_mut()
+                                            .expect("terminal")
+                                            .project_pending_prompt(
+                                                Some(target),
+                                                message_id,
+                                                text.clone(),
+                                                delivery,
+                                            );
+                                        let command = HostCommand::Subagent {
+                                            session_id,
+                                            action: SubagentAction::Prompt {
+                                                request_id: Uuid::new_v4(),
+                                                target: target.to_string(),
+                                                message_id,
+                                                text: text.clone(),
+                                                attachments: attachments.clone(),
+                                                delivery,
+                                            },
+                                        };
+                                        let submission = UiPromptSubmission {
+                                            journal_session_id: target,
+                                            target: Some(target),
+                                            message_id,
+                                            rejected_text: text.clone(),
+                                            text,
+                                            attachments,
+                                            delivery,
+                                            command: Some(command),
+                                            kind: PromptSubmissionKind::Send,
+                                            started_idle_turn: false,
+                                        };
+                                        if let Err(submission) = dispatch_ui_prompt(
+                                            &ui_interaction_tx,
+                                            &mut pending_prompt_ids,
+                                            submission,
+                                        ) {
+                                            let terminal = terminal.as_mut().expect("terminal");
+                                            terminal.reject_optimistic_prompt(
+                                                Some(target),
+                                                submission.message_id,
+                                                submission.rejected_text,
+                                                submission.attachments,
+                                            );
+                                            terminal.set_notice(
+                                                "Could not queue the prompt for durable storage".to_string(),
+                                            );
+                                            interaction_dirty = true;
+                                            terminal_dirty = true;
+                                            continue;
+                                        }
+                                        continue;
+                                    }
                                     let active = matches!(
                                         status,
                                         SessionStatus::Starting
