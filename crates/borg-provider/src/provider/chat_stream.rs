@@ -211,6 +211,10 @@ struct ClaudeSteerCorrelation {
 #[derive(Default)]
 struct ClaudeToolGenerationState {
     blocks: HashMap<u64, ClaudeToolGenerationBlock>,
+    /// Claude streams nothing between `message_start` and its first content
+    /// block while the model reasons without visible thinking, so the
+    /// generation window is surfaced as an explicit reasoning phase.
+    reasoning_phase_open: bool,
 }
 
 #[derive(Default)]
@@ -230,17 +234,44 @@ impl ClaudeToolGenerationState {
         let Some(event) = raw.get("event") else {
             return Vec::new();
         };
+        let event_type = event.get("type").and_then(Value::as_str);
+        match event_type {
+            Some("message_start") => {
+                self.reasoning_phase_open = true;
+                return vec![ChatStreamEvent::Phase {
+                    name: "reasoning/started".to_string(),
+                    input: Value::Null,
+                }];
+            }
+            Some("message_delta" | "message_stop") if self.reasoning_phase_open => {
+                self.reasoning_phase_open = false;
+                return vec![ChatStreamEvent::Phase {
+                    name: "reasoning_completed".to_string(),
+                    input: Value::Null,
+                }];
+            }
+            _ => {}
+        }
         let Some(index) = event.get("index").and_then(Value::as_u64) else {
             return Vec::new();
         };
-        match event.get("type").and_then(Value::as_str) {
+        match event_type {
             Some("content_block_start") => {
                 let Some(content_block) = event.get("content_block") else {
                     return Vec::new();
                 };
-                if content_block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                let block_type = content_block.get("type").and_then(Value::as_str);
+                let mut progress = Vec::new();
+                if self.reasoning_phase_open && block_type != Some("thinking") {
+                    self.reasoning_phase_open = false;
+                    progress.push(ChatStreamEvent::Phase {
+                        name: "reasoning_completed".to_string(),
+                        input: Value::Null,
+                    });
+                }
+                if block_type != Some("tool_use") {
                     self.blocks.remove(&index);
-                    return Vec::new();
+                    return progress;
                 }
                 let id = content_block
                     .get("id")
