@@ -6027,8 +6027,14 @@ impl BorgTerminal {
         };
         let status_glyph = activity_glyph(status);
         let status_is_interruptible = status_control_is_actionable(status);
-        let (model_status, effort_status, fast_status, permission_status, mut cwd_status) =
-            self.transcript.config_statuses();
+        let ConfigStatuses {
+            model: model_status,
+            effort: effort_status,
+            fast: fast_status,
+            permission: permission_status,
+            billing: billing_status,
+            cwd: mut cwd_status,
+        } = self.transcript.config_statuses();
         let active_cwd = self
             .transcript
             .config
@@ -7191,6 +7197,18 @@ impl BorgTerminal {
                 permission_status,
                 self.permission_status_hovered,
                 permission_status_color,
+            );
+            // Billing is always visible so a switch between a subscription and
+            // pay-as-you-go credentials is never silent.
+            let billing_status_color = billing_status
+                .as_deref()
+                .map(billing_status_color)
+                .unwrap_or(Color::Gray);
+            push_interactive_status_segment(
+                &mut status_spans,
+                billing_status,
+                false,
+                billing_status_color,
             );
             let context_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             let context_status_start = if context_status.is_empty() {
@@ -9576,8 +9594,14 @@ impl Composer {
             .attachments
             .iter()
             .map(|attachment| (attachment.start, attachment.end))
-            .chain(self.pasted_texts.iter().map(|pasted| (pasted.start, pasted.end)))
-            .filter(|(token_start, token_end)| *token_start < self.cursor && *token_end > self.cursor)
+            .chain(
+                self.pasted_texts
+                    .iter()
+                    .map(|pasted| (pasted.start, pasted.end)),
+            )
+            .filter(|(token_start, token_end)| {
+                *token_start < self.cursor && *token_end > self.cursor
+            })
             .map(|(_, token_end)| token_end)
             .max();
         if let Some(token_end) = token_end {
@@ -13721,6 +13745,14 @@ fn effort_status_color(effort: &str) -> Color {
         "xhigh" => Color::LightMagenta,
         "max" | "ultra" => Color::LightRed,
         _ => Color::Gray,
+    }
+}
+
+fn billing_status_color(billing: &str) -> Color {
+    match billing {
+        "api" => Color::LightBlue,
+        "endpoint" => Color::Gray,
+        _ => Color::LightMagenta,
     }
 }
 

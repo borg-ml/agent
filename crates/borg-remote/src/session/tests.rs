@@ -1028,6 +1028,7 @@ fn test_provider_capabilities() -> Vec<crate::ProviderCapability> {
         auth_methods: vec![crate::ProviderAuthMethod::Subscription],
         can_spawn: true,
         usage: None,
+        billing: None,
     })
     .collect()
 }

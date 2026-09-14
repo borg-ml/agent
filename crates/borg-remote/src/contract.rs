@@ -510,6 +510,11 @@ pub struct ProviderUsage {
     #[serde(default)]
     pub windows: Vec<ProviderUsageWindow>,
     pub detail: Option<String>,
+    /// Provider-reported plan tier for a subscription lane (for example
+    /// `pro`, `max`, `plus`). Secret-free; `None` when the provider does not
+    /// report one or the usage probe has not run yet.
+    #[serde(default)]
+    pub plan: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -538,6 +543,45 @@ pub struct ProviderCapability {
     /// not expose a quota view or the probe was unavailable.
     #[serde(default)]
     pub usage: Option<ProviderUsage>,
+    /// The lane a turn on this provider is billed against right now, chosen
+    /// with the same precedence the provider adapter uses at run time (an
+    /// explicit API key wins over a subscription session). `None` when the
+    /// provider has no usable credential or an older host did not classify it.
+    #[serde(default)]
+    pub billing: Option<BillingLane>,
+}
+
+/// Which account a provider turn is charged to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum BillingLane {
+    /// A vendor subscription (ChatGPT Plus/Pro, Claude Pro/Max, GLM Coding
+    /// Plan, OpenCode provider login). Token counters are informational.
+    Subscription,
+    /// Pay-as-you-go API credentials billed per token.
+    ApiKey,
+    /// A configured endpoint (local server or gateway) with no vendor billing.
+    Endpoint,
+}
+
+impl ProviderCapability {
+    /// Short, always-visible billing label for the composer status row:
+    /// `api`, `endpoint`, the reported subscription tier (`pro`, `max`, …),
+    /// or `sub` for a subscription whose tier is not known yet.
+    pub fn billing_label(&self) -> Option<String> {
+        Some(match self.billing? {
+            BillingLane::ApiKey => "api".to_string(),
+            BillingLane::Endpoint => "endpoint".to_string(),
+            BillingLane::Subscription => self
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.plan.as_deref())
+                .map(|plan| plan.trim().to_ascii_lowercase())
+                .filter(|plan| !plan.is_empty())
+                .unwrap_or_else(|| "sub".to_string()),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -2703,6 +2747,33 @@ mod tests {
     }
 
     #[test]
+    fn billing_label_prefers_the_reported_plan_tier() {
+        let mut capability = ProviderCapability {
+            provider: CodingProvider::Claude,
+            installed: true,
+            version: None,
+            authenticated: true,
+            auth_detail: None,
+            auth_methods: vec![ProviderAuthMethod::Subscription],
+            can_spawn: true,
+            usage: None,
+            billing: Some(BillingLane::Subscription),
+        };
+        assert_eq!(capability.billing_label().as_deref(), Some("sub"));
+        capability.usage = Some(ProviderUsage {
+            availability: ProviderUsageAvailability::Available,
+            windows: Vec::new(),
+            detail: None,
+            plan: Some(" Max ".to_string()),
+        });
+        assert_eq!(capability.billing_label().as_deref(), Some("max"));
+        capability.billing = Some(BillingLane::ApiKey);
+        assert_eq!(capability.billing_label().as_deref(), Some("api"));
+        capability.billing = None;
+        assert_eq!(capability.billing_label(), None);
+    }
+
+    #[test]
     fn provider_prompt_exposes_safe_auth_and_spawn_state_without_secrets() {
         let secret = "sk-do-not-render";
         let prompt = provider_capabilities_prompt(&[
@@ -2723,7 +2794,9 @@ mod tests {
                         global: true,
                     }],
                     detail: None,
+                    plan: None,
                 }),
+                billing: Some(BillingLane::Subscription),
             },
             ProviderCapability {
                 provider: CodingProvider::OpenRouter,
@@ -2734,6 +2807,7 @@ mod tests {
                 auth_methods: vec![ProviderAuthMethod::ApiKey],
                 can_spawn: true,
                 usage: None,
+                billing: Some(BillingLane::ApiKey),
             },
             ProviderCapability {
                 provider: CodingProvider::Claude,
@@ -2752,7 +2826,9 @@ mod tests {
                         global: true,
                     }],
                     detail: Some("Claude subscription usage is exhausted".to_string()),
+                    plan: None,
                 }),
+                billing: Some(BillingLane::Subscription),
             },
         ]);
         assert!(prompt.contains("Codex: READY"));

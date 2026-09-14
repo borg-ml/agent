@@ -4948,9 +4948,9 @@ fn focused_transcript_configuration_switches_cwd_metadata() {
     let mut children = HashMap::from([(child_id, child)]);
 
     switch_to_child_transcript(&mut displayed, &mut director, &mut children, child_id);
-    assert!(displayed.config_statuses().4.ends_with("child"));
+    assert!(displayed.config_statuses().cwd.ends_with("child"));
     switch_to_director_transcript(&mut displayed, &mut director, &mut children, child_id);
-    assert!(displayed.config_statuses().4.ends_with("director"));
+    assert!(displayed.config_statuses().cwd.ends_with("director"));
 }
 
 #[test]
@@ -9207,16 +9207,13 @@ fn projected_session_state_restores_status_config_outside_the_history_tail() {
         ..Default::default()
     });
 
-    assert_eq!(
-        transcript.config_statuses(),
-        (
-            Some("gpt-5.6-sol".to_string()),
-            Some("medium".to_string()),
-            None,
-            Some("full access".to_string()),
-            format!("{separator}w{separator}borg")
-        )
-    );
+    let statuses = transcript.config_statuses();
+    assert_eq!(statuses.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(statuses.effort.as_deref(), Some("medium"));
+    assert_eq!(statuses.fast, None);
+    assert_eq!(statuses.permission.as_deref(), Some("full access"));
+    assert_eq!(statuses.billing, None);
+    assert_eq!(statuses.cwd, format!("{separator}w{separator}borg"));
     assert_eq!(transcript.context_remaining_percent, 77);
     assert_eq!(transcript.agent_roster_entries()[0].usage, "123.0k");
 }
@@ -9237,10 +9234,93 @@ fn fast_mode_gets_its_own_status_segment_only_when_enabled() {
         ..Default::default()
     });
 
-    let (model, effort, fast, _, _) = transcript.config_statuses();
-    assert_eq!(model.as_deref(), Some("gpt-5.6-sol"));
-    assert_eq!(effort.as_deref(), Some("high"));
-    assert_eq!(fast.as_deref(), Some("fast"));
+    let statuses = transcript.config_statuses();
+    assert_eq!(statuses.model.as_deref(), Some("gpt-5.6-sol"));
+    assert_eq!(statuses.effort.as_deref(), Some("high"));
+    assert_eq!(statuses.fast.as_deref(), Some("fast"));
+}
+
+#[test]
+fn billing_status_follows_the_configured_provider_and_capability_refresh() {
+    let capability = |provider, billing, plan: Option<&str>| borg_remote::ProviderCapability {
+        provider,
+        installed: true,
+        version: None,
+        authenticated: true,
+        auth_detail: None,
+        auth_methods: Vec::new(),
+        can_spawn: true,
+        usage: plan.map(|plan| borg_remote::ProviderUsage {
+            availability: borg_remote::ProviderUsageAvailability::Available,
+            windows: Vec::new(),
+            detail: None,
+            plan: Some(plan.to_string()),
+        }),
+        billing: Some(billing),
+    };
+    let mut transcript = Transcript::default();
+    transcript.seed_session_state(&SessionState {
+        configuration: Some(borg_remote::SessionConfiguration {
+            cwd: PathBuf::from("/workspace/borg"),
+            provider: CodingProvider::Claude,
+            model: Some("claude-fable-5-1".to_string()),
+            effort: None,
+            fast: false,
+            response_language: ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+        }),
+        provider_capabilities: vec![
+            capability(
+                CodingProvider::Claude,
+                borg_remote::BillingLane::Subscription,
+                None,
+            ),
+            capability(
+                CodingProvider::Codex,
+                borg_remote::BillingLane::ApiKey,
+                None,
+            ),
+        ],
+        ..Default::default()
+    });
+    assert_eq!(transcript.config_statuses().billing.as_deref(), Some("sub"));
+
+    // The background refresh reports the tier; the label sharpens durably.
+    let _ = transcript.apply(&SessionEvent::new(
+        Uuid::new_v4(),
+        1,
+        SessionEventKind::ProviderCapabilitiesUpdated {
+            providers: vec![
+                capability(
+                    CodingProvider::Claude,
+                    borg_remote::BillingLane::Subscription,
+                    Some("max"),
+                ),
+                capability(
+                    CodingProvider::Codex,
+                    borg_remote::BillingLane::ApiKey,
+                    None,
+                ),
+            ],
+        },
+    ));
+    assert_eq!(transcript.config_statuses().billing.as_deref(), Some("max"));
+
+    // Switching provider re-reads the lane for the new provider.
+    let _ = transcript.apply(&SessionEvent::new(
+        Uuid::new_v4(),
+        2,
+        SessionEventKind::SessionConfigured {
+            cwd: PathBuf::from("/workspace/borg"),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-6-astra".to_string()),
+            effort: None,
+            fast: false,
+            response_language: ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+        },
+    ));
+    assert_eq!(transcript.config_statuses().billing.as_deref(), Some("api"));
 }
 
 #[test]

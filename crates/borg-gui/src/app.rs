@@ -1006,6 +1006,18 @@ impl Render for BorgGui {
             .unwrap_or("unknown")
             .into();
         let fast = configuration.is_some_and(|c| c.fast);
+        let billing: Option<SharedString> = self
+            .view
+            .as_ref()
+            .and_then(|view| {
+                let configuration = view.state.configuration.as_ref()?;
+                view.state
+                    .provider_capabilities
+                    .iter()
+                    .find(|capability| capability.provider == configuration.provider)?
+                    .billing_label()
+            })
+            .map(SharedString::from);
         let language = configuration
             .map(|configuration| configuration.response_language.code())
             .unwrap_or("auto");
@@ -1568,6 +1580,9 @@ impl Render for BorgGui {
                                     .child(div().id("fast-setting").cursor_pointer().text_color(rgb(if fast { palette::PEACH } else { palette::TEXT_MUTED })).hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(Self::toggle_fast)).child(if fast { "fast" } else { "standard" }))
                                     .child("·")
                                     .child(div().id("access-setting").cursor_pointer().hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(Self::cycle_permission)).child(Self::status_segment("access", access, palette::PEACH)))
+                                    .when_some(billing, |row, billing| {
+                                        row.child("·").child(Self::status_segment("billing", billing, palette::PEACH))
+                                    })
                                     .child("·")
                                     .child(div().id("language-setting").cursor_pointer().text_color(rgb(palette::TEXT_MUTED)).hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(Self::cycle_language)).child(language))
                                     .child("·")

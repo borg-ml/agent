@@ -120,6 +120,7 @@ struct Transcript {
     goal: Option<SessionGoal>,
     todos: Vec<PlanItem>,
     config: Option<SessionDisplayConfig>,
+    provider_capabilities: Vec<borg_remote::ProviderCapability>,
     active_turn: Option<ActiveTurnDisplayConfig>,
     live_turn_closed: bool,
     subagents: HashMap<Uuid, SubagentStatus>,
@@ -235,6 +236,7 @@ impl Default for Transcript {
             queued_messages: HashSet::new(),
             queued_message_sequences: HashMap::new(),
             local_minute_cache: HashMap::new(),
+            provider_capabilities: Vec::new(),
             follow_tail: true,
             selected: None,
             diff_expansion: DiffExpansionPolicy::Expanded,
@@ -281,6 +283,30 @@ struct SessionDisplayConfig {
     response_language: ResponseLanguage,
     fast: bool,
     permission_mode: PermissionMode,
+}
+
+/// Status-row values derived from the session configuration.
+#[derive(Default)]
+pub(crate) struct ConfigStatuses {
+    pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
+    pub(crate) fast: Option<String>,
+    pub(crate) permission: Option<String>,
+    pub(crate) billing: Option<String>,
+    pub(crate) cwd: String,
+}
+
+/// The billing label for the configured provider, from the durable capability
+/// snapshot: `api`, the subscription tier (`pro`, `max`, …), `sub`, or
+/// `endpoint`. `None` until the host has classified the lane.
+fn billing_status_for(
+    capabilities: &[borg_remote::ProviderCapability],
+    provider: CodingProvider,
+) -> Option<String> {
+    capabilities
+        .iter()
+        .find(|capability| capability.provider == provider)
+        .and_then(borg_remote::ProviderCapability::billing_label)
 }
 
 impl SessionDisplayConfig {
@@ -505,6 +531,7 @@ impl Transcript {
     fn seed_session_state(&mut self, state: &SessionState) {
         self.goal = state.goal.clone();
         self.todos = state.todos.clone();
+        self.provider_capabilities = state.provider_capabilities.clone();
         self.config = state
             .configuration
             .as_ref()
@@ -1119,6 +1146,9 @@ impl Transcript {
                     self.context_tokens = None;
                     self.context_window_tokens = None;
                 }
+            }
+            SessionEventKind::ProviderCapabilitiesUpdated { providers } => {
+                self.provider_capabilities = providers.clone();
             }
             SessionEventKind::TurnStarted {
                 message_id,
@@ -2920,26 +2950,18 @@ impl Transcript {
         self.action_descriptors = enabled;
     }
 
-    fn config_statuses(
-        &self,
-    ) -> (
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-        String,
-    ) {
+    fn config_statuses(&self) -> ConfigStatuses {
         let Some(config) = self.config.as_ref() else {
-            return (None, None, None, None, String::new());
+            return ConfigStatuses::default();
         };
-        let model = config.model.clone();
-        (
-            model,
-            config.effort.clone(),
-            config.fast.then(|| "fast".to_string()),
-            Some(permission_mode_label(config.permission_mode).to_string()),
-            fish_style_path(&config.cwd),
-        )
+        ConfigStatuses {
+            model: config.model.clone(),
+            effort: config.effort.clone(),
+            fast: config.fast.then(|| "fast".to_string()),
+            permission: Some(permission_mode_label(config.permission_mode).to_string()),
+            billing: billing_status_for(&self.provider_capabilities, config.provider),
+            cwd: fish_style_path(&config.cwd),
+        }
     }
 
     fn context_status(&self) -> (String, bool) {

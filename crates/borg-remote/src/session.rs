@@ -1637,6 +1637,19 @@ async fn run_agent_session_store_kernel(
         )
         .await?;
     }
+    // Launch only classifies credentials so first paint is never blocked on a
+    // provider subprocess. The subscription tier and quota come from a
+    // background refresh and are journaled when they arrive, so every client
+    // (TUI, GUI, remote) sees the same billing label durably.
+    let (capability_refresh_tx, mut capability_refresh_rx) =
+        mpsc::channel::<Vec<crate::ProviderCapability>>(1);
+    if !launch.capabilities.provider_capabilities.is_empty() {
+        let seed = launch.capabilities.provider_capabilities.clone();
+        tokio::spawn(async move {
+            let refreshed = crate::host::refresh_provider_capability_usage(&seed).await;
+            let _ = capability_refresh_tx.send(refreshed).await;
+        });
+    }
     if initial_state.effective_capabilities.as_ref() != Some(&effective_capabilities) {
         record(
             &mut journal,
@@ -2082,6 +2095,19 @@ async fn run_agent_session_store_kernel(
                             session_id,
                             subagents.as_ref().expect("team inbox requires coordinator"),
                         ).await?;
+                        continue;
+                    }
+                    Some(providers) = capability_refresh_rx.recv() => {
+                        if launch.capabilities.provider_capabilities != providers {
+                            launch.capabilities.provider_capabilities = providers.clone();
+                            record(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                SessionEventKind::ProviderCapabilitiesUpdated { providers },
+                            )
+                            .await?;
+                        }
                         continue;
                     }
                     autonomy = autonomy_dispatch_rx.recv() => {

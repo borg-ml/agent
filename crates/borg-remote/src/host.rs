@@ -19,6 +19,7 @@ use tokio::sync::{Mutex, mpsc, watch};
 use url::{Host, Url};
 use uuid::Uuid;
 
+use crate::BillingLane;
 use crate::receipt::{ReceiptState, SqliteReceiptStore};
 use crate::session::AbortTask;
 use crate::{
@@ -1216,6 +1217,7 @@ async fn probe_provider_usage(provider: CodingProvider) -> Option<ProviderUsage>
 }
 
 fn codex_provider_usage(limits: borg_provider::provider::CodexAccountRateLimits) -> ProviderUsage {
+    let plan = limits.plan_type.clone();
     let windows = [limits.primary, limits.secondary]
         .into_iter()
         .flatten()
@@ -1237,12 +1239,14 @@ fn codex_provider_usage(limits: borg_provider::provider::CodexAccountRateLimits)
         },
         windows,
         detail: exhausted.then(|| "Codex subscription usage is exhausted".to_string()),
+        plan,
     }
 }
 
 fn claude_provider_usage(
     limits: borg_provider::provider::ClaudeAccountRateLimits,
 ) -> ProviderUsage {
+    let plan = limits.subscription_type.clone();
     let exhausted = limits.rate_limits_available
         && limits
             .windows
@@ -1274,6 +1278,7 @@ fn claude_provider_usage(
         } else {
             None
         },
+        plan,
     }
 }
 
@@ -1358,15 +1363,27 @@ async fn probe_provider(
     };
     let mut auth_methods = Vec::new();
     let mut detail = Vec::new();
-    match provider {
+    // `billing` follows the precedence the provider adapter applies when it
+    // actually runs a turn, not the order the methods are listed in: the
+    // Codex and Claude CLIs give an explicit API-key environment variable
+    // precedence over their OAuth session.
+    let billing = match provider {
         CodingProvider::Codex => {
             if subscription_authenticated {
                 auth_methods.push(ProviderAuthMethod::Subscription);
                 detail.push("Codex subscription authenticated");
             }
-            if nonempty_env("OPENAI_API_KEY").is_some() {
+            let api_key = nonempty_env("OPENAI_API_KEY").is_some();
+            if api_key {
                 auth_methods.push(ProviderAuthMethod::ApiKey);
                 detail.push("OpenAI API key configured");
+            }
+            if api_key {
+                Some(BillingLane::ApiKey)
+            } else if subscription_authenticated {
+                Some(BillingLane::Subscription)
+            } else {
+                None
             }
         }
         CodingProvider::Claude => {
@@ -1374,13 +1391,24 @@ async fn probe_provider(
                 auth_methods.push(ProviderAuthMethod::Subscription);
                 detail.push("Claude subscription authenticated");
             }
-            if borg_provider::credentials::api_key(
+            let api_key = borg_provider::credentials::api_key(
                 borg_provider::credentials::ApiKeyCredential::Anthropic,
             )
-            .is_some()
-            {
+            .is_some();
+            if api_key {
                 auth_methods.push(ProviderAuthMethod::ApiKey);
                 detail.push("Anthropic API key configured");
+            }
+            let env_api_key = nonempty_env("ANTHROPIC_API_KEY").is_some()
+                || nonempty_env("ANTHROPIC_AUTH_TOKEN").is_some();
+            if env_api_key {
+                Some(BillingLane::ApiKey)
+            } else if subscription_authenticated {
+                Some(BillingLane::Subscription)
+            } else if api_key {
+                Some(BillingLane::ApiKey)
+            } else {
+                None
             }
         }
         CodingProvider::OpenCode => {
@@ -1388,16 +1416,21 @@ async fn probe_provider(
                 auth_methods.push(ProviderAuthMethod::Subscription);
                 detail.push("OpenCode provider credentials available");
             }
+            subscription_authenticated.then_some(BillingLane::Subscription)
         }
         CodingProvider::Kimi => {
             if managed_kimi {
                 auth_methods.push(ProviderAuthMethod::Endpoint);
                 detail.push("Borg gateway credentials available");
+                Some(BillingLane::Endpoint)
             } else if nonempty_env("BORG_KIMI_API_KEY").is_some()
                 || nonempty_env("MOONSHOT_API_KEY").is_some()
             {
                 auth_methods.push(ProviderAuthMethod::ApiKey);
                 detail.push("Kimi API key configured");
+                Some(BillingLane::ApiKey)
+            } else {
+                None
             }
         }
         CodingProvider::Glm => {
@@ -1409,9 +1442,13 @@ async fn probe_provider(
             {
                 auth_methods.push(ProviderAuthMethod::Subscription);
                 detail.push("GLM Coding Plan key configured");
+                Some(BillingLane::Subscription)
             } else if nonempty_env("BORG_GLM_API_KEY").is_some() {
                 auth_methods.push(ProviderAuthMethod::ApiKey);
                 detail.push("GLM API key configured");
+                Some(BillingLane::ApiKey)
+            } else {
+                None
             }
         }
         CodingProvider::OpenRouter => {
@@ -1422,6 +1459,9 @@ async fn probe_provider(
             {
                 auth_methods.push(ProviderAuthMethod::ApiKey);
                 detail.push("OpenRouter API key configured");
+                Some(BillingLane::ApiKey)
+            } else {
+                None
             }
         }
         CodingProvider::OpenAiCompatible => {
@@ -1442,9 +1482,12 @@ async fn probe_provider(
                     auth_methods.push(ProviderAuthMethod::ApiKey);
                     detail.push("endpoint API key configured");
                 }
+                Some(BillingLane::Endpoint)
+            } else {
+                None
             }
         }
-    }
+    };
     let authenticated = !auth_methods.is_empty();
     let installed = match provider {
         // These routes execute in Borg's native harness; they do not depend
@@ -1471,6 +1514,7 @@ async fn probe_provider(
         auth_methods,
         can_spawn,
         usage: None,
+        billing,
     }
 }
 
@@ -1662,10 +1706,13 @@ fn claude_auth_status_authenticated(output: &str) -> bool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
         Err(_) => {
+            // Non-JSON output is an older CLI or an error banner. Only a
+            // positive statement counts; an unrelated message (a crash, an
+            // update notice, a login URL) must not read as authenticated.
             let normalized = output.to_ascii_lowercase();
-            !normalized.trim().is_empty()
-                && !normalized.contains("not logged in")
+            !normalized.contains("not logged in")
                 && !normalized.contains("logged out")
+                && (normalized.contains("logged in") || normalized.contains("authenticated"))
         }
     }
 }

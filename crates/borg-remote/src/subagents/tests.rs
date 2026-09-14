@@ -470,6 +470,7 @@ fn test_provider_capabilities() -> Vec<crate::ProviderCapability> {
         auth_methods: vec![crate::ProviderAuthMethod::Subscription],
         can_spawn: true,
         usage: None,
+        billing: None,
     })
     .collect()
 }
@@ -1885,6 +1886,7 @@ async fn subagent_admission_rejects_an_exhausted_subscription() {
             global: true,
         }],
         detail: Some("Claude subscription usage is exhausted".to_string()),
+        plan: None,
     });
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
