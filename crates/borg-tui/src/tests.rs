@@ -12778,3 +12778,98 @@ fn a_cleanly_completed_response_is_not_marked_interrupted() {
     assert!(rendered.contains("Done."), "{rendered}");
     assert!(!rendered.contains("user interrupted"), "{rendered}");
 }
+
+#[tokio::test]
+#[ignore = "requires a PTY; verifies live inspector identity across reordered entries"]
+async fn action_inspector_stays_on_its_entry_when_late_messages_arrive() {
+    let session_id = Uuid::new_v4();
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        session_id,
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    for (sequence, kind) in [
+        SessionEventKind::ReasoningDelta {
+            text: "thinking".into(),
+        },
+        SessionEventKind::ToolStarted {
+            tool_call_id: "run-identity".into(),
+            name: "exec".into(),
+            input: serde_json::json!({"cmd": "cargo test"}),
+            input_ref: None,
+        },
+        SessionEventKind::Error {
+            message: "error detail".into(),
+        },
+        SessionEventKind::PlanUpdated { items: Vec::new() },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        terminal.apply_session_event(&SessionEvent::new(session_id, sequence as u64 + 10, kind));
+    }
+    let targets = (0..terminal.transcript.order.len())
+        .filter(|index| terminal.transcript.inspector_heading(*index).is_some())
+        .collect::<Vec<_>>();
+    assert!(targets.len() >= 3);
+    for (offset, target) in targets.into_iter().enumerate() {
+        let target = target + offset;
+        let heading = terminal
+            .transcript
+            .inspector_heading(target)
+            .unwrap()
+            .0
+            .to_owned();
+        terminal.open_tool_inspector(target);
+        assert!(terminal.is_inspecting_action());
+        terminal.history_page_requested = true;
+        assert!(!terminal.take_history_page_request());
+        terminal.apply_session_event(&SessionEvent::new(
+            session_id,
+            100 + offset as u64,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "late prompt".into(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ));
+        assert_eq!(terminal.focused_tool, Some(target + 1));
+        assert_eq!(
+            terminal.transcript.inspector_heading(target + 1).unwrap().0,
+            heading
+        );
+        terminal.close_tool_inspector();
+    }
+    terminal.open_tool_inspector(terminal.transcript.order.len() - 1);
+    let focused = terminal.focused_tool;
+    let mut root = Transcript::default();
+    root.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ReasoningDelta {
+            text: "root".into(),
+        },
+    ));
+    terminal.director_transcript = Some(Box::new(root));
+    terminal.focused_child = Some(Uuid::new_v4());
+    terminal.apply_session_event(&SessionEvent::new(
+        session_id,
+        200,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "root prompt".into(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    ));
+    assert_eq!(terminal.focused_tool, focused);
+    terminal.shutdown().await;
+}

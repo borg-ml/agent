@@ -3262,7 +3262,8 @@ async fn run_local_agent_session(
                     .as_mut()
                     .expect("history-page task branch is guarded")
                     .await
-            }, if history_page_task.is_some() => {
+            }, if history_page_task.is_some()
+                && terminal.as_ref().is_none_or(|terminal| !terminal.is_inspecting_action()) => {
                 history_page_task = None;
                 if let Some(terminal) = terminal.as_mut() {
                     terminal.set_history_page_loading(false);

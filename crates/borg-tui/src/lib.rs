@@ -2374,6 +2374,10 @@ impl BorgTerminal {
             || composer_cursor_position(&self.composer.text, self.composer.cursor, width).0 == 0
     }
 
+    pub fn is_inspecting_action(&self) -> bool {
+        self.focused_tool.is_some()
+    }
+
     pub fn replace_history(&mut self, events: &[SessionEvent]) {
         let previous_height = self.rendered_transcript_height;
         let replaced_displayed = replace_root_transcript_history(
@@ -2405,7 +2409,11 @@ impl BorgTerminal {
     /// must never hydrate historical pages behind a user who is following the
     /// live tail.
     pub fn take_history_page_request(&mut self) -> bool {
-        if self.focused_child.is_some() {
+        // An open action inspector holds a transcript index, and hydrating an
+        // older page rebuilds `order` from a longer event list, renumbering
+        // every entry. Defer paging until the inspector closes rather than let
+        // the focused action silently become a different one.
+        if self.focused_child.is_some() || self.focused_tool.is_some() {
             self.history_page_requested = false;
             return false;
         }
@@ -2828,7 +2836,7 @@ impl BorgTerminal {
             }
             _ => {}
         }
-        let (removed_entry, transcript_changed) = {
+        let (removed_entry, inserted_entries, transcript_changed) = {
             let replaying_history = self.replaying_history;
             let transcript = self
                 .director_transcript
@@ -2866,13 +2874,22 @@ impl BorgTerminal {
                             SessionEventKind::AgentMessageReceived { .. } => false,
                             _ => true,
                         }));
+            let inserted_entries = transcript.take_entry_insertions();
             (
                 removed_entry,
+                inserted_entries,
                 changed || transcript.order.len() != entries_before,
             )
         };
-        if let Some(removed) = removed_entry {
-            self.remap_selection_after_entry_removal(removed);
+        if self.focused_child.is_none() {
+            if let Some(removed) = removed_entry {
+                self.remap_selection_after_entry_removal(removed);
+            }
+            // Removals are reported before insertions because the transcript
+            // applies them in that order within a single event.
+            for inserted in inserted_entries {
+                self.remap_selection_after_entry_insertion(inserted);
+            }
         }
         if transcript_changed {
             if should_preserve_transcript_viewport(self.transcript.follow_tail)
@@ -3000,8 +3017,13 @@ impl BorgTerminal {
         if self.focused_child == Some(agent.session_id) {
             let entries_before = self.transcript.order.len();
             let changed = session_event_changes_transcript(&child_event.kind);
-            if let Some(removed) = self.transcript.apply(child_event) {
+            let removed_entry = self.transcript.apply(child_event);
+            let inserted_entries = self.transcript.take_entry_insertions();
+            if let Some(removed) = removed_entry {
                 self.remap_selection_after_entry_removal(removed);
+            }
+            for inserted in inserted_entries {
+                self.remap_selection_after_entry_insertion(inserted);
             }
             changed || self.transcript.order.len() != entries_before
         } else {
@@ -3438,6 +3460,23 @@ impl BorgTerminal {
             self.remap_selection_after_entry_removal(removed);
         }
         self.invalidate_transcript_render_cache();
+    }
+
+    /// Shift viewport state that lives outside the transcript when an entry is
+    /// inserted ahead of it. A late user message (or any reordered insertion)
+    /// renumbers every following entry, so an inspector or selection anchored
+    /// by index would silently re-target whatever row slid into its place.
+    fn remap_selection_after_entry_insertion(&mut self, inserted: usize) {
+        if let Some(index) = self.focused_tool.as_mut()
+            && *index >= inserted
+        {
+            *index += 1;
+        }
+        if let Some(selection) = self.text_selection.as_mut() {
+            for point in [&mut selection.anchor, &mut selection.focus] {
+                point.entry += usize::from(point.entry >= inserted);
+            }
+        }
     }
 
     fn remap_selection_after_entry_removal(&mut self, removed: usize) {

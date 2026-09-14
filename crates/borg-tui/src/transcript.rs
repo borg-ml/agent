@@ -155,6 +155,12 @@ struct Transcript {
     expanded_tool_runs: HashSet<usize>,
     active_reasoning: Option<usize>,
     last_edit: Option<usize>,
+    /// Entry indices inserted ahead of existing rows since the owner last
+    /// drained them. Removals are reported through the `apply` return value;
+    /// insertions need the same channel so viewport state held outside the
+    /// transcript (the action inspector, a text selection) keeps pointing at
+    /// the entry the user chose rather than whatever slid into its index.
+    pending_entry_insertions: Vec<usize>,
     next_image_number: usize,
     message_markdown_cache: RefCell<MessageMarkdownCache>,
     tool_body_cache: RefCell<ToolBodyCache>,
@@ -251,6 +257,7 @@ impl Default for Transcript {
             expanded_tool_runs: HashSet::new(),
             active_reasoning: None,
             last_edit: None,
+            pending_entry_insertions: Vec::new(),
             next_image_number: 1,
             message_markdown_cache: RefCell::new(MessageMarkdownCache::default()),
             tool_body_cache: RefCell::new(ToolBodyCache::default()),
@@ -987,6 +994,9 @@ impl Transcript {
         event: &SessionEvent,
         reorder_late_user_messages: bool,
     ) -> Option<usize> {
+        // Scope recorded insertions to this event so a transcript nobody
+        // drains (an unfocused child) cannot accumulate stale indices.
+        self.pending_entry_insertions.clear();
         let provider_advanced = matches!(
             &event.kind,
             SessionEventKind::Message {
@@ -2180,7 +2190,16 @@ impl Transcript {
             .unwrap_or(self.order.len())
     }
 
+    /// Drain the entry indices inserted ahead of existing rows by the most
+    /// recent applied event, oldest first. Callers holding their own entry
+    /// indices must shift them by these, in order, exactly as
+    /// `reindex_after_insertion` shifted the transcript's own bookkeeping.
+    fn take_entry_insertions(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.pending_entry_insertions)
+    }
+
     fn reindex_after_insertion(&mut self, index: usize) {
+        self.pending_entry_insertions.push(index);
         let cache = self.message_markdown_cache.get_mut();
         cache.messages = cache
             .messages
