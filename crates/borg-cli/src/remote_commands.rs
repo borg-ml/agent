@@ -102,7 +102,7 @@ type AgentConfigPollResult = (
     Option<std::result::Result<AgentConfig, String>>,
 );
 type ProjectionGapRepairTask = tokio::task::JoinHandle<Result<Vec<SessionEvent>>>;
-type StaleOwnerHandoffTask = tokio::task::JoinHandle<Result<()>>;
+type StaleOwnerHandoffTask = tokio::task::JoinHandle<Result<bool>>;
 /// Resume filtering is local and eager, so load enough history to make search useful while
 /// keeping picker construction and per-keystroke filtering bounded.
 const RESUME_PICKER_SESSION_LIMIT: usize = 1_000;
@@ -1371,6 +1371,7 @@ async fn ensure_detached_session_host(
     if diagnostics_file.metadata()?.len() > 64 * 1024 {
         diagnostics_file.set_len(0)?;
     }
+    let diagnostics_start = diagnostics_file.metadata()?.len();
     let executable = std::env::current_exe().context("failed to locate the Borg executable")?;
     let mut command = TokioCommand::new(&executable);
     command
@@ -1391,12 +1392,12 @@ async fn ensure_detached_session_host(
         &mut child,
         || Ok(socket_path.exists() && local_session_owner_is_active(&sessions_dir, session_id)?),
         |terminal| show_session_recovery_notice(terminal,
-            &format!("Session {session_id} is still starting or recovering. Ctrl-C detaches; the host keeps recovering. {}", session_host_diagnostics(&diagnostics_path))),
+            &format!("Session {session_id} is still starting or recovering. Ctrl-C detaches; the host keeps recovering. {}", session_host_diagnostics(&diagnostics_path, diagnostics_start))),
         SESSION_HOST_START_NOTICE_INTERVAL,
         terminal,
     ).await;
     let result = result.map_err(|error| {
-        let detail = session_host_diagnostics(&diagnostics_path);
+        let detail = session_host_diagnostics(&diagnostics_path, diagnostics_start);
         if detail.is_empty() {
             error
         } else {
@@ -1406,18 +1407,22 @@ async fn ensure_detached_session_host(
     tokio::spawn(async move {
         let status = child.wait().await;
         if !matches!(status, Ok(status) if status.success()) {
-            tracing::warn!(?status, diagnostics = %session_host_diagnostics(&diagnostics_path),
+            tracing::warn!(?status, diagnostics = %session_host_diagnostics(&diagnostics_path, diagnostics_start),
                 "detached session host exited");
         }
     });
     result
 }
 
-fn session_host_diagnostics(path: &Path) -> String {
+fn session_host_diagnostics(path: &Path, launch_offset: u64) -> String {
     use std::io::{Read, Seek, SeekFrom};
     let read_tail = || -> io::Result<String> {
         let mut file = fs::File::open(path)?;
-        let start = file.metadata()?.len().saturating_sub(4096);
+        let start = file
+            .metadata()?
+            .len()
+            .saturating_sub(4096)
+            .max(launch_offset);
         file.seek(SeekFrom::Start(start))?;
         let mut tail = Vec::new();
         file.take(4096).read_to_end(&mut tail)?;
@@ -1906,7 +1911,7 @@ async fn run_local_agent_session(
         && args.session_host.is_none()
         && !BorgTerminal::fallback_requested();
     let store_open_started = std::time::Instant::now();
-    let sqlite_store = Arc::new(if interactive_store_open {
+    let sqlite_store = Arc::new(if interactive_store_open || args.session_host.is_some() {
         SqliteSessionStore::open_interactive(sessions_dir.join("sessions.sqlite3")).await?
     } else {
         SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?
@@ -1936,12 +1941,17 @@ async fn run_local_agent_session(
         .load_host_launch_metadata(session_id)
         .await?
         .is_some();
-    let mut writer = SessionWriterLease::try_acquire(&lock_path)?;
-    let mut session_access = if writer.is_some() {
+    let writer = SessionWriterLease::try_acquire(&lock_path)?;
+    let session_access = if writer.is_some() {
         LocalSessionAccess::Owned
     } else {
         LocalSessionAccess::Attached
     };
+    // A competing launcher may have started the host while this process opened
+    // SQLite. A host must never become a viewer or stop the winning owner.
+    if args.session_host.is_some() && session_access.is_attached() {
+        return Ok(None);
+    }
     if !sqlite_store.contains_session(session_id).await? {
         anyhow::ensure!(
             !session_access.is_attached(),
@@ -1984,25 +1994,8 @@ async fn run_local_agent_session(
     }
     let mut stale_local_owner = session_access.is_attached()
         && !remote_launch_present
+        && local_session_owner_is_active(&sessions_dir, session_id)?
         && !local_session_owner_uses_current_binary(&sessions_dir, session_id)?;
-    if stale_local_owner && stale_local_owner_can_handoff(session_state.status) {
-        // Prompt admission intentionally precedes the durable Starting event.
-        // Give an obsolete owner one short scheduling window to expose that
-        // transition before deciding its apparently Ready state is safe to
-        // hand off, so an update cannot eat a just-submitted prompt.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        session_state = store.state(session_id).await?;
-        if stale_local_owner_can_handoff(session_state.status) {
-            tracing::info!(%session_id, "replacing obsolete local session owner before attach");
-            writer = Some(
-                stop_stale_local_owner_and_acquire(&lock_path, &control_socket_path, session_id)
-                    .await?,
-            );
-            session_access = LocalSessionAccess::Owned;
-            session_state = store.state(session_id).await?;
-            stale_local_owner = false;
-        }
-    }
     let resuming = session_state.latest_sequence > 0;
     let mut current_goal = session_state.goal.clone();
     let mut current_todos = session_state.todos.clone();
@@ -2222,7 +2215,12 @@ async fn run_local_agent_session(
     let has_initial_prompt = initial_prompt.is_some();
     let interactive = can_prompt || args.gui_owner || args.session_host.is_some();
     let history_started = std::time::Instant::now();
-    let (mut history, mut history_page_before_sequence) = if can_prompt && !fallback_terminal {
+    let (mut history, mut history_page_before_sequence) = if args.session_host.is_some() {
+        // The headless host has no transcript to render. Its actor restores the
+        // recovery projection after publishing control; never replay the entire
+        // journal here before a terminal can attach.
+        (Vec::new(), session_state.latest_sequence.saturating_add(1))
+    } else if can_prompt && !fallback_terminal {
         let bootstrap =
             recent_tui_history(store.as_ref(), session_id, session_state.latest_sequence).await?;
         (bootstrap.events, bootstrap.page_before)
@@ -2553,20 +2551,20 @@ async fn run_local_agent_session(
             bootstrap_events = history.len(),
             "interactive session reached first paint"
         );
-        if interactive_store_open {
-            let maintenance_store = Arc::clone(&sqlite_store);
-            tokio::spawn(async move {
-                if let Err(error) = maintenance_store.finish_interactive_open(session_id).await {
-                    tracing::warn!(%session_id, %error, "deferred interactive store maintenance failed");
-                }
-            });
-        }
     } else if let Some(notice) = startup_update_notice.as_deref() {
         eprintln!("\n  {notice}\n");
     } else if let Some(notice) = retry_notice.as_deref() {
         eprintln!("\n  {notice}\n");
     }
     let mut displayed_update_notice = startup_update_notice;
+    if interactive_store_open || args.session_host.is_some() {
+        let maintenance_store = Arc::clone(&sqlite_store);
+        tokio::spawn(async move {
+            if let Err(error) = maintenance_store.finish_interactive_open(session_id).await {
+                tracing::warn!(%session_id, %error, "deferred local store maintenance failed");
+            }
+        });
+    }
     // Pending prompts are durable queue state, not part of the bounded
     // transcript bootstrap. Hydrate them after first paint so a long queue
     // cannot make resume wait on the full recovery projection, and ask the
@@ -2711,7 +2709,26 @@ async fn run_local_agent_session(
     let mut session_event_stream_open = true;
     let mut queued_session_events = VecDeque::new();
     let mut projection_gap_repair_task: Option<ProjectionGapRepairTask> = None;
-    let mut stale_owner_handoff_task: Option<StaleOwnerHandoffTask> = None;
+    let mut stale_owner_handoff_task: Option<StaleOwnerHandoffTask> =
+        if stale_local_owner && stale_local_owner_can_handoff(session_state.status) {
+            let lock_path = lock_path.clone();
+            let socket_path = control_socket_path.clone();
+            let store = Arc::clone(&store);
+            Some(tokio::spawn(async move {
+                // Prompt admission precedes the durable Starting event. Recheck
+                // after a scheduling window without delaying the first frame.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                if stale_local_owner_can_handoff(store.state(session_id).await?.status) {
+                    let _writer =
+                        stop_stale_local_owner_and_acquire(&lock_path, &socket_path, session_id)
+                            .await?;
+                    return Ok(true);
+                }
+                Ok(false)
+            }))
+        } else {
+            None
+        };
     let mut ui_interaction_completions_open = true;
     let mut editor_preferences_errors_open = true;
     let mut payload_hydration_results_open = true;
@@ -2783,10 +2800,11 @@ async fn run_local_agent_session(
             }, if stale_owner_handoff_task.is_some() => {
                 stale_owner_handoff_task = None;
                 match result {
-                    Ok(Ok(())) => {
+                    Ok(Ok(true)) => {
                         stale_local_owner = false;
                         resume_session = Some(session_id);
                     }
+                    Ok(Ok(false)) => {}
                     Ok(Err(error)) => {
                         tracing::warn!(%error, %session_id, "could not replace obsolete local session owner");
                         if let Some(terminal) = terminal.as_mut() {
@@ -3802,7 +3820,8 @@ async fn run_local_agent_session(
                             session_id,
                             HostCommand::Stop { session_id },
                         )
-                        .await
+                        .await?;
+                        Ok(true)
                     }));
                 }
                 if pending_approval.is_some() && !can_prompt {
@@ -7491,21 +7510,34 @@ async fn recent_tui_history(
     session_id: Uuid,
     latest_sequence: u64,
 ) -> Result<ResumeBootstrapHistory> {
-    let (checkpoint, latest_user_messages, scanned) = tokio::try_join!(
+    let scan_after = recent_tui_history_after(latest_sequence);
+    let (checkpoint, latest_user_messages, latest_messages, scanned) = tokio::try_join!(
         store.latest_completed_context_compaction(session_id),
         store.recent_user_messages(session_id, 1),
+        store.recent_messages(session_id, RICH_TUI_HISTORY_MESSAGE_LIMIT),
         store.events_after(
             session_id,
-            recent_tui_history_after(latest_sequence),
+            scan_after,
             RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT,
         ),
     )?;
+    // The tail scan is keyed on the latest sequence, so it only reaches the
+    // conversation when the newest events are conversation events. After a
+    // long autonomous turn the stream ends in thousands of subagent and tool
+    // events and the scan contains no message at all, which is why resume
+    // could open on an old prompt instead of the last reply. Splice the
+    // newest turns back in by sequence; raising the scan cap cannot fix this
+    // because the gap is unbounded.
     let mut scanned = scanned;
-    if let Some(latest_user) = latest_user_messages.into_iter().next()
-        && !scanned.iter().any(|event| event.id == latest_user.id)
+    for message in latest_messages
+        .into_iter()
+        .chain(latest_user_messages.into_iter().next())
     {
-        let index = scanned.partition_point(|event| event.sequence < latest_user.sequence);
-        scanned.insert(index, latest_user);
+        if scanned.iter().any(|event| event.id == message.id) {
+            continue;
+        }
+        let index = scanned.partition_point(|event| event.sequence < message.sequence);
+        scanned.insert(index, message);
     }
     let selection = select_resume_bootstrap_history(scanned);
     let mut selected = selection.events;
@@ -7515,11 +7547,24 @@ async fn recent_tui_history(
         let index = selected.partition_point(|event| event.sequence < checkpoint.sequence);
         selected.insert(index, checkpoint);
     }
+    // Spliced rows sit below the scan window, so they must never become the
+    // paging cursor: paging only walks older, and a cursor pinned to a
+    // spliced sequence would strand the whole interval between it and the
+    // contiguous tail. Keep the cursor inside the scanned window, which is
+    // the first region actually known to be complete.
+    let page_before = selection
+        .page_before
+        .filter(|sequence| *sequence > scan_after)
+        .or_else(|| {
+            selected
+                .iter()
+                .map(|event| event.sequence)
+                .find(|sequence| *sequence > scan_after)
+        })
+        .unwrap_or_else(|| latest_sequence.saturating_add(1));
     Ok(ResumeBootstrapHistory {
         events: selected,
-        page_before: selection
-            .page_before
-            .unwrap_or_else(|| latest_sequence.saturating_add(1)),
+        page_before,
     })
 }
 

@@ -22,8 +22,9 @@ use uuid::Uuid;
 
 use crate::session_action::{SessionAction, SessionActionState, SessionActionTransition};
 use crate::{
-    CodingProvider, MessageStatus, PermissionMode, PlanItem, ResponseLanguage, SessionEvent,
-    SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef, SessionStatus,
+    CodingProvider, EventActor, MessageStatus, PermissionMode, PlanItem, ResponseLanguage,
+    SessionEvent, SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef,
+    SessionStatus,
 };
 
 pub(crate) const INLINE_SESSION_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -1162,6 +1163,52 @@ pub trait SessionStore: Send + Sync {
             .await?
             .into_iter()
             .filter(|event| event.kind.is_recallable_user_message())
+            .rev()
+            .take(limit)
+            .collect::<Vec<_>>();
+        messages.reverse();
+        Ok(messages)
+    }
+    /// Return the newest conversation turns **this session authored itself**,
+    /// ordered from oldest to newest, in the session's logical sequence space.
+    ///
+    /// Resume needs the end of the conversation, which is not the end of the
+    /// event stream: a long autonomous turn can append hundreds of thousands
+    /// of subagent and tool events after the last reply, so any bounded tail
+    /// scan keyed on the latest sequence lands in that noise and reaches no
+    /// message at all. The sqlite override answers this from the partial
+    /// message index, so the cost tracks `limit` instead of the trailing
+    /// event volume.
+    ///
+    /// A fork's inherited prefix is deliberately excluded, because including
+    /// it cannot be bounded: an inherited event's logical sequence is its rank
+    /// in the composed parent prefix, so placing one would mean counting the
+    /// inheritable parent events below it, which is a full index range scan
+    /// per row and recursive across grandparents. Excluding it costs nothing
+    /// in practice: the inherited prefix occupies logical `1..=inherited`, so
+    /// whenever a caller's bounded tail scan reaches down into that range it
+    /// is already served by the fork projection, which renumbers and rewrites
+    /// inherited events correctly. The only thinner case is a fork that
+    /// authored a long local tail but fewer than `limit` local messages, which
+    /// returns fewer rows rather than wrong ones, and the remainder still
+    /// pages in normally.
+    async fn recent_messages(&self, session_id: Uuid, limit: usize) -> Result<Vec<SessionEvent>> {
+        let inherited = self.inherited_event_count(session_id).await?;
+        let mut messages = self
+            .read(session_id)
+            .await?
+            .into_iter()
+            .filter(|event| {
+                event.sequence > inherited
+                    && matches!(
+                        event.kind,
+                        SessionEventKind::Message {
+                            actor: EventActor::User | EventActor::Assistant,
+                            status: MessageStatus::Complete | MessageStatus::InProgress,
+                            ..
+                        }
+                    )
+            })
             .rev()
             .take(limit)
             .collect::<Vec<_>>();
@@ -6581,6 +6628,39 @@ impl SessionStore for SqliteSessionStore {
              order by sequence desc limit ?",
         )
         .bind(session_id.to_string())
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut messages = rows
+            .into_iter()
+            .map(|row| serde_json::from_str(row.try_get("event_json")?).map_err(Into::into))
+            .collect::<Result<Vec<SessionEvent>>>()?;
+        messages.reverse();
+        Ok(messages)
+    }
+
+    async fn recent_messages(&self, session_id: Uuid, limit: usize) -> Result<Vec<SessionEvent>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Served by idx_session_events_message_sequence, which is partial on
+        // event_kind = 'message' and already ordered by descending sequence.
+        //
+        // A fork stores only its own events, numbered from inherited + 1, so
+        // these rows already carry logical sequences and need no projection.
+        // The bound is stated rather than left implicit so this matches the
+        // trait's locally-authored contract by construction instead of by
+        // coincidence of where a fork's rows happen to start.
+        let session = self.session_row(session_id).await?;
+        let rows = sqlx::query(
+            "select event_json from session_events \
+             where session_id = ? and event_kind = 'message' and sequence > ? \
+             and json_extract(event_json, '$.kind.actor') in ('user', 'assistant') \
+             and json_extract(event_json, '$.kind.status') in ('complete', 'in_progress') \
+             order by sequence desc limit ?",
+        )
+        .bind(session_id.to_string())
+        .bind(i64::try_from(session.inherited_event_count).unwrap_or(i64::MAX))
         .bind(i64::try_from(limit).unwrap_or(i64::MAX))
         .fetch_all(&self.pool)
         .await?;

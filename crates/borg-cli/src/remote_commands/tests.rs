@@ -240,6 +240,52 @@ fn resume_retries_sqlite_contention_but_not_permanent_errors() {
     )));
 }
 
+#[tokio::test]
+async fn competing_detached_host_exits_without_waiting_for_database_writer_or_stopping_owner() {
+    let root = short_socket_tempdir();
+    let session_id = Uuid::new_v4();
+    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    store.create_session(session_id).await.unwrap();
+    let lock_path = root.path().join(format!("{session_id}.lock"));
+    let writer = SessionWriterLease::try_acquire(&lock_path)
+        .unwrap()
+        .unwrap();
+    let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("update sessions set updated_at=updated_at where id=?")
+        .bind(session_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    let mut args = LocalAgentCliArgs::resume(Some(session_id));
+    args.session_host = Some(session_id);
+    args.local_only = true;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        run_local_agent_session(
+            &args,
+            None,
+            None,
+            Some(root.path()),
+            Arc::new(TuiCrashContext::default()),
+            None,
+        ),
+    )
+    .await
+    .expect("competing host blocked on database maintenance")
+    .expect("competing host must exit successfully");
+    assert!(result.is_none());
+    assert!(
+        SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .is_none()
+    );
+    transaction.rollback().await.unwrap();
+    drop(writer);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn detached_host_waits_past_notice_interval_without_replacing_live_child() {
@@ -769,6 +815,235 @@ async fn first_resume_frame_keeps_latest_updates_from_a_long_autonomous_turn() {
         SessionEventKind::Message { actor: EventActor::Assistant, text, .. }
             if text == "latest autonomous update"
     )));
+}
+
+/// The sibling test above ends the stream on the last reply, so the bounded
+/// tail scan reaches the conversation by construction. Real autonomous turns
+/// end in subagent and tool traffic instead: the reported session held 4,400
+/// non-message events after its last reply, so the scan window contained no
+/// message at all and resume opened on a prompt from hours earlier. Only a
+/// conversation end parked behind a longer-than-scan-limit tail reproduces
+/// that, which is what this builds.
+#[tokio::test]
+async fn first_resume_frame_reaches_a_conversation_end_buried_behind_a_long_event_tail() {
+    let directory = tempdir().unwrap();
+    let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "recovered request".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let reply = store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: "the patch remains staged".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ))
+        .await
+        .unwrap();
+    for _ in 0..(RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT * 2) {
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ReasoningCompleted,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let latest_sequence = store.state(session_id).await.unwrap().latest_sequence;
+    let history = recent_tui_history(&store, session_id, latest_sequence)
+        .await
+        .unwrap();
+
+    let messages = history
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::Message { actor, text, .. } => Some((*actor, text.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        vec![
+            (EventActor::User, "recovered request"),
+            (EventActor::Assistant, "the patch remains staged"),
+        ],
+        "the first frame must end on the last reply, not on the prompt that opened the turn"
+    );
+    assert!(
+        history
+            .events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence),
+        "spliced conversation rows must stay in sequence order"
+    );
+    // The reply is spliced from outside the scan window, so it must not become
+    // the paging cursor: everything between it and the retained tail is still
+    // unloaded and only pages in from a cursor inside that window.
+    assert!(history.page_before > reply.sequence);
+    assert!(history.page_before > recent_tui_history_after(latest_sequence));
+    let older = older_tui_history(&store, session_id, history.page_before)
+        .await
+        .unwrap();
+    assert!(
+        older
+            .iter()
+            .any(|event| event.sequence > reply.sequence && event.sequence < history.page_before),
+        "paging up must load the interval the splice skipped"
+    );
+}
+
+/// The conversation splice reads a fork's own rows, which are numbered from
+/// `inherited + 1` and therefore already live in the fork's logical sequence
+/// space. This pins that: a fork must reach its own conversation end behind a
+/// long local tail, the spliced rows must sit above the inherited prefix, and
+/// the frame must still be ordered and page correctly. Without the explicit
+/// bound the splice would depend on where a fork's rows happen to start.
+#[tokio::test]
+async fn first_resume_frame_reaches_a_forked_conversation_end_in_logical_sequence_space() {
+    let directory = tempdir().unwrap();
+    let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    let parent_id = Uuid::new_v4();
+    store.create_session(parent_id).await.unwrap();
+    for text in ["inherited prompt", "inherited reply"] {
+        let actor = if text == "inherited prompt" {
+            EventActor::User
+        } else {
+            EventActor::Assistant
+        };
+        store
+            .append(SessionEvent::new(
+                parent_id,
+                0,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor,
+                    text: text.to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    let fork_id = Uuid::new_v4();
+    let fork = store.fork_before(parent_id, fork_id, 3).await.unwrap();
+    assert!(fork.inherited_event_count > 0);
+    store
+        .append(SessionEvent::new(
+            fork_id,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "forked prompt".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let forked_reply = store
+        .append(SessionEvent::new(
+            fork_id,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: "forked reply".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ))
+        .await
+        .unwrap();
+    for _ in 0..(RICH_TUI_HISTORY_BOOTSTRAP_SCAN_LIMIT * 2) {
+        store
+            .append(SessionEvent::new(
+                fork_id,
+                0,
+                SessionEventKind::ReasoningCompleted,
+            ))
+            .await
+            .unwrap();
+    }
+
+    let spliced = store
+        .recent_messages(fork_id, RICH_TUI_HISTORY_MESSAGE_LIMIT)
+        .await
+        .unwrap();
+    assert!(
+        spliced
+            .iter()
+            .all(|event| event.sequence > fork.inherited_event_count
+                && event.session_id == fork_id),
+        "the splice must stay inside the rows the fork authored itself"
+    );
+    assert_eq!(
+        spliced
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        spliced
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        "spliced rows must be ordered and unique in logical sequence space"
+    );
+
+    let latest_sequence = store.state(fork_id).await.unwrap().latest_sequence;
+    let history = recent_tui_history(&store, fork_id, latest_sequence)
+        .await
+        .unwrap();
+    assert!(
+        history.events.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::Message { actor: EventActor::Assistant, text, .. }
+                if text == "forked reply"
+        )),
+        "a fork must reach its own conversation end on the first frame"
+    );
+    assert!(
+        history
+            .events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence)
+    );
+    assert!(history.page_before > forked_reply.sequence);
+    // The inherited prefix is not spliced, so it must remain reachable the
+    // normal way: paging walks down into the projection that renumbers it.
+    assert!(history.page_before > fork.inherited_event_count);
 }
 
 #[test]
@@ -2851,7 +3126,22 @@ async fn resume_hydration_over_a_real_session_store_is_bounded() {
         .queue_events;
     let queue_elapsed = queue_started.elapsed();
 
-    assert!(bootstrap.events.len() <= RICH_TUI_HISTORY_EVENT_LIMIT + 2);
+    // Tail + spliced conversation turns + the latest prompt + the compaction
+    // checkpoint. The conversation splice is what puts the end of the thread
+    // on the first frame when the stream ends in subagent traffic.
+    assert!(
+        bootstrap.events.len() <= RICH_TUI_HISTORY_EVENT_LIMIT + RICH_TUI_HISTORY_MESSAGE_LIMIT + 2
+    );
+    assert!(
+        bootstrap.events.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::Message {
+                actor: EventActor::Assistant,
+                ..
+            }
+        )),
+        "the first frame must reach the conversation, not just the event tail"
+    );
     assert_eq!(
         latest_subagent_snapshots(&team_history).len(),
         snapshots.len()
