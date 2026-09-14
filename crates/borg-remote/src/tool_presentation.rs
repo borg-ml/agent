@@ -618,6 +618,12 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
         return (label, detail);
     }
 
+    if tool.contains("fetch")
+        && let Some(url) = string_field(input, "url").filter(|url| !url.trim().is_empty())
+    {
+        return ("Fetch web".to_string(), compact_text(url, 120));
+    }
+
     if name.to_ascii_lowercase().contains("web") {
         let detail = web_search_query(input)
             .map(|query| format!("“{}”", compact_text(&query, 120)))
