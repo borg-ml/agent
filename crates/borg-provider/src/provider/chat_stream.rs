@@ -4408,6 +4408,8 @@ mod tests {
                 "stream-json",
                 "--verbose",
                 "--include-partial-messages",
+                "--disallowedTools",
+                "Agent,Task",
                 "--permission-mode",
                 "manual",
                 "--no-session-persistence",
