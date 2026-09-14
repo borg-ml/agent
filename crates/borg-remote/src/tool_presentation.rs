@@ -626,7 +626,7 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
     }
 
     if let Some(command) = command_from_input(input) {
-        if let Some(query) = search_query(command) {
+        if let Some(query) = search_chain_query(command) {
             return (
                 "Search".to_string(),
                 format!("“{}”", compact_text(&query, 120)),
@@ -953,7 +953,7 @@ fn tool_category(name: &str, label: &str, input: &Value) -> ToolPresentationCate
         if let Some(command) = command_from_input(input)
             && command_is_read_only(command)
         {
-            if search_query(command).is_some() {
+            if search_chain_query(command).is_some() {
                 ToolPresentationCategory::Search
             } else {
                 ToolPresentationCategory::Read
@@ -1962,6 +1962,47 @@ fn search_query(command: &str) -> Option<String> {
     if let Some(script) = shell_script(&words) {
         return search_query(script);
     }
+    search_query_in_words(words)
+}
+
+/// Classify a command as a search only when searching is the whole of its
+/// work: one `rg`/`grep` invocation, alone or inside a pipeline whose other
+/// stages are read-only filters. A chain that also runs unrelated commands
+/// stays an execution, because labelling it "Searched" would hide everything
+/// else it did. Quoted arguments and nested `sh -c` scripts are resolved by
+/// the existing shell parse rather than matched as raw text.
+fn search_chain_query(command: &str) -> Option<String> {
+    let words = shell_words(command);
+    if let Some(script) = shell_script(&words) {
+        return search_chain_query(script);
+    }
+    let mut search = None;
+    let mut executed = 0usize;
+    for (operator, segment) in shell_command_segments(&words) {
+        if segment.is_empty() || is_shell_setup_segment(&segment) {
+            continue;
+        }
+        // `;`, `&&` and `||` start a new command; only a pipeline keeps
+        // feeding the same search.
+        if executed > 0 && operator != Some("|") {
+            return None;
+        }
+        executed += 1;
+        let executable = segment.first().and_then(|word| word.rsplit('/').next());
+        if matches!(executable, Some("rg" | "grep")) {
+            if search.is_none() {
+                search = Some(segment);
+            }
+            continue;
+        }
+        if !command_is_read_only(&segment.join(" ")) {
+            return None;
+        }
+    }
+    search.and_then(search_query_in_words)
+}
+
+fn search_query_in_words(words: Vec<String>) -> Option<String> {
     let search_index = words
         .iter()
         .position(|word| matches!(word.rsplit('/').next(), Some("rg" | "grep")))?;
@@ -2292,6 +2333,51 @@ fn patch_source(source: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mixed_shell_chains_are_not_searches() {
+        for command in [
+            "sed -n 1,20p src/lib.rs; rg pattern src; python3 -c 1",
+            "rg pattern src && cargo test",
+            "sh -c \"rg pattern src; cargo test\"",
+        ] {
+            assert_eq!(
+                super::tool_call_summary("exec", &serde_json::json!({"cmd": command})).0,
+                "Run"
+            );
+        }
+        for command in [
+            "rg pattern src; cat README.md",
+            "rg pattern src | head -20; git status",
+        ] {
+            assert_ne!(
+                super::project_tool_presentation(
+                    "exec",
+                    &serde_json::json!({"cmd": command}),
+                    None,
+                    false
+                )
+                .category,
+                super::ToolPresentationCategory::Search
+            );
+        }
+        assert_eq!(
+            super::tool_call_summary(
+                "exec",
+                &serde_json::json!({"cmd": "rg pattern src | head -20; git status"})
+            )
+            .0,
+            "Inspect repository"
+        );
+        assert_eq!(
+            super::tool_call_summary(
+                "exec",
+                &serde_json::json!({"cmd": "rg pattern src | head -20"})
+            )
+            .0,
+            "Search"
+        );
+    }
+
     use serde_json::json;
 
     use super::*;
