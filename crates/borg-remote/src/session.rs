@@ -684,6 +684,11 @@ const TURN_WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const TURN_WATCHDOG_WARNING_AFTER: Duration = Duration::from_secs(60);
 #[cfg(test)]
 const TURN_WATCHDOG_WARNING_AFTER: Duration = Duration::from_millis(50);
+const TURN_WATCHDOG_SUSPECT_AFTER: Duration = Duration::from_secs(5 * 60);
+const TURN_WATCHDOG_WAKE_GRACE: Duration = Duration::from_secs(60);
+// A missed poll may be suspension or a scheduler pause; either warrants one
+// bounded chance to reconnect, not an immediate timeout.
+const TURN_WATCHDOG_WAKE_GAP: Duration = Duration::from_secs(30);
 /// A provider that stopped answering can also refuse to die; the terminal
 /// boundary must not wait on it.
 #[cfg(not(test))]
@@ -731,6 +736,10 @@ struct TurnWatchdog {
     last_output_wall: std::time::SystemTime,
     active_tools: HashSet<String>,
     warned: bool,
+    suspected: bool,
+    last_poll_mono: tokio::time::Instant,
+    last_poll_wall: std::time::SystemTime,
+    wake_grace_until: Option<tokio::time::Instant>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -753,6 +762,10 @@ impl TurnWatchdog {
             last_output_wall: std::time::SystemTime::now(),
             active_tools: HashSet::new(),
             warned: false,
+            suspected: false,
+            last_poll_mono: tokio::time::Instant::now(),
+            last_poll_wall: std::time::SystemTime::now(),
+            wake_grace_until: None,
         }
     }
 
@@ -780,6 +793,10 @@ impl TurnWatchdog {
     fn note_output(&mut self) -> bool {
         self.last_output_mono = tokio::time::Instant::now();
         self.last_output_wall = std::time::SystemTime::now();
+        self.last_poll_mono = self.last_output_mono;
+        self.last_poll_wall = self.last_output_wall;
+        self.wake_grace_until = None;
+        self.suspected = false;
         std::mem::take(&mut self.warned)
     }
 
@@ -835,6 +852,28 @@ impl TurnWatchdog {
     }
 
     fn verdict(&mut self) -> WatchdogVerdict {
+        let now = tokio::time::Instant::now();
+        let wall = std::time::SystemTime::now();
+        let poll_gap = now
+            .duration_since(self.last_poll_mono)
+            .max(wall.duration_since(self.last_poll_wall).unwrap_or_default());
+        self.last_poll_mono = now;
+        self.last_poll_wall = wall;
+        if matches!(self.phase, TurnPhase::AwaitingProvider | TurnPhase::Active)
+            && poll_gap >= TURN_WATCHDOG_POLL_INTERVAL + TURN_WATCHDOG_WAKE_GAP
+        {
+            self.wake_grace_until = Some(now + TURN_WATCHDOG_WAKE_GRACE);
+            self.warned = true;
+            return WatchdogVerdict::Stalling(format!(
+                "{}; host resumed or watchdog was delayed; allowing {}s for provider reconnection",
+                self.phase.detail(),
+                TURN_WATCHDOG_WAKE_GRACE.as_secs(),
+            ));
+        }
+        if self.wake_grace_until.is_some_and(|deadline| now < deadline) {
+            return WatchdogVerdict::Healthy;
+        }
+        self.wake_grace_until = None;
         let idle = self.idle();
         let budget = self.budget();
         if budget.is_some_and(|budget| idle >= budget) {
@@ -850,8 +889,15 @@ impl TurnWatchdog {
         if self.phase != TurnPhase::Active {
             return WatchdogVerdict::Healthy;
         }
-        // Warn early rather than halfway: on a short budget half of it is still
-        // a long silence, and on a long one a minute is enough to be useful.
+        if self.active_tools.is_empty() && idle >= TURN_WATCHDOG_SUSPECT_AFTER && !self.suspected {
+            self.warned = true;
+            self.suspected = true;
+            return WatchdogVerdict::Stalling(format!(
+                "{}; possibly stalled; {}; still waiting for provider",
+                self.phase.detail(),
+                humanize_idle(idle),
+            ));
+        }
         let warn_after = budget
             .map(|budget| (budget / 2).min(TURN_WATCHDOG_WARNING_AFTER))
             .unwrap_or(TURN_WATCHDOG_WARNING_AFTER);
@@ -860,7 +906,7 @@ impl TurnWatchdog {
         }
         self.warned = true;
         WatchdogVerdict::Stalling(format!(
-            "{}; {}; {}",
+            "{}; waiting for provider; {}; {}",
             self.phase.detail(),
             humanize_idle(idle),
             self.activity(),

@@ -11909,21 +11909,76 @@ third"
 // while a human owns the turn.
 
 #[tokio::test(flavor = "current_thread")]
-async fn a_suspended_host_expires_the_watchdog_on_wall_clock_time() {
+async fn a_suspended_host_gets_one_bounded_reconnection_grace() {
+    for phase in [TurnPhase::AwaitingProvider, TurnPhase::Active] {
+        for monotonic_includes_sleep in [false, true] {
+            let mut watchdog = TurnWatchdog::new(phase);
+            let sleep = Duration::from_secs(6 * 60 * 60);
+            watchdog.last_output_wall = std::time::SystemTime::now() - sleep;
+            watchdog.last_poll_wall = watchdog.last_output_wall;
+            if monotonic_includes_sleep {
+                watchdog.last_poll_mono = tokio::time::Instant::now() - sleep;
+            }
+            let before = tokio::time::Instant::now();
+            assert!(
+                matches!(watchdog.verdict(), WatchdogVerdict::Stalling(detail)
+                if detail.contains("reconnection"))
+            );
+            let deadline = watchdog.wake_grace_until.unwrap();
+            assert!(deadline >= before + TURN_WATCHDOG_WAKE_GRACE);
+            assert!(deadline <= tokio::time::Instant::now() + TURN_WATCHDOG_WAKE_GRACE);
+            for _ in 0..3 {
+                assert_eq!(watchdog.verdict(), WatchdogVerdict::Healthy);
+                assert_eq!(watchdog.wake_grace_until, Some(deadline));
+            }
+            // Expiring the grace does not erase the pre-sleep silence budget.
+            watchdog.wake_grace_until = Some(tokio::time::Instant::now());
+            assert!(matches!(watchdog.verdict(), WatchdogVerdict::Expired(_)));
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn progress_and_cancellation_end_reconnection_grace() {
     let mut watchdog = TurnWatchdog::new(TurnPhase::Active);
-    // A sleeping host freezes the monotonic clock, so the worker still looks
-    // busy to it long after the provider stopped existing.
-    watchdog.last_output_wall = std::time::SystemTime::now() - Duration::from_secs(6 * 60 * 60);
+    watchdog.last_poll_wall = std::time::SystemTime::now() - Duration::from_secs(3600);
+    assert!(matches!(watchdog.verdict(), WatchdogVerdict::Stalling(_)));
+    assert!(watchdog.note_output());
+    assert!(watchdog.wake_grace_until.is_none());
+    assert_eq!(watchdog.verdict(), WatchdogVerdict::Healthy);
+
+    for phase in [TurnPhase::Cancelling, TurnPhase::Draining] {
+        watchdog.set_phase(phase);
+        watchdog.last_poll_wall = std::time::SystemTime::now() - Duration::from_secs(3600);
+        watchdog.last_output_wall = watchdog.last_poll_wall;
+        assert!(matches!(watchdog.verdict(), WatchdogVerdict::Expired(_)));
+        assert!(watchdog.wake_grace_until.is_none());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn quiet_model_escalates_visibility_without_failing_at_five_minutes() {
+    let mut watchdog = TurnWatchdog::new(TurnPhase::Active);
+    watchdog.stall_timeout = Some(Duration::from_secs(20 * 60));
+    watchdog.last_output_wall = std::time::SystemTime::now() - TURN_WATCHDOG_WARNING_AFTER;
     assert!(
-        watchdog.last_output_mono.elapsed() < Duration::from_secs(1),
-        "the monotonic clock must still look fresh for this to be a regression"
+        matches!(watchdog.verdict(), WatchdogVerdict::Stalling(detail)
+        if detail.contains("waiting for provider") && !detail.contains("possibly stalled"))
     );
-    assert!(matches!(
-        watchdog.verdict(),
-        WatchdogVerdict::Expired(error)
-            if error.contains("no provider output for 360m")
-                && error.contains("the model has not responded")
-    ));
+    assert_eq!(watchdog.verdict(), WatchdogVerdict::Healthy);
+
+    watchdog.last_output_wall = std::time::SystemTime::now() - TURN_WATCHDOG_SUSPECT_AFTER;
+    assert!(
+        matches!(watchdog.verdict(), WatchdogVerdict::Stalling(detail)
+        if detail.contains("possibly stalled"))
+    );
+    watchdog.last_output_wall = std::time::SystemTime::now() - Duration::from_secs(19 * 60);
+    assert_eq!(watchdog.verdict(), WatchdogVerdict::Healthy);
+    watchdog.last_output_wall = std::time::SystemTime::now() - Duration::from_secs(20 * 60);
+    assert!(matches!(watchdog.verdict(), WatchdogVerdict::Expired(_)));
+    assert!(watchdog.note_output());
+    assert!(!watchdog.suspected);
+    assert_eq!(watchdog.verdict(), WatchdogVerdict::Healthy);
 }
 
 #[tokio::test(flavor = "current_thread")]
