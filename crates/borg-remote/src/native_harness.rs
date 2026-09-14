@@ -29,6 +29,11 @@ const MAX_TOOL_RESULT_BYTES: usize = 1024 * 1024;
 const MAX_APPROVAL_DETAIL_BYTES: usize = 8 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+/// Continuations granted when the model hits its completion-token limit
+/// before finishing a reply. Each one keeps the truncated prefix as its own
+/// message and asks the model to resume, instead of discarding the turn.
+const MAX_LENGTH_CONTINUATIONS: usize = 2;
+const LENGTH_CONTINUATION_PROMPT: &str = "Your previous reply was cut off at the output-token limit. Continue exactly where it stopped, without repeating what was already written.";
 #[derive(Clone)]
 pub(crate) struct NativeHarness {
     model_client: Arc<dyn NativeModelClient>,
@@ -259,6 +264,8 @@ impl NativeHarness {
         let mut assistant_message_id = Uuid::new_v4();
         let mut model_round = 0_usize;
         let mut tool_round = 0_usize;
+        let mut length_continuations = 0_usize;
+        let mut truncated_text = String::new();
         loop {
             model_round += 1;
             let result = match self
@@ -319,7 +326,47 @@ impl NativeHarness {
             messages.push(result.message.clone());
 
             if result.finish_reason == "length" {
-                bail!("native provider response was truncated at the completion-token limit");
+                // Truncated tool-call arguments cannot be resumed, and an
+                // endless chain of continuations would burn the budget; a
+                // truncated prose reply is kept and continued.
+                if !tool_calls.is_empty() || length_continuations >= MAX_LENGTH_CONTINUATIONS {
+                    bail!("native provider response was truncated at the completion-token limit");
+                }
+                length_continuations += 1;
+                let partial = content.clone().unwrap_or_default();
+                if !partial.trim().is_empty() {
+                    send(
+                        &events,
+                        SessionEventKind::Message {
+                            message_id: assistant_message_id,
+                            actor: EventActor::Assistant,
+                            text: partial.clone(),
+                            attachments: Vec::new(),
+                            status: MessageStatus::Complete,
+                            delivery: None,
+                        },
+                    )
+                    .await;
+                    truncated_text.push_str(&partial);
+                }
+                assistant_message_id = Uuid::new_v4();
+                let nudge = ModelMessage::user(LENGTH_CONTINUATION_PROMPT);
+                record_native_message(&events, turn.provider, &nudge).await?;
+                messages.push(nudge);
+                canonicalize_native_messages(&mut messages);
+                send(
+                    &events,
+                    SessionEventKind::ProviderEvent {
+                        provider: turn.provider,
+                        kind: "native_response_continued".to_string(),
+                        payload: json!({
+                            "model_round": model_round,
+                            "continuation": length_continuations,
+                        }),
+                    },
+                )
+                .await;
+                continue;
             }
             if tool_calls.is_empty() {
                 if result.finish_reason != "stop" {
@@ -355,7 +402,11 @@ impl NativeHarness {
                 .await;
                 return Ok(AgentTurnResult {
                     provider_session_id: None,
-                    final_text,
+                    final_text: if truncated_text.is_empty() {
+                        final_text
+                    } else {
+                        format!("{truncated_text}{final_text}")
+                    },
                 });
             }
             if result.finish_reason != "tool_calls" {
@@ -539,13 +590,10 @@ impl NativeHarness {
                 },
             )
             .await;
-            if native_usage_needs_auto_compaction(&result.usage, trailing_context_tokens) {
-                let context_tokens = result
-                    .usage
-                    .context_tokens
-                    .unwrap_or_default()
-                    .saturating_add(trailing_context_tokens);
-                let context_window_tokens = result.usage.context_window_tokens.unwrap_or_default();
+            let budget = native_context_budget(&result.usage, &messages, trailing_context_tokens);
+            if budget.needs_auto_compaction() {
+                let context_tokens = budget.context_tokens;
+                let context_window_tokens = budget.context_window_tokens;
                 send(
                     &events,
                     SessionEventKind::ProviderEvent {
@@ -556,6 +604,10 @@ impl NativeHarness {
                             "summary": "Compacting context…",
                             "automatic": true,
                             "trigger": "tool_round_context_threshold",
+                            "context_tokens_before": context_tokens,
+                            "effective_context_window_tokens": context_window_tokens,
+                            "context_source": budget.context_source,
+                            "context_window_source": budget.window_source,
                         }),
                     },
                 )
@@ -569,9 +621,46 @@ impl NativeHarness {
                         messages.clone(),
                     )
                     .await;
-                let (summary, compaction_usage) = match compacted {
-                    Ok(compacted) => compacted,
+                let (summary, retained, degraded) = match compacted {
+                    Ok((summary, compaction_usage)) => {
+                        absorb_usage(&mut usage, &compaction_usage);
+                        let retained = retain_recent_native_messages(
+                            &messages,
+                            context_window_tokens.saturating_mul(NATIVE_COMPACT_RETAIN_PERCENT)
+                                / 100,
+                        );
+                        send(
+                            &events,
+                            SessionEventKind::ProviderEvent {
+                                provider: turn.provider,
+                                kind: "context_compaction".to_string(),
+                                payload: json!({
+                                    "status": "completed",
+                                    "summary": summary,
+                                    "native": true,
+                                    "automatic": true,
+                                    "trigger": "tool_round_context_threshold",
+                                    "context_tokens_before": context_tokens,
+                                    "effective_context_window_tokens": context_window_tokens,
+                                    "context_source": budget.context_source,
+                                    "context_window_source": budget.window_source,
+                                    "remaining_percent_threshold":
+                                        NATIVE_AUTO_COMPACT_REMAINING_PERCENT,
+                                    "retained_messages": retained.len(),
+                                    "provider_duration_ms": compaction_usage.duration_ms,
+                                    "input_tokens": compaction_usage.input_tokens,
+                                    "output_tokens": compaction_usage.output_tokens,
+                                }),
+                            },
+                        )
+                        .await;
+                        (summary, retained, false)
+                    }
                     Err(error) => {
+                        // Summarization is one more best-effort model call.
+                        // When it fails, the oldest context is dropped
+                        // mechanically so the turn continues on the recent
+                        // window instead of dying with the work half done.
                         send(
                             &events,
                             SessionEventKind::ProviderEvent {
@@ -582,51 +671,67 @@ impl NativeHarness {
                                     "trigger": "tool_round_context_threshold",
                                     "context_tokens_before": context_tokens,
                                     "effective_context_window_tokens": context_window_tokens,
-                                    "error": error.to_string(),
+                                    "error": format!("{error:#}"),
+                                    "degraded_to": "recent_window",
                                 }),
                             },
                         )
                         .await;
-                        return Err(error.context(
-                            "automatic compaction failed before the next native model round",
-                        ));
+                        let retained = retain_recent_native_messages(
+                            &messages,
+                            context_window_tokens.saturating_mul(NATIVE_DEGRADED_RETAIN_PERCENT)
+                                / 100,
+                        );
+                        let summary = NATIVE_DEGRADED_COMPACTION_SUMMARY.to_string();
+                        send(
+                            &events,
+                            SessionEventKind::ProviderEvent {
+                                provider: turn.provider,
+                                kind: "context_compaction".to_string(),
+                                payload: json!({
+                                    "status": "completed",
+                                    "summary": summary,
+                                    "native": true,
+                                    "automatic": true,
+                                    "degraded": true,
+                                    "trigger": "tool_round_context_threshold",
+                                    "context_tokens_before": context_tokens,
+                                    "effective_context_window_tokens": context_window_tokens,
+                                    "retained_messages": retained.len(),
+                                }),
+                            },
+                        )
+                        .await;
+                        (summary, retained, true)
                     }
                 };
-                absorb_usage(&mut usage, &compaction_usage);
-                send(
-                    &events,
-                    SessionEventKind::ProviderEvent {
-                        provider: turn.provider,
-                        kind: "context_compaction".to_string(),
-                        payload: json!({
-                            "status": "completed",
-                            "summary": summary,
-                            "native": true,
-                            "automatic": true,
-                            "trigger": "tool_round_context_threshold",
-                            "context_tokens_before": context_tokens,
-                            "effective_context_window_tokens": context_window_tokens,
-                            "remaining_percent_threshold":
-                                NATIVE_AUTO_COMPACT_REMAINING_PERCENT,
-                            "provider_duration_ms": compaction_usage.duration_ms,
-                            "input_tokens": compaction_usage.input_tokens,
-                            "output_tokens": compaction_usage.output_tokens,
-                        }),
-                    },
-                )
-                .await;
-                send(
-                    &events,
-                    SessionEventKind::ContextWindowUpdated {
-                        context_tokens: 0,
-                        context_window_tokens,
-                    },
-                )
-                .await;
                 messages.truncate(1);
                 messages.push(ModelMessage::user(format!(
                     "Previous conversation summary:\n\n{summary}"
                 )));
+                // The verbatim tail is re-journaled after the boundary so a
+                // replayed conversation carries the same recent evidence the
+                // live turn continued with.
+                for message in &retained {
+                    record_native_message(&events, turn.provider, message).await?;
+                }
+                messages.extend(retained);
+                canonicalize_native_messages(&mut messages);
+                if degraded {
+                    tracing::warn!(
+                        context_tokens,
+                        context_window_tokens,
+                        "native compaction failed; continued on the recent window"
+                    );
+                }
+                send(
+                    &events,
+                    SessionEventKind::ContextWindowUpdated {
+                        context_tokens: estimated_messages_tokens(&messages),
+                        context_window_tokens,
+                    },
+                )
+                .await;
             }
         }
     }
@@ -1004,7 +1109,7 @@ impl NativeToolRuntime {
             }
             "exec_command" => {
                 let args: ExecCommandArgs = serde_json::from_value(arguments)?;
-                self.exec_command(args).await
+                self.exec_command(args, cancellation).await
             }
             "write_stdin" => {
                 let args: WriteStdinArgs = serde_json::from_value(arguments)?;
@@ -1015,13 +1120,16 @@ impl NativeToolRuntime {
                 match (args.cmd.as_deref(), args.session_id) {
                     (Some(cmd), None) => {
                         ensure_process_fields_absent(&args)?;
-                        self.exec_command(ExecCommandArgs {
-                            cmd: cmd.to_string(),
-                            workdir: args.workdir,
-                            yield_time_ms: args.yield_time_ms,
-                            max_output_tokens: args.max_output_tokens,
-                            timeout_ms: args.timeout_ms,
-                        })
+                        self.exec_command(
+                            ExecCommandArgs {
+                                cmd: cmd.to_string(),
+                                workdir: args.workdir,
+                                yield_time_ms: args.yield_time_ms,
+                                max_output_tokens: args.max_output_tokens,
+                                timeout_ms: args.timeout_ms,
+                            },
+                            cancellation,
+                        )
                         .await
                     }
                     (None, Some(session_id)) => {
@@ -1064,7 +1172,13 @@ impl NativeToolRuntime {
         }
     }
 
-    async fn exec_command(&self, args: ExecCommandArgs) -> Result<Value> {
+    /// `cancellation` outlives the initial output snapshot: firing it after the
+    /// command has gone to the background still terminates the process tree.
+    async fn exec_command(
+        &self,
+        args: ExecCommandArgs,
+        cancellation: Option<CancellationToken>,
+    ) -> Result<Value> {
         Ok(serde_json::to_value(
             self.execution_provider
                 .command(ExecutionCommandRequest {
@@ -1080,7 +1194,7 @@ impl NativeToolRuntime {
                         .clamp(1, MAX_COMMAND_TIMEOUT_MS),
                     journal: self.session_store.clone(),
                     environment: self.command_environment.clone(),
-                    cancellation: None,
+                    cancellation,
                 })
                 .await?,
         )?)
@@ -1633,7 +1747,13 @@ async fn execute_tool(
         tool_call.function.name.as_str(),
         "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec" | "monitor"
     ) && runtime.permission != PermissionMode::FullAccess;
+    // A shell command is cancelled by an interrupt but not by a steer: the
+    // model reads the steer after its command finishes, which is what a user
+    // typing a correction mid-build expects. Without a token here an interrupt
+    // only dropped the future while the process ran on to its timeout.
+    let shell_exec = matches!(tool_call.function.name.as_str(), "exec" | "exec_command");
     let call_cancel = (external_mcp
+        || shell_exec
         || matches!(
             tool_call.function.name.as_str(),
             "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec" | "monitor"
@@ -1645,12 +1765,13 @@ async fn execute_tool(
         workflow_approved,
         call_cancel.clone(),
     );
-    await_tool_with_controls(call, call_cancel, controls).await
+    await_tool_with_controls(call, call_cancel, !shell_exec, controls).await
 }
 
 async fn await_tool_with_controls(
     call: impl std::future::Future<Output = Result<Value>>,
     call_cancel: Option<CancellationToken>,
+    cancel_on_steer: bool,
     controls: &mut Option<mpsc::Receiver<AgentTurnControl>>,
 ) -> Result<(String, bool, Option<NativeSteer>)> {
     tokio::pin!(call);
@@ -1684,7 +1805,7 @@ async fn await_tool_with_controls(
                         let _ = ack.send(Err("steer was recalled before delivery".to_string()));
                         continue;
                     }
-                    if let Some(cancel) = &call_cancel {
+                    if cancel_on_steer && let Some(cancel) = &call_cancel {
                         cancel.cancel();
                     }
                     if let Some(pending) = &mut pending_steer {
@@ -2074,22 +2195,98 @@ fn absorb_usage(total: &mut ProviderCallUsage, usage: &ProviderCallUsage) {
     }
 }
 
-const NATIVE_AUTO_COMPACT_REMAINING_PERCENT: u64 = 5;
+/// Remaining share of the context window at which a tool round triggers
+/// automatic compaction. The next round adds the model's reply plus every new
+/// tool result before usage is reported again, so 5% of headroom was
+/// routinely overrun by a single large read and the turn failed on length.
+const NATIVE_AUTO_COMPACT_REMAINING_PERCENT: u64 = 15;
+/// Share of the window kept verbatim after the summary so the model keeps the
+/// evidence it was just reasoning about, not only a prose recollection of it.
+const NATIVE_COMPACT_RETAIN_PERCENT: u64 = 10;
+/// Share of the window kept when summarization itself fails and the oldest
+/// context is dropped mechanically so the turn can continue.
+const NATIVE_DEGRADED_RETAIN_PERCENT: u64 = 40;
+/// Window assumed when the provider reports none (local OpenAI-compatible
+/// servers commonly omit it). Compacting a larger model early costs one
+/// summary; never compacting costs the whole turn once the real window fills.
+const NATIVE_ASSUMED_CONTEXT_WINDOW_TOKENS: u64 = 128_000;
+const NATIVE_DEGRADED_COMPACTION_SUMMARY: &str = "Automatic summarization failed, so the oldest part of this conversation was dropped instead. The most recent messages are kept verbatim; use `query_history` or ask the user for anything earlier that is still needed.";
 
-fn native_usage_needs_auto_compaction(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeContextBudget {
+    context_tokens: u64,
+    context_window_tokens: u64,
+    /// `provider` when usage was reported, `estimated` when Borg counted the
+    /// transcript itself (`chars / 4`) because the provider reported nothing.
+    context_source: &'static str,
+    /// `provider` or `assumed` (see [`NATIVE_ASSUMED_CONTEXT_WINDOW_TOKENS`]).
+    window_source: &'static str,
+}
+
+impl NativeContextBudget {
+    fn needs_auto_compaction(&self) -> bool {
+        self.context_window_tokens > 0
+            && u128::from(self.context_tokens).saturating_mul(100)
+                >= u128::from(self.context_window_tokens)
+                    .saturating_mul(100 - u128::from(NATIVE_AUTO_COMPACT_REMAINING_PERCENT))
+    }
+}
+
+/// Context accounting for the next model round. Provider-reported usage is
+/// preferred, but a provider that reports nothing (or zero, as local servers
+/// do) must not disable compaction and let the transcript grow unbounded.
+fn native_context_budget(
     usage: &ProviderCallUsage,
+    messages: &[ModelMessage],
     trailing_context_tokens: u64,
-) -> bool {
-    let (Some(context_tokens), Some(context_window_tokens)) =
-        (usage.context_tokens, usage.context_window_tokens)
-    else {
-        return false;
+) -> NativeContextBudget {
+    let (context_tokens, context_source) = match usage.context_tokens {
+        Some(reported) if reported > 0 => {
+            (reported.saturating_add(trailing_context_tokens), "provider")
+        }
+        _ => (estimated_messages_tokens(messages), "estimated"),
     };
-    let context_tokens = context_tokens.saturating_add(trailing_context_tokens);
-    context_window_tokens > 0
-        && u128::from(context_tokens).saturating_mul(100)
-            >= u128::from(context_window_tokens)
-                .saturating_mul(100 - u128::from(NATIVE_AUTO_COMPACT_REMAINING_PERCENT))
+    let (context_window_tokens, window_source) = match usage.context_window_tokens {
+        Some(window) if window > 0 => (window, "provider"),
+        _ => (NATIVE_ASSUMED_CONTEXT_WINDOW_TOKENS, "assumed"),
+    };
+    NativeContextBudget {
+        context_tokens,
+        context_window_tokens,
+        context_source,
+        window_source,
+    }
+}
+
+fn estimated_messages_tokens(messages: &[ModelMessage]) -> u64 {
+    messages
+        .iter()
+        .map(estimated_message_tokens)
+        .fold(0, u64::saturating_add)
+}
+
+/// The most recent messages that fit `budget_tokens`, aligned so a tool
+/// result never leads without the assistant call it answers. The leading
+/// system prompt is never part of the tail.
+fn retain_recent_native_messages(
+    messages: &[ModelMessage],
+    budget_tokens: u64,
+) -> Vec<ModelMessage> {
+    let body = messages.get(1..).unwrap_or_default();
+    let mut start = body.len();
+    let mut used = 0_u64;
+    while start > 0 {
+        let tokens = estimated_message_tokens(&body[start - 1]);
+        if used.saturating_add(tokens) > budget_tokens {
+            break;
+        }
+        used = used.saturating_add(tokens);
+        start -= 1;
+    }
+    while start < body.len() && matches!(body[start], ModelMessage::Tool { .. }) {
+        start += 1;
+    }
+    body[start..].to_vec()
 }
 
 fn estimated_message_tokens(message: &ModelMessage) -> u64 {
@@ -2116,13 +2313,9 @@ fn bounded_tool_content(output: String) -> String {
     if output.len() <= MAX_TOOL_RESULT_BYTES {
         return output;
     }
-    let mut boundary = MAX_TOOL_RESULT_BYTES;
-    while !output.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
     format!(
         "{}\n\n[tool output truncated at {} bytes]",
-        &output[..boundary],
+        crate::persistent_runtime::bounded_head_tail(output, MAX_TOOL_RESULT_BYTES),
         MAX_TOOL_RESULT_BYTES
     )
 }
@@ -2691,6 +2884,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_command_is_cancelled_by_interrupt_but_not_by_steering() {
+        let (control_tx, control_rx) = mpsc::channel(2);
+        let (_finish_tx, finish_rx) = tokio::sync::oneshot::channel::<Value>();
+        let cancel = CancellationToken::new();
+        let call_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            await_tool_with_controls(
+                async { Ok(finish_rx.await?) },
+                Some(call_cancel),
+                false,
+                &mut Some(control_rx),
+            )
+            .await
+        });
+        let (ack, acknowledged) = tokio::sync::oneshot::channel();
+        control_tx
+            .send(AgentTurnControl::Steer {
+                message_id: Uuid::new_v4(),
+                text: "also run the linter".into(),
+                attachments: Vec::new(),
+                admission: borg_provider::provider::SteerAdmission::pending(),
+                ack,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), acknowledged)
+            .await
+            .expect("steering must not wait for the running command")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !cancel.is_cancelled(),
+            "a steer must not kill the running shell command"
+        );
+        control_tx.send(AgentTurnControl::Interrupt).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("interrupt must retain its bounded cleanup wait")
+            .unwrap();
+        assert!(cancel.is_cancelled(), "an interrupt must kill the command");
+        assert!(
+            result
+                .err()
+                .expect("turn must stop")
+                .to_string()
+                .contains("interrupted")
+        );
+    }
+
+    #[tokio::test]
     async fn running_tool_keeps_controls_live_after_steering() {
         for interrupt in [false, true] {
             let (control_tx, control_rx) = mpsc::channel(2);
@@ -2701,6 +2944,7 @@ mod tests {
                 await_tool_with_controls(
                     async { Ok(finish_rx.await?) },
                     Some(call_cancel),
+                    true,
                     &mut Some(control_rx),
                 )
                 .await
@@ -3496,10 +3740,12 @@ mod tests {
 
     #[test]
     fn bounded_tool_results_preserve_utf8_boundaries() {
-        let output = "é".repeat(MAX_TOOL_RESULT_BYTES);
+        let output = format!("head {}tail", "é".repeat(MAX_TOOL_RESULT_BYTES));
         let bounded = bounded_tool_content(output);
-        assert!(bounded.is_char_boundary(MAX_TOOL_RESULT_BYTES));
-        assert!(bounded.contains("tool output truncated"));
+        assert!(bounded.starts_with("head "));
+        assert!(bounded.contains("bytes truncated of"));
+        assert!(bounded.contains("tail\n\n[tool output truncated"));
+        assert!(bounded.len() < MAX_TOOL_RESULT_BYTES + 256);
     }
 
     #[tokio::test]
@@ -3577,32 +3823,106 @@ mod tests {
     }
 
     #[test]
-    fn tool_round_auto_compaction_uses_five_percent_effective_headroom() {
+    fn tool_round_auto_compaction_keeps_fifteen_percent_headroom() {
         let usage = |context_tokens, context_window_tokens| ProviderCallUsage {
             context_tokens: Some(context_tokens),
             context_window_tokens: Some(context_window_tokens),
             ..ProviderCallUsage::default()
         };
-        assert!(!native_usage_needs_auto_compaction(
-            &usage(94_999, 100_000),
-            0
-        ));
-        assert!(native_usage_needs_auto_compaction(
-            &usage(95_000, 100_000),
-            0
-        ));
+        let needs = |usage: &ProviderCallUsage, trailing| {
+            native_context_budget(usage, &[], trailing).needs_auto_compaction()
+        };
+        assert!(!needs(&usage(84_999, 100_000), 0));
+        assert!(needs(&usage(85_000, 100_000), 0));
         let large_tool_result = ModelMessage::Tool {
             tool_call_id: "large-result".to_string(),
             content: "x".repeat(4_000),
         };
-        assert!(native_usage_needs_auto_compaction(
-            &usage(94_000, 100_000),
+        assert!(needs(
+            &usage(84_000, 100_000),
             estimated_message_tokens(&large_tool_result)
         ));
-        assert!(!native_usage_needs_auto_compaction(
-            &ProviderCallUsage::default(),
-            1_000
-        ));
+    }
+
+    #[test]
+    fn missing_or_zero_usage_falls_back_to_a_local_estimate() {
+        // Local servers report no usage (or zeros); the transcript must still
+        // be counted or compaction never triggers.
+        let messages = vec![
+            ModelMessage::System {
+                content: "system".to_string(),
+            },
+            ModelMessage::Tool {
+                tool_call_id: "big".to_string(),
+                content: "x".repeat(4 * 120_000),
+            },
+        ];
+        let budget = native_context_budget(&ProviderCallUsage::default(), &messages, 0);
+        assert_eq!(budget.context_source, "estimated");
+        assert_eq!(budget.window_source, "assumed");
+        assert_eq!(
+            budget.context_window_tokens,
+            NATIVE_ASSUMED_CONTEXT_WINDOW_TOKENS
+        );
+        assert!(budget.context_tokens >= 120_000);
+        assert!(budget.needs_auto_compaction());
+
+        let zero = ProviderCallUsage {
+            context_tokens: Some(0),
+            context_window_tokens: Some(0),
+            ..ProviderCallUsage::default()
+        };
+        assert_eq!(
+            native_context_budget(&zero, &messages, 0),
+            budget,
+            "zero usage is treated like missing usage"
+        );
+        let small = native_context_budget(&ProviderCallUsage::default(), &messages[..1], 1_000);
+        assert!(!small.needs_auto_compaction());
+    }
+
+    #[test]
+    fn retained_tail_fits_the_budget_and_never_leads_with_a_tool_result() {
+        let assistant_call = |id: &str| ModelMessage::Assistant {
+            content: None,
+            reasoning_content: None,
+            reasoning_details: None,
+            provider_state: None,
+            tool_calls: vec![ModelToolCall::function(
+                id.to_string(),
+                "read_file".to_string(),
+                "{}".to_string(),
+            )],
+        };
+        let tool_result = |id: &str, size: usize| ModelMessage::Tool {
+            tool_call_id: id.to_string(),
+            content: "y".repeat(size),
+        };
+        let messages = vec![
+            ModelMessage::System {
+                content: "system".to_string(),
+            },
+            ModelMessage::user("first"),
+            assistant_call("a"),
+            tool_result("a", 4_000),
+            assistant_call("b"),
+            tool_result("b", 400),
+            tool_result("b2", 400),
+        ];
+        let tail = retain_recent_native_messages(&messages, 400);
+        assert!(
+            tail.is_empty() || !matches!(tail[0], ModelMessage::Tool { .. }),
+            "a tail must not start with an orphaned tool result: {tail:?}"
+        );
+        let tail = retain_recent_native_messages(&messages, 600);
+        assert!(
+            matches!(&tail[0], ModelMessage::Assistant { tool_calls, .. } if tool_calls[0].id == "b")
+        );
+        assert_eq!(tail.len(), 3);
+        let everything = retain_recent_native_messages(&messages, u64::MAX);
+        assert_eq!(everything.len(), messages.len() - 1);
+        assert!(!matches!(everything[0], ModelMessage::System { .. }));
+        assert!(retain_recent_native_messages(&messages[..1], u64::MAX).is_empty());
     }
 
     #[test]

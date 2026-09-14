@@ -25,6 +25,10 @@ use uuid::Uuid;
 
 const MAX_CODE_BYTES: usize = 512 * 1024;
 const MAX_RUNTIME_RESULT_BYTES: usize = 1024 * 1024;
+/// Hard ceiling on one protocol line from the worker. Results above
+/// `MAX_RUNTIME_RESULT_BYTES` are truncated field by field rather than
+/// discarded; only a line this large indicates a broken worker.
+const MAX_RUNTIME_LINE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_EXECUTION_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const MAX_EXECUTION_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
@@ -474,8 +478,8 @@ async fn execute_request(
     loop {
         let line = read_line_until(&mut process.stdout, deadline).await?;
         ensure!(
-            line.len() <= MAX_RUNTIME_RESULT_BYTES,
-            "persistent runtime message exceeds {MAX_RUNTIME_RESULT_BYTES} bytes"
+            line.len() <= MAX_RUNTIME_LINE_BYTES,
+            "persistent runtime message exceeds {MAX_RUNTIME_LINE_BYTES} bytes"
         );
         let message: Value = serde_json::from_str(&line)
             .with_context(|| "persistent runtime returned invalid protocol JSON")?;
@@ -536,11 +540,7 @@ async fn execute_request(
                         .unwrap_or_default()
                         .to_string(),
                 };
-                ensure!(
-                    serde_json::to_vec(&result)?.len() <= MAX_RUNTIME_RESULT_BYTES,
-                    "persistent runtime result exceeds {MAX_RUNTIME_RESULT_BYTES} bytes"
-                );
-                return Ok(result);
+                return Ok(bound_runtime_result(result));
             }
             Some(other) => {
                 bail!("persistent runtime returned unknown message type `{other}`")
@@ -560,6 +560,55 @@ async fn write_json_line(writer: &mut ChildStdin, value: &Value) -> Result<()> {
     writer.write_all(&line).await?;
     writer.flush().await?;
     Ok(())
+}
+
+/// Keep an oversized result useful instead of failing the whole execution:
+/// the model asked for the value, and a head+tail excerpt with a marker lets
+/// it decide what to re-query, while the marker is honest about the gap.
+fn bound_runtime_result(mut result: PersistentRuntimeResult) -> PersistentRuntimeResult {
+    let serialized_len = |result: &PersistentRuntimeResult| {
+        serde_json::to_vec(result).map_or(usize::MAX, |bytes| bytes.len())
+    };
+    if serialized_len(&result) <= MAX_RUNTIME_RESULT_BYTES {
+        return result;
+    }
+    let per_field = MAX_RUNTIME_RESULT_BYTES / 4;
+    result.stdout = bounded_head_tail(result.stdout, per_field);
+    result.stderr = bounded_head_tail(result.stderr, per_field);
+    if serialized_len(&result) > MAX_RUNTIME_RESULT_BYTES {
+        let rendered = serde_json::to_string(&result.value).unwrap_or_default();
+        result.value = json!({
+            "truncated": true,
+            "original_bytes": rendered.len(),
+            "preview": bounded_head_tail(rendered, per_field),
+        });
+    }
+    result
+}
+
+/// Truncate to `max_bytes`, keeping the head and the tail (the end of a long
+/// output is usually the interesting part) with a marker for the gap.
+pub(crate) fn bounded_head_tail(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let tail_len = max_bytes / 4;
+    let head_len = max_bytes.saturating_sub(tail_len);
+    let mut head_end = head_len.min(text.len());
+    while !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len().saturating_sub(tail_len).max(head_end);
+    while !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}\n\n[… {} bytes truncated of {} …]\n\n{}",
+        &text[..head_end],
+        tail_start - head_end,
+        text.len(),
+        &text[tail_start..]
+    )
 }
 
 async fn read_line_until(reader: &mut BufReader<ChildStdout>, deadline: Instant) -> Result<String> {
@@ -1287,6 +1336,37 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn oversized_results_are_truncated_head_and_tail_instead_of_discarded() {
+        let result = PersistentRuntimeResult {
+            runtime: "python",
+            persistent: true,
+            recovered_from_manifest: false,
+            execution_count: 1,
+            value: json!({"rows": "r".repeat(MAX_RUNTIME_RESULT_BYTES)}),
+            stdout: format!(
+                "first line\n{}\nlast line",
+                "é".repeat(MAX_RUNTIME_RESULT_BYTES)
+            ),
+            stderr: String::new(),
+        };
+        let bounded = bound_runtime_result(result);
+        assert!(serde_json::to_vec(&bounded).unwrap().len() <= MAX_RUNTIME_RESULT_BYTES);
+        assert!(bounded.stdout.starts_with("first line"));
+        assert!(bounded.stdout.ends_with("last line"));
+        assert!(bounded.stdout.contains("bytes truncated of"));
+        assert_eq!(bounded.value["truncated"], true);
+        assert!(
+            bounded.value["preview"]
+                .as_str()
+                .unwrap()
+                .starts_with("{\"rows\"")
+        );
+
+        let small = bounded_head_tail("tiny".to_string(), 1024);
+        assert_eq!(small, "tiny");
+    }
 
     struct TestHost;
 
