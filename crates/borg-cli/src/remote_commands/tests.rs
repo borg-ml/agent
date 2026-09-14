@@ -29,6 +29,7 @@ fn force_quit_does_not_wait_for_runtime_teardown() {
         .args([
             "--exact",
             "remote_commands::tests::force_quit_does_not_wait_for_runtime_teardown",
+            "--nocapture",
         ])
         .env(CHILD, "1")
         .stdout(std::process::Stdio::piped())
