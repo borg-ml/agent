@@ -256,6 +256,19 @@ fn dispatch_ui_prompt(
     }
 }
 
+/// Once-ever marker recording that Borg has emitted its first-boot desktop
+/// notification, so the host terminal's OS-permission prompt is requested a
+/// single time rather than on every launch.
+fn notification_prime_marker() -> PathBuf {
+    std::env::var_os("BORG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".borg")))
+        .or_else(|| dirs::home_dir().map(|home| home.join(".borg")))
+        .unwrap_or_else(|| PathBuf::from(".borg"))
+        .join("state")
+        .join("notifications-primed")
+}
+
 fn spawn_editor_preferences_writer() -> (
     mpsc::UnboundedSender<EditorPreferences>,
     mpsc::UnboundedReceiver<String>,
@@ -2546,6 +2559,28 @@ async fn run_local_agent_session(
         terminal.set_transcript_colors(&editor_preferences.transcript);
         if let Some((text, attachments)) = restored_prompt {
             terminal.restore_composer(text, attachments);
+        }
+        // First boot: emit one notification so the host terminal asks the OS
+        // for notification permission (the popup a bare CLI cannot raise
+        // itself). Do it once, only when notifications are not turned off, and
+        // only when no more important startup notice is showing.
+        if editor_preferences.interaction.completion_notifications != CompletionAlertPolicy::Off {
+            let marker = notification_prime_marker();
+            if !marker.exists() && terminal.prime_desktop_notification() {
+                if let Some(parent) = marker.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(&marker, b"1\n");
+                let startup_notice_shown = startup_update_notice.is_some()
+                    || retry_notice.is_some()
+                    || stale_local_owner
+                    || extension_catalog.has_errors();
+                if !startup_notice_shown {
+                    terminal.set_notice(
+                        "If your OS asks, allow notifications for this terminal so Borg can alert you when a turn finishes.".to_string(),
+                    );
+                }
+            }
         }
         terminal.draw()?;
         tracing::info!(

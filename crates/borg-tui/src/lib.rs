@@ -4853,18 +4853,31 @@ impl BorgTerminal {
     }
 
     fn send_completion_alert(&mut self, notification: bool, sound: bool) {
-        // OSC 9 is understood by modern terminal emulators as a desktop
-        // notification. BEL requests the user's configured terminal sound.
+        // The desktop notification asks the host terminal to post a banner;
+        // BEL requests the user's configured terminal sound.
         if notification {
-            let _ = write!(
-                self.terminal.backend_mut(),
-                "\x1b]9;Borg Agent finished working\x1b\\"
-            );
+            let sequence = desktop_notification_sequence("Borg Agent", "Finished working");
+            let _ = write!(self.terminal.backend_mut(), "{sequence}");
         }
         if sound {
             let _ = write!(self.terminal.backend_mut(), "\x07");
         }
         let _ = io::Write::flush(self.terminal.backend_mut());
+    }
+
+    /// Emit one desktop notification so the host terminal asks the OS for
+    /// notification permission the first time Borg runs. On macOS this is what
+    /// surfaces the "<terminal> wants to send notifications" prompt; a CLI
+    /// process cannot request it directly. Returns whether the sequence was
+    /// written.
+    pub fn prime_desktop_notification(&mut self) -> bool {
+        let sequence = desktop_notification_sequence(
+            "Borg Agent",
+            "Notifications are on \u{2014} you'll be alerted when a turn finishes.",
+        );
+        let written = write!(self.terminal.backend_mut(), "{sequence}").is_ok();
+        let _ = io::Write::flush(self.terminal.backend_mut());
+        written
     }
 
     pub fn advance_scroll_frame(&mut self) {
@@ -8424,6 +8437,52 @@ fn completion_alert_enabled(policy: CompletionAlertPolicy, window_focused: bool)
         CompletionAlertPolicy::Unfocused => !window_focused,
         CompletionAlertPolicy::Always => true,
     }
+}
+
+/// Build the desktop-notification escape sequence for the host terminal.
+///
+/// OSC 777 (`notify;title;body`) carries a title and is used where the
+/// terminal, or tmux, understands it; OSC 9 (body only) is the broadly
+/// supported fallback. Exactly one is emitted so a terminal that honours both
+/// never raises two banners for one event.
+fn desktop_notification_sequence(title: &str, body: &str) -> String {
+    desktop_notification_sequence_for(title, body, terminal_supports_osc_777())
+}
+
+fn desktop_notification_sequence_for(title: &str, body: &str, prefers_osc_777: bool) -> String {
+    // Neither `;` nor a control byte can appear inside an OSC payload without
+    // truncating it; collapse them to spaces defensively.
+    let sanitize = |value: &str| {
+        value
+            .chars()
+            .map(|character| {
+                if character == ';' || character.is_control() {
+                    ' '
+                } else {
+                    character
+                }
+            })
+            .collect::<String>()
+    };
+    let body = sanitize(body);
+    if prefers_osc_777 {
+        format!("\x1b]777;notify;{};{body}\x1b\\", sanitize(title))
+    } else {
+        format!("\x1b]9;{body}\x1b\\")
+    }
+}
+
+/// Whether the host terminal renders OSC 777 notifications. tmux forwards it to
+/// the outer terminal (where OSC 9 often does not survive), and the listed
+/// emulators support the titled form; everything else gets OSC 9.
+fn terminal_supports_osc_777() -> bool {
+    if std::env::var_os("TMUX").is_some() {
+        return true;
+    }
+    matches!(
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        Some("ghostty" | "WezTerm" | "rio")
+    )
 }
 
 fn completion_alert_policy_label(policy: CompletionAlertPolicy) -> &'static str {

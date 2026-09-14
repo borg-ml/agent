@@ -12916,3 +12916,20 @@ fn empty_thinking_row_is_not_expandable_or_hinted() {
     assert!(transcript.toggle_tool(0).is_empty());
     assert!(!transcript.tool_is_expanded(0));
 }
+
+#[test]
+fn desktop_notification_prefers_titled_osc_777_and_falls_back_to_osc_9() {
+    assert_eq!(
+        desktop_notification_sequence_for("Borg Agent", "Finished working", true),
+        "\x1b]777;notify;Borg Agent;Finished working\x1b\\"
+    );
+    assert_eq!(
+        desktop_notification_sequence_for("Borg Agent", "Finished working", false),
+        "\x1b]9;Finished working\x1b\\"
+    );
+    // A stray separator or control byte must not truncate the OSC payload.
+    assert_eq!(
+        desktop_notification_sequence_for("a;b", "c\x07;d", true),
+        "\x1b]777;notify;a b;c  d\x1b\\"
+    );
+}
