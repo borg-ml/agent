@@ -583,6 +583,9 @@ pub struct ClaudeAccountRateLimits {
     pub rate_limits_available: bool,
     pub windows: Vec<ClaudeRateLimitWindow>,
     pub extra_usage_available: bool,
+    /// Set when Claude answered from its persisted usage cache instead of a
+    /// fresh fetch; the value is when that cache was last refreshed.
+    pub last_known_at: Option<DateTime<Utc>>,
 }
 
 /// Read the authenticated Codex account limits through the same app-server
@@ -613,13 +616,52 @@ pub async fn read_claude_account_rate_limits() -> Result<ClaudeAccountRateLimits
     }
     #[cfg(feature = "claude")]
     {
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            read_claude_account_rate_limits_inner(),
-        )
-        .await
-        .context("timed out reading Claude account limits")?
+        let read = || async {
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                read_claude_account_rate_limits_inner(),
+            )
+            .await
+            .context("timed out reading Claude account limits")?
+        };
+        let mut limits = read().await?;
+        if limits.last_known_at.is_some() {
+            // The CLI silently serves its persisted cache when the live fetch
+            // fails (typically a momentary rate limit on the usage endpoint).
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            if let Ok(fresh) = read().await
+                && fresh.last_known_at.is_none()
+            {
+                limits = fresh;
+            }
+        }
+        Ok(limits)
     }
+}
+
+/// Claude Code refreshes `cachedUsageUtilization` in its config file on every
+/// successful live fetch (throttled to once per five minutes) and serves that
+/// cache for up to an hour when the fetch fails, without marking the answer.
+/// A cache older than the throttle window after a `get_usage` call therefore
+/// means the answer was not fresh.
+#[cfg(feature = "claude")]
+fn claude_usage_cache_last_known_at() -> Option<DateTime<Utc>> {
+    const CONFIG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+    const FRESH_WINDOW: chrono::TimeDelta = chrono::TimeDelta::minutes(6);
+    let directory = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))?;
+    let path = directory.join(".claude.json");
+    if std::fs::metadata(&path).ok()?.len() > CONFIG_MAX_BYTES {
+        return None;
+    }
+    let config: Value = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+    let fetched_at_ms = config
+        .pointer("/cachedUsageUtilization/fetchedAtMs")
+        .and_then(Value::as_i64)?;
+    let fetched_at = DateTime::<Utc>::from_timestamp_millis(fetched_at_ms)?;
+    (Utc::now() - fetched_at > FRESH_WINDOW).then_some(fetched_at)
 }
 
 #[cfg(feature = "claude")]
@@ -666,7 +708,7 @@ async fn read_claude_account_rate_limits_inner() -> Result<ClaudeAccountRateLimi
     write_claude_control_request(
         &mut stdin,
         &usage_id,
-        serde_json::json!({"subtype": "get_usage"}),
+        serde_json::json!({"subtype": "get_usage", "skip_behaviors": true}),
     )
     .await?;
 
@@ -694,7 +736,12 @@ async fn read_claude_account_rate_limits_inner() -> Result<ClaudeAccountRateLimi
                     .unwrap_or("unknown control error")
             );
         }
-        break parse_claude_account_rate_limits(response.get("response").unwrap_or(&Value::Null));
+        let mut limits =
+            parse_claude_account_rate_limits(response.get("response").unwrap_or(&Value::Null))?;
+        if limits.rate_limits_available {
+            limits.last_known_at = claude_usage_cache_last_known_at();
+        }
+        break Ok(limits);
     };
     drop(lines);
     drop(stdin);
@@ -756,6 +803,35 @@ fn parse_claude_account_rate_limits(value: &Value) -> Result<ClaudeAccountRateLi
             global,
         });
     }
+    // Newer CLIs report per-model weekly windows (for example Fable) as a
+    // separate list rather than fixed `seven_day_<model>` keys.
+    for scoped in limits
+        .and_then(|limits| limits.get("model_scoped"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let (Some(name), Some(used_percent)) = (
+            scoped.get("display_name").and_then(Value::as_str),
+            scoped.get("utilization").and_then(Value::as_f64),
+        ) else {
+            continue;
+        };
+        let label = format!("Weekly · {name}");
+        if windows.iter().any(|window| window.label == label) {
+            continue;
+        }
+        windows.push(ClaudeRateLimitWindow {
+            label,
+            used_percent: used_percent.clamp(0.0, 100.0).round() as u8,
+            resets_at: scoped
+                .get("resets_at")
+                .and_then(Value::as_str)
+                .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc)),
+            global: false,
+        });
+    }
     let extra_usage = limits.and_then(|limits| limits.get("extra_usage"));
     let extra_usage_available = extra_usage
         .and_then(|usage| usage.get("is_enabled"))
@@ -773,6 +849,7 @@ fn parse_claude_account_rate_limits(value: &Value) -> Result<ClaudeAccountRateLi
         rate_limits_available,
         windows,
         extra_usage_available,
+        last_known_at: None,
     })
 }
 

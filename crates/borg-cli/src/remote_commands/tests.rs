@@ -1,5 +1,6 @@
 use super::*;
 use sqlx::Executor;
+use std::io::Read as _;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 #[cfg(unix)]
@@ -8,6 +9,7 @@ use tokio::io::AsyncReadExt;
 #[test]
 fn force_quit_does_not_wait_for_runtime_teardown() {
     const CHILD: &str = "BORG_TEST_FORCE_QUIT_CHILD";
+    const FORCE_QUIT_SESSION: &str = "6f5c1a8e-3b2d-4c7a-9e1f-2a4b6c8d0e12";
     if std::env::var_os(CHILD).is_some() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let (started, ready) = std::sync::mpsc::channel();
@@ -16,7 +18,11 @@ fn force_quit_does_not_wait_for_runtime_teardown() {
             std::thread::sleep(Duration::from_secs(60));
         });
         ready.recv().expect("blocking task started");
-        force_quit(&mut None, &AtomicBool::new(false));
+        force_quit(
+            &mut None,
+            &AtomicBool::new(false),
+            Some(Uuid::parse_str(FORCE_QUIT_SESSION).expect("session id")),
+        );
     }
 
     let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
@@ -25,12 +31,24 @@ fn force_quit_does_not_wait_for_runtime_teardown() {
             "remote_commands::tests::force_quit_does_not_wait_for_runtime_teardown",
         ])
         .env(CHILD, "1")
+        .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("start force-quit child");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(status) = child.try_wait().expect("child status") {
             assert_eq!(status.code(), Some(130));
+            let mut stdout = String::new();
+            child
+                .stdout
+                .take()
+                .expect("child stdout")
+                .read_to_string(&mut stdout)
+                .expect("read child stdout");
+            assert!(
+                stdout.contains(&format!("borg resume {FORCE_QUIT_SESSION}")),
+                "forced exit must print the resume command: {stdout:?}"
+            );
             break;
         }
         if Instant::now() >= deadline {
@@ -3068,6 +3086,7 @@ fn usage_screen_keeps_account_limits_and_session_usage_distinct() {
             global: true,
         }],
         extra_usage_available: false,
+        last_known_at: None,
     });
     let claude_summary = format_usage_summary(
         CodingProvider::Claude,

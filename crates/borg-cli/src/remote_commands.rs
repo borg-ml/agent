@@ -1174,7 +1174,13 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
             )
             .await
             {
-                Ok(DetachedHostWait::Detach) => return Ok(()),
+                Ok(DetachedHostWait::Detach) => {
+                    shutdown_terminal(&mut reusable_terminal, &crash_context.tui_active).await;
+                    if !args.ephemeral {
+                        println!("\n{}", resume_instructions(session_id, false));
+                    }
+                    return Ok(());
+                }
                 Ok(DetachedHostWait::Ready) => {}
                 Err(error) if local_resume_error_is_retryable(&error) => {
                     let notice = format!(
@@ -5246,7 +5252,11 @@ async fn run_local_agent_session(
                         }
                     }
                     UiAction::ForceQuit => {
-                        force_quit(&mut terminal, &crash_context.tui_active);
+                        force_quit(
+                            &mut terminal,
+                            &crash_context.tui_active,
+                            (!args.ephemeral).then_some(session_id),
+                        );
                     }
                     UiAction::Quit => {
                         user_requested_exit = true;
@@ -6776,7 +6786,11 @@ async fn run_local_agent_session(
             }
             _ = tokio::signal::ctrl_c(), if interactive => {
                 if repeated_ctrl_c(&mut last_ctrl_c, std::time::Instant::now()) {
-                    force_quit(&mut terminal, &crash_context.tui_active);
+                    force_quit(
+                            &mut terminal,
+                            &crash_context.tui_active,
+                            (!args.ephemeral).then_some(session_id),
+                        );
                 } else if let Some(terminal) = terminal.as_mut() {
                     terminal.handle_external_interrupt();
                     terminal_dirty = true;
@@ -7107,12 +7121,24 @@ fn read_hidden_line() -> Result<String> {
     result
 }
 
-fn force_quit(terminal: &mut Option<BorgTerminal>, tui_active: &AtomicBool) -> ! {
+fn force_quit(
+    terminal: &mut Option<BorgTerminal>,
+    tui_active: &AtomicBool,
+    resume: Option<Uuid>,
+) -> ! {
     tui_active.store(false, Ordering::Release);
     // Restore modes without dropping the potentially large transcript or
     // waiting for task/runtime teardown on the second Ctrl-C.
     if let Some(terminal) = terminal.as_mut() {
         terminal.restore_terminal();
+    }
+    // The detached host keeps the session alive, so a forced exit must still
+    // tell the user how to get back to it. Print after the terminal is
+    // restored so the line lands on the primary screen, and flush explicitly
+    // because `process::exit` skips stdout teardown.
+    if let Some(session_id) = resume {
+        println!("\n{}", resume_instructions(session_id, false));
+        let _ = io::stdout().flush();
     }
     std::process::exit(130);
 }
@@ -8736,6 +8762,13 @@ fn format_usage_summary(
             } else {
                 for window in &limits.windows {
                     append_claude_rate_limit_window(&mut lines, window);
+                }
+                if let Some(at) = limits.last_known_at {
+                    lines.push(format!(
+                        "  {:<16} last known as of {} · Claude could not refresh; retry shortly",
+                        "Stale",
+                        at.with_timezone(&Local).format("%H:%M on %d %b")
+                    ));
                 }
             }
             if limits.extra_usage_available {
