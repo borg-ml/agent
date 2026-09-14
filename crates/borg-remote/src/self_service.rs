@@ -1023,6 +1023,20 @@ impl SelfServiceContext {
             toml::Value::String(args.description.clone()),
         );
         manifest.insert("enabled".into(), toml::Value::Boolean(true));
+        // Declare the least access the package needs. Skills-only and embedded
+        // Blu packages are sandboxed, which the default project policy admits;
+        // an external runtime worker is a trusted user process. Leaving this
+        // out defaults to `trusted`, which the loader rejects for project
+        // packages and silently isolates the package the model just "created".
+        let runtime_access = if workflow.is_none() || runtime.is_embedded() {
+            "sandboxed"
+        } else {
+            "trusted"
+        };
+        manifest.insert(
+            "runtime_access".into(),
+            toml::Value::String(runtime_access.into()),
+        );
         manifest.insert(
             "skill_roots".into(),
             toml::Value::Array(vec![toml::Value::String("skills".into())]),
@@ -1103,10 +1117,15 @@ impl SelfServiceContext {
             "reload_signal": reload_signal,
             "audit": audit,
             "runtime": runtime,
+            "runtime_access": runtime_access,
             "source_extension": source_extension,
             "version": version,
             "revision": revision,
             "hot_reload": "next native turn boundary",
+            "activation": "pending",
+            "activation_note": format!(
+                "The package is installed and will be evaluated against the user's `[extensions]` policy at the next native turn boundary; it needs `{runtime_access}` access to activate. A package the policy rejects is isolated (not run) and listed by `borg extensions doctor`; check `list_blu_extensions` before relying on it."
+            ),
         }))
     }
 
@@ -1707,7 +1726,7 @@ pub(crate) fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "create_blu_extension",
-            "description": "Create or replace a live extension package with a skill and optional executable workflow. Select embedded Blu for .blu/.lua/.luau or a supervised Python, IPython, JavaScript, or TypeScript worker; the package is atomically installed and rescanned at the next native turn boundary.",
+            "description": "Create or replace a live extension package with a skill and optional executable workflow. Select embedded Blu for .blu/.lua/.luau or a supervised Python, IPython, JavaScript, or TypeScript worker. The package is atomically installed and evaluated against the user's extension policy at the next native turn boundary; the result reports the declared runtime_access and activation is pending until that evaluation passes (external runtimes need trusted access).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1730,7 +1749,7 @@ pub(crate) fn tool_specs() -> Vec<Value> {
         }),
         json!({
             "name": "create_extension",
-            "description": "Generic alias for create_blu_extension: create a live, hot-reloadable Blu/Lua/Luau/Python/IPython/JavaScript/TypeScript extension package for self-extension.",
+            "description": "Generic alias for create_blu_extension: create a Blu/Lua/Luau/Python/IPython/JavaScript/TypeScript extension package for self-extension. Activation is pending until the next native turn boundary evaluates it against the user's extension policy.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2585,25 +2604,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_merge_preserves_unmentioned_sections() {
-        let mut root = toml::Value::Table(toml::map::Map::new());
-        let patch = json_to_toml(json!({"aliases": {"review": "/effort high"}})).unwrap();
-        let table = root.as_table_mut().unwrap();
-        table.insert("commands".into(), toml::Value::Table(toml::map::Map::new()));
-        merge_toml(table.get_mut("commands").unwrap(), patch);
-        assert_eq!(
-            root["commands"]["aliases"]["review"].as_str(),
-            Some("/effort high")
-        );
-    }
-
-    #[test]
-    fn settings_validation_rejects_unknown_nested_fields_before_writing() {
-        let valid = toml::from_str::<toml::Value>(
-            r#"
-            [local]
-            base_url = "http://127.0.0.1:8000/v1"
-    #[test]
     fn trusted_settings_sections_only_flag_privilege_bearing_writes() {
         let arguments = json!({
             "scope": "user",
@@ -2622,6 +2622,25 @@ mod tests {
         assert!(trusted_settings_sections("read_file", &arguments).is_empty());
     }
 
+    #[test]
+    fn settings_merge_preserves_unmentioned_sections() {
+        let mut root = toml::Value::Table(toml::map::Map::new());
+        let patch = json_to_toml(json!({"aliases": {"review": "/effort high"}})).unwrap();
+        let table = root.as_table_mut().unwrap();
+        table.insert("commands".into(), toml::Value::Table(toml::map::Map::new()));
+        merge_toml(table.get_mut("commands").unwrap(), patch);
+        assert_eq!(
+            root["commands"]["aliases"]["review"].as_str(),
+            Some("/effort high")
+        );
+    }
+
+    #[test]
+    fn settings_validation_rejects_unknown_nested_fields_before_writing() {
+        let valid = toml::from_str::<toml::Value>(
+            r#"
+            [local]
+            base_url = "http://127.0.0.1:8000/v1"
             model = "local-model"
             context_window_tokens = 32768
             model_dirs = ["/models"]
@@ -2836,6 +2855,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(created["hot_reload"], "next native turn boundary");
+        assert_eq!(created["activation"], "pending");
+        assert!(matches!(
+            created["runtime_access"].as_str(),
+            Some("sandboxed" | "trusted")
+        ));
+        let manifest_path = PathBuf::from(created["path"].as_str().expect("path")).join("blu.toml");
+        let manifest = fs::read_to_string(&manifest_path).expect("manifest");
+        assert!(
+            manifest.contains("runtime_access = \"sandboxed\"")
+                || manifest.contains("runtime_access = \"trusted\""),
+            "{manifest}"
+        );
         assert!(
             workspace
                 .path()

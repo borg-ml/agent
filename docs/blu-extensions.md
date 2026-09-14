@@ -207,8 +207,17 @@ permissions of the selected user process and must be treated as trusted.
 Use the provider-neutral `list_workflows` and `run_workflow` tools for all
 runtimes. `list_blu_workflows` and `run_blu_extension` remain compatibility
 aliases for existing Blu packages. The model can create a package on the fly
-with `create_extension`; the atomic package swap is visible at the next native
-turn boundary, just like a Blu edit.
+with `create_extension`. The package declares the least `runtime_access` it
+needs (`sandboxed` for skills-only and embedded Blu workflows, `trusted` for an
+external runtime worker), and the atomic swap is evaluated against the user's
+`[extensions]` policy at the next native turn boundary, just like a Blu edit.
+The tool result reports `activation: "pending"` until then; a package the
+policy rejects is isolated and listed by `borg extensions doctor`.
+
+Settings writes through `update_agent_settings` that touch `mcp`,
+`extensions`, `approvals`, `providers`, or `capabilities` always require an
+explicit human approval unless the session runs with Full Access, because they
+change what Borg executes or trusts.
 
 Installs are staged and validated before an atomic directory swap. Git installs
 record their source and exact revision in the scope's `blu.toml`; update clones
