@@ -30,6 +30,74 @@ const MAX_CHECKPOINT_JSON_BYTES: usize = 2 * 1024 * 1024;
 
 const AUTONOMY_SCHEMA_VERSION: i64 = 2;
 
+/// The canonical schema. Older databases are migrated forward by re-running
+/// this batch and adding the columns it declares that they lack.
+const AUTONOMY_SCHEMA_SQL: &str = r#"
+            create table if not exists autonomy_jobs (
+                job_id text primary key,
+                idempotency_key text not null unique,
+                kind text not null,
+                payload_json text not null,
+                state text not null,
+                due_at_ms integer not null,
+                attempt integer not null default 0,
+                max_attempts integer not null,
+                lease_owner text,
+                lease_token text,
+                lease_heartbeat_at_ms integer,
+                lease_expires_at_ms integer,
+                session_id text,
+                goal_id text,
+                result_json text,
+                last_error text,
+                created_at_ms integer not null,
+                updated_at_ms integer not null,
+                check (state in ('queued', 'claimed', 'running', 'completed', 'failed', 'cancelled')),
+                check (attempt >= 0 and max_attempts > 0 and attempt <= max_attempts)
+            );
+
+            create index if not exists idx_autonomy_jobs_due
+                on autonomy_jobs (state, due_at_ms, created_at_ms, job_id);
+            create index if not exists idx_autonomy_jobs_lease_expiry
+                on autonomy_jobs (state, lease_expires_at_ms, updated_at_ms, job_id);
+
+            create table if not exists autonomy_job_transitions (
+                job_id text not null references autonomy_jobs(job_id) on delete cascade,
+                sequence integer not null,
+                from_state text,
+                to_state text not null,
+                attempt integer not null,
+                reason text,
+                lease_owner text,
+                occurred_at_ms integer not null,
+                primary key (job_id, sequence),
+                check (to_state in ('queued', 'claimed', 'running', 'completed', 'failed', 'cancelled')),
+                check (from_state is null or from_state in
+                    ('queued', 'claimed', 'running', 'completed', 'failed', 'cancelled'))
+            );
+
+            create table if not exists autonomy_checkpoints (
+                checkpoint_id text primary key,
+                job_id text not null references autonomy_jobs(job_id) on delete cascade,
+                checkpoint_key text not null,
+                session_id text,
+                goal_id text,
+                kind text not null,
+                state_json text not null,
+                evidence_json text not null,
+                content_hash text not null,
+                created_at_ms integer not null,
+                unique (job_id, checkpoint_key)
+            );
+            create index if not exists idx_autonomy_checkpoints_job
+                on autonomy_checkpoints (job_id, created_at_ms, checkpoint_id);
+
+            create table if not exists borg_autonomy_schema (
+                id integer primary key check(id=1),
+                version integer not null
+            );
+            "#;
+
 /// The durable lifecycle of one programmatic runtime job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -949,76 +1017,41 @@ impl SqliteAutonomyStore {
     }
 
     async fn ensure_schema(&self) -> Result<()> {
-        sqlx::raw_sql(
-            r#"
-            create table if not exists autonomy_jobs (
-                job_id text primary key,
-                idempotency_key text not null unique,
-                kind text not null,
-                payload_json text not null,
-                state text not null,
-                due_at_ms integer not null,
-                attempt integer not null default 0,
-                max_attempts integer not null,
-                lease_owner text,
-                lease_token text,
-                lease_heartbeat_at_ms integer,
-                lease_expires_at_ms integer,
-                session_id text,
-                goal_id text,
-                result_json text,
-                last_error text,
-                created_at_ms integer not null,
-                updated_at_ms integer not null,
-                check (state in ('queued', 'claimed', 'running', 'completed', 'failed', 'cancelled')),
-                check (attempt >= 0 and max_attempts > 0 and attempt <= max_attempts)
-            );
-
-            create index if not exists idx_autonomy_jobs_due
-                on autonomy_jobs (state, due_at_ms, created_at_ms, job_id);
-            create index if not exists idx_autonomy_jobs_lease_expiry
-                on autonomy_jobs (state, lease_expires_at_ms, updated_at_ms, job_id);
-
-            create table if not exists autonomy_job_transitions (
-                job_id text not null references autonomy_jobs(job_id) on delete cascade,
-                sequence integer not null,
-                from_state text,
-                to_state text not null,
-                attempt integer not null,
-                reason text,
-                lease_owner text,
-                occurred_at_ms integer not null,
-                primary key (job_id, sequence),
-                check (to_state in ('queued', 'claimed', 'running', 'completed', 'failed', 'cancelled')),
-                check (from_state is null or from_state in
-                    ('queued', 'claimed', 'running', 'completed', 'failed', 'cancelled'))
-            );
-
-            create table if not exists autonomy_checkpoints (
-                checkpoint_id text primary key,
-                job_id text not null references autonomy_jobs(job_id) on delete cascade,
-                checkpoint_key text not null,
-                session_id text,
-                goal_id text,
-                kind text not null,
-                state_json text not null,
-                evidence_json text not null,
-                content_hash text not null,
-                created_at_ms integer not null,
-                unique (job_id, checkpoint_key)
-            );
-            create index if not exists idx_autonomy_checkpoints_job
-                on autonomy_checkpoints (job_id, created_at_ms, checkpoint_id);
-
-            create table if not exists borg_autonomy_schema (
-                id integer primary key check(id=1),
-                version integer not null
-            );
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .context("create autonomy SQLite schema")?;
+        sqlx::raw_sql(AUTONOMY_SCHEMA_SQL)
+            .execute(&self.pool)
+            .await
+            .context("create autonomy SQLite schema")?;
+        let version: Option<i64> =
+            sqlx::query_scalar("select version from borg_autonomy_schema where id=1")
+                .fetch_optional(&self.pool)
+                .await?;
+        ensure!(
+            version.is_none_or(|version| version <= AUTONOMY_SCHEMA_VERSION),
+            "autonomy database schema version {} was written by a newer Borg; expected {AUTONOMY_SCHEMA_VERSION}",
+            version.unwrap_or_default()
+        );
+        if version != Some(AUTONOMY_SCHEMA_VERSION) {
+            let mut connection = self.pool.acquire().await?;
+            let added = crate::schema_migration::add_missing_columns(
+                &mut connection,
+                AUTONOMY_SCHEMA_SQL,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "autonomy database schema version {} cannot be migrated in place; recreate or explicitly export/import this database",
+                    version.unwrap_or_default()
+                )
+            })?;
+            if version.is_some() || !added.is_empty() {
+                tracing::warn!(
+                    from = version.unwrap_or_default(),
+                    to = AUTONOMY_SCHEMA_VERSION,
+                    ?added,
+                    "migrated the autonomy database schema in place"
+                );
+            }
+        }
         let has_result: i64 = sqlx::query_scalar(
             "select exists(select 1 from pragma_table_info('autonomy_jobs') where name='result_json')",
         )
@@ -1028,15 +1061,14 @@ impl SqliteAutonomyStore {
             has_result != 0,
             "autonomy database is stale: autonomy_jobs.result_json is missing; recreate or explicitly export/import this database"
         );
-        let version: Option<i64> =
-            sqlx::query_scalar("select version from borg_autonomy_schema where id=1")
-                .fetch_optional(&self.pool)
-                .await?;
         match version {
-            Some(version) => ensure!(
-                version == AUTONOMY_SCHEMA_VERSION,
-                "autonomy database schema version {version} is unsupported; expected {AUTONOMY_SCHEMA_VERSION}"
-            ),
+            Some(AUTONOMY_SCHEMA_VERSION) => {}
+            Some(_) => {
+                sqlx::query("update borg_autonomy_schema set version=? where id=1")
+                    .bind(AUTONOMY_SCHEMA_VERSION)
+                    .execute(&self.pool)
+                    .await?;
+            }
             None => {
                 sqlx::query("insert into borg_autonomy_schema(id,version) values(1,?)")
                     .bind(AUTONOMY_SCHEMA_VERSION)

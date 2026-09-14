@@ -1205,9 +1205,11 @@ async fn empty_sessions_are_discarded_but_real_sessions_are_kept() {
 }
 
 #[tokio::test]
-async fn opening_schema_v4_archives_and_recreates_the_database() {
+async fn opening_schema_v4_migrates_in_place_and_keeps_sessions() {
     let (directory, store) = store().await;
     let path = directory.path().join("sessions.sqlite3");
+    let kept = Uuid::new_v4();
+    store.create_session(kept).await.unwrap();
     sqlx::query("drop index if exists idx_session_actions_lease_expiry")
         .execute(store.pool())
         .await
@@ -1260,7 +1262,11 @@ async fn opening_schema_v4_archives_and_recreates_the_database() {
         .fetch_one(reopened.pool())
         .await
         .unwrap();
-    assert_eq!(sessions, 0, "the incompatible database must not be reused");
+    assert_eq!(
+        sessions, 1,
+        "an additive upgrade must keep the user's sessions"
+    );
+    assert!(reopened.contains_session(kept).await.unwrap());
     let archive_count = std::fs::read_dir(directory.path())
         .unwrap()
         .filter_map(|entry| entry.ok())
@@ -1271,24 +1277,47 @@ async fn opening_schema_v4_archives_and_recreates_the_database() {
                 .starts_with("sessions.sqlite3.incompatible-")
         })
         .count();
-    assert_eq!(
-        archive_count, 1,
-        "the old database should remain recoverable"
-    );
+    assert_eq!(archive_count, 0, "nothing was archived aside");
 }
 
 #[tokio::test]
-async fn opening_a_legacy_database_without_a_schema_marker_archives_it() {
+async fn opening_a_future_schema_version_is_refused_without_touching_the_database() {
     let (directory, store) = store().await;
     let path = directory.path().join("sessions.sqlite3");
+    sqlx::query("update borg_session_schema set version=? where id=1")
+        .bind(SESSION_SCHEMA_VERSION + 1)
+        .execute(store.pool())
+        .await
+        .unwrap();
+    store.pool().close().await;
+
+    let error = match SqliteSessionStore::open(&path).await {
+        Ok(_) => panic!("a future schema version must be refused"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("future"), "{error}");
+    assert!(path.exists());
+}
+
+#[tokio::test]
+async fn opening_a_legacy_database_without_a_schema_marker_migrates_it() {
+    let (directory, store) = store().await;
+    let path = directory.path().join("sessions.sqlite3");
+    let kept = Uuid::new_v4();
+    store.create_session(kept).await.unwrap();
     sqlx::query("drop table borg_session_schema")
         .execute(store.pool())
         .await
         .unwrap();
     store.pool().close().await;
 
-    SqliteSessionStore::open(&path).await.unwrap();
-
+    let reopened = SqliteSessionStore::open(&path).await.unwrap();
+    assert!(reopened.contains_session(kept).await.unwrap());
+    let version: i64 = sqlx::query_scalar("select version from borg_session_schema where id=1")
+        .fetch_one(reopened.pool())
+        .await
+        .unwrap();
+    assert_eq!(version, SESSION_SCHEMA_VERSION);
     assert_eq!(
         std::fs::read_dir(directory.path())
             .unwrap()
@@ -1300,7 +1329,7 @@ async fn opening_a_legacy_database_without_a_schema_marker_archives_it() {
                     .starts_with("sessions.sqlite3.incompatible-")
             })
             .count(),
-        1
+        0
     );
 }
 
@@ -1343,6 +1372,7 @@ async fn provider_capability_snapshot_is_durable_metadata_not_context() {
         auth_methods: vec![crate::ProviderAuthMethod::Subscription],
         can_spawn: true,
         usage: None,
+        billing: None,
     }];
     store
         .append(SessionEvent::new(

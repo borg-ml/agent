@@ -46,6 +46,268 @@ const FORK_PROJECTION_CHECKPOINT_INTERVAL: u64 = 256;
 pub const SESSION_PROJECTION_VERSION: i32 = 3;
 const SESSION_SCHEMA_VERSION: i64 = 5;
 const DISPOSABLE_SCHEMA_ERROR: &str = "Borg session database schema is incompatible";
+
+/// The canonical schema. Older databases are migrated forward by re-running
+/// this batch and adding the columns it declares that they lack.
+const SESSION_SCHEMA_SQL: &str = r#"
+            create table if not exists sessions (
+                id text primary key,
+                parent_session_id text references sessions(id),
+                parent_cut_sequence integer,
+                owner_session_id text references sessions(id),
+                inherited_event_count integer not null default 0,
+                next_sequence integer not null default 1,
+                live_revision integer not null default 0,
+                state_json text not null,
+                projection_version integer not null default 3,
+                created_at text not null,
+                updated_at text not null
+            );
+
+            create table if not exists session_model_access (
+                session_id text not null references sessions(id) on delete cascade,
+                provider text not null,
+                account_identity text not null,
+                primary key (session_id, provider)
+            );
+
+            create table if not exists session_harness_routes (
+                session_id text not null references sessions(id) on delete cascade,
+                provider text not null,
+                native integer not null check (native in (0, 1)),
+                primary key (session_id, provider)
+            );
+
+            create table if not exists session_events (
+                session_id text not null references sessions(id) on delete cascade,
+                sequence integer not null,
+                event_id text not null,
+                event_kind text not null,
+                event_json text not null,
+                projection_json text not null,
+                fork_inheritable integer not null,
+                recovery_relevant integer not null,
+                message_id text,
+                created_at text not null,
+                primary key (session_id, sequence),
+                unique (session_id, event_id)
+            );
+
+            create table if not exists session_actions (
+                action_id text primary key,
+                session_id text not null references sessions(id) on delete cascade,
+                action_kind text not null,
+                state text not null,
+                delivery_policy text not null,
+                wake_policy text not null,
+                payload_json text not null,
+                attempt integer not null default 0,
+                error text,
+                created_at text not null,
+                updated_at text not null,
+                accepted_at text,
+                delivered_at text,
+                completed_at text,
+                lease_owner text,
+                lease_token text,
+                lease_heartbeat_at text,
+                lease_expires_at text
+            );
+
+            create index if not exists idx_session_actions_pending
+                on session_actions (session_id, state, created_at);
+
+            create table if not exists session_action_transitions (
+                action_id text not null references session_actions(action_id) on delete cascade,
+                session_id text not null references sessions(id) on delete cascade,
+                transition_no integer not null,
+                from_state text,
+                to_state text not null,
+                error text,
+                created_at text not null,
+                primary key (action_id, transition_no)
+            );
+
+            create index if not exists idx_session_action_transitions_session
+                on session_action_transitions (session_id, created_at, action_id);
+
+            create table if not exists session_live_state (
+                session_id text not null references sessions(id) on delete cascade,
+                live_key text not null,
+                revision integer not null,
+                event_json text not null,
+                updated_at text not null,
+                primary key (session_id, live_key)
+            );
+
+            create index if not exists idx_session_live_revision
+                on session_live_state (session_id, revision);
+
+            create table if not exists session_payloads (
+                id text primary key,
+                session_id text not null references sessions(id) on delete cascade,
+                event_id text not null,
+                payload_kind text not null,
+                payload blob not null,
+                byte_len integer not null,
+                created_at text not null
+            );
+
+            create index if not exists idx_session_payloads_event
+                on session_payloads (session_id, event_id);
+
+            -- Search is a disposable projection. The event row and payload
+            -- blobs above remain the only source of truth, while this table
+            -- gives exact tenant/range filtering and FTS a compact join key.
+            create table if not exists session_event_search (
+                rowid integer primary key,
+                session_id text not null references sessions(id) on delete cascade,
+                sequence integer not null,
+                event_id text not null,
+                event_kind text not null,
+                actor text,
+                body text not null,
+                unique (session_id, event_id)
+            );
+
+            create index if not exists idx_session_event_search_sequence
+                on session_event_search (session_id, sequence);
+
+            create virtual table if not exists session_event_fts using fts5(
+                body,
+                content='session_event_search',
+                content_rowid='rowid',
+                tokenize='unicode61 remove_diacritics 2'
+            );
+
+            create trigger if not exists session_event_search_insert
+            after insert on session_event_search begin
+                insert into session_event_fts(rowid, body) values (new.rowid, new.body);
+            end;
+
+            create trigger if not exists session_event_search_delete
+            after delete on session_event_search begin
+                insert into session_event_fts(session_event_fts, rowid, body)
+                    values ('delete', old.rowid, old.body);
+            end;
+
+            create trigger if not exists session_event_search_update
+            after update on session_event_search begin
+                insert into session_event_fts(session_event_fts, rowid, body)
+                    values ('delete', old.rowid, old.body);
+                insert into session_event_fts(rowid, body) values (new.rowid, new.body);
+            end;
+
+            create index if not exists idx_session_events_message
+                on session_events (session_id, message_id)
+                where message_id is not null;
+
+            create index if not exists idx_session_events_message_sequence
+                on session_events (session_id, sequence desc)
+                where event_kind = 'message';
+
+            create index if not exists idx_session_events_fork_inheritable
+                on session_events (session_id, sequence)
+                where fork_inheritable = 1;
+
+            create index if not exists idx_session_events_recovery
+                on session_events (session_id, sequence)
+                where recovery_relevant = 1;
+
+            create index if not exists idx_session_events_subagent_recovery
+                on session_events (
+                    session_id,
+                    event_kind,
+                    json_extract(event_json, '$.kind.agent.session_id'),
+                    sequence desc
+                ) where event_kind = 'subagent_activity';
+
+            create index if not exists idx_session_events_context_compaction
+                on session_events (session_id, sequence desc)
+                where event_kind = 'provider_event'
+                  and json_extract(event_json, '$.kind.kind') = 'context_compaction';
+
+            create index if not exists idx_session_events_context_clear
+                on session_events (session_id, sequence desc)
+                where event_kind = 'context_cleared';
+
+            create index if not exists idx_sessions_activity
+                on sessions (updated_at desc);
+
+            create table if not exists session_workspace_bindings (
+                session_id text primary key references sessions(id) on delete cascade,
+                workspace_id text not null,
+                participant_id text not null,
+                host_id text,
+                attached_at text not null
+            );
+
+            create index if not exists idx_session_workspace_bindings_workspace
+                on session_workspace_bindings (workspace_id, session_id);
+
+            create table if not exists host_launches (
+                session_id text primary key,
+                metadata_json text not null,
+                created_at text not null,
+                updated_at text not null
+            );
+
+            create table if not exists host_launch_owners (
+                session_id text primary key references host_launches(session_id) on delete cascade,
+                host_id text not null,
+                relay_origin text not null
+            );
+
+            create table if not exists host_journal_cursors (
+                session_id text primary key references host_launches(session_id) on delete cascade,
+                event_cursor integer not null default 0,
+                live_revision integer not null default 0
+            );
+
+            create table if not exists host_workspace_cursors (
+                host_id text not null,
+                session_id text not null references sessions(id) on delete cascade,
+                workspace_id text not null,
+                sequence integer not null default 0,
+                primary key(host_id,session_id,workspace_id)
+            );
+
+            create table if not exists host_bootstraps (
+                session_id text primary key references host_launches(session_id) on delete cascade
+            );
+
+            -- A runtime manifest records how a trusted namespace was opened
+            -- and whether its worker survived. Checkpoints are explicit JSON
+            -- data; executable code is never replayed automatically.
+            create table if not exists runtime_manifests (
+                session_id text primary key references sessions(id) on delete cascade,
+                manifest_version integer not null,
+                runtime text not null,
+                root text not null,
+                command text not null,
+                worker_id text not null,
+                status text not null,
+                execution_count integer not null default 0,
+                last_code_hash text,
+                last_error text,
+                created_at text not null,
+                updated_at text not null
+            );
+
+            create table if not exists runtime_checkpoints (
+                session_id text not null references sessions(id) on delete cascade,
+                checkpoint_key text not null,
+                state_json text not null,
+                content_hash text not null,
+                revision integer not null,
+                created_at text not null,
+                primary key (session_id, checkpoint_key),
+                unique (session_id, revision)
+            );
+
+            create index if not exists idx_runtime_checkpoints_revision
+                on runtime_checkpoints (session_id, revision desc);
+            "#;
 pub(crate) const DEFAULT_HISTORY_LIMIT: usize = 50;
 pub(crate) const MAX_HISTORY_LIMIT: usize = 200;
 pub(crate) const DEFAULT_HISTORY_SCAN_LIMIT: usize = 10_000;
@@ -3367,289 +3629,42 @@ impl SqliteSessionStore {
         } else {
             None
         };
-        if had_existing_schema {
+        // Older databases (or a legacy one without a marker, treated as
+        // version 0) are migrated forward in place below. Only a database
+        // written by a newer Borg is refused outright.
+        let migrate_from = if had_existing_schema {
             match existing_schema_version {
-                Some(version) if version == SESSION_SCHEMA_VERSION => {}
+                Some(version) if version == SESSION_SCHEMA_VERSION => None,
                 Some(version) if version > SESSION_SCHEMA_VERSION => {
                     bail!(
                         "unsupported future Borg session schema version {version}; current is {SESSION_SCHEMA_VERSION}"
                     );
                 }
-                Some(version) => {
-                    bail!(
-                        "{DISPOSABLE_SCHEMA_ERROR}: version {version} is older than the current version {SESSION_SCHEMA_VERSION}"
-                    );
-                }
-                None => {
-                    bail!(
-                        "{DISPOSABLE_SCHEMA_ERROR}: legacy database has no current schema marker"
-                    );
-                }
+                Some(version) => Some(version),
+                None => Some(0),
+            }
+        } else {
+            None
+        };
+        sqlx::raw_sql(SESSION_SCHEMA_SQL)
+            .execute(&self.pool)
+            .await?;
+        if let Some(from) = migrate_from {
+            let mut connection = self.pool.acquire().await?;
+            match crate::schema_migration::add_missing_columns(&mut connection, SESSION_SCHEMA_SQL)
+                .await
+            {
+                Ok(added) => warn!(
+                    from,
+                    to = SESSION_SCHEMA_VERSION,
+                    ?added,
+                    "migrated the session database schema in place"
+                ),
+                Err(error) => bail!(
+                    "{DISPOSABLE_SCHEMA_ERROR}: version {from} cannot be migrated in place: {error:#}"
+                ),
             }
         }
-        sqlx::raw_sql(
-            r#"
-            create table if not exists sessions (
-                id text primary key,
-                parent_session_id text references sessions(id),
-                parent_cut_sequence integer,
-                owner_session_id text references sessions(id),
-                inherited_event_count integer not null default 0,
-                next_sequence integer not null default 1,
-                live_revision integer not null default 0,
-                state_json text not null,
-                projection_version integer not null default 3,
-                created_at text not null,
-                updated_at text not null
-            );
-
-            create table if not exists session_model_access (
-                session_id text not null references sessions(id) on delete cascade,
-                provider text not null,
-                account_identity text not null,
-                primary key (session_id, provider)
-            );
-
-            create table if not exists session_harness_routes (
-                session_id text not null references sessions(id) on delete cascade,
-                provider text not null,
-                native integer not null check (native in (0, 1)),
-                primary key (session_id, provider)
-            );
-
-            create table if not exists session_events (
-                session_id text not null references sessions(id) on delete cascade,
-                sequence integer not null,
-                event_id text not null,
-                event_kind text not null,
-                event_json text not null,
-                projection_json text not null,
-                fork_inheritable integer not null,
-                recovery_relevant integer not null,
-                message_id text,
-                created_at text not null,
-                primary key (session_id, sequence),
-                unique (session_id, event_id)
-            );
-
-            create table if not exists session_actions (
-                action_id text primary key,
-                session_id text not null references sessions(id) on delete cascade,
-                action_kind text not null,
-                state text not null,
-                delivery_policy text not null,
-                wake_policy text not null,
-                payload_json text not null,
-                attempt integer not null default 0,
-                error text,
-                created_at text not null,
-                updated_at text not null,
-                accepted_at text,
-                delivered_at text,
-                completed_at text,
-                lease_owner text,
-                lease_token text,
-                lease_heartbeat_at text,
-                lease_expires_at text
-            );
-
-            create index if not exists idx_session_actions_pending
-                on session_actions (session_id, state, created_at);
-
-            create table if not exists session_action_transitions (
-                action_id text not null references session_actions(action_id) on delete cascade,
-                session_id text not null references sessions(id) on delete cascade,
-                transition_no integer not null,
-                from_state text,
-                to_state text not null,
-                error text,
-                created_at text not null,
-                primary key (action_id, transition_no)
-            );
-
-            create index if not exists idx_session_action_transitions_session
-                on session_action_transitions (session_id, created_at, action_id);
-
-            create table if not exists session_live_state (
-                session_id text not null references sessions(id) on delete cascade,
-                live_key text not null,
-                revision integer not null,
-                event_json text not null,
-                updated_at text not null,
-                primary key (session_id, live_key)
-            );
-
-            create index if not exists idx_session_live_revision
-                on session_live_state (session_id, revision);
-
-            create table if not exists session_payloads (
-                id text primary key,
-                session_id text not null references sessions(id) on delete cascade,
-                event_id text not null,
-                payload_kind text not null,
-                payload blob not null,
-                byte_len integer not null,
-                created_at text not null
-            );
-
-            create index if not exists idx_session_payloads_event
-                on session_payloads (session_id, event_id);
-
-            -- Search is a disposable projection. The event row and payload
-            -- blobs above remain the only source of truth, while this table
-            -- gives exact tenant/range filtering and FTS a compact join key.
-            create table if not exists session_event_search (
-                rowid integer primary key,
-                session_id text not null references sessions(id) on delete cascade,
-                sequence integer not null,
-                event_id text not null,
-                event_kind text not null,
-                actor text,
-                body text not null,
-                unique (session_id, event_id)
-            );
-
-            create index if not exists idx_session_event_search_sequence
-                on session_event_search (session_id, sequence);
-
-            create virtual table if not exists session_event_fts using fts5(
-                body,
-                content='session_event_search',
-                content_rowid='rowid',
-                tokenize='unicode61 remove_diacritics 2'
-            );
-
-            create trigger if not exists session_event_search_insert
-            after insert on session_event_search begin
-                insert into session_event_fts(rowid, body) values (new.rowid, new.body);
-            end;
-
-            create trigger if not exists session_event_search_delete
-            after delete on session_event_search begin
-                insert into session_event_fts(session_event_fts, rowid, body)
-                    values ('delete', old.rowid, old.body);
-            end;
-
-            create trigger if not exists session_event_search_update
-            after update on session_event_search begin
-                insert into session_event_fts(session_event_fts, rowid, body)
-                    values ('delete', old.rowid, old.body);
-                insert into session_event_fts(rowid, body) values (new.rowid, new.body);
-            end;
-
-            create index if not exists idx_session_events_message
-                on session_events (session_id, message_id)
-                where message_id is not null;
-
-            create index if not exists idx_session_events_message_sequence
-                on session_events (session_id, sequence desc)
-                where event_kind = 'message';
-
-            create index if not exists idx_session_events_fork_inheritable
-                on session_events (session_id, sequence)
-                where fork_inheritable = 1;
-
-            create index if not exists idx_session_events_recovery
-                on session_events (session_id, sequence)
-                where recovery_relevant = 1;
-
-            create index if not exists idx_session_events_subagent_recovery
-                on session_events (
-                    session_id,
-                    event_kind,
-                    json_extract(event_json, '$.kind.agent.session_id'),
-                    sequence desc
-                ) where event_kind = 'subagent_activity';
-
-            create index if not exists idx_session_events_context_compaction
-                on session_events (session_id, sequence desc)
-                where event_kind = 'provider_event'
-                  and json_extract(event_json, '$.kind.kind') = 'context_compaction';
-
-            create index if not exists idx_session_events_context_clear
-                on session_events (session_id, sequence desc)
-                where event_kind = 'context_cleared';
-
-            create index if not exists idx_sessions_activity
-                on sessions (updated_at desc);
-
-            create table if not exists session_workspace_bindings (
-                session_id text primary key references sessions(id) on delete cascade,
-                workspace_id text not null,
-                participant_id text not null,
-                host_id text,
-                attached_at text not null
-            );
-
-            create index if not exists idx_session_workspace_bindings_workspace
-                on session_workspace_bindings (workspace_id, session_id);
-
-            create table if not exists host_launches (
-                session_id text primary key,
-                metadata_json text not null,
-                created_at text not null,
-                updated_at text not null
-            );
-
-            create table if not exists host_launch_owners (
-                session_id text primary key references host_launches(session_id) on delete cascade,
-                host_id text not null,
-                relay_origin text not null
-            );
-
-            create table if not exists host_journal_cursors (
-                session_id text primary key references host_launches(session_id) on delete cascade,
-                event_cursor integer not null default 0,
-                live_revision integer not null default 0
-            );
-
-            create table if not exists host_workspace_cursors (
-                host_id text not null,
-                session_id text not null references sessions(id) on delete cascade,
-                workspace_id text not null,
-                sequence integer not null default 0,
-                primary key(host_id,session_id,workspace_id)
-            );
-
-            create table if not exists host_bootstraps (
-                session_id text primary key references host_launches(session_id) on delete cascade
-            );
-
-            -- A runtime manifest records how a trusted namespace was opened
-            -- and whether its worker survived. Checkpoints are explicit JSON
-            -- data; executable code is never replayed automatically.
-            create table if not exists runtime_manifests (
-                session_id text primary key references sessions(id) on delete cascade,
-                manifest_version integer not null,
-                runtime text not null,
-                root text not null,
-                command text not null,
-                worker_id text not null,
-                status text not null,
-                execution_count integer not null default 0,
-                last_code_hash text,
-                last_error text,
-                created_at text not null,
-                updated_at text not null
-            );
-
-            create table if not exists runtime_checkpoints (
-                session_id text not null references sessions(id) on delete cascade,
-                checkpoint_key text not null,
-                state_json text not null,
-                content_hash text not null,
-                revision integer not null,
-                created_at text not null,
-                primary key (session_id, checkpoint_key),
-                unique (session_id, revision)
-            );
-
-            create index if not exists idx_runtime_checkpoints_revision
-                on runtime_checkpoints (session_id, revision desc);
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
         // A current database already has both disposable projections. Do not
         // rescan the canonical journal on every open; missing history rows
         // are repaired for the requested session by ensure_history_projection.
@@ -3697,13 +3712,11 @@ impl SqliteSessionStore {
                     "unsupported future Borg session schema version {version}; current is {SESSION_SCHEMA_VERSION}"
                 );
             }
-            Some(version) => {
-                bail!(
-                    "{DISPOSABLE_SCHEMA_ERROR}: version {version} is older than the current version {SESSION_SCHEMA_VERSION}"
-                );
-            }
-            None if had_existing_schema => {
-                bail!("{DISPOSABLE_SCHEMA_ERROR}: legacy database has no current schema marker");
+            Some(_) => {
+                sqlx::query("update borg_session_schema set version=? where id=1")
+                    .bind(SESSION_SCHEMA_VERSION)
+                    .execute(&mut *schema_transaction)
+                    .await?;
             }
             None => {
                 sqlx::query("insert into borg_session_schema(id,version) values(1,?)")

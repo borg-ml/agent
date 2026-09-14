@@ -33,6 +33,7 @@ mod process_environment;
 mod profiling;
 mod receipt;
 mod runtime_protocol;
+mod schema_migration;
 mod self_service;
 mod session;
 mod session_action;

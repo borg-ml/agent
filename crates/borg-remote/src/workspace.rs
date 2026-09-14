@@ -18,6 +18,26 @@ const SQLITE_MMAP_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 const SQLITE_CACHE_KIB: u64 = 8 * 1024;
 const WORKSPACE_SCHEMA_VERSION: i64 = 2;
 
+/// The canonical schema. Older databases are migrated forward by re-running
+/// this batch and adding the columns it declares that they lack.
+const WORKSPACE_SCHEMA_SQL: &str = r#"
+      create table if not exists borg_workspace_schema (id integer primary key check(id=1), version integer not null);
+      create table if not exists workspace_participants (id text primary key, display_name text not null, kind text not null, created_at text not null);
+      create table if not exists agent_instances (participant_id text primary key references workspace_participants(id), host_id text, workspace_id text);
+      create table if not exists workspaces (id text primary key, name text not null, next_sequence integer not null default 1, created_at text not null);
+      create table if not exists workspace_members (workspace_id text not null references workspaces(id) on delete cascade, participant_id text not null references workspace_participants(id), role text not null, joined_at text not null, primary key(workspace_id,participant_id));
+      create table if not exists workspace_threads (id text primary key, workspace_id text not null references workspaces(id) on delete cascade, title text not null, created_at text not null);
+      create table if not exists workspace_events (workspace_id text not null references workspaces(id) on delete cascade, sequence integer not null, id text not null, author_id text not null references workspace_participants(id), idempotency_key text not null, canonical_json text not null, event_json text not null, created_at text not null, primary key(workspace_id,sequence), unique(workspace_id,author_id,idempotency_key));
+      create table if not exists workspace_work_items (workspace_id text not null references workspaces(id) on delete cascade, work_id text not null, created_sequence integer not null, primary key(workspace_id,work_id));
+      create table if not exists workspace_work_claims (workspace_id text not null references workspaces(id) on delete cascade, work_id text not null, claim_id text not null, claimant_id text not null references workspace_participants(id), sequence integer not null, primary key(workspace_id,work_id));
+      create table if not exists workspace_work_dependencies (workspace_id text not null references workspaces(id) on delete cascade, work_id text not null, depends_on_work_id text not null, sequence integer not null, primary key(workspace_id,work_id,depends_on_work_id));
+      create table if not exists workspace_deliveries (workspace_id text not null, sequence integer not null, recipient_id text not null references workspace_participants(id), mode text not null, state text not null, attempts integer not null default 0, last_attempt_json text, is_message integer not null default 0, primary key(workspace_id,sequence,recipient_id), foreign key(workspace_id,sequence) references workspace_events(workspace_id,sequence) on delete cascade);
+      create table if not exists workspace_presence_leases (workspace_id text not null references workspaces(id) on delete cascade, participant_id text not null references workspace_participants(id), client_id text not null, host_id text, expires_at text not null, primary key(workspace_id,participant_id,client_id));
+      create index if not exists idx_workspace_delivery_recipient on workspace_deliveries(workspace_id,recipient_id,sequence);
+      create index if not exists idx_workspace_events_id on workspace_events(workspace_id,id);
+      create index if not exists idx_workspace_events_messages on workspace_events(workspace_id,sequence) where json_extract(event_json, '$.kind.type')='message';
+    "#;
+
 /// Stable identity for the local OS user across all personal workspaces in one
 /// Borg installation. Authenticated cloud workspaces replace this projection
 /// with the product user participant ID.
@@ -1114,23 +1134,41 @@ impl SqliteWorkspaceStore {
             crate::session_store::SQLITE_SCHEMA_WAIT_TIMEOUT,
         )
         .await?;
-        sqlx::raw_sql(r#"
-      create table if not exists borg_workspace_schema (id integer primary key check(id=1), version integer not null);
-      create table if not exists workspace_participants (id text primary key, display_name text not null, kind text not null, created_at text not null);
-      create table if not exists agent_instances (participant_id text primary key references workspace_participants(id), host_id text, workspace_id text);
-      create table if not exists workspaces (id text primary key, name text not null, next_sequence integer not null default 1, created_at text not null);
-      create table if not exists workspace_members (workspace_id text not null references workspaces(id) on delete cascade, participant_id text not null references workspace_participants(id), role text not null, joined_at text not null, primary key(workspace_id,participant_id));
-      create table if not exists workspace_threads (id text primary key, workspace_id text not null references workspaces(id) on delete cascade, title text not null, created_at text not null);
-      create table if not exists workspace_events (workspace_id text not null references workspaces(id) on delete cascade, sequence integer not null, id text not null, author_id text not null references workspace_participants(id), idempotency_key text not null, canonical_json text not null, event_json text not null, created_at text not null, primary key(workspace_id,sequence), unique(workspace_id,author_id,idempotency_key));
-      create table if not exists workspace_work_items (workspace_id text not null references workspaces(id) on delete cascade, work_id text not null, created_sequence integer not null, primary key(workspace_id,work_id));
-      create table if not exists workspace_work_claims (workspace_id text not null references workspaces(id) on delete cascade, work_id text not null, claim_id text not null, claimant_id text not null references workspace_participants(id), sequence integer not null, primary key(workspace_id,work_id));
-      create table if not exists workspace_work_dependencies (workspace_id text not null references workspaces(id) on delete cascade, work_id text not null, depends_on_work_id text not null, sequence integer not null, primary key(workspace_id,work_id,depends_on_work_id));
-      create table if not exists workspace_deliveries (workspace_id text not null, sequence integer not null, recipient_id text not null references workspace_participants(id), mode text not null, state text not null, attempts integer not null default 0, last_attempt_json text, is_message integer not null default 0, primary key(workspace_id,sequence,recipient_id), foreign key(workspace_id,sequence) references workspace_events(workspace_id,sequence) on delete cascade);
-      create table if not exists workspace_presence_leases (workspace_id text not null references workspaces(id) on delete cascade, participant_id text not null references workspace_participants(id), client_id text not null, host_id text, expires_at text not null, primary key(workspace_id,participant_id,client_id));
-      create index if not exists idx_workspace_delivery_recipient on workspace_deliveries(workspace_id,recipient_id,sequence);
-      create index if not exists idx_workspace_events_id on workspace_events(workspace_id,id);
-      create index if not exists idx_workspace_events_messages on workspace_events(workspace_id,sequence) where json_extract(event_json, '$.kind.type')='message';
-    "#).execute(&mut *transaction).await?;
+        sqlx::raw_sql(WORKSPACE_SCHEMA_SQL)
+            .execute(&mut *transaction)
+            .await?;
+        let version: Option<i64> =
+            sqlx::query_scalar("select version from borg_workspace_schema where id=1")
+                .fetch_optional(&mut *transaction)
+                .await?;
+        ensure!(
+            version.is_none_or(|version| version <= WORKSPACE_SCHEMA_VERSION),
+            "workspace database schema version {} was written by a newer Borg; expected {WORKSPACE_SCHEMA_VERSION}",
+            version.unwrap_or_default()
+        );
+        if version != Some(WORKSPACE_SCHEMA_VERSION) {
+            // Additive migration: the batch above created any new tables and
+            // indexes; add the columns an older layout lacks.
+            let added = crate::schema_migration::add_missing_columns(
+                &mut transaction,
+                WORKSPACE_SCHEMA_SQL,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "workspace database schema version {} cannot be migrated in place; recreate or explicitly export/import this database",
+                    version.unwrap_or_default()
+                )
+            })?;
+            if version.is_some() || !added.is_empty() {
+                tracing::warn!(
+                    from = version.unwrap_or_default(),
+                    to = WORKSPACE_SCHEMA_VERSION,
+                    ?added,
+                    "migrated the workspace database schema in place"
+                );
+            }
+        }
         let columns = sqlx::query("pragma table_info(workspace_deliveries)")
             .fetch_all(&mut *transaction)
             .await?;
@@ -1140,15 +1178,14 @@ impl SqliteWorkspaceStore {
                 .any(|column| column.get::<String, _>("name") == "is_message"),
             "workspace database is stale: workspace_deliveries.is_message is missing; recreate or explicitly export/import this database"
         );
-        let version: Option<i64> =
-            sqlx::query_scalar("select version from borg_workspace_schema where id=1")
-                .fetch_optional(&mut *transaction)
-                .await?;
         match version {
-            Some(version) => ensure!(
-                version == WORKSPACE_SCHEMA_VERSION,
-                "workspace database schema version {version} is unsupported; expected {WORKSPACE_SCHEMA_VERSION}"
-            ),
+            Some(WORKSPACE_SCHEMA_VERSION) => {}
+            Some(_) => {
+                sqlx::query("update borg_workspace_schema set version=? where id=1")
+                    .bind(WORKSPACE_SCHEMA_VERSION)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
             None => {
                 sqlx::query("insert into borg_workspace_schema(id,version) values(1,?)")
                     .bind(WORKSPACE_SCHEMA_VERSION)
@@ -2629,7 +2666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_workspace_store_is_rejected_instead_of_migrated() {
+    async fn stale_workspace_store_is_migrated_in_place() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let opts = SqliteConnectOptions::from_str(&format!("sqlite://{}", file.path().display()))
             .unwrap()
@@ -2659,14 +2696,26 @@ mod tests {
         .unwrap();
         pool.close().await;
 
-        let error = match SqliteWorkspaceStore::open(file.path()).await {
-            Ok(_) => panic!("stale workspace schema was silently accepted"),
-            Err(error) => error,
-        };
+        let store = SqliteWorkspaceStore::open(file.path())
+            .await
+            .expect("a stale workspace schema is migrated in place, not rejected");
+        let columns: Vec<String> = sqlx::query("pragma table_info(workspace_deliveries)")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
         assert!(
-            format!("{error:#}").contains("workspace_deliveries.is_message"),
-            "unexpected stale-schema error: {error:#}"
+            columns.iter().any(|name| name == "is_message"),
+            "migration must add workspace_deliveries.is_message; columns: {columns:?}"
         );
+        let version: i64 =
+            sqlx::query_scalar("select version from borg_workspace_schema where id=1")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(version, WORKSPACE_SCHEMA_VERSION);
     }
 
     #[tokio::test]
