@@ -1622,6 +1622,63 @@ fn map_claude_event(
     map_claude_event_with_correlation(event, billing_mode, None)
 }
 
+/// Claude Code reports its own context compaction through `system` frames:
+/// `subtype: "status", status: "compacting"` while it runs and
+/// `subtype: "compact_boundary"` (with `compact_metadata`) once the new
+/// transcript boundary lands. Codex compaction reaches Borg as a
+/// `context_compaction` provider event, and every Borg client renders its
+/// compaction card from that kind, so Claude's frames are mapped onto the same
+/// contract here. Claude keeps its own compacted session, so the payload marks
+/// the provider context as preserved: the durable journal must not restart
+/// replay or treat the boundary as a Borg-owned recovery checkpoint.
+fn claude_context_compaction_payload(raw: &Value) -> Option<Value> {
+    if raw.get("type").and_then(Value::as_str) != Some("system") {
+        return None;
+    }
+    match raw.get("subtype").and_then(Value::as_str)? {
+        "compact_boundary" => {
+            let metadata = raw.get("compact_metadata");
+            let trigger = metadata
+                .and_then(|metadata| metadata.get("trigger"))
+                .and_then(Value::as_str)
+                .filter(|trigger| !trigger.trim().is_empty());
+            let pre_tokens = metadata
+                .and_then(|metadata| metadata.get("pre_tokens"))
+                .and_then(Value::as_u64);
+            let mut detail = String::from("Claude Code compacted its transcript");
+            match (trigger, pre_tokens) {
+                (Some(trigger), Some(tokens)) => {
+                    detail.push_str(&format!(" ({trigger}, {tokens} tokens before)"));
+                }
+                (Some(trigger), None) => detail.push_str(&format!(" ({trigger})")),
+                (None, Some(tokens)) => detail.push_str(&format!(" ({tokens} tokens before)")),
+                (None, None) => {}
+            }
+            Some(serde_json::json!({
+                "status": "completed",
+                "summary": detail,
+                "trigger": trigger,
+                "pre_tokens": pre_tokens,
+                "provider_context_preserved": true,
+            }))
+        }
+        "status" => {
+            let compacting = raw
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status.eq_ignore_ascii_case("compacting"));
+            compacting.then(|| {
+                serde_json::json!({
+                    "status": "started",
+                    "summary": "Compacting context…",
+                    "provider_context_preserved": true,
+                })
+            })
+        }
+        _ => None,
+    }
+}
+
 fn map_claude_event_with_correlation(
     event: claude_agents::ChatStreamEvent,
     billing_mode: ProviderBillingMode,
@@ -1638,6 +1695,21 @@ fn map_claude_event_with_correlation(
             tool_use_id,
             tool_name,
         } => {
+            if let Some(compaction) = raw_payload
+                .as_ref()
+                .and_then(claude_context_compaction_payload)
+            {
+                return ChatStreamEvent::ProviderEvent {
+                    kind: "context_compaction".to_string(),
+                    payload: compaction,
+                    raw_payload,
+                    stream_channel,
+                    content_text,
+                    provider_item_id,
+                    tool_use_id,
+                    tool_name,
+                };
+            }
             enrich_claude_lifecycle_payload(
                 &kind,
                 &mut payload,
@@ -4665,6 +4737,74 @@ mod tests {
             } else {
                 assert!(progress.is_empty());
             }
+        }
+    }
+
+    fn claude_system_frame(raw: Value) -> claude_agents::ChatStreamEvent {
+        claude_agents::ChatStreamEvent::ProviderEvent {
+            kind: "claude.system".to_string(),
+            payload: serde_json::json!({"type": "system"}),
+            raw_payload: Some(raw),
+            stream_channel: None,
+            content_text: None,
+            provider_item_id: None,
+            tool_use_id: None,
+            tool_name: None,
+        }
+    }
+
+    #[test]
+    fn claude_compaction_frames_map_to_borg_context_compaction_events() {
+        let boundary = map_claude_event(
+            claude_system_frame(serde_json::json!({
+                "type": "system",
+                "subtype": "compact_boundary",
+                "session_id": "session-1",
+                "compact_metadata": {"trigger": "auto", "pre_tokens": 142_000},
+            })),
+            ProviderBillingMode::Unknown,
+        );
+        let ChatStreamEvent::ProviderEvent { kind, payload, .. } = boundary else {
+            panic!("compact boundary must stay a provider event");
+        };
+        assert_eq!(kind, "context_compaction");
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["provider_context_preserved"], true);
+        assert!(payload.get("provider_recovery_checkpoint").is_none());
+        assert_eq!(payload["pre_tokens"], 142_000);
+        assert_eq!(payload["trigger"], "auto");
+        let summary = payload["summary"].as_str().expect("summary");
+        assert!(
+            summary.contains("auto") && summary.contains("142000"),
+            "{summary}"
+        );
+
+        let compacting = map_claude_event(
+            claude_system_frame(serde_json::json!({
+                "type": "system",
+                "subtype": "status",
+                "status": "compacting",
+            })),
+            ProviderBillingMode::Unknown,
+        );
+        let ChatStreamEvent::ProviderEvent { kind, payload, .. } = compacting else {
+            panic!("compacting status must stay a provider event");
+        };
+        assert_eq!(kind, "context_compaction");
+        assert_eq!(payload["status"], "started");
+        assert_eq!(payload["provider_context_preserved"], true);
+
+        for opaque in [
+            serde_json::json!({"type": "system", "subtype": "init", "session_id": "s"}),
+            serde_json::json!({"type": "system", "subtype": "status", "status": null}),
+            serde_json::json!({"type": "system", "subtype": "background_tasks_changed"}),
+        ] {
+            let ChatStreamEvent::ProviderEvent { kind, .. } =
+                map_claude_event(claude_system_frame(opaque), ProviderBillingMode::Unknown)
+            else {
+                panic!("system frames stay provider events");
+            };
+            assert_eq!(kind, "claude.system");
         }
     }
 
