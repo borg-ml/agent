@@ -16,6 +16,36 @@ const MAX_RETRIEVAL_ADAPTER_SOURCE: usize = 256 * 1024;
 const MAX_RETRIEVAL_ADAPTERS: usize = 128;
 const MAX_BLU_EXTENSIONS: usize = 128;
 const MAX_EXTENSION_HISTORY_VERSIONS: usize = 32;
+/// Settings sections that change what Borg will execute or trust: MCP server
+/// commands, extension trust policy, approval reviewers, provider gateways, and
+/// capability grants. A model writing these is escalating its own privileges,
+/// so the write needs a human decision in every mode short of Full Access.
+pub(crate) const TRUSTED_SETTINGS_SECTIONS: &[&str] = &[
+    "mcp",
+    "extensions",
+    "approvals",
+    "providers",
+    "capabilities",
+];
+
+/// The trust-bearing sections an `update_agent_settings` call would write.
+pub(crate) fn trusted_settings_sections(tool: &str, arguments: &Value) -> Vec<String> {
+    if tool != "update_agent_settings" {
+        return Vec::new();
+    }
+    arguments
+        .get("updates")
+        .and_then(Value::as_object)
+        .map(|updates| {
+            updates
+                .keys()
+                .filter(|key| TRUSTED_SETTINGS_SECTIONS.contains(&key.as_str()))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 const SETTINGS_SECTIONS: &[&str] = &[
     "capabilities",
     "extensions",
@@ -2573,6 +2603,25 @@ mod tests {
             r#"
             [local]
             base_url = "http://127.0.0.1:8000/v1"
+    #[test]
+    fn trusted_settings_sections_only_flag_privilege_bearing_writes() {
+        let arguments = json!({
+            "scope": "user",
+            "updates": {"commands": {"aliases": {}}, "mcp": {"servers": {}}, "approvals": {}}
+        });
+        let mut sections = trusted_settings_sections("update_agent_settings", &arguments);
+        sections.sort();
+        assert_eq!(sections, vec!["approvals".to_string(), "mcp".to_string()]);
+        assert!(
+            trusted_settings_sections(
+                "update_agent_settings",
+                &json!({"updates": {"keybindings": {}}})
+            )
+            .is_empty()
+        );
+        assert!(trusted_settings_sections("read_file", &arguments).is_empty());
+    }
+
             model = "local-model"
             context_window_tokens = 32768
             model_dirs = ["/models"]

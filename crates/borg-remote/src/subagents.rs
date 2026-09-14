@@ -1180,7 +1180,8 @@ impl AgentToolDispatcher {
         workflow_cancel: Option<CancellationToken>,
     ) -> Result<Value> {
         let mut workflow_approved = workflow_approved;
-        if name == "runtime_exec"
+        let trusted_settings = crate::self_service::trusted_settings_sections(name, &arguments);
+        if (name == "runtime_exec" || !trusted_settings.is_empty())
             && !workflow_approved
             && self.runtime_permission != crate::PermissionMode::FullAccess
         {
@@ -1189,13 +1190,25 @@ impl AgentToolDispatcher {
                 .read()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
+            // Trust-bearing settings writes are a privilege escalation; when
+            // no human approval channel exists they must not proceed at all.
+            ensure!(
+                approvals.is_some() || trusted_settings.is_empty(),
+                "update_agent_settings cannot change [{}] without an explicit approval; ask the user to edit the agent config or switch to Full Access",
+                trusted_settings.join(", ")
+            );
             if let Some(approvals) = approvals {
                 let detail = serde_json::to_string(&arguments)?;
                 ensure!(
                     detail.len() <= crate::MAX_HOOK_ARGUMENT_BYTES,
                     "tool request is too large to display for approval; split it into smaller calls"
                 );
-                let request = approvals.request("Use Borg persistent runtime".to_string(), detail);
+                let title = if trusted_settings.is_empty() {
+                    "Use Borg persistent runtime".to_string()
+                } else {
+                    format!("Change trusted settings [{}]", trusted_settings.join(", "))
+                };
+                let request = approvals.request(title, detail);
                 let decision = if let Some(cancel) = &workflow_cancel {
                     tokio::select! {
                         biased;

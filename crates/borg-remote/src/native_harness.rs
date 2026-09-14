@@ -1503,17 +1503,33 @@ async fn execute_tool(
             .map(str::to_string),
         _ => None,
     };
+    // A settings write that changes what Borg trusts or executes (MCP server
+    // commands, extension policy, approval reviewers, provider gateways) is
+    // the model escalating its own privileges. It always needs a human in
+    // every mode short of Full Access; the automatic reviewer is a model too.
+    let trusted_settings =
+        crate::self_service::trusted_settings_sections(&tool_call.function.name, &input);
     if (shell_command.is_some()
         || tool_call.function.name == "runtime_exec"
         || matches!(
             tool_call.function.name.as_str(),
             "run_workflow" | "run_blu_workflow" | "run_blu_extension"
         )
-        || external_mcp)
+        || external_mcp
+        || !trusted_settings.is_empty())
         && runtime.permission != PermissionMode::FullAccess
     {
         let (title, detail) = if let Some(command) = shell_command.as_deref() {
             ("Run command", command.to_string())
+        } else if !trusted_settings.is_empty() {
+            (
+                "Change trusted settings",
+                format!(
+                    "update_agent_settings writes [{}]: {}",
+                    trusted_settings.join(", "),
+                    bounded_text(input.to_string(), MAX_APPROVAL_DETAIL_BYTES)
+                ),
+            )
         } else {
             (
                 if tool_call.function.name == "runtime_exec" {
@@ -1532,6 +1548,9 @@ async fn execute_tool(
             PermissionMode::FullAccess => ApprovalDecision::AllowOnce,
             PermissionMode::Manual => {
                 request_tool_approval(title, &detail, shell_command, events, controls).await?
+            }
+            PermissionMode::Auto if !trusted_settings.is_empty() => {
+                request_tool_approval(title, &detail, None, events, controls).await?
             }
             PermissionMode::Auto => {
                 match review_tool_automatically(
