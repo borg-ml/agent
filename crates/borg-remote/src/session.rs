@@ -1974,7 +1974,9 @@ async fn run_agent_session_store_kernel(
         let next = if !usage_limit_retry_waiting
             && let Some(prompt) = pop_next_pending_prompt(
                 &mut pending,
-                goal_is_active || network_retry_message_id.is_some() || usage_limit_continuation_id.is_some(),
+                goal_is_active
+                    || network_retry_message_id.is_some()
+                    || usage_limit_continuation_id.is_some(),
             ) {
             Some(prompt)
         } else if !usage_limit_retry_waiting && let Ok(text) = monitor_events_rx.try_recv() {
@@ -2807,7 +2809,11 @@ async fn run_agent_session_store_kernel(
             }
         };
         if let Some(prompt) = next.as_ref() {
-            reconcile_usage_limit_continuation(&mut pending, &mut usage_limit_continuation_id, prompt);
+            reconcile_usage_limit_continuation(
+                &mut pending,
+                &mut usage_limit_continuation_id,
+                prompt,
+            );
         }
         let Some(mut prompt) = next else {
             if owns_team && let Some(team) = &subagents {
@@ -3601,9 +3607,17 @@ async fn run_agent_session_store_kernel(
                                 network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
                                 auth_lookup_retries = 0;
                                 retry_not_before = None;
-                                for kind in retryable_provider_errors.drain(..) {
-                                    turn_reported_error = true;
-                                    record(&mut journal, &events, session_id, kind).await?;
+                                if interrupted {
+                                    // The provider reports a user stop as an
+                                    // execution error (Claude: error_during_execution);
+                                    // that is the expected outcome of Escape, not
+                                    // a failure to surface.
+                                    retryable_provider_errors.clear();
+                                } else {
+                                    for kind in retryable_provider_errors.drain(..) {
+                                        turn_reported_error = true;
+                                        record(&mut journal, &events, session_id, kind).await?;
+                                    }
                                 }
                             }
                             if !retry && !interrupted && !turn_reported_error {
@@ -3651,6 +3665,8 @@ async fn run_agent_session_store_kernel(
                                 }
                             } else if usage_limit_exhausted {
                                 error.clone()
+                            } else if interrupted {
+                                "Interrupted".to_string()
                             } else {
                                 format!("Turn failed; the session remains available: {error}")
                             };
