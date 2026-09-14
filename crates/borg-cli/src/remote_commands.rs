@@ -2638,6 +2638,7 @@ async fn run_local_agent_session(
         )
         .map(|((interaction_id, kind), payload)| (interaction_id, kind, payload));
     let mut child_pending_approvals = child_pending_approval_ids(&team_history);
+    let mut working_subagents = working_subagent_ids(&team_snapshots);
     let mut saw_running = false;
     // A prompt can be accepted by the local command channel while the actor
     // still reports Ready. Preserve that handoff on terminal hangup instead
@@ -2678,6 +2679,8 @@ async fn run_local_agent_session(
         status,
         SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval
     ));
+    // A resumed session can attach to children that are already running.
+    sleep_inhibitor.set_children_active(!working_subagents.is_empty());
     let mut render_frame_interval = tui_frame_interval(tui_fps);
     let mut render_tick = tui_render_interval(render_frame_interval);
     let mut interaction_tick = tui_render_interval(tui_frame_interval(tui_fps));
@@ -3206,6 +3209,8 @@ async fn run_local_agent_session(
                 match team_state_result {
                     Ok(Ok((team_history, team_snapshots, child_histories))) => {
                         child_pending_approvals = child_pending_approval_ids(&team_history);
+                        working_subagents = working_subagent_ids(&team_snapshots);
+                        sleep_inhibitor.set_children_active(!working_subagents.is_empty());
                         if let Some(terminal) = terminal.as_mut() {
                             seed_terminal_subagent_threads(
                                 terminal,
@@ -3659,6 +3664,16 @@ async fn run_local_agent_session(
                             terminal_dirty = true;
                         }
                     }
+                }
+                // Sits outside the match below because status-only activity
+                // carries no child event, and those are the transitions here.
+                if let SessionEventKind::SubagentActivity { agent, .. } = &event.kind {
+                    if subagent_is_working(agent.status) {
+                        working_subagents.insert(agent.session_id);
+                    } else {
+                        working_subagents.remove(&agent.session_id);
+                    }
+                    sleep_inhibitor.set_children_active(!working_subagents.is_empty());
                 }
                 match &event.kind {
                     SessionEventKind::ApprovalRequested { approval_id, .. } => {
@@ -7749,6 +7764,22 @@ fn child_pending_approval_ids(events: &[SessionEvent]) -> HashMap<Uuid, String> 
         }
     }
     pending
+}
+
+/// Mirrors the root-turn predicate used for `set_turn_active`.
+fn subagent_is_working(status: SubagentStatus) -> bool {
+    matches!(
+        status,
+        SubagentStatus::Starting | SubagentStatus::Running | SubagentStatus::WaitingForApproval
+    )
+}
+
+fn working_subagent_ids(agents: &[SubagentSnapshot]) -> HashSet<Uuid> {
+    agents
+        .iter()
+        .filter(|agent| subagent_is_working(agent.status))
+        .map(|agent| agent.session_id)
+        .collect()
 }
 
 fn latest_subagent_snapshots(events: &[SessionEvent]) -> Vec<SubagentSnapshot> {

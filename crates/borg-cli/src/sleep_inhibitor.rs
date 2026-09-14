@@ -1,19 +1,23 @@
 use tracing::warn;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-const INHIBITION_REASON: &str = "Borg is running an active turn";
+const INHIBITION_REASON: &str = "Borg is running active work";
 
 trait SleepGuard {
     fn is_alive(&mut self) -> bool;
 }
 
-/// Keeps the machine awake only while Borg has an active turn and the user has
-/// left the setting enabled. On systemd Linux this also asks logind not to
-/// handle a lid switch during the turn; other platforms retain their own lid
-/// policy because they do not expose a safe per-process lid override.
+/// Keeps the machine awake while Borg has work in flight and the user has left
+/// the setting enabled. The root turn and the subagents are tracked separately
+/// because the root routinely returns to `Ready` while spawned children keep
+/// running, and releasing then lets the host idle-sleep out from under them.
+/// On systemd Linux this also asks logind not to handle a lid switch while
+/// that work runs; other platforms retain their own lid policy because they do
+/// not expose a safe per-process lid override.
 pub(crate) struct SleepInhibitor {
     enabled: bool,
     turn_active: bool,
+    children_active: bool,
     guard: Option<Box<dyn SleepGuard>>,
     unavailable_logged: bool,
 }
@@ -23,6 +27,7 @@ impl SleepInhibitor {
         Self {
             enabled,
             turn_active: false,
+            children_active: false,
             guard: None,
             unavailable_logged: false,
         }
@@ -38,6 +43,12 @@ impl SleepInhibitor {
         self.reconcile();
     }
 
+    /// Tracked independently of the root turn; see the type-level note.
+    pub(crate) fn set_children_active(&mut self, children_active: bool) {
+        self.children_active = children_active;
+        self.reconcile();
+    }
+
     /// Re-check a live backend and restart it if the helper exited while the
     /// turn was still active. The caller invokes this from its periodic UI
     /// tick, so an unexpected helper exit does not silently lose protection.
@@ -46,7 +57,7 @@ impl SleepInhibitor {
     }
 
     fn reconcile(&mut self) {
-        if !self.enabled || !self.turn_active {
+        if !self.enabled || !(self.turn_active || self.children_active) {
             self.release();
             return;
         }
@@ -359,7 +370,19 @@ mod windows {
 
 #[cfg(test)]
 mod tests {
-    use super::SleepInhibitor;
+    use super::{SleepGuard, SleepInhibitor};
+
+    /// Stands in for a live OS backend so guard lifetime can be asserted
+    /// without spawning caffeinate or systemd-inhibit. Reporting itself
+    /// alive also keeps `reconcile` on its early-return path, so no test
+    /// here can reach the real `acquire`.
+    struct FakeGuard;
+
+    impl SleepGuard for FakeGuard {
+        fn is_alive(&mut self) -> bool {
+            true
+        }
+    }
 
     #[test]
     fn disabled_inhibitor_never_acquires_a_backend() {
@@ -368,6 +391,42 @@ mod tests {
         inhibitor.refresh();
         assert!(inhibitor.guard.is_none());
         inhibitor.set_turn_active(false);
+    }
+
+    /// The regression behind stuck subagents after host sleep: the root turn
+    /// reported `Ready` while two children were still Running, the inhibitor
+    /// released on that transition alone, and the host idle-slept under them.
+    #[test]
+    fn children_keep_the_guard_after_the_root_turn_ends() {
+        let mut inhibitor = SleepInhibitor::new(true);
+        inhibitor.turn_active = true;
+        inhibitor.guard = Some(Box::new(FakeGuard));
+
+        inhibitor.set_children_active(true);
+        assert!(inhibitor.guard.is_some());
+
+        inhibitor.set_turn_active(false);
+        assert!(
+            inhibitor.guard.is_some(),
+            "an idle root released the guard while a subagent was still working"
+        );
+
+        // Only the last child leaving a working state releases the host.
+        inhibitor.set_children_active(false);
+        assert!(inhibitor.guard.is_none());
+    }
+
+    #[test]
+    fn disabling_the_setting_releases_an_active_child_guard() {
+        let mut inhibitor = SleepInhibitor::new(true);
+        inhibitor.children_active = true;
+        inhibitor.guard = Some(Box::new(FakeGuard));
+
+        inhibitor.set_enabled(false);
+        assert!(
+            inhibitor.guard.is_none(),
+            "the disabled setting must release child-driven inhibition"
+        );
     }
 
     #[test]
