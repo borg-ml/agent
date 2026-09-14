@@ -11,6 +11,13 @@ use tokio::time::{Duration, Instant, timeout};
 use url::Url;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// `initialize` is the one request that legitimately takes long: jdtls, gopls
+/// and rust-analyzer index the workspace before answering. Every other
+/// request keeps the short timeout so a wedged server is noticed quickly.
+const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Servers publish diagnostics only after their first analysis pass; waiting
+/// three seconds produced empty results on any non-trivial workspace.
+const PUBLISHED_DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(15);
 const LSP_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const LSP_REAPER_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_LSP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -20,7 +27,7 @@ const MAX_WORKSPACE_DIAGNOSTIC_FILES: usize = 4096;
 pub struct LspService {
     root: PathBuf,
     path_policy: LspPathPolicy,
-    clients: std::sync::Arc<Mutex<HashMap<LspClientKey, LspClient>>>,
+    clients: std::sync::Arc<Mutex<HashMap<LspClientKey, LspClientSlot>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -90,8 +97,19 @@ struct LspClient {
     next_id: u64,
     opened_versions: HashMap<PathBuf, i32>,
     published_diagnostics: HashMap<String, Value>,
+}
+
+/// One language server per (server, workspace root). The map lock is held
+/// only to find or create the slot; the slot's own lock serialises traffic
+/// to that server, so a slow rust-analyzer start or request never blocks a
+/// hover against gopls in the same session. `None` means the server has not
+/// started successfully yet; the first caller to lock the slot starts it.
+struct LspClientSlot {
+    client: SharedLspClient,
     last_used: Instant,
 }
+
+type SharedLspClient = std::sync::Arc<Mutex<Option<LspClient>>>;
 
 impl LspService {
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -136,11 +154,38 @@ impl LspService {
 
     pub async fn diagnostics(&self, path: &Path) -> Result<Value> {
         let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
-        let mut clients = self.clients.lock().await;
-        let client = ensure_client(&mut clients, spec, &workspace_root).await?;
+        let shared = self.lease_client(spec, &workspace_root).await;
+        let mut slot = shared.lock().await;
+        let client = ready_client(&mut slot, spec, &workspace_root).await?;
         client
             .document_diagnostics(&path, &uri, spec.language_id)
             .await
+    }
+
+    /// Find or create the slot for `(spec, root)` under the map lock, without
+    /// starting the server there.
+    async fn lease_client(&self, spec: &'static ServerSpec, root: &Path) -> SharedLspClient {
+        let key = LspClientKey {
+            server_id: spec.id,
+            workspace_root: root.to_path_buf(),
+        };
+        let mut clients = self.clients.lock().await;
+        let slot = clients.entry(key).or_insert_with(|| LspClientSlot {
+            client: std::sync::Arc::new(Mutex::new(None)),
+            last_used: Instant::now(),
+        });
+        slot.last_used = Instant::now();
+        slot.client.clone()
+    }
+
+    /// Snapshot of every slot, taken under the map lock and released before
+    /// any server is spoken to.
+    async fn active_clients(&self) -> Vec<(LspClientKey, SharedLspClient)> {
+        let clients = self.clients.lock().await;
+        clients
+            .iter()
+            .map(|(key, slot)| (key.clone(), slot.client.clone()))
+            .collect()
     }
 
     pub async fn hover(&self, path: &Path, line: u32, character: u32) -> Result<Value> {
@@ -170,16 +215,20 @@ impl LspService {
     }
 
     pub async fn workspace_symbols(&self, query: &str) -> Result<Value> {
-        let mut clients = self.clients.lock().await;
+        let clients = self.active_clients().await;
         if clients.is_empty() {
             bail!("no language server is active; inspect a supported source file first");
         }
         let mut server_counts = HashMap::new();
-        for key in clients.keys() {
+        for (key, _) in &clients {
             *server_counts.entry(key.server_id).or_insert(0usize) += 1;
         }
         let mut results = serde_json::Map::new();
-        for (key, client) in clients.iter_mut() {
+        for (key, shared) in &clients {
+            let mut slot = shared.lock().await;
+            let Some(client) = slot.as_mut() else {
+                continue;
+            };
             let value = client
                 .request("workspace/symbol", json!({ "query": query }))
                 .await
@@ -200,23 +249,28 @@ impl LspService {
     pub async fn workspace_diagnostics(&self, path: Option<&Path>) -> Result<Value> {
         if let Some(path) = path {
             let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
-            let mut clients = self.clients.lock().await;
-            let client = ensure_client(&mut clients, spec, &workspace_root).await?;
+            let shared = self.lease_client(spec, &workspace_root).await;
+            let mut slot = shared.lock().await;
+            let client = ready_client(&mut slot, spec, &workspace_root).await?;
             client.open_document(&path, &uri, spec.language_id).await?;
         }
 
-        let mut clients = self.clients.lock().await;
+        let clients = self.active_clients().await;
         if clients.is_empty() {
             bail!(
                 "no language server is active; provide a representative source path to initialize one"
             );
         }
         let mut server_counts = HashMap::new();
-        for key in clients.keys() {
+        for (key, _) in &clients {
             *server_counts.entry(key.server_id).or_insert(0usize) += 1;
         }
         let mut results = serde_json::Map::new();
-        for (key, client) in clients.iter_mut() {
+        for (key, shared) in &clients {
+            let mut slot = shared.lock().await;
+            let Some(client) = slot.as_mut() else {
+                continue;
+            };
             let value = match client.workspace_diagnostics().await {
                 Ok(value) => value,
                 Err(error) if is_unknown_workspace_diagnostics_request(&error) => {
@@ -248,8 +302,9 @@ impl LspService {
 
     async fn document_request(&self, path: &Path, method: &str, extra: Value) -> Result<Value> {
         let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
-        let mut clients = self.clients.lock().await;
-        let client = ensure_client(&mut clients, spec, &workspace_root).await?;
+        let shared = self.lease_client(spec, &workspace_root).await;
+        let mut slot = shared.lock().await;
+        let client = ready_client(&mut slot, spec, &workspace_root).await?;
         client.open_document(&path, &uri, spec.language_id).await?;
         let mut params = extra.as_object().cloned().unwrap_or_default();
         params.insert("textDocument".to_string(), json!({ "uri": uri }));
@@ -265,16 +320,24 @@ impl LspService {
         extra: Value,
     ) -> Result<Value> {
         let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
-        let mut clients = self.clients.lock().await;
-        let client = ensure_client(&mut clients, spec, &workspace_root).await?;
-        client.open_document(&path, &uri, spec.language_id).await?;
+        let shared = self.lease_client(spec, &workspace_root).await;
+        let mut slot = shared.lock().await;
+        let client = ready_client(&mut slot, spec, &workspace_root).await?;
+        let text = client.open_document(&path, &uri, spec.language_id).await?;
+        // Callers count columns in characters; the wire position is UTF-16
+        // code units (the encoding negotiated in `initialize`).
+        let line_index = line.saturating_sub(1);
+        let character = utf16_column(
+            text.lines().nth(line_index as usize).unwrap_or_default(),
+            character.saturating_sub(1),
+        );
         let mut params = extra.as_object().cloned().unwrap_or_default();
         params.insert("textDocument".to_string(), json!({ "uri": uri }));
         params.insert(
             "position".to_string(),
             json!({
-                "line": line.saturating_sub(1),
-                "character": character.saturating_sub(1)
+                "line": line_index,
+                "character": character
             }),
         );
         client.request(method, Value::Object(params)).await
@@ -352,7 +415,6 @@ impl LspClient {
             next_id: 1,
             opened_versions: HashMap::new(),
             published_diagnostics: HashMap::new(),
-            last_used: Instant::now(),
         };
         let root_uri = Url::from_directory_path(root)
             .map_err(|_| anyhow::anyhow!("cannot convert workspace root to URI"))?
@@ -361,6 +423,7 @@ impl LspClient {
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
+                "general": { "positionEncodings": ["utf-16"] },
                 "textDocument": {
                     "hover": { "contentFormat": ["markdown", "plaintext"] },
                     "definition": { "linkSupport": true },
@@ -374,12 +437,14 @@ impl LspClient {
         if let Some(options) = server_initialization_options(spec) {
             initialize["initializationOptions"] = options;
         }
-        client.request("initialize", initialize).await?;
+        client
+            .request_with_timeout("initialize", initialize, INITIALIZE_TIMEOUT)
+            .await?;
         client.notify("initialized", json!({})).await?;
         Ok(client)
     }
 
-    async fn open_document(&mut self, path: &Path, uri: &str, language_id: &str) -> Result<()> {
+    async fn open_document(&mut self, path: &Path, uri: &str, language_id: &str) -> Result<String> {
         let text = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("cannot read {}", path.display()))?;
@@ -396,16 +461,17 @@ impl LspClient {
                     "uri": uri,
                     "languageId": language_id,
                     "version": *version,
-                    "text": text
+                    "text": text.clone()
                 }
             })
         } else {
             json!({
                 "textDocument": { "uri": uri, "version": *version },
-                "contentChanges": [{ "text": text }]
+                "contentChanges": [{ "text": text.clone() }]
             })
         };
-        self.notify(method, params).await
+        self.notify(method, params).await?;
+        Ok(text)
     }
 
     async fn close_document(&mut self, path: &Path, uri: &str) -> Result<()> {
@@ -490,6 +556,16 @@ impl LspClient {
     }
 
     async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.request_with_timeout(method, params, REQUEST_TIMEOUT)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Duration,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         self.write_message(&json!({
@@ -499,7 +575,7 @@ impl LspClient {
             "params": params
         }))
         .await?;
-        timeout(REQUEST_TIMEOUT, async {
+        timeout(deadline, async {
             loop {
                 let message = self.read_message().await?;
                 self.capture_diagnostics(&message);
@@ -547,7 +623,7 @@ impl LspClient {
         if let Some(items) = self.published_diagnostics.remove(uri) {
             return Ok(json!({ "kind": "full", "items": items }));
         }
-        timeout(Duration::from_secs(3), async {
+        timeout(PUBLISHED_DIAGNOSTICS_TIMEOUT, async {
             loop {
                 let message = self.read_message().await?;
                 self.capture_diagnostics(&message);
@@ -609,24 +685,30 @@ impl LspClient {
     }
 }
 
-async fn ensure_client<'a>(
-    clients: &'a mut HashMap<LspClientKey, LspClient>,
+/// Start the server for a slot on first use. Runs under the slot lock, so
+/// concurrent callers for the same workspace wait for one start instead of
+/// racing, while other servers stay reachable.
+async fn ready_client<'a>(
+    slot: &'a mut Option<LspClient>,
     spec: &'static ServerSpec,
     root: &Path,
 ) -> Result<&'a mut LspClient> {
-    let key = LspClientKey {
-        server_id: spec.id,
-        workspace_root: root.to_path_buf(),
-    };
-    if !clients.contains_key(&key) {
-        clients.insert(key.clone(), LspClient::start(spec, root).await?);
+    if slot.is_none() {
+        *slot = Some(LspClient::start(spec, root).await?);
     }
-    let client = clients.get_mut(&key).expect("inserted LSP client");
-    client.last_used = Instant::now();
-    Ok(client)
+    Ok(slot.as_mut().expect("started LSP client"))
 }
 
-fn spawn_idle_reaper(clients: &std::sync::Arc<Mutex<HashMap<LspClientKey, LspClient>>>) {
+/// The UTF-16 code-unit column for a character (code point) column on `line`.
+/// A column past the end of the line maps to the end of the line.
+fn utf16_column(line: &str, character_column: u32) -> u32 {
+    line.chars()
+        .take(character_column as usize)
+        .map(|character| character.len_utf16() as u32)
+        .sum::<u32>()
+}
+
+fn spawn_idle_reaper(clients: &std::sync::Arc<Mutex<HashMap<LspClientKey, LspClientSlot>>>) {
     let clients = std::sync::Arc::downgrade(clients);
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
@@ -640,10 +722,14 @@ fn spawn_idle_reaper(clients: &std::sync::Arc<Mutex<HashMap<LspClientKey, LspCli
             let Some(clients) = clients.upgrade() else {
                 return;
             };
-            clients
-                .lock()
-                .await
-                .retain(|key, client| !lsp_client_should_reap(key, client.last_used.elapsed()));
+            clients.lock().await.retain(|key, slot| {
+                if !lsp_client_should_reap(key, slot.last_used.elapsed()) {
+                    return true;
+                }
+                // A slot whose server is mid-request is not idle, whatever
+                // its timestamp says.
+                slot.client.try_lock().is_err()
+            });
         }
     });
 }
@@ -1022,6 +1108,23 @@ mod tests {
     }
 
     #[test]
+    fn character_columns_are_converted_to_utf16_units() {
+        assert_eq!(utf16_column("let x = 1;", 4), 4);
+        // 'é' is one code point and one UTF-16 unit; '😀' is one code point
+        // and two UTF-16 units.
+        assert_eq!(utf16_column("é😀x", 0), 0);
+        assert_eq!(utf16_column("é😀x", 1), 1);
+        assert_eq!(utf16_column("é😀x", 2), 3);
+        assert_eq!(utf16_column("é😀x", 3), 4);
+        assert_eq!(
+            utf16_column("é😀x", 99),
+            4,
+            "past the end clamps to the line end"
+        );
+        assert_eq!(utf16_column("", 5), 0);
+    }
+
+    #[test]
     fn missing_lsp_workspaces_are_reaped_even_when_recently_used() {
         let workspace = tempfile::tempdir().expect("workspace");
         let key = LspClientKey {
@@ -1176,8 +1279,22 @@ mod tests {
             .workspace_diagnostics(Some(Path::new("broken.c")))
             .await
             .expect("clangd workspace diagnostics");
-        let clients = service.clients.lock().await;
-        let client = clients.values().next().expect("active clangd client");
-        assert!(client.opened_versions.is_empty());
+        let shared = service
+            .clients
+            .lock()
+            .await
+            .values()
+            .next()
+            .expect("active clangd client")
+            .client
+            .clone();
+        let client = shared.lock().await;
+        assert!(
+            client
+                .as_ref()
+                .expect("started clangd client")
+                .opened_versions
+                .is_empty()
+        );
     }
 }
