@@ -1486,6 +1486,7 @@ fn provider_subscription_credentials_present(provider: CodingProvider) -> bool {
                     .and_then(|path| read_bounded_auth_json(&path))
                     .as_ref()
                     .is_some_and(claude_auth_json_authenticated)
+                || claude_keychain_credentials_present()
         }
         CodingProvider::OpenCode => opencode_auth_json()
             .as_ref()
@@ -1495,6 +1496,25 @@ fn provider_subscription_credentials_present(provider: CodingProvider) -> bool {
         | CodingProvider::OpenRouter
         | CodingProvider::OpenAiCompatible => false,
     }
+}
+
+/// On macOS the Claude CLI keeps its OAuth session in the login Keychain and
+/// writes no credentials file, so a file-only check reports every fresh Borg
+/// instance as signed out. Probe the item's existence without reading it.
+#[cfg(target_os = "macos")]
+fn claude_keychain_credentials_present() -> bool {
+    std::process::Command::new("/usr/bin/security")
+        .args(["find-generic-password", "-s", "Claude Code-credentials"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn claude_keychain_credentials_present() -> bool {
+    false
 }
 
 fn codex_auth_path() -> Option<PathBuf> {
