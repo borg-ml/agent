@@ -960,7 +960,122 @@ impl Default for GitStatusCache {
     }
 }
 
+/// Background `git push` runner for the footer's unpushed-commits indicator.
+/// Mirrors [`GitStatusCache`]: the push runs off the UI thread and its result
+/// is drained on a later tick so a slow network push never blocks rendering.
+struct GitPushState {
+    in_flight: HashSet<PathBuf>,
+    sender: mpsc::Sender<(PathBuf, std::result::Result<String, String>)>,
+    receiver: mpsc::Receiver<(PathBuf, std::result::Result<String, String>)>,
+}
+
+impl Default for GitPushState {
+    fn default() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            in_flight: HashSet::new(),
+            sender,
+            receiver,
+        }
+    }
+}
+
+impl GitPushState {
+    fn is_pushing(&self, cwd: &Path) -> bool {
+        self.in_flight.contains(cwd)
+    }
+
+    /// Spawn `git push` for `cwd` unless one is already running there. Returns
+    /// true when a new push started.
+    fn start(&mut self, cwd: &Path) -> bool {
+        if !self.in_flight.insert(cwd.to_path_buf()) {
+            return false;
+        }
+        let cwd = cwd.to_path_buf();
+        let sender = self.sender.clone();
+        thread::spawn(move || {
+            let outcome = run_git_push(&cwd);
+            let _ = sender.send((cwd, outcome));
+        });
+        true
+    }
+
+    fn drain(&mut self) -> Vec<(PathBuf, std::result::Result<String, String>)> {
+        let mut finished = Vec::new();
+        while let Ok(result) = self.receiver.try_recv() {
+            self.in_flight.remove(&result.0);
+            finished.push(result);
+        }
+        finished
+    }
+}
+
+fn run_git_push(cwd: &Path) -> std::result::Result<String, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("push")
+        .output()
+        .map_err(|error| format!("could not run git: {error}"))?;
+    if output.status.success() {
+        // git writes push progress to stderr; the last non-empty line is the
+        // useful summary ("main -> main" or "Everything up-to-date").
+        let summary = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("Pushed")
+            .to_string();
+        Ok(summary)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(stderr
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("git push failed")
+            .to_string())
+    }
+}
+
+/// Screen rectangle of the `↑N` token inside a right-aligned footer metadata
+/// line, or `None` when there is nothing to push. The token sits before an
+/// optional `↓M` behind-count, so its right edge is the metadata's right edge
+/// minus the width of whatever trails it. Right alignment clips overflow on the
+/// left, so the git suffix is always intact even when the path is truncated.
+fn git_ahead_hit_area(status: &GitWorktreeStatus, metadata: Rect) -> Option<Rect> {
+    if status.ahead == 0 {
+        return None;
+    }
+    let ahead_token = format!("↑{}", status.ahead);
+    let ahead_width = ahead_token.width() as u16;
+    let trailing_width = if status.behind > 0 {
+        format!("{STATUS_SEPARATOR}↓{}", status.behind).width() as u16
+    } else {
+        0
+    };
+    let right = metadata.right().saturating_sub(trailing_width);
+    let x = right.saturating_sub(ahead_width);
+    if x < metadata.x {
+        return None;
+    }
+    Some(Rect {
+        x,
+        y: metadata.y,
+        width: ahead_width,
+        height: 1,
+    })
+}
+
 impl GitStatusCache {
+    /// Drop the cached status for `cwd` so the next `status_for` re-reads it.
+    /// Used after a push changes the ahead/behind counts.
+    fn invalidate(&mut self, cwd: &Path) {
+        self.values.remove(cwd);
+    }
+
     fn status_for(&mut self, cwd: &Path) -> Option<&GitWorktreeStatus> {
         while let Ok(result) = self.receiver.try_recv() {
             self.refreshing.remove(&result.cwd);
@@ -1029,6 +1144,9 @@ pub struct BorgTerminal {
     configured_model_entries: Vec<borg_provider::DynamicModelEntry>,
     extension_commands: Vec<borg_remote::ExtensionApiCommand>,
     git_status_cache: GitStatusCache,
+    git_push: GitPushState,
+    git_status_area: Option<Rect>,
+    git_status_hovered: bool,
     status: SessionStatus,
     interrupt_requested: bool,
     connection_retry_at: Option<DateTime<Utc>>,
@@ -2098,6 +2216,9 @@ impl BorgTerminal {
             configured_model_entries: Vec::new(),
             extension_commands: Vec::new(),
             git_status_cache: GitStatusCache::default(),
+            git_push: GitPushState::default(),
+            git_status_area: None,
+            git_status_hovered: false,
             status: SessionStatus::Starting,
             interrupt_requested: false,
             connection_retry_at: None,
@@ -2259,6 +2380,9 @@ impl BorgTerminal {
         self.cwd = cwd;
         self.extension_commands.clear();
         self.git_status_cache = GitStatusCache::default();
+        self.git_push = GitPushState::default();
+        self.git_status_area = None;
+        self.git_status_hovered = false;
         self.status = SessionStatus::Starting;
         self.interrupt_requested = false;
         self.session_state_sequence = 0;
@@ -3305,6 +3429,41 @@ impl BorgTerminal {
         })
     }
 
+    /// The working directory whose git status the footer shows: the active
+    /// session's cwd, or the terminal's own when no session is configured.
+    fn active_git_cwd(&self) -> PathBuf {
+        self.transcript
+            .config
+            .as_ref()
+            .map(|config| config.cwd.clone())
+            .unwrap_or_else(|| self.cwd.clone())
+    }
+
+    /// Push the branch shown in the footer indicator. Runs `git push` off the
+    /// UI thread; the result is drained on a later frame and shown as a notice.
+    fn push_unpushed_commits(&mut self) {
+        let cwd = self.active_git_cwd();
+        if self.git_push.is_pushing(&cwd) {
+            self.notice = Some("Already pushing…".to_string());
+            return;
+        }
+        if self.git_push.start(&cwd) {
+            self.notice = Some("Pushing to upstream…".to_string());
+        }
+    }
+
+    /// Drain finished background pushes, report the outcome, and force a git
+    /// status refresh so the footer's ↑N reflects the new upstream.
+    fn drain_git_push_results(&mut self) {
+        for (cwd, outcome) in self.git_push.drain() {
+            match outcome {
+                Ok(summary) => self.notice = Some(format!("Pushed · {summary}")),
+                Err(error) => self.notice = Some(format!("git push failed · {error}")),
+            }
+            self.git_status_cache.invalidate(&cwd);
+        }
+    }
+
     fn active_queued_prompts(&self) -> &[PendingPromptProjection] {
         if let Some(child) = self.focused_child {
             self.child_queued_prompts
@@ -3408,6 +3567,7 @@ impl BorgTerminal {
         self.context_status_hovered = false;
         self.fast_status_hovered = false;
         self.permission_status_hovered = false;
+        self.git_status_hovered = false;
         self.back_to_director_hovered = false;
         self.scrollbar_hovered = false;
         self.jump_to_bottom_hovered = false;
@@ -4482,6 +4642,9 @@ impl BorgTerminal {
                 self.permission_status_hovered = self
                     .permission_status_area
                     .is_some_and(|area| area.contains(pointer));
+                self.git_status_hovered = self
+                    .git_status_area
+                    .is_some_and(|area| area.contains(pointer));
                 self.back_to_director_hovered = self
                     .back_to_director_area
                     .is_some_and(|area| area.contains(pointer));
@@ -4663,6 +4826,13 @@ impl BorgTerminal {
                             .is_some_and(|area| area.contains(pointer))
                         {
                             self.open_permission_picker();
+                            return Ok(UiAction::None);
+                        }
+                        if self
+                            .git_status_area
+                            .is_some_and(|area| area.contains(pointer))
+                        {
+                            self.push_unpushed_commits();
                             return Ok(UiAction::None);
                         }
                     }
@@ -5898,6 +6068,7 @@ impl BorgTerminal {
     }
 
     fn draw_internal(&mut self, input_fast_path: bool) -> Result<()> {
+        self.drain_git_push_results();
         if self
             .copy_notice_expires_at
             .is_some_and(|expires_at| Instant::now() >= expires_at)
@@ -6099,9 +6270,11 @@ impl BorgTerminal {
         if cwd_status.is_empty() {
             cwd_status = fish_style_path(&active_cwd);
         }
+        let mut footer_git_status = None;
         if let Some(git_status) = self.git_status_cache.status_for(&active_cwd) {
             cwd_status.push_str(" · ");
             cwd_status.push_str(&git_status.compact_label());
+            footer_git_status = Some(git_status.clone());
         }
         let cache_status = self.transcript.cache_status(Utc::now());
         let (_, context_imminent) = self.transcript.context_status();
@@ -7474,6 +7647,47 @@ impl BorgTerminal {
                     tooltip,
                 );
             }
+            if self.git_status_hovered
+                && let Some(git_area) = self.git_status_area
+                && let Some(git_status) = footer_git_status.as_ref()
+            {
+                let pushing = self.git_push.is_pushing(&active_cwd);
+                let text = if pushing {
+                    format!("Pushing {} to {}…", git_status.branch, "upstream")
+                } else {
+                    format!(
+                        "Push ↑{} to {} — click",
+                        git_status.ahead, git_status.branch
+                    )
+                };
+                let tooltip_width = (text.width() as u16)
+                    .saturating_add(4)
+                    .clamp(24, area.width.min(80));
+                let tooltip_height = 3u16.min(git_area.y.saturating_sub(area.y).max(1));
+                let tooltip = Rect {
+                    x: git_area
+                        .right()
+                        .saturating_sub(tooltip_width)
+                        .max(area.x)
+                        .min(area.right().saturating_sub(tooltip_width)),
+                    y: git_area.y.saturating_sub(tooltip_height),
+                    width: tooltip_width,
+                    height: tooltip_height,
+                };
+                frame.render_widget(Clear, tooltip);
+                frame.render_widget(
+                    Paragraph::new(text)
+                        .wrap(ratatui::widgets::Wrap { trim: true })
+                        .style(Style::default().fg(Color::White).bg(COMMAND_PANEL_BG))
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().fg(Color::Cyan))
+                                .title(" git push "),
+                        ),
+                    tooltip,
+                );
+            }
             if (self.shell_menu_open || self.hovered_shell_row.is_some()) && !shell_rows.is_empty()
             {
                 let tooltip_width = shell_rows
@@ -7623,6 +7837,7 @@ impl BorgTerminal {
                     tooltip,
                 );
             }
+            self.git_status_area = None;
             if !is_launch_screen {
                 let footer_metadata = Some(footer_metadata_text(
                     &footer_status_text(shell_status.as_deref(), todo_status.as_deref()),
@@ -7660,16 +7875,20 @@ impl BorgTerminal {
                     } else {
                         footer_metadata_line("", &cwd_status, false, metadata_width as usize)
                     };
+                    let metadata_rect = Rect {
+                        x: footer_area.right().saturating_sub(metadata_width),
+                        width: metadata_width,
+                        ..footer_area
+                    };
                     frame.render_widget(
                         Paragraph::new(metadata_line)
                             .alignment(Alignment::Right)
                             .style(Style::default().bg(COMMAND_PANEL_BG)),
-                        Rect {
-                            x: footer_area.right().saturating_sub(metadata_width),
-                            width: metadata_width,
-                            ..footer_area
-                        },
+                        metadata_rect,
                     );
+                    self.git_status_area = footer_git_status
+                        .as_ref()
+                        .and_then(|status| git_ahead_hit_area(status, metadata_rect));
                 }
             }
             if showing_primary_controls && !showing_transcript_interaction_hint {

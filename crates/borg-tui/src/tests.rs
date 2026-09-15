@@ -4919,6 +4919,48 @@ fn git_worktree_status_is_compact_and_includes_divergence_and_dirty_state() {
 }
 
 #[test]
+fn git_ahead_hit_area_targets_the_ahead_token_from_the_right_edge() {
+    let metadata = Rect {
+        x: 40,
+        y: 20,
+        width: 40,
+        height: 1,
+    };
+    // No unpushed commits: nothing to click.
+    let none = GitWorktreeStatus {
+        branch: "main".into(),
+        dirty: false,
+        ahead: 0,
+        behind: 0,
+    };
+    assert_eq!(git_ahead_hit_area(&none, metadata), None);
+
+    // ↑3 is the last token, so its box sits at the metadata's right edge.
+    let ahead_only = GitWorktreeStatus {
+        branch: "main".into(),
+        dirty: true,
+        ahead: 3,
+        behind: 0,
+    };
+    let area = git_ahead_hit_area(&ahead_only, metadata).expect("ahead is clickable");
+    assert_eq!(area.right(), metadata.right());
+    assert_eq!(area.width, "↑3".width() as u16);
+    assert_eq!(area.y, metadata.y);
+
+    // With a behind count trailing, the ↑ box shifts left by " · ↓1".
+    let diverged = GitWorktreeStatus {
+        branch: "main".into(),
+        dirty: false,
+        ahead: 12,
+        behind: 1,
+    };
+    let area = git_ahead_hit_area(&diverged, metadata).expect("ahead is clickable");
+    let trailing = format!("{STATUS_SEPARATOR}↓1").width() as u16;
+    assert_eq!(area.right(), metadata.right() - trailing);
+    assert_eq!(area.width, "↑12".width() as u16);
+}
+
+#[test]
 fn git_status_falls_back_cleanly_outside_a_worktree() {
     let missing = std::env::temp_dir().join(format!("borg-missing-worktree-{}", Uuid::new_v4()));
     assert_eq!(read_git_worktree_status(&missing), None);
