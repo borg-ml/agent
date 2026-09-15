@@ -3029,7 +3029,7 @@ fn claude_command_args(
         // provider shares one implementation, journal, and UI; the native
         // equivalents would run invisibly to Borg.
         "--disallowedTools".to_string(),
-        "Agent,Task,Monitor".to_string(),
+        "Agent,Task,Monitor,Watch".to_string(),
     ];
     if permission == LocalAgentPermission::FullAccess {
         args.push("--dangerously-skip-permissions".to_string());
@@ -4478,7 +4478,7 @@ mod tests {
                 "--verbose",
                 "--include-partial-messages",
                 "--disallowedTools",
-                "Agent,Task,Monitor",
+                "Agent,Task,Monitor,Watch",
                 "--permission-mode",
                 "manual",
                 "--no-session-persistence",

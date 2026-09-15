@@ -95,7 +95,7 @@ const MAX_RESIDENT_CODEX_SUBSCRIPTION_POOLS: usize = 4;
 fn provider_native_orchestration_tool(name: &str) -> bool {
     matches!(
         name,
-        "subAgentActivity" | "collabAgentToolCall" | "Agent" | "Task" | "Watch"
+        "subAgentActivity" | "collabAgentToolCall" | "Agent" | "Task" | "Watch" | "Monitor"
     )
 }
 
@@ -2595,6 +2595,7 @@ mod tests {
         assert!(provider_native_orchestration_tool("subAgentActivity"));
         assert!(provider_native_orchestration_tool("collabAgentToolCall"));
         assert!(provider_native_orchestration_tool("Watch"));
+        assert!(provider_native_orchestration_tool("Monitor"));
         assert!(!provider_native_orchestration_tool(
             "mcp__borg_agent__watch"
         ));
