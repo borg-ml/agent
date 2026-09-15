@@ -5336,7 +5336,9 @@ pub async fn sync_remote_session(
             uploaded_sequence: 0,
             uploaded_live_revision: 0,
             workspace_retry_at: HashMap::new(),
-            uploaded_workspace_sequences: HashMap::new(),
+            uploaded_workspace_sequences: store
+                .sqlite_host_workspace_cursors(config.host_id, session_id)
+                .await?,
             workspace_relay_available: false,
             instance_relay_available: true,
             next_workspace_roster_sync: next_sync,
@@ -5345,7 +5347,7 @@ pub async fn sync_remote_session(
             retry_at: Instant::now(),
         };
         ensure!(
-            flush_workspace_messages(
+            flush_host_workspace_messages(
                 &client,
                 &config,
                 &store,
