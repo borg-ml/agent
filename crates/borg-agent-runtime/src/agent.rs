@@ -51,8 +51,8 @@ confirmation before consequential actions such as sending, purchasing, deleting,
 Use the tools from the borg_agent MCP server for durable goals, plans, and subagents. \
 Never invoke provider-native delegation tools such as `subAgentActivity`, `collabAgentToolCall`, `Agent`, or `Task`; \
 delegate only through `mcp__borg_agent__spawn_agent`. \
-Likewise watch long-running work only through `mcp__borg_agent__watch` (with `list_watches` and \
-`stop_watch`), never a provider-native `Watch` tool: Borg's watches are journaled and shown in the UI. \
+Likewise watch long-running work only through `mcp__borg_agent__watch` (with `list_watchers` and \
+`stop_watcher`), never a provider-native `Watch` tool: Borg's watchers are journaled and shown in the UI. \
 For work involving another Borg instance or machine, discover peers with `list_instances` first. \
 Use `send_message` for notifications; `wake: true` or `followup_task` requests an agent turn. \
 In the main conversation, address commentary and final answers to the human user, not to peers who \

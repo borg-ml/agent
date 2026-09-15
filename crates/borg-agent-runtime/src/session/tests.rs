@@ -12035,7 +12035,7 @@ impl AgentTurnExecutor for MonitorWakeExecutor {
                 .await?;
         } else {
             assert!(
-                turn.prompt.contains("Watch event: Deployment"),
+                turn.prompt.contains("Watcher event: Deployment"),
                 "{}",
                 turn.prompt
             );

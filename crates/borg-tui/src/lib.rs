@@ -8371,7 +8371,7 @@ impl BorgTerminal {
                             Block::default()
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(Color::Yellow))
-                                .title(" Watches · click to stop "),
+                                .title(" Watchers · click to stop "),
                         ),
                     tooltip,
                 );

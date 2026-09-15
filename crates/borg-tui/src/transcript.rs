@@ -3175,7 +3175,7 @@ impl Transcript {
     /// Footer token for armed watches: only running ones count.
     pub(crate) fn watch_status(&self) -> Option<String> {
         let running = self.watches.iter().filter(|watch| watch.running).count();
-        (running > 0).then(|| format!("{running} watch{}", if running == 1 { "" } else { "es" }))
+        (running > 0).then(|| format!("{running} watcher{}", if running == 1 { "" } else { "s" }))
     }
 
     /// One row per watch for the watches panel, newest first.
@@ -4957,7 +4957,9 @@ mod parallel_preparation_tests {
 /// watch, the captured output, and a trailing instruction for the model.
 /// Returns the watch label and the output without the instruction.
 pub(crate) fn parse_watch_event(text: &str) -> Option<(String, String)> {
-    let rest = text.strip_prefix("Watch event: ")?;
+    let rest = text
+        .strip_prefix("Watcher event: ")
+        .or_else(|| text.strip_prefix("Watch event: "))?;
     let (header, body) = rest.split_once('\n').unwrap_or((rest, ""));
     let label = header
         .rsplit_once(" (")

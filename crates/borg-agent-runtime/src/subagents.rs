@@ -1447,7 +1447,7 @@ impl AgentToolDispatcher {
                 let watches = self
                     .watches
                     .as_ref()
-                    .context("watches are unavailable for this session")?;
+                    .context("watchers are unavailable for this session")?;
                 let timeout = self
                     .resource_limits
                     .as_ref()
@@ -1465,17 +1465,17 @@ impl AgentToolDispatcher {
                         .await?,
                 )?)
             }
-            "list_watches" => {
+            "list_watchers" | "list_watches" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
                 Ok(serde_json::to_value(
                     self.watches
                         .as_ref()
-                        .context("watches are unavailable for this session")?
+                        .context("watchers are unavailable for this session")?
                         .list()
                         .await,
                 )?)
             }
-            "stop_watch" => {
+            "stop_watcher" | "stop_watch" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct Args {
@@ -1485,7 +1485,7 @@ impl AgentToolDispatcher {
                 Ok(serde_json::to_value(
                     self.watches
                         .as_ref()
-                        .context("watches are unavailable for this session")?
+                        .context("watchers are unavailable for this session")?
                         .stop(args.watch_id)
                         .await?,
                 )?)
@@ -5818,7 +5818,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         ),
         tool(
             "watch",
-            "Start a session-scoped background command that watches logs, files, or external status. Each stdout line is delivered to you automatically in bounded batches, including when idle. Use a command that emits only meaningful changes. Do not poll or wait for it. Requires shell approval; runs until stopped, session exit, or 24 hours. Use list_watches and stop_watch to manage watches.",
+            "Start a session-scoped background command that watches logs, files, or external status. Each stdout line is delivered to you automatically in bounded batches, including when idle. Use a command that emits only meaningful changes. Do not poll or wait for it. Requires shell approval; runs until stopped, session exit, or 24 hours. Use list_watchers and stop_watcher to manage watchers.",
             json!({
                 "type": "object", "properties": {
                     "command": {"type": "string", "minLength": 1},
@@ -5828,15 +5828,30 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
             }),
         ),
         tool(
+            "list_watchers",
+            "List this session's background watchers and whether they are running.",
+            json!({
+                "type": "object", "properties": {}, "additionalProperties": false
+            }),
+        ),
+        tool(
+            "stop_watcher",
+            "Stop a background watcher and its process tree.",
+            json!({
+                "type": "object", "properties": {"watch_id": {"type": "string", "format": "uuid"}},
+                "required": ["watch_id"], "additionalProperties": false
+            }),
+        ),
+        tool(
             "list_watches",
-            "List this session's background watches and whether they are running.",
+            "Compatibility alias for list_watchers. List this session's background watchers.",
             json!({
                 "type": "object", "properties": {}, "additionalProperties": false
             }),
         ),
         tool(
             "stop_watch",
-            "Stop a background watch and its process tree.",
+            "Compatibility alias for stop_watcher. Stop a background watcher and its process tree.",
             json!({
                 "type": "object", "properties": {"watch_id": {"type": "string", "format": "uuid"}},
                 "required": ["watch_id"], "additionalProperties": false
