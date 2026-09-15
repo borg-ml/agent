@@ -91,6 +91,18 @@ first and consumes the window's observation; results carry the settled tree.
 Coordinate clicks bypass name-based confirmation gating because no element is
 named; element-targeted `pointer_click` is gated like `click`.
 
+Verified on the Mac at `mac-input` `5962d2c`: `type_text` ("Borg typed ✓ héllo"
+arrived intact), `key` (`cmd+a`, `delete`), element-targeted `pointer_click`,
+and `drag` (text selection visible). Two findings drove follow-up changes:
+injected typing goes through the app's text-input pipeline, so autocorrect and
+auto-capitalisation apply (verify the resulting `text`, not the input); and an
+element's geometric centre can lie outside its scroll area, which made `scroll`
+a silent no-op. Pointer ops now target the centre of the element's
+`visible_bounds` (clipped by enclosing `AXScrollArea`s and the window) and refuse
+elements that are scrolled out of view; text nodes also expose `selected_text`.
+A tree that is still changing right after typing can reject the next action as
+"changed since observation" — re-observe and retry.
+
 ## Windows (unverified)
 
 `computer_use/windows.ps1` implements the contract on UI Automation under

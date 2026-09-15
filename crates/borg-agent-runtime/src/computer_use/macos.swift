@@ -26,8 +26,21 @@ struct Node: Codable, Equatable {
     let focused: Bool
     let showing: Bool
     let bounds: Bounds?
+    /// Portion of `bounds` inside every enclosing AXScrollArea and the window;
+    /// absent when the element is scrolled out of view. Pointer ops target this.
+    let visible_bounds: Bounds?
     let text: String?
+    let selected_text: String?
     let actions: [String]?
+}
+
+extension Bounds {
+    func intersection(_ other: Bounds) -> Bounds? {
+        let x0 = Swift.max(x, other.x), y0 = Swift.max(y, other.y)
+        let x1 = Swift.min(x + width, other.x + other.width), y1 = Swift.min(y + height, other.y + other.height)
+        guard x1 > x0, y1 > y0 else { return nil }
+        return Bounds(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
+    }
 }
 
 struct Observation {
@@ -128,17 +141,39 @@ func window(_ id: String) throws -> WindowEntry {
     return entry
 }
 
+func frame(_ element: AXUIElement) -> Bounds? {
+    guard let origin = axPoint(attribute(element, kAXPositionAttribute)),
+          let size = axSize(attribute(element, kAXSizeAttribute)), size.width > 0, size.height > 0 else { return nil }
+    return Bounds(x: origin.x, y: origin.y, width: size.width, height: size.height)
+}
+
+/// Clip an element's frame by every enclosing scroll area and its window.
+func visibleFrame(_ element: AXUIElement, _ bounds: Bounds) -> Bounds? {
+    var visible: Bounds? = bounds
+    var cursor = element
+    for _ in 0..<64 {
+        guard let parent = attribute(cursor, kAXParentAttribute) else { break }
+        cursor = parent as! AXUIElement
+        let role = string(cursor, kAXRoleAttribute) ?? ""
+        if role == "AXScrollArea" || role == "AXWindow", let clip = frame(cursor) {
+            visible = visible?.intersection(clip)
+            if visible == nil || role == "AXWindow" { break }
+        }
+    }
+    return visible
+}
+
 func describe(_ element: AXUIElement, parent: String?) throws -> Node {
     let role = string(element, kAXRoleAttribute) ?? ""
-    var bounds: Bounds?
-    if let origin = axPoint(attribute(element, kAXPositionAttribute)),
-       let size = axSize(attribute(element, kAXSizeAttribute)),
-       size.width > 0, size.height > 0 {
-        bounds = Bounds(x: origin.x, y: origin.y, width: size.width, height: size.height)
-    }
+    let bounds = frame(element)
+    let visible = bounds.flatMap { visibleFrame(element, $0) }
     var text: String?
+    var selected: String?
     if role != "AXSecureTextField", let value = attribute(element, kAXValueAttribute) as? String {
         text = String(value.prefix(2048))
+        if let selection = attribute(element, kAXSelectedTextAttribute) as? String, !selection.isEmpty {
+            selected = String(selection.prefix(2048))
+        }
     }
     let name = string(element, kAXTitleAttribute) ?? string(element, kAXDescriptionAttribute) ?? ""
     let id = try identify(element)
@@ -146,7 +181,8 @@ func describe(_ element: AXUIElement, parent: String?) throws -> Node {
         id: id, parent: parent, role: role, name: String(name.prefix(1024)),
         enabled: (attribute(element, kAXEnabledAttribute) as? Bool) ?? true,
         focused: boolean(element, kAXFocusedAttribute),
-        showing: bounds != nil, bounds: bounds, text: text, actions: actionNames(element))
+        showing: bounds != nil, bounds: bounds, visible_bounds: visible, text: text, selected_text: selected,
+        actions: actionNames(element))
 }
 
 func tree(_ root: AXUIElement, limit: Int) throws -> ([String: Node], [String], Bool) {
@@ -365,7 +401,7 @@ func focusWindow(_ entry: WindowEntry) throws {
     guard let app = NSRunningApplication(processIdentifier: entry.pid) else {
         throw Failure(message: "target application is no longer running")
     }
-    app.activate(options: [.activateIgnoringOtherApps])
+    if #available(macOS 14.0, *) { app.activate() } else { app.activate(options: [.activateIgnoringOtherApps]) }
     _ = AXUIElementPerformAction(entry.element, kAXRaiseAction as CFString)
     Thread.sleep(forTimeInterval: 0.15)
     guard app.isActive else { throw Failure(message: "could not bring the target application to the front") }
@@ -434,12 +470,15 @@ func pressKeys(_ entry: WindowEntry, _ spec: String) throws {
 func pointerTarget(_ args: [String: Any], entry: WindowEntry) throws -> (CGPoint, Bool) {
     if args["element_id"] != nil {
         let (_, element) = try target(args)
-        guard let origin = axPoint(attribute(element, kAXPositionAttribute)),
-              let size = axSize(attribute(element, kAXSizeAttribute)), size.width > 0, size.height > 0 else {
-            throw Failure(message: "element has no on-screen bounds")
+        guard let bounds = frame(element) else { throw Failure(message: "element has no on-screen bounds") }
+        guard let visible = visibleFrame(element, bounds) else {
+            observations[entry.id] = nil
+            throw Failure(message: "element is scrolled out of view; scroll its container or target a visible element")
         }
         observations[entry.id] = nil
-        return (CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2), false)
+        // Aim at the centre of the VISIBLE part so events reach the element, not
+        // whatever happens to cover its off-screen geometric centre.
+        return (CGPoint(x: visible.x + visible.width / 2, y: visible.y + visible.height / 2), false)
     }
     guard let x = number(args["x"]), let y = number(args["y"]) else {
         throw Failure(message: "pointer ops need element_id + observation_id or x + y")
