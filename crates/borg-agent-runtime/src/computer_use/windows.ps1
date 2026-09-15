@@ -22,6 +22,12 @@ $Observations = @{} # window id -> @{ observation_id; nodes (ordered id -> node)
 
 function Fail([string]$message) { throw [System.Exception]::new($message) }
 
+# Safe property read: absent members return $null instead of throwing under StrictMode.
+function Arg($request, [string]$name) {
+    if ($null -ne $request -and $request.PSObject.Properties[$name]) { return $request.$name }
+    return $null
+}
+
 function Identify($element) {
     $key = ($element.GetRuntimeId() -join '.')
     if ($ObjectIds.ContainsKey($key)) { return $ObjectIds[$key] }
@@ -151,12 +157,12 @@ function Screenshot([string]$scope, [string]$windowId) {
         borg_attachments = @([ordered]@{ media_type = 'image/png'; data_base64 = [Convert]::ToBase64String($data) }) }
 }
 
-function Snapshot($args) {
-    $windowId = [string]$args.window_id
+function Snapshot($request) {
+    $windowId = [string](Arg $request 'window_id')
     if (-not $windowId) { Fail 'window_id is required' }
     $win = Window $windowId
     $limit = 300
-    if ($null -ne $args.max_nodes) { $limit = [int]$args.max_nodes }
+    if ($null -ne (Arg $request 'max_nodes')) { $limit = [int](Arg $request 'max_nodes') }
     if ($limit -lt 1 -or $limit -gt 1000) { Fail 'max_nodes must be between 1 and 1000' }
     $tree = Tree $win $limit
     $token = [guid]::NewGuid().ToString('N')
@@ -164,7 +170,7 @@ function Snapshot($args) {
     $result = [ordered]@{ window_id = $windowId; observation_id = $token; truncated = $tree.truncated
         coordinate_space = 'physical screen pixels (virtual-screen origin), matching desktop screenshots' }
     $requested = $null
-    if ($null -ne $args.since) { $requested = [string]$args.since }
+    if ($null -ne (Arg $request 'since')) { $requested = [string](Arg $request 'since') }
     if ($requested) {
         if ($null -eq $previous -or $previous.observation_id -ne $requested) { Fail 'unknown diff baseline; observe without since' }
         $changed = @(); $removed = @()
@@ -175,19 +181,19 @@ function Snapshot($args) {
         $result.nodes = @($tree.nodes.Values)
     }
     $Observations[$windowId] = @{ observation_id = $token; nodes = $tree.nodes; json = $tree.json }
-    if ($args.screenshot -eq $true) {
-        $shot = Screenshot ([string]$args.screenshot_scope) $windowId
+    if ((Arg $request 'screenshot') -eq $true) {
+        $shot = Screenshot ([string](Arg $request 'screenshot_scope')) $windowId
         foreach ($k in $shot.Keys) { $result[$k] = $shot[$k] }
     }
     return $result
 }
 
-function Target($args) {
-    $windowId = [string]$args.window_id
+function Target($request) {
+    $windowId = [string](Arg $request 'window_id')
     $win = Window $windowId
     $observed = $Observations[$windowId]
-    if ($null -eq $observed -or $observed.observation_id -ne [string]$args.observation_id) { Fail 'stale observation_id; observe the window again before acting' }
-    $key = [string]$args.element_id
+    if ($null -eq $observed -or $observed.observation_id -ne [string](Arg $request 'observation_id')) { Fail 'stale observation_id; observe the window again before acting' }
+    $key = [string](Arg $request 'element_id')
     if (-not $observed.nodes.Contains($key)) { Fail 'element_id was not present in this observation' }
     $element = $Objects[$key]
     $expected = $observed.nodes[$key]
@@ -205,10 +211,10 @@ function Target($args) {
     return @($win, $element)
 }
 
-function Mutate($args, [string]$op) {
-    $pair = Target $args
+function Mutate($request, [string]$op) {
+    $pair = Target $request
     $win = $pair[0]; $element = $pair[1]
-    $windowId = [string]$args.window_id
+    $windowId = [string](Arg $request 'window_id')
     # Consume the observation BEFORE issuing an effect, including failed effects.
     $Observations.Remove($windowId)
     $pattern = $null
@@ -218,7 +224,7 @@ function Mutate($args, [string]$op) {
         elseif ($element.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pattern)) { $pattern.Select() }
         else { Fail 'element has no semantic invoke/toggle/select pattern; no coordinate fallback performed' }
     } elseif ($op -eq 'set_value') {
-        $text = $args.text
+        $text = (Arg $request 'text')
         if ($text -isnot [string] -or $text.Length -gt 16384) { Fail 'text must be a string of at most 16384 characters' }
         if ($element.Current.IsPassword) { Fail 'password entry requires a human' }
         if (-not $element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) { Fail 'element value is not settable' }
@@ -245,8 +251,8 @@ function Mutate($args, [string]$op) {
     return $result
 }
 
-function Dispatch($args) {
-    $op = [string]$args.op
+function Dispatch($request) {
+    $op = [string](Arg $request 'op')
     switch ($op) {
         'capabilities' {
             return [ordered]@{ platform = 'windows'; backend = 'UI Automation'; desktop_available = $true
@@ -256,10 +262,10 @@ function Dispatch($args) {
                                 'Runs in the interactive user session only; elevated (UAC) windows are not observable.') }
         }
         'list_windows' { return [ordered]@{ windows = (Windows) } }
-        'screenshot' { return Screenshot ([string]$args.scope) ([string]$args.window_id) }
-        'observe' { return Snapshot $args }
-        'click' { return Mutate $args $op }
-        'set_value' { return Mutate $args $op }
+        'screenshot' { return Screenshot ([string](Arg $request 'scope')) ([string](Arg $request 'window_id')) }
+        'observe' { return Snapshot $request }
+        'click' { return Mutate $request $op }
+        'set_value' { return Mutate $request $op }
         default { Fail "unsupported operation: $op" }
     }
 }

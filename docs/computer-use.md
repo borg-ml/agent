@@ -85,7 +85,10 @@ view; bounds are physical screen pixels (the helper is DPI-aware), so they match
 desktop. `scope: "window"` uses `PrintWindow` for isolated capture. `click` uses
 Invoke, Toggle or SelectionItem patterns; `set_value` uses ValuePattern and
 refuses password and read-only controls. Elevated windows are not observable.
-**Not yet exercised on a real Windows host**; treat as unverified.
+The script parses cleanly and its JSONL protocol loop (capabilities, error
+envelopes, argument validation) was dry-run under PowerShell 7.6 on Linux with
+the Windows-only calls stubbed. **Not yet exercised on a real Windows host**;
+treat as unverified.
 
 Still missing: macOS and Windows real-host verification;
 keyboard/pointer injection, scrolling and dragging; isolated window capture;
