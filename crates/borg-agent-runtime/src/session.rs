@@ -4799,6 +4799,7 @@ async fn run_agent_session_store_kernel(
                                             text,
                                             attachments: Vec::new(),
                                             admission: SteerAdmission::pending(),
+                                            preempt: false,
                                             ack,
                                         })
                                         .await
@@ -7283,6 +7284,9 @@ async fn dispatch_steer(
             text: prompt.text.clone(),
             attachments: prompt.attachments.clone(),
             admission,
+            // Only the human preempts the running task; reminders and team
+            // notices fold in at the next boundary.
+            preempt: prompt.actor == EventActor::User,
             ack,
         })
         .await

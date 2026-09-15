@@ -3018,6 +3018,7 @@ mod tests {
                         text: text.into(),
                         attachments: vec![PathBuf::from(text)],
                         admission: admission.clone(),
+                        preempt: true,
                         ack,
                     })
                     .await
@@ -3135,6 +3136,7 @@ mod tests {
                         text: "cancel the proposed command".into(),
                         attachments: Vec::new(),
                         admission: borg_provider::provider::SteerAdmission::pending(),
+                        preempt: true,
                         ack,
                     }
                 })
@@ -3178,6 +3180,7 @@ mod tests {
                 text: "also run the linter".into(),
                 attachments: Vec::new(),
                 admission: borg_provider::provider::SteerAdmission::pending(),
+                preempt: true,
                 ack,
             })
             .await
@@ -3230,6 +3233,7 @@ mod tests {
                         text: text.into(),
                         attachments: vec![PathBuf::from(text)],
                         admission: borg_provider::provider::SteerAdmission::pending(),
+                        preempt: true,
                         ack,
                     })
                     .await
@@ -3429,6 +3433,7 @@ mod tests {
                                 text: "stop writing".to_string(),
                                 attachments: Vec::new(),
                                 admission: borg_provider::provider::SteerAdmission::pending(),
+                                preempt: true,
                                 ack,
                             }
                         };

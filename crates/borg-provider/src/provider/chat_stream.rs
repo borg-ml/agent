@@ -73,6 +73,7 @@ mod claude_agents {
             text: String,
             attachments: Vec<PathBuf>,
             message_id: Option<String>,
+            preempt: bool,
             ack: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
         },
         Approval {
@@ -429,6 +430,10 @@ pub enum ChatStreamControl {
         text: String,
         attachments: Vec<PathBuf>,
         admission: SteerAdmission,
+        /// Human input: providers that can should end the running turn after
+        /// the tool in flight and answer this message next (Claude Code's
+        /// priority `now`), instead of folding it into the current task.
+        preempt: bool,
         ack: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
     Approval {
@@ -1475,6 +1480,7 @@ async fn relay_claude_runtime(
                             text,
                             attachments,
                             admission,
+                            preempt,
                             ack,
                         } => {
                             let permit = match sender.reserve().await {
@@ -1503,6 +1509,7 @@ async fn relay_claude_runtime(
                                 text,
                                 attachments,
                                 message_id: client_user_message_id.clone(),
+                                preempt,
                                 ack: native_ack,
                             });
                             let _ = ack.send(Ok(()));
@@ -2328,6 +2335,7 @@ async fn run_pooled_codex_turn(
                         text: steer_text,
                         attachments,
                         admission,
+                        preempt: _,
                         ack,
                     } => {
                         if !admission.accept() {
@@ -2581,6 +2589,7 @@ async fn run_codex_subscription_process(
                         text: steer_text,
                         attachments,
                         admission,
+                        preempt: _,
                         ack,
                     } => {
                         if !admission.accept() {
