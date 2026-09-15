@@ -28,6 +28,13 @@ Linux requires the desktop session bus, Python 3, PyGObject and AT-SPI2.
   entire visible desktop. For tree plus image, use `observe` with `screenshot: true`
   and `screenshot_scope: "desktop"`. There is no silent whole-screen fallback.
 
+Consequential controls are gated in the dispatcher on every platform: after an
+observation, a `click` or `set_value` whose target name contains a word such as
+send, pay, delete, publish, install, password or permission is refused until the
+human has confirmed that exact action and the call repeats with `confirmed: true`
+(`cua.click(..., confirmed=True)` / `cua.click(..., {confirmed: true})`). Tool
+approval alone never satisfies this gate.
+
 Python code mode: `cua.capabilities()`, `cua.list_windows()`,
 `cua.observe(window_id)`, `cua.screenshot("desktop")`,
 `cua.click(window_id, element_id, observation_id)`, and

@@ -1,4 +1,5 @@
 //! Session-owned native desktop helper. Handles never survive a helper restart.
+use std::collections::HashMap;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -13,6 +14,98 @@ const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 #[derive(Default)]
 pub(crate) struct ComputerUse {
     process: Mutex<Option<DesktopProcess>>,
+    /// Role and name of every element from the latest observation per window,
+    /// so consequential targets can be gated before the helper acts.
+    observed: Mutex<HashMap<String, HashMap<String, ObservedElement>>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ObservedElement {
+    role: String,
+    name: String,
+}
+
+/// Words that mark an on-screen control as consequential: acting on it can
+/// send, spend, destroy, publish, or change security state. Matching is on
+/// whole words of the observed name, case-insensitively.
+const CONSEQUENTIAL_WORDS: &[&str] = &[
+    "send",
+    "submit",
+    "post",
+    "publish",
+    "share",
+    "reply",
+    "tweet",
+    "buy",
+    "purchase",
+    "pay",
+    "checkout",
+    "order",
+    "subscribe",
+    "donate",
+    "transfer",
+    "withdraw",
+    "delete",
+    "remove",
+    "erase",
+    "discard",
+    "uninstall",
+    "format",
+    "reset",
+    "wipe",
+    "empty",
+    "confirm",
+    "agree",
+    "accept",
+    "apply",
+    "install",
+    "sign",
+    "authorize",
+    "approve",
+    "grant",
+    "allow",
+    "revoke",
+    "permission",
+    "permissions",
+    "privacy",
+    "security",
+    "password",
+    "passcode",
+    "pin",
+    "unlock",
+    "login",
+    "logout",
+    "card",
+    "cvv",
+    "iban",
+];
+
+/// Whether an effect on this element needs explicit human confirmation.
+pub(crate) fn action_is_consequential(op: &str, element: &ObservedElement) -> bool {
+    if !matches!(op, "click" | "set_value") {
+        return false;
+    }
+    let lowered = element.name.to_ascii_lowercase();
+    lowered
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|word| CONSEQUENTIAL_WORDS.contains(&word))
+}
+
+fn element_from_node(node: &Value) -> Option<(String, ObservedElement)> {
+    let id = node.get("id")?.as_str()?.to_string();
+    let element = ObservedElement {
+        role: node
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        name: node
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    };
+    Some((id, element))
 }
 
 struct DesktopProcess {
@@ -45,6 +138,7 @@ impl ComputerUse {
             ),
             "unsupported computer-use operation `{op}`"
         );
+        self.gate_consequential_action(op, &arguments).await?;
         let mut request = serde_json::to_vec(&arguments)?;
         ensure!(
             request.len() <= 128 * 1024,
@@ -114,7 +208,70 @@ impl ComputerUse {
                 .as_str()
                 .unwrap_or("desktop operation failed")
         );
+        self.remember_observation(&response["result"]).await;
         Ok(response["result"].clone())
+    }
+
+    /// Refuse to act on a consequential element unless the caller states that
+    /// the human already confirmed this specific action (`confirmed: true`).
+    async fn gate_consequential_action(&self, op: &str, arguments: &Value) -> Result<()> {
+        if !matches!(op, "click" | "set_value") {
+            return Ok(());
+        }
+        let window_id = arguments
+            .get("window_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let element_id = arguments
+            .get("element_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let observed = self.observed.lock().await;
+        let Some(element) = observed
+            .get(window_id)
+            .and_then(|nodes| nodes.get(element_id))
+        else {
+            return Ok(());
+        };
+        if action_is_consequential(op, element)
+            && arguments.get("confirmed") != Some(&Value::Bool(true))
+        {
+            bail!(
+                "{op} on {} \"{}\" is consequential (it can send, spend, destroy, publish, or change security state); ask the human to confirm this exact action, then repeat the call with confirmed: true",
+                element.role,
+                element.name
+            );
+        }
+        Ok(())
+    }
+
+    async fn remember_observation(&self, result: &Value) {
+        let Some(window_id) = result.get("window_id").and_then(Value::as_str) else {
+            return;
+        };
+        let mut observed = self.observed.lock().await;
+        if let Some(nodes) = result.get("nodes").and_then(Value::as_array) {
+            observed.insert(
+                window_id.to_string(),
+                nodes.iter().filter_map(element_from_node).collect(),
+            );
+            return;
+        }
+        let entry = observed.entry(window_id.to_string()).or_default();
+        if let Some(changed) = result.get("changed").and_then(Value::as_array) {
+            entry.extend(changed.iter().filter_map(element_from_node));
+        }
+        if let Some(removed) = result.get("removed").and_then(Value::as_array) {
+            for id in removed.iter().filter_map(Value::as_str) {
+                entry.remove(id);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn seed_observation(&self, window_id: &str, nodes: Value) {
+        self.remember_observation(&json!({"window_id": window_id, "nodes": nodes}))
+            .await;
     }
 }
 
@@ -244,4 +401,76 @@ async fn macos_helper_binary() -> Result<std::path::PathBuf> {
     // Rename last so a concurrent session never executes a partial binary.
     tokio::fs::rename(&staging, &binary).await?;
     Ok(binary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn element(role: &str, name: &str) -> ObservedElement {
+        ObservedElement {
+            role: role.into(),
+            name: name.into(),
+        }
+    }
+
+    #[test]
+    fn consequential_names_match_whole_words_only() {
+        assert!(action_is_consequential(
+            "click",
+            &element("push button", "Send")
+        ));
+        assert!(action_is_consequential(
+            "click",
+            &element("AXButton", "Delete all messages")
+        ));
+        assert!(action_is_consequential(
+            "set_value",
+            &element("text", "Card number")
+        ));
+        assert!(action_is_consequential(
+            "click",
+            &element("Button", "sign-in")
+        ));
+        assert!(!action_is_consequential(
+            "click",
+            &element("push button", "Sender options")
+        ));
+        assert!(!action_is_consequential(
+            "click",
+            &element("push button", "Verify click")
+        ));
+        assert!(!action_is_consequential(
+            "observe",
+            &element("push button", "Send")
+        ));
+    }
+
+    #[tokio::test]
+    async fn consequential_click_is_refused_before_any_helper_runs() {
+        let desktop = ComputerUse::default();
+        desktop
+            .seed_observation(
+                "w1",
+                json!([
+                    {"id": "e1", "role": "push button", "name": "Send"},
+                    {"id": "e2", "role": "push button", "name": "Verify click"}
+                ]),
+            )
+            .await;
+        let error = desktop
+            .call(json!({"op": "click", "window_id": "w1", "element_id": "e1", "observation_id": "o"}))
+            .await
+            .expect_err("consequential click must be refused");
+        assert!(error.to_string().contains("confirmed: true"), "{error}");
+        assert!(
+            desktop.process.lock().await.is_none(),
+            "no helper may be spawned"
+        );
+        // Diffs keep the gate current: a removed element no longer gates.
+        desktop
+            .remember_observation(&json!({"window_id": "w1", "changed": [], "removed": ["e1"]}))
+            .await;
+        assert!(!desktop.observed.lock().await["w1"].contains_key("e1"));
+    }
 }

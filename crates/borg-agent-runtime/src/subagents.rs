@@ -5754,7 +5754,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
     let mut specs = vec![
         tool(
             "computer_use",
-            "Native desktop access, including sensitive screen contents; requires Full Access or approval. Query capabilities first. Linux AT-SPI2 currently supports list_windows, bounded observe (optional since diff), explicit desktop screenshots (scope=desktop or observe screenshot=true plus screenshot_scope=desktop), semantic click and set_value. Actions require window_id, element_id and the latest observation_id; inspect returned state to verify effects. No coordinate/clipboard fallback. Other platforms return unavailable.",
+            "Native desktop access, including sensitive screen contents; requires Full Access or approval. Query capabilities first: it reports the platform backend (Linux AT-SPI2, macOS AXUIElement, Windows UI Automation), permissions and capture scopes. Operations: list_windows, bounded observe (optional since diff, optional screenshot=true with screenshot_scope), explicit screenshots (scope=desktop, or scope=window with window_id where supported), semantic click and set_value. Actions require window_id, element_id and the latest observation_id; inspect returned state to verify effects. Acting on a consequential control (send, pay, delete, publish, security, credentials) is refused until the human has confirmed that exact action and you pass confirmed=true. No coordinate/clipboard fallback.",
             json!({
                 "type": "object",
                 "properties": {
@@ -5765,9 +5765,10 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
                     "since": {"type": "string"},
                     "max_nodes": {"type": "integer", "minimum": 1, "maximum": 1000},
                     "screenshot": {"type": "boolean"},
-                    "scope": {"type": "string", "enum": ["desktop"]},
-                    "screenshot_scope": {"type": "string", "enum": ["desktop"]},
-                    "text": {"type": "string", "maxLength": 16384}
+                    "scope": {"type": "string", "enum": ["desktop", "window"]},
+                    "screenshot_scope": {"type": "string", "enum": ["desktop", "window"]},
+                    "text": {"type": "string", "maxLength": 16384},
+                    "confirmed": {"type": "boolean", "description": "Set only after the human confirmed this exact consequential action."}
                 },
                 "required": ["op"], "additionalProperties": false
             }),

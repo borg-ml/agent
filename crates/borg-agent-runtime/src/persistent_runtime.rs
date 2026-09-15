@@ -1032,17 +1032,17 @@ class ComputerUse:
     def list_windows(self):
         return self("list_windows")
 
-    def screenshot(self, scope):
-        return self("screenshot", scope=scope)
+    def screenshot(self, scope, window_id=None):
+        return self("screenshot", scope=scope, **({"window_id": window_id} if window_id else {}))
 
     def observe(self, window_id, **options):
         return self("observe", window_id=window_id, **options)
 
-    def click(self, window_id, element_id, observation_id):
-        return self("click", window_id=window_id, element_id=element_id, observation_id=observation_id)
+    def click(self, window_id, element_id, observation_id, confirmed=False):
+        return self("click", window_id=window_id, element_id=element_id, observation_id=observation_id, **({"confirmed": True} if confirmed else {}))
 
-    def set_value(self, window_id, element_id, observation_id, text):
-        return self("set_value", window_id=window_id, element_id=element_id, observation_id=observation_id, text=text)
+    def set_value(self, window_id, element_id, observation_id, text, confirmed=False):
+        return self("set_value", window_id=window_id, element_id=element_id, observation_id=observation_id, text=text, **({"confirmed": True} if confirmed else {}))
 
 
 NAMESPACE["borg"] = Borg()
@@ -1316,10 +1316,10 @@ context.borg = borg;
 const cua = (op, arguments_ = {}) => borg.tool("computer_use", {...arguments_, op});
 cua.capabilities = () => cua("capabilities");
 cua.list_windows = () => cua("list_windows");
-cua.screenshot = (scope) => cua("screenshot", {scope});
+cua.screenshot = (scope, window_id) => cua("screenshot", window_id ? {scope, window_id} : {scope});
 cua.observe = (window_id, options = {}) => cua("observe", {...options, window_id});
-cua.click = (window_id, element_id, observation_id) => cua("click", {window_id, element_id, observation_id});
-cua.set_value = (window_id, element_id, observation_id, text) => cua("set_value", {window_id, element_id, observation_id, text});
+cua.click = (window_id, element_id, observation_id, options = {}) => cua("click", {...options, window_id, element_id, observation_id});
+cua.set_value = (window_id, element_id, observation_id, text, options = {}) => cua("set_value", {...options, window_id, element_id, observation_id, text});
 context.cua = cua;
 context.console = runtimeConsole;
 

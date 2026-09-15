@@ -131,7 +131,7 @@ func describe(_ element: AXUIElement, parent: String?) throws -> Node {
         bounds = Bounds(x: origin.x, y: origin.y, width: size.width, height: size.height)
     }
     var text: String?
-    if role != kAXSecureTextFieldRole as String, let value = attribute(element, kAXValueAttribute) as? String {
+    if role != "AXSecureTextField", let value = attribute(element, kAXValueAttribute) as? String {
         text = String(value.prefix(2048))
     }
     let name = string(element, kAXTitleAttribute) ?? string(element, kAXDescriptionAttribute) ?? ""
@@ -311,7 +311,7 @@ func mutate(_ args: [String: Any], op: String) throws -> [String: Any] {
         guard let text = args["text"] as? String, text.count <= 16384 else {
             throw Failure(message: "text must be a string of at most 16384 characters")
         }
-        if string(element, kAXRoleAttribute) == kAXSecureTextFieldRole as String {
+        if string(element, kAXRoleAttribute) == "AXSecureTextField" {
             throw Failure(message: "password entry requires a human")
         }
         var settable = DarwinBoolean(false)
