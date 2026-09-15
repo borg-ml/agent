@@ -8,7 +8,7 @@ use uuid::Uuid;
 const RECEIPT_VERSION: u8 = 1;
 
 #[derive(Debug)]
-pub(crate) enum ReceiptState<T> {
+pub enum ReceiptState<T> {
     Missing,
     Started,
     Terminal(T),
@@ -45,7 +45,7 @@ struct SqliteReceiptTransition {
 ///
 /// The supplied pool remains owned by the caller. `receipt_records` is the
 /// current projection; `receipt_transitions` is append-only audit history.
-pub(crate) struct SqliteReceiptStore {
+pub struct SqliteReceiptStore {
     pool: SqlitePool,
 }
 
@@ -54,18 +54,18 @@ impl SqliteReceiptStore {
         Self { pool }
     }
 
-    pub(crate) async fn open(pool: SqlitePool) -> Result<Self> {
+    pub async fn open(pool: SqlitePool) -> Result<Self> {
         let store = Self::new(pool);
         store.ensure_schema().await?;
         Ok(store)
     }
 
-    #[cfg(test)]
-    pub(crate) fn pool(&self) -> &SqlitePool {
+    /// Raw pool access for cross-crate tests that inspect receipt rows.
+    pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 
-    pub(crate) async fn load<Request, Response>(
+    pub async fn load<Request, Response>(
         &self,
         request_id: Uuid,
         request: &Request,
@@ -148,7 +148,7 @@ impl SqliteReceiptStore {
     }
 
     /// Durably records intent before a mutation may begin.
-    pub(crate) async fn begin<Request: Serialize>(
+    pub async fn begin<Request: Serialize>(
         &self,
         request_id: Uuid,
         request: &Request,
@@ -189,7 +189,7 @@ impl SqliteReceiptStore {
 
     /// Atomically publishes a terminal response while retaining the intent
     /// transition as evidence that the mutation was authorized.
-    pub(crate) async fn finish<Request, Response>(
+    pub async fn finish<Request, Response>(
         &self,
         request_id: Uuid,
         request: &Request,
@@ -265,7 +265,7 @@ impl SqliteReceiptStore {
         Ok(())
     }
 
-    pub(crate) async fn enqueue_host_operation(
+    pub async fn enqueue_host_operation(
         &self,
         host_id: Uuid,
         request_id: Uuid,
@@ -299,7 +299,7 @@ impl SqliteReceiptStore {
         Ok(())
     }
 
-    pub(crate) async fn next_host_operation(
+    pub async fn next_host_operation(
         &self,
         host_id: Uuid,
     ) -> Result<Option<(Uuid, serde_json::Value)>> {
@@ -338,11 +338,7 @@ impl SqliteReceiptStore {
         }
     }
 
-    pub(crate) async fn quarantine_host_operation(
-        &self,
-        host_id: Uuid,
-        request_id: Uuid,
-    ) -> Result<()> {
+    pub async fn quarantine_host_operation(&self, host_id: Uuid, request_id: Uuid) -> Result<()> {
         let mut transaction = self.begin_write().await?;
         sqlx::query(
             "update host_operation_queue set quarantine_reason=? where host_id=? and request_id=?",
@@ -356,7 +352,7 @@ impl SqliteReceiptStore {
         Ok(())
     }
 
-    pub(crate) async fn queued_host_operation(
+    pub async fn queued_host_operation(
         &self,
         host_id: Uuid,
         request_id: Uuid,
@@ -377,11 +373,7 @@ impl SqliteReceiptStore {
         Ok(decoded)
     }
 
-    pub(crate) async fn finish_host_operation(
-        &self,
-        host_id: Uuid,
-        request_id: Uuid,
-    ) -> Result<()> {
+    pub async fn finish_host_operation(&self, host_id: Uuid, request_id: Uuid) -> Result<()> {
         let mut transaction = self.begin_write().await?;
         sqlx::query("delete from host_operation_queue where host_id=? and request_id=?")
             .bind(host_id.to_string())

@@ -98,7 +98,7 @@ impl GenerationActivity {
         Some(event)
     }
 
-    fn finish(&mut self, id: &str) {
+    pub fn finish(&mut self, id: &str) {
         if self.pending.remove(&Some(id.to_owned())).is_none() {
             self.pending.remove(&None);
         }

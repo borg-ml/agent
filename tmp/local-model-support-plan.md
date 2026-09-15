@@ -124,8 +124,8 @@ structure without change.
 **This is the single blocking issue for local-model UX.**
 
 Catalog consumers that must keep compiling:
-- `crates/borg-remote/src/contract.rs:185,210`
-- `crates/borg-remote/src/subagents.rs:2805,2840,2864,4742`
+- `crates/borg-agent-runtime/src/contract.rs:185,210`
+- `crates/borg-agent-runtime/src/subagents.rs:2805,2840,2864,4742`
 - `crates/borg-cli/src/terminal_ui.rs:1238`
 - `crates/borg-cli/src/terminal_ui/tests.rs:407`
 - `crates/borg-provider/src/provider/mod.rs:1000`

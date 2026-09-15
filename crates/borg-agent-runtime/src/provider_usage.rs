@@ -16,13 +16,13 @@ use crate::{
     ProviderUsageAvailability, ProviderUsageWindow,
 };
 
-pub(crate) const PROVIDER_CAPABILITIES_CACHE_TTL: Duration = Duration::from_secs(5);
+pub const PROVIDER_CAPABILITIES_CACHE_TTL: Duration = Duration::from_secs(5);
 
 type ProviderUsageCache = HashMap<CodingProvider, (Instant, Option<ProviderUsage>)>;
 
-pub(crate) static PROVIDER_USAGE_CACHE: OnceLock<Mutex<ProviderUsageCache>> = OnceLock::new();
+pub static PROVIDER_USAGE_CACHE: OnceLock<Mutex<ProviderUsageCache>> = OnceLock::new();
 
-pub(crate) async fn refresh_provider_capability_usage(
+pub async fn refresh_provider_capability_usage(
     capabilities: &[ProviderCapability],
 ) -> Vec<ProviderCapability> {
     let has_subscription = |provider| {

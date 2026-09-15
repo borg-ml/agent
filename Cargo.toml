@@ -2,6 +2,7 @@
 members = [
     "crates/borg-core",
     "crates/borg-dictation",
+    "crates/borg-agent-runtime",
     "crates/borg-provider",
     "crates/borg-remote",
     "crates/borg-search",
@@ -13,6 +14,7 @@ members = [
 default-members = [
     "crates/borg-core",
     "crates/borg-dictation",
+    "crates/borg-agent-runtime",
     "crates/borg-provider",
     "crates/borg-remote",
     "crates/borg-search",

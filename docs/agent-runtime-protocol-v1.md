@@ -11,7 +11,7 @@ hosts, Web relays, goals, plans, approvals, subagents, MCP tools, and
 provider-specific adapters keep their behavior during convergence.
 
 The reference JSON fixtures live in
-`crates/borg-remote/protocol-fixtures/v1/`. Borg Web conformance tests consume
+`crates/borg-agent-runtime/protocol-fixtures/v1/`. Borg Web conformance tests consume
 that directory through `BORG_AGENT_RUNTIME_FIXTURES`; the product fork is a
 consumer of the fixtures, not a second editable protocol source.
 

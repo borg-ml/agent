@@ -14,7 +14,7 @@ pub(crate) fn configure_runtime_environment(command: &mut Command) {
     configure_sanitized_child_environment(command);
 }
 
-pub(crate) fn configure_host_child_environment(command: &mut Command) {
+pub fn configure_host_child_environment(command: &mut Command) {
     if std::env::var("BORG_HOST_EXECUTION_PROFILE").ok().as_deref() == Some("isolated_hosted") {
         configure_sanitized_child_environment(command);
     }

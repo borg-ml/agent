@@ -700,7 +700,10 @@ fn runtime_asset_for(accelerator: DictationAccelerator) -> Result<RuntimeAsset> 
             DictationAccelerator::Auto => unreachable!("handled above"),
         });
     }
-    bail!("no {} dictation runtime is published for this platform", accelerator.id())
+    bail!(
+        "no {} dictation runtime is published for this platform",
+        accelerator.id()
+    )
 }
 
 #[cfg(windows)]
@@ -1786,7 +1789,11 @@ mod tests {
             assert!(asset.url.ends_with(asset.file));
             assert_eq!(asset.sha256.len(), 64);
             assert!(asset.size > 0);
-            assert!(files.insert(asset.file), "duplicate model file {}", asset.file);
+            assert!(
+                files.insert(asset.file),
+                "duplicate model file {}",
+                asset.file
+            );
         }
         assert_eq!(DictationModelId::from_id("nonsense"), None);
     }

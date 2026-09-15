@@ -87,7 +87,7 @@ The design should not force these axes into one global `runtime` setting.
 
 The current implementation already has a useful extraction seam:
 
-- `crates/borg-remote/src/blu_workflow.rs::BluWorkflowRunner` owns workflow
+- `crates/borg-agent-runtime/src/blu_workflow.rs::BluWorkflowRunner` owns workflow
   admission, leases, cancellation, durable completion, and replay.
 - `execute_blu_source` owns Blu-specific VM construction, compiler limits,
   native function registration, interruption, and `BluValue` conversion.

@@ -881,16 +881,6 @@ async fn upload_live_state(
     }
 }
 
-pub fn default_host_config_path() -> PathBuf {
-    std::env::var_os("BORG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".borg")))
-        .or_else(|| dirs::home_dir().map(|home| home.join(".borg")))
-        .unwrap_or_else(|| PathBuf::from(".borg"))
-        .join("remote")
-        .join("host.json")
-}
-
 pub async fn enroll_host(
     server: &str,
     token: &str,

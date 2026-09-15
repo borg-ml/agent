@@ -402,9 +402,9 @@ exhausted-account recovery remains unverified.
 
 ## Evidence
 
-- Current routing: `crates/borg-remote/src/contract.rs` (`uses_native_harness`)
-  and `crates/borg-remote/src/agent.rs` (`run_borg_provider_turn`).
-- Existing model boundary: `crates/borg-remote/src/native_harness.rs`
+- Current routing: `crates/borg-agent-runtime/src/contract.rs` (`uses_native_harness`)
+  and `crates/borg-agent-runtime/src/agent.rs` (`run_borg_provider_turn`).
+- Existing model boundary: `crates/borg-agent-runtime/src/native_harness.rs`
   (`NativeModelClient`) and `crates/borg-provider/src/provider/model_turn.rs`.
 - [OpenAI authentication documentation](https://learn.chatgpt.com/docs/auth).
 - [OpenAI app-server documentation](https://learn.chatgpt.com/docs/app-server).

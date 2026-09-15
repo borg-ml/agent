@@ -1287,7 +1287,7 @@ impl SqliteWorkspaceStore {
 impl SqliteWorkspaceStore {
     /// Project an authenticated relay delivery into the same inbox as local messages.
     /// Thread/reply references remain cloud identities; their history need not be local.
-    pub(crate) async fn import_relay_message(
+    pub async fn import_relay_message(
         &self,
         message: WorkspaceMessage,
         author_name: &str,

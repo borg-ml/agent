@@ -26,7 +26,7 @@ use crate::{
     WorkspaceEventKind, WorkspaceStore,
 };
 
-pub(crate) struct AbortTask<T = ()>(pub(crate) tokio::task::JoinHandle<T>);
+pub struct AbortTask<T = ()>(pub tokio::task::JoinHandle<T>);
 
 impl<T> Drop for AbortTask<T> {
     fn drop(&mut self) {
@@ -1333,7 +1333,7 @@ pub async fn run_agent_session_with_store_and_writer(
 /// Run a session with an explicit LSP path policy. Local callers use the
 /// trusted unrestricted default; enrolled hosts provide their own boundary.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_agent_session_with_store_and_writer_and_lsp_policy(
+pub async fn run_agent_session_with_store_and_writer_and_lsp_policy(
     session_root: &Path,
     session_id: Uuid,
     launch: LaunchSession,

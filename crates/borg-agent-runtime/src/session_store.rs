@@ -27,7 +27,7 @@ use crate::{
     SessionStatus,
 };
 
-pub(crate) const INLINE_SESSION_PAYLOAD_BYTES: usize = 64 * 1024;
+pub const INLINE_SESSION_PAYLOAD_BYTES: usize = 64 * 1024;
 pub(crate) const SESSION_PAYLOAD_PREVIEW_BYTES: usize = 4 * 1024;
 // A blocked SQLite connection must return to the pool quickly. The writer
 // admission loop below owns the longer wait; keeping that wait in SQLite
@@ -40,7 +40,7 @@ const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const SQLITE_MMAP_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 const SQLITE_CACHE_KIB: u64 = 8 * 1024;
-pub(crate) const MAX_HOST_LAUNCH_METADATA_BYTES: usize = 512 * 1024;
+pub const MAX_HOST_LAUNCH_METADATA_BYTES: usize = 512 * 1024;
 // Cap fork replay at 255 local events without duplicating SessionState in every row.
 const FORK_PROJECTION_CHECKPOINT_INTERVAL: u64 = 256;
 pub const SESSION_PROJECTION_VERSION: i32 = 3;
@@ -2482,7 +2482,7 @@ impl SqliteSessionStore {
         self.persist_host_launch(session_id, metadata, None).await
     }
 
-    pub(crate) async fn persist_owned_host_launch_metadata(
+    pub async fn persist_owned_host_launch_metadata(
         &self,
         session_id: Uuid,
         metadata: &serde_json::Value,
@@ -2586,10 +2586,7 @@ impl SqliteSessionStore {
         Ok(())
     }
 
-    pub(crate) async fn host_launch_owner(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Option<(Uuid, String)>> {
+    pub async fn host_launch_owner(&self, session_id: Uuid) -> Result<Option<(Uuid, String)>> {
         sqlx::query("select host_id,relay_origin from host_launch_owners where session_id=?")
             .bind(session_id.to_string())
             .fetch_optional(&self.pool)
@@ -2604,7 +2601,7 @@ impl SqliteSessionStore {
     }
 
     /// Caller must first verify this legacy session with the host-authenticated relay.
-    pub(crate) async fn claim_legacy_host_launch_owner(
+    pub async fn claim_legacy_host_launch_owner(
         &self,
         session_id: Uuid,
         host_id: Uuid,
@@ -2678,7 +2675,7 @@ impl SqliteSessionStore {
             .transpose()
     }
 
-    pub(crate) async fn pending_host_journals(
+    pub async fn pending_host_journals(
         &self,
         after: Option<Uuid>,
         limit: usize,
@@ -2701,7 +2698,7 @@ impl SqliteSessionStore {
         rows.into_iter().map(|id| parse_uuid(&id)).collect()
     }
 
-    pub(crate) async fn acknowledge_host_journal(
+    pub async fn acknowledge_host_journal(
         &self,
         session_id: Uuid,
         event_cursor: u64,
@@ -2723,7 +2720,7 @@ impl SqliteSessionStore {
         Ok(())
     }
 
-    pub(crate) async fn pending_host_workspace_messages(
+    pub async fn pending_host_workspace_messages(
         &self,
         host_id: Uuid,
         after: Option<Uuid>,
@@ -2750,7 +2747,7 @@ impl SqliteSessionStore {
         rows.into_iter().map(|id| parse_uuid(&id)).collect()
     }
 
-    pub(crate) async fn host_workspace_cursors(
+    pub async fn host_workspace_cursors(
         &self,
         host_id: Uuid,
         session_id: Uuid,
@@ -2773,7 +2770,7 @@ impl SqliteSessionStore {
             .collect()
     }
 
-    pub(crate) async fn acknowledge_host_workspaces(
+    pub async fn acknowledge_host_workspaces(
         &self,
         host_id: Uuid,
         session_id: Uuid,
@@ -2798,7 +2795,7 @@ impl SqliteSessionStore {
         Ok(())
     }
 
-    pub(crate) async fn begin_host_bootstrap(&self, session_id: Uuid) -> Result<()> {
+    pub async fn begin_host_bootstrap(&self, session_id: Uuid) -> Result<()> {
         let mut transaction = self.begin_write().await?;
         sqlx::query("insert into host_bootstraps (session_id) values (?) on conflict do nothing")
             .bind(session_id.to_string())
@@ -2808,7 +2805,7 @@ impl SqliteSessionStore {
         Ok(())
     }
 
-    pub(crate) async fn finish_host_bootstrap(&self, session_id: Uuid) -> Result<()> {
+    pub async fn finish_host_bootstrap(&self, session_id: Uuid) -> Result<()> {
         let mut transaction = self.begin_write().await?;
         sqlx::query("delete from host_bootstraps where session_id=?")
             .bind(session_id.to_string())
@@ -2819,7 +2816,7 @@ impl SqliteSessionStore {
     }
 
     /// The host must hold the session writer lease before settling abandoned work.
-    pub(crate) async fn settle_terminal_host_session(&self, session_id: Uuid) -> Result<()> {
+    pub async fn settle_terminal_host_session(&self, session_id: Uuid) -> Result<()> {
         loop {
             let mut transaction = self.begin_write().await?;
             let terminal: i64 = sqlx::query_scalar(
@@ -2866,7 +2863,7 @@ impl SqliteSessionStore {
             .await
     }
 
-    pub(crate) async fn pending_host_launch_metadata_for_host(
+    pub async fn pending_host_launch_metadata_for_host(
         &self,
         offset: usize,
         owner: Option<(Uuid, &str)>,
@@ -7119,7 +7116,7 @@ fn payload_kind_name(kind: SessionPayloadKind) -> &'static str {
     kind.as_str()
 }
 
-pub(crate) fn deferred_json_payload(payload: &SessionPayloadRef) -> serde_json::Value {
+pub fn deferred_json_payload(payload: &SessionPayloadRef) -> serde_json::Value {
     serde_json::json!({
         "borg_payload_deferred": true,
         "payload_id": payload.id,
@@ -7127,7 +7124,7 @@ pub(crate) fn deferred_json_payload(payload: &SessionPayloadRef) -> serde_json::
     })
 }
 
-pub(crate) fn deferred_text_payload(value: &str, payload: &SessionPayloadRef) -> String {
+pub fn deferred_text_payload(value: &str, payload: &SessionPayloadRef) -> String {
     let mut end = value.len().min(SESSION_PAYLOAD_PREVIEW_BYTES);
     while !value.is_char_boundary(end) {
         end -= 1;

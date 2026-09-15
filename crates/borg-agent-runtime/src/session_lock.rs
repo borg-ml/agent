@@ -44,7 +44,7 @@ impl SessionWriterLease {
         }
     }
 
-    pub(crate) fn acquire(lock_path: impl Into<PathBuf>) -> Result<Self> {
+    pub fn acquire(lock_path: impl Into<PathBuf>) -> Result<Self> {
         let lock_path = lock_path.into();
         Self::try_acquire(lock_path.clone())?.with_context(|| {
             format!(

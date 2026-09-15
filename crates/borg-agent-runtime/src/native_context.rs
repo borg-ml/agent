@@ -25,7 +25,7 @@ struct SkillEntry {
 }
 
 impl NativeContext {
-    pub(crate) async fn load(cwd: PathBuf, extension_skill_roots: Vec<PathBuf>) -> Result<Self> {
+    pub async fn load(cwd: PathBuf, extension_skill_roots: Vec<PathBuf>) -> Result<Self> {
         tokio::task::spawn_blocking(move || Self::load_blocking(&cwd, &extension_skill_roots))
             .await
             .context("native context loader stopped")?

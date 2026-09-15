@@ -31,7 +31,7 @@ pub struct LspService {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum LspPathPolicy {
+pub enum LspPathPolicy {
     /// Local trusted sessions already have the host's normal filesystem
     /// access, so LSP should not impose a narrower artificial boundary.
     Unrestricted,
@@ -47,11 +47,11 @@ impl LspPathPolicy {
         Self::Unrestricted
     }
 
-    pub(crate) fn session_workspace() -> Self {
+    pub fn session_workspace() -> Self {
         Self::SessionWorkspace
     }
 
-    pub(crate) fn authorized_roots(roots: Vec<PathBuf>) -> Self {
+    pub fn authorized_roots(roots: Vec<PathBuf>) -> Self {
         Self::AuthorizedRoots(roots)
     }
 

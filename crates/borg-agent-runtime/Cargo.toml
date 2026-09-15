@@ -1,6 +1,6 @@
 [package]
-name = "borg-remote"
-description = "Durable local and remote agent session protocol, store, host, and tools"
+name = "borg-agent-runtime"
+description = "Borg agent loop, tool dispatch, code-mode runtimes, session store, and orchestration"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,27 +12,33 @@ publish = false
 
 [features]
 default = ["subscription-adapters"]
-subscription-adapters = ["borg-agent-runtime/subscription-adapters", "borg-provider/codex", "borg-provider/claude"]
-profiling = ["borg-agent-runtime/profiling"]
-
-[[example]]
-name = "codex_native_probe"
-required-features = ["subscription-adapters"]
+subscription-adapters = ["borg-provider/codex", "borg-provider/claude"]
+profiling = []
 
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
-borg-agent-runtime = { path = "../borg-agent-runtime", default-features = false }
+base64.workspace = true
+blu-lang.workspace = true
 borg-provider = { path = "../borg-provider", default-features = false }
+borg-search.workspace = true
 chrono.workspace = true
+dirs.workspace = true
 futures.workspace = true
+hex.workspace = true
+ignore.workspace = true
+libc.workspace = true
+regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 tempfile.workspace = true
+toml.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
+ts-rs.workspace = true
 url.workspace = true
 uuid.workspace = true

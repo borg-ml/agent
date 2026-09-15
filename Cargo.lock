@@ -1022,6 +1022,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "borg-agent-runtime"
+version = "0.6.6"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.23.1",
+ "blu-lang",
+ "borg-provider",
+ "borg-search",
+ "chrono",
+ "dirs 6.0.0",
+ "futures",
+ "hex",
+ "ignore",
+ "libc",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml 1.1.4+spec-1.1.0",
+ "tracing",
+ "ts-rs",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "borg-core"
 version = "0.6.6"
 dependencies = [
@@ -1096,17 +1128,10 @@ version = "0.6.6"
 dependencies = [
  "anyhow",
  "async-trait",
- "base64 0.23.1",
- "blu-lang",
+ "borg-agent-runtime",
  "borg-provider",
- "borg-search",
  "chrono",
- "dirs 6.0.0",
  "futures",
- "hex",
- "ignore",
- "libc",
- "regex",
  "reqwest",
  "serde",
  "serde_json",
@@ -1114,10 +1139,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "tokio",
- "tokio-util",
- "toml 1.1.4+spec-1.1.0",
  "tracing",
- "ts-rs",
  "url",
  "uuid",
 ]
