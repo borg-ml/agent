@@ -8476,7 +8476,8 @@ fn provider_error_is_expected_interrupt(provider: CodingProvider, error: &str) -
     // The generic subtype has no failure detail. Only accept it after a Borg
     // interrupt; detailed execution failures must remain visible.
     provider == CodingProvider::Claude
-        && (error == "claude SDK error_during_execution: claude SDK returned subtype=error_during_execution"
+        && (error
+            == "claude SDK error_during_execution: claude SDK returned subtype=error_during_execution"
             || error.contains(r#""terminal_reason":"aborted_streaming""#)
             || error.contains(r#""terminal_reason":"aborted_tools""#))
 }

@@ -739,8 +739,13 @@ impl Transcript {
     fn inspector_heading(&self, index: usize) -> Option<(&str, bool)> {
         match self.order.get(index)? {
             TranscriptEntry::Tool { name, complete, .. } => Some((name, *complete)),
-            TranscriptEntry::Action { label, state, .. } => Some((label, !matches!(state,
-                TranscriptActionState::Running | TranscriptActionState::Waiting))),
+            TranscriptEntry::Action { label, state, .. } => Some((
+                label,
+                !matches!(
+                    state,
+                    TranscriptActionState::Running | TranscriptActionState::Waiting
+                ),
+            )),
             TranscriptEntry::Plan { .. } => Some(("Plan", true)),
             TranscriptEntry::Compaction { complete, .. } => Some(("Compaction", *complete)),
             _ => None,
@@ -1305,9 +1310,7 @@ impl Transcript {
                 if *actor == EventActor::System
                     && let Some((label, body)) = parse_watch_event(text)
                 {
-                    if *status != MessageStatus::Queued
-                        && self.watch_messages.insert(*message_id)
-                    {
+                    if *status != MessageStatus::Queued && self.watch_messages.insert(*message_id) {
                         self.order.push(TranscriptEntry::Action {
                             kind: TranscriptActionKind::Agent,
                             label: "Watch".to_string(),
@@ -1904,10 +1907,15 @@ impl Transcript {
             {
                 self.finish_reasoning(event.created_at);
             }
-            SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "mcp_server_unavailable" => {
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "mcp_server_unavailable" =>
+            {
                 self.order.push(TranscriptEntry::Info {
                     title: "MCP unavailable".to_string(),
-                    text: payload["message"].as_str().unwrap_or("External MCP tools unavailable for this turn").to_string(),
+                    text: payload["message"]
+                        .as_str()
+                        .unwrap_or("External MCP tools unavailable for this turn")
+                        .to_string(),
                     time: local_event_time(event),
                 });
             }
@@ -3010,7 +3018,12 @@ impl Transcript {
             effort: config.effort.clone(),
             fast: config.fast.then(|| "fast".to_string()),
             permission: Some(permission_mode_label(config.permission_mode).to_string()),
-            billing: if config.provider == CodingProvider::OpenCode && config.model.as_deref().is_some_and(|model| model.starts_with("opencode-go/")) {
+            billing: if config.provider == CodingProvider::OpenCode
+                && config
+                    .model
+                    .as_deref()
+                    .is_some_and(|model| model.starts_with("opencode-go/"))
+            {
                 Some("Go sub".to_string())
             } else {
                 billing_status_for(&self.provider_capabilities, config.provider)
@@ -3562,22 +3575,22 @@ impl Transcript {
         if let Some(index) = focused_tool
             && let Some((name, complete)) = self.inspector_heading(index)
         {
-            lines.extend(markdown::wrap_markdown_spans(&[
-                Span::styled(
-                    "  Action details",
-                    Style::default()
-                        .fg(BORG_ORANGE)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!(
-                        " · {name} · {}",
-                        if complete { "complete" } else { "live" }
+            lines.extend(markdown::wrap_markdown_spans(
+                &[
+                    Span::styled(
+                        "  Action details",
+                        Style::default()
+                            .fg(BORG_ORANGE)
+                            .add_modifier(Modifier::BOLD),
                     ),
-                    Style::default().fg(Color::Gray),
-                ),
-                Span::styled(" · Esc to return", Style::default().fg(Color::DarkGray)),
-            ], width));
+                    Span::styled(
+                        format!(" · {name} · {}", if complete { "complete" } else { "live" }),
+                        Style::default().fg(Color::Gray),
+                    ),
+                    Span::styled(" · Esc to return", Style::default().fg(Color::DarkGray)),
+                ],
+                width,
+            ));
             lines.push(Line::default());
         }
         for (index, entry) in self.order.iter().enumerate() {
@@ -3907,7 +3920,9 @@ impl Transcript {
                     } else {
                         format!("{time}  {glyph} {label}  {detail}")
                     };
-                    if focused_tool.is_none() && body.as_deref().is_some_and(|body| !body.trim().is_empty()) {
+                    if focused_tool.is_none()
+                        && body.as_deref().is_some_and(|body| !body.trim().is_empty())
+                    {
                         summary.push_str(if *expanded {
                             " · click to collapse"
                         } else {
@@ -3973,7 +3988,9 @@ impl Transcript {
                         ),
                     ]));
                     let display_items = ordered_plan_items(items);
-                    let clipped = !*expanded && focused_tool != Some(index) && items.len() > MAX_COLLAPSED_PLAN_ITEMS;
+                    let clipped = !*expanded
+                        && focused_tool != Some(index)
+                        && items.len() > MAX_COLLAPSED_PLAN_ITEMS;
                     let display_limit = if clipped {
                         MAX_COLLAPSED_PLAN_ITEMS
                     } else {
@@ -4154,7 +4171,11 @@ impl Transcript {
                     };
                     lines.push(Line::from(vec![
                         Span::styled(
-                            if focused_tool == Some(index) { "▌ Compacted context".to_string() } else { format!("▌ {}", compact_text(summary, 180)) },
+                            if focused_tool == Some(index) {
+                                "▌ Compacted context".to_string()
+                            } else {
+                                format!("▌ {}", compact_text(summary, 180))
+                            },
                             Style::default()
                                 .fg(BORG_ORANGE)
                                 .add_modifier(Modifier::BOLD),
@@ -4366,7 +4387,12 @@ impl Transcript {
                             "  │ "
                         };
                         if focused_tool == Some(index) {
-                            lines.extend(rendering::tool_detail_lines(language, source, width, body_prefix));
+                            lines.extend(rendering::tool_detail_lines(
+                                language,
+                                source,
+                                width,
+                                body_prefix,
+                            ));
                         } else if *complete {
                             let key = (index, width, false, tool_window.is_some());
                             let mut cache = self.tool_body_cache.borrow_mut();
@@ -4423,7 +4449,12 @@ impl Transcript {
                             "  │ "
                         };
                         if focused_tool == Some(index) {
-                            lines.extend(rendering::tool_detail_lines(language, source, width, body_prefix));
+                            lines.extend(rendering::tool_detail_lines(
+                                language,
+                                source,
+                                width,
+                                body_prefix,
+                            ));
                         } else if *complete {
                             let key = (index, width, true, tool_window.is_some());
                             let mut cache = self.tool_body_cache.borrow_mut();
