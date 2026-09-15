@@ -5079,10 +5079,10 @@ async fn run_local_agent_session(
                                     .to_string(),
                             );
                         } else {
-                            // Both flows need a plain terminal: the subscription
-                            // sign-in runs the provider's own device flow, and the
-                            // key prompt reads from stdin with echo disabled.
-                            shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+                            let interactive = provider_auth_requires_terminal(target, choice);
+                            if interactive {
+                                shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
+                            }
                             let outcome = authenticate_provider(target, choice).await;
                             if outcome.is_ok() {
                                 // Authentication changes are part of the
@@ -5092,48 +5092,51 @@ async fn run_local_agent_session(
                                 // credential context.
                                 lifecycle_executor.stop_session(session_id).await?;
                             }
-                            let latest_state = store.state(session_id).await?;
-                            let latest = recent_tui_history(
-                                store.as_ref(),
-                                session_id,
-                                latest_state.latest_sequence,
-                            )
-                            .await?;
-                            let mut restored = BorgTerminal::enter(
-                                &sessions_dir,
-                                session_id,
-                                cwd.clone(),
-                                &agent_config.keybindings,
-                            )?;
-                            restored.set_dictation_icon(dictation_icon_style_for_preference(
-                                editor_preferences.presentation.dictation_icon,
-                            ));
-                            restored.set_active_message_behavior(steer_active_turn);
-                            restored.set_configured_model_entries(agent_config.configured_model_entries());
-                            restored.set_extension_commands(extension_catalog.api_snapshot().commands);
-                            let composer_history = store
-                                .recent_user_messages(session_id, RICH_TUI_PROMPT_HISTORY_LIMIT)
+                            if interactive {
+                                let latest_state = store.state(session_id).await?;
+                                let latest = recent_tui_history(
+                                    store.as_ref(),
+                                    session_id,
+                                    latest_state.latest_sequence,
+                                )
                                 .await?;
-                            restored.seed_composer_history(&composer_history);
-                            restored.seed_history(&latest.events);
-                            let (_, agents, histories) = load_subagent_thread_state(
-                                store.as_ref(),
-                                &sessions_dir,
-                                session_id,
-                            )
-                            .await?;
-                            seed_terminal_subagent_threads(&mut restored, &agents, &histories);
-                            restored.seed_session_state(&latest_state);
-                            let active = restored.session_provider().unwrap_or(provider);
-                            restored.set_notice(match &outcome {
+                                let mut restored = BorgTerminal::enter(
+                                    &sessions_dir,
+                                    session_id,
+                                    cwd.clone(),
+                                    &agent_config.keybindings,
+                                )?;
+                                restored.set_dictation_icon(dictation_icon_style_for_preference(
+                                    editor_preferences.presentation.dictation_icon,
+                                ));
+                                restored.set_active_message_behavior(steer_active_turn);
+                                restored.set_configured_model_entries(agent_config.configured_model_entries());
+                                restored.set_extension_commands(extension_catalog.api_snapshot().commands);
+                                let composer_history = store
+                                    .recent_user_messages(session_id, RICH_TUI_PROMPT_HISTORY_LIMIT)
+                                    .await?;
+                                restored.seed_composer_history(&composer_history);
+                                restored.seed_history(&latest.events);
+                                let (_, agents, histories) = load_subagent_thread_state(
+                                    store.as_ref(),
+                                    &sessions_dir,
+                                    session_id,
+                                )
+                                .await?;
+                                seed_terminal_subagent_threads(&mut restored, &agents, &histories);
+                                restored.seed_session_state(&latest_state);
+                                terminal = Some(restored);
+                                crash_context.tui_active.store(true, Ordering::Release);
+                            }
+                            let terminal = terminal.as_mut().expect("terminal");
+                            let active = terminal.session_provider().unwrap_or(provider);
+                            terminal.set_notice(match &outcome {
                                 Ok(message) => message.clone(),
                                 Err(error) => format!("Provider not connected: {error:#}"),
                             });
-                            terminal = Some(restored);
-                            crash_context.tui_active.store(true, Ordering::Release);
                             if outcome.is_ok() {
                                 if target == CodingProvider::OpenCode && !model.starts_with("opencode-go/") {
-                                    terminal.as_mut().expect("terminal").open_model_picker();
+                                    terminal.open_model_picker();
                                 } else {
                                     dispatch_ui_command(
                                         &ui_interaction_tx,
@@ -7467,6 +7470,26 @@ fn prompt_and_store_api_key(provider: CodingProvider) -> Result<PathBuf> {
     borg_provider::credentials::store_api_key(credential, &key)
 }
 
+fn provider_auth_requires_terminal(provider: CodingProvider, choice: ProviderAuthChoice) -> bool {
+    use borg_provider::credentials;
+    match choice {
+        ProviderAuthChoice::ReplaceApiKey | ProviderAuthChoice::ReconnectSubscription => true,
+        ProviderAuthChoice::ApiKey => match provider {
+            CodingProvider::Codex => credentials::openai_api_key().is_none(),
+            CodingProvider::OpenCode => credentials::opencode_go_api_key().is_none(),
+            _ => true,
+        },
+        ProviderAuthChoice::Subscription => {
+            provider != CodingProvider::Codex
+                || !credentials::codex_auth_json().is_some_and(|auth| {
+                    auth["tokens"]["access_token"]
+                        .as_str()
+                        .is_some_and(|token| !token.is_empty())
+                })
+        }
+    }
+}
+
 async fn authenticate_provider(
     provider: CodingProvider,
     choice: ProviderAuthChoice,
@@ -7477,12 +7500,7 @@ async fn authenticate_provider(
         ProviderAuthChoice::ApiKey | ProviderAuthChoice::ReplaceApiKey
     );
     if api {
-        let saved = match provider {
-            CodingProvider::Codex => credentials::openai_api_key().is_some(),
-            CodingProvider::OpenCode => credentials::opencode_go_api_key().is_some(),
-            _ => false,
-        };
-        if !saved || choice == ProviderAuthChoice::ReplaceApiKey {
+        if provider_auth_requires_terminal(provider, choice) {
             prompt_and_store_api_key(provider)?;
         }
         if provider == CodingProvider::Codex {
@@ -7506,13 +7524,7 @@ async fn authenticate_provider(
         }
         return Ok(format!("{} API key saved.", provider.label()));
     }
-    let saved_subscription = provider == CodingProvider::Codex
-        && credentials::codex_auth_json().is_some_and(|auth| {
-            auth["tokens"]["access_token"]
-                .as_str()
-                .is_some_and(|token| !token.is_empty())
-        });
-    if !saved_subscription || choice == ProviderAuthChoice::ReconnectSubscription {
+    if provider_auth_requires_terminal(provider, choice) {
         if provider == CodingProvider::Codex
             && credentials::stored_api_key(credentials::ApiKeyCredential::OpenAi).is_none()
             && let Some(key) = credentials::codex_auth_json()

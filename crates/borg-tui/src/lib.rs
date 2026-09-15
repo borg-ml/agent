@@ -2419,7 +2419,7 @@ fn model_picker_options_with_configured(
     let go_models = borg_provider::opencode_go_model_entries();
     if go_models.is_empty() {
         let mut option = PickerOption::new("Connect OpenCode Go…", "/connect-go");
-        option.section = Some("OpenCode Go · subscription".to_string());
+        option.section = Some("OpenCode Go".to_string());
         option.preview =
             Some("Add your Go subscription key and load the available models.".to_string());
         options.push(option);
@@ -2432,7 +2432,7 @@ fn model_picker_options_with_configured(
         let mut option = PickerOption::new(model.label, model.id);
         option.preview = model.detail;
         if first_go {
-            option.section = Some("OpenCode Go · subscription".to_string());
+            option.section = Some("OpenCode Go".to_string());
             first_go = false;
         }
         options.push(option);
