@@ -35,6 +35,28 @@ human has confirmed that exact action and the call repeats with `confirmed: true
 (`cua.click(..., confirmed=True)` / `cua.click(..., {confirmed: true})`). Tool
 approval alone never satisfies this gate.
 
+### Input injection contract (all platforms)
+
+`type_text {window_id, text}`, `key {window_id, keys}` (one key plus
+cmd/ctrl/alt/shift, e.g. `ctrl+shift+t`), `pointer_click {window_id,
+element_id+observation_id | x,y, button?, count?}`, `scroll {window_id,
+element_id+observation_id | x,y, dx, dy}` (positive `dy` scrolls content down;
+units reported in the result) and `drag {window_id, from_x, from_y, to_x, to_y,
+button?}`. Every injection raises/focuses the target window — acceptable only
+because each op is approval-gated — consumes that window's observation and
+returns the settled tree. Semantic `click`/`set_value` remain the preferred,
+name-gated way to act on an element; injected ops exist for coordinate space and
+for keys, scrolling and dragging that accessibility actions cannot express.
+Raw `x,y` targets are in screenshot/screen pixel space (Linux, Windows) or AX
+screen points (macOS) and are flagged `coordinate_click: true`; they bypass
+name-based confirmation gating because no element is named.
+
+Linux caveat: AT-SPI extents on GTK Wayland are window-relative and the
+compositor may not expose the window origin, so element-targeted
+`pointer_click`/`scroll` return a clear error there instead of guessing; use
+`click`/`set_value` or a raw coordinate read from a desktop screenshot. The
+Linux backend is a Borg-owned evdev uinput device plus `wtype` (no `ydotool`).
+
 Python code mode: `cua.capabilities()`, `cua.list_windows()`,
 `cua.observe(window_id)`, `cua.screenshot("desktop")`,
 `cua.click(window_id, element_id, observation_id)`, and
