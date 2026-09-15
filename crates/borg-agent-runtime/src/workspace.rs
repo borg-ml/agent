@@ -470,7 +470,7 @@ impl SqliteWorkspaceStore {
             sqlx::query_scalar("select version from borg_workspace_schema where id=1")
                 .fetch_optional(&self.pool)
                 .await?;
-        if version != Some(WORKSPACE_SCHEMA_VERSION) {
+        if version.is_none_or(|version| version < WORKSPACE_SCHEMA_VERSION) {
             return Ok(false);
         }
         let has_pending_message_index: i64 = sqlx::query_scalar(
@@ -1193,12 +1193,13 @@ impl SqliteWorkspaceStore {
             sqlx::query_scalar("select version from borg_workspace_schema where id=1")
                 .fetch_optional(&mut *transaction)
                 .await?;
-        ensure!(
-            version.is_none_or(|version| version <= WORKSPACE_SCHEMA_VERSION),
-            "workspace database schema version {} was written by a newer Borg; expected {WORKSPACE_SCHEMA_VERSION}",
-            version.unwrap_or_default()
-        );
-        if version != Some(WORKSPACE_SCHEMA_VERSION) {
+        if let Some(version) = version.filter(|version| *version > WORKSPACE_SCHEMA_VERSION) {
+            tracing::warn!(
+                version,
+                "using a newer additive workspace schema without downgrading it"
+            );
+        }
+        if version.is_none_or(|version| version < WORKSPACE_SCHEMA_VERSION) {
             // Additive migration: the batch above created any new tables and
             // indexes; add the columns an older layout lacks.
             let added = crate::schema_migration::add_missing_columns(
@@ -1231,7 +1232,7 @@ impl SqliteWorkspaceStore {
             "workspace database is stale: workspace_deliveries.is_message is missing; recreate or explicitly export/import this database"
         );
         match version {
-            Some(WORKSPACE_SCHEMA_VERSION) => {}
+            Some(version) if version >= WORKSPACE_SCHEMA_VERSION => {}
             Some(_) => {
                 sqlx::query("update borg_workspace_schema set version=? where id=1")
                     .bind(WORKSPACE_SCHEMA_VERSION)
@@ -2721,6 +2722,64 @@ mod tests {
             .expect("attaching to a current workspace schema blocked on the SQLite writer lock");
         attached.unwrap();
         writer.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn newer_additive_workspace_schema_preserves_version_and_data() {
+        let (store, workspace, _, _, _) = fixture().await;
+        let future = WORKSPACE_SCHEMA_VERSION + 1;
+        sqlx::query("update borg_workspace_schema set version=? where id=1")
+            .bind(future)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("alter table workspaces add column future_payload text")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query("update workspaces set future_payload=? where id=?")
+            .bind("keep me")
+            .bind(workspace.id.to_string())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        store.schema().await.unwrap();
+        let writer = crate::SqliteSessionStore::begin_sqlite_write(store.pool())
+            .await
+            .unwrap();
+        let attached = tokio::time::timeout(
+            Duration::from_secs(5),
+            SqliteWorkspaceStore::from_pool(store.pool().clone()),
+        )
+        .await
+        .expect("newer additive schema must attach without taking the writer")
+        .unwrap();
+        writer.rollback().await.unwrap();
+        attached
+            .create_workspace(Workspace {
+                id: Uuid::new_v4(),
+                name: "new workspace".into(),
+                created_at: Utc::now(),
+            })
+            .await
+            .unwrap();
+        let version: i64 =
+            sqlx::query_scalar("select version from borg_workspace_schema where id=1")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        let payload: String =
+            sqlx::query_scalar("select future_payload from workspaces where id=?")
+                .bind(workspace.id.to_string())
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(version, future);
+        assert_eq!(payload, "keep me");
+        assert_eq!(
+            attached.workspace_name(workspace.id).await.unwrap(),
+            Some(workspace.name)
+        );
     }
 
     #[tokio::test]

@@ -440,6 +440,8 @@ pub struct SqliteAutonomyStore {
 
 impl SqliteAutonomyStore {
     /// Create the autonomy tables and return a store over `pool`.
+    /// Wildcard reads below are uncached: additive migrations can change their
+    /// result columns while an older owner keeps this pool open.
     pub async fn open(pool: SqlitePool) -> Result<Self> {
         let store = Self { pool };
         store.ensure_schema().await?;
@@ -462,6 +464,7 @@ impl SqliteAutonomyStore {
         let mut tx = crate::SqliteSessionStore::begin_sqlite_write(&self.pool).await?;
 
         if let Some(row) = sqlx::query("select * from autonomy_jobs where idempotency_key=?")
+            .persistent(false)
             .bind(&input.idempotency_key)
             .fetch_optional(&mut *tx)
             .await?
@@ -522,6 +525,7 @@ impl SqliteAutonomyStore {
     /// Read one job for inspection or an authorized runtime worker.
     pub async fn get(&self, job_id: Uuid) -> Result<Option<AutonomyJob>> {
         let row = sqlx::query("select * from autonomy_jobs where job_id=?")
+            .persistent(false)
             .bind(job_id.to_string())
             .fetch_optional(&self.pool)
             .await?;
@@ -967,6 +971,7 @@ impl SqliteAutonomyStore {
 
         if let Some(row) =
             sqlx::query("select * from autonomy_checkpoints where job_id=? and checkpoint_key=?")
+                .persistent(false)
                 .bind(input.job_id.to_string())
                 .bind(&input.checkpoint_key)
                 .fetch_optional(&mut *tx)
@@ -1012,6 +1017,7 @@ impl SqliteAutonomyStore {
             "select * from autonomy_checkpoints where job_id=? \
              order by created_at_ms asc, checkpoint_id asc limit ?",
         )
+        .persistent(false)
         .bind(job_id.to_string())
         .bind(i64::from(MAX_CHECKPOINTS_PER_LIST))
         .fetch_all(&self.pool)
@@ -1024,6 +1030,7 @@ impl SqliteAutonomyStore {
         let rows = sqlx::query(
             "select * from autonomy_job_transitions where job_id=? order by sequence asc",
         )
+        .persistent(false)
         .bind(job_id.to_string())
         .fetch_all(&self.pool)
         .await?;
@@ -1039,12 +1046,13 @@ impl SqliteAutonomyStore {
             sqlx::query_scalar("select version from borg_autonomy_schema where id=1")
                 .fetch_optional(&self.pool)
                 .await?;
-        ensure!(
-            version.is_none_or(|version| version <= AUTONOMY_SCHEMA_VERSION),
-            "autonomy database schema version {} was written by a newer Borg; expected {AUTONOMY_SCHEMA_VERSION}",
-            version.unwrap_or_default()
-        );
-        if version != Some(AUTONOMY_SCHEMA_VERSION) {
+        if let Some(version) = version.filter(|version| *version > AUTONOMY_SCHEMA_VERSION) {
+            tracing::warn!(
+                version,
+                "using a newer additive autonomy schema without downgrading it"
+            );
+        }
+        if version.is_none_or(|version| version < AUTONOMY_SCHEMA_VERSION) {
             let mut connection = self.pool.acquire().await?;
             let added = crate::schema_migration::add_missing_columns(
                 &mut connection,
@@ -1076,7 +1084,7 @@ impl SqliteAutonomyStore {
             "autonomy database is stale: autonomy_jobs.result_json is missing; recreate or explicitly export/import this database"
         );
         match version {
-            Some(AUTONOMY_SCHEMA_VERSION) => {}
+            Some(version) if version >= AUTONOMY_SCHEMA_VERSION => {}
             Some(_) => {
                 sqlx::query("update borg_autonomy_schema set version=? where id=1")
                     .bind(AUTONOMY_SCHEMA_VERSION)
@@ -1143,6 +1151,7 @@ async fn append_transition(
 
 async fn load_job(tx: &mut Transaction<'_, Sqlite>, job_id: Uuid) -> Result<AutonomyJob> {
     let row = sqlx::query("select * from autonomy_jobs where job_id=?")
+        .persistent(false)
         .bind(job_id.to_string())
         .fetch_optional(&mut **tx)
         .await?
@@ -1155,6 +1164,7 @@ async fn load_checkpoint(
     checkpoint_id: Uuid,
 ) -> Result<AutonomyCheckpoint> {
     let row = sqlx::query("select * from autonomy_checkpoints where checkpoint_id=?")
+        .persistent(false)
         .bind(checkpoint_id.to_string())
         .fetch_one(&mut **tx)
         .await?;
@@ -1397,6 +1407,48 @@ mod tests {
         async fn execute(&self, job: AutonomyJob) -> Result<Value> {
             Ok(serde_json::json!({"job_id": job.job_id, "kind": job.kind}))
         }
+    }
+
+    #[tokio::test]
+    async fn newer_additive_autonomy_schema_preserves_version_and_data() {
+        let store = store().await;
+        let input = enqueue("future-schema", at(1_700_000_000), 2);
+        let job = store.enqueue(input.clone()).await.unwrap();
+        let future = AUTONOMY_SCHEMA_VERSION + 1;
+        sqlx::query("update borg_autonomy_schema set version=? where id=1")
+            .bind(future)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("alter table autonomy_jobs add column future_payload text")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        sqlx::query("update autonomy_jobs set future_payload=? where job_id=?")
+            .bind("keep me")
+            .bind(job.job_id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        let attached = SqliteAutonomyStore::open(store.pool.clone()).await.unwrap();
+        assert_eq!(attached.enqueue(input).await.unwrap().job_id, job.job_id);
+        attached
+            .enqueue(enqueue("new-job", at(1_700_000_001), 2))
+            .await
+            .unwrap();
+        let version: i64 =
+            sqlx::query_scalar("select version from borg_autonomy_schema where id=1")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        let payload: String =
+            sqlx::query_scalar("select future_payload from autonomy_jobs where job_id=?")
+                .bind(job.job_id.to_string())
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(version, future);
+        assert_eq!(payload, "keep me");
     }
 
     #[tokio::test]
