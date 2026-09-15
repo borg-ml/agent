@@ -1259,6 +1259,8 @@ impl Transcript {
                 context_tokens,
                 context_window_tokens,
             } => {
+                self.cache_diagnostics
+                    .update_context_tokens(*context_tokens);
                 self.context_known = true;
                 self.context_tokens = Some(*context_tokens);
                 self.context_window_tokens = Some(*context_window_tokens);

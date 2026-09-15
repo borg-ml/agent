@@ -55,7 +55,7 @@ pub(super) struct CacheDiagnostics {
 
 struct PromptSnapshot {
     prompt_tokens: u64,
-    reusable_context_tokens: u64,
+    reusable_context_tokens: Option<u64>,
     at: DateTime<Utc>,
     signature: CacheSignature,
     cache_telemetry_available: bool,
@@ -189,15 +189,18 @@ impl CacheDiagnostics {
             // A provider turn can contain several model/tool-loop calls. Its
             // processed-token total grows once per call and can be many times
             // larger than the context that a cold request would resend.
-            reusable_context_tokens: usage
-                .context_tokens
-                .filter(|tokens| *tokens > 0)
-                .unwrap_or(prompt_tokens),
+            reusable_context_tokens: usage.context_tokens,
             at,
             signature,
             cache_telemetry_available,
         });
         notice
+    }
+
+    pub(super) fn update_context_tokens(&mut self, tokens: u64) {
+        if let Some(previous) = self.previous.as_mut() {
+            previous.reusable_context_tokens = Some(tokens);
+        }
     }
 
     pub(super) fn status(
@@ -422,11 +425,11 @@ fn cache_hit_percent(cached_tokens: u64, prompt_tokens: u64) -> u8 {
     percent as u8
 }
 
-fn warning_status(label: impl Into<String>, resend_tokens: u64) -> CacheStatus {
+fn warning_status(label: impl Into<String>, resend_tokens: Option<u64>) -> CacheStatus {
     CacheStatus {
         label: label.into(),
         warning: true,
-        resend_tokens: Some(resend_tokens),
+        resend_tokens,
     }
 }
 
@@ -618,11 +621,9 @@ mod tests {
     fn measured_zero_hit_does_not_predict_another_cold_turn() {
         let mut diagnostics = CacheDiagnostics::default();
         let at = Utc::now();
-        diagnostics.observe(
-            at,
-            signature("gpt-5.6-sol", "high"),
-            usage_with_cache_creation(1_000, 49_000, 50_000),
-        );
+        let mut measured = usage_with_cache_creation(1_000, 49_000, 50_000);
+        measured.context_tokens = Some(100_000);
+        diagnostics.observe(at, signature("gpt-5.6-sol", "high"), measured);
         diagnostics.observe(
             at + TimeDelta::minutes(1),
             signature("gpt-5.6-sol", "high"),
@@ -643,11 +644,9 @@ mod tests {
     fn cold_cache_guidance_includes_resend_token_count() {
         let mut diagnostics = CacheDiagnostics::default();
         let at = Utc::now();
-        diagnostics.observe(
-            at,
-            signature("gpt-5.6-sol", "high"),
-            usage_with_cache_creation(1_000, 49_000, 50_000),
-        );
+        let mut measured = usage_with_cache_creation(1_000, 49_000, 50_000);
+        measured.context_tokens = Some(100_000);
+        diagnostics.observe(at, signature("gpt-5.6-sol", "high"), measured);
 
         let status = diagnostics
             .status(at, &signature("gpt-5.6-sol", "low"))
@@ -674,6 +673,31 @@ mod tests {
         let guidance = status.cold_cache_guidance();
         assert!(guidance.contains("100.0k tokens"), "{guidance}");
         assert!(!guidance.contains("800.0k tokens"), "{guidance}");
+    }
+
+    #[test]
+    fn resend_size_is_unknown_without_context_and_tracks_compaction() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        diagnostics.observe(
+            at,
+            signature("gpt-5.6-sol", "high"),
+            usage(1_200_000, 1_000_000),
+        );
+        let changed = signature("gpt-5.6-sol", "low");
+        let status = diagnostics.status(at, &changed).unwrap();
+        assert_eq!(status.resend_tokens, None);
+        assert!(!status.cold_cache_guidance().contains("2.2m"));
+        diagnostics.update_context_tokens(80_000);
+        assert_eq!(
+            diagnostics.status(at, &changed).unwrap().resend_tokens,
+            Some(80_000)
+        );
+        diagnostics.update_context_tokens(12_000);
+        assert_eq!(
+            diagnostics.status(at, &changed).unwrap().resend_tokens,
+            Some(12_000)
+        );
     }
 
     #[test]
