@@ -3577,12 +3577,26 @@ async fn run_agent_session_store_kernel(
                             provider_session_id: None,
                             final_text: String::new(),
                         })
+                    } else if interrupted && result.as_ref().err().is_some_and(|error| {
+                        provider_error_is_expected_interrupt(launch.provider, &format!("{error:#}"))
+                    }) {
+                        Ok(crate::AgentTurnResult {
+                            provider_session_id: None,
+                            final_text: String::new(),
+                        })
                     } else {
                         result
                     };
                     while let Ok(kind) = provider_events.try_recv() {
                         let Some(kind) = generation.observe(kind, tokio::time::Instant::now()) else { continue; };
                         if is_executor_lifecycle_status(&kind) {
+                            continue;
+                        }
+                        if interrupted && matches!(
+                            &kind,
+                            SessionEventKind::Error { message }
+                                if provider_error_is_expected_interrupt(launch.provider, message)
+                        ) {
                             continue;
                         }
                         if matches!(
@@ -3991,6 +4005,13 @@ async fn run_agent_session_store_kernel(
                         if executor_reports_provider_drained(&kind) {
                             watchdog.set_phase(TurnPhase::Draining);
                         }
+                        continue;
+                    }
+                    if interrupted && matches!(
+                        &kind,
+                        SessionEventKind::Error { message }
+                            if provider_error_is_expected_interrupt(launch.provider, message)
+                    ) {
                         continue;
                     }
                     if matches!(
@@ -8445,6 +8466,15 @@ async fn cancel_connection_retry(
         .await?;
     }
     Ok(())
+}
+
+fn provider_error_is_expected_interrupt(provider: CodingProvider, error: &str) -> bool {
+    // The generic subtype has no failure detail. Only accept it after a Borg
+    // interrupt; detailed execution failures must remain visible.
+    provider == CodingProvider::Claude
+        && (error == "claude SDK error_during_execution: claude SDK returned subtype=error_during_execution"
+            || error.contains(r#""terminal_reason":"aborted_streaming""#)
+            || error.contains(r#""terminal_reason":"aborted_tools""#))
 }
 
 fn provider_error_is_auth_lookup_unavailable(error: &str) -> bool {

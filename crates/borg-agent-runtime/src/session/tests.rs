@@ -1501,6 +1501,7 @@ impl AgentTurnExecutor for OversizedCompactionExecutor {
 }
 
 struct InterruptibleQueueExecutor {
+    abort_error: Option<&'static str>,
     seen: RecordedPromptTurns,
     provider_sessions: Arc<Mutex<Vec<Option<String>>>>,
     called: Arc<Notify>,
@@ -1752,7 +1753,7 @@ impl AgentTurnExecutor for InterruptibleQueueExecutor {
     async fn execute(
         &self,
         turn: AgentTurn,
-        _events: mpsc::Sender<SessionEventKind>,
+        events: mpsc::Sender<SessionEventKind>,
         controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
         self.seen
@@ -1770,6 +1771,15 @@ impl AgentTurnExecutor for InterruptibleQueueExecutor {
                 controls.recv().await,
                 Some(AgentTurnControl::Interrupt) | None
             ) {}
+            if let Some(error) = self.abort_error {
+                events
+                    .send(SessionEventKind::Error {
+                        message: error.to_string(),
+                    })
+                    .await
+                    .unwrap();
+                anyhow::bail!(error);
+            }
         }
         Ok(AgentTurnResult {
             provider_session_id: Some("provider-session".to_string()),
@@ -3654,15 +3664,44 @@ async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() 
 
 #[tokio::test]
 async fn interrupted_turn_reaches_fifo_drain_boundary() {
+    assert_interrupted_fifo(CodingProvider::Codex, None, true).await;
+}
+
+#[tokio::test]
+async fn claude_interrupt_preserves_queue_and_only_normalizes_expected_aborts() {
+    for (error, expected) in [
+        (
+            "claude SDK error_during_execution: claude SDK returned subtype=error_during_execution",
+            true,
+        ),
+        (
+            r#"claude SDK error_during_execution: stopped "terminal_reason":"aborted_tools""#,
+            true,
+        ),
+        (
+            "claude SDK error_during_execution: permission denied",
+            false,
+        ),
+    ] {
+        assert_interrupted_fifo(CodingProvider::Claude, Some(error), expected).await;
+    }
+}
+
+async fn assert_interrupted_fifo(
+    provider: CodingProvider,
+    abort_error: Option<&'static str>,
+    expected_interrupt: bool,
+) {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
-    let (event_tx, mut event_rx) = mpsc::channel(32);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
     let seen = Arc::new(Mutex::new(Vec::new()));
     let provider_sessions = Arc::new(Mutex::new(Vec::new()));
     let called = Arc::new(Notify::new());
     let executor = Arc::new(InterruptibleQueueExecutor {
+        abort_error,
         seen: Arc::clone(&seen),
         provider_sessions: Arc::clone(&provider_sessions),
         called: Arc::clone(&called),
@@ -3674,7 +3713,7 @@ async fn interrupted_turn_reaches_fifo_drain_boundary() {
             LaunchSession {
                 request_id: Uuid::new_v4(),
                 cwd: root.path().to_path_buf(),
-                provider: CodingProvider::Codex,
+                provider,
                 model: None,
                 effort: None,
                 fast: Some(false),
@@ -3732,18 +3771,30 @@ async fn interrupted_turn_reaches_fifo_drain_boundary() {
     actor.await.unwrap().unwrap();
 
     let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
-    assert!(events.iter().any(|event| matches!(
-        &event.kind,
-        SessionEventKind::TurnCompleted {
-            error: Some(error),
-            ..
-        } if error == "turn interrupted"
-    )));
+    assert_eq!(
+        events.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TurnCompleted {
+                error: Some(error),
+                ..
+            } if error == "turn interrupted"
+        )),
+        expected_interrupt
+    );
     assert!(!events.iter().any(|event| matches!(
         &event.kind,
         SessionEventKind::Error { message }
             if message.contains("provider completed without a visible response")
     )));
+
+    if let Some(error) = abort_error {
+        assert_eq!(
+            events.iter().any(|event| matches!(
+                &event.kind, SessionEventKind::Error { message } if message == error
+            )),
+            !expected_interrupt
+        );
+    }
 
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 2);
@@ -3754,23 +3805,34 @@ async fn interrupted_turn_reaches_fifo_drain_boundary() {
                 Vec::new()
             )
         );
-    assert_eq!(
-        seen[1].0,
-        format_subscription_frame(&format_subscription_actor_value(
-            EventActor::User,
-            "second [Image 1]\n\nthird"
-        ))
-    );
+    if provider == CodingProvider::Codex {
+        assert_eq!(
+            seen[1].0,
+            format_subscription_frame(&format_subscription_actor_value(
+                EventActor::User,
+                "second [Image 1]\n\nthird"
+            ))
+        );
+    } else {
+        assert!(subscription_prompt_ends_with(
+            &seen[1].0,
+            "second [Image 1]
+
+third"
+        ));
+    }
     assert_eq!(
         seen[1].1,
         [PathBuf::from("/tmp/queued-image.png")],
         "queued image attachments must stay on their FIFO prompt"
     );
-    assert_eq!(
-        provider_sessions.lock().unwrap().as_slice(),
-        [None, Some("provider-session".to_string())],
-        "interrupting a Codex turn must preserve its provider thread"
-    );
+    if provider == CodingProvider::Codex {
+        assert_eq!(
+            provider_sessions.lock().unwrap().as_slice(),
+            [None, Some("provider-session".to_string())],
+            "interrupting a Codex turn must preserve its provider thread"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3784,6 +3846,7 @@ async fn user_stop_gate_holds_background_turns_until_a_human_prompt() {
     let provider_sessions = Arc::new(Mutex::new(Vec::new()));
     let called = Arc::new(Notify::new());
     let executor = Arc::new(InterruptibleQueueExecutor {
+        abort_error: None,
         seen: Arc::clone(&seen),
         provider_sessions: Arc::clone(&provider_sessions),
         called: Arc::clone(&called),
@@ -4027,6 +4090,7 @@ async fn user_stop_gate_is_re_engaged_from_durable_state_after_actor_restart() {
     let provider_sessions = Arc::new(Mutex::new(Vec::new()));
     let called = Arc::new(Notify::new());
     let executor = Arc::new(InterruptibleQueueExecutor {
+        abort_error: None,
         seen: Arc::clone(&seen),
         provider_sessions: Arc::clone(&provider_sessions),
         called: Arc::clone(&called),
