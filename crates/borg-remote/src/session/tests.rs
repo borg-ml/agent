@@ -1427,10 +1427,7 @@ impl AgentTurnExecutor for UsageLimitThenSuccessExecutor {
         events: mpsc::Sender<SessionEventKind>,
         _controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
-        self.prompts
-            .lock()
-            .unwrap()
-            .push(turn.prompt.clone());
+        self.prompts.lock().unwrap().push(turn.prompt.clone());
         if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
             if self.side_effects_before_limit {
                 let _ = events
@@ -2186,7 +2183,9 @@ async fn usage_limit_after_side_effects_continues_instead_of_replaying_the_promp
             .expect("continuation turn completes")
         else {
             let result = actor.await.unwrap();
-            panic!("session exited early after {completions} completion(s): {result:?}; statuses {user_statuses:?}");
+            panic!(
+                "session exited early after {completions} completion(s): {result:?}; statuses {user_statuses:?}"
+            );
         };
         match &event.kind {
             SessionEventKind::Message {
@@ -7240,9 +7239,16 @@ async fn inactive_team_reports_settle_without_starting_a_provider_turn() {
         batch: Vec::new(),
     }]);
 
-    settle_inactive_team_notifications(&mut runtime, &event_tx, session_id, &mut pending, false, None)
-        .await
-        .unwrap();
+    settle_inactive_team_notifications(
+        &mut runtime,
+        &event_tx,
+        session_id,
+        &mut pending,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert!(pending.is_empty());
     let event = event_rx.recv().await.unwrap();
@@ -7283,9 +7289,16 @@ async fn inactive_wake_report_is_retained_for_the_root_provider_turn() {
         batch: Vec::new(),
     }]);
 
-    settle_inactive_team_notifications(&mut runtime, &event_tx, session_id, &mut pending, false, None)
-        .await
-        .unwrap();
+    settle_inactive_team_notifications(
+        &mut runtime,
+        &event_tx,
+        session_id,
+        &mut pending,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].message_id, message_id);
