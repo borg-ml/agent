@@ -92,10 +92,10 @@ pub(crate) const PROVIDER_CONTEXT_CONTRACT_VERSION: u32 = 1;
 
 const MAX_RESIDENT_CODEX_SUBSCRIPTION_POOLS: usize = 4;
 
-fn provider_native_agent_tool(name: &str) -> bool {
+fn provider_native_orchestration_tool(name: &str) -> bool {
     matches!(
         name,
-        "subAgentActivity" | "collabAgentToolCall" | "Agent" | "Task"
+        "subAgentActivity" | "collabAgentToolCall" | "Agent" | "Task" | "Watch"
     )
 }
 
@@ -1884,7 +1884,7 @@ async fn run_borg_provider_turn(
             }
             ChatStreamEvent::ToolCall { id, name, input } => {
                 anyhow::ensure!(
-                    !provider_native_agent_tool(&name),
+                    !provider_native_orchestration_tool(&name),
                     "{:?} exposed a forbidden provider-native agent tool: {name}",
                     turn.provider
                 );
@@ -2592,9 +2592,15 @@ mod tests {
 
     #[test]
     fn provider_native_delegation_tools_are_rejected() {
-        assert!(provider_native_agent_tool("subAgentActivity"));
-        assert!(provider_native_agent_tool("collabAgentToolCall"));
-        assert!(!provider_native_agent_tool("mcp__borg_agent__spawn_agent"));
+        assert!(provider_native_orchestration_tool("subAgentActivity"));
+        assert!(provider_native_orchestration_tool("collabAgentToolCall"));
+        assert!(provider_native_orchestration_tool("Watch"));
+        assert!(!provider_native_orchestration_tool(
+            "mcp__borg_agent__watch"
+        ));
+        assert!(!provider_native_orchestration_tool(
+            "mcp__borg_agent__spawn_agent"
+        ));
     }
 
     #[test]
