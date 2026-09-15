@@ -1349,7 +1349,7 @@ pub async fn run_agent_session_with_store_and_writer_and_lsp_policy(
         "fast mode is not supported by the {:?} transport",
         launch.provider
     );
-    run_agent_session_store_kernel(
+    Box::pin(run_agent_session_store_kernel(
         session_root,
         session_id,
         launch,
@@ -1360,7 +1360,7 @@ pub async fn run_agent_session_with_store_and_writer_and_lsp_policy(
         lsp_policy,
         None,
         Vec::new(),
-    )
+    ))
     .await
 }
 
@@ -1383,7 +1383,7 @@ pub async fn run_agent_session_with_store_writer_and_peers(
         "fast mode is not supported by the {:?} transport",
         launch.provider
     );
-    run_agent_session_store_kernel(
+    Box::pin(run_agent_session_store_kernel(
         session_root,
         session_id,
         launch,
@@ -1394,7 +1394,7 @@ pub async fn run_agent_session_with_store_writer_and_peers(
         crate::LspPathPolicy::unrestricted(),
         None,
         initial_peers,
-    )
+    ))
     .await
 }
 
@@ -1415,7 +1415,7 @@ pub(crate) async fn run_agent_session_with_store_and_writer_and_team(
         "fast mode is not supported by the {:?} transport",
         launch.provider
     );
-    run_agent_session_store_kernel(
+    Box::pin(run_agent_session_store_kernel(
         session_root,
         session_id,
         launch,
@@ -1426,7 +1426,7 @@ pub(crate) async fn run_agent_session_with_store_and_writer_and_team(
         crate::LspPathPolicy::unrestricted(),
         Some(team),
         Vec::new(),
-    )
+    ))
     .await
 }
 
@@ -1454,7 +1454,7 @@ async fn run_agent_session_kernel(
         store.create_session(session_id).await?;
     }
     let runtime_store: Arc<dyn SessionStore> = store;
-    run_agent_session_store_kernel(
+    Box::pin(run_agent_session_store_kernel(
         session_root,
         session_id,
         launch,
@@ -1465,7 +1465,7 @@ async fn run_agent_session_kernel(
         crate::LspPathPolicy::unrestricted(),
         None,
         Vec::new(),
-    )
+    ))
     .await
 }
 
