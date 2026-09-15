@@ -5754,11 +5754,18 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
     let mut specs = vec![
         tool(
             "computer_use",
-            "Native desktop access, including sensitive screen contents; requires Full Access or approval. Query capabilities first: it reports the platform backend (Linux AT-SPI2, macOS AXUIElement, Windows UI Automation), permissions and capture scopes. Operations: list_windows, bounded observe (optional since diff, optional screenshot=true with screenshot_scope), explicit screenshots (scope=desktop, or scope=window with window_id where supported), semantic click and set_value. Actions require window_id, element_id and the latest observation_id; inspect returned state to verify effects. Acting on a consequential control (send, pay, delete, publish, security, credentials) is refused until the human has confirmed that exact action and you pass confirmed=true. No coordinate/clipboard fallback.",
+            "Native desktop access, including sensitive screen contents; requires Full Access or approval. Query capabilities first: it reports the platform backend (Linux AT-SPI2, macOS AXUIElement, Windows UI Automation), permissions and capture scopes. Operations: list_windows, bounded observe (optional since diff, optional screenshot=true with screenshot_scope), explicit screenshots (scope=desktop, or scope=window with window_id where supported), semantic click and set_value, and input injection where the backend supports it: type_text (text), key (keys like cmd+s), pointer_click (element_id+observation_id or x,y; button, count), scroll (dx, dy), drag (from_x, from_y, to_x, to_y). Injection raises the target window (a focus change). Prefer semantic click/set_value for element targeting; on Linux Wayland an element-targeted pointer_click/scroll fails with a clear error when the window origin is unknown, so fall back to click/set_value or to raw x,y read from a desktop screenshot. Actions require window_id, element_id and the latest observation_id; inspect returned state to verify effects. Acting on a consequential control (send, pay, delete, publish, security, credentials) is refused until the human has confirmed that exact action and you pass confirmed=true. No coordinate/clipboard fallback.",
             json!({
                 "type": "object",
                 "properties": {
-                    "op": {"type": "string", "enum": ["capabilities", "list_windows", "observe", "screenshot", "click", "set_value"]},
+                    "op": {"type": "string", "enum": ["capabilities", "list_windows", "observe", "screenshot", "click", "set_value", "type_text", "key", "pointer_click", "scroll", "drag"]},
+                    "keys": {"type": "string", "maxLength": 64},
+                    "x": {"type": "number"}, "y": {"type": "number"},
+                    "button": {"type": "string", "enum": ["left", "right", "middle"]},
+                    "count": {"type": "integer", "minimum": 1, "maximum": 2},
+                    "dx": {"type": "number"}, "dy": {"type": "number"},
+                    "from_x": {"type": "number"}, "from_y": {"type": "number"},
+                    "to_x": {"type": "number"}, "to_y": {"type": "number"},
                     "window_id": {"type": "string"},
                     "element_id": {"type": "string"},
                     "observation_id": {"type": "string"},

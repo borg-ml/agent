@@ -35,6 +35,28 @@ human has confirmed that exact action and the call repeats with `confirmed: true
 (`cua.click(..., confirmed=True)` / `cua.click(..., {confirmed: true})`). Tool
 approval alone never satisfies this gate.
 
+### Input injection contract (all platforms)
+
+`type_text {window_id, text}`, `key {window_id, keys}` (one key plus
+cmd/ctrl/alt/shift, e.g. `ctrl+shift+t`), `pointer_click {window_id,
+element_id+observation_id | x,y, button?, count?}`, `scroll {window_id,
+element_id+observation_id | x,y, dx, dy}` (positive `dy` scrolls content down;
+units reported in the result) and `drag {window_id, from_x, from_y, to_x, to_y,
+button?}`. Every injection raises/focuses the target window — acceptable only
+because each op is approval-gated — consumes that window's observation and
+returns the settled tree. Semantic `click`/`set_value` remain the preferred,
+name-gated way to act on an element; injected ops exist for coordinate space and
+for keys, scrolling and dragging that accessibility actions cannot express.
+Raw `x,y` targets are in screenshot/screen pixel space (Linux, Windows) or AX
+screen points (macOS) and are flagged `coordinate_click: true`; they bypass
+name-based confirmation gating because no element is named.
+
+Linux caveat: AT-SPI extents on GTK Wayland are window-relative and the
+compositor may not expose the window origin, so element-targeted
+`pointer_click`/`scroll` return a clear error there instead of guessing; use
+`click`/`set_value` or a raw coordinate read from a desktop screenshot. The
+Linux backend is a Borg-owned evdev uinput device plus `wtype` (no `ydotool`).
+
 Python code mode: `cua.capabilities()`, `cua.list_windows()`,
 `cua.observe(window_id)`, `cua.screenshot("desktop")`,
 `cua.click(window_id, element_id, observation_id)`, and
@@ -79,7 +101,29 @@ granted; `list_windows`; `observe` of a TextEdit window (45 nodes); `set_value`
 of "Borg macOS ✓" into its `AXTextArea`, confirmed both in the returned tree and
 visually in the window capture; an empty `since` diff after the action; desktop
 capture at 2880×1800 and isolated window capture at 1396×1200. Element ids are
-scoped to one helper process, as on Linux. Input injection is not implemented.
+scoped to one helper process, as on Linux.
+
+macOS input injection (CGEvent, **not yet verified on the Mac**): `type_text`
+(Unicode via keyboard events), `key` (one key plus cmd/ctrl/alt/shift, e.g.
+`cmd+s`), `pointer_click` (centre of an observed element, validated like
+`click`, or an explicit `x`,`y` in AX screen points; `button`, `count`),
+`scroll` (`dx`,`dy` pixels; positive `dy` scrolls content down) and `drag`
+(`from_x`,`from_y`,`to_x`,`to_y`). Every injection raises the target window
+first and consumes the window's observation; results carry the settled tree.
+Coordinate clicks bypass name-based confirmation gating because no element is
+named; element-targeted `pointer_click` is gated like `click`.
+
+Verified on the Mac at `mac-input` `5962d2c`: `type_text` ("Borg typed ✓ héllo"
+arrived intact), `key` (`cmd+a`, `delete`), element-targeted `pointer_click`,
+and `drag` (text selection visible). Two findings drove follow-up changes:
+injected typing goes through the app's text-input pipeline, so autocorrect and
+auto-capitalisation apply (verify the resulting `text`, not the input); and an
+element's geometric centre can lie outside its scroll area, which made `scroll`
+a silent no-op. Pointer ops now target the centre of the element's
+`visible_bounds` (clipped by enclosing `AXScrollArea`s and the window) and refuse
+elements that are scrolled out of view; text nodes also expose `selected_text`.
+A tree that is still changing right after typing can reject the next action as
+"changed since observation" — re-observe and retry.
 
 ## Windows (unverified)
 
@@ -91,6 +135,9 @@ view; bounds are physical screen pixels (the helper is DPI-aware), so they match
 desktop. `scope: "window"` uses `PrintWindow` for isolated capture. `click` uses
 Invoke, Toggle or SelectionItem patterns; `set_value` uses ValuePattern and
 refuses password and read-only controls. Elevated windows are not observable.
+Input injection (`type_text`, `key`, `pointer_click`, `scroll`, `drag`) uses
+`SendInput` with absolute coordinates normalised over the virtual desktop and
+brings the target window to the foreground first.
 The script parses cleanly and its JSONL protocol loop (capabilities, error
 envelopes, argument validation) was dry-run under PowerShell 7.6 on Linux with
 the Windows-only calls stubbed. **Not yet exercised on a real Windows host**;

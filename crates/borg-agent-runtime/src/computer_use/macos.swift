@@ -26,8 +26,21 @@ struct Node: Codable, Equatable {
     let focused: Bool
     let showing: Bool
     let bounds: Bounds?
+    /// Portion of `bounds` inside every enclosing AXScrollArea and the window;
+    /// absent when the element is scrolled out of view. Pointer ops target this.
+    let visible_bounds: Bounds?
     let text: String?
+    let selected_text: String?
     let actions: [String]?
+}
+
+extension Bounds {
+    func intersection(_ other: Bounds) -> Bounds? {
+        let x0 = Swift.max(x, other.x), y0 = Swift.max(y, other.y)
+        let x1 = Swift.min(x + width, other.x + other.width), y1 = Swift.min(y + height, other.y + other.height)
+        guard x1 > x0, y1 > y0 else { return nil }
+        return Bounds(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
+    }
 }
 
 struct Observation {
@@ -128,17 +141,39 @@ func window(_ id: String) throws -> WindowEntry {
     return entry
 }
 
+func frame(_ element: AXUIElement) -> Bounds? {
+    guard let origin = axPoint(attribute(element, kAXPositionAttribute)),
+          let size = axSize(attribute(element, kAXSizeAttribute)), size.width > 0, size.height > 0 else { return nil }
+    return Bounds(x: origin.x, y: origin.y, width: size.width, height: size.height)
+}
+
+/// Clip an element's frame by every enclosing scroll area and its window.
+func visibleFrame(_ element: AXUIElement, _ bounds: Bounds) -> Bounds? {
+    var visible: Bounds? = bounds
+    var cursor = element
+    for _ in 0..<64 {
+        guard let parent = attribute(cursor, kAXParentAttribute) else { break }
+        cursor = parent as! AXUIElement
+        let role = string(cursor, kAXRoleAttribute) ?? ""
+        if role == "AXScrollArea" || role == "AXWindow", let clip = frame(cursor) {
+            visible = visible?.intersection(clip)
+            if visible == nil || role == "AXWindow" { break }
+        }
+    }
+    return visible
+}
+
 func describe(_ element: AXUIElement, parent: String?) throws -> Node {
     let role = string(element, kAXRoleAttribute) ?? ""
-    var bounds: Bounds?
-    if let origin = axPoint(attribute(element, kAXPositionAttribute)),
-       let size = axSize(attribute(element, kAXSizeAttribute)),
-       size.width > 0, size.height > 0 {
-        bounds = Bounds(x: origin.x, y: origin.y, width: size.width, height: size.height)
-    }
+    let bounds = frame(element)
+    let visible = bounds.flatMap { visibleFrame(element, $0) }
     var text: String?
+    var selected: String?
     if role != "AXSecureTextField", let value = attribute(element, kAXValueAttribute) as? String {
         text = String(value.prefix(2048))
+        if let selection = attribute(element, kAXSelectedTextAttribute) as? String, !selection.isEmpty {
+            selected = String(selection.prefix(2048))
+        }
     }
     let name = string(element, kAXTitleAttribute) ?? string(element, kAXDescriptionAttribute) ?? ""
     let id = try identify(element)
@@ -146,7 +181,8 @@ func describe(_ element: AXUIElement, parent: String?) throws -> Node {
         id: id, parent: parent, role: role, name: String(name.prefix(1024)),
         enabled: (attribute(element, kAXEnabledAttribute) as? Bool) ?? true,
         focused: boolean(element, kAXFocusedAttribute),
-        showing: bounds != nil, bounds: bounds, text: text, actions: actionNames(element))
+        showing: bounds != nil, bounds: bounds, visible_bounds: visible, text: text, selected_text: selected,
+        actions: actionNames(element))
 }
 
 func tree(_ root: AXUIElement, limit: Int) throws -> ([String: Node], [String], Bool) {
@@ -329,7 +365,11 @@ func mutate(_ args: [String: Any], op: String) throws -> [String: Any] {
     default:
         throw Failure(message: "unsupported operation: \(op)")
     }
-    // Bounded settling: two matching trees; not a claim that application work finished.
+    return try settleAndSnapshot(entry, op: op)
+}
+
+/// Bounded settling: two matching trees; not a claim that application work finished.
+func settleAndSnapshot(_ entry: WindowEntry, op: String, extra: [String: Any] = [:]) throws -> [String: Any] {
     let deadline = Date().addingTimeInterval(1.5)
     var previous: [String: Node]?
     var settled = false
@@ -339,12 +379,200 @@ func mutate(_ args: [String: Any], op: String) throws -> [String: Any] {
         previous = current
         Thread.sleep(forTimeInterval: 0.1)
     }
-    var result = try snapshot(["window_id": windowId])
+    var result = try snapshot(["window_id": entry.id])
     result["action"] = op
     result["dispatched"] = true
     result["tree_settled"] = settled
     result["verification"] = "Inspect the returned tree for the requested application effect."
+    for (key, value) in extra { result[key] = value }
     return result
+}
+
+// MARK: - Input injection (CGEvent). Coordinates are AX screen points, top-left origin.
+
+func number(_ value: Any?) -> Double? {
+    if let d = value as? Double { return d }
+    if let i = value as? Int { return Double(i) }
+    return nil
+}
+
+/// Bring the target window to the front so injected events reach it.
+func focusWindow(_ entry: WindowEntry) throws {
+    guard let app = NSRunningApplication(processIdentifier: entry.pid) else {
+        throw Failure(message: "target application is no longer running")
+    }
+    if #available(macOS 14.0, *) { app.activate() } else { app.activate(options: [.activateIgnoringOtherApps]) }
+    _ = AXUIElementPerformAction(entry.element, kAXRaiseAction as CFString)
+    Thread.sleep(forTimeInterval: 0.15)
+    guard app.isActive else { throw Failure(message: "could not bring the target application to the front") }
+}
+
+func post(_ event: CGEvent?) throws {
+    guard let event = event else { throw Failure(message: "could not create input event") }
+    event.post(tap: .cghidEventTap)
+}
+
+let keyCodes: [String: CGKeyCode] = [
+    "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9, "b": 11, "q": 12, "w": 13,
+    "e": 14, "r": 15, "y": 16, "t": 17, "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23, "=": 24, "9": 25,
+    "7": 26, "-": 27, "8": 28, "0": 29, "]": 30, "o": 31, "u": 32, "[": 33, "i": 34, "p": 35, "return": 36,
+    "enter": 36, "l": 37, "j": 38, "'": 39, "k": 40, ";": 41, "\\": 42, ",": 43, "/": 44, "n": 45, "m": 46,
+    ".": 47, "tab": 48, "space": 49, "`": 50, "delete": 51, "backspace": 51, "escape": 53, "esc": 53,
+    "forwarddelete": 117, "home": 115, "end": 119, "pageup": 116, "pagedown": 121, "left": 123, "right": 124,
+    "down": 125, "up": 126, "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97, "f7": 98, "f8": 100,
+    "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+]
+
+func typeText(_ entry: WindowEntry, _ text: String) throws {
+    try focusWindow(entry)
+    for chunk in Array(text.utf16).chunked(20) {
+        let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true)
+        let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
+        down?.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+        up?.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: chunk)
+        try post(down); try post(up)
+        Thread.sleep(forTimeInterval: 0.01)
+    }
+}
+
+extension Array {
+    func chunked(_ size: Int) -> [[Element]] {
+        stride(from: 0, to: count, by: size).map { Array(self[$0..<Swift.min($0 + size, count)]) }
+    }
+}
+
+func pressKeys(_ entry: WindowEntry, _ spec: String) throws {
+    var flags = CGEventFlags()
+    var key: CGKeyCode?
+    for part in spec.lowercased().split(separator: "+").map({ $0.trimmingCharacters(in: .whitespaces) }) {
+        switch part {
+        case "cmd", "command", "meta", "super": flags.insert(.maskCommand)
+        case "ctrl", "control": flags.insert(.maskControl)
+        case "alt", "option", "opt": flags.insert(.maskAlternate)
+        case "shift": flags.insert(.maskShift)
+        default:
+            guard key == nil, let code = keyCodes[part] else {
+                throw Failure(message: "unsupported key \"\(part)\"; use one non-modifier key per call")
+            }
+            key = code
+        }
+    }
+    guard let code = key else { throw Failure(message: "keys must name one non-modifier key") }
+    try focusWindow(entry)
+    let down = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: true)
+    let up = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: false)
+    down?.flags = flags; up?.flags = flags
+    try post(down); try post(up)
+}
+
+/// Resolve a pointer target: the centre of an observed element (validated
+/// like click) or an explicit AX screen point.
+func pointerTarget(_ args: [String: Any], entry: WindowEntry) throws -> (CGPoint, Bool) {
+    if args["element_id"] != nil {
+        let (_, element) = try target(args)
+        guard let bounds = frame(element) else { throw Failure(message: "element has no on-screen bounds") }
+        guard let visible = visibleFrame(element, bounds) else {
+            observations[entry.id] = nil
+            throw Failure(message: "element is scrolled out of view; scroll its container or target a visible element")
+        }
+        observations[entry.id] = nil
+        // Aim at the centre of the VISIBLE part so events reach the element, not
+        // whatever happens to cover its off-screen geometric centre.
+        return (CGPoint(x: visible.x + visible.width / 2, y: visible.y + visible.height / 2), false)
+    }
+    guard let x = number(args["x"]), let y = number(args["y"]) else {
+        throw Failure(message: "pointer ops need element_id + observation_id or x + y")
+    }
+    observations[entry.id] = nil
+    return (CGPoint(x: x, y: y), true)
+}
+
+func mouseButton(_ name: Any?) throws -> (CGMouseButton, CGEventType, CGEventType, CGEventType) {
+    switch (name as? String) ?? "left" {
+    case "left": return (.left, .leftMouseDown, .leftMouseUp, .leftMouseDragged)
+    case "right": return (.right, .rightMouseDown, .rightMouseUp, .rightMouseDragged)
+    case "middle": return (.center, .otherMouseDown, .otherMouseUp, .otherMouseDragged)
+    default: throw Failure(message: "button must be left, right or middle")
+    }
+}
+
+func movePointer(to point: CGPoint) throws {
+    try post(CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left))
+    Thread.sleep(forTimeInterval: 0.05)
+}
+
+func pointerClick(_ args: [String: Any], entry: WindowEntry) throws -> [String: Any] {
+    let (point, coordinate) = try pointerTarget(args, entry: entry)
+    let (button, downType, upType, _) = try mouseButton(args["button"])
+    let count = (args["count"] as? Int) ?? 1
+    guard (1...2).contains(count) else { throw Failure(message: "count must be 1 or 2") }
+    try focusWindow(entry)
+    try movePointer(to: point)
+    for click in 1...count {
+        let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: point, mouseButton: button)
+        let up = CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: point, mouseButton: button)
+        down?.setIntegerValueField(.mouseEventClickState, value: Int64(click))
+        up?.setIntegerValueField(.mouseEventClickState, value: Int64(click))
+        try post(down); Thread.sleep(forTimeInterval: 0.03); try post(up)
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    return try settleAndSnapshot(entry, op: "pointer_click", extra: ["coordinate_click": coordinate, "point": ["x": point.x, "y": point.y]])
+}
+
+func scroll(_ args: [String: Any], entry: WindowEntry) throws -> [String: Any] {
+    let (point, coordinate) = try pointerTarget(args, entry: entry)
+    let dx = Int32(number(args["dx"]) ?? 0), dy = Int32(number(args["dy"]) ?? 0)
+    guard abs(dx) <= 10000, abs(dy) <= 10000 else { throw Failure(message: "scroll distance is limited to 10000 pixels") }
+    try focusWindow(entry)
+    try movePointer(to: point)
+    // Positive dy scrolls content down; CGEvent's wheel1 is positive for scrolling up.
+    try post(CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: -dy, wheel2: -dx, wheel3: 0))
+    return try settleAndSnapshot(entry, op: "scroll", extra: ["coordinate_click": coordinate, "point": ["x": point.x, "y": point.y], "units": "pixels"])
+}
+
+func drag(_ args: [String: Any], entry: WindowEntry) throws -> [String: Any] {
+    guard let fx = number(args["from_x"]), let fy = number(args["from_y"]),
+          let tx = number(args["to_x"]), let ty = number(args["to_y"]) else {
+        throw Failure(message: "drag needs from_x, from_y, to_x, to_y")
+    }
+    let (button, downType, upType, dragType) = try mouseButton(args["button"])
+    observations[entry.id] = nil
+    try focusWindow(entry)
+    let from = CGPoint(x: fx, y: fy), to = CGPoint(x: tx, y: ty)
+    try movePointer(to: from)
+    try post(CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: from, mouseButton: button))
+    let steps = 12
+    for step in 1...steps {
+        let t = Double(step) / Double(steps)
+        let point = CGPoint(x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t)
+        try post(CGEvent(mouseEventSource: nil, mouseType: dragType, mouseCursorPosition: point, mouseButton: button))
+        Thread.sleep(forTimeInterval: 0.02)
+    }
+    try post(CGEvent(mouseEventSource: nil, mouseType: upType, mouseCursorPosition: to, mouseButton: button))
+    return try settleAndSnapshot(entry, op: "drag", extra: ["from": ["x": fx, "y": fy], "to": ["x": tx, "y": ty]])
+}
+
+func inject(_ args: [String: Any], op: String) throws -> [String: Any] {
+    guard let windowId = args["window_id"] as? String else { throw Failure(message: "window_id is required") }
+    let entry = try window(windowId)
+    switch op {
+    case "type_text":
+        guard let text = args["text"] as? String, text.count <= 16384 else {
+            throw Failure(message: "text must be a string of at most 16384 characters")
+        }
+        observations[windowId] = nil
+        try typeText(entry, text)
+        return try settleAndSnapshot(entry, op: op)
+    case "key":
+        guard let keys = args["keys"] as? String else { throw Failure(message: "keys is required") }
+        observations[windowId] = nil
+        try pressKeys(entry, keys)
+        return try settleAndSnapshot(entry, op: op, extra: ["keys": keys])
+    case "pointer_click": return try pointerClick(args, entry: entry)
+    case "scroll": return try scroll(args, entry: entry)
+    case "drag": return try drag(args, entry: entry)
+    default: throw Failure(message: "unsupported operation: \(op)")
+    }
 }
 
 func dispatch(_ args: [String: Any]) throws -> [String: Any] {
@@ -355,9 +583,11 @@ func dispatch(_ args: [String: Any]) throws -> [String: Any] {
         let capture = CGPreflightScreenCaptureAccess()
         return ["platform": "macos", "backend": "AXUIElement", "desktop_available": trusted,
                 "accessibility_trusted": trusted, "screen_recording": capture,
-                "operations": ["capabilities", "list_windows", "observe", "screenshot", "click", "set_value"],
+                "operations": ["capabilities", "list_windows", "observe", "screenshot", "click", "set_value",
+                               "type_text", "key", "pointer_click", "scroll", "drag"],
                 "capture_scopes": capture ? ["desktop", "window"] : [],
-                "limitations": ["No keyboard, pointer injection, drag, or scroll backend yet.",
+                "input_coordinate_space": "AX screen points (top-left origin); divide Retina screenshot pixels by the display scale",
+                "limitations": ["Input injection raises the target window first, so it changes focus.",
                                 trusted ? "Accessibility access granted." : "Grant Accessibility access to the terminal running Borg (System Settings > Privacy & Security > Accessibility).",
                                 capture ? "Screen Recording access granted." : "Grant Screen Recording access to enable screenshots."]]
     case "list_windows":
@@ -368,6 +598,8 @@ func dispatch(_ args: [String: Any]) throws -> [String: Any] {
         return try snapshot(args)
     case "click", "set_value":
         return try mutate(args, op: op)
+    case "type_text", "key", "pointer_click", "scroll", "drag":
+        return try inject(args, op: op)
     default:
         throw Failure(message: "unsupported operation: \(op)")
     }

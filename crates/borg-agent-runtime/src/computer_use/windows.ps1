@@ -9,6 +9,26 @@ Add-Type -Namespace Borg -Name Native -MemberDefinition @'
 [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
 [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hwnd);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+[DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+[DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+[DllImport("user32.dll", SetLastError = true)] public static extern uint SendInput(uint count, INPUT[] inputs, int size);
+[StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+[StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+[StructLayout(LayoutKind.Explicit)] public struct INPUTUNION { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; }
+[StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public INPUTUNION u; }
+public static void Key(ushort vk, bool up) {
+    var input = new INPUT { type = 1 }; input.u.ki = new KEYBDINPUT { wVk = vk, dwFlags = up ? 2u : 0u };
+    if (SendInput(1, new[] { input }, Marshal.SizeOf(typeof(INPUT))) != 1) throw new Exception("SendInput rejected the key event");
+}
+public static void Unicode(char c, bool up) {
+    var input = new INPUT { type = 1 }; input.u.ki = new KEYBDINPUT { wScan = c, dwFlags = 4u | (up ? 2u : 0u) };
+    if (SendInput(1, new[] { input }, Marshal.SizeOf(typeof(INPUT))) != 1) throw new Exception("SendInput rejected the text event");
+}
+public static void Mouse(uint flags, int dx, int dy, uint data) {
+    var input = new INPUT { type = 0 }; input.u.mi = new MOUSEINPUT { dx = dx, dy = dy, mouseData = data, dwFlags = flags };
+    if (SendInput(1, new[] { input }, Marshal.SizeOf(typeof(INPUT))) != 1) throw new Exception("SendInput rejected the mouse event");
+}
 '@
 [void][Borg.Native]::SetProcessDPIAware()
 [Console]::InputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -251,14 +271,160 @@ function Mutate($request, [string]$op) {
     return $result
 }
 
+# ---- Input injection (SendInput). Coordinates are physical screen pixels of the virtual desktop.
+
+function FocusWindow($win) {
+    $hwnd = [IntPtr]$win.Current.NativeWindowHandle
+    if ($hwnd -eq [IntPtr]::Zero) { Fail 'window has no native handle to focus' }
+    [void][Borg.Native]::SetForegroundWindow($hwnd)
+    Start-Sleep -Milliseconds 150
+    if ([Borg.Native]::GetForegroundWindow() -ne $hwnd) { Fail 'could not bring the target window to the front' }
+}
+
+function MoveMouse([double]$x, [double]$y) {
+    # Absolute SendInput coordinates are normalised to 0..65535 over the virtual screen.
+    $vx = [Borg.Native]::GetSystemMetrics(76); $vy = [Borg.Native]::GetSystemMetrics(77)
+    $vw = [Borg.Native]::GetSystemMetrics(78); $vh = [Borg.Native]::GetSystemMetrics(79)
+    $nx = [int](($x - $vx) * 65535 / [Math]::Max(1, $vw - 1)); $ny = [int](($y - $vy) * 65535 / [Math]::Max(1, $vh - 1))
+    [Borg.Native]::Mouse(0x8001 -bor 0x4000, $nx, $ny, 0)   # MOVE | ABSOLUTE | VIRTUALDESK
+    Start-Sleep -Milliseconds 50
+}
+
+$VirtualKeys = @{ return = 0x0D; enter = 0x0D; tab = 0x09; space = 0x20; escape = 0x1B; esc = 0x1B; backspace = 0x08; delete = 0x08
+    forwarddelete = 0x2E; home = 0x24; end = 0x23; pageup = 0x21; pagedown = 0x22; left = 0x25; up = 0x26; right = 0x27; down = 0x28
+    f1 = 0x70; f2 = 0x71; f3 = 0x72; f4 = 0x73; f5 = 0x74; f6 = 0x75; f7 = 0x76; f8 = 0x77; f9 = 0x78; f10 = 0x79; f11 = 0x7A; f12 = 0x7B }
+$Modifiers = @{ cmd = 0x5B; command = 0x5B; meta = 0x5B; super = 0x5B; win = 0x5B; ctrl = 0x11; control = 0x11; alt = 0x12; option = 0x12; opt = 0x12; shift = 0x10 }
+
+function PressKeys($win, [string]$spec) {
+    $held = @(); $key = $null
+    foreach ($part in ($spec.ToLowerInvariant() -split '\+' | ForEach-Object { $_.Trim() })) {
+        if ($Modifiers.ContainsKey($part)) { $held += [uint16]$Modifiers[$part]; continue }
+        if ($null -ne $key) { Fail 'use one non-modifier key per call' }
+        if ($VirtualKeys.ContainsKey($part)) { $key = [uint16]$VirtualKeys[$part] }
+        elseif ($part.Length -eq 1 -and $part -match '[a-z0-9]') { $key = [uint16][char]$part.ToUpperInvariant() }
+        else { Fail "unsupported key `"$part`"" }
+    }
+    if ($null -eq $key) { Fail 'keys must name one non-modifier key' }
+    FocusWindow $win
+    foreach ($m in $held) { [Borg.Native]::Key($m, $false) }
+    [Borg.Native]::Key($key, $false); [Borg.Native]::Key($key, $true)
+    [array]::Reverse($held); foreach ($m in $held) { [Borg.Native]::Key($m, $true) }
+}
+
+function PointerTarget($request, $win) {
+    if ($null -ne (Arg $request 'element_id')) {
+        $pair = Target $request
+        $r = $pair[1].Current.BoundingRectangle
+        if ($r.IsEmpty -or $r.Width -le 0 -or $r.Height -le 0) { Fail 'element has no on-screen bounds' }
+        $Observations.Remove([string](Arg $request 'window_id'))
+        return @(($r.X + $r.Width / 2), ($r.Y + $r.Height / 2), $false)
+    }
+    $x = Arg $request 'x'; $y = Arg $request 'y'
+    if ($null -eq $x -or $null -eq $y) { Fail 'pointer ops need element_id + observation_id or x + y' }
+    $Observations.Remove([string](Arg $request 'window_id'))
+    return @([double]$x, [double]$y, $true)
+}
+
+function ButtonFlags($name) {
+    switch ([string]$name) {
+        '' { return @(0x0002, 0x0004, 0) }
+        'left' { return @(0x0002, 0x0004, 0) }
+        'right' { return @(0x0008, 0x0010, 0) }
+        'middle' { return @(0x0020, 0x0040, 0) }
+        default { Fail 'button must be left, right or middle' }
+    }
+}
+
+function Settle($win, [string]$op, $extra) {
+    $windowId = (Identify $win)
+    $deadline = [DateTime]::UtcNow.AddSeconds(1.5)
+    $previous = $null; $settled = $false
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $current = (Tree $win 300).json
+        if ($null -ne $previous -and $previous.Count -eq $current.Count) {
+            $same = $true
+            foreach ($id in $current.Keys) { if ($previous[$id] -ne $current[$id]) { $same = $false; break } }
+            if ($same) { $settled = $true; break }
+        }
+        $previous = $current
+        Start-Sleep -Milliseconds 100
+    }
+    $result = Snapshot ([pscustomobject]@{ window_id = $windowId })
+    $result.action = $op; $result.dispatched = $true; $result.tree_settled = $settled
+    $result.verification = 'Inspect the returned tree for the requested application effect.'
+    if ($null -ne $extra) { foreach ($k in $extra.Keys) { $result[$k] = $extra[$k] } }
+    return $result
+}
+
+function Inject($request, [string]$op) {
+    $windowId = [string](Arg $request 'window_id')
+    if (-not $windowId) { Fail 'window_id is required' }
+    $win = Window $windowId
+    switch ($op) {
+        'type_text' {
+            $text = Arg $request 'text'
+            if ($text -isnot [string] -or $text.Length -gt 16384) { Fail 'text must be a string of at most 16384 characters' }
+            $Observations.Remove($windowId)
+            FocusWindow $win
+            foreach ($c in $text.ToCharArray()) { [Borg.Native]::Unicode($c, $false); [Borg.Native]::Unicode($c, $true) }
+            return Settle $win $op $null
+        }
+        'key' {
+            $keys = [string](Arg $request 'keys')
+            if (-not $keys) { Fail 'keys is required' }
+            $Observations.Remove($windowId)
+            PressKeys $win $keys
+            return Settle $win $op @{ keys = $keys }
+        }
+        'pointer_click' {
+            $t = PointerTarget $request $win
+            $flags = ButtonFlags (Arg $request 'button')
+            $count = 1; if ($null -ne (Arg $request 'count')) { $count = [int](Arg $request 'count') }
+            if ($count -lt 1 -or $count -gt 2) { Fail 'count must be 1 or 2' }
+            FocusWindow $win
+            MoveMouse $t[0] $t[1]
+            for ($i = 0; $i -lt $count; $i++) { [Borg.Native]::Mouse($flags[0], 0, 0, 0); Start-Sleep -Milliseconds 30; [Borg.Native]::Mouse($flags[1], 0, 0, 0); Start-Sleep -Milliseconds 50 }
+            return Settle $win $op @{ coordinate_click = $t[2]; point = [ordered]@{ x = $t[0]; y = $t[1] } }
+        }
+        'scroll' {
+            $t = PointerTarget $request $win
+            $dx = [int](Arg $request 'dx'); $dy = [int](Arg $request 'dy')
+            if ([Math]::Abs($dx) -gt 10000 -or [Math]::Abs($dy) -gt 10000) { Fail 'scroll distance is limited to 10000 pixels' }
+            FocusWindow $win
+            MoveMouse $t[0] $t[1]
+            # WHEEL data is positive to scroll content up; convert 120-unit notches per 40 px.
+            if ($dy -ne 0) { [Borg.Native]::Mouse(0x0800, 0, 0, [uint32]([int](-$dy * 3) -band 0xFFFFFFFF)) }
+            if ($dx -ne 0) { [Borg.Native]::Mouse(0x1000, 0, 0, [uint32]([int]($dx * 3) -band 0xFFFFFFFF)) }
+            return Settle $win $op @{ coordinate_click = $t[2]; point = [ordered]@{ x = $t[0]; y = $t[1] }; units = 'pixels' }
+        }
+        'drag' {
+            $fx = Arg $request 'from_x'; $fy = Arg $request 'from_y'; $tx = Arg $request 'to_x'; $ty = Arg $request 'to_y'
+            if ($null -eq $fx -or $null -eq $fy -or $null -eq $tx -or $null -eq $ty) { Fail 'drag needs from_x, from_y, to_x, to_y' }
+            $flags = ButtonFlags (Arg $request 'button')
+            $Observations.Remove($windowId)
+            FocusWindow $win
+            MoveMouse ([double]$fx) ([double]$fy)
+            [Borg.Native]::Mouse($flags[0], 0, 0, 0)
+            for ($i = 1; $i -le 12; $i++) {
+                $t = $i / 12.0
+                MoveMouse ([double]$fx + ([double]$tx - [double]$fx) * $t) ([double]$fy + ([double]$ty - [double]$fy) * $t)
+            }
+            [Borg.Native]::Mouse($flags[1], 0, 0, 0)
+            return Settle $win $op @{ from = [ordered]@{ x = [double]$fx; y = [double]$fy }; to = [ordered]@{ x = [double]$tx; y = [double]$ty } }
+        }
+        default { Fail "unsupported operation: $op" }
+    }
+}
+
 function Dispatch($request) {
     $op = [string](Arg $request 'op')
     switch ($op) {
         'capabilities' {
             return [ordered]@{ platform = 'windows'; backend = 'UI Automation'; desktop_available = $true
-                operations = @('capabilities', 'list_windows', 'observe', 'screenshot', 'click', 'set_value')
+                operations = @('capabilities', 'list_windows', 'observe', 'screenshot', 'click', 'set_value', 'type_text', 'key', 'pointer_click', 'scroll', 'drag')
                 capture_scopes = @('desktop', 'window')
-                limitations = @('No keyboard, pointer injection, drag, or scroll backend yet.',
+                input_coordinate_space = 'physical screen pixels of the virtual desktop, matching desktop screenshots'
+                limitations = @('Input injection brings the target window to the foreground first, so it changes focus.',
                                 'Runs in the interactive user session only; elevated (UAC) windows are not observable.') }
         }
         'list_windows' { return [ordered]@{ windows = (Windows) } }
@@ -266,6 +432,7 @@ function Dispatch($request) {
         'observe' { return Snapshot $request }
         'click' { return Mutate $request $op }
         'set_value' { return Mutate $request $op }
+        { $_ -in 'type_text', 'key', 'pointer_click', 'scroll', 'drag' } { return Inject $request $op }
         default { Fail "unsupported operation: $op" }
     }
 }
