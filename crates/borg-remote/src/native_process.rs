@@ -652,7 +652,12 @@ impl HeadTailBuffer {
         if tail_keep > 0 {
             bytes.extend(self.tail.iter().skip(self.tail.len() - tail_keep));
         }
-        (String::from_utf8_lossy(&bytes).into_owned(), omitted)
+        // Redact high-confidence secrets before the output reaches the model or
+        // the durable completion event. `render` assembles the full bounded
+        // string, so a credential is never split across a read boundary here.
+        let rendered =
+            crate::secret_scrub::scrub_secrets(&String::from_utf8_lossy(&bytes)).into_owned();
+        (rendered, omitted)
     }
 }
 
@@ -1190,6 +1195,16 @@ mod tests {
         assert!(omitted > 0);
         assert!(text.starts_with('x'));
         assert!(text.ends_with("fatal: final failure"));
+    }
+
+    #[test]
+    fn render_redacts_secrets_before_they_reach_the_model_or_journal() {
+        let output = HeadTailBuffer::from_text(
+            "printing token\nghp_0123456789abcdefghijklmnopqrstuvwxyzAB\ndone",
+        );
+        let (text, _) = output.render(100);
+        assert!(!text.contains("ghp_0123456789"));
+        assert!(text.contains("[redacted:github-token]"));
     }
 
     #[tokio::test]

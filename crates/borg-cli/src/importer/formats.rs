@@ -260,6 +260,38 @@ pub(super) fn read(
                 plan.warnings.push("No memory found in the export. Include memories.json or use a portable memory export.".into());
             }
         }
+        Source::ChatGpt => {
+            if threads {
+                let mut parsed_any = false;
+                for file in &files {
+                    if file.extension().is_none_or(|ext| ext != "json") {
+                        continue;
+                    }
+                    let name = file.file_name().unwrap_or_default().to_string_lossy();
+                    // The export's chat archive is `conversations.json`. When
+                    // the user points --path straight at a single JSON file we
+                    // trust it, but inside an unpacked export we ignore the
+                    // sibling `user.json` / `model_comparisons.json` etc.
+                    if name != "conversations.json" && !path.is_file() {
+                        continue;
+                    }
+                    match read_json(file).and_then(|value| chatgpt_export(value, &mut plan)) {
+                        Ok(()) => parsed_any = true,
+                        Err(error) => plan.warnings.push(format!("{}: {error:#}", file.display())),
+                    }
+                }
+                if !parsed_any && plan.threads.is_empty() {
+                    plan.warnings.push(
+                        "No conversations.json found. Export your data from ChatGPT (Settings > Data controls > Export), then choose the downloaded ZIP or its conversations.json.".into(),
+                    );
+                }
+            }
+            if memory {
+                plan.warnings.push(
+                    "ChatGPT exports do not include memory or custom instructions in a portable form; only conversations were imported.".into(),
+                );
+            }
+        }
         Source::Portable => {
             #[derive(Deserialize)]
             struct Archive {
@@ -408,6 +440,15 @@ fn timestamp(value: Option<&Value>) -> DateTime<Utc> {
                         } else {
                             DateTime::from_timestamp(n, 0)
                         }
+                    })
+                })
+                // ChatGPT exports record `create_time` as fractional epoch
+                // seconds (a JSON float), which `as_i64` rejects.
+                .or_else(|| {
+                    v.as_f64().and_then(|seconds| {
+                        let whole = seconds.trunc() as i64;
+                        let nanos = ((seconds.fract()) * 1_000_000_000.0).round() as u32;
+                        DateTime::from_timestamp(whole, nanos)
                     })
                 })
         })
@@ -672,6 +713,157 @@ fn codex_item(item: &Value, created_at: DateTime<Utc>) -> Option<Message> {
         created_at,
     })
 }
+/// Parse a ChatGPT data export's `conversations.json`.
+///
+/// Each conversation stores its turns as a `mapping` node tree, not a flat
+/// list: a regenerated answer or an edited prompt forks the tree, and the
+/// `current_node` marks the leaf of the branch the user last saw. We walk from
+/// that leaf up through `parent` links so an imported thread is the branch the
+/// user actually kept, in order, rather than every dead-end draft.
+fn chatgpt_export(value: Value, plan: &mut PreparedImport) -> Result<()> {
+    let conversations = value
+        .as_array()
+        .context("expected an array of ChatGPT conversations")?;
+    for conversation in conversations {
+        let Some(mapping) = conversation.get("mapping").and_then(Value::as_object) else {
+            continue;
+        };
+        // Prefer the branch ending at current_node; fall back to the single
+        // childless leaf when the export omits it.
+        let leaf = conversation
+            .get("current_node")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                mapping
+                    .iter()
+                    .find(|(_, node)| {
+                        node.get("children")
+                            .and_then(Value::as_array)
+                            .is_none_or(|children| children.is_empty())
+                    })
+                    .map(|(id, _)| id.clone())
+            });
+        let mut chain = Vec::new();
+        let mut cursor = leaf;
+        let mut guard = 0usize;
+        while let Some(id) = cursor {
+            let Some(node) = mapping.get(&id) else { break };
+            chain.push(node);
+            cursor = node
+                .get("parent")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            guard += 1;
+            if guard > mapping.len() {
+                break; // A malformed export with a parent cycle cannot loop us.
+            }
+        }
+        chain.reverse();
+        let mut messages = Vec::new();
+        for node in chain {
+            let Some(message) = node.get("message").filter(|value| !value.is_null()) else {
+                continue;
+            };
+            let role = message
+                .pointer("/author/role")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            // System and tool nodes are plumbing (custom instructions, tool
+            // plumbing, hidden setup); keep only the human/assistant dialogue.
+            if role != "user" && role != "assistant" {
+                continue;
+            }
+            if message
+                .pointer("/metadata/is_visually_hidden_from_conversation")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let text = chatgpt_message_text(message.get("content"));
+            if text.trim().is_empty() {
+                continue;
+            }
+            messages.push(Message {
+                role: role.to_string(),
+                text,
+                attachments: Vec::new(),
+                created_at: timestamp(message.get("create_time")),
+            });
+        }
+        if messages.is_empty() {
+            continue;
+        }
+        // A stable id keeps repeat imports idempotent. Fall back to the title
+        // and first message when the export omits an id rather than minting a
+        // random one that would re-import as a duplicate next time.
+        let id = [
+            string(conversation, "conversation_id"),
+            string(conversation, "id"),
+        ]
+        .into_iter()
+        .find(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                string(conversation, "title"),
+                messages
+                    .first()
+                    .map(|m| m.text.as_str())
+                    .unwrap_or_default()
+            )
+        });
+        let title = {
+            let raw = string(conversation, "title");
+            if raw.is_empty() {
+                "Untitled ChatGPT conversation".to_string()
+            } else {
+                raw
+            }
+        };
+        plan.threads.push(Thread {
+            id,
+            title,
+            cwd: None,
+            messages,
+        });
+    }
+    Ok(())
+}
+
+/// Flatten a ChatGPT `content` object to text. Text and code parts join with
+/// blank lines; non-text parts (image pointers, DALL·E prompts) become a short
+/// placeholder so the surrounding conversation still reads in order.
+fn chatgpt_message_text(content: Option<&Value>) -> String {
+    let Some(content) = content else {
+        return String::new();
+    };
+    // Some node kinds carry their body outside `parts` (e.g. user editable
+    // context or tool text); handle the common `parts` array first.
+    let parts = match content.get("parts").and_then(Value::as_array) {
+        Some(parts) => parts,
+        None => {
+            return content
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+        }
+    };
+    let mut chunks = Vec::new();
+    for part in parts {
+        if let Some(text) = part.as_str() {
+            if !text.is_empty() {
+                chunks.push(text.to_string());
+            }
+        } else if let Some(kind) = part.get("content_type").and_then(Value::as_str) {
+            chunks.push(format!("[{kind} content omitted on import]"));
+        }
+    }
+    chunks.join("\n\n")
+}
+
 fn claude_export(value: Value, plan: &mut PreparedImport) -> Result<()> {
     let conversations = value
         .as_array()
@@ -939,6 +1131,47 @@ mod tests {
         .unwrap();
         assert_ne!(child.id, thread.id);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn chatgpt_export_follows_the_kept_branch_and_skips_plumbing() {
+        let root = tempfile::tempdir().unwrap();
+        // root(system, hidden) -> u1 -> a1(first answer) and a1b(regenerated).
+        // current_node points at a1b, so the regenerated answer is kept and
+        // the abandoned a1 branch is dropped.
+        let export = serde_json::json!([
+            {
+                "title": "Rust help",
+                "conversation_id": "conv-1",
+                "current_node": "a1b",
+                "mapping": {
+                    "root": {"id":"root","message":{"author":{"role":"system"},"content":{"content_type":"text","parts":[""]},"metadata":{"is_visually_hidden_from_conversation":true}},"parent":null,"children":["u1"]},
+                    "u1": {"id":"u1","message":{"author":{"role":"user"},"create_time":1700000000.5,"content":{"content_type":"text","parts":["How do I read a file?"]}},"parent":"root","children":["a1","a1b"]},
+                    "a1": {"id":"a1","message":{"author":{"role":"assistant"},"content":{"content_type":"text","parts":["first draft"]}},"parent":"u1","children":[]},
+                    "a1b": {"id":"a1b","message":{"author":{"role":"assistant"},"create_time":1700000001.0,"content":{"content_type":"text","parts":["Use std::fs::read_to_string."]}},"parent":"u1","children":[]}
+                }
+            }
+        ]);
+        fs::write(
+            root.path().join("conversations.json"),
+            serde_json::to_vec(&export).unwrap(),
+        )
+        .unwrap();
+        let plan = read(Source::ChatGpt, root.path(), true, false).unwrap();
+        assert_eq!(plan.threads.len(), 1);
+        let thread = &plan.threads[0];
+        assert_eq!(thread.title, "Rust help");
+        assert_eq!(thread.id, "conv-1");
+        let texts: Vec<&str> = thread.messages.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["How do I read a file?", "Use std::fs::read_to_string."]
+        );
+        assert_eq!(thread.messages[0].role, "user");
+        assert_eq!(thread.messages[1].role, "assistant");
+        // The fractional epoch create_time parsed rather than falling back to
+        // the Unix epoch.
+        assert!(thread.messages[0].created_at > DateTime::<Utc>::UNIX_EPOCH);
     }
 
     #[test]

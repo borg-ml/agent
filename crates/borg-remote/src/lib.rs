@@ -34,6 +34,7 @@ mod profiling;
 mod receipt;
 mod runtime_protocol;
 mod schema_migration;
+mod secret_scrub;
 mod self_service;
 mod session;
 mod session_action;

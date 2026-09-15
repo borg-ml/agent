@@ -19,6 +19,8 @@ use uuid::Uuid;
 pub(crate) enum Source {
     #[value(alias = "codex-cli", alias = "codex-desktop")]
     Codex,
+    #[value(alias = "openai", alias = "chat-gpt")]
+    ChatGpt,
     ClaudeCode,
     ClaudeDesktop,
     Portable,
@@ -27,6 +29,7 @@ impl Source {
     pub fn key(self) -> &'static str {
         match self {
             Self::Codex => "codex",
+            Self::ChatGpt => "chatgpt",
             Self::ClaudeCode => "claude-code",
             Self::ClaudeDesktop => "claude-desktop",
             Self::Portable => "portable",
@@ -158,7 +161,7 @@ pub(crate) async fn prepare(args: &ImportArgs) -> Result<PreparedImport> {
     );
     let source = args
         .source
-        .context("choose codex, claude-code, claude-desktop, or portable")?;
+        .context("choose codex, chatgpt, claude-code, claude-desktop, or portable")?;
     let path = args.path.clone().or_else(|| source.default_path()).context(
         "this source needs --path to its export. For Claude Desktop, export data from Settings > Privacy, then choose the downloaded ZIP")?;
     let threads = !args.no_threads;
@@ -420,13 +423,14 @@ pub(crate) async fn run(mut args: ImportArgs) -> Result<()> {
     let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
     if args.source.is_none() && interactive {
         println!(
-            "Import into Borg\n1. Codex CLI / Desktop\n2. Claude Code\n3. Claude Desktop export\n4. Portable JSON"
+            "Import into Borg\n1. Codex CLI / Desktop\n2. ChatGPT export\n3. Claude Code\n4. Claude Desktop export\n5. Portable JSON"
         );
         args.source = Some(match read_line("Source [1]: ")?.as_str() {
             "" | "1" => Source::Codex,
-            "2" => Source::ClaudeCode,
-            "3" => Source::ClaudeDesktop,
-            "4" => Source::Portable,
+            "2" => Source::ChatGpt,
+            "3" => Source::ClaudeCode,
+            "4" => Source::ClaudeDesktop,
+            "5" => Source::Portable,
             _ => bail!("unknown source"),
         });
     }

@@ -8,17 +8,21 @@ Import is also available from `/settings`.
 | Source | Input |
 | --- | --- |
 | Codex CLI / Desktop | Shared Codex home (`CODEX_HOME`, otherwise `~/.codex`): session and archived-session JSONL, memory Markdown, memory database, and instructions |
+| ChatGPT | Downloaded export ZIP or extracted directory containing `conversations.json`. Each conversation's kept branch (the one ending at `current_node`) is imported in order; regenerated/edited dead-ends and hidden system turns are dropped |
 | Claude Code | Claude home (`CLAUDE_CONFIG_DIR`, otherwise `~/.claude`): project transcripts, project memories, and instructions |
 | Claude Desktop | Downloaded export ZIP or extracted export directory, including `conversations.json` and `memories.json` when available |
 | Other apps | Portable JSON described below, optionally packaged with attachments in a ZIP |
 
 Claude Desktop exports are available under **Settings → Privacy → Export data**.
 See [Claude's export instructions](https://support.claude.com/en/articles/9450526-export-your-claude-data).
+ChatGPT exports are available under **Settings → Data controls → Export data**; ChatGPT emails a
+download link to a ZIP that contains `conversations.json`.
 For Desktop and portable sources, the terminal prompts for an export path.
 Quote paths containing spaces, for example:
 
 ```sh
 borg import claude-desktop --path "$HOME/Downloads/Claude export.zip"
+borg import chatgpt --path "$HOME/Downloads/chatgpt-export.zip"
 borg import codex --no-memory
 borg import claude-code --no-threads
 borg import codex --preview --json
