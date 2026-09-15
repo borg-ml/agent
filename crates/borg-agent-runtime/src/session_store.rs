@@ -884,6 +884,9 @@ pub struct SessionState {
     pub pending_provider_interaction_payload: Option<serde_json::Value>,
     pub goal: Option<SessionGoal>,
     pub todos: Vec<PlanItem>,
+    /// Watches armed by the agent; the last `WatchesChanged` snapshot.
+    #[serde(default)]
+    pub watches: Vec<crate::WatchSummary>,
     pub usage: SessionUsage,
     pub first_prompt: Option<String>,
     pub latest_prompt: Option<String>,
@@ -1072,6 +1075,7 @@ impl SessionState {
                 self.pending_provider_interaction_kind = None;
                 self.pending_provider_interaction_payload = None;
             }
+            SessionEventKind::WatchesChanged { watches } => self.watches = watches.clone(),
             SessionEventKind::GoalUpdated { goal } => self.goal = Some(goal.clone()),
             SessionEventKind::GoalCleared { .. } => self.goal = None,
             SessionEventKind::PlanUpdated { items } => self.todos = items.clone(),

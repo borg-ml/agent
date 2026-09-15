@@ -57,12 +57,12 @@ capabilities are discovered from that shell with `borg tools` and invoked with
 `borg call NAME JSON`. Set `capabilities.harness = "native"` only when the
 direct one-tool-per-capability fallback is preferred.
 
-Ask Borg to monitor a log or deployment, for example: “Watch the build log and
-let me know when it fails.” The `monitor` tool runs a background shell command
-and delivers stdout lines automatically, in bounded batches. `list_monitors`
-and `stop_monitor` manage the watches. Monitors last for the current session,
+Ask Borg to watch a log or deployment, for example: “Watch the build log and
+let me know when it fails.” The `watch` tool runs a background shell command
+and delivers stdout lines automatically, in bounded batches. `list_watches`
+and `stop_watch` manage the watches. Watches last for the current session,
 up to 24 hours (or the host's command limit), and stop with their process trees
-when the session ends. A monitor can wake an idle agent; human messages take
+when the session ends. A watch can wake an idle agent; human messages take
 priority, and arriving events are handled at the next turn boundary.
 
 If the provider connection drops, Borg saves the interrupted work and retries

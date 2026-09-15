@@ -16,7 +16,6 @@ mod host_paths;
 mod imported_memory;
 mod local_control;
 mod lsp;
-mod monitor;
 mod native_context;
 mod native_harness;
 mod native_io;
@@ -39,6 +38,7 @@ mod session_lock;
 pub mod session_store;
 mod subagents;
 mod tool_presentation;
+mod watch;
 mod workspace;
 mod workspace_snapshot;
 

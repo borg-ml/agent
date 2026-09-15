@@ -188,7 +188,7 @@ struct BluWorkflowToolContext {
 /// their own goal or collaboration semantics.
 #[derive(Clone)]
 pub struct AgentToolDispatcher {
-    monitors: Option<crate::monitor::Monitors>,
+    watches: Option<crate::watch::Watches>,
     goals: SessionGoalTools,
     todos: SessionTodoTools,
     consultation: Option<SessionConsultationTools>,
@@ -745,7 +745,7 @@ impl AgentToolDispatcher {
                 autonomy,
             });
         Self {
-            monitors: None,
+            watches: None,
             goals,
             todos,
             consultation,
@@ -775,8 +775,8 @@ impl AgentToolDispatcher {
         }
     }
 
-    pub(crate) fn with_monitors(mut self, monitors: crate::monitor::Monitors) -> Self {
-        self.monitors = Some(monitors);
+    pub(crate) fn with_watches(mut self, watches: crate::watch::Watches) -> Self {
+        self.watches = Some(watches);
         self
     }
 
@@ -1437,24 +1437,24 @@ impl AgentToolDispatcher {
                 self.read_workspace_tool(self.execution_provider().as_ref(), name, arguments)
                     .await
             }
-            "monitor" => {
+            "watch" => {
                 ensure!(
                     self.runtime_permission == crate::PermissionMode::FullAccess
                         || workflow_approved,
-                    "monitor requires Full Access or an explicit approval"
+                    "watch requires Full Access or an explicit approval"
                 );
                 let args = serde_json::from_value(arguments)?;
-                let monitors = self
-                    .monitors
+                let watches = self
+                    .watches
                     .as_ref()
-                    .context("monitors are unavailable for this session")?;
+                    .context("watches are unavailable for this session")?;
                 let timeout = self
                     .resource_limits
                     .as_ref()
                     .map(|limits| limits.max_workspace_command_timeout_ms)
                     .unwrap_or(24 * 60 * 60 * 1000);
                 Ok(serde_json::to_value(
-                    monitors
+                    watches
                         .start(
                             self.actor_session_id,
                             &self.runtime_root,
@@ -1465,28 +1465,28 @@ impl AgentToolDispatcher {
                         .await?,
                 )?)
             }
-            "list_monitors" => {
+            "list_watches" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
                 Ok(serde_json::to_value(
-                    self.monitors
+                    self.watches
                         .as_ref()
-                        .context("monitors are unavailable for this session")?
+                        .context("watches are unavailable for this session")?
                         .list()
                         .await,
                 )?)
             }
-            "stop_monitor" => {
+            "stop_watch" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct Args {
-                    monitor_id: Uuid,
+                    watch_id: Uuid,
                 }
                 let args: Args = serde_json::from_value(arguments)?;
                 Ok(serde_json::to_value(
-                    self.monitors
+                    self.watches
                         .as_ref()
-                        .context("monitors are unavailable for this session")?
-                        .stop(args.monitor_id)
+                        .context("watches are unavailable for this session")?
+                        .stop(args.watch_id)
                         .await?,
                 )?)
             }
@@ -5784,8 +5784,8 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
             }),
         ),
         tool(
-            "monitor",
-            "Start a session-scoped background command that watches logs, files, or external status. Each stdout line is delivered to you automatically in bounded batches, including when idle. Use a command that emits only meaningful changes. Do not poll or wait for it. Requires shell approval; runs until stopped, session exit, or 24 hours. Use list_monitors and stop_monitor to manage watches.",
+            "watch",
+            "Start a session-scoped background command that watches logs, files, or external status. Each stdout line is delivered to you automatically in bounded batches, including when idle. Use a command that emits only meaningful changes. Do not poll or wait for it. Requires shell approval; runs until stopped, session exit, or 24 hours. Use list_watches and stop_watch to manage watches.",
             json!({
                 "type": "object", "properties": {
                     "command": {"type": "string", "minLength": 1},
@@ -5795,18 +5795,18 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
             }),
         ),
         tool(
-            "list_monitors",
-            "List this session's background monitors and whether they are running.",
+            "list_watches",
+            "List this session's background watches and whether they are running.",
             json!({
                 "type": "object", "properties": {}, "additionalProperties": false
             }),
         ),
         tool(
-            "stop_monitor",
-            "Stop a background monitor and its process tree.",
+            "stop_watch",
+            "Stop a background watch and its process tree.",
             json!({
-                "type": "object", "properties": {"monitor_id": {"type": "string", "format": "uuid"}},
-                "required": ["monitor_id"], "additionalProperties": false
+                "type": "object", "properties": {"watch_id": {"type": "string", "format": "uuid"}},
+                "required": ["watch_id"], "additionalProperties": false
             }),
         ),
         tool(

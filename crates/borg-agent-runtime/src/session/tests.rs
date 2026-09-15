@@ -11677,7 +11677,7 @@ impl AgentTurnExecutor for MonitorWakeExecutor {
         if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
             turn.agent_tools
                 .call(
-                    "monitor",
+                    "watch",
                     serde_json::json!({
                         "command": "printf 'deployment ready\\n'", "label": "Deployment"
                     }),
@@ -11685,7 +11685,7 @@ impl AgentTurnExecutor for MonitorWakeExecutor {
                 .await?;
         } else {
             assert!(
-                turn.prompt.contains("Monitor event: Deployment"),
+                turn.prompt.contains("Watch event: Deployment"),
                 "{}",
                 turn.prompt
             );
@@ -11744,7 +11744,7 @@ async fn monitor_event_wakes_an_idle_session_without_an_active_goal() {
     while completions < 2 {
         let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
             .await
-            .expect("monitor notification wakes idle agent")
+            .expect("watch notification wakes idle agent")
             .expect("session remains attached");
         if matches!(event.kind, SessionEventKind::TurnCompleted { .. }) {
             completions += 1;

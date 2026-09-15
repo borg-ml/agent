@@ -1748,7 +1748,7 @@ async fn run_agent_session_store_kernel(
     let mut todos = state.todos;
     // Explicit user-stop gate. A human Escape engages it; only an explicit
     // human prompt or goal resume clears it. While engaged, no background
-    // input (team Steer/Queue prompts, queued internal prompts, monitor
+    // input (team Steer/Queue prompts, queued internal prompts, watch
     // events, autonomy jobs, automatic retries) may open a provider turn.
     // Re-engaged from durable state so a reload never overrides the stop.
     let mut user_stop = state.user_stopped;
@@ -1865,10 +1865,10 @@ async fn run_agent_session_store_kernel(
     let workflow_snapshot = executor.extension_workflow_snapshot();
     let workflow_processes = crate::native_process::ProcessManager::default();
     let web_search = executor.web_search_provider();
-    let (monitor_events_tx, mut monitor_events_rx) = mpsc::channel(16);
-    let monitors =
-        crate::monitor::Monitors::new(workflow_processes.clone(), monitor_events_tx, session_id);
-    let _monitor_shutdown = SessionAutonomyShutdown(monitors.cancel.clone());
+    let (watch_events_tx, mut watch_events_rx) = mpsc::channel(16);
+    let watches =
+        crate::watch::Watches::new(workflow_processes.clone(), watch_events_tx, session_id);
+    let _watch_shutdown = SessionAutonomyShutdown(watches.cancel.clone());
     let dispatcher = crate::AgentToolDispatcher::new_with_search(
         goal_tools.clone(),
         todo_tools.clone(),
@@ -1889,7 +1889,7 @@ async fn run_agent_session_store_kernel(
         web_search,
     )
     .with_resource_limits(launch.capabilities.resource_limits.clone())
-    .with_monitors(monitors);
+    .with_watches(watches.clone());
     if let Some(extension_api) = executor.extension_api_snapshot() {
         dispatcher.configure_extension_api(extension_api)?;
     }
@@ -2040,8 +2040,8 @@ async fn run_agent_session_store_kernel(
                     || usage_limit_continuation_id.is_some(),
             ) {
             Some(prompt)
-        } else if !usage_limit_retry_waiting && let Ok(text) = monitor_events_rx.try_recv() {
-            Some(monitor_prompt(text, &mut monitor_events_rx))
+        } else if !usage_limit_retry_waiting && let Ok(text) = watch_events_rx.try_recv() {
+            Some(watch_prompt(text, &mut watch_events_rx))
         } else if !usage_limit_retry_waiting
             && !user_stop
             && let Some(active_goal) = goal
@@ -2083,170 +2083,181 @@ async fn run_agent_session_store_kernel(
             loop {
                 let usage_limit_wait = wait_for_retry_deadline(retry_not_before);
                 let command = tokio::select! {
-                    biased;
-                    _ = usage_limit_wait, if retry_not_before.is_some() => {
-                        retry_not_before = None;
-                        let goal_is_active = goal.as_ref().is_some_and(|goal| goal.status == GoalStatus::Active);
-                        break pop_next_pending_prompt(&mut pending, goal_is_active || network_retry_message_id.is_some() || usage_limit_continuation_id.is_some()).or_else(|| {
-                            (!user_stop).then_some(()).and_then(|()| goal.as_ref()
-                                .filter(|goal| goal_allows_automatic_continuation(goal)))
-                                .map(|active_goal| QueuedPrompt {
-                                    message_id: Uuid::new_v4(),
-                                    text: continuation_prompt(active_goal),
-                                    actor: EventActor::System,
-                                    attachments: Vec::new(),
-                                    output_schema: None,
-                                    delivery: PromptDelivery::Queue,
-                                    visible: false,
-                                    interrupt_batch: false,
-                                    batch: Vec::new(),
-                                })
-                        });
-                    }
-                    command = next_host_command(&mut deferred_commands, &mut commands) => command,
-                    Some(text) = monitor_events_rx.recv(), if retry_not_before.is_none() => {
-                        break Some(monitor_prompt(text, &mut monitor_events_rx));
-                    }
-                    message = root_message_rx.recv(), if owns_team => {
-                        match message {
-                            Ok(message) => {
-                                team_message_ids.insert(message.message_id);
-                                Some(HostCommand::TeamPrompt {
-                                    session_id,
-                                    message_id: message.message_id,
-                                    text: message.text,
-                                    attachments: Vec::new(),
-                                    output_schema: None,
-                                    delivery: message.delivery,
-                                })
-                            }
-                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                            Err(broadcast::error::RecvError::Closed) => continue,
-                        }
-                    }
-                    activity = subagent_activity_rx.recv(), if owns_team => {
-                        if let Ok(activity) = activity {
-                            record_subagent_activity(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                subagents.as_ref().expect("team activity requires coordinator"),
-                                activity,
-                            ).await?;
-                        }
-                        continue;
-                    }
-                    _ = root_inbox_tick.tick(), if owns_team => {
-                        refresh_durable_root_inbox(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            subagents.as_ref().expect("team inbox requires coordinator"),
-                        ).await?;
-                        continue;
-                    }
-                    Some(providers) = capability_refresh_rx.recv() => {
-                        if launch.capabilities.provider_capabilities != providers {
-                            launch.capabilities.provider_capabilities = providers.clone();
-                            record(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                SessionEventKind::ProviderCapabilitiesUpdated { providers },
-                            )
-                            .await?;
-                        }
-                        continue;
-                    }
-                    autonomy = autonomy_dispatch_rx.recv() => {
-                        let Some(dispatch) = autonomy else {
-                            continue;
-                        };
-                        if user_stop {
-                            // Blu workflows never reach the admission funnel.
-                            let _ = dispatch.result.send(Err(anyhow::anyhow!(
-                                "session stopped by the user; autonomy job was not run"
-                            )));
-                            continue;
-                        }
-                        if dispatch.job.kind == "blu_workflow" {
-                            let request = match autonomy_blu_workflow(&dispatch.job, session_id) {
-                                Ok(request) => request,
-                                Err(error) => {
-                                    let _ = dispatch.result.send(Err(error));
-                                    continue;
-                                }
-                            };
-                            let Some(autonomy_store) = workflow_autonomy_store.clone() else {
-                                let _ = dispatch.result.send(Err(anyhow::anyhow!(
-                                    "Blu workflow jobs require durable autonomy storage"
-                                )));
-                                continue;
-                            };
-                            let workflow_store = autonomy_store.session_store();
-                            let runner = crate::blu_workflow::BluWorkflowRunner::new(
-                                session_id,
-                                workflow_store,
-                                autonomy_store,
-                                Some(dispatcher.clone()),
-                                workflow_processes.clone(),
-                                launch.cwd.clone(),
-                                launch.permission_mode,
-                            );
-                            tokio::spawn(async move {
-                                let result = runner.run(request).await.and_then(|result| {
-                                    if result.success {
-                                        Ok(serde_json::to_value(result)?)
-                                    } else {
-                                        Err(anyhow::anyhow!(result.error.unwrap_or_else(|| {
-                                            "Blu workflow completed unsuccessfully".to_string()
-                                        })))
+                                    biased;
+                                    _ = usage_limit_wait, if retry_not_before.is_some() => {
+                                        retry_not_before = None;
+                                        let goal_is_active = goal.as_ref().is_some_and(|goal| goal.status == GoalStatus::Active);
+                                        break pop_next_pending_prompt(&mut pending, goal_is_active || network_retry_message_id.is_some() || usage_limit_continuation_id.is_some()).or_else(|| {
+                                            (!user_stop).then_some(()).and_then(|()| goal.as_ref()
+                                                .filter(|goal| goal_allows_automatic_continuation(goal)))
+                                                .map(|active_goal| QueuedPrompt {
+                                                    message_id: Uuid::new_v4(),
+                                                    text: continuation_prompt(active_goal),
+                                                    actor: EventActor::System,
+                                                    attachments: Vec::new(),
+                                                    output_schema: None,
+                                                    delivery: PromptDelivery::Queue,
+                                                    visible: false,
+                                                    interrupt_batch: false,
+                                                    batch: Vec::new(),
+                                                })
+                                        });
                                     }
-                                });
-                                let _ = dispatch.result.send(result);
-                            });
-                            continue;
-                        }
-                        let job_id = dispatch.job.job_id;
-                        let mut text = match autonomy_job_prompt(&dispatch.job, session_id) {
-                            Ok(text) => text,
-                            Err(error) => {
-                                let _ = dispatch.result.send(Err(error));
-                                continue;
-                            }
-                        };
-                        if dispatch.job.attempt > 1
-                            && let Some(autonomy_store) = workflow_autonomy_store.as_ref()
-                        {
-                            match autonomy_store.list_checkpoints(job_id).await {
-                                Ok(checkpoints) => {
-                                    text = autonomy_retry_prompt(
-                                        text,
-                                        dispatch.job.attempt,
-                                        &checkpoints,
-                                    );
-                                }
-                                Err(error) => {
-                                    tracing::warn!(
-                                        %job_id,
-                                        %error,
-                                        "autonomy checkpoints unavailable for the retry prompt"
-                                    );
-                                }
-                            }
-                        }
-                        autonomy_prompt_ids.insert(job_id);
-                        autonomy_completions.insert(job_id, dispatch.result);
-                        Some(HostCommand::Prompt {
-                            session_id,
-                            message_id: job_id,
-                            text,
-                            attachments: Vec::new(),
-                            output_schema: None,
-                            delivery: PromptDelivery::Queue,
-                        })
-                    }
-                };
+                                    command = next_host_command(&mut deferred_commands, &mut commands) => command,
+                                    _ = watches.changed.notified() => {
+                                        let snapshot = watches.summaries().await;
+                                        record(
+                                            &mut journal,
+                                            &events,
+                                            session_id,
+                                            SessionEventKind::WatchesChanged { watches: snapshot },
+                                        )
+                                        .await?;
+                                        continue;
+                                    }
+                Some(text) = watch_events_rx.recv(), if retry_not_before.is_none() => {
+                                        break Some(watch_prompt(text, &mut watch_events_rx));
+                                    }
+                                    message = root_message_rx.recv(), if owns_team => {
+                                        match message {
+                                            Ok(message) => {
+                                                team_message_ids.insert(message.message_id);
+                                                Some(HostCommand::TeamPrompt {
+                                                    session_id,
+                                                    message_id: message.message_id,
+                                                    text: message.text,
+                                                    attachments: Vec::new(),
+                                                    output_schema: None,
+                                                    delivery: message.delivery,
+                                                })
+                                            }
+                                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                            Err(broadcast::error::RecvError::Closed) => continue,
+                                        }
+                                    }
+                                    activity = subagent_activity_rx.recv(), if owns_team => {
+                                        if let Ok(activity) = activity {
+                                            record_subagent_activity(
+                                                &mut journal,
+                                                &events,
+                                                session_id,
+                                                subagents.as_ref().expect("team activity requires coordinator"),
+                                                activity,
+                                            ).await?;
+                                        }
+                                        continue;
+                                    }
+                                    _ = root_inbox_tick.tick(), if owns_team => {
+                                        refresh_durable_root_inbox(
+                                            &mut journal,
+                                            &events,
+                                            session_id,
+                                            subagents.as_ref().expect("team inbox requires coordinator"),
+                                        ).await?;
+                                        continue;
+                                    }
+                                    Some(providers) = capability_refresh_rx.recv() => {
+                                        if launch.capabilities.provider_capabilities != providers {
+                                            launch.capabilities.provider_capabilities = providers.clone();
+                                            record(
+                                                &mut journal,
+                                                &events,
+                                                session_id,
+                                                SessionEventKind::ProviderCapabilitiesUpdated { providers },
+                                            )
+                                            .await?;
+                                        }
+                                        continue;
+                                    }
+                                    autonomy = autonomy_dispatch_rx.recv() => {
+                                        let Some(dispatch) = autonomy else {
+                                            continue;
+                                        };
+                                        if user_stop {
+                                            // Blu workflows never reach the admission funnel.
+                                            let _ = dispatch.result.send(Err(anyhow::anyhow!(
+                                                "session stopped by the user; autonomy job was not run"
+                                            )));
+                                            continue;
+                                        }
+                                        if dispatch.job.kind == "blu_workflow" {
+                                            let request = match autonomy_blu_workflow(&dispatch.job, session_id) {
+                                                Ok(request) => request,
+                                                Err(error) => {
+                                                    let _ = dispatch.result.send(Err(error));
+                                                    continue;
+                                                }
+                                            };
+                                            let Some(autonomy_store) = workflow_autonomy_store.clone() else {
+                                                let _ = dispatch.result.send(Err(anyhow::anyhow!(
+                                                    "Blu workflow jobs require durable autonomy storage"
+                                                )));
+                                                continue;
+                                            };
+                                            let workflow_store = autonomy_store.session_store();
+                                            let runner = crate::blu_workflow::BluWorkflowRunner::new(
+                                                session_id,
+                                                workflow_store,
+                                                autonomy_store,
+                                                Some(dispatcher.clone()),
+                                                workflow_processes.clone(),
+                                                launch.cwd.clone(),
+                                                launch.permission_mode,
+                                            );
+                                            tokio::spawn(async move {
+                                                let result = runner.run(request).await.and_then(|result| {
+                                                    if result.success {
+                                                        Ok(serde_json::to_value(result)?)
+                                                    } else {
+                                                        Err(anyhow::anyhow!(result.error.unwrap_or_else(|| {
+                                                            "Blu workflow completed unsuccessfully".to_string()
+                                                        })))
+                                                    }
+                                                });
+                                                let _ = dispatch.result.send(result);
+                                            });
+                                            continue;
+                                        }
+                                        let job_id = dispatch.job.job_id;
+                                        let mut text = match autonomy_job_prompt(&dispatch.job, session_id) {
+                                            Ok(text) => text,
+                                            Err(error) => {
+                                                let _ = dispatch.result.send(Err(error));
+                                                continue;
+                                            }
+                                        };
+                                        if dispatch.job.attempt > 1
+                                            && let Some(autonomy_store) = workflow_autonomy_store.as_ref()
+                                        {
+                                            match autonomy_store.list_checkpoints(job_id).await {
+                                                Ok(checkpoints) => {
+                                                    text = autonomy_retry_prompt(
+                                                        text,
+                                                        dispatch.job.attempt,
+                                                        &checkpoints,
+                                                    );
+                                                }
+                                                Err(error) => {
+                                                    tracing::warn!(
+                                                        %job_id,
+                                                        %error,
+                                                        "autonomy checkpoints unavailable for the retry prompt"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        autonomy_prompt_ids.insert(job_id);
+                                        autonomy_completions.insert(job_id, dispatch.result);
+                                        Some(HostCommand::Prompt {
+                                            session_id,
+                                            message_id: job_id,
+                                            text,
+                                            attachments: Vec::new(),
+                                            output_schema: None,
+                                            delivery: PromptDelivery::Queue,
+                                        })
+                                    }
+                                };
                 match command {
                     Some(HostCommand::TeamPrompt {
                         session_id: command_session_id,
@@ -2583,6 +2594,20 @@ async fn run_agent_session_store_kernel(
                             action,
                         )
                         .await?;
+                    }
+                    Some(HostCommand::StopWatch {
+                        session_id: command_session_id,
+                        watch_id,
+                    }) if command_session_id == session_id => {
+                        stop_watch_for_frontend(
+                            &watches,
+                            watch_id,
+                            &mut journal,
+                            &events,
+                            session_id,
+                        )
+                        .await?;
+                        continue;
                     }
                     Some(HostCommand::Compact {
                         session_id: command_session_id,
@@ -4230,6 +4255,16 @@ async fn run_agent_session_store_kernel(
                     ));
                     break;
                 }
+                _ = watches.changed.notified() => {
+                    let snapshot = watches.summaries().await;
+                    record(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        SessionEventKind::WatchesChanged { watches: snapshot },
+                    )
+                    .await?;
+                }
                 steer_result = steer_results.recv(), if !pending_steers.is_empty() => {
                     let Some((acknowledgement_id, acknowledgement)) = steer_result else {
                         continue;
@@ -4787,6 +4822,16 @@ async fn run_agent_session_store_kernel(
                             ).await?;
                             interrupted = true;
                             batch_pending_after_interrupt = true;
+                        }
+                        HostCommand::StopWatch { watch_id, .. } => {
+                            stop_watch_for_frontend(
+                                &watches,
+                                watch_id,
+                                &mut journal,
+                                &events,
+                                session_id,
+                            )
+                            .await?;
                         }
                         HostCommand::Interrupt { .. } => {
                             pause_active_goal(
@@ -6705,7 +6750,37 @@ fn recall_withdrawable_steers(
     recalled
 }
 
-fn monitor_prompt(mut text: String, receiver: &mut mpsc::Receiver<String>) -> QueuedPrompt {
+/// A frontend asked to stop a watch (watches panel). Failures are visible
+/// errors, and the refreshed watch list is published either way.
+async fn stop_watch_for_frontend(
+    watches: &crate::watch::Watches,
+    watch_id: Uuid,
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+) -> Result<()> {
+    if let Err(error) = watches.stop(watch_id).await {
+        record(
+            journal,
+            events,
+            session_id,
+            SessionEventKind::Error {
+                message: format!("could not stop watch {watch_id}: {error:#}"),
+            },
+        )
+        .await?;
+    }
+    let snapshot = watches.summaries().await;
+    record(
+        journal,
+        events,
+        session_id,
+        SessionEventKind::WatchesChanged { watches: snapshot },
+    )
+    .await
+}
+
+fn watch_prompt(mut text: String, receiver: &mut mpsc::Receiver<String>) -> QueuedPrompt {
     while text.len() < 48 * 1024 {
         let Ok(next) = receiver.try_recv() else {
             break;

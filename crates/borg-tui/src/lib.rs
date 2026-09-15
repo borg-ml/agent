@@ -26,11 +26,11 @@ use borg_remote::{
     PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, ResponseLanguage, SessionEvent,
     SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef, SessionState,
     SessionStatus, SubagentActivityKind, SubagentSnapshot, SubagentStatus,
-    ToolPresentationCategory, compact_text, edit_is_awaiting_diff, is_diff_language, is_edit_tool,
-    is_mcp_resource_probe, is_subagent_tool, project_tool_presentation, tool_action_is_instant,
-    tool_can_start_background_process, tool_has_rich_ui, tool_output_background_handle,
-    tool_output_code_view, tool_process_followup_handle, tool_process_output_text,
-    web_search_query,
+    ToolPresentationCategory, WatchSummary, compact_text, edit_is_awaiting_diff, is_diff_language,
+    is_edit_tool, is_mcp_resource_probe, is_subagent_tool, project_tool_presentation,
+    tool_action_is_instant, tool_can_start_background_process, tool_has_rich_ui,
+    tool_output_background_handle, tool_output_code_view, tool_process_followup_handle,
+    tool_process_output_text, web_search_query,
 };
 #[cfg(test)]
 use borg_remote::{tool_call_summary, tool_code_view};
@@ -815,6 +815,8 @@ pub enum LidSleepAuthorizationChoice {
 #[derive(Debug)]
 pub enum UiAction {
     None,
+    /// Stop a watch from the watches panel.
+    StopWatch(Uuid),
     ToggleGoal {
         action: GoalAction,
     },
@@ -1532,6 +1534,11 @@ pub struct BorgTerminal {
     shell_menu_open: bool,
     shell_row_hit_areas: Vec<(Rect, Option<usize>)>,
     hovered_shell_row: Option<usize>,
+    watch_status_area: Option<Rect>,
+    watch_status_hovered: bool,
+    watch_menu_open: bool,
+    watch_row_hit_areas: Vec<(Rect, Uuid)>,
+    hovered_watch_row: Option<usize>,
     agents_status_area: Option<Rect>,
     agents_status_hovered: bool,
     model_status_area: Option<Rect>,
@@ -2604,6 +2611,11 @@ impl BorgTerminal {
             shell_menu_open: false,
             shell_row_hit_areas: Vec::new(),
             hovered_shell_row: None,
+            watch_status_area: None,
+            watch_status_hovered: false,
+            watch_menu_open: false,
+            watch_row_hit_areas: Vec::new(),
+            hovered_watch_row: None,
             agents_status_area: None,
             agents_status_hovered: false,
             model_status_area: None,
@@ -2754,6 +2766,11 @@ impl BorgTerminal {
         self.shell_menu_open = false;
         self.shell_row_hit_areas.clear();
         self.hovered_shell_row = None;
+        self.watch_status_area = None;
+        self.watch_status_hovered = false;
+        self.watch_menu_open = false;
+        self.watch_row_hit_areas.clear();
+        self.hovered_watch_row = None;
         self.agents_status_area = None;
         self.agents_status_hovered = false;
         self.model_status_area = None;
@@ -3908,6 +3925,8 @@ impl BorgTerminal {
         self.todo_status_hovered = false;
         self.shell_status_hovered = false;
         self.hovered_shell_row = None;
+        self.watch_status_hovered = false;
+        self.hovered_watch_row = None;
         self.agents_status_hovered = false;
         self.model_status_hovered = false;
         self.effort_status_hovered = false;
@@ -4972,6 +4991,13 @@ impl BorgTerminal {
                     .shell_row_hit_areas
                     .iter()
                     .position(|(area, _)| area.contains(pointer));
+                self.watch_status_hovered = self
+                    .watch_status_area
+                    .is_some_and(|area| area.contains(pointer));
+                self.hovered_watch_row = self
+                    .watch_row_hit_areas
+                    .iter()
+                    .position(|(area, _)| area.contains(pointer));
                 self.agents_status_hovered = self
                     .agents_status_area
                     .is_some_and(|area| area.contains(pointer));
@@ -5134,6 +5160,18 @@ impl BorgTerminal {
                                     run: None,
                                 },
                             ));
+                        }
+                        if self
+                            .watch_status_area
+                            .is_some_and(|area| area.contains(pointer))
+                        {
+                            self.watch_menu_open = !self.watch_menu_open;
+                            return Ok(UiAction::None);
+                        }
+                        if let Some(row) = self.hovered_watch_row
+                            && let Some((_, watch_id)) = self.watch_row_hit_areas.get(row)
+                        {
+                            return Ok(UiAction::StopWatch(*watch_id));
                         }
                         if self
                             .todo_status_area
@@ -6660,6 +6698,11 @@ impl BorgTerminal {
         if shell_rows.is_empty() {
             self.shell_menu_open = false;
         }
+        let watch_status = self.transcript.watch_status();
+        let watch_rows = self.transcript.watch_rows();
+        if watch_rows.is_empty() {
+            self.watch_menu_open = false;
+        }
         let todo_status = self.transcript.todo_status();
         let slash_suggestions = (self.picker.is_none())
             .then(|| slash_suggestion_lines(&self.composer.text, self.slash_selection))
@@ -6998,6 +7041,8 @@ impl BorgTerminal {
         let mut next_permission_status_area = None;
         let mut next_team_roster_hit_areas = Vec::new();
         let mut next_shell_row_hit_areas = Vec::new();
+        let mut next_watch_status_area = None;
+        let mut next_watch_row_hit_areas: Vec<(Rect, Uuid)> = Vec::new();
         let mut next_back_to_director_area = None;
         let mut next_keybindings_hint_area = None;
         let mut next_dictation_button_area = None;
@@ -7105,11 +7150,15 @@ impl BorgTerminal {
             });
             next_composer_area = Some(composer_area);
             if !is_launch_screen
-                && (billing_status.is_some() || shell_status.is_some() || todo_status.is_some())
+                && (billing_status.is_some()
+                    || shell_status.is_some()
+                    || watch_status.is_some()
+                    || todo_status.is_some())
             {
                 let combined_status = footer_status_text(
                     billing_status.as_deref(),
                     shell_status.as_deref(),
+                    watch_status.as_deref(),
                     todo_status.as_deref(),
                 );
                 let metadata_width =
@@ -7118,32 +7167,32 @@ impl BorgTerminal {
                 let metadata_x = footer_area.right().saturating_sub(visible_metadata_width);
                 // Billing leads the metadata, so the interactive shell/todo
                 // hit areas start after it.
+                let interactive_follow =
+                    shell_status.is_some() || watch_status.is_some() || todo_status.is_some();
                 let billing_prefix_width = billing_status
                     .as_deref()
-                    .filter(|_| shell_status.is_some() || todo_status.is_some())
+                    .filter(|_| interactive_follow)
                     .map(|status| status.width() + STATUS_SEPARATOR.width())
                     .unwrap_or(0) as u16;
-                let metadata_x = metadata_x.saturating_add(billing_prefix_width);
-                if let Some(shell_status) = shell_status.as_deref() {
-                    next_shell_status_area = Some(Rect {
-                        x: metadata_x,
+                // Tokens are laid out left to right; each interactive token's
+                // hit area starts after everything before it.
+                let mut cursor_x = metadata_x.saturating_add(billing_prefix_width);
+                let mut place = |status: Option<&str>| -> Option<Rect> {
+                    let status = status?;
+                    let area = Rect {
+                        x: cursor_x,
                         y: footer_area.y,
-                        width: (shell_status.width() as u16).min(visible_metadata_width),
+                        width: (status.width() as u16).min(visible_metadata_width),
                         height: 1,
-                    });
-                }
-                if let Some(todo_status) = todo_status.as_deref() {
-                    let shell_prefix_width = shell_status
-                        .as_deref()
-                        .map(|status| status.width() + STATUS_SEPARATOR.width())
-                        .unwrap_or(0) as u16;
-                    next_todo_status_area = Some(Rect {
-                        x: metadata_x.saturating_add(shell_prefix_width),
-                        y: footer_area.y,
-                        width: (todo_status.width() as u16).min(visible_metadata_width),
-                        height: 1,
-                    });
-                }
+                    };
+                    cursor_x = cursor_x
+                        .saturating_add(status.width() as u16)
+                        .saturating_add(STATUS_SEPARATOR.width() as u16);
+                    Some(area)
+                };
+                next_shell_status_area = place(shell_status.as_deref());
+                next_watch_status_area = place(watch_status.as_deref());
+                next_todo_status_area = place(todo_status.as_deref());
             }
             if !is_launch_screen {
                 frame.render_widget(
@@ -8120,6 +8169,59 @@ impl BorgTerminal {
                     ));
                 }
             }
+            if (self.watch_menu_open || self.hovered_watch_row.is_some()) && !watch_rows.is_empty()
+            {
+                let tooltip_width = watch_rows
+                    .iter()
+                    .map(|(row, _)| row.width() as u16)
+                    .max()
+                    .unwrap_or(24)
+                    .saturating_add(4)
+                    .clamp(30, status_area.width.min(110));
+                let tooltip_height = (watch_rows.len() as u16)
+                    .saturating_add(2)
+                    .min(status_area.y.saturating_sub(area.y).max(1));
+                let watch_anchor = next_watch_status_area.unwrap_or(status_area);
+                let tooltip = Rect {
+                    x: watch_anchor
+                        .x
+                        .min(area.right().saturating_sub(tooltip_width)),
+                    y: watch_anchor.y.saturating_sub(tooltip_height),
+                    width: tooltip_width,
+                    height: tooltip_height,
+                };
+                frame.render_widget(Clear, tooltip);
+                let lines = watch_rows
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (row, _))| {
+                        Line::from(format!("  {row}"))
+                            .style(shell_row_style(self.hovered_watch_row == Some(index)))
+                    })
+                    .collect::<Vec<_>>();
+                frame.render_widget(
+                    Paragraph::new(lines)
+                        .style(Style::default().fg(Color::White).bg(COMMAND_PANEL_BG))
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().fg(Color::Yellow))
+                                .title(" Watches · click to stop "),
+                        ),
+                    tooltip,
+                );
+                for (index, (_, watch_id)) in watch_rows.iter().enumerate() {
+                    next_watch_row_hit_areas.push((
+                        Rect {
+                            x: tooltip.x.saturating_add(1),
+                            y: tooltip.y.saturating_add(1 + index as u16),
+                            width: tooltip.width.saturating_sub(2),
+                            height: 1,
+                        },
+                        *watch_id,
+                    ));
+                }
+            }
             if self.todo_status_hovered && !self.transcript.todos.is_empty() {
                 let rows = self
                     .transcript
@@ -8223,6 +8325,7 @@ impl BorgTerminal {
                     &footer_status_text(
                         billing_status.as_deref(),
                         shell_status.as_deref(),
+                        watch_status.as_deref(),
                         todo_status.as_deref(),
                     ),
                     &cwd_status,
@@ -8249,14 +8352,17 @@ impl BorgTerminal {
                 if footer_metadata.is_some() && metadata_width > 0 {
                     let metadata_line = if billing_status.is_some()
                         || shell_status.is_some()
+                        || watch_status.is_some()
                         || todo_status.is_some()
                     {
                         footer_shell_todo_metadata_line(
                             billing_status.as_deref(),
                             shell_status.as_deref(),
+                            watch_status.as_deref(),
                             todo_status.as_deref(),
                             &cwd_status,
                             self.shell_status_hovered,
+                            self.watch_status_hovered,
                             self.todo_status_hovered,
                             metadata_width as usize,
                         )
@@ -8479,6 +8585,7 @@ impl BorgTerminal {
                     &footer_status_text(
                         billing_status.as_deref(),
                         shell_status.as_deref(),
+                        watch_status.as_deref(),
                         todo_status.as_deref(),
                     ),
                     &cwd_status,
@@ -8536,6 +8643,7 @@ impl BorgTerminal {
         if picker_open || self.keybindings_open {
             next_team_roster_hit_areas.clear();
             next_shell_row_hit_areas.clear();
+            next_watch_row_hit_areas.clear();
         }
         self.scrollbar_area = next_scrollbar_area;
         self.scrollbar_thumb_area = next_scrollbar_thumb_area;
@@ -8558,6 +8666,8 @@ impl BorgTerminal {
         self.todo_status_area = next_todo_status_area;
         self.shell_status_area = next_shell_status_area;
         self.shell_row_hit_areas = next_shell_row_hit_areas;
+        self.watch_status_area = next_watch_status_area;
+        self.watch_row_hit_areas = next_watch_row_hit_areas;
         self.agents_status_area = next_agents_status_area;
         self.model_status_area = next_model_status_area;
         self.effort_status_area = next_effort_status_area;
@@ -10952,6 +11062,7 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         | SessionEventKind::ContextWindowUpdated { .. }
         | SessionEventKind::UserStopChanged { .. }
         | SessionEventKind::SubagentControl { .. }
+        | SessionEventKind::WatchesChanged { .. }
         | SessionEventKind::ProviderSessionLinked { .. }
         | SessionEventKind::RuntimeProcessStarted { .. }
         | SessionEventKind::RuntimeProcessOutput { .. }
@@ -13426,9 +13537,10 @@ fn footer_metadata_line(
 fn footer_status_text(
     billing_status: Option<&str>,
     shell_status: Option<&str>,
+    watch_status: Option<&str>,
     todo_status: Option<&str>,
 ) -> String {
-    [billing_status, shell_status, todo_status]
+    [billing_status, shell_status, watch_status, todo_status]
         .into_iter()
         .flatten()
         .filter(|status| !status.is_empty())
@@ -13471,16 +13583,19 @@ fn footer_todo_metadata_line(
     ])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn footer_shell_todo_metadata_line(
     billing_status: Option<&str>,
     shell_status: Option<&str>,
+    watch_status: Option<&str>,
     todo_status: Option<&str>,
     cwd_status: &str,
     shell_hovered: bool,
+    watch_hovered: bool,
     todo_hovered: bool,
     max_width: usize,
 ) -> Line<'static> {
-    let status = footer_status_text(billing_status, shell_status, todo_status);
+    let status = footer_status_text(billing_status, shell_status, watch_status, todo_status);
     let metadata = footer_metadata_text(&status, cwd_status, max_width);
     if !metadata.starts_with(&status) {
         return Line::from(Span::styled(metadata, Style::default().fg(Color::Gray)));
@@ -13494,40 +13609,25 @@ fn footer_shell_todo_metadata_line(
                 Modifier::empty()
             })
     };
-    let mut spans = Vec::new();
     // Billing is always visible so a switch between a subscription and
     // pay-as-you-go credentials is never silent. It sits on the footer row,
     // away from the effort level, so a "max sub" plan never reads as "max"
-    // effort.
-    if let Some(billing) = billing_status {
-        spans.push(Span::styled(
-            billing.to_string(),
-            Style::default().fg(billing_status_color(billing)),
-        ));
-        if shell_status.is_some() || todo_status.is_some() {
+    // effort. Interactive tokens (shells, watches, to-dos) follow it.
+    let parts = [
+        billing_status.map(|billing| (billing, Style::default().fg(billing_status_color(billing)))),
+        shell_status.map(|shell| (shell, interactive_style(shell_hovered, USER_LABEL_BLUE))),
+        watch_status.map(|watch| (watch, interactive_style(watch_hovered, Color::Yellow))),
+        todo_status.map(|todo| (todo, interactive_style(todo_hovered, Color::LightGreen))),
+    ];
+    let mut spans = Vec::new();
+    for (text, style) in parts.into_iter().flatten() {
+        if !spans.is_empty() {
             spans.push(Span::styled(
                 STATUS_SEPARATOR,
                 Style::default().fg(Color::Gray),
             ));
         }
-    }
-    if let Some(shell) = shell_status {
-        spans.push(Span::styled(
-            shell.to_string(),
-            interactive_style(shell_hovered, USER_LABEL_BLUE),
-        ));
-    }
-    if shell_status.is_some() && todo_status.is_some() {
-        spans.push(Span::styled(
-            STATUS_SEPARATOR,
-            Style::default().fg(Color::Gray),
-        ));
-    }
-    if let Some(todo) = todo_status {
-        spans.push(Span::styled(
-            todo.to_string(),
-            interactive_style(todo_hovered, Color::LightGreen),
-        ));
+        spans.push(Span::styled(text.to_string(), style));
     }
     spans.push(Span::styled(
         metadata[status.len()..].to_string(),

@@ -4850,6 +4850,15 @@ async fn run_local_agent_session(
                             );
                         }
                     }
+                    UiAction::StopWatch(watch_id) => {
+                        dispatch_ui_command(
+                            &ui_interaction_tx,
+                            HostCommand::StopWatch {
+                                session_id,
+                                watch_id,
+                            },
+                        );
+                    }
                     UiAction::FlushPendingInput { target, prompt } => {
                         if let Some((message_id, text, attachments)) = prompt {
                             let command = target.map_or_else(
@@ -9693,6 +9702,7 @@ fn remote_command_name(command: &HostCommand) -> &'static str {
         HostCommand::ExtensionCommand { .. } => "extension command",
         HostCommand::Subagent { .. } => "subagent",
         HostCommand::Interrupt { .. } => "interrupt",
+        HostCommand::StopWatch { .. } => "stop watch",
         HostCommand::Compact { .. } => "compact",
         HostCommand::ClearContext { .. } => "clear context",
         HostCommand::Stop { .. } => "stop",

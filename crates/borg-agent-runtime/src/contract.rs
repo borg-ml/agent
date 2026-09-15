@@ -1188,6 +1188,11 @@ pub enum HostCommand {
     Interrupt {
         session_id: Uuid,
     },
+    /// Stop a watch the agent armed with the `watch` tool.
+    StopWatch {
+        session_id: Uuid,
+        watch_id: Uuid,
+    },
     Compact {
         session_id: Uuid,
     },
@@ -1233,6 +1238,7 @@ impl HostCommand {
             | Self::ExtensionCommand { session_id, .. }
             | Self::Subagent { session_id, .. }
             | Self::Interrupt { session_id }
+            | Self::StopWatch { session_id, .. }
             | Self::Compact { session_id }
             | Self::ClearContext { session_id }
             | Self::Stop { session_id } => Some(*session_id),
@@ -1375,6 +1381,22 @@ impl SubagentAction {
             | Self::Approve { request_id, .. } => *request_id,
         }
     }
+}
+
+/// A watch armed by the agent (`watch` tool): a long-running command whose
+/// output lines are delivered to the session as events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct WatchSummary {
+    pub watch_id: Uuid,
+    pub label: String,
+    pub command: String,
+    pub running: bool,
+    #[ts(type = "string")]
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    #[ts(type = "string | null")]
+    pub last_event_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub event_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -2230,6 +2252,11 @@ pub enum SessionEventKind {
         context_window_tokens: u64,
     },
     ContextCleared,
+    /// The set of watches armed in this session changed (started, emitted,
+    /// exited, or stopped). Carries the full current list.
+    WatchesChanged {
+        watches: Vec<WatchSummary>,
+    },
     GoalUpdated {
         goal: SessionGoal,
     },
@@ -2246,7 +2273,7 @@ pub enum SessionEventKind {
     /// human Escape (turn boundary, active turn, or idle reconnect wait);
     /// cleared only by an explicit human prompt or an explicit goal resume.
     /// While engaged, no background input (team Steer/Queue prompts, queued
-    /// internal prompts, monitor events, autonomy jobs, automatic retries)
+    /// internal prompts, watch events, autonomy jobs, automatic retries)
     /// may open a provider turn. Survives session-actor reload so the
     /// NEVER-override-Escape contract holds across restarts.
     UserStopChanged {

@@ -125,6 +125,10 @@ struct Transcript {
     live_turn_closed: bool,
     subagents: HashMap<Uuid, SubagentStatus>,
     subagent_snapshots: HashMap<Uuid, SubagentSnapshot>,
+    /// Watches the agent armed (last `WatchesChanged` snapshot).
+    pub(crate) watches: Vec<WatchSummary>,
+    /// Watch events already materialised as transcript rows.
+    watch_messages: HashSet<Uuid>,
     subagent_entries: HashMap<Uuid, usize>,
     agent_messages: HashSet<Uuid>,
     agent_message_senders: HashSet<Uuid>,
@@ -227,6 +231,8 @@ impl Default for Transcript {
             live_turn_closed: false,
             subagents: HashMap::new(),
             subagent_snapshots: HashMap::new(),
+            watches: Vec::new(),
+            watch_messages: HashSet::new(),
             subagent_entries: HashMap::new(),
             agent_messages: HashSet::new(),
             agent_message_senders: HashSet::new(),
@@ -531,6 +537,7 @@ impl Transcript {
     fn seed_session_state(&mut self, state: &SessionState) {
         self.goal = state.goal.clone();
         self.todos = state.todos.clone();
+        self.watches = state.watches.clone();
         self.provider_capabilities = state.provider_capabilities.clone();
         self.config = state
             .configuration
@@ -593,6 +600,7 @@ impl Transcript {
         self.subagent_entries.clear();
         self.agent_messages.clear();
         self.agent_message_senders.clear();
+        self.watch_messages.clear();
         self.queued_messages.clear();
         self.queued_message_sequences.clear();
         self.tool_run_offsets.clear();
@@ -1288,6 +1296,27 @@ impl Transcript {
                 {
                     return removed_entry;
                 }
+                // Watch output is provider input too, but the user armed the
+                // watch and wants to see what it said: a compact, collapsed
+                // row per delivered event.
+                if *actor == EventActor::System
+                    && let Some((label, body)) = parse_watch_event(text)
+                {
+                    if *status != MessageStatus::Queued
+                        && self.watch_messages.insert(*message_id)
+                    {
+                        self.order.push(TranscriptEntry::Action {
+                            kind: TranscriptActionKind::Agent,
+                            label: "Watch".to_string(),
+                            detail: label,
+                            body: Some(body),
+                            time: local_event_time(event),
+                            state: TranscriptActionState::Complete,
+                            expanded: false,
+                        });
+                    }
+                    return removed_entry;
+                }
                 // Provider input is hidden; AgentMessageReceived owns visible team reports.
                 if *actor == EventActor::System {
                     removed_entry = self.remove_message(*message_id);
@@ -1783,6 +1812,9 @@ impl Transcript {
                     state: TranscriptActionState::Waiting,
                     expanded: false,
                 })
+            }
+            SessionEventKind::WatchesChanged { watches } => {
+                self.watches = watches.clone();
             }
             SessionEventKind::GoalUpdated { goal } => {
                 self.goal = Some(goal.clone());
@@ -3111,6 +3143,39 @@ impl Transcript {
             || format!("{label} /goal"),
             |duration| format!("{label} /goal {duration}"),
         ))
+    }
+
+    /// Footer token for armed watches: only running ones count.
+    pub(crate) fn watch_status(&self) -> Option<String> {
+        let running = self.watches.iter().filter(|watch| watch.running).count();
+        (running > 0).then(|| format!("{running} watch{}", if running == 1 { "" } else { "es" }))
+    }
+
+    /// One row per watch for the watches panel, newest first.
+    pub(crate) fn watch_rows(&self) -> Vec<(String, Uuid)> {
+        let now = Utc::now();
+        let mut watches: Vec<&WatchSummary> = self.watches.iter().collect();
+        watches.sort_by_key(|watch| std::cmp::Reverse(watch.started_at));
+        watches
+            .into_iter()
+            .map(|watch| {
+                let state = if watch.running { "running" } else { "exited" };
+                let events = format!(
+                    "{} event{}",
+                    watch.event_count,
+                    if watch.event_count == 1 { "" } else { "s" }
+                );
+                let last = watch
+                    .last_event_at
+                    .map(|at| format!("last {} ago", format_short_age(now - at)))
+                    .unwrap_or_else(|| "no events yet".to_string());
+                let age = format_short_age(now - watch.started_at);
+                (
+                    format!("{} · {state} {age} · {events} · {last}", watch.label),
+                    watch.watch_id,
+                )
+            })
+            .collect()
     }
 
     fn todo_status(&self) -> Option<String> {
@@ -4818,5 +4883,40 @@ mod parallel_preparation_tests {
                 ..
             } if source_name != "action_preparing"
         )));
+    }
+}
+
+/// A watch notification as the runtime formats it: a header line naming the
+/// watch, the captured output, and a trailing instruction for the model.
+/// Returns the watch label and the output without the instruction.
+pub(crate) fn parse_watch_event(text: &str) -> Option<(String, String)> {
+    let rest = text.strip_prefix("Watch event: ")?;
+    let (header, body) = rest.split_once('\n').unwrap_or((rest, ""));
+    let label = header
+        .rsplit_once(" (")
+        .map(|(label, _)| label)
+        .unwrap_or(header)
+        .trim()
+        .to_string();
+    let body = body
+        .lines()
+        .filter(|line| !line.starts_with("Treat this as command output"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim_end()
+        .to_string();
+    Some((label, body))
+}
+
+fn format_short_age(age: chrono::Duration) -> String {
+    let seconds = age.num_seconds().max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3600)
+    } else {
+        format!("{}d", seconds / 86_400)
     }
 }

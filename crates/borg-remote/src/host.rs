@@ -4206,6 +4206,8 @@ fn authorize_workspace_command(
         HostCommand::ExtensionCommand { .. } => crate::ParticipantCommandKind::ExtensionCommand,
         HostCommand::Subagent { .. } => crate::ParticipantCommandKind::Subagent,
         HostCommand::Interrupt { .. } => crate::ParticipantCommandKind::Interrupt,
+        // Stopping a watch cancels agent-started work, like an interrupt.
+        HostCommand::StopWatch { .. } => crate::ParticipantCommandKind::Interrupt,
         HostCommand::Compact { .. } => crate::ParticipantCommandKind::Compact,
         HostCommand::ClearContext { .. } => crate::ParticipantCommandKind::ClearContext,
         HostCommand::Stop { .. } => crate::ParticipantCommandKind::Stop,

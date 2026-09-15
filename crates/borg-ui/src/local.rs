@@ -810,6 +810,10 @@ impl LocalSessionClient {
             },
             FrontendCommand::ClearContext => HostCommand::ClearContext { session_id },
             FrontendCommand::Compact => HostCommand::Compact { session_id },
+            FrontendCommand::StopWatch(watch_id) => HostCommand::StopWatch {
+                session_id,
+                watch_id,
+            },
             FrontendCommand::FocusAgent(_)
             | FrontendCommand::NewSession
             | FrontendCommand::OpenSession(_)

@@ -207,6 +207,8 @@ pub enum FrontendCommand {
     SetFast(bool),
     ClearContext,
     Compact,
+    /// Stop a watch the agent armed (from the watches panel).
+    StopWatch(Uuid),
     FocusAgent(Option<Uuid>),
     NewSession,
     OpenSession(Uuid),

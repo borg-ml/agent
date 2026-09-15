@@ -1623,7 +1623,7 @@ async fn execute_tool(
     let external_mcp = runtime.mcp.contains(&tool_call.function.name);
     let shell_command = match tool_call.function.name.as_str() {
         "exec_command" | "exec" => input.get("cmd").and_then(Value::as_str).map(str::to_string),
-        "monitor" => input
+        "watch" => input
             .get("command")
             .and_then(Value::as_str)
             .map(str::to_string),
@@ -1791,7 +1791,7 @@ async fn execute_tool(
 
     let workflow_approved = matches!(
         tool_call.function.name.as_str(),
-        "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec" | "monitor"
+        "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec" | "watch"
     ) && runtime.permission != PermissionMode::FullAccess;
     // A shell command is cancelled by an interrupt but not by a steer: the
     // model reads the steer after its command finishes, which is what a user
@@ -1802,7 +1802,7 @@ async fn execute_tool(
         || shell_exec
         || matches!(
             tool_call.function.name.as_str(),
-            "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec" | "monitor"
+            "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec" | "watch"
         ))
     .then(CancellationToken::new);
     let call = runtime.call(
