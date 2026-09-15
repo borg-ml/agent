@@ -197,7 +197,7 @@ struct AgentRosterEntry {
 
 #[derive(Default)]
 struct MessageMarkdownCache {
-    previews: HashMap<(PathBuf, usize), Vec<Line<'static>>>,
+    previews: HashMap<(PathBuf, usize, usize), Vec<Line<'static>>>,
     messages: HashMap<(usize, usize), MarkdownRender>,
     #[cfg(test)]
     misses: usize,
@@ -3775,7 +3775,11 @@ impl Transcript {
                     link_rows.extend(message_lines.links);
                     lines.extend(message_lines.lines);
                     let available = width.saturating_sub(MESSAGE_HORIZONTAL_PADDING).max(1);
-                    let tile_width = available.min(24);
+                    // Give attachments a generous tile so the downscaled preview
+                    // keeps enough resolution to read the shape of the image,
+                    // while still allowing two side by side on a wide transcript.
+                    let tile_width = available.min(48);
+                    let tile_rows = tile_width.min(24);
                     let columns = ((available + 2) / (tile_width + 2)).max(1);
                     for group in attachments.chunks(columns) {
                         let mut cache = self.message_markdown_cache.borrow_mut();
@@ -3787,9 +3791,10 @@ impl Transcript {
                             .map(|(_, path)| {
                                 cache
                                     .previews
-                                    .entry((path.clone(), tile_width))
+                                    .entry((path.clone(), tile_width, tile_rows))
                                     .or_insert_with(|| {
-                                        attachments::preview(path, tile_width).unwrap_or_default()
+                                        attachments::preview(path, tile_width, tile_rows)
+                                            .unwrap_or_default()
                                     })
                                     .clone()
                             })

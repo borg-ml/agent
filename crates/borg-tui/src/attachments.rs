@@ -11,23 +11,40 @@ use uuid::Uuid;
 const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_INLINE_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 
-pub(super) fn preview(path: &Path, width: usize) -> Option<Vec<ratatui::text::Line<'static>>> {
+pub(super) fn preview(
+    path: &Path,
+    width: usize,
+    max_rows: usize,
+) -> Option<Vec<ratatui::text::Line<'static>>> {
     use ratatui::{
         style::{Color, Style},
         text::{Line, Span},
     };
 
-    if fs::metadata(path).ok()?.len() > MAX_ATTACHMENT_BYTES || width == 0 {
+    if fs::metadata(path).ok()?.len() > MAX_ATTACHMENT_BYTES || width == 0 || max_rows == 0 {
         return None;
     }
+    // Half blocks pack two vertical pixels into one cell (top = foreground,
+    // bottom = background), so a tile of `width` columns and `max_rows` rows
+    // can carry `width` × `2 * max_rows` pixels. Downscale to that real
+    // resolution with a quality filter instead of a fixed 24×16 thumbnail,
+    // so wider transcripts render a sharper preview rather than a mush of
+    // oversized blocks.
     let image = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
         .ok()?
         .decode()
         .ok()?
-        .thumbnail(width.min(24) as u32, 16)
+        .resize(
+            width as u32,
+            (max_rows * 2) as u32,
+            image::imageops::FilterType::Lanczos3,
+        )
         .to_rgb8();
+    if image.width() == 0 || image.height() == 0 {
+        return None;
+    }
     Some(
         (0..image.height())
             .step_by(2)
