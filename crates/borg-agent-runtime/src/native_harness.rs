@@ -151,7 +151,7 @@ impl NativeHarness {
                 .context("subscription model access requires durable Borg session storage")?;
             let identity = borg_provider::provider::CodexModelProvider::account_identity().await?;
             store
-                .bind_model_access(access.session_id, provider, &identity)
+                .record_model_access(access.session_id, provider, &identity)
                 .await?;
             let scoped = Self {
                 model_client: Arc::new(ProviderModelClient {

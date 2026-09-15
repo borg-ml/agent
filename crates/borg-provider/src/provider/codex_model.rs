@@ -122,7 +122,7 @@ impl SubscriptionAccess {
     ) -> Result<reqwest::Response> {
         ensure!(
             self.identity() == expected_account,
-            "Codex account differs from this session's bound account; reconnect the original account or start a new session"
+            "OpenAI credentials changed during this turn; retry to use the currently selected account"
         );
         if self.is_api_key() {
             return request
@@ -147,7 +147,7 @@ impl SubscriptionAccess {
         let refreshed = refresh.await?;
         ensure!(
             refreshed.identity() == expected_account,
-            "Codex account changed during authentication recovery; start a new session"
+            "OpenAI account changed during authentication recovery; retry to use the currently selected account"
         );
         *self = refreshed;
         retry
@@ -337,12 +337,12 @@ impl SubscriptionAccess {
 }
 
 impl CodexModelProvider {
-    /// Non-secret subscription account identity, suitable for a host-owned binding.
+    /// Non-secret access identity, captured by Borg for this turn only.
     pub async fn account_identity() -> Result<String> {
         Ok(SubscriptionAccess::read(false).await?.identity())
     }
 
-    /// The host must commit this identity before transmitting a durable session's context.
+    /// Keep the credentials selected at turn admission stable while this turn runs.
     pub async fn model_turn_for_account(
         &self,
         mut request: ModelTurnRequest,
@@ -371,7 +371,7 @@ impl CodexModelProvider {
             let mut access = SubscriptionAccess::read(false).await?;
             trace.invocation.executable = access.endpoint().into();
             ensure!(access.identity() == expected_account,
-                "Codex account differs from this session's bound account; reconnect the original account or start a new session");
+                "OpenAI credentials changed during this turn; retry to use the currently selected account");
             let context_window = if access.is_api_key() {
                 None
             } else {
@@ -382,15 +382,7 @@ impl CodexModelProvider {
                     "fast mode is not supported by this Codex model");
                 Some(capabilities.usable_context_window()?)
             };
-            for message in &mut request.messages {
-                if let ModelMessage::Assistant { provider_state, .. } = message
-                    && let Some(ModelProviderState::OpenAiResponses { account_identity, .. }) = provider_state
-                    && account_identity.as_deref().map_or(access.is_api_key(), |identity| identity != expected_account)
-                {
-                    *provider_state = None;
-                }
-            }
-            let body = self.request_body(&request)?;
+            let body = self.request_body_for_account(&mut request, expected_account)?;
             let endpoint = access.endpoint();
             let response = self
                 .send(
@@ -472,6 +464,24 @@ impl CodexModelProvider {
                 })
             }
         }
+    }
+
+    fn request_body_for_account(
+        &self,
+        request: &mut ModelTurnRequest,
+        expected_account: &str,
+    ) -> Result<Value> {
+        for message in &mut request.messages {
+            if let ModelMessage::Assistant { provider_state, .. } = message
+                && let Some(ModelProviderState::OpenAiResponses {
+                    account_identity, ..
+                }) = provider_state
+                && account_identity.as_deref() != Some(expected_account)
+            {
+                *provider_state = None;
+            }
+        }
+        self.request_body(request)
     }
 
     fn request_body(&self, request: &ModelTurnRequest) -> Result<Value> {
@@ -1011,6 +1021,58 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{mpsc, oneshot};
 
+    #[test]
+    fn account_switch_replays_borg_history_without_foreign_continuation() {
+        let provider = CodexModelProvider {
+            model: "test-model".into(),
+            effort: "low".into(),
+        };
+        for origin in [None, Some("account-a"), Some("account-b")] {
+            let output =
+                vec![json!({"type":"reasoning", "encrypted_content":"opaque-account-state"})];
+            let mut request = ModelTurnRequest {
+                fast: false,
+                request_id: None,
+                session_id: Some("same-borg-session".into()),
+                prompt_cache_key: None,
+                tools: vec![],
+                output_schema: None,
+                messages: vec![
+                    ModelMessage::user("keep the task"),
+                    ModelMessage::Assistant {
+                        content: Some("running the tool".into()),
+                        reasoning_content: None,
+                        reasoning_details: None,
+                        provider_state: Some(ModelProviderState::OpenAiResponses {
+                            output: output.clone(),
+                            account_identity: origin.map(str::to_owned),
+                        }),
+                        tool_calls: vec![ModelToolCall::function(
+                            "call-1".into(),
+                            "exec".into(),
+                            "{}".into(),
+                        )],
+                    },
+                    ModelMessage::tool("call-1", "the result"),
+                ],
+            };
+            let body = provider
+                .request_body_for_account(&mut request, "account-b")
+                .unwrap();
+            let input = body["input"].as_array().unwrap();
+            assert_eq!(input[0]["content"][0]["text"], "keep the task");
+            assert_eq!(input.last().unwrap()["output"], "the result");
+            if origin == Some("account-b") {
+                assert_eq!(input[1], output[0]);
+            } else {
+                assert_eq!(input[1]["content"][0]["text"], "running the tool");
+                assert_eq!(input[2]["call_id"], "call-1");
+                assert_eq!(input[2]["name"], "exec");
+                assert!(!body.to_string().contains("opaque-account-state"));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn api_billing_uses_api_credentials_without_subscription_recovery() {
         let mut access = SubscriptionAccess {
@@ -1397,7 +1459,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("bound account"));
+        assert!(
+            error
+                .to_string()
+                .contains("credentials changed during this turn")
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(25), listener.accept())
                 .await

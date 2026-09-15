@@ -1797,8 +1797,8 @@ impl SqliteSessionStore {
         let native = if let Some(existing) = existing {
             existing
         } else {
-            // Unbound prototype history must still enter native admission, which
-            // refuses replay without account provenance; never fall back to a CLI.
+            // Existing native history stays on Borg's harness, including history
+            // predating account tags; never fall back to a CLI-owned conversation.
             let native_history: bool = sqlx::query_scalar(
                 "with recursive lineage(id) as (select ? union all \
                  select s.parent_session_id from sessions s join lineage l on s.id=l.id \
@@ -1841,7 +1841,7 @@ impl SqliteSessionStore {
     }
 
     #[cfg(any(feature = "subscription-adapters", test))]
-    pub(crate) async fn bind_model_access(
+    pub(crate) async fn record_model_access(
         &self,
         session_id: Uuid,
         provider: CodingProvider,
@@ -1868,53 +1868,15 @@ impl SqliteSessionStore {
             .as_str()
             .context("provider is not a string")?
             .to_owned();
-        // An intentional billing switch keeps separate bindings. Returning to
-        // either lane still requires its original account/key.
-        let provider = if provider == "codex" && account_identity.starts_with("api-sha256:") {
-            "codex_api".to_string()
-        } else {
-            provider
-        };
-        let existing: Option<String> = sqlx::query_scalar(
-            "select account_identity from session_model_access where session_id=? and provider=?",
+        // This records the last selected access, not ownership of the session.
+        sqlx::query(
+            "insert into session_model_access (session_id, provider, account_identity) values (?, ?, ?) on conflict(session_id, provider) do update set account_identity=excluded.account_identity",
         )
         .bind(session_id.to_string())
         .bind(&provider)
-        .fetch_optional(&mut *transaction)
+        .bind(account_identity)
+        .execute(&mut *transaction)
         .await?;
-        if let Some(existing) = existing {
-            ensure!(
-                existing == account_identity,
-                "model account differs from this session's bound account; reconnect the original account or start a new session"
-            );
-        } else {
-            // Pre-binding prototype history has no trustworthy account provenance.
-            // Keep lineage outermost so SQLite seeks by session instead of scanning
-            // every session’s JSON history while holding the writer lock.
-            let has_unbound_history: i64 = sqlx::query_scalar(
-                "with recursive lineage(id) as (select ? union all \
-                 select s.parent_session_id from sessions s join lineage l on s.id=l.id \
-                 where s.parent_session_id is not null) \
-                 select exists(select 1 from lineage l cross join session_events e on e.session_id=l.id \
-                 where json_extract(e.event_json, '$.kind.provider')=? \
-                 and (json_extract(e.event_json, '$.kind.kind')='native_model_message' \
-                 or (json_extract(e.event_json, '$.kind.type')='turn_started' and exists( \
-                 select 1 from session_events done where done.session_id=e.session_id \
-                 and json_extract(done.event_json, '$.kind.type')='turn_completed' \
-                 and json_extract(done.event_json, '$.kind.message_id')=json_extract(e.event_json, '$.kind.message_id')))))",
-            )
-            .bind(session_id.to_string())
-            .bind(&provider)
-            .fetch_one(&mut *transaction)
-            .await?;
-            ensure!(
-                has_unbound_history == 0,
-                "native model history has no account binding; start a new session before using subscription model access"
-            );
-            sqlx::query("insert into session_model_access (session_id, provider, account_identity) values (?, ?, ?)")
-                .bind(session_id.to_string()).bind(&provider).bind(account_identity)
-                .execute(&mut *transaction).await?;
-        }
         transaction.commit().await?;
         Ok(())
     }
@@ -4079,19 +4041,6 @@ impl SqliteSessionStore {
                 .execute(&mut *transaction)
                 .await?;
         }
-        let conflicting_access: i64 = sqlx::query_scalar(
-            "select exists(select 1 from session_model_access child join session_model_access owner \
-             on child.provider=owner.provider where child.session_id=? and owner.session_id=? \
-             and child.account_identity<>owner.account_identity)",
-        ).bind(session_id.to_string()).bind(owner_session_id.to_string())
-            .fetch_one(&mut *transaction).await?;
-        ensure!(
-            conflicting_access == 0,
-            "child model account differs from its owner's bound account"
-        );
-        sqlx::query("insert into session_model_access (session_id, provider, account_identity) select ?, provider, account_identity from session_model_access where session_id=? on conflict(session_id, provider) do nothing")
-            .bind(session_id.to_string()).bind(owner_session_id.to_string())
-            .execute(&mut *transaction).await?;
         let owner_workspace: Option<String> = sqlx::query_scalar(
             "select workspace_id from session_workspace_bindings where session_id=?",
         )
@@ -6976,9 +6925,6 @@ impl SessionStore for SqliteSessionStore {
         .bind(&now)
         .execute(&mut *transaction)
         .await?;
-        sqlx::query("insert into session_model_access (session_id, provider, account_identity) select ?, provider, account_identity from session_model_access where session_id=?")
-            .bind(session_id.to_string()).bind(parent_session_id.to_string())
-            .execute(&mut *transaction).await?;
         let parent_native =
             Self::resolve_codex_harness(&mut transaction, parent_session_id, None).await?;
         sqlx::query("insert into session_harness_routes (session_id, provider, native) values (?, 'codex', ?)")

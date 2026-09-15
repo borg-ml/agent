@@ -49,6 +49,11 @@ to ChatGPT. Without a selection in Borg, it follows your Codex login. You can
 also add a key directly with `borg login codex --api-key`; input is hidden,
 or you can pipe it through stdin.
 
+Provider credentials do not own a Borg session: switching accounts or replacing
+an API key preserves its ledger, forks, and collaborators. OpenAI continuation
+data is reused only for its originating account; other turns use Borg's ordinary
+conversation history. Credentials remain fixed within an in-flight turn.
+
 For OpenCode Go, run `borg login opencode --api-key` and enter your Go
 subscription key. `/model` lists Go models under **OpenCode Go** using the
 `opencode-go/<model>` route. The footer shows the selected billing mode.

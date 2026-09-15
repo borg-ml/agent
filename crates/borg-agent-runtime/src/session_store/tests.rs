@@ -505,7 +505,7 @@ async fn codex_harness_route_survives_restart_clear_fork_and_child_registration(
         if !native {
             assert!(
                 store
-                    .bind_model_access(parent, CodingProvider::Codex, "account-a")
+                    .record_model_access(parent, CodingProvider::Codex, "account-a")
                     .await
                     .is_err()
             );
@@ -548,174 +548,78 @@ async fn codex_harness_route_survives_restart_clear_fork_and_child_registration(
 }
 
 #[tokio::test]
-async fn model_access_binding_is_atomic_durable_and_inherited_without_context_dependence() {
+async fn model_access_changes_preserve_history_across_restart_forks_and_children() {
     let (directory, store) = store().await;
-    let session_id = Uuid::new_v4();
-    store.create_session(session_id).await.unwrap();
-    let (first, second) = tokio::join!(
-        store.bind_model_access(session_id, CodingProvider::Codex, "account-a"),
-        store.bind_model_access(session_id, CodingProvider::Codex, "account-b"),
-    );
-    assert_ne!(
-        first.is_ok(),
-        second.is_ok(),
-        "only one first-use identity may win"
-    );
-    let (accepted, rejected) = if first.is_ok() {
-        ("account-a", "account-b")
-    } else {
-        ("account-b", "account-a")
-    };
-    for kind in [
-        SessionEventKind::ContextCleared,
-        SessionEventKind::ProviderEvent {
-            provider: CodingProvider::Codex,
-            kind: "context_compaction".to_string(),
-            payload: serde_json::json!({"summary": "compacted"}),
-        },
-    ] {
-        store
-            .append(SessionEvent::new(session_id, 0, kind))
-            .await
-            .unwrap();
-    }
-    let fork_id = Uuid::new_v4();
-    store.fork_before(session_id, fork_id, 1).await.unwrap();
-    let child_id = Uuid::new_v4();
-    store
-        .register_child_session(session_id, child_id)
-        .await
-        .unwrap();
-    let conflicting_child = Uuid::new_v4();
-    store.create_session(conflicting_child).await.unwrap();
-    store
-        .bind_model_access(conflicting_child, CodingProvider::Codex, rejected)
-        .await
-        .unwrap();
-    assert!(
-        store
-            .register_child_session(session_id, conflicting_child)
-            .await
-            .is_err()
-    );
-    store.pool.close().await;
-    let reopened = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
-    for id in [session_id, fork_id, child_id] {
-        assert!(reopened.uses_native_codex_harness(id).await.unwrap());
-        reopened
-            .bind_model_access(id, CodingProvider::Codex, accepted)
-            .await
-            .unwrap();
-        assert!(
-            reopened
-                .bind_model_access(id, CodingProvider::Codex, rejected)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("bound account")
-        );
-    }
-    let fresh = Uuid::new_v4();
-    reopened.create_session(fresh).await.unwrap();
-    reopened
-        .bind_model_access(fresh, CodingProvider::Codex, rejected)
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
-async fn explicit_openai_billing_switch_keeps_both_account_bindings() {
-    let (_directory, store) = store().await;
-    let session = Uuid::new_v4();
-    store.create_session(session).await.unwrap();
-    for identity in [
-        "subscription-account",
-        "api-sha256:saved-key",
-        "subscription-account",
-        "api-sha256:saved-key",
-    ] {
-        store
-            .bind_model_access(session, CodingProvider::Codex, identity)
-            .await
-            .unwrap();
-    }
-    for identity in ["different-subscription", "api-sha256:different-key"] {
-        assert!(
-            store
-                .bind_model_access(session, CodingProvider::Codex, identity)
-                .await
-                .is_err()
-        );
-    }
-}
-
-#[tokio::test]
-async fn subscription_access_rejects_unbound_prototype_history_and_its_forks() {
-    let (_directory, store) = store().await;
-    let session_id = Uuid::new_v4();
-    store.create_session(session_id).await.unwrap();
+    let parent = Uuid::new_v4();
+    store.create_session(parent).await.unwrap();
+    // Existing native history without account tags must remain usable.
     store
         .append(SessionEvent::new(
-            session_id,
+            parent,
             0,
             SessionEventKind::ProviderEvent {
                 provider: CodingProvider::Codex,
                 kind: "native_model_message".to_string(),
                 payload: serde_json::to_value(borg_provider::provider::ModelMessage::user(
-                    "old private context",
+                    "keep this history",
                 ))
                 .unwrap(),
             },
         ))
         .await
         .unwrap();
-    let fork_id = Uuid::new_v4();
-    store.fork_before(session_id, fork_id, 2).await.unwrap();
-    for id in [session_id, fork_id] {
-        assert!(store.uses_native_codex_harness(id).await.unwrap());
-        assert!(
-            store
-                .bind_model_access(id, CodingProvider::Codex, "current-account")
+    store
+        .record_model_access(parent, CodingProvider::Codex, "account-a")
+        .await
+        .unwrap();
+
+    let fork = Uuid::new_v4();
+    store.fork_before(parent, fork, 2).await.unwrap();
+    let child = Uuid::new_v4();
+    store.create_session(child).await.unwrap();
+    store
+        .record_model_access(child, CodingProvider::Codex, "account-b")
+        .await
+        .unwrap();
+    store.register_child_session(parent, child).await.unwrap();
+
+    let mut histories = Vec::new();
+    for id in [parent, fork, child] {
+        histories.push((
+            id,
+            serde_json::to_value(store.read(id).await.unwrap()).unwrap(),
+        ));
+    }
+    store.pool.close().await;
+    let reopened = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    for (id, history) in histories {
+        for identity in [
+            "account-b",
+            "api-sha256:first-key",
+            "api-sha256:replacement-key",
+            "account-a",
+        ] {
+            reopened
+                .record_model_access(id, CodingProvider::Codex, identity)
                 .await
-                .unwrap_err()
-                .to_string()
-                .contains("no account binding")
-        );
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(reopened.read(id).await.unwrap()).unwrap(),
+                history
+            );
+        }
     }
-    let legacy = Uuid::new_v4();
-    let message_id = Uuid::new_v4();
-    store.create_session(legacy).await.unwrap();
-    for kind in [
-        SessionEventKind::TurnStarted {
-            message_id,
-            provider: CodingProvider::Codex,
-            model: None,
-            effort: None,
-            fast: false,
-        },
-        SessionEventKind::TurnCompleted {
-            message_id,
-            provider_session_id: None,
-            final_text: "old result".to_string(),
-            error: None,
-        },
-    ] {
-        store
-            .append(SessionEvent::new(legacy, 0, kind))
-            .await
-            .unwrap();
-    }
-    assert!(
-        store
-            .bind_model_access(legacy, CodingProvider::Codex, "current-account")
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("no account binding")
-    );
-    assert!(!store.uses_native_codex_harness(legacy).await.unwrap());
+    // Different selected accounts do not prevent reconnecting an existing child.
+    reopened
+        .record_model_access(child, CodingProvider::Codex, "account-c")
+        .await
+        .unwrap();
+    reopened
+        .register_child_session(parent, child)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -3779,7 +3683,7 @@ async fn interactive_open_adds_account_bindings_without_replacing_existing_sessi
             .unwrap()
     );
     reopened
-        .bind_model_access(session_id, CodingProvider::Codex, "account-a")
+        .record_model_access(session_id, CodingProvider::Codex, "account-a")
         .await
         .unwrap();
 }
