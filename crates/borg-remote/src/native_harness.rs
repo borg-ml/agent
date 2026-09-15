@@ -1635,6 +1635,12 @@ async fn execute_tool(
     // every mode short of Full Access; the automatic reviewer is a model too.
     let trusted_settings =
         crate::self_service::trusted_settings_sections(&tool_call.function.name, &input);
+    // Built-in tools that mutate the workspace or durable extension state used
+    // to run unconditionally; only shell/runtime/workflow calls were gated. In
+    // any mode short of Full Access these now need the same approval, so a user
+    // who chose Manual actually reviews file writes and self-extension, and Auto
+    // routes them through the automatic reviewer.
+    let mutating_builtin = mutating_builtin_approval(&tool_call.function.name, &input);
     if (shell_command.is_some()
         || tool_call.function.name == "runtime_exec"
         || matches!(
@@ -1642,6 +1648,7 @@ async fn execute_tool(
             "run_workflow" | "run_blu_workflow" | "run_blu_extension"
         )
         || external_mcp
+        || mutating_builtin.is_some()
         || !trusted_settings.is_empty())
         && runtime.permission != PermissionMode::FullAccess
     {
@@ -1673,6 +1680,8 @@ async fn execute_tool(
                     bounded_text(input.to_string(), MAX_APPROVAL_DETAIL_BYTES)
                 ),
             )
+        } else if let Some((title, detail)) = &mutating_builtin {
+            (*title, detail.clone())
         } else {
             (
                 if tool_call.function.name == "runtime_exec" {
@@ -1978,6 +1987,64 @@ async fn review_tool_automatically(
         reason: payload.reason,
         usage: result.usage,
     }))
+}
+
+/// Classify a built-in tool call that mutates the workspace or durable
+/// extension state, returning the approval title and a human-readable detail.
+/// Returns `None` for read-only and already-gated tools (shell, runtime,
+/// workflows, and `update_agent_settings`, which the trusted-settings gate
+/// handles). Approvals only fire outside Full Access.
+fn mutating_builtin_approval(name: &str, input: &Value) -> Option<(&'static str, String)> {
+    let field = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    match name {
+        "write_file" => Some(("Write file", format!("write_file {}", field("path")))),
+        "edit_file" => Some((
+            "Edit file",
+            format!(
+                "edit_file {}\n- {}\n+ {}",
+                field("path"),
+                bounded_text(field("old_text"), MAX_APPROVAL_DETAIL_BYTES / 2),
+                bounded_text(field("new_text"), MAX_APPROVAL_DETAIL_BYTES / 2),
+            ),
+        )),
+        "spawn_agent" => Some((
+            "Spawn subagent",
+            format!(
+                "spawn_agent {}{}: {}",
+                field("task_name"),
+                input
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(|provider| format!(" [{provider}]"))
+                    .unwrap_or_default(),
+                bounded_text(field("message"), MAX_APPROVAL_DETAIL_BYTES),
+            ),
+        )),
+        "create_plugin"
+        | "create_extension"
+        | "create_blu_extension"
+        | "create_retrieval_adapter"
+        | "rollback_plugin"
+        | "rollback_blu_extension"
+        | "rollback_retrieval_adapter"
+        | "remove_blu_extension"
+        | "set_blu_extension_enabled" => {
+            let id = field("id");
+            let detail = if id.is_empty() {
+                bounded_text(input.to_string(), MAX_APPROVAL_DETAIL_BYTES)
+            } else {
+                id
+            };
+            Some(("Change extensions", format!("{name} {detail}")))
+        }
+        _ => None,
+    }
 }
 
 async fn request_tool_approval(
@@ -2786,6 +2853,56 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn mutating_builtins_are_gated_read_only_builtins_are_not() {
+        let write = mutating_builtin_approval(
+            "write_file",
+            &json!({"path": "src/main.rs", "content": "fn main() {}"}),
+        );
+        assert_eq!(write.as_ref().map(|(title, _)| *title), Some("Write file"));
+        assert!(write.unwrap().1.contains("src/main.rs"));
+
+        let edit = mutating_builtin_approval(
+            "edit_file",
+            &json!({"path": "a.txt", "old_text": "one", "new_text": "two"}),
+        )
+        .expect("edit_file is gated");
+        assert_eq!(edit.0, "Edit file");
+        assert!(edit.1.contains("- one") && edit.1.contains("+ two"));
+
+        let spawn = mutating_builtin_approval(
+            "spawn_agent",
+            &json!({"task_name": "build", "message": "compile it", "provider": "codex"}),
+        )
+        .expect("spawn_agent is gated");
+        assert_eq!(spawn.0, "Spawn subagent");
+        assert!(spawn.1.contains("build") && spawn.1.contains("[codex]"));
+
+        assert_eq!(
+            mutating_builtin_approval("create_extension", &json!({"id": "acme.tool"}))
+                .map(|(title, _)| title),
+            Some("Change extensions")
+        );
+
+        // Read-only and separately-gated tools are not classified here.
+        for name in [
+            "read_file",
+            "list_files",
+            "search_files",
+            "exec",
+            "runtime_exec",
+            "run_workflow",
+            "update_agent_settings",
+            "get_agent_settings",
+            "list_plugins",
+        ] {
+            assert!(
+                mutating_builtin_approval(name, &json!({})).is_none(),
+                "{name} must not be gated as a mutating built-in"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn compaction_keeps_transcript_system_instructions_out_of_live_policy() {
