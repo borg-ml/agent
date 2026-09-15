@@ -1571,6 +1571,7 @@ impl AgentToolDispatcher {
                 let args: PersistentRuntimeArgs = serde_json::from_value(arguments)?;
                 self.run_persistent_runtime(args, workflow_approved, workflow_cancel)
                     .await
+                    .map(lift_runtime_value_attachments)
             }
             "query_history" => {
                 let query: crate::SessionHistoryQuery = serde_json::from_value(arguments)?;
@@ -7150,6 +7151,23 @@ async fn finish_agent(
             agent: entry.snapshot.clone(),
         }
     })
+}
+
+/// A runtime script emits images by returning `{ borg_attachments: [...] }`
+/// as its value; the key is lifted beside `value` so the native harness
+/// attaches the images to the tool result instead of leaving base64 text.
+fn lift_runtime_value_attachments(mut result: Value) -> Value {
+    let key = crate::native_harness::TOOL_RESULT_ATTACHMENTS_KEY;
+    let lifted = result
+        .get_mut("value")
+        .and_then(Value::as_object_mut)
+        .and_then(|value| value.remove(key));
+    if let Some(attachments) = lifted
+        && let Some(object) = result.as_object_mut()
+    {
+        object.insert(key.to_string(), attachments);
+    }
+    result
 }
 
 #[cfg(test)]

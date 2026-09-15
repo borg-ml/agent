@@ -3681,3 +3681,17 @@ async fn restored_live_child_stays_dormant_and_stops_with_its_root() {
         .expect("root stop must release the child writer");
     drop(released_writer);
 }
+
+#[test]
+fn runtime_values_lift_image_attachments_beside_the_result() {
+    let key = crate::native_harness::TOOL_RESULT_ATTACHMENTS_KEY;
+    let lifted = super::lift_runtime_value_attachments(serde_json::json!({
+        "runtime": "python",
+        "value": {"ok": true, key: [{"media_type": "image/png", "data_base64": "AAAA"}]},
+        "stdout": ""
+    }));
+    assert_eq!(lifted["value"], serde_json::json!({"ok": true}));
+    assert_eq!(lifted[key][0]["media_type"], "image/png");
+    let plain = super::lift_runtime_value_attachments(serde_json::json!({"value": 3}));
+    assert!(plain.get(key).is_none());
+}
