@@ -31,7 +31,7 @@ impl ComputerUse {
             .get("op")
             .and_then(Value::as_str)
             .context("op is required")?;
-        if !matches!(std::env::consts::OS, "linux" | "macos") {
+        if !matches!(std::env::consts::OS, "linux" | "macos" | "windows") {
             if op == "capabilities" {
                 return Ok(json!({"platform": std::env::consts::OS, "available": false,
                     "reason": "A native Borg computer-use driver is not implemented for this platform yet."}));
@@ -120,6 +120,8 @@ impl ComputerUse {
 
 const HELPER_REQUIREMENTS: &str = if cfg!(target_os = "macos") {
     "macOS computer use requires the Xcode Command Line Tools (xcode-select --install) plus Accessibility and Screen Recording permission for the terminal running Borg"
+} else if cfg!(target_os = "windows") {
+    "Windows computer use requires Windows PowerShell 5.1+ (or pwsh) in the interactive user session"
 } else {
     "Linux computer use requires python3, PyGObject and AT-SPI2 on the desktop session bus"
 };
@@ -132,28 +134,86 @@ async fn helper_command() -> Result<Command> {
         let binary = macos_helper_binary().await?;
         return Ok(Command::new(binary));
     }
+    if cfg!(target_os = "windows") {
+        let script = cached_helper_source("windows", "ps1", WINDOWS_HELPER_SOURCE).await?;
+        let shell = if which_in_path("pwsh") {
+            "pwsh"
+        } else {
+            "powershell"
+        };
+        let mut command = Command::new(shell);
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+            ])
+            .arg(script);
+        return Ok(command);
+    }
     let mut command = Command::new("python3");
     command.args(["-I", "-u", "-c", include_str!("computer_use/linux.py")]);
     Ok(command)
 }
 
 const MACOS_HELPER_SOURCE: &str = include_str!("computer_use/macos.swift");
+const WINDOWS_HELPER_SOURCE: &str = include_str!("computer_use/windows.ps1");
+
+fn which_in_path(program: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let names: Vec<String> = if cfg!(windows) {
+        vec![format!("{program}.exe"), program.to_string()]
+    } else {
+        vec![program.to_string()]
+    };
+    std::env::split_paths(&paths).any(|dir| names.iter().any(|name| dir.join(name).is_file()))
+}
+
+fn helper_cache_dir() -> Result<std::path::PathBuf> {
+    Ok(dirs::home_dir()
+        .context("home directory unavailable for the computer-use helper cache")?
+        .join(".borg")
+        .join("state")
+        .join("computer-use"))
+}
+
+/// Write an embedded helper source to the cache under a content hash so the
+/// file on disk always matches the running binary's revision.
+async fn cached_helper_source(
+    platform: &str,
+    extension: &str,
+    source: &str,
+) -> Result<std::path::PathBuf> {
+    use sha2::{Digest, Sha256};
+    let digest = hex::encode(Sha256::digest(source.as_bytes()));
+    let cache = helper_cache_dir()?;
+    let path = cache.join(format!("{platform}-{}.{extension}", &digest[..16]));
+    if tokio::fs::metadata(&path).await.is_err() {
+        tokio::fs::create_dir_all(&cache).await?;
+        let staging = cache.join(format!(
+            "{platform}-{}.{}.tmp",
+            &digest[..16],
+            std::process::id()
+        ));
+        tokio::fs::write(&staging, source).await?;
+        tokio::fs::rename(&staging, &path).await?;
+    }
+    Ok(path)
+}
 
 async fn macos_helper_binary() -> Result<std::path::PathBuf> {
     use sha2::{Digest, Sha256};
     let digest = hex::encode(Sha256::digest(MACOS_HELPER_SOURCE.as_bytes()));
-    let cache = dirs::home_dir()
-        .context("home directory unavailable for the computer-use helper cache")?
-        .join(".borg")
-        .join("state")
-        .join("computer-use");
+    let cache = helper_cache_dir()?;
     let binary = cache.join(format!("macos-{}", &digest[..16]));
     if tokio::fs::metadata(&binary).await.is_ok() {
         return Ok(binary);
     }
-    tokio::fs::create_dir_all(&cache).await?;
-    let source = cache.join(format!("macos-{}.swift", &digest[..16]));
-    tokio::fs::write(&source, MACOS_HELPER_SOURCE).await?;
+    let source = cached_helper_source("macos", "swift", MACOS_HELPER_SOURCE).await?;
     let staging = cache.join(format!(
         "macos-{}.{}.tmp",
         &digest[..16],

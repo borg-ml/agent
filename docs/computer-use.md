@@ -68,8 +68,20 @@ Accessibility and Screen Recording permission for the terminal running Borg.
 exercised on a real Mac**; treat it as unverified until this section records the
 host, commit and observed effects.
 
-Still missing: Windows driver, macOS real-host verification;
+## Windows (unverified)
+
+`computer_use/windows.ps1` implements the contract on UI Automation under
+Windows PowerShell 5.1+ or `pwsh` (no compile step; the script is cached by
+content hash under `~/.borg/state/computer-use/`). Observations use the control
+view; bounds are physical screen pixels (the helper is DPI-aware), so they match
+`scope: "desktop"` screenshots taken with `CopyFromScreen` over the virtual
+desktop. `scope: "window"` uses `PrintWindow` for isolated capture. `click` uses
+Invoke, Toggle or SelectionItem patterns; `set_value` uses ValuePattern and
+refuses password and read-only controls. Elevated windows are not observable.
+**Not yet exercised on a real Windows host**; treat as unverified.
+
+Still missing: macOS and Windows real-host verification;
 keyboard/pointer injection, scrolling and dragging; isolated window capture;
 full cross-provider image/desktop task verification; installation and broadcast
-verification. `capabilities` on Windows explicitly returns unavailable.
+verification.
 Installing a binary does not upgrade an already-running Borg process.
