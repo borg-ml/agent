@@ -4845,8 +4845,42 @@ fn footer_todo_metadata_keeps_the_todo_segment_interactive() {
 }
 
 #[test]
+fn footer_billing_leads_the_metadata_and_uses_the_billing_color() {
+    let line = footer_shell_todo_metadata_line(
+        Some("max sub"),
+        Some("1 shell"),
+        None,
+        "~/borg-cli",
+        false,
+        false,
+        usize::MAX,
+    );
+    assert_eq!(line.spans[0].content, "max sub");
+    assert_eq!(
+        line.spans[0].style.fg,
+        Some(billing_status_color("max sub"))
+    );
+    assert_eq!(line.spans[1].content, STATUS_SEPARATOR);
+    assert_eq!(line.spans[2].content, "1 shell");
+
+    let billing_only = footer_shell_todo_metadata_line(
+        Some("api"),
+        None,
+        None,
+        "~/borg-cli",
+        false,
+        false,
+        usize::MAX,
+    );
+    assert_eq!(billing_only.spans[0].content, "api");
+    assert_eq!(billing_only.spans[0].style.fg, Some(Color::LightBlue));
+    assert!(billing_only.spans[1].content.contains("~/borg-cli"));
+}
+
+#[test]
 fn footer_shell_metadata_uses_the_blue_background_action_identity() {
     let line = footer_shell_todo_metadata_line(
+        None,
         Some("1 shell"),
         Some("2 to-dos"),
         "~/borg-cli",
@@ -4862,6 +4896,7 @@ fn footer_shell_metadata_uses_the_blue_background_action_identity() {
     assert_eq!(shell_row_style(false).fg, Some(USER_LABEL_BLUE));
 
     let hovered = footer_shell_todo_metadata_line(
+        None,
         Some("1 shell"),
         None,
         "~/borg-cli",
@@ -9346,7 +9381,10 @@ fn billing_status_follows_the_configured_provider_and_capability_refresh() {
             ],
         },
     ));
-    assert_eq!(transcript.config_statuses().billing.as_deref(), Some("max"));
+    assert_eq!(
+        transcript.config_statuses().billing.as_deref(),
+        Some("max sub")
+    );
 
     // Switching provider re-reads the lane for the new provider.
     let _ = transcript.apply(&SessionEvent::new(
@@ -13054,4 +13092,120 @@ fn desktop_notification_prefers_titled_osc_777_and_falls_back_to_osc_9() {
         desktop_notification_sequence_for("a;b", "c\x07;d", true),
         "\x1b]777;notify;a b;c  d\x1b\\"
     );
+}
+
+#[test]
+fn reasoning_started_provider_event_changes_the_transcript() {
+    // Claude thinking text is redacted for some models, so `reasoning/started`
+    // is the only early signal that opens the Thinking row. It must count as
+    // a transcript change or the row only shows up with the next tool call.
+    assert!(session_event_changes_transcript(
+        &SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Claude,
+            kind: "reasoning/started".to_string(),
+            payload: serde_json::json!({}),
+        }
+    ));
+    assert!(!session_event_changes_transcript(
+        &SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Claude,
+            kind: "reasoning/progress".to_string(),
+            payload: serde_json::json!({}),
+        }
+    ));
+}
+
+#[test]
+fn peer_agent_message_is_visible_without_subagent_opt_in() {
+    let session_id = Uuid::new_v4();
+    let peer = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::AgentMessageReceived {
+            message_id: Uuid::new_v4(),
+            sender_id: Uuid::new_v4(),
+            sender_name: "agent".to_string(),
+            text: "From session 94a66b94: steer orphaning confirmed.".to_string(),
+        },
+    );
+    // Default transcript: child subagent reports are hidden ...
+    let mut transcript = Transcript::default();
+    assert!(!transcript.show_subagent_messages);
+    transcript.apply(&peer);
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // ... but a message from a sender that is not one of our children is a
+    // peer Borg instance and always renders.
+    assert!(rendered.contains("Peer"), "{rendered}");
+    assert!(rendered.contains("steer orphaning confirmed"), "{rendered}");
+}
+
+#[test]
+fn git_commit_hit_area_targets_the_branch_token_when_dirty() {
+    let metadata = Rect {
+        x: 10,
+        y: 3,
+        width: 40,
+        height: 1,
+    };
+    let clean = GitWorktreeStatus {
+        branch: "main".to_string(),
+        dirty: false,
+        ahead: 1,
+        behind: 0,
+    };
+    assert_eq!(git_commit_hit_area(&clean, metadata), None);
+    let dirty = GitWorktreeStatus {
+        branch: "main".to_string(),
+        dirty: true,
+        ahead: 2,
+        behind: 1,
+    };
+    let area = git_commit_hit_area(&dirty, metadata).expect("dirty tree is clickable");
+    let label_width = dirty.compact_label().width() as u16;
+    assert_eq!(area.x, metadata.right() - label_width);
+    assert_eq!(area.width, "main*".width() as u16);
+    assert_eq!(area.y, 3);
+    // The commit and push targets never overlap.
+    let push = git_ahead_hit_area(&dirty, metadata).expect("ahead is clickable");
+    assert!(area.right() <= push.x);
+}
+
+#[test]
+fn commit_message_model_spec_parses_with_default_effort() {
+    assert_eq!(
+        CommitMessageModel::parse(""),
+        CommitMessageModel {
+            model: "gpt-5.6-luna".to_string(),
+            effort: "low".to_string(),
+        }
+    );
+    assert_eq!(
+        CommitMessageModel::parse("claude-haiku-4-5@medium"),
+        CommitMessageModel {
+            model: "claude-haiku-4-5".to_string(),
+            effort: "medium".to_string(),
+        }
+    );
+    assert_eq!(CommitMessageModel::parse("gpt-5.6-luna").effort, "low");
+}
+
+#[test]
+fn commit_message_fallback_and_cleaning() {
+    let stat = " a.rs | 2 +-\n b.rs | 4 ++++\n c.rs | 1 -\n 3 files changed, 5 insertions(+), 2 deletions(-)";
+    let message = fallback_commit_message(stat);
+    assert!(
+        message.starts_with("Update a.rs, b.rs and 1 more"),
+        "{message}"
+    );
+    assert!(message.contains("3 files changed"), "{message}");
+    assert_eq!(
+        clean_commit_message("```\nFix footer\n\n- detail\n```\n"),
+        Some("Fix footer\n\n- detail".to_string())
+    );
+    assert_eq!(clean_commit_message("\n```\n```\n"), None);
 }

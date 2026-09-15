@@ -1580,9 +1580,6 @@ impl Render for BorgGui {
                                     .child(div().id("fast-setting").cursor_pointer().text_color(rgb(if fast { palette::PEACH } else { palette::TEXT_MUTED })).hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(Self::toggle_fast)).child(if fast { "fast" } else { "standard" }))
                                     .child("·")
                                     .child(div().id("access-setting").cursor_pointer().hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(Self::cycle_permission)).child(Self::status_segment("access", access, palette::PEACH)))
-                                    .when_some(billing, |row, billing| {
-                                        row.child("·").child(Self::status_segment("billing", billing, palette::PEACH))
-                                    })
                                     .child("·")
                                     .child(div().id("language-setting").cursor_pointer().text_color(rgb(palette::TEXT_MUTED)).hover(|style| style.bg(rgb(palette::SURFACE_RAISED))).on_click(cx.listener(Self::cycle_language)).child(language))
                                     .child("·")
@@ -1812,10 +1809,20 @@ impl Render for BorgGui {
                             .text_color(rgb(palette::TEXT_MUTED))
                         .child(div().id("command-help").cursor_pointer().on_click(cx.listener(Self::toggle_help)).child("send  enter  ·  newline  shift-enter  ·  history  ↑/↓  ·  commands  ctrl-shift-p"))
                             .child(
-                                self.view
-                                    .as_ref()
-                                    .map(|v| v.session_id.to_string())
-                                    .unwrap_or_default(),
+                                div()
+                                    .flex()
+                                    .gap_3()
+                                    // Billing lives on the bottom row, away from the
+                                    // effort level, so "max sub" never reads as "max" effort.
+                                    .when_some(billing, |row, billing| {
+                                        row.child(Self::status_segment("billing", billing, palette::PEACH))
+                                    })
+                                    .child(
+                                        self.view
+                                            .as_ref()
+                                            .map(|v| v.session_id.to_string())
+                                            .unwrap_or_default(),
+                                    ),
                             ),
                     ),
             )

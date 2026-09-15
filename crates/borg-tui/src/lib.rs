@@ -1069,6 +1069,319 @@ fn git_ahead_hit_area(status: &GitWorktreeStatus, metadata: Rect) -> Option<Rect
     })
 }
 
+/// Background "commit everything and push" runner for the footer's dirty
+/// worktree indicator. The commit message is drafted by a cheap model (see
+/// [`commit_model_from_environment`]); when that model is unavailable the
+/// commit still happens with a deterministic summary so a click never fails
+/// just because a provider is out of quota.
+struct GitCommitState {
+    in_flight: HashSet<PathBuf>,
+    sender: mpsc::Sender<(PathBuf, std::result::Result<String, String>)>,
+    receiver: mpsc::Receiver<(PathBuf, std::result::Result<String, String>)>,
+}
+
+impl Default for GitCommitState {
+    fn default() -> Self {
+        let (sender, receiver) = mpsc::channel();
+        Self {
+            in_flight: HashSet::new(),
+            sender,
+            receiver,
+        }
+    }
+}
+
+impl GitCommitState {
+    fn is_committing(&self, cwd: &Path) -> bool {
+        self.in_flight.contains(cwd)
+    }
+
+    /// Spawn stage → draft message → commit → push for `cwd` unless one is
+    /// already running there. Returns true when a new run started.
+    fn start(&mut self, cwd: &Path, model: CommitMessageModel) -> bool {
+        if !self.in_flight.insert(cwd.to_path_buf()) {
+            return false;
+        }
+        let cwd = cwd.to_path_buf();
+        let sender = self.sender.clone();
+        thread::spawn(move || {
+            let outcome = run_git_commit_and_push(&cwd, &model);
+            let _ = sender.send((cwd, outcome));
+        });
+        true
+    }
+
+    fn drain(&mut self) -> Vec<(PathBuf, std::result::Result<String, String>)> {
+        let mut finished = Vec::new();
+        while let Ok(result) = self.receiver.try_recv() {
+            self.in_flight.remove(&result.0);
+            finished.push(result);
+        }
+        finished
+    }
+}
+
+/// Model used to draft click-to-commit messages, as `MODEL[@EFFORT]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommitMessageModel {
+    model: String,
+    effort: String,
+}
+
+const DEFAULT_COMMIT_MESSAGE_MODEL: &str = "gpt-5.6-luna@low";
+const COMMIT_DIFF_CHAR_BUDGET: usize = 60_000;
+
+impl CommitMessageModel {
+    fn parse(spec: &str) -> Self {
+        let spec = spec.trim();
+        let spec = if spec.is_empty() {
+            DEFAULT_COMMIT_MESSAGE_MODEL
+        } else {
+            spec
+        };
+        let (model, effort) = spec
+            .rsplit_once('@')
+            .map_or((spec, "low"), |(model, effort)| (model, effort));
+        Self {
+            model: model.trim().to_string(),
+            effort: effort.trim().to_string(),
+        }
+    }
+
+    fn label(&self) -> String {
+        format!("{}@{}", self.model, self.effort)
+    }
+}
+
+/// `BORG_COMMIT_MODEL=MODEL[@EFFORT]` overrides the default cheap model.
+fn commit_model_from_environment() -> CommitMessageModel {
+    CommitMessageModel::parse(&std::env::var("BORG_COMMIT_MODEL").unwrap_or_default())
+}
+
+fn git_in(cwd: &Path, args: &[&str]) -> std::result::Result<std::process::Output, String> {
+    Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .map_err(|error| format!("could not run git: {error}"))
+}
+
+fn git_last_stderr_line(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("git failed")
+        .to_string()
+}
+
+/// Stage every change, draft a message, commit, then push. Returns a short
+/// human summary for the footer notice.
+fn run_git_commit_and_push(
+    cwd: &Path,
+    model: &CommitMessageModel,
+) -> std::result::Result<String, String> {
+    let add = git_in(cwd, &["add", "-A"])?;
+    if !add.status.success() {
+        return Err(git_last_stderr_line(&add));
+    }
+    let stat = git_in(cwd, &["diff", "--cached", "--stat"])?;
+    let stat = String::from_utf8_lossy(&stat.stdout).trim().to_string();
+    if stat.is_empty() {
+        return Err("nothing to commit".to_string());
+    }
+    let diff = git_in(cwd, &["diff", "--cached", "--no-color"])?;
+    let diff = String::from_utf8_lossy(&diff.stdout);
+    let diff = truncate_chars(&diff, COMMIT_DIFF_CHAR_BUDGET);
+    let message = draft_commit_message(cwd, model, &stat, &diff)
+        .unwrap_or_else(|| fallback_commit_message(&stat));
+    let commit = git_in(cwd, &["commit", "-m", &message])?;
+    if !commit.status.success() {
+        return Err(git_last_stderr_line(&commit));
+    }
+    let short = git_in(cwd, &["rev-parse", "--short", "HEAD"])?;
+    let short = String::from_utf8_lossy(&short.stdout).trim().to_string();
+    let subject = message
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    match run_git_push(cwd) {
+        Ok(push) => Ok(format!("{short} {subject} · {push}")),
+        Err(error) => Err(format!("committed {short} but push failed · {error}")),
+    }
+}
+
+fn truncate_chars(text: &str, budget: usize) -> String {
+    if text.chars().count() <= budget {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(budget).collect();
+    out.push_str(
+        "
+… (diff truncated)
+",
+    );
+    out
+}
+
+/// Deterministic message used when no drafting model is reachable.
+fn fallback_commit_message(stat: &str) -> String {
+    let files: Vec<&str> = stat
+        .lines()
+        .filter(|line| line.contains('|'))
+        .filter_map(|line| line.split('|').next())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+    let summary = stat.lines().last().unwrap_or("").trim();
+    match files.as_slice() {
+        [] => "Update working tree".to_string(),
+        [one] => format!(
+            "Update {one}
+
+{summary}"
+        ),
+        [a, b] => format!(
+            "Update {a} and {b}
+
+{summary}"
+        ),
+        [a, b, rest @ ..] => format!(
+            "Update {a}, {b} and {} more
+
+{summary}",
+            rest.len()
+        ),
+    }
+}
+
+fn commit_message_prompt(stat: &str, diff: &str) -> String {
+    format!(
+        "Write a git commit message for the staged changes below. Output ONLY the message:          an imperative subject line of at most 72 characters, then a blank line, then at most          four short bullet points explaining what changed and why. No code fences, no preamble.
+
+         --- git diff --cached --stat ---
+{stat}
+
+--- git diff --cached ---
+{diff}"
+    )
+}
+
+/// Ask the configured cheap model for a commit message. Codex-family models
+/// (`gpt-*`) go through `codex exec`; Claude models through `claude -p`.
+/// Returns None when the CLI is missing, fails, or produces nothing usable.
+fn draft_commit_message(
+    cwd: &Path,
+    model: &CommitMessageModel,
+    stat: &str,
+    diff: &str,
+) -> Option<String> {
+    use std::io::Write;
+    let prompt = commit_message_prompt(stat, diff);
+    let output = if model.model.starts_with("claude") {
+        let mut child = Command::new("claude")
+            .args([
+                "-p",
+                "--model",
+                &model.model,
+                "--effort",
+                &model.effort,
+                "--no-session-persistence",
+                "--disallowedTools",
+                "Bash,Edit,Write,Agent,Task",
+            ])
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        child.stdin.take()?.write_all(prompt.as_bytes()).ok()?;
+        child.wait_with_output().ok()?
+    } else {
+        let last_message =
+            std::env::temp_dir().join(format!("borg-commit-message-{}.txt", std::process::id()));
+        let mut child = Command::new("codex")
+            .args([
+                "exec",
+                "--model",
+                &model.model,
+                "-c",
+                &format!("model_reasoning_effort=\"{}\"", model.effort),
+                "--sandbox",
+                "read-only",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--color",
+                "never",
+                "--output-last-message",
+            ])
+            .arg(&last_message)
+            .arg("-")
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        child.stdin.take()?.write_all(prompt.as_bytes()).ok()?;
+        let mut output = child.wait_with_output().ok()?;
+        if let Ok(text) = std::fs::read(&last_message) {
+            output.stdout = text;
+        }
+        let _ = std::fs::remove_file(&last_message);
+        output
+    };
+    if !output.status.success() {
+        return None;
+    }
+    clean_commit_message(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Strip code fences and surrounding whitespace; reject empty drafts.
+fn clean_commit_message(raw: &str) -> Option<String> {
+    let mut lines: Vec<&str> = raw.lines().map(str::trim_end).collect();
+    while lines
+        .first()
+        .is_some_and(|line| line.trim().is_empty() || line.trim_start().starts_with("```"))
+    {
+        lines.remove(0);
+    }
+    while lines
+        .last()
+        .is_some_and(|line| line.trim().is_empty() || line.trim_start().starts_with("```"))
+    {
+        lines.pop();
+    }
+    let message = lines.join("\n").trim().to_string();
+    (!message.is_empty()).then_some(message)
+}
+
+/// Clickable area over the `branch*` token when the worktree is dirty. The
+/// git label is the right-most metadata item, so the branch token starts at
+/// `right - width(label)`.
+fn git_commit_hit_area(status: &GitWorktreeStatus, metadata: Rect) -> Option<Rect> {
+    if !status.dirty {
+        return None;
+    }
+    let label_width = status.compact_label().width() as u16;
+    let branch_width = format!("{}*", status.branch).width() as u16;
+    let x = metadata.right().saturating_sub(label_width);
+    if x < metadata.x || branch_width == 0 {
+        return None;
+    }
+    Some(Rect {
+        x,
+        y: metadata.y,
+        width: branch_width,
+        height: 1,
+    })
+}
+
 impl GitStatusCache {
     /// Drop the cached status for `cwd` so the next `status_for` re-reads it.
     /// Used after a push changes the ahead/behind counts.
@@ -1145,8 +1458,11 @@ pub struct BorgTerminal {
     extension_commands: Vec<borg_remote::ExtensionApiCommand>,
     git_status_cache: GitStatusCache,
     git_push: GitPushState,
+    git_commit: GitCommitState,
     git_status_area: Option<Rect>,
     git_status_hovered: bool,
+    git_commit_area: Option<Rect>,
+    git_commit_hovered: bool,
     status: SessionStatus,
     interrupt_requested: bool,
     connection_retry_at: Option<DateTime<Utc>>,
@@ -2217,8 +2533,11 @@ impl BorgTerminal {
             extension_commands: Vec::new(),
             git_status_cache: GitStatusCache::default(),
             git_push: GitPushState::default(),
+            git_commit: GitCommitState::default(),
             git_status_area: None,
             git_status_hovered: false,
+            git_commit_area: None,
+            git_commit_hovered: false,
             status: SessionStatus::Starting,
             interrupt_requested: false,
             connection_retry_at: None,
@@ -2381,8 +2700,11 @@ impl BorgTerminal {
         self.extension_commands.clear();
         self.git_status_cache = GitStatusCache::default();
         self.git_push = GitPushState::default();
+        self.git_commit = GitCommitState::default();
         self.git_status_area = None;
         self.git_status_hovered = false;
+        self.git_commit_area = None;
+        self.git_commit_hovered = false;
         self.status = SessionStatus::Starting;
         self.interrupt_requested = false;
         self.session_state_sequence = 0;
@@ -2914,7 +3236,7 @@ impl BorgTerminal {
             SessionEventKind::SessionStarted
             | SessionEventKind::ProviderSessionLinked { .. }
             | SessionEventKind::SubagentControl { .. } => false,
-            SessionEventKind::ProviderEvent { kind, .. } => {
+            SessionEventKind::ProviderEvent { kind, payload, .. } => {
                 is_context_compaction(kind)
                     || is_live_tool_call_event(kind)
                     || kind == "action/preparing"
@@ -2922,6 +3244,7 @@ impl BorgTerminal {
                     || kind == "action/preparing_cancelled"
                     || kind == "network_retry"
                     || kind == "network_recovered"
+                    || Transcript::provider_reasoning_lifecycle(kind, payload).is_some()
             }
             _ => true,
         };
@@ -3462,6 +3785,30 @@ impl BorgTerminal {
             }
             self.git_status_cache.invalidate(&cwd);
         }
+        for (cwd, outcome) in self.git_commit.drain() {
+            match outcome {
+                Ok(summary) => self.notice = Some(format!("Committed · {summary}")),
+                Err(error) => self.notice = Some(format!("git commit failed · {error}")),
+            }
+            self.git_status_cache.invalidate(&cwd);
+        }
+    }
+
+    /// Stage everything in the footer's worktree, draft a commit message with
+    /// the cheap commit model, commit, and push — all off the UI thread.
+    fn commit_and_push_working_tree(&mut self) {
+        let cwd = self.active_git_cwd();
+        if self.git_commit.is_committing(&cwd) {
+            self.notice = Some("Already committing…".to_string());
+            return;
+        }
+        let model = commit_model_from_environment();
+        if self.git_commit.start(&cwd, model.clone()) {
+            self.notice = Some(format!(
+                "Committing · drafting message with {}…",
+                model.label()
+            ));
+        }
     }
 
     fn active_queued_prompts(&self) -> &[PendingPromptProjection] {
@@ -3568,6 +3915,7 @@ impl BorgTerminal {
         self.fast_status_hovered = false;
         self.permission_status_hovered = false;
         self.git_status_hovered = false;
+        self.git_commit_hovered = false;
         self.back_to_director_hovered = false;
         self.scrollbar_hovered = false;
         self.jump_to_bottom_hovered = false;
@@ -4645,6 +4993,9 @@ impl BorgTerminal {
                 self.git_status_hovered = self
                     .git_status_area
                     .is_some_and(|area| area.contains(pointer));
+                self.git_commit_hovered = self
+                    .git_commit_area
+                    .is_some_and(|area| area.contains(pointer));
                 self.back_to_director_hovered = self
                     .back_to_director_area
                     .is_some_and(|area| area.contains(pointer));
@@ -4826,6 +5177,13 @@ impl BorgTerminal {
                             .is_some_and(|area| area.contains(pointer))
                         {
                             self.open_permission_picker();
+                            return Ok(UiAction::None);
+                        }
+                        if self
+                            .git_commit_area
+                            .is_some_and(|area| area.contains(pointer))
+                        {
+                            self.commit_and_push_working_tree();
                             return Ok(UiAction::None);
                         }
                         if self
@@ -6746,13 +7104,26 @@ impl BorgTerminal {
                     .saturating_sub(u16::from(!is_launch_screen)),
             });
             next_composer_area = Some(composer_area);
-            if !is_launch_screen && (shell_status.is_some() || todo_status.is_some()) {
-                let combined_status =
-                    footer_status_text(shell_status.as_deref(), todo_status.as_deref());
+            if !is_launch_screen
+                && (billing_status.is_some() || shell_status.is_some() || todo_status.is_some())
+            {
+                let combined_status = footer_status_text(
+                    billing_status.as_deref(),
+                    shell_status.as_deref(),
+                    todo_status.as_deref(),
+                );
                 let metadata_width =
                     footer_metadata_text(&combined_status, &cwd_status, usize::MAX).width() as u16;
                 let visible_metadata_width = metadata_width.min(footer_area.width);
                 let metadata_x = footer_area.right().saturating_sub(visible_metadata_width);
+                // Billing leads the metadata, so the interactive shell/todo
+                // hit areas start after it.
+                let billing_prefix_width = billing_status
+                    .as_deref()
+                    .filter(|_| shell_status.is_some() || todo_status.is_some())
+                    .map(|status| status.width() + STATUS_SEPARATOR.width())
+                    .unwrap_or(0) as u16;
+                let metadata_x = metadata_x.saturating_add(billing_prefix_width);
                 if let Some(shell_status) = shell_status.as_deref() {
                     next_shell_status_area = Some(Rect {
                         x: metadata_x,
@@ -7426,18 +7797,6 @@ impl BorgTerminal {
                 self.permission_status_hovered,
                 permission_status_color,
             );
-            // Billing is always visible so a switch between a subscription and
-            // pay-as-you-go credentials is never silent.
-            let billing_status_color = billing_status
-                .as_deref()
-                .map(billing_status_color)
-                .unwrap_or(Color::Gray);
-            push_interactive_status_segment(
-                &mut status_spans,
-                billing_status,
-                false,
-                billing_status_color,
-            );
             let context_status_start = status_spans.iter().map(|span| span.width()).sum::<usize>();
             let context_status_start = if context_status.is_empty() {
                 context_status_start
@@ -7647,12 +8006,32 @@ impl BorgTerminal {
                     tooltip,
                 );
             }
-            if self.git_status_hovered
-                && let Some(git_area) = self.git_status_area
+            if (self.git_status_hovered || self.git_commit_hovered)
+                && let Some(git_area) = if self.git_commit_hovered {
+                    self.git_commit_area
+                } else {
+                    self.git_status_area
+                }
                 && let Some(git_status) = footer_git_status.as_ref()
             {
                 let pushing = self.git_push.is_pushing(&active_cwd);
-                let text = if pushing {
+                let committing = self.git_commit.is_committing(&active_cwd);
+                let tooltip_title = if self.git_commit_hovered {
+                    " git commit "
+                } else {
+                    " git push "
+                };
+                let text = if self.git_commit_hovered {
+                    if committing {
+                        format!("Committing on {}…", git_status.branch)
+                    } else {
+                        format!(
+                            "Commit all changes on {} — message by {} — then push — click",
+                            git_status.branch,
+                            commit_model_from_environment().label()
+                        )
+                    }
+                } else if pushing {
                     format!("Pushing {} to {}…", git_status.branch, "upstream")
                 } else {
                     format!(
@@ -7683,7 +8062,7 @@ impl BorgTerminal {
                             Block::default()
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(Color::Cyan))
-                                .title(" git push "),
+                                .title(tooltip_title),
                         ),
                     tooltip,
                 );
@@ -7838,9 +8217,14 @@ impl BorgTerminal {
                 );
             }
             self.git_status_area = None;
+            self.git_commit_area = None;
             if !is_launch_screen {
                 let footer_metadata = Some(footer_metadata_text(
-                    &footer_status_text(shell_status.as_deref(), todo_status.as_deref()),
+                    &footer_status_text(
+                        billing_status.as_deref(),
+                        shell_status.as_deref(),
+                        todo_status.as_deref(),
+                    ),
                     &cwd_status,
                     usize::MAX,
                 ))
@@ -7863,8 +8247,12 @@ impl BorgTerminal {
                     controls_area,
                 );
                 if footer_metadata.is_some() && metadata_width > 0 {
-                    let metadata_line = if shell_status.is_some() || todo_status.is_some() {
+                    let metadata_line = if billing_status.is_some()
+                        || shell_status.is_some()
+                        || todo_status.is_some()
+                    {
                         footer_shell_todo_metadata_line(
+                            billing_status.as_deref(),
                             shell_status.as_deref(),
                             todo_status.as_deref(),
                             &cwd_status,
@@ -7889,6 +8277,9 @@ impl BorgTerminal {
                     self.git_status_area = footer_git_status
                         .as_ref()
                         .and_then(|status| git_ahead_hit_area(status, metadata_rect));
+                    self.git_commit_area = footer_git_status
+                        .as_ref()
+                        .and_then(|status| git_commit_hit_area(status, metadata_rect));
                 }
             }
             if showing_primary_controls && !showing_transcript_interaction_hint {
@@ -8085,7 +8476,11 @@ impl BorgTerminal {
                 && !footer_area.is_empty()
             {
                 let metadata_width = Some(footer_metadata_text(
-                    &footer_status_text(shell_status.as_deref(), todo_status.as_deref()),
+                    &footer_status_text(
+                        billing_status.as_deref(),
+                        shell_status.as_deref(),
+                        todo_status.as_deref(),
+                    ),
                     &cwd_status,
                     usize::MAX,
                 ))
@@ -10579,12 +10974,16 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
             ..
         } => true,
         SessionEventKind::StatusChanged { .. } => false,
-        SessionEventKind::ProviderEvent { kind, .. } => {
+        SessionEventKind::ProviderEvent { kind, payload, .. } => {
             is_context_compaction(kind)
                 || is_live_tool_call_event(kind)
                 || kind == "action/preparing"
                 || kind == "action/generation_status"
                 || kind == "action/preparing_cancelled"
+                // `reasoning/started` opens the Thinking row. Without this the
+                // row only materialises on `reasoning_completed`, i.e. in the
+                // same frame as the tool call it precedes.
+                || Transcript::provider_reasoning_lifecycle(kind, payload).is_some()
         }
         SessionEventKind::SubagentActivity {
             activity,
@@ -13024,8 +13423,12 @@ fn footer_metadata_line(
     ])
 }
 
-fn footer_status_text(shell_status: Option<&str>, todo_status: Option<&str>) -> String {
-    [shell_status, todo_status]
+fn footer_status_text(
+    billing_status: Option<&str>,
+    shell_status: Option<&str>,
+    todo_status: Option<&str>,
+) -> String {
+    [billing_status, shell_status, todo_status]
         .into_iter()
         .flatten()
         .filter(|status| !status.is_empty())
@@ -13069,6 +13472,7 @@ fn footer_todo_metadata_line(
 }
 
 fn footer_shell_todo_metadata_line(
+    billing_status: Option<&str>,
     shell_status: Option<&str>,
     todo_status: Option<&str>,
     cwd_status: &str,
@@ -13076,7 +13480,7 @@ fn footer_shell_todo_metadata_line(
     todo_hovered: bool,
     max_width: usize,
 ) -> Line<'static> {
-    let status = footer_status_text(shell_status, todo_status);
+    let status = footer_status_text(billing_status, shell_status, todo_status);
     let metadata = footer_metadata_text(&status, cwd_status, max_width);
     if !metadata.starts_with(&status) {
         return Line::from(Span::styled(metadata, Style::default().fg(Color::Gray)));
@@ -13091,6 +13495,22 @@ fn footer_shell_todo_metadata_line(
             })
     };
     let mut spans = Vec::new();
+    // Billing is always visible so a switch between a subscription and
+    // pay-as-you-go credentials is never silent. It sits on the footer row,
+    // away from the effort level, so a "max sub" plan never reads as "max"
+    // effort.
+    if let Some(billing) = billing_status {
+        spans.push(Span::styled(
+            billing.to_string(),
+            Style::default().fg(billing_status_color(billing)),
+        ));
+        if shell_status.is_some() || todo_status.is_some() {
+            spans.push(Span::styled(
+                STATUS_SEPARATOR,
+                Style::default().fg(Color::Gray),
+            ));
+        }
+    }
     if let Some(shell) = shell_status {
         spans.push(Span::styled(
             shell.to_string(),

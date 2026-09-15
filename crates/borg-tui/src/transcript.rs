@@ -1955,10 +1955,16 @@ impl Transcript {
                 if self.agent_messages.insert(*message_id) {
                     self.agent_message_senders.insert(*sender_id);
                     self.hide_received_subagent_report(*sender_id);
-                    if self.show_subagent_messages {
+                    // Child subagent reports are opt-in (they are summarised
+                    // by the parent turn). A message from a sender that is
+                    // not one of this session's children is a peer Borg
+                    // instance talking to this thread; it must always be
+                    // visible so the user can see what the agent is replying to.
+                    let from_peer = !self.subagent_snapshots.contains_key(sender_id);
+                    if self.show_subagent_messages || from_peer {
                         self.order.push(TranscriptEntry::Action {
                             kind: TranscriptActionKind::Agent,
-                            label: "Agent".to_string(),
+                            label: if from_peer { "Peer" } else { "Agent" }.to_string(),
                             detail: if sender_name.trim().is_empty() {
                                 sender_id.to_string()
                             } else {
@@ -2395,7 +2401,10 @@ impl Transcript {
         }
     }
 
-    fn provider_reasoning_lifecycle(kind: &str, payload: &serde_json::Value) -> Option<bool> {
+    pub(crate) fn provider_reasoning_lifecycle(
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Option<bool> {
         let (method, suffix) = kind
             .rsplit_once(':')
             .map_or((kind, None), |(method, suffix)| (method, Some(suffix)));

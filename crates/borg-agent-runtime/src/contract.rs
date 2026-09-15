@@ -579,6 +579,9 @@ impl ProviderCapability {
                 .and_then(|usage| usage.plan.as_deref())
                 .map(|plan| plan.trim().to_ascii_lowercase())
                 .filter(|plan| !plan.is_empty())
+                // Suffix the tier so a "max" plan is never mistaken for the
+                // "max" effort level rendered beside it.
+                .map(|plan| format!("{plan} sub"))
                 .unwrap_or_else(|| "sub".to_string()),
         })
     }
@@ -2766,7 +2769,7 @@ mod tests {
             detail: None,
             plan: Some(" Max ".to_string()),
         });
-        assert_eq!(capability.billing_label().as_deref(), Some("max"));
+        assert_eq!(capability.billing_label().as_deref(), Some("max sub"));
         capability.billing = Some(BillingLane::ApiKey);
         assert_eq!(capability.billing_label().as_deref(), Some("api"));
         capability.billing = None;
