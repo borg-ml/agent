@@ -2138,6 +2138,41 @@ fn obsolete_owner_handoff_waits_for_a_safe_turn_boundary() {
         SessionStatus::WaitingForApproval
     )));
     assert!(!stale_local_owner_can_handoff(None));
+
+    let rejection = |reason: &str| {
+        SessionEvent::new(
+            Uuid::new_v4(),
+            0,
+            SessionEventKind::Error {
+                message: format!(
+                    "The active session owner is not accepting commands yet: session owner rejected command: {reason}"
+                ),
+            },
+        )
+    };
+    for database in ["workspace", "autonomy"] {
+        let mut event = rejection(&format!(
+            "{database} database schema version 12 was written by a newer Borg; expected 11"
+        ));
+        assert!(local_owner_rejected_newer_schema(&event));
+        event.sequence = 42;
+        assert!(!local_owner_rejected_newer_schema(&event));
+    }
+    for reason in [
+        "permission denied",
+        "session writer is active but its local control channel is unavailable",
+        "workspace database schema version 11 was written by a newer Borg; expected 11",
+        "workspace database schema version 12 cannot be migrated in place",
+    ] {
+        assert!(!local_owner_rejected_newer_schema(&rejection(reason)));
+    }
+    let mut unrelated =
+        rejection("workspace database schema version 12 was written by a newer Borg; expected 11");
+    if let SessionEventKind::Error { message } = &mut unrelated.kind {
+        *message =
+            "workspace database schema version 12 was written by a newer Borg; expected 11".into();
+    }
+    assert!(!local_owner_rejected_newer_schema(&unrelated));
 }
 
 #[test]

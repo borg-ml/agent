@@ -1799,6 +1799,29 @@ fn stale_local_owner_can_handoff(status: Option<SessionStatus>) -> bool {
     matches!(status, Some(SessionStatus::Ready | SessionStatus::Stopped))
 }
 
+fn local_owner_rejected_newer_schema(event: &SessionEvent) -> bool {
+    let SessionEventKind::Error { message } = &event.kind else {
+        return false;
+    };
+    if event.sequence != 0 {
+        return false;
+    }
+    let Some(reason) = message.strip_prefix(
+        "The active session owner is not accepting commands yet: session owner rejected command: ",
+    ) else {
+        return false;
+    };
+    ["workspace", "autonomy"].iter().any(|database| {
+        let Some(versions) = reason.strip_prefix(&format!("{database} database schema version ")) else {
+            return false;
+        };
+        let Some((actual, expected)) = versions.split_once(" was written by a newer Borg; expected ") else {
+            return false;
+        };
+        matches!((actual.parse::<u64>(), expected.parse::<u64>()), (Ok(actual), Ok(expected)) if actual > expected)
+    })
+}
+
 /// A stopped state is the durable result of the previous local process going
 /// away, not the state of the new process the user just asked to resume. Keep
 /// the owner UI responsive while the actor rehydrates a long session; the
@@ -3807,15 +3830,17 @@ async fn run_local_agent_session(
                     )));
                     continue;
                 }
+                let schema_rejected = local_owner_rejected_newer_schema(&event);
                 let handoff_stale_owner = stale_local_owner
                     && stale_owner_handoff_task.is_none()
-                    && matches!(
-                        event.kind,
-                        SessionEventKind::StatusChanged {
-                            status: SessionStatus::Ready,
-                            ..
-                        }
-                    );
+                    && (schema_rejected
+                        || matches!(
+                            event.kind,
+                            SessionEventKind::StatusChanged {
+                                status: SessionStatus::Ready,
+                                ..
+                            }
+                        ));
                 delivered_projection.observe(&event)?;
                 if let Some(message_id) = committed_prompt_id(&event.kind) {
                     pending_prompt_ids.remove(&message_id);
@@ -3983,13 +4008,23 @@ async fn run_local_agent_session(
                 }
                 if handoff_stale_owner {
                     let socket_path = control_socket_path.clone();
+                    let lock_path = lock_path.clone();
+                    let sessions_dir = sessions_dir.clone();
+                    let store = Arc::clone(&store);
+                    if let Some(terminal) = terminal.as_mut() {
+                        terminal.set_notice("Upgrading the older session owner; queued prompts will resume.");
+                        terminal_dirty = true;
+                    }
                     stale_owner_handoff_task = Some(tokio::spawn(async move {
-                        send_local_session_command(
-                            &socket_path,
-                            session_id,
-                            HostCommand::Stop { session_id },
-                        )
-                        .await?;
+                        if local_session_owner_uses_current_binary(&sessions_dir, session_id)?
+                            || (!schema_rejected
+                                && !stale_local_owner_can_handoff(store.state(session_id).await?.status))
+                        {
+                            return Ok(false);
+                        }
+                        let _writer = stop_stale_local_owner_and_acquire(
+                            &lock_path, &socket_path, session_id,
+                        ).await?;
                         Ok(true)
                     }));
                 }
