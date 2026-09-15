@@ -3,3 +3,4 @@
 /.borg
 *.env.local
 .env
+__pycache__/
