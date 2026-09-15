@@ -2862,6 +2862,17 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
         assert_eq!(routed["delivery_state"], "relay_pending");
         assert_eq!(routed["recipient_ids"][0], remote.to_string());
         assert_eq!(routed["sender"], format!("participant:{sender}"));
+        let status = sender_coordinator
+            .call_tool_as(
+                sender,
+                "get_message_status",
+                json!({"message_id": routed["message_id"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status["deliveries"][0]["recipient_id"], remote.to_string());
+        assert_eq!(status["deliveries"][0]["state"], "pending");
+        assert_eq!(status["deliveries"][0]["attempts"], 0);
     }
     let listed = sender_coordinator
         .call_tool_as(
@@ -3049,6 +3060,7 @@ fn tool_catalog_exposes_one_complete_lifecycle() {
             "broadcast_team",
             "list_unread_team_messages",
             "acknowledge_team_message",
+            "get_message_status",
             "interrupt_agent",
             "wait_agent"
         ]

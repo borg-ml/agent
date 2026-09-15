@@ -1351,6 +1351,22 @@ pub struct ClaimedActionTransition {
 #[async_trait]
 pub trait SessionStore: Send + Sync {
     async fn create_session(&self, session_id: Uuid) -> Result<()>;
+    /// Durable per-workspace relay upload cursors for one host session.
+    async fn host_workspace_cursors(
+        &self,
+        _host_id: Uuid,
+        _session_id: Uuid,
+    ) -> Result<HashMap<Uuid, u64>> {
+        Ok(HashMap::new())
+    }
+    async fn acknowledge_host_workspaces(
+        &self,
+        _host_id: Uuid,
+        _session_id: Uuid,
+        _cursors: &HashMap<Uuid, u64>,
+    ) -> Result<()> {
+        Ok(())
+    }
     async fn register_child_session(
         &self,
         _owner_session_id: Uuid,
@@ -2747,7 +2763,7 @@ impl SqliteSessionStore {
         rows.into_iter().map(|id| parse_uuid(&id)).collect()
     }
 
-    pub async fn host_workspace_cursors(
+    pub async fn sqlite_host_workspace_cursors(
         &self,
         host_id: Uuid,
         session_id: Uuid,
@@ -2770,7 +2786,7 @@ impl SqliteSessionStore {
             .collect()
     }
 
-    pub async fn acknowledge_host_workspaces(
+    pub async fn sqlite_acknowledge_host_workspaces(
         &self,
         host_id: Uuid,
         session_id: Uuid,
@@ -6361,6 +6377,23 @@ fn sqlite_lock_text(error: &str) -> bool {
 
 #[async_trait]
 impl SessionStore for SqliteSessionStore {
+    async fn host_workspace_cursors(
+        &self,
+        host_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<HashMap<Uuid, u64>> {
+        self.sqlite_host_workspace_cursors(host_id, session_id)
+            .await
+    }
+    async fn acknowledge_host_workspaces(
+        &self,
+        host_id: Uuid,
+        session_id: Uuid,
+        cursors: &HashMap<Uuid, u64>,
+    ) -> Result<()> {
+        self.sqlite_acknowledge_host_workspaces(host_id, session_id, cursors)
+            .await
+    }
     async fn autonomy_store(&self) -> Result<Option<crate::SqliteAutonomyStore>> {
         Ok(Some(
             crate::SqliteAutonomyStore::open(self.pool.clone()).await?,

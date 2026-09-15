@@ -2351,7 +2351,7 @@ async fn recover_host_workspace_messages(
 async fn flush_host_workspace_messages(
     client: &Client,
     config: &HostConfig,
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     workspace: Option<&SqliteWorkspaceStore>,
     session_id: Uuid,
     execution_workspace: Option<Uuid>,
@@ -2608,7 +2608,9 @@ pub async fn mirror_local_session(
         uploaded_sequence: 0,
         uploaded_live_revision: 0,
         workspace_retry_at: HashMap::new(),
-        uploaded_workspace_sequences: HashMap::new(),
+        uploaded_workspace_sequences: store
+            .host_workspace_cursors(config.host_id, session_id)
+            .await?,
         workspace_relay_available: false,
         instance_relay_available: true,
         next_workspace_roster_sync: Instant::now(),
@@ -2856,7 +2858,7 @@ pub async fn mirror_local_session(
                     }
                 }
             }
-            let workspace_caught_up = flush_workspace_messages(
+            let workspace_caught_up = flush_host_workspace_messages(
                 &client,
                 &config,
                 store.as_ref(),
@@ -5624,7 +5626,25 @@ async fn flush_workspace_messages(
                         .send()
                         .await;
                     match response {
-                        Ok(response) if response.status().is_success() => {}
+                        Ok(response) if response.status().is_success() => {
+                            for recipient in delivery_recipients {
+                                store
+                                    .transition_message_delivery(
+                                        workspace.id,
+                                        message.id,
+                                        recipient,
+                                        crate::DeliveryState::Relayed,
+                                        Some(crate::DeliveryAttempt {
+                                            attempted_at: Utc::now(),
+                                            detail: Some(format!(
+                                                "accepted by {} for relay",
+                                                config.server
+                                            )),
+                                        }),
+                                    )
+                                    .await?;
+                            }
+                        }
                         Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
                             return Err(response.error_for_status().unwrap_err())
                                 .context("remote host token was rejected; enroll this host again");
@@ -7022,6 +7042,18 @@ mod tests {
                 .any(|instance| instance.participant.id == healthy_recipient
                     && instance.host_id == Some(remote_host_id))
         );
+        let healthy_deliveries = workspace
+            .deliveries_after(
+                direct_workspaces[&healthy_recipient],
+                healthy_recipient,
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(healthy_deliveries.len(), 1);
+        assert_eq!(healthy_deliveries[0].state, crate::DeliveryState::Relayed);
+        assert_eq!(healthy_deliveries[0].attempts, 1);
     }
 
     #[test]

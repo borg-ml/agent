@@ -179,6 +179,9 @@ pub enum DeliveryMode {
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryState {
     Pending,
+    /// Accepted by the remote relay for a recipient on another host; the
+    /// recipient's own host reports admission and acknowledgement.
+    Relayed,
     Admitted,
     Acknowledged,
     Failed,
@@ -988,6 +991,35 @@ impl SqliteWorkspaceStore {
         }
         transaction.commit().await?;
         Ok(())
+    }
+
+    /// Every recipient delivery row for one message, across all workspaces.
+    pub async fn message_deliveries(&self, message_id: Uuid) -> Result<Vec<RecipientDelivery>> {
+        let rows = sqlx::query(
+            "select d.workspace_id,d.sequence,d.recipient_id,d.mode,d.state,d.attempts,d.last_attempt_json \
+             from workspace_events e join workspace_deliveries d \
+               on d.workspace_id=e.workspace_id and d.sequence=e.sequence \
+             where e.id=? order by d.recipient_id",
+        )
+        .bind(message_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(RecipientDelivery {
+                    workspace_id: Uuid::parse_str(r.get("workspace_id"))?,
+                    sequence: u64::try_from(r.get::<i64, _>("sequence"))?,
+                    recipient_id: Uuid::parse_str(r.get("recipient_id"))?,
+                    mode: serde_json::from_str(r.get("mode"))?,
+                    state: serde_json::from_str(r.get("state"))?,
+                    attempts: u32::try_from(r.get::<i64, _>("attempts"))?,
+                    last_attempt: r
+                        .get::<Option<String>, _>("last_attempt_json")
+                        .map(|x| serde_json::from_str(&x))
+                        .transpose()?,
+                })
+            })
+            .collect()
     }
 
     pub async fn transition_message_delivery(
@@ -1860,7 +1892,13 @@ impl WorkspaceStore for SqliteWorkspaceStore {
             (current, next),
             (
                 DeliveryState::Pending,
-                DeliveryState::Admitted | DeliveryState::Failed | DeliveryState::Recalled
+                DeliveryState::Relayed
+                    | DeliveryState::Admitted
+                    | DeliveryState::Failed
+                    | DeliveryState::Recalled
+            ) | (
+                DeliveryState::Relayed,
+                DeliveryState::Relayed | DeliveryState::Acknowledged | DeliveryState::Failed
             ) | (
                 DeliveryState::Admitted,
                 DeliveryState::Acknowledged | DeliveryState::Failed

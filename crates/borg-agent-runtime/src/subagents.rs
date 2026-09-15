@@ -5226,6 +5226,30 @@ impl SubagentCoordinator {
                     .await?;
                 Ok(json!({ "acknowledged": true }))
             }
+            "get_message_status" => {
+                let args: AcknowledgeMessageArgs = serde_json::from_value(arguments)?;
+                let deliveries = self
+                    .workspace_store()
+                    .await?
+                    .message_deliveries(args.message_id)
+                    .await?;
+                ensure!(
+                    !deliveries.is_empty(),
+                    "unknown message id {}",
+                    args.message_id
+                );
+                Ok(json!({
+                    "message_id": args.message_id,
+                    "deliveries": deliveries.iter().map(|delivery| json!({
+                        "recipient_id": delivery.recipient_id,
+                        "workspace_id": delivery.workspace_id,
+                        "mode": delivery.mode,
+                        "state": delivery.state,
+                        "attempts": delivery.attempts,
+                        "last_attempt": delivery.last_attempt,
+                    })).collect::<Vec<_>>(),
+                }))
+            }
             "interrupt_agent" => {
                 let args: TargetArgs = serde_json::from_value(arguments)?;
                 self.interrupt(&args.target).await?;
@@ -5441,7 +5465,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         message_tool(
             "send_message",
-            "Queue a durable message for any discovered Borg instance, across projects and enrolled machines. Use participant:<id> from list_instances, session:<UUID> for a local session, or a team path. Cross-workspace messages use a private channel. Messages notify by default without starting an idle agent. Set wake:true to request a turn; explicit user interruption still takes precedence.",
+            "Queue a durable message for any discovered Borg instance, across projects and enrolled machines. Use participant:<id> from list_instances, session:<UUID> for a local session, or a team path. Cross-workspace messages use a private channel. Messages notify by default without starting an idle agent. Set wake:true to request a turn; explicit user interruption still takes precedence. A relay_pending result means the host relay forwards it asynchronously; confirm with get_message_status.",
         ),
         message_tool(
             "followup_task",
@@ -5460,6 +5484,11 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         tool(
             "acknowledge_team_message",
             "Acknowledge one unread team message.",
+            json!({"type":"object","properties":{"message_id":{"type":"string"}},"required":["message_id"],"additionalProperties":false}),
+        ),
+        tool(
+            "get_message_status",
+            "Per-recipient delivery state of a message you sent: pending (not yet handed to the relay), relayed (accepted by the remote relay; the recipient host admits it on its next sync), admitted, acknowledged, or failed with the last attempt detail.",
             json!({"type":"object","properties":{"message_id":{"type":"string"}},"required":["message_id"],"additionalProperties":false}),
         ),
         tool(
