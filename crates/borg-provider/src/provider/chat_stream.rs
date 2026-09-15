@@ -72,6 +72,7 @@ mod claude_agents {
         Steer {
             text: String,
             attachments: Vec<PathBuf>,
+            message_id: Option<String>,
             ack: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
         },
         Approval {
@@ -1477,9 +1478,12 @@ async fn relay_claude_runtime(
                             }
                             let (native_ack, _native_acknowledgement) =
                                 tokio::sync::oneshot::channel();
+                            // The Borg message id becomes the stdin uuid, so the
+                            // CLI's command_lifecycle frames name it directly.
                             permit.send(claude_agents::ChatStreamControl::Steer {
                                 text,
                                 attachments,
+                                message_id: client_user_message_id.clone(),
                                 ack: native_ack,
                             });
                             let _ = ack.send(Ok(()));
@@ -1867,8 +1871,15 @@ fn enrich_claude_lifecycle_payload(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     match state {
         "queued" => {
+            // Exact match first: the stdin uuid is the Borg message id. Fall
+            // back to arrival order for steers registered without an id.
+            let exact = steer_correlation
+                .pending
+                .iter()
+                .position(|message_id| message_id == command_uuid)
+                .and_then(|index| steer_correlation.pending.remove(index));
             if !steer_correlation.commands.contains_key(command_uuid)
-                && let Some(message_id) = steer_correlation.pending.pop_front()
+                && let Some(message_id) = exact.or_else(|| steer_correlation.pending.pop_front())
             {
                 payload.insert(
                     "client_user_message_id".to_string(),

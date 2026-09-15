@@ -420,16 +420,30 @@ async fn accepted_steers_settle_in_fifo_order_when_acknowledgements_arrive_out_o
     let mut pending_steers = VecDeque::from([steer(first_id), steer(second_id)]);
 
     pending_steers[1].state = PendingSteerState::Accepted;
-    settle_accepted_steers(&mut journal, &events, session_id, &mut pending_steers)
-        .await
-        .unwrap();
+    settle_accepted_steers(
+        &mut journal,
+        &events,
+        session_id,
+        &mut pending_steers,
+        false,
+        &mut HashMap::new(),
+    )
+    .await
+    .unwrap();
     assert!(event_rx.try_recv().is_err());
     assert_eq!(pending_steers.len(), 2);
 
     pending_steers[0].state = PendingSteerState::Accepted;
-    settle_accepted_steers(&mut journal, &events, session_id, &mut pending_steers)
-        .await
-        .unwrap();
+    settle_accepted_steers(
+        &mut journal,
+        &events,
+        session_id,
+        &mut pending_steers,
+        false,
+        &mut HashMap::new(),
+    )
+    .await
+    .unwrap();
 
     let mut settled = Vec::new();
     while let Ok(event) = event_rx.try_recv() {
@@ -450,6 +464,115 @@ async fn accepted_steers_settle_in_fifo_order_when_acknowledgements_arrive_out_o
         ]
     );
     assert!(pending_steers.is_empty());
+}
+
+#[tokio::test]
+async fn claude_steers_stay_pending_input_until_the_cli_reports_consumption() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (_store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+    let (events, mut event_rx) = mpsc::channel(16);
+    let consumed_id = Uuid::new_v4();
+    let leftover_id = Uuid::new_v4();
+    let steer = |message_id| {
+        let admission = SteerAdmission::pending();
+        assert!(admission.accept());
+        PendingSteer {
+            prompt: QueuedPrompt {
+                message_id,
+                text: message_id.to_string(),
+                actor: EventActor::User,
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+                visible: true,
+                interrupt_batch: true,
+                batch: Vec::new(),
+            },
+            admission,
+            state: PendingSteerState::Accepted,
+            acknowledgement_id: Uuid::new_v4(),
+            attempt_boundary: 0,
+        }
+    };
+    let mut pending_steers = VecDeque::from([steer(consumed_id), steer(leftover_id)]);
+    let mut awaiting = HashMap::new();
+    settle_accepted_steers(
+        &mut journal,
+        &events,
+        session_id,
+        &mut pending_steers,
+        true,
+        &mut awaiting,
+    )
+    .await
+    .unwrap();
+    assert_eq!(awaiting.len(), 2, "deferred steers wait for consumption");
+
+    // Unrelated lifecycle traffic (the original prompt's own command) is ignored.
+    let lifecycle = |state: &str, message_id: Option<Uuid>| {
+        let mut payload = serde_json::json!({"type": "command_lifecycle", "state": state});
+        if let Some(message_id) = message_id {
+            payload["client_user_message_id"] = serde_json::json!(message_id.to_string());
+        }
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Claude,
+            kind: "claude.command_lifecycle".to_string(),
+            payload,
+        }
+    };
+    complete_consumed_steers(
+        &lifecycle("started", None),
+        &mut awaiting,
+        &mut journal,
+        &events,
+        session_id,
+    )
+    .await
+    .unwrap();
+    complete_consumed_steers(
+        &lifecycle("queued", Some(consumed_id)),
+        &mut awaiting,
+        &mut journal,
+        &events,
+        session_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(awaiting.len(), 2);
+    complete_consumed_steers(
+        &lifecycle("started", Some(consumed_id)),
+        &mut awaiting,
+        &mut journal,
+        &events,
+        session_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(awaiting.len(), 1);
+    flush_awaiting_steers(&mut awaiting, false, &mut journal, &events, session_id)
+        .await
+        .unwrap();
+    assert!(awaiting.is_empty());
+
+    let mut settled = Vec::new();
+    while let Ok(event) = event_rx.try_recv() {
+        if let SessionEventKind::Message {
+            message_id, status, ..
+        } = event.kind
+        {
+            settled.push((message_id, status));
+        }
+    }
+    assert_eq!(
+        settled,
+        [
+            (consumed_id, MessageStatus::InProgress),
+            (leftover_id, MessageStatus::InProgress),
+            (consumed_id, MessageStatus::Complete),
+            (leftover_id, MessageStatus::Complete),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -4579,17 +4702,24 @@ async fn accepted_claude_steer_is_settled_before_turn_is_interrupted() {
             && message_id == followup_id
         {
             transitions.push((status, delivery));
-            if status == MessageStatus::Complete && delivery == PromptDelivery::Steer {
+            if matches!(status, MessageStatus::Complete | MessageStatus::Failed)
+                && delivery == PromptDelivery::Steer
+            {
                 break;
             }
         }
     }
+    // Claude reports consumption per stdin message, so an accepted steer stays
+    // InProgress (pending input) until the CLI starts it. An interrupt before
+    // that settles it as Failed, like the interrupted prompt itself, rather
+    // than claiming the model saw it; either way it is settled and cannot be
+    // resurrected by the interruption.
     assert_eq!(
         transitions,
         [
             (MessageStatus::Queued, PromptDelivery::Steer),
             (MessageStatus::InProgress, PromptDelivery::Steer),
-            (MessageStatus::Complete, PromptDelivery::Steer),
+            (MessageStatus::Failed, PromptDelivery::Steer),
         ],
         "provider-accepted Claude input must settle before a later interruption can resurrect it"
     );

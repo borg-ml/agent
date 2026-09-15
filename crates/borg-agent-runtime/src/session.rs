@@ -3447,6 +3447,10 @@ async fn run_agent_session_store_kernel(
         let mut pending_approval: Option<PendingApproval> = None;
         let mut pending_provider_interaction: Option<String> = None;
         let mut pending_steers = VecDeque::<PendingSteer>::new();
+        // Steers the provider accepted onto stdin but has not yet consumed.
+        // They stay InProgress ("pending input") until the provider reports
+        // the model actually picked them up, then flip to Complete.
+        let mut steers_awaiting_consumption: HashMap<Uuid, PromptBatchEntry> = HashMap::new();
         let mut steer_boundary_generation = 0_u64;
         let mut context_compaction_in_progress = false;
         let (steer_result_tx, mut steer_results) =
@@ -3469,6 +3473,14 @@ async fn run_agent_session_store_kernel(
                 _ = generation.wait(), if !interrupted => {
                     if !provider_events.is_empty() { continue; }
                     for kind in generation.expire(tokio::time::Instant::now()) {
+                        complete_consumed_steers(
+                            &kind,
+                            &mut steers_awaiting_consumption,
+                            &mut journal,
+                            &events,
+                            session_id,
+                        )
+                        .await?;
                         record(&mut journal, &events, session_id, kind).await?;
                     }
                 }
@@ -3545,6 +3557,14 @@ async fn run_agent_session_store_kernel(
                         if context_usage_observation(&kind) {
                             provider_context_usage_valid = true;
                         }
+                        complete_consumed_steers(
+                            &kind,
+                            &mut steers_awaiting_consumption,
+                            &mut journal,
+                            &events,
+                            session_id,
+                        )
+                        .await?;
                         record(&mut journal, &events, session_id, kind).await?;
                         if let Some(tokens) = usage {
                             account_goal_tokens(
@@ -3570,6 +3590,14 @@ async fn run_agent_session_store_kernel(
                         &events,
                         session_id,
                         &mut pending_provider_interaction,
+                    )
+                    .await?;
+                    flush_awaiting_steers(
+                        &mut steers_awaiting_consumption,
+                        interrupted,
+                        &mut journal,
+                        &events,
+                        session_id,
                     )
                     .await?;
                     promote_uncommitted_steers(
@@ -3710,6 +3738,14 @@ async fn run_agent_session_store_kernel(
                                 } else {
                                     for kind in retryable_provider_errors.drain(..) {
                                         turn_reported_error = true;
+                                        complete_consumed_steers(
+                                            &kind,
+                                            &mut steers_awaiting_consumption,
+                                            &mut journal,
+                                            &events,
+                                            session_id,
+                                        )
+                                        .await?;
                                         record(&mut journal, &events, session_id, kind).await?;
                                     }
                                 }
@@ -3959,6 +3995,14 @@ async fn run_agent_session_store_kernel(
                     if context_usage_observation(&kind) {
                         provider_context_usage_valid = true;
                     }
+                    complete_consumed_steers(
+                        &kind,
+                        &mut steers_awaiting_consumption,
+                        &mut journal,
+                        &events,
+                        session_id,
+                    )
+                    .await?;
                     record(&mut journal, &events, session_id, kind).await?;
                     if retry_steers && !context_compaction_in_progress && !user_stop && !interrupted {
                         steer_boundary_generation = steer_boundary_generation.saturating_add(1);
@@ -4069,6 +4113,14 @@ async fn run_agent_session_store_kernel(
                             error: Some("turn interrupted".to_string()),
                         },
                     ).await?;
+                    flush_awaiting_steers(
+                        &mut steers_awaiting_consumption,
+                        interrupted,
+                        &mut journal,
+                        &events,
+                        session_id,
+                    )
+                    .await?;
                     promote_uncommitted_steers(
                         &mut journal,
                         &events,
@@ -4129,6 +4181,14 @@ async fn run_agent_session_store_kernel(
                             "autonomy turn liveness timeout"
                         )));
                     }
+                    flush_awaiting_steers(
+                        &mut steers_awaiting_consumption,
+                        interrupted,
+                        &mut journal,
+                        &events,
+                        session_id,
+                    )
+                    .await?;
                     promote_uncommitted_steers(
                         &mut journal,
                         &events,
@@ -4189,6 +4249,8 @@ async fn run_agent_session_store_kernel(
                             &events,
                             session_id,
                             &mut pending_steers,
+                            provider_reports_steer_consumption(launch.provider),
+                            &mut steers_awaiting_consumption,
                         )
                         .await?;
                     } else {
@@ -4788,6 +4850,14 @@ async fn run_agent_session_store_kernel(
                                     final_text: String::new(),
                                     error: Some("turn interrupted".to_string()),
                                 },
+                            )
+                            .await?;
+                            flush_awaiting_steers(
+                                &mut steers_awaiting_consumption,
+                                interrupted,
+                                &mut journal,
+                                &events,
+                                session_id,
                             )
                             .await?;
                             promote_uncommitted_steers(
@@ -7305,11 +7375,107 @@ async fn promote_uncommitted_steers(
     Ok(())
 }
 
+/// Claude names every stdin message in its `command_lifecycle` frames, so the
+/// runtime can hold a steer at InProgress until the model really consumes it.
+/// Other providers merge steers synchronously and complete them on acceptance.
+fn provider_reports_steer_consumption(provider: CodingProvider) -> bool {
+    provider == CodingProvider::Claude
+}
+
+/// The provider told us the model picked up a steer: `claude.command_lifecycle`
+/// with `state: started`, carrying the Borg message id the stdin uuid was
+/// stamped with. Flip that steer from pending input to Complete.
+async fn complete_consumed_steers(
+    kind: &SessionEventKind,
+    awaiting: &mut HashMap<Uuid, PromptBatchEntry>,
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+) -> Result<()> {
+    if awaiting.is_empty() {
+        return Ok(());
+    }
+    let SessionEventKind::ProviderEvent { kind, payload, .. } = kind else {
+        return Ok(());
+    };
+    if kind != "claude.command_lifecycle" {
+        return Ok(());
+    }
+    let state = payload
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let status = match state {
+        "started" | "completed" => MessageStatus::Complete,
+        "failed" | "cancelled" | "error" => MessageStatus::Failed,
+        _ => return Ok(()),
+    };
+    let Some(message_id) = payload
+        .get("client_user_message_id")
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+    else {
+        return Ok(());
+    };
+    let Some(entry) = awaiting.remove(&message_id) else {
+        return Ok(());
+    };
+    record_steer_entry_status(journal, events, session_id, entry, status).await
+}
+
+/// A turn is over: nothing can consume a steer any more, so settle whatever is
+/// still pending input. Complete on a normal end (the CLI folds late steers
+/// into its final command), Failed when the turn was interrupted.
+async fn flush_awaiting_steers(
+    awaiting: &mut HashMap<Uuid, PromptBatchEntry>,
+    interrupted: bool,
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+) -> Result<()> {
+    let status = if interrupted {
+        MessageStatus::Failed
+    } else {
+        MessageStatus::Complete
+    };
+    let mut entries: Vec<_> = awaiting.drain().collect();
+    entries.sort_by_key(|(id, _)| *id);
+    for (_, entry) in entries {
+        record_steer_entry_status(journal, events, session_id, entry, status).await?;
+    }
+    Ok(())
+}
+
+async fn record_steer_entry_status(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    entry: PromptBatchEntry,
+    status: MessageStatus,
+) -> Result<()> {
+    record(
+        journal,
+        events,
+        session_id,
+        SessionEventKind::Message {
+            message_id: entry.message_id,
+            actor: entry.actor,
+            text: entry.text,
+            attachments: entry.attachments,
+            status,
+            delivery: Some(PromptDelivery::Steer),
+        },
+    )
+    .await
+}
+
 async fn settle_accepted_steers(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
     pending_steers: &mut VecDeque<PendingSteer>,
+    defer_completion: bool,
+    awaiting: &mut HashMap<Uuid, PromptBatchEntry>,
 ) -> Result<()> {
     let mut receipts = Vec::new();
     while matches!(
@@ -7320,7 +7486,15 @@ async fn settle_accepted_steers(
             .pop_front()
             .expect("accepted steer was at the front");
         let entries = steer.prompt.batch_entries();
-        for status in [MessageStatus::InProgress, MessageStatus::Complete] {
+        let statuses: &[MessageStatus] = if defer_completion {
+            for entry in &entries {
+                awaiting.insert(entry.message_id, entry.clone());
+            }
+            &[MessageStatus::InProgress]
+        } else {
+            &[MessageStatus::InProgress, MessageStatus::Complete]
+        };
+        for status in statuses.iter().copied() {
             for entry in &entries {
                 receipts.extend(journal.take_projection_diagnostics());
                 receipts.push(
