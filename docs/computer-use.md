@@ -101,6 +101,9 @@ view; bounds are physical screen pixels (the helper is DPI-aware), so they match
 desktop. `scope: "window"` uses `PrintWindow` for isolated capture. `click` uses
 Invoke, Toggle or SelectionItem patterns; `set_value` uses ValuePattern and
 refuses password and read-only controls. Elevated windows are not observable.
+Input injection (`type_text`, `key`, `pointer_click`, `scroll`, `drag`) uses
+`SendInput` with absolute coordinates normalised over the virtual desktop and
+brings the target window to the foreground first.
 The script parses cleanly and its JSONL protocol loop (capabilities, error
 envelopes, argument validation) was dry-run under PowerShell 7.6 on Linux with
 the Windows-only calls stubbed. **Not yet exercised on a real Windows host**;
