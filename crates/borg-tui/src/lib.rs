@@ -1825,10 +1825,11 @@ impl Picker {
                         .section
                         .as_deref()
                         .is_some_and(|section| fuzzy_matches(section, query))
-                    || option
-                        .preview
-                        .as_deref()
-                        .is_some_and(|preview| fuzzy_matches(preview, query))
+                    || (self.kind != PickerKind::Model
+                        && option
+                            .preview
+                            .as_deref()
+                            .is_some_and(|preview| fuzzy_matches(preview, query)))
             })
             .map(|(index, _)| index)
             .collect()

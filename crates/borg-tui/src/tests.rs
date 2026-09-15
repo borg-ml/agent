@@ -1227,7 +1227,7 @@ fn model_picker_openrouter_uses_runtime_entries_and_existing_fuzzy_filter() {
     let discovered = [borg_provider::DynamicModelEntry {
         id: "anthropic/claude-sonnet-4".to_string(),
         label: "Claude Sonnet 4".to_string(),
-        detail: Some("200000 context · strong coding model".to_string()),
+        detail: Some("200000 context · also offered through opencode-go".to_string()),
     }];
     let options = model_picker_options_with_discovered(
         Some(CodingProvider::OpenRouter),
@@ -1244,7 +1244,7 @@ fn model_picker_openrouter_uses_runtime_entries_and_existing_fuzzy_filter() {
             .is_some_and(|preview| preview.contains("200000 context"))
     );
 
-    let picker = Picker {
+    let mut picker = Picker {
         kind: PickerKind::Model,
         title: "Choose model",
         options,
@@ -1260,6 +1260,11 @@ fn model_picker_openrouter_uses_runtime_entries_and_existing_fuzzy_filter() {
             .any(|index| { picker.options[*index].value == "claude-sonnet-5" })
     );
     assert_eq!(matches.len(), 2);
+    picker.set_query("opencode-go".to_string());
+    assert!(
+        !picker.matches().contains(&1),
+        "model search must not match an unrelated provider mentioned in its description"
+    );
 }
 
 #[test]
