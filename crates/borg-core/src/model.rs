@@ -46,7 +46,11 @@ pub enum ModelMessage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "protocol", rename_all = "snake_case")]
 pub enum ModelProviderState {
-    OpenAiResponses { output: Vec<Value> },
+    OpenAiResponses {
+        output: Vec<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_identity: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

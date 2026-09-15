@@ -1868,6 +1868,13 @@ impl SqliteSessionStore {
             .as_str()
             .context("provider is not a string")?
             .to_owned();
+        // An intentional billing switch keeps separate bindings. Returning to
+        // either lane still requires its original account/key.
+        let provider = if provider == "codex" && account_identity.starts_with("api-sha256:") {
+            "codex_api".to_string()
+        } else {
+            provider
+        };
         let existing: Option<String> = sqlx::query_scalar(
             "select account_identity from session_model_access where session_id=? and provider=?",
         )

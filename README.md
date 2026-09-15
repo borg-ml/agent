@@ -43,6 +43,17 @@ borg capabilities
 borg extensions list
 ```
 
+Use `/login` (or `/connect`) to choose ChatGPT subscription access or OpenAI
+API billing on this machine. Borg keeps the saved API key when you switch back
+to ChatGPT. Without a selection in Borg, it follows your Codex login. You can
+also add a key directly with `borg login codex --api-key`; input is hidden,
+or you can pipe it through stdin.
+
+For OpenCode Go, run `borg login opencode --api-key` and enter your Go
+subscription key. `/model` lists Go models under **OpenCode Go** using the
+`opencode-go/<model>` route. The footer shows the selected billing mode.
+Subscription limits never trigger an automatic switch to API billing.
+
 Interactive sessions run in a detached per-session host. Closing one TUI or
 GUI view does not stop an active turn, its provider app server, or subagents;
 another view can attach to the same durable session. An unattended host exits
@@ -69,6 +80,11 @@ If the provider connection drops, Borg saves the interrupted work and retries
 automatically with delays capped at 30 seconds. The terminal shows the retry
 countdown; Escape cancels recovery. Completed tool work is included in recovery
 context so the agent can check interrupted commands before continuing.
+
+Usage limits wait until the provider's reported reset time, including its time
+zone. If no reset is supplied, Borg retries after 30 minutes. The terminal shows
+when work will resume; Escape cancels the wait, and `/login` or `/model` lets
+you switch connections and continue sooner.
 
 On macOS, Option/Ctrl+Left/Right move by word, Cmd+Left/Right go to line
 boundaries, and Cmd+Up/Down go to the start/end of the composer. Shift extends

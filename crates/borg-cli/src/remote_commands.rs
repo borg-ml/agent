@@ -2213,6 +2213,11 @@ async fn run_local_agent_session(
     ) && !BorgTerminal::fallback_requested();
     if rich_tui_allowed {
         tokio::spawn(async {
+            if let Err(error) = borg_provider::refresh_opencode_go_model_catalog().await {
+                tracing::debug!(%error, "OpenCode Go model catalog unavailable");
+            }
+        });
+        tokio::spawn(async {
             if let Err(error) = borg_provider::refresh_openrouter_model_catalog().await {
                 tracing::debug!(%error, "OpenRouter model catalog unavailable; keeping current/manual model fallback");
             }
@@ -5005,7 +5010,10 @@ async fn run_local_agent_session(
                         } else {
                             CodingProvider::for_model(&model).unwrap_or(active)
                         };
-                        if !configured && !provider_credentials_present(target) {
+                        let connected = if model.starts_with("opencode-go/") {
+                            borg_provider::credentials::opencode_go_api_key().is_some()
+                        } else { provider_credentials_present(target) };
+                        if !configured && !connected {
                             terminal
                                 .as_mut()
                                 .expect("terminal")
@@ -5015,10 +5023,7 @@ async fn run_local_agent_session(
                                 &ui_interaction_tx,
                                 model_selection_command(session_id, active, target, model.clone()),
                             );
-                            terminal
-                                .as_mut()
-                                .expect("terminal")
-                                .open_effort_picker_for(Some(target), Some(&model));
+                            terminal.as_mut().expect("terminal").set_notice(format!("Selected {model}. Use /effort to adjust reasoning or /login to change billing."));
                         }
                     }
                     UiAction::AuthenticateProvider {
@@ -5041,22 +5046,7 @@ async fn run_local_agent_session(
                             // sign-in runs the provider's own device flow, and the
                             // key prompt reads from stdin with echo disabled.
                             shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
-                            let outcome = match choice {
-                                ProviderAuthChoice::Subscription => {
-                                    login_provider(target).await.map(|()| {
-                                        format!("Connected {}.", target.label())
-                                    })
-                                }
-                                ProviderAuthChoice::ApiKey => {
-                                    prompt_and_store_api_key(target).map(|path| {
-                                        format!(
-                                            "{} API key saved to {}.",
-                                            target.label(),
-                                            path.display()
-                                        )
-                                    })
-                                }
-                            };
+                            let outcome = authenticate_provider(target, choice).await;
                             if outcome.is_ok() {
                                 // Authentication changes are part of the
                                 // provider lifecycle. Drop any retained
@@ -5099,20 +5089,20 @@ async fn run_local_agent_session(
                             restored.seed_session_state(&latest_state);
                             let active = restored.session_provider().unwrap_or(provider);
                             restored.set_notice(match &outcome {
-                                Ok(message) => format!("{message} Switching to {model}."),
+                                Ok(message) => message.clone(),
                                 Err(error) => format!("Provider not connected: {error:#}"),
                             });
                             terminal = Some(restored);
                             crash_context.tui_active.store(true, Ordering::Release);
                             if outcome.is_ok() {
-                                dispatch_ui_command(
-                                    &ui_interaction_tx,
-                                    model_selection_command(session_id, active, target, model.clone()),
-                                );
-                                terminal
-                                    .as_mut()
-                                    .expect("terminal")
-                                    .open_effort_picker_for(Some(target), Some(&model));
+                                if target == CodingProvider::OpenCode && !model.starts_with("opencode-go/") {
+                                    terminal.as_mut().expect("terminal").open_model_picker();
+                                } else {
+                                    dispatch_ui_command(
+                                        &ui_interaction_tx,
+                                        model_selection_command(session_id, active, target, model.clone()),
+                                    );
+                                }
                             }
                         }
                     }
@@ -6810,7 +6800,7 @@ async fn run_local_agent_session(
                                         crash_context.tui_active.store(true, Ordering::Release);
                                     }
                                 }
-                                "/login" if attachments.is_empty() => {
+                                "/login" | "/connect" if attachments.is_empty() => {
                                     if matches!(
                                         status,
                                         SessionStatus::Starting
@@ -6821,55 +6811,10 @@ async fn run_local_agent_session(
                                             "Interrupt the current turn before reconnecting the provider."
                                         );
                                     } else {
-                                        // The native device flow needs a normal terminal. Rebuild
-                                        // the UI from its journal after the provider returns.
-                                        shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
-                                        let login = login_provider(provider).await;
                                         let latest_state = store.state(session_id).await?;
-                                        let latest = recent_tui_history(
-                                            store.as_ref(),
-                                            session_id,
-                                            latest_state.latest_sequence,
-                                        )
-                                        .await?;
-                                        let mut restored = BorgTerminal::enter(
-                                            &sessions_dir,
-                                            session_id,
-                                            cwd.clone(),
-                                            &agent_config.keybindings,
-                                        )?;
-                                        restored.set_dictation_icon(dictation_icon_style_for_preference(
-                                            editor_preferences.presentation.dictation_icon,
-                                        ));
-                                        restored.set_configured_model_entries(agent_config.configured_model_entries());
-                                        restored.set_extension_commands(extension_catalog.api_snapshot().commands);
-                                        let composer_history = store
-                                            .recent_user_messages(
-                                                session_id,
-                                                RICH_TUI_PROMPT_HISTORY_LIMIT,
-                                            )
-                                            .await?;
-                                        restored.seed_composer_history(&composer_history);
-                                        restored.seed_history(&latest.events);
-                                        let (_, agents, histories) =
-                                            load_subagent_thread_state(
-                                                store.as_ref(),
-                                                &sessions_dir,
-                                                session_id,
-                                            )
-                                                .await?;
-                                        seed_terminal_subagent_threads(
-                                            &mut restored,
-                                            &agents,
-                                            &histories,
-                                        );
-                                        restored.seed_session_state(&latest_state);
-                                        restored.set_notice(match login {
-                                            Ok(()) => "Signed in. Retry your message.".to_string(),
-                                            Err(error) => format!("Sign-in failed: {error:#}"),
-                                        });
-                                        terminal = Some(restored);
-                                        crash_context.tui_active.store(true, Ordering::Release);
+                                        let active = terminal.as_ref().and_then(BorgTerminal::session_provider).unwrap_or(provider);
+                                        let model = latest_state.configuration.as_ref().and_then(|config| config.model.clone()).unwrap_or_else(|| active.model_catalog().map(|catalog| catalog.default_model.to_string()).unwrap_or_default());
+                                        terminal.as_mut().expect("terminal").open_provider_auth_picker(active, model);
                                     }
                                 }
                                 "/quit" | "/exit" if attachments.is_empty() => {
@@ -7405,11 +7350,12 @@ pub(crate) async fn login_command(
     };
     let provider: CodingProvider = provider.into();
     match provider {
-        CodingProvider::Codex | CodingProvider::OpenCode if api_key => anyhow::bail!(
-            "{} authenticates with a subscription sign-in; {}",
-            provider.label(),
-            credential_guidance(provider)
-        ),
+        CodingProvider::Codex | CodingProvider::OpenCode if api_key => {
+            println!(
+                "{}",
+                authenticate_provider(provider, ProviderAuthChoice::ReplaceApiKey).await?
+            );
+        }
         CodingProvider::OpenRouter => {
             let path = prompt_and_store_api_key(provider)?;
             println!("{} API key saved to {}.", provider.label(), path.display());
@@ -7419,8 +7365,10 @@ pub(crate) async fn login_command(
             println!("{} API key saved to {}.", provider.label(), path.display());
         }
         CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
-            login_provider(provider).await?;
-            println!("Connected {}.", provider.label());
+            println!(
+                "{}",
+                authenticate_provider(provider, ProviderAuthChoice::ReconnectSubscription).await?
+            );
         }
         CodingProvider::Kimi | CodingProvider::Glm | CodingProvider::OpenAiCompatible => {
             anyhow::bail!(
@@ -7436,11 +7384,15 @@ pub(crate) async fn login_command(
 /// One line telling a user how a provider gets its credentials.
 fn credential_guidance(provider: CodingProvider) -> &'static str {
     match provider {
-        CodingProvider::Codex => "`borg login codex` (ChatGPT subscription) or set OPENAI_API_KEY",
+        CodingProvider::Codex => {
+            "`borg login codex` (ChatGPT) or `borg login codex --api-key` (API billing); /login switches saved credentials"
+        }
         CodingProvider::Claude => {
             "`borg login claude` (Claude subscription) or `borg login claude --api-key`"
         }
-        CodingProvider::OpenCode => "`borg login opencode` (runs `opencode providers login`)",
+        CodingProvider::OpenCode => {
+            "`borg login opencode --api-key` (Go subscription key), then /model → OpenCode Go"
+        }
         CodingProvider::OpenRouter => "`borg login openrouter` stores an OpenRouter API key",
         CodingProvider::Kimi => "set BORG_KIMI_API_KEY (or MOONSHOT_API_KEY)",
         CodingProvider::Glm => "set BORG_GLM_API_KEY, or select the GLM Coding Plan",
@@ -7452,17 +7404,93 @@ fn credential_guidance(provider: CodingProvider) -> &'static str {
 
 fn prompt_and_store_api_key(provider: CodingProvider) -> Result<PathBuf> {
     let credential = match provider {
+        CodingProvider::Codex => borg_provider::credentials::ApiKeyCredential::OpenAi,
+        CodingProvider::OpenCode => borg_provider::credentials::ApiKeyCredential::OpenCodeGo,
+        CodingProvider::Kimi => borg_provider::credentials::ApiKeyCredential::Kimi,
+        CodingProvider::Glm => borg_provider::credentials::ApiKeyCredential::Zai,
         CodingProvider::Claude => borg_provider::credentials::ApiKeyCredential::Anthropic,
         CodingProvider::OpenRouter => borg_provider::credentials::ApiKeyCredential::OpenRouter,
         other => anyhow::bail!("{} does not use a borg-managed API key", other.label()),
     };
-    println!(
-        "Paste your {} API key (input hidden), then press Enter:",
+    let key_label = if provider == CodingProvider::OpenCode {
+        "OpenCode Go subscription"
+    } else {
         provider.label()
-    );
+    };
+    println!("Paste your {key_label} key (input hidden), then press Enter:");
     io::stdout().flush().ok();
-    let key = read_hidden_line().context("failed to read API key")?;
+    let key = if io::stdin().is_terminal() {
+        read_hidden_line().context("failed to read API key")?
+    } else {
+        use std::io::Read;
+        let mut key = String::new();
+        io::stdin().take(16 * 1024).read_to_string(&mut key)?;
+        key
+    };
     borg_provider::credentials::store_api_key(credential, &key)
+}
+
+async fn authenticate_provider(
+    provider: CodingProvider,
+    choice: ProviderAuthChoice,
+) -> Result<String> {
+    use borg_provider::credentials::{self, OpenAiAuthMode};
+    let api = matches!(
+        choice,
+        ProviderAuthChoice::ApiKey | ProviderAuthChoice::ReplaceApiKey
+    );
+    if api {
+        let saved = match provider {
+            CodingProvider::Codex => credentials::openai_api_key().is_some(),
+            CodingProvider::OpenCode => credentials::opencode_go_api_key().is_some(),
+            _ => false,
+        };
+        if !saved || choice == ProviderAuthChoice::ReplaceApiKey {
+            prompt_and_store_api_key(provider)?;
+        }
+        if provider == CodingProvider::Codex {
+            credentials::set_openai_auth_mode(OpenAiAuthMode::ApiKey)?;
+            return Ok(
+                "OpenAI API billing selected · pay per use. ChatGPT login kept.".to_string(),
+            );
+        }
+        if provider == CodingProvider::OpenCode {
+            return Ok(
+                match borg_provider::refresh_opencode_go_model_catalog().await {
+                    Ok(_) => {
+                        "OpenCode Go key selected. Choose a Go subscription model with /model."
+                            .to_string()
+                    }
+                    Err(error) => format!(
+                        "OpenCode Go key saved. Model list unavailable: {error}. Select the Go connection again to retry."
+                    ),
+                },
+            );
+        }
+        return Ok(format!("{} API key saved.", provider.label()));
+    }
+    let saved_subscription = provider == CodingProvider::Codex
+        && credentials::codex_auth_json().is_some_and(|auth| {
+            auth["tokens"]["access_token"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty())
+        });
+    if !saved_subscription || choice == ProviderAuthChoice::ReconnectSubscription {
+        if provider == CodingProvider::Codex
+            && credentials::stored_api_key(credentials::ApiKeyCredential::OpenAi).is_none()
+            && let Some(key) = credentials::codex_auth_json()
+                .and_then(|auth| auth["OPENAI_API_KEY"].as_str().map(str::to_string))
+            && !key.trim().is_empty()
+        {
+            credentials::store_api_key(credentials::ApiKeyCredential::OpenAi, &key)?;
+        }
+        login_provider(provider).await?;
+    }
+    if provider == CodingProvider::Codex {
+        credentials::set_openai_auth_mode(OpenAiAuthMode::Subscription)?;
+        return Ok("ChatGPT subscription selected. Saved OpenAI API key kept.".to_string());
+    }
+    Ok(format!("Connected {}.", provider.label()))
 }
 
 /// Line editor with echo suppressed. Only printable characters, backspace and

@@ -592,7 +592,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/steer", "send now and redirect the current turn"),
     ("/interrupt", "interrupt the current turn"),
     ("/stop", "alias for /interrupt"),
-    ("/login", "reconnect the current provider"),
+    ("/login", "switch ChatGPT / API key billing"),
+    ("/connect", "manage provider connections"),
     ("/remote", "connect this machine to your Borg account"),
     ("/collab", "share this live session"),
     ("/quit", "close this view; active work continues"),
@@ -1468,6 +1469,7 @@ pub struct BorgTerminal {
     status: SessionStatus,
     interrupt_requested: bool,
     connection_retry_at: Option<DateTime<Utc>>,
+    usage_retry_at: Option<DateTime<Utc>>,
     steer_active_turn: bool,
     /// Highest durable root sequence incorporated into this projection.
     /// Asynchronous history/state hydration may finish after live events, so
@@ -1573,7 +1575,7 @@ pub struct BorgTerminal {
     picker: Option<Picker>,
     /// Model the user picked from a provider that still needs credentials;
     /// applied once the auth picker resolves.
-    pending_auth_model: Option<String>,
+    pending_auth_model: Option<(CodingProvider, String)>,
     /// True once the enable-dictation flow has completed (mirrors the durable
     /// preference); gates whether the dictation key records or opens the flow.
     dictation_enabled: bool,
@@ -1773,6 +1775,8 @@ enum PickerKind {
 pub enum ProviderAuthChoice {
     Subscription,
     ApiKey,
+    ReconnectSubscription,
+    ReplaceApiKey,
 }
 
 impl Picker {
@@ -2062,6 +2066,7 @@ impl Picker {
             .filter(|q| !q.is_empty())
         {
             Some(query) => format!("> {} · {query}", self.title),
+            None if self.query.is_some() => format!("> {} · type to filter", self.title),
             None => format!("> {}", self.title),
         }
     }
@@ -2296,7 +2301,7 @@ fn model_picker_options_with_configured(
             return;
         };
         for (index, (id, label)) in catalog.selectable_models.iter().enumerate() {
-            let mut option = PickerOption::new(*id, *id);
+            let mut option = PickerOption::new(format!("{label} · {id}"), *id);
             option.preview = Some((*label).to_string());
             if index == 0 {
                 option.section = Some(target.label().to_string());
@@ -2409,6 +2414,27 @@ fn model_picker_options_with_configured(
             }
             options.push(option);
         }
+    }
+    let go_models = borg_provider::opencode_go_model_entries();
+    if go_models.is_empty() {
+        let mut option = PickerOption::new("Connect OpenCode Go…", "/connect-go");
+        option.section = Some("OpenCode Go · subscription".to_string());
+        option.preview =
+            Some("Add your Go subscription key and load the available models.".to_string());
+        options.push(option);
+    }
+    let mut first_go = true;
+    for model in go_models {
+        if options.iter().any(|option| option.value == model.id) {
+            continue;
+        }
+        let mut option = PickerOption::new(model.label, model.id);
+        option.preview = model.detail;
+        if first_go {
+            option.section = Some("OpenCode Go · subscription".to_string());
+            first_go = false;
+        }
+        options.push(option);
     }
     options
 }
@@ -2548,6 +2574,7 @@ impl BorgTerminal {
             status: SessionStatus::Starting,
             interrupt_requested: false,
             connection_retry_at: None,
+            usage_retry_at: None,
             steer_active_turn: false,
             session_state_sequence: 0,
             pending_approval: false,
@@ -3178,6 +3205,30 @@ impl BorgTerminal {
         if !self.replaying_history {
             match &event.kind {
                 SessionEventKind::ProviderEvent { kind, payload, .. }
+                    if kind == "usage_limit_retry" =>
+                {
+                    self.usage_retry_at = payload
+                        .get("retry_at")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok());
+                    if let Some(deadline) = self.usage_retry_at {
+                        self.set_notice(format!(
+                            "Usage limit · resumes {} · /login or /model to switch · Esc to cancel",
+                            deadline.with_timezone(&Local).format("%a %H:%M")
+                        ));
+                    }
+                }
+                SessionEventKind::ProviderEvent { kind, .. }
+                    if kind == "usage_limit_retry_cancelled" =>
+                {
+                    self.usage_retry_at = None;
+                    self.set_notice("Automatic retry cancelled. Your work is saved.");
+                }
+                SessionEventKind::TurnStarted { .. }
+                | SessionEventKind::SessionConfigured { .. } => {
+                    self.usage_retry_at = None;
+                }
+                SessionEventKind::ProviderEvent { kind, payload, .. }
                     if kind == "network_retry" =>
                 {
                     let delay = payload
@@ -3200,10 +3251,16 @@ impl BorgTerminal {
                     self.set_notice("Connection restored · work resumed");
                 }
                 SessionEventKind::StatusChanged {
-                    status: SessionStatus::Ready | SessionStatus::Stopped | SessionStatus::Failed,
+                    status:
+                        status @ (SessionStatus::Ready | SessionStatus::Stopped | SessionStatus::Failed),
                     ..
-                } if self.connection_retry_at.take().is_some() => {
-                    self.notice = None;
+                } => {
+                    if self.connection_retry_at.take().is_some() {
+                        self.notice = None;
+                    }
+                    if *status != SessionStatus::Ready {
+                        self.usage_retry_at = None;
+                    }
                 }
                 _ => {}
             }
@@ -3952,7 +4009,12 @@ impl BorgTerminal {
 
     fn begin_user_interrupt(&mut self) -> bool {
         let status = self.active_status();
-        if !claim_interrupt(&mut self.interrupt_requested, status) {
+        let interrupt_status = if self.usage_retry_at.is_some() {
+            SessionStatus::Starting
+        } else {
+            status
+        };
+        if !claim_interrupt(&mut self.interrupt_requested, interrupt_status) {
             return false;
         }
         if status == SessionStatus::Running {
@@ -4148,12 +4210,59 @@ impl BorgTerminal {
             .config
             .as_ref()
             .and_then(|config| config.model.clone());
-        let options = model_picker_options_with_configured(
+        let mut options = model_picker_options_with_configured(
             provider,
             current.as_deref(),
             &[],
             &self.configured_model_entries,
         );
+        for option in &mut options {
+            let target = CodingProvider::for_model(&option.value);
+            if let Some(capability) = self
+                .transcript
+                .provider_capabilities
+                .iter()
+                .find(|capability| Some(capability.provider) == target)
+            {
+                let connection = if capability.authenticated {
+                    capability
+                        .billing_label()
+                        .unwrap_or_else(|| "connected".to_string())
+                } else {
+                    "connect to use".to_string()
+                };
+                if let Some(section) = &mut option.section {
+                    *section = format!("{section} · {connection}");
+                }
+                option.preview = Some(format!(
+                    "{}\n{} · {}{}",
+                    option.preview.as_deref().unwrap_or(&option.value),
+                    capability.provider.label(),
+                    connection,
+                    if capability
+                        .usage
+                        .as_ref()
+                        .is_some_and(|usage| usage.availability
+                            == borg_remote::ProviderUsageAvailability::Exhausted)
+                    {
+                        " · allowance exhausted"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            if current.as_deref() == Some(&option.value) {
+                option.label = format!("{} · current", option.label);
+            }
+        }
+        let mut connection = PickerOption::new("Manage connection / billing…", "/login");
+        connection.section = Some("Connections".to_string());
+        connection.preview = Some(
+            "Switch saved credentials, sign in, or add an API key. API billing is usage-based."
+                .to_string(),
+        );
+        options.push(connection);
+        options.push(PickerOption::new("Enter a model ID…", "/model-custom"));
         let selected = current
             .as_deref()
             .and_then(|current| options.iter().position(|option| option.value == current))
@@ -4163,7 +4272,7 @@ impl BorgTerminal {
             title: "Choose model",
             options,
             selected,
-            query: None,
+            query: Some(String::new()),
             viewport_offset: Cell::new(0),
         });
     }
@@ -4180,21 +4289,40 @@ impl BorgTerminal {
     /// Asks how to authenticate `provider` before switching to `model`.
     /// Dismissing the picker leaves the session on its current model.
     pub fn open_provider_auth_picker(&mut self, provider: CodingProvider, model: String) {
-        let options = vec![
-            PickerOption::new(
-                format!("Connect your {} subscription", provider.label()),
-                "subscription",
-            ),
-            PickerOption::new(
-                format!("Add an API key for {}", provider.label()),
+        let mut options = match provider {
+            CodingProvider::Codex => vec![
+                PickerOption::new("ChatGPT subscription · included allowance", "subscription"),
+                PickerOption::new("OpenAI API key · pay per use", "api-key"),
+                PickerOption::new("Sign in to ChatGPT…", "reconnect-subscription"),
+                PickerOption::new("Add or replace OpenAI API key…", "replace-api-key"),
+            ],
+            CodingProvider::OpenCode => vec![
+                PickerOption::new("OpenCode Go · subscription key", "api-key"),
+                PickerOption::new("Add or replace Go key…", "replace-api-key"),
+                PickerOption::new("Other OpenCode connections…", "reconnect-subscription"),
+            ],
+            CodingProvider::Claude => vec![
+                PickerOption::new("Connect Claude subscription…", "subscription"),
+                PickerOption::new("Add Anthropic API key · pay per use", "api-key"),
+            ],
+            _ => vec![PickerOption::new(
+                format!("Add {} API key…", provider.label()),
                 "api-key",
-            ),
-            PickerOption::new("Cancel", "cancel"),
-        ];
-        self.pending_auth_model = Some(model);
+            )],
+        };
+        for option in &mut options {
+            option.preview = Some(match option.value.as_str() {
+                "subscription" if provider == CodingProvider::Codex => "Use your saved ChatGPT login. If needed, Borg opens the subscription sign-in flow.",
+                "api-key" if provider == CodingProvider::Codex => "Use your saved OpenAI key, or enter one privately. Requests are billed to your OpenAI API account. Your ChatGPT login is kept.",
+                "api-key" | "replace-api-key" if provider == CodingProvider::OpenCode => "Get your subscription key at opencode.ai/auth. Go models use your Go allowance; select one in /model.",
+                _ => "Credentials are entered privately and are never added to the conversation.",
+            }.to_string());
+        }
+        options.push(PickerOption::new("Cancel", "cancel"));
+        self.pending_auth_model = Some((provider, model));
         self.picker = Some(Picker {
             kind: PickerKind::ProviderAuth,
-            title: "Provider not connected",
+            title: "Connection & billing",
             options,
             selected: 0,
             query: None,
@@ -6179,6 +6307,13 @@ impl BorgTerminal {
         if self
             .picker
             .as_ref()
+            .is_some_and(|picker| picker.selected_position().is_none())
+        {
+            return Ok(UiAction::None);
+        }
+        if self
+            .picker
+            .as_ref()
             .and_then(|picker| picker.options.get(picker.selected))
             .is_some_and(|option| option.disabled)
         {
@@ -6283,24 +6418,37 @@ impl BorgTerminal {
                 text: format!("/resume {}", picker.selected_value()),
                 attachments: Vec::new(),
             },
-            PickerKind::Model => UiAction::SetModel(picker.selected_value()),
+            PickerKind::Model => match picker.selected_value().as_str() {
+                "/connect-go" => {
+                    self.open_provider_auth_picker(CodingProvider::OpenCode, String::new());
+                    UiAction::None
+                }
+                "/login" => UiAction::Submit {
+                    target: None,
+                    text: "/login".to_string(),
+                    attachments: Vec::new(),
+                },
+                "/model-custom" => {
+                    self.composer.replace_text("/model ".to_string());
+                    UiAction::None
+                }
+                model => UiAction::SetModel(model.to_string()),
+            },
             PickerKind::ProviderAuth => {
                 let choice = match picker.selected_value().as_str() {
                     "subscription" => Some(ProviderAuthChoice::Subscription),
                     "api-key" => Some(ProviderAuthChoice::ApiKey),
+                    "reconnect-subscription" => Some(ProviderAuthChoice::ReconnectSubscription),
+                    "replace-api-key" => Some(ProviderAuthChoice::ReplaceApiKey),
                     _ => None,
                 };
                 let model = self.pending_auth_model.take();
                 match (choice, model) {
-                    (Some(choice), Some(model)) => {
-                        let provider =
-                            CodingProvider::for_model(&model).unwrap_or(CodingProvider::Claude);
-                        UiAction::AuthenticateProvider {
-                            provider,
-                            model,
-                            choice,
-                        }
-                    }
+                    (Some(choice), Some((provider, model))) => UiAction::AuthenticateProvider {
+                        provider,
+                        model,
+                        choice,
+                    },
                     _ => UiAction::None,
                 }
             }
@@ -6627,10 +6775,16 @@ impl BorgTerminal {
         let status = self.active_status();
         let reconnect_label = self
             .connection_retry_at
+            .or(self.usage_retry_at)
             .filter(|_| self.focused_child.is_none())
             .map(|deadline| {
                 let seconds = (deadline - Utc::now()).num_seconds().max(0);
-                if seconds > 0 {
+                if self.usage_retry_at.is_some() {
+                    format!(
+                        "resumes {}",
+                        deadline.with_timezone(&Local).format("%a %H:%M")
+                    )
+                } else if seconds > 0 {
                     format!("retry in {seconds}s")
                 } else {
                     "reconnecting".to_string()
@@ -6735,6 +6889,8 @@ impl BorgTerminal {
                 self.keymap.label(KeyAction::Send),
                 self.keymap.label(KeyAction::Interrupt)
             )
+        } else if self.picker.is_some() {
+            "↑↓ select · enter confirm · esc cancel".to_string()
         } else {
             primary_controls_line(&self.keymap, self.ui_language)
         };
@@ -6776,7 +6932,9 @@ impl BorgTerminal {
             Style::default().fg(Color::DarkGray)
         };
         let controls = slash_suggestions.unwrap_or_else(|| {
-            if let Some(notice) = copy_notice_text.as_ref() {
+            if self.picker.is_some() {
+                vec![Line::from(primary_controls.clone())]
+            } else if let Some(notice) = copy_notice_text.as_ref() {
                 vec![copy_notice_line(notice.clone())]
             } else if let Some(hint) = hover_notice_hint {
                 vec![Line::from(Span::styled(
@@ -6911,7 +7069,12 @@ impl BorgTerminal {
                 selection.focus,
             );
         }
-        let composer_max_height = if resume_picker_open {
+        let composer_max_height = if resume_picker_open
+            || self
+                .picker
+                .as_ref()
+                .is_some_and(|picker| picker.kind == PickerKind::Model)
+        {
             18.max(self.composer_max_height)
         } else {
             self.composer_max_height
@@ -8761,7 +8924,7 @@ impl BorgTerminal {
         }
         if matches!(
             self.picker.as_ref().map(|picker| picker.kind),
-            Some(PickerKind::Commands)
+            Some(PickerKind::Commands | PickerKind::Model)
         ) {
             // Typing filters, so this runs ahead of every other key path: the
             // palette owns the keyboard while it is open.
@@ -9204,6 +9367,7 @@ impl BorgTerminal {
         if self.keymap.matches(KeyAction::Interrupt, &key) {
             if status_control_is_actionable(self.active_status())
                 && self.connection_retry_at.is_none()
+                && self.usage_retry_at.is_none()
                 && self.has_pending_input_for_escape()
             {
                 return Ok(self.flush_pending_input());

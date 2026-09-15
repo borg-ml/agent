@@ -218,10 +218,12 @@ impl CodingProvider {
                 })
             })
             .or_else(|| (model == borg_provider::kimi_product_model()).then_some(Self::Kimi))
+            .or_else(|| model.starts_with("gpt-").then_some(Self::Codex))
             .or_else(|| (model == borg_provider::glm_product_model()).then_some(Self::Glm))
             .or_else(|| {
                 model
                     .strip_prefix("opencode/")
+                    .or_else(|| model.strip_prefix("opencode-go/"))
                     .filter(|suffix| !suffix.is_empty())
                     .map(|_| Self::OpenCode)
             })
@@ -2474,6 +2476,14 @@ mod tests {
             Some(CodingProvider::OpenRouter)
         );
         assert_eq!(CodingProvider::for_model("some/openrouter-model"), None);
+        assert_eq!(
+            CodingProvider::for_model("opencode-go/kimi-k2.7-code"),
+            Some(CodingProvider::OpenCode)
+        );
+        assert_eq!(
+            CodingProvider::for_model("opencode-go/gpt-5.6-luna"),
+            Some(CodingProvider::OpenCode)
+        );
     }
 
     #[test]

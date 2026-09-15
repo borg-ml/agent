@@ -1692,10 +1692,21 @@ async fn run_agent_session_store_kernel(
     let (capability_refresh_tx, mut capability_refresh_rx) =
         mpsc::channel::<Vec<crate::ProviderCapability>>(1);
     if !launch.capabilities.provider_capabilities.is_empty() {
-        let seed = launch.capabilities.provider_capabilities.clone();
+        let mut seed = launch.capabilities.provider_capabilities.clone();
         tokio::spawn(async move {
-            let refreshed = crate::provider_usage::refresh_provider_capability_usage(&seed).await;
-            let _ = capability_refresh_tx.send(refreshed).await;
+            loop {
+                seed = tokio::select! {
+                    _ = capability_refresh_tx.closed() => break,
+                    refreshed = crate::provider_usage::refresh_provider_capability_usage(&seed) => refreshed,
+                };
+                if capability_refresh_tx.send(seed.clone()).await.is_err() {
+                    break;
+                }
+                tokio::select! {
+                    _ = capability_refresh_tx.closed() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                }
+            }
         });
     }
     if initial_state.effective_capabilities.as_ref() != Some(&effective_capabilities) {

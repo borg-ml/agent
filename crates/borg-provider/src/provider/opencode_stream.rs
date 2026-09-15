@@ -47,6 +47,13 @@ async fn run(
         None => std::env::current_dir().context("failed to resolve OpenCode working directory")?,
     };
     let mut command = crate::provider_bin::command(crate::provider_bin::Runtime::OpenCode).await?;
+    if model.starts_with("opencode-go/") {
+        let key = crate::credentials::opencode_go_api_key()
+            .context("OpenCode Go is not connected; use /login or borg login opencode --api-key")?;
+        let mut auth = crate::credentials::opencode_auth_json()?;
+        auth["opencode-go"] = serde_json::json!({"type": "api", "key": key});
+        command.env("OPENCODE_AUTH_CONTENT", serde_json::to_string(&auth)?);
+    }
     command
         .current_dir(&cwd)
         .stdin(std::process::Stdio::null())
@@ -404,6 +411,14 @@ async fn next_server_event(
 }
 
 async fn default_model() -> Result<String> {
+    if crate::credentials::opencode_go_api_key().is_some() {
+        let models = crate::refresh_opencode_go_model_catalog().await?;
+        return models
+            .into_iter()
+            .next()
+            .map(|model| model.id)
+            .context("OpenCode Go returned no available models; choose one with /model");
+    }
     let output = crate::provider_bin::command(crate::provider_bin::Runtime::OpenCode)
         .await?
         .arg("models")

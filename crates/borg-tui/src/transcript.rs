@@ -3000,7 +3000,11 @@ impl Transcript {
             effort: config.effort.clone(),
             fast: config.fast.then(|| "fast".to_string()),
             permission: Some(permission_mode_label(config.permission_mode).to_string()),
-            billing: billing_status_for(&self.provider_capabilities, config.provider),
+            billing: if config.provider == CodingProvider::OpenCode && config.model.as_deref().is_some_and(|model| model.starts_with("opencode-go/")) {
+                Some("Go sub".to_string())
+            } else {
+                billing_status_for(&self.provider_capabilities, config.provider)
+            },
             cwd: fish_style_path(&config.cwd),
         }
     }

@@ -1,5 +1,5 @@
-//! Opt-in model-only subscription adapter. Codex manages access, never a turn
-//! or a tool. Production chat routing stays on app-server until parity is proven.
+//! OpenAI model access for ChatGPT subscriptions and explicitly selected API
+//! billing. Borg owns the conversation and tools in both modes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
@@ -21,6 +21,7 @@ use super::{
 };
 
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
+const API_ENDPOINT: &str = "https://api.openai.com/v1/responses";
 const MODELS_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/models";
 const MAX_STREAM_BYTES: usize = 128 * 1024 * 1024;
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
@@ -101,6 +102,18 @@ struct SubscriptionAccess {
 }
 
 impl SubscriptionAccess {
+    fn is_api_key(&self) -> bool {
+        self.account_id.is_empty()
+    }
+
+    fn endpoint(&self) -> &'static str {
+        if self.is_api_key() {
+            API_ENDPOINT
+        } else {
+            ENDPOINT
+        }
+    }
+
     async fn send_with_recovery(
         &mut self,
         request: reqwest::RequestBuilder,
@@ -111,6 +124,13 @@ impl SubscriptionAccess {
             self.identity() == expected_account,
             "Codex account differs from this session's bound account; reconnect the original account or start a new session"
         );
+        if self.is_api_key() {
+            return request
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .context("OpenAI API connection failed");
+        }
         let retry = request
             .try_clone()
             .context("Codex request cannot be replayed for authentication recovery")?;
@@ -139,6 +159,12 @@ impl SubscriptionAccess {
     }
 
     fn identity(&self) -> String {
+        if self.is_api_key() {
+            return format!(
+                "api-sha256:{}",
+                hex::encode(Sha256::digest(format!("borg:openai:api:{}", self.token)))
+            );
+        }
         format!(
             "sha256:{}",
             hex::encode(Sha256::digest(format!(
@@ -223,6 +249,18 @@ impl SubscriptionAccess {
     }
 
     async fn read(refresh: bool) -> Result<Self> {
+        use crate::credentials::{
+            OpenAiAuthMode, openai_api_key, openai_auth_mode, openai_uses_api_key,
+        };
+        let mode = openai_auth_mode()?;
+        if mode == Some(OpenAiAuthMode::ApiKey) || (mode.is_none() && openai_uses_api_key()) {
+            if let Some(token) = openai_api_key() {
+                return Ok(Self {
+                    token,
+                    account_id: String::new(),
+                });
+            }
+        }
         let response = tokio::time::timeout(
             Duration::from_secs(60),
             super::chat_stream::codex_account_request(
@@ -254,12 +292,24 @@ impl SubscriptionAccess {
             }
         })?;
         let auth = &response["result"];
+        if mode != Some(OpenAiAuthMode::Subscription) && auth["authMethod"] == "apikey" {
+            return Ok(Self {
+                token: auth["authToken"].as_str().filter(|token| !token.is_empty()).map(str::to_string)
+                    .or_else(openai_api_key)
+                    .context("Codex is signed in with an API key but did not provide it; add the key with /login")?,
+                account_id: String::new(),
+            });
+        }
+        ensure!(
+            mode != Some(OpenAiAuthMode::ApiKey),
+            "OpenAI API key missing; add one with /login or borg login codex --api-key"
+        );
         ensure!(
             matches!(
                 auth["authMethod"].as_str(),
                 Some("chatgpt" | "chatgptAuthTokens")
             ),
-            "model-only Codex requires a ChatGPT subscription; no API-key fallback is allowed"
+            "ChatGPT subscription is selected, but Codex is not signed in to ChatGPT; use /login to connect it or select OpenAI API billing"
         );
         let token = auth["authToken"]
             .as_str()
@@ -295,7 +345,7 @@ impl CodexModelProvider {
     /// The host must commit this identity before transmitting a durable session's context.
     pub async fn model_turn_for_account(
         &self,
-        request: ModelTurnRequest,
+        mut request: ModelTurnRequest,
         progress: Option<UnboundedSender<ProviderProgress>>,
         expected_account: &str,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
@@ -314,36 +364,53 @@ impl CodexModelProvider {
             stderr: String::new(),
         };
         let result = async {
-            let body = self.request_body(&request)?;
             let client = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(30))
                 .build()?;
             let mut access = SubscriptionAccess::read(false).await?;
+            trace.invocation.executable = access.endpoint().into();
             ensure!(access.identity() == expected_account,
                 "Codex account differs from this session's bound account; reconnect the original account or start a new session");
-            let capabilities = access.model_capabilities(&client, &self.model).await?;
-            ensure!(capabilities.supported_reasoning_levels.iter().any(|level| level.effort == self.effort),
-                "selected effort is not supported by this Codex model");
-            let context_window = capabilities.usable_context_window()?;
-            ensure!(!request.fast || capabilities.supports_fast(),
-                "fast mode is not supported by this Codex model");
+            let context_window = if access.is_api_key() {
+                None
+            } else {
+                let capabilities = access.model_capabilities(&client, &self.model).await?;
+                ensure!(capabilities.supported_reasoning_levels.iter().any(|level| level.effort == self.effort),
+                    "selected effort is not supported by this Codex model");
+                ensure!(!request.fast || capabilities.supports_fast(),
+                    "fast mode is not supported by this Codex model");
+                Some(capabilities.usable_context_window()?)
+            };
+            for message in &mut request.messages {
+                if let ModelMessage::Assistant { provider_state, .. } = message
+                    && let Some(ModelProviderState::OpenAiResponses { account_identity, .. }) = provider_state
+                    && account_identity.as_deref().map_or(access.is_api_key(), |identity| identity != expected_account)
+                {
+                    *provider_state = None;
+                }
+            }
+            let body = self.request_body(&request)?;
+            let endpoint = access.endpoint();
             let response = self
                 .send(
                     &client,
-                    ENDPOINT,
+                    endpoint,
                     &mut access,
                     expected_account,
                     &request,
                     &body,
                 )
                 .await?;
-            let (message, response) = self.read_stream(response, progress.as_ref()).await?;
-            Ok::<_, anyhow::Error>((message, response, context_window))
+            let (mut message, response) = self.read_stream(response, progress.as_ref()).await?;
+            if let ModelMessage::Assistant { provider_state: Some(ModelProviderState::OpenAiResponses { account_identity, .. }), .. } = &mut message {
+                *account_identity = Some(expected_account.to_string());
+            }
+            Ok::<_, anyhow::Error>((message, response, context_window, access.is_api_key()))
         }
         .await;
         match result {
-            Ok((message, raw_response, context_window)) => {
+            Ok((message, raw_response, context_window, api_key)) => {
                 trace.exit_status = Some(0);
                 let input = raw_response
                     .pointer("/usage/input_tokens")
@@ -376,8 +443,12 @@ impl CodexModelProvider {
                         output_tokens: output,
                         total_tokens: input.saturating_add(output),
                         context_tokens: Some(input),
-                        context_window_tokens: Some(context_window),
-                        cost_basis: CostBasis::SubscriptionEquivalent,
+                        context_window_tokens: context_window,
+                        cost_basis: if api_key {
+                            CostBasis::Unavailable
+                        } else {
+                            CostBasis::SubscriptionEquivalent
+                        },
                         ..Default::default()
                     },
                     raw_response,
@@ -385,7 +456,13 @@ impl CodexModelProvider {
                 })
             }
             Err(error) => {
-                let message = error.to_string();
+                let message = if trace.invocation.executable == API_ENDPOINT {
+                    error
+                        .to_string()
+                        .replace("Codex subscription", "OpenAI API")
+                } else {
+                    error.to_string()
+                };
                 trace.exit_status = Some(1);
                 trace.stderr = message.clone();
                 Err(ProviderCallError {
@@ -421,7 +498,7 @@ impl CodexModelProvider {
                     input.push(json!({"role": "user", "content": blocks}));
                 }
                 ModelMessage::Assistant {
-                    provider_state: Some(ModelProviderState::OpenAiResponses { output }),
+                    provider_state: Some(ModelProviderState::OpenAiResponses { output, .. }),
                     ..
                 } => {
                     input.extend(output.iter().cloned());
@@ -880,7 +957,10 @@ impl ResponseState {
                 content: (!content.is_empty()).then_some(content),
                 reasoning_content: (!self.reasoning.is_empty()).then_some(self.reasoning),
                 reasoning_details: None,
-                provider_state: Some(ModelProviderState::OpenAiResponses { output }),
+                provider_state: Some(ModelProviderState::OpenAiResponses {
+                    output,
+                    account_identity: None,
+                }),
                 tool_calls: calls,
             },
             response,
@@ -930,6 +1010,49 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{mpsc, oneshot};
+
+    #[tokio::test]
+    async fn api_billing_uses_api_credentials_without_subscription_recovery() {
+        let mut access = SubscriptionAccess {
+            token: "test-api-key".into(),
+            account_id: String::new(),
+        };
+        assert_eq!(access.endpoint(), "https://api.openai.com/v1/responses");
+        let identity = access.identity();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut bytes = [0; 1024];
+                let size = socket.read(&mut bytes).await.unwrap();
+                assert!(size > 0);
+                request.extend_from_slice(&bytes[..size]);
+            }
+            let request = String::from_utf8(request).unwrap().to_lowercase();
+            assert!(request.contains("authorization: bearer test-api-key\r\n"));
+            assert!(!request.contains("chatgpt-account-id"));
+            socket
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let response = access
+            .send_with_recovery(
+                reqwest::Client::new()
+                    .get(endpoint)
+                    .timeout(Duration::from_secs(2)),
+                &identity,
+                async { panic!("API authentication must not fall back to a ChatGPT subscription") },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn authentication_recovery_retries_once_without_crossing_accounts() {

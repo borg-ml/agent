@@ -1107,11 +1107,14 @@ pub(crate) enum ConfigCommand {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(crate) enum RemoteProviderArg {
+    #[value(alias = "openai")]
     Codex,
     Claude,
+    #[value(name = "opencode", alias = "open-code")]
     OpenCode,
     Kimi,
     Glm,
+    #[value(name = "openrouter", alias = "open-router")]
     OpenRouter,
     OpenAiCompatible,
 }

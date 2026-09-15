@@ -1202,12 +1202,12 @@ async fn probe_provider(
                 auth_methods.push(ProviderAuthMethod::Subscription);
                 detail.push("Codex subscription authenticated");
             }
-            let api_key = nonempty_env("OPENAI_API_KEY").is_some();
+            let api_key = borg_provider::credentials::openai_api_key().is_some();
             if api_key {
                 auth_methods.push(ProviderAuthMethod::ApiKey);
                 detail.push("OpenAI API key configured");
             }
-            if api_key {
+            if borg_provider::credentials::openai_uses_api_key() {
                 Some(BillingLane::ApiKey)
             } else if subscription_authenticated {
                 Some(BillingLane::Subscription)
@@ -1241,11 +1241,13 @@ async fn probe_provider(
             }
         }
         CodingProvider::OpenCode => {
-            if subscription_authenticated {
+            if subscription_authenticated
+                || borg_provider::credentials::opencode_go_api_key().is_some()
+            {
                 auth_methods.push(ProviderAuthMethod::Subscription);
                 detail.push("OpenCode provider credentials available");
             }
-            subscription_authenticated.then_some(BillingLane::Subscription)
+            (!auth_methods.is_empty()).then_some(BillingLane::Subscription)
         }
         CodingProvider::Kimi => {
             if managed_kimi {
@@ -1352,7 +1354,14 @@ fn provider_subscription_credentials_present(provider: CodingProvider) -> bool {
         CodingProvider::Codex => codex_auth_path()
             .and_then(|path| read_bounded_auth_json(&path))
             .as_ref()
-            .is_some_and(codex_auth_json_authenticated),
+            .is_some_and(|auth| {
+                auth["auth_mode"] != "apikey"
+                    && auth["tokens"].as_object().is_some_and(|tokens| {
+                        tokens
+                            .values()
+                            .any(|value| nonempty_json_string(Some(value)))
+                    })
+            }),
         CodingProvider::Claude => {
             nonempty_env("CLAUDE_CODE_OAUTH_TOKEN").is_some()
                 || claude_credentials_path()
@@ -1444,6 +1453,7 @@ fn nonempty_json_string(value: Option<&serde_json::Value>) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
+#[cfg(test)]
 fn codex_auth_json_authenticated(value: &serde_json::Value) -> bool {
     value
         .get("tokens")
@@ -1614,10 +1624,16 @@ pub fn provider_credentials_present(provider: CodingProvider) -> bool {
                 || provider_subscription_credentials_present(provider)
         }
         CodingProvider::Codex => {
-            nonempty_env("OPENAI_API_KEY").is_some()
+            if borg_provider::credentials::openai_uses_api_key() {
+                borg_provider::credentials::openai_api_key().is_some()
+            } else {
+                provider_subscription_credentials_present(provider)
+            }
+        }
+        CodingProvider::OpenCode => {
+            borg_provider::credentials::opencode_go_api_key().is_some()
                 || provider_subscription_credentials_present(provider)
         }
-        CodingProvider::OpenCode => provider_subscription_credentials_present(provider),
         CodingProvider::Kimi => {
             nonempty_env("BORG_KIMI_API_KEY").is_some()
                 || nonempty_env("MOONSHOT_API_KEY").is_some()

@@ -2784,6 +2784,23 @@ async fn codex_app_server_command(
         command.env("HOME", auth_home.path());
         let codex_home = crate::provider_auth::ensure_codex_home(auth_home.path())?;
         command.env("CODEX_HOME", codex_home);
+    } else if crate::credentials::openai_uses_api_key() {
+        let key = crate::credentials::openai_api_key()
+            .context("OpenAI API key missing; add one with /login")?;
+        command.env("BORG_OPENAI_SELECTED_KEY", key).args([
+            "--config",
+            "model_provider=\"openai\"",
+            "--config",
+            "model_providers.openai.requires_openai_auth=false",
+            "--config",
+            "model_providers.openai.env_key=\"BORG_OPENAI_SELECTED_KEY\"",
+            "--config",
+            "model_providers.openai.base_url=\"https://api.openai.com/v1\"",
+        ]);
+    } else if crate::credentials::openai_auth_mode()?
+        == Some(crate::credentials::OpenAiAuthMode::Subscription)
+    {
+        command.env_remove("OPENAI_API_KEY");
     }
     if let Some(cwd) = request.working_directory.as_deref() {
         command.current_dir(cwd);
@@ -4311,6 +4328,16 @@ fn provider_billing_mode(
             }
         }
         SubscriptionProvider::Codex => {
+            if auth_home.is_none() {
+                if crate::credentials::openai_uses_api_key() {
+                    return ProviderBillingMode::ApiKey;
+                }
+                if crate::credentials::openai_auth_mode().ok().flatten()
+                    == Some(crate::credentials::OpenAiAuthMode::Subscription)
+                {
+                    return ProviderBillingMode::Subscription;
+                }
+            }
             if has_nonempty_env("OPENAI_API_KEY") {
                 return ProviderBillingMode::ApiKey;
             }

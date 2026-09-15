@@ -122,6 +122,59 @@ pub struct DynamicModelEntry {
 }
 
 static OPENROUTER_MODEL_ENTRIES: OnceLock<RwLock<Vec<DynamicModelEntry>>> = OnceLock::new();
+static OPENCODE_GO_MODEL_ENTRIES: OnceLock<RwLock<Vec<DynamicModelEntry>>> = OnceLock::new();
+
+pub fn opencode_go_model_entries() -> Vec<DynamicModelEntry> {
+    OPENCODE_GO_MODEL_ENTRIES
+        .get_or_init(|| RwLock::new(Vec::new()))
+        .read()
+        .map(|entries| entries.clone())
+        .unwrap_or_default()
+}
+
+pub async fn refresh_opencode_go_model_catalog() -> anyhow::Result<Vec<DynamicModelEntry>> {
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?
+        .get("https://opencode.ai/zen/go/v1/models")
+        .send()
+        .await?
+        .error_for_status()?;
+    let payload: serde_json::Value = serde_json::from_str(
+        &crate::provider::read_provider_success_response_text(response).await?,
+    )?;
+    let mut entries = openrouter_model_entries_from_response(&payload);
+    for entry in &mut entries {
+        entry.id = format!("opencode-go/{}", entry.id);
+        entry.detail = Some("OpenCode Go subscription · uses your Go allowance".to_string());
+    }
+    // The installed adapter must understand the model's wire protocol too.
+    // Its catalog can be narrower than the service's list of model IDs.
+    if let Ok(Ok(output)) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("opencode")
+            .args(["models", "opencode-go"])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+        && output.status.success()
+    {
+        let supported = String::from_utf8_lossy(&output.stdout);
+        entries.retain(|entry| supported.lines().any(|line| line.trim() == entry.id));
+    }
+    anyhow::ensure!(
+        !entries.is_empty(),
+        "OpenCode Go returned no models; try /model again"
+    );
+    *OPENCODE_GO_MODEL_ENTRIES
+        .get_or_init(|| RwLock::new(Vec::new()))
+        .write()
+        .map_err(|_| anyhow::anyhow!("OpenCode Go catalog lock unavailable"))? = entries.clone();
+    Ok(entries)
+}
 
 fn openrouter_model_entries_store() -> &'static RwLock<Vec<DynamicModelEntry>> {
     OPENROUTER_MODEL_ENTRIES.get_or_init(|| RwLock::new(Vec::new()))
@@ -245,6 +298,7 @@ pub fn dynamic_models_for_backend(
     let open_ended = matches!(
         backend,
         "openai-compatible"
+            | "opencode"
             | "open-ai-compatible"
             | "OpenAI-compatible"
             | "Open-ai-compatible"

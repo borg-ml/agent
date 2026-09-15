@@ -25,6 +25,73 @@ pub static PROVIDER_USAGE_CACHE: OnceLock<Mutex<ProviderUsageCache>> = OnceLock:
 pub async fn refresh_provider_capability_usage(
     capabilities: &[ProviderCapability],
 ) -> Vec<ProviderCapability> {
+    let mut capabilities = capabilities.to_vec();
+    for capability in &mut capabilities {
+        if capability.provider == CodingProvider::OpenCode
+            && borg_provider::credentials::opencode_go_api_key().is_some()
+        {
+            capability.billing = Some(crate::BillingLane::Subscription);
+            capability.authenticated = true;
+            capability.can_spawn = capability.installed;
+            if !capability
+                .auth_methods
+                .contains(&ProviderAuthMethod::Subscription)
+            {
+                capability
+                    .auth_methods
+                    .push(ProviderAuthMethod::Subscription);
+            }
+        }
+        if capability.provider == CodingProvider::Codex {
+            if borg_provider::credentials::openai_uses_api_key() {
+                capability.billing = Some(crate::BillingLane::ApiKey);
+                capability.usage = None;
+                capability
+                    .auth_methods
+                    .retain(|method| *method != ProviderAuthMethod::Subscription);
+                if borg_provider::credentials::openai_api_key().is_some() {
+                    if !capability
+                        .auth_methods
+                        .contains(&ProviderAuthMethod::ApiKey)
+                    {
+                        capability.auth_methods.push(ProviderAuthMethod::ApiKey);
+                    }
+                    capability.authenticated = true;
+                } else {
+                    capability.auth_methods.clear();
+                    capability.authenticated = false;
+                }
+            } else {
+                let auth = borg_provider::credentials::codex_auth_json();
+                let authenticated = auth.as_ref().map_or(
+                    capability.authenticated
+                        && capability.billing == Some(crate::BillingLane::Subscription),
+                    |auth| {
+                        auth["auth_mode"] != "apikey"
+                            && auth["tokens"]["access_token"]
+                                .as_str()
+                                .is_some_and(|token| !token.is_empty())
+                    },
+                );
+                capability.billing = Some(crate::BillingLane::Subscription);
+                capability.authenticated = authenticated;
+                if authenticated
+                    && !capability
+                        .auth_methods
+                        .contains(&ProviderAuthMethod::Subscription)
+                {
+                    capability
+                        .auth_methods
+                        .push(ProviderAuthMethod::Subscription);
+                } else if !authenticated {
+                    capability
+                        .auth_methods
+                        .retain(|method| *method != ProviderAuthMethod::Subscription);
+                    capability.usage = None;
+                }
+            }
+        }
+    }
     let has_subscription = |provider| {
         capabilities.iter().any(|capability| {
             capability.provider == provider
@@ -57,19 +124,19 @@ pub async fn refresh_provider_capability_usage(
                 CodingProvider::Claude => claude.clone(),
                 _ => return capability,
             };
-            if usage.is_some() {
+            if capability.billing == Some(crate::BillingLane::ApiKey) {
+                capability.usage = None;
+            } else if usage.is_some() {
                 capability.usage = usage;
             }
             let exhausted = capability
                 .usage
                 .as_ref()
                 .is_some_and(|usage| usage.availability == ProviderUsageAvailability::Exhausted);
-            let alternate_route = capability.auth_methods.iter().any(|method| {
-                matches!(
-                    method,
-                    ProviderAuthMethod::ApiKey | ProviderAuthMethod::Endpoint
-                )
-            });
+            let alternate_route = matches!(
+                capability.billing,
+                Some(crate::BillingLane::ApiKey | crate::BillingLane::Endpoint)
+            );
             capability.can_spawn =
                 capability.installed && capability.authenticated && (!exhausted || alternate_route);
             capability
@@ -80,7 +147,7 @@ pub async fn refresh_provider_capability_usage(
 async fn probe_provider_usage(provider: CodingProvider) -> Option<ProviderUsage> {
     let cache = PROVIDER_USAGE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some((probed_at, usage)) = cache.lock().await.get(&provider)
-        && probed_at.elapsed() < PROVIDER_CAPABILITIES_CACHE_TTL
+        && probed_at.elapsed() < Duration::from_secs(60)
     {
         return usage.clone();
     }

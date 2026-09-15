@@ -626,6 +626,32 @@ async fn model_access_binding_is_atomic_durable_and_inherited_without_context_de
 }
 
 #[tokio::test]
+async fn explicit_openai_billing_switch_keeps_both_account_bindings() {
+    let (_directory, store) = store().await;
+    let session = Uuid::new_v4();
+    store.create_session(session).await.unwrap();
+    for identity in [
+        "subscription-account",
+        "api-sha256:saved-key",
+        "subscription-account",
+        "api-sha256:saved-key",
+    ] {
+        store
+            .bind_model_access(session, CodingProvider::Codex, identity)
+            .await
+            .unwrap();
+    }
+    for identity in ["different-subscription", "api-sha256:different-key"] {
+        assert!(
+            store
+                .bind_model_access(session, CodingProvider::Codex, identity)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test]
 async fn subscription_access_rejects_unbound_prototype_history_and_its_forks() {
     let (_directory, store) = store().await;
     let session_id = Uuid::new_v4();
