@@ -61,7 +61,7 @@ AT-SPI coordinates on Wayland are **not** assumed to be screenshot coordinates.
 The local Niri compositor omitted visible-window geometry and rejected isolated
 `grim -T` capture. Those experiments are not advertised as supported window capture.
 
-## macOS (unverified)
+## macOS (verified on a real host)
 
 `computer_use/macos.swift` implements the same contract on AXUIElement: window
 enumeration over regular apps, bounded tree observation with diffs, `AXPress`
@@ -71,9 +71,15 @@ CGWindowID; ambiguous titles refused; images over 4 MiB are downscaled). The
 dispatcher compiles the helper once per source revision with `swiftc` into
 `~/.borg/state/computer-use/`, so the Xcode Command Line Tools are required, plus
 Accessibility and Screen Recording permission for the terminal running Borg.
-`capabilities` reports both permission states. **This has not yet been built or
-exercised on a real Mac**; treat it as unverified until this section records the
-host, commit and observed effects.
+`capabilities` reports both permission states.
+
+Verified by the Mac Borg instance on macOS 26.2 (arm64, Swift 6.3 / Xcode 26.4)
+at commit `ecc3ff3`: `swiftc` build; `capabilities` with both permissions
+granted; `list_windows`; `observe` of a TextEdit window (45 nodes); `set_value`
+of "Borg macOS ✓" into its `AXTextArea`, confirmed both in the returned tree and
+visually in the window capture; an empty `since` diff after the action; desktop
+capture at 2880×1800 and isolated window capture at 1396×1200. Element ids are
+scoped to one helper process, as on Linux. Input injection is not implemented.
 
 ## Windows (unverified)
 
@@ -90,7 +96,7 @@ envelopes, argument validation) was dry-run under PowerShell 7.6 on Linux with
 the Windows-only calls stubbed. **Not yet exercised on a real Windows host**;
 treat as unverified.
 
-Still missing: macOS and Windows real-host verification;
+Still missing: Windows real-host verification;
 keyboard/pointer injection, scrolling and dragging; isolated window capture;
 full cross-provider image/desktop task verification; installation and broadcast
 verification.

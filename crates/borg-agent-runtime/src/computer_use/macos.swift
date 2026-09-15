@@ -71,10 +71,16 @@ func children(_ element: AXUIElement) -> [AXUIElement] {
     (attribute(element, kAXChildrenAttribute) as? [AXUIElement]) ?? []
 }
 
-func axValue<T>(_ value: AnyObject?, _ kind: AXValueType, _ zero: T) -> T? {
+func axPoint(_ value: AnyObject?) -> CGPoint? {
     guard let value = value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
-    var out = zero
-    return AXValueGetValue(value as! AXValue, kind, &out) ? out : nil
+    var out = CGPoint.zero
+    return AXValueGetValue(value as! AXValue, .cgPoint, &out) ? out : nil
+}
+
+func axSize(_ value: AnyObject?) -> CGSize? {
+    guard let value = value, CFGetTypeID(value) == AXValueGetTypeID() else { return nil }
+    var out = CGSize.zero
+    return AXValueGetValue(value as! AXValue, .cgSize, &out) ? out : nil
 }
 
 func alive(_ element: AXUIElement) -> Bool {
@@ -125,8 +131,8 @@ func window(_ id: String) throws -> WindowEntry {
 func describe(_ element: AXUIElement, parent: String?) throws -> Node {
     let role = string(element, kAXRoleAttribute) ?? ""
     var bounds: Bounds?
-    if let origin = axValue(attribute(element, kAXPositionAttribute), .cgPoint, CGPoint.zero),
-       let size = axValue(attribute(element, kAXSizeAttribute), .cgSize, CGSize.zero),
+    if let origin = axPoint(attribute(element, kAXPositionAttribute)),
+       let size = axSize(attribute(element, kAXSizeAttribute)),
        size.width > 0, size.height > 0 {
         bounds = Bounds(x: origin.x, y: origin.y, width: size.width, height: size.height)
     }
