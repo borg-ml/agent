@@ -3974,7 +3974,9 @@ async fn run_local_agent_session(
                     },
                     _ => {}
                 }
-                if let Some(terminal) = terminal.as_mut() {
+                if schema_rejected && stale_local_owner {
+                    tracing::info!(%session_id, "recovering obsolete owner after schema rejection");
+                } else if let Some(terminal) = terminal.as_mut() {
                     terminal_dirty |= terminal.apply_session_event(&event);
                     if history
                         .last()
