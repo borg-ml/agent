@@ -3319,6 +3319,7 @@ impl BorgTerminal {
                     || kind == "action/preparing_cancelled"
                     || kind == "network_retry"
                     || kind == "network_recovered"
+                    || kind == "mcp_server_unavailable"
                     || Transcript::provider_reasoning_lifecycle(kind, payload).is_some()
             }
             _ => true,
@@ -11256,6 +11257,7 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
                 || kind == "action/preparing"
                 || kind == "action/generation_status"
                 || kind == "action/preparing_cancelled"
+                || kind == "mcp_server_unavailable"
                 // `reasoning/started` opens the Thinking row. Without this the
                 // row only materialises on `reasoning_completed`, i.e. in the
                 // same frame as the tool call it precedes.

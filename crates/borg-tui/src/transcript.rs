@@ -1901,6 +1901,13 @@ impl Transcript {
             {
                 self.finish_reasoning(event.created_at);
             }
+            SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "mcp_server_unavailable" => {
+                self.order.push(TranscriptEntry::Info {
+                    title: "MCP unavailable".to_string(),
+                    text: payload["message"].as_str().unwrap_or("External MCP tools unavailable for this turn").to_string(),
+                    time: local_event_time(event),
+                });
+            }
             SessionEventKind::ProviderEvent { kind, .. } if kind == "context_compaction_failed" => {
                 self.finish_reasoning(event.created_at);
                 self.cache_diagnostics.reset();

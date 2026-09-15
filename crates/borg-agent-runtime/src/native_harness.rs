@@ -227,6 +227,20 @@ impl NativeHarness {
             )),
         }
         system_prompt.push_str(&runtime.context.prompt_appendix());
+        for (server, error) in &runtime.mcp.startup_failures {
+            let message =
+                format!("MCP server {server} unavailable; continuing without its tools. {error}");
+            send(
+                &events,
+                SessionEventKind::ProviderEvent {
+                    provider: turn.provider,
+                    kind: "mcp_server_unavailable".to_string(),
+                    payload: json!({"server": server, "error": error, "message": message}),
+                },
+            )
+            .await;
+            system_prompt.push_str(&format!("\nExternal MCP server {} is unavailable for this turn. Its tools are not available; do not claim to have used them.", serde_json::to_string(server)?));
+        }
         if !turn.system_prompt_appendix.is_empty() {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(&turn.system_prompt_appendix);
@@ -3371,7 +3385,12 @@ mod tests {
                     crate::native_process::ProcessManager::default(),
                     PermissionMode::FullAccess,
                 ),
-                external_mcp_servers: Vec::new(),
+                external_mcp_servers: vec![borg_provider::mcp::ExternalMcpServer {
+                    name: "unavailable".to_string(),
+                    command: "sh".to_string(),
+                    args: vec!["-c".to_string(), "exit 127".to_string()],
+                    ..Default::default()
+                }],
                 runtime_mcp_context: Default::default(),
                 extension_skill_roots: Vec::new(),
                 extension_workflows: Vec::new(),
@@ -3384,9 +3403,13 @@ mod tests {
             let task =
                 tokio::spawn(async move { harness.run(turn, events_tx, Some(controls_rx)).await });
             let mut controlled = false;
+            let mut warned = false;
             let mut steer_ack = None;
             tokio::time::timeout(Duration::from_secs(10), async {
                 while let Some(event) = events_rx.recv().await {
+                    if matches!(&event, SessionEventKind::ProviderEvent { kind, .. } if kind == "mcp_server_unavailable") {
+                        warned = true;
+                    }
                     if let SessionEventKind::ProviderEvent { kind, payload, .. } = event
                         && kind == "native_model_message"
                         && matches!(
@@ -3415,6 +3438,10 @@ mod tests {
             })
             .await
             .expect("tool loop should finish after control");
+            assert!(
+                warned,
+                "unavailable MCP tools must be reported without aborting the model/tool loop"
+            );
             assert!(
                 controlled,
                 "first result must be emitted while the batch is active"

@@ -26,6 +26,7 @@ pub(crate) struct NativeMcpRuntime {
     servers: Vec<ExternalMcpServer>,
     tools: HashMap<String, NativeMcpTool>,
     definitions: Vec<ModelToolDefinition>,
+    pub(crate) startup_failures: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -40,16 +41,29 @@ impl NativeMcpRuntime {
         let mut configured_servers = Vec::with_capacity(servers.len());
         let mut tools = HashMap::new();
         let mut definitions = Vec::new();
+        let mut startup_failures = Vec::new();
         let mut startups = servers
             .into_iter()
             .map(|server| async move {
-                let mut client = NativeMcpClient::start(&server).await?;
-                let listed = client.list_tools().await?;
-                Ok::<_, anyhow::Error>((server, client, listed))
+                let started = async {
+                    let mut client = NativeMcpClient::start(&server).await?;
+                    let listed = client.list_tools().await?;
+                    Ok::<_, anyhow::Error>((client, listed))
+                }
+                .await;
+                (server, started)
             })
             .collect::<FuturesOrdered<_>>();
-        while let Some(started) = startups.next().await {
-            let (server, client, listed) = started?;
+        while let Some((server, started)) = startups.next().await {
+            let (client, listed) = match started {
+                Ok(started) => started,
+                Err(error) => {
+                    let error = truncate(&format!("{error:#}"), 2048).to_string();
+                    tracing::warn!(server = %server.name, %error, "external MCP server unavailable; continuing without its tools");
+                    startup_failures.push((server.name, error));
+                    continue;
+                }
+            };
             let client_index = clients.len();
             for listed_tool in listed {
                 let full_name = external_tool_name(&server.name, &listed_tool.name);
@@ -91,6 +105,7 @@ impl NativeMcpRuntime {
             servers: configured_servers,
             tools,
             definitions,
+            startup_failures,
         })
     }
 
@@ -613,15 +628,25 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"map.generate"
 read _call
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}'
 "#;
-        let runtime = NativeMcpRuntime::start(vec![ExternalMcpServer {
-            name: "fake-server".to_string(),
-            command: "sh".to_string(),
-            args: vec!["-c".to_string(), script.to_string()],
-            env: BTreeMap::new(),
-            allowed_tools: vec!["map.generate".to_string()],
-        }])
+        let runtime = NativeMcpRuntime::start(vec![
+            ExternalMcpServer {
+                name: "unavailable".to_string(),
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "exit 127".to_string()],
+                ..Default::default()
+            },
+            ExternalMcpServer {
+                name: "fake-server".to_string(),
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), script.to_string()],
+                env: BTreeMap::new(),
+                allowed_tools: vec!["map.generate".to_string()],
+            },
+        ])
         .await
         .unwrap();
+        assert_eq!(runtime.startup_failures.len(), 1);
+        assert_eq!(runtime.startup_failures[0].0, "unavailable");
         assert!(runtime.contains("mcp__fake_server__map_generate"));
         assert!(!runtime.contains("mcp__fake_server__hidden"));
         assert_eq!(runtime.definitions().len(), 1);
@@ -770,13 +795,13 @@ case "$first" in
     ;;
 esac
 "#;
-        let error = match NativeMcpRuntime::start(vec![ExternalMcpServer {
+        let error = match NativeMcpClient::start(&ExternalMcpServer {
             name: "modern-only-server".to_string(),
             command: "sh".to_string(),
             args: vec!["-c".to_string(), script.to_string()],
             env: BTreeMap::new(),
             allowed_tools: vec![],
-        }])
+        })
         .await
         {
             Ok(_) => panic!("recognized modern negotiation error was downgraded to legacy"),
