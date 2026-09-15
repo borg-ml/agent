@@ -36,7 +36,7 @@ impl<T> Drop for AbortTask<T> {
 
 const ROOT_INBOX_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
 #[cfg(not(test))]
-const USAGE_LIMIT_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5 * 60);
+const USAGE_LIMIT_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(30 * 60);
 #[cfg(test)]
 const USAGE_LIMIT_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
@@ -2379,7 +2379,7 @@ async fn run_agent_session_store_kernel(
                     Some(HostCommand::Interrupt {
                         session_id: command_session_id,
                     }) if command_session_id == session_id
-                        && network_retry_message_id.is_some() =>
+                        && (network_retry_message_id.is_some() || retry_not_before.is_some()) =>
                     {
                         if let Some(message_id) = network_retry_message_id.take() {
                             cancel_connection_retry(
@@ -2392,6 +2392,20 @@ async fn run_agent_session_store_kernel(
                             .await?;
                         }
                         retry_not_before = None;
+                        if let Some(id) = usage_limit_continuation_id.take() {
+                            pending.retain(|prompt| prompt.message_id != id);
+                        }
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::ProviderEvent {
+                                provider: launch.provider,
+                                kind: "usage_limit_retry_cancelled".to_string(),
+                                payload: serde_json::json!({}),
+                            },
+                        )
+                        .await?;
                         network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
                         auth_lookup_retries = 0;
                         pause_active_goal(
@@ -2411,7 +2425,9 @@ async fn run_agent_session_store_kernel(
                             session_id,
                             SessionEventKind::StatusChanged {
                                 status: SessionStatus::Ready,
-                                detail: Some("Reconnection cancelled. Your work is saved.".into()),
+                                detail: Some(
+                                    "Automatic retry cancelled. Your work is saved.".into(),
+                                ),
                             },
                         )
                         .await?;
@@ -2488,6 +2504,11 @@ async fn run_agent_session_store_kernel(
                         continue;
                     }
                     Some(HostCommand::Configure { action, .. }) => {
+                        let retry_selection = matches!(
+                            action,
+                            crate::SessionConfigAction::SetModel { .. }
+                                | crate::SessionConfigAction::SetProvider { .. }
+                        );
                         match apply_session_config(
                             &mut journal,
                             &events,
@@ -2512,6 +2533,10 @@ async fn run_agent_session_store_kernel(
                                             journal.ensure_complete_context(session_id).await?;
                                             retained_conversation_context(journal.context_events())
                                         };
+                                }
+                                if retry_selection && retry_not_before.take().is_some() {
+                                    usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
+                                    break pop_next_pending_prompt(&mut pending, true);
                                 }
                             }
                             Err(error) => {
@@ -3706,17 +3731,10 @@ async fn run_agent_session_store_kernel(
                             }
                             let usage_limit_reset_delay =
                                 provider_error_usage_limit_reset_delay(&error);
-                            // A reset further out than the retry ceiling is an
-                            // exhausted plan window, not a transient limit:
-                            // waiting silently would leave the session looking
-                            // stuck for hours or days.
-                            let usage_limit_exhausted = provider_error_is_usage_limited(&error)
-                                && usage_limit_reset_delay
-                                    .is_some_and(|delay| delay > USAGE_LIMIT_RETRY_MAX_DELAY);
                             let usage_limit_retry = launch.capabilities.auto_resume_usage_limits
                                 && provider_supports_usage_limit_resume(launch.provider)
                                 && provider_error_is_temporary_usage_limited(&error)
-                                && !usage_limit_exhausted;
+                                && !interrupted;
                             let usage_limit_wait = usage_limit_retry
                                 .then(|| usage_limit_reset_delay.unwrap_or(usage_limit_retry_delay));
                             // Once the turn has run tools or produced output,
@@ -3724,14 +3742,6 @@ async fn run_agent_session_store_kernel(
                             // on. Re-sending it would repeat that work, so the
                             // resume is a continuation rather than a replay.
                             let usage_limit_continue = usage_limit_retry && turn_had_side_effects;
-                            let error = if usage_limit_exhausted {
-                                usage_limit_exhausted_message(
-                                    launch.provider,
-                                    usage_limit_reset_delay.unwrap_or_default(),
-                                )
-                            } else {
-                                error
-                            };
                             let auth_lookup_failure = provider_error_is_auth_lookup_unavailable(&error);
                             if network_retry_message_id != Some(prompt.message_id) {
                                 auth_lookup_retries = 0;
@@ -3818,8 +3828,6 @@ async fn run_agent_session_store_kernel(
                                     "Borg blocked a provider-native delegation attempt. The turn was not retried because doing so could repeat work."
                                         .to_string()
                                 }
-                            } else if usage_limit_exhausted {
-                                error.clone()
                             } else if interrupted {
                                 "Interrupted".to_string()
                             } else {
@@ -3839,6 +3847,11 @@ async fn run_agent_session_store_kernel(
                             } else if let Some(wait) = usage_limit_wait {
                                 goal_turn_failures.reset();
                                 retry_not_before = Some(Instant::now() + wait);
+                                record(&mut journal, &events, session_id, SessionEventKind::ProviderEvent {
+                                    provider: launch.provider,
+                                    kind: "usage_limit_retry".into(),
+                                    payload: serde_json::json!({"retry_at": Utc::now() + chrono::Duration::from_std(wait).unwrap_or_default()}),
+                                }).await?;
                                 if usage_limit_reset_delay.is_none() {
                                     usage_limit_retry_delay = usage_limit_retry_delay
                                         .saturating_mul(2)
@@ -8492,11 +8505,19 @@ fn provider_error_is_usage_limited(error: &str) -> bool {
         || compact.contains("quotaexceeded")
         || compact.contains("toomanyrequests")
         || compact.contains("hityourlimit")
+        || compact.contains("hityoursessionlimit")
 }
 
 /// Reset delay a subscription adapter attached to its normalized usage-limit
 /// error, when the provider reported one.
 fn provider_error_usage_limit_reset_delay(error: &str) -> Option<Duration> {
+    provider_error_usage_limit_reset_delay_at(error, Utc::now())
+}
+
+fn provider_error_usage_limit_reset_delay_at(
+    error: &str,
+    now: chrono::DateTime<Utc>,
+) -> Option<Duration> {
     if let Some(seconds) = error
         .split("Provider-reported retry delay: ")
         .nth(1)
@@ -8505,15 +8526,41 @@ fn provider_error_usage_limit_reset_delay(error: &str) -> Option<Duration> {
     {
         return Some(Duration::from_secs(seconds));
     }
-    let stamp = error
-        .split("Provider-reported reset: ")
-        .nth(1)?
-        .split(" UTC")
-        .next()?;
-    let reset = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S")
-        .ok()?
-        .and_utc();
-    Some((reset - Utc::now()).to_std().unwrap_or_default())
+    if let Some(stamp) = error.split("Provider-reported reset: ").nth(1) {
+        let stamp = stamp.split(" UTC").next()?;
+        let reset = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S")
+            .ok()?
+            .and_utc();
+        return Some((reset - now).to_std().unwrap_or(Duration::from_secs(1)));
+    }
+
+    // Claude's terminal error supplies a wall clock and IANA time zone.
+    // Interpret it in that zone, including daylight saving and midnight.
+    use chrono::TimeZone;
+    static RESET: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let captures = RESET
+        .get_or_init(|| {
+            regex::Regex::new(r"(?i)resets\s+(\d{1,2}(?::\d{2})?\s*[ap]m)\s*\(([^)]+)\)").unwrap()
+        })
+        .captures(error)?;
+    let mut clock = captures[1].replace(' ', "").to_ascii_lowercase();
+    if !clock.contains(':') {
+        clock.insert_str(clock.len() - 2, ":00");
+    }
+    let clock = chrono::NaiveTime::parse_from_str(&clock, "%I:%M%P").ok()?;
+    let zone: chrono_tz::Tz = captures[2].parse().ok()?;
+    let date = now.with_timezone(&zone).date_naive();
+    let reset = [Some(date), date.succ_opt()]
+        .into_iter()
+        .flatten()
+        .flat_map(|date| {
+            let times = zone.from_local_datetime(&date.and_time(clock));
+            [times.earliest(), times.latest()].into_iter().flatten()
+        })
+        .map(|time| time.with_timezone(&Utc))
+        .filter(|time| *time > now)
+        .min()?;
+    (reset - now).to_std().ok()
 }
 
 fn format_reset_delay(delay: Duration) -> String {
@@ -8527,15 +8574,6 @@ fn format_reset_delay(delay: Duration) -> String {
     } else {
         format!("{seconds}s")
     }
-}
-
-fn usage_limit_exhausted_message(provider: CodingProvider, reset_in: Duration) -> String {
-    let reset_at = Utc::now() + chrono::Duration::from_std(reset_in).unwrap_or_default();
-    format!(
-        "{provider:?} subscription usage limit exhausted; it resets in {} ({}). Your message was not sent: wait for the reset or switch provider/model, then retry.",
-        format_reset_delay(reset_in),
-        reset_at.format("%Y-%m-%d %H:%M UTC")
-    )
 }
 
 fn provider_error_is_temporary_usage_limited(error: &str) -> bool {

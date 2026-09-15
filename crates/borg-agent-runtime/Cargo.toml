@@ -23,6 +23,7 @@ blu-lang.workspace = true
 borg-provider = { path = "../borg-provider", default-features = false }
 borg-search.workspace = true
 chrono.workspace = true
+chrono-tz = "0.10"
 dirs.workspace = true
 futures.workspace = true
 hex.workspace = true

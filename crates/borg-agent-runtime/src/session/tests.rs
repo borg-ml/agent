@@ -6868,6 +6868,34 @@ fn structured_rate_and_billing_errors_are_usage_limited() {
 }
 
 #[test]
+fn usage_limit_reset_honors_provider_time_zone_and_long_waits() {
+    let now = chrono::DateTime::parse_from_rfc3339("2026-09-15T13:47:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let delay = |message| provider_error_usage_limit_reset_delay_at(message, now);
+    assert_eq!(
+        delay("You've hit your session limit · resets 5:50pm (Europe/London)"),
+        Some(Duration::from_secs(3 * 3600 + 3 * 60))
+    );
+    assert_eq!(
+        delay("resets 1am (Europe/London)"),
+        Some(Duration::from_secs(10 * 3600 + 13 * 60))
+    );
+    assert_eq!(
+        delay("Provider-reported reset: 2026-09-17 13:47:00 UTC."),
+        Some(Duration::from_secs(2 * 86400))
+    );
+    assert_eq!(
+        delay("Provider-reported retry delay: 7200 seconds."),
+        Some(Duration::from_secs(7200))
+    );
+    assert_eq!(delay("resets 5pm (Unknown/Zone)"), None);
+    assert!(provider_error_is_temporary_usage_limited(
+        "You've hit your session limit · resets 5:50pm (Europe/London)"
+    ));
+}
+
+#[test]
 fn usage_limit_auto_resume_is_restricted_to_subscription_cli_providers() {
     assert!(provider_supports_usage_limit_resume(CodingProvider::Claude));
     assert!(provider_supports_usage_limit_resume(CodingProvider::Codex));
