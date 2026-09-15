@@ -11,6 +11,46 @@ use uuid::Uuid;
 const MAX_ATTACHMENT_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_INLINE_IMAGE_BYTES: usize = 25 * 1024 * 1024;
 
+pub(super) fn preview(path: &Path, width: usize) -> Option<Vec<ratatui::text::Line<'static>>> {
+    use ratatui::{
+        style::{Color, Style},
+        text::{Line, Span},
+    };
+
+    if fs::metadata(path).ok()?.len() > MAX_ATTACHMENT_BYTES || width == 0 {
+        return None;
+    }
+    let image = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?
+        .thumbnail(width.min(24) as u32, 16)
+        .to_rgb8();
+    Some(
+        (0..image.height())
+            .step_by(2)
+            .map(|y| {
+                Line::from(
+                    (0..image.width())
+                        .map(|x| {
+                            let top = image.get_pixel(x, y).0;
+                            let bottom = image.get_pixel(x, (y + 1).min(image.height() - 1)).0;
+                            Span::styled(
+                                "▀",
+                                Style::default()
+                                    .fg(Color::Rgb(top[0], top[1], top[2]))
+                                    .bg(Color::Rgb(bottom[0], bottom[1], bottom[2])),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect(),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasteOutcome {
     pub text: String,

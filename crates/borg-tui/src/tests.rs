@@ -759,12 +759,20 @@ fn transcript_attachments_preserve_the_explicit_image_number() {
 
 #[test]
 fn transcript_attachment_rows_link_to_the_local_image() {
-    let path = std::env::temp_dir().join("borg-clickable-image.png");
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("red.png");
+    let blue = root.path().join("blue.png");
+    image::RgbImage::from_pixel(8, 8, image::Rgb([255, 0, 0]))
+        .save(&path)
+        .unwrap();
+    image::RgbImage::from_pixel(8, 8, image::Rgb([0, 0, 255]))
+        .save(&blue)
+        .unwrap();
     let mut transcript = Transcript::default();
     transcript.order.push(TranscriptEntry::Message {
         actor: EventActor::User,
         text: "inspect [Image 1]".to_string(),
-        attachments: vec![(1, path.clone())],
+        attachments: vec![(1, path.clone()), (2, blue)],
         model: None,
         effort: None,
         time: "2026-08-26 12:00".to_string(),
@@ -779,6 +787,40 @@ fn transcript_attachment_rows_link_to_the_local_image() {
         link.url == url::Url::from_file_path(&path).unwrap().to_string()
             && rendered.0[link.row].to_string().contains("Image 1")
     }));
+    let has_color =
+        |line: &Line<'_>, color| line.spans.iter().any(|span| span.style.fg == Some(color));
+    assert!(rendered.0.iter().any(
+        |line| has_color(line, Color::Rgb(255, 0, 0)) && has_color(line, Color::Rgb(0, 0, 255))
+    ));
+    let narrow = transcript.render(20, None, None, None);
+    for line in narrow
+        .0
+        .iter()
+        .filter(|line| line.to_string().contains('▀'))
+    {
+        assert!(line.width() <= 20);
+        assert!(
+            !(has_color(line, Color::Rgb(255, 0, 0)) && has_color(line, Color::Rgb(0, 0, 255)))
+        );
+    }
+    transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::User,
+        text: String::new(),
+        attachments: vec![(3, root.path().join("missing.png"))],
+        model: None,
+        effort: None,
+        time: String::new(),
+        status: MessageStatus::Complete,
+        complete: true,
+        user_interrupted: false,
+    });
+    assert!(
+        transcript
+            .render(80, None, None, None)
+            .0
+            .iter()
+            .any(|line| line.to_string().contains("Image 3"))
+    );
 }
 
 #[test]

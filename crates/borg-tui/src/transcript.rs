@@ -197,6 +197,7 @@ struct AgentRosterEntry {
 
 #[derive(Default)]
 struct MessageMarkdownCache {
+    previews: HashMap<(PathBuf, usize), Vec<Line<'static>>>,
     messages: HashMap<(usize, usize), MarkdownRender>,
     #[cfg(test)]
     misses: usize,
@@ -3760,36 +3761,58 @@ impl Transcript {
                     }
                     link_rows.extend(message_lines.links);
                     lines.extend(message_lines.lines);
-                    for (number, path) in attachments {
-                        let token = format!("[Image {number}]");
-                        if !text.contains(&token) {
-                            lines.push(Line::from(Span::styled(
-                                format!("  {token}"),
-                                Style::default()
-                                    .fg(Color::LightCyan)
-                                    .add_modifier(Modifier::BOLD),
-                            )));
+                    let available = width.saturating_sub(MESSAGE_HORIZONTAL_PADDING).max(1);
+                    let tile_width = available.min(24);
+                    let columns = ((available + 2) / (tile_width + 2)).max(1);
+                    for group in attachments.chunks(columns) {
+                        let mut cache = self.message_markdown_cache.borrow_mut();
+                        if cache.previews.len() > 128 {
+                            cache.previews.clear();
                         }
-                        let attachment_line = Line::from(vec![
-                            Span::styled("    ▣ ", Style::default().fg(Color::LightCyan)),
-                            Span::styled(
-                                format!("Image {number}"),
-                                Style::default().add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                format!("  {}", display_name(path)),
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                        ]);
-                        if let Ok(url) = url::Url::from_file_path(path) {
-                            link_rows.push(LinkRowRange {
-                                row: lines.len(),
-                                start: 4,
-                                end: attachment_line.width(),
-                                url: url.to_string(),
-                            });
+                        let previews = group
+                            .iter()
+                            .map(|(_, path)| {
+                                cache
+                                    .previews
+                                    .entry((path.clone(), tile_width))
+                                    .or_insert_with(|| {
+                                        attachments::preview(path, tile_width).unwrap_or_default()
+                                    })
+                                    .clone()
+                            })
+                            .collect::<Vec<_>>();
+                        let height = previews.iter().map(Vec::len).max().unwrap_or(0);
+                        for row in 0..=height {
+                            let mut line = Line::from("  ");
+                            for (column, (number, path)) in group.iter().enumerate() {
+                                let start = line.width();
+                                let tile = if row == height {
+                                    Line::from(Span::styled(
+                                        truncate_table_cell(
+                                            &format!("Image {number} · {}", display_name(path)),
+                                            tile_width,
+                                        ),
+                                        Style::default().fg(Color::LightCyan),
+                                    ))
+                                } else {
+                                    previews[column].get(row).cloned().unwrap_or_default()
+                                };
+                                let padding = tile_width.saturating_sub(tile.width());
+                                line.spans.extend(tile.spans);
+                                if let Ok(url) = url::Url::from_file_path(path) {
+                                    link_rows.push(LinkRowRange {
+                                        row: lines.len(),
+                                        start,
+                                        end: start + tile_width,
+                                        url: url.to_string(),
+                                    });
+                                }
+                                if column + 1 < group.len() {
+                                    line.spans.push(Span::raw(" ".repeat(padding + 2)));
+                                }
+                            }
+                            lines.push(line);
                         }
-                        lines.push(attachment_line);
                     }
                     if *actor == EventActor::Assistant && !complete && !running_tool {
                         lines.push(Line::from(Span::styled(
