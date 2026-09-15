@@ -290,7 +290,7 @@ const HELPER_REQUIREMENTS: &str = if cfg!(target_os = "macos") {
 } else if cfg!(target_os = "windows") {
     "Windows computer use requires Windows PowerShell 5.1+ (or pwsh) in the interactive user session"
 } else {
-    "Linux computer use requires python3, PyGObject and AT-SPI2 on the desktop session bus"
+    "Linux computer use requires python3, PyGObject and AT-SPI2 on the desktop session bus; input injection also needs python-evdev, a writable /dev/uinput and wtype (Wayland) or xdotool (X11)"
 };
 
 /// Platform helper process. Linux runs the AT-SPI worker under the system

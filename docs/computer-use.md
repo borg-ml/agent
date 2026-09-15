@@ -13,6 +13,8 @@ application actions; approval to run code is not blanket permission to purchase,
 send, delete, or change security settings.
 
 Linux requires the desktop session bus, Python 3, PyGObject and AT-SPI2.
+Input injection additionally requires python-evdev, a writable `/dev/uinput`
+(the `input` group or a udev rule) and `wtype` on Wayland or `xdotool` on X11.
 
 - `list_windows`: window IDs are scoped to the helper lifetime.
 - `observe`: `window_id`, optional `max_nodes` (1–1000), optional `since` for
@@ -54,8 +56,33 @@ name-based confirmation gating because no element is named.
 Linux caveat: AT-SPI extents on GTK Wayland are window-relative and the
 compositor may not expose the window origin, so element-targeted
 `pointer_click`/`scroll` return a clear error there instead of guessing; use
-`click`/`set_value` or a raw coordinate read from a desktop screenshot. The
-Linux backend is a Borg-owned evdev uinput device plus `wtype` (no `ydotool`).
+`click`/`set_value` or a raw coordinate read from a desktop screenshot.
+
+### Linux input backend (implemented, test-only verification)
+
+`computer_use/linux.py` injects through a Borg-owned evdev uinput device
+("Borg virtual input": keys, mouse buttons, wheel and an absolute pointer axis)
+created lazily on the first injection and owned by the helper process; Unicode
+`type_text` goes through `wtype` on Wayland or `xdotool type` on X11 (no
+`ydotool` daemon). `capabilities` lists the five injection ops only when
+python-evdev, a writable `/dev/uinput` and the typing tool are present, and
+otherwise names what is missing. Pointer coordinates are desktop screenshot
+pixels: the helper maps them onto the absolute axis using the size of the last
+`scope: "desktop"` screenshot (probed once with `grim`/`xdotool` when none was
+taken) so a point read from a screenshot lands on that pixel; on multi-output or
+scaled layouts the compositor decides how an absolute device maps, so verify
+with a screenshot. `scroll` emits wheel notches (about 120 px each, at least one
+for any non-zero request) and reports them. Wayland compositors may refuse
+focus stealing, so instead of raising blindly the helper checks the AT-SPI
+`ACTIVE` state after a `grab_focus` attempt and refuses with a clear error when
+the target window is not active — injected events always reach the focused
+window. Element-targeted `pointer_click`/`scroll` work only on X11 sessions,
+where AT-SPI screen extents are real screen pixels. Key names match the other
+platforms (`delete` is backspace, `forwarddelete` deletes forward; modifiers
+`ctrl`/`alt`/`shift`/`cmd`|`super`); uinput key codes are physical, so the
+compositor's keyboard layout applies. Verified so far without live desktop
+actions: key parsing, axis mapping, capability reporting, error paths, and
+device creation/udev classification with no events emitted.
 
 Python code mode: `cua.capabilities()`, `cua.list_windows()`,
 `cua.observe(window_id)`, `cua.screenshot("desktop")`,
