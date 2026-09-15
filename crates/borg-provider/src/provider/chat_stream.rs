@@ -3082,7 +3082,14 @@ async fn build_claude_command_spec(
     auth_home: Option<&TempDir>,
     mcp_config_path: Option<&Path>,
 ) -> Result<claude_agents::CommandSpec> {
-    let mut environment = Vec::new();
+    // Borg owns long-running work through its own watchers. Claude Code's
+    // automatic backgrounding of slow Bash commands withholds the turn's
+    // `result` until the task finishes, which left sessions "running" for
+    // minutes after the model had already delivered its final answer.
+    let mut environment = vec![(
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".to_string(),
+        "1".to_string(),
+    )];
     if let Some(auth_home) = auth_home {
         environment.push(("HOME".to_string(), auth_home.path().display().to_string()));
     }
