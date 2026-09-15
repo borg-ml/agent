@@ -1931,6 +1931,28 @@ async fn run_borg_provider_turn(
                 flush_pending_reasoning(&events, &mut pending_reasoning).await;
                 reasoning_text.clear();
                 last_completed_reasoning = None;
+                // A tool call ends the current assistant text segment. Commit it
+                // as its own message and open a fresh id so text generated after
+                // the tool is not appended to the message rendered above the
+                // tool rows, and so the finished segment stops showing as live.
+                if !text.trim().is_empty() {
+                    send(
+                        &events,
+                        SessionEventKind::Message {
+                            message_id: assistant_message_id,
+                            actor: EventActor::Assistant,
+                            text: text.clone(),
+                            attachments: Vec::new(),
+                            status: MessageStatus::Complete,
+                            delivery: None,
+                        },
+                    )
+                    .await;
+                    completed_segment = true;
+                    assistant_message_id = Uuid::new_v4();
+                    text.clear();
+                    last_text_emit = Instant::now() - Duration::from_millis(50);
+                }
                 if first_model_output {
                     first_model_output = false;
                     tracing::debug!(
