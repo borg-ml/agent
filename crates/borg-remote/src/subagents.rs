@@ -1687,9 +1687,10 @@ impl AgentToolDispatcher {
             }
             "get_provider_capabilities" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
-                let providers =
-                    crate::host::refresh_provider_capability_usage(&self.provider_capabilities)
-                        .await;
+                let providers = crate::provider_usage::refresh_provider_capability_usage(
+                    &self.provider_capabilities,
+                )
+                .await;
                 Ok(json!({
                     "providers": providers,
                     "instruction": "Check usage availability before cross-provider spawn or consultation. Only providers with can_spawn=true are eligible."

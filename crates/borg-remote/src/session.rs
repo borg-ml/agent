@@ -1694,7 +1694,7 @@ async fn run_agent_session_store_kernel(
     if !launch.capabilities.provider_capabilities.is_empty() {
         let seed = launch.capabilities.provider_capabilities.clone();
         tokio::spawn(async move {
-            let refreshed = crate::host::refresh_provider_capability_usage(&seed).await;
+            let refreshed = crate::provider_usage::refresh_provider_capability_usage(&seed).await;
             let _ = capability_refresh_tx.send(refreshed).await;
         });
     }

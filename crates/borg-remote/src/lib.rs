@@ -31,6 +31,7 @@ mod persistent_runtime;
 mod plugin_store;
 mod process_environment;
 mod profiling;
+mod provider_usage;
 mod receipt;
 mod runtime_protocol;
 mod schema_migration;
