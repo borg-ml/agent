@@ -73,6 +73,20 @@ pub enum ActiveMessageBehavior {
     Queue,
 }
 
+/// Where the one-time admin authorization for lid-closed wakefulness stands.
+/// macOS needs root to veto lid-close sleep, so Borg asks once (Touch ID or
+/// password) and remembers a refusal instead of nagging on every launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LidSleepSetup {
+    /// Never asked; prompt the first time the setting would take effect.
+    Ask,
+    /// The user approved and the helper rule was installed.
+    Authorized,
+    /// The user refused; fall back to idle-sleep prevention silently.
+    Declined,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompletionAlertPolicy {
@@ -108,6 +122,11 @@ pub enum ToolClickBehavior {
 pub struct InteractionPreferences {
     pub active_messages: ActiveMessageBehavior,
     pub prevent_sleep: bool,
+    /// Also keep the machine awake when the lid is closed while Borg works.
+    /// Only meaningful with `prevent_sleep`; on macOS it needs the one-time
+    /// authorization tracked by `lid_sleep_setup`.
+    pub prevent_lid_sleep: bool,
+    pub lid_sleep_setup: LidSleepSetup,
     pub completion_notifications: CompletionAlertPolicy,
     pub completion_sound: CompletionAlertPolicy,
     /// Set once the user has completed the enable-dictation flow (which also
@@ -121,6 +140,8 @@ impl Default for InteractionPreferences {
         Self {
             active_messages: ActiveMessageBehavior::Steer,
             prevent_sleep: true,
+            prevent_lid_sleep: true,
+            lid_sleep_setup: LidSleepSetup::Ask,
             completion_notifications: CompletionAlertPolicy::Unfocused,
             completion_sound: CompletionAlertPolicy::Unfocused,
             dictation_enabled: false,
@@ -423,6 +444,8 @@ mod tests {
             interaction: InteractionPreferences {
                 active_messages: ActiveMessageBehavior::Queue,
                 prevent_sleep: false,
+                prevent_lid_sleep: false,
+                lid_sleep_setup: LidSleepSetup::Declined,
                 completion_notifications: CompletionAlertPolicy::Always,
                 completion_sound: CompletionAlertPolicy::Off,
                 dictation_enabled: true,
@@ -537,6 +560,8 @@ mod tests {
         assert_eq!(preferences.transcript.assistant_label, "borg");
         assert_eq!(preferences.transcript.user_message_color, "#c6e4ff");
         assert!(preferences.interaction.prevent_sleep);
+        assert!(preferences.interaction.prevent_lid_sleep);
+        assert_eq!(preferences.interaction.lid_sleep_setup, LidSleepSetup::Ask);
         assert_eq!(preferences.presentation.refresh_rate_fps, 60);
         assert_eq!(preferences.layout.horizontal_margin, 0);
     }

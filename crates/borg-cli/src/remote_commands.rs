@@ -46,9 +46,9 @@ use crate::dictation::{
 };
 use crate::editor_preferences::{
     ActiveMessageBehavior, CompletionAlertPolicy, DictationIconStyle, DiffExpansionPolicy,
-    EditorPreferences, ToolClickBehavior,
+    EditorPreferences, LidSleepSetup, ToolClickBehavior,
 };
-use crate::sleep_inhibitor::SleepInhibitor;
+use crate::sleep_inhibitor::{LidSleepStatus, SleepInhibitor, authorize_lid_sleep};
 use crate::terminal_ui::{
     BorgTerminal, DictationState, ProviderAuthChoice, ResumeSessionOption, TerminalInputEvent,
     UiAction, dictation_icon_style_for_preference, discard_pending_terminal_input,
@@ -2770,6 +2770,7 @@ async fn run_local_agent_session(
     let mut tool_started_frame_hold_until = None;
     let mut tui_fps = tui_refresh_rate(u64::from(editor_preferences.presentation.refresh_rate_fps));
     let mut prevent_sleep = editor_preferences.interaction.prevent_sleep;
+    let mut prevent_lid_sleep = editor_preferences.interaction.prevent_lid_sleep;
     let mut steer_active_turn =
         editor_preferences.interaction.active_messages == ActiveMessageBehavior::Steer;
     if let Some(terminal) = terminal.as_mut() {
@@ -2779,7 +2780,8 @@ async fn run_local_agent_session(
     let mut rewind_prompt = None;
     let mut pending_revert_sequence = None;
     let mut revert_fork_task: Option<RevertForkTask> = None;
-    let mut sleep_inhibitor = SleepInhibitor::new(prevent_sleep);
+    let mut sleep_inhibitor = SleepInhibitor::new(prevent_sleep, prevent_lid_sleep);
+    let mut lid_sleep_auth_task: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
     let mut dictation_recorder: Option<LocalDictationRecorder> = None;
     let mut dictation_task: Option<tokio::task::JoinHandle<Result<String>>> = None;
     let mut dictation_setup_task: Option<tokio::task::JoinHandle<Result<LocalDictationBackend>>> =
@@ -2847,8 +2849,56 @@ async fn run_local_agent_session(
         tokio::task::JoinHandle<Result<crate::importer::ImportTaskResult>>,
     > = None;
     let mut pending_import: Option<crate::importer::PreparedImport> = None;
+    // Lid-closed wakefulness is on by default but needs root on macOS. Ask for
+    // the one-time authorization at launch; a refusal is remembered so this
+    // never turns into a nag.
+    if prevent_sleep && prevent_lid_sleep {
+        match (
+            editor_preferences.interaction.lid_sleep_setup,
+            sleep_inhibitor.lid_status(),
+        ) {
+            (LidSleepSetup::Ask, LidSleepStatus::NeedsAuthorization) => {
+                if let Some(terminal) = terminal.as_mut() {
+                    terminal.open_lid_sleep_authorization_picker();
+                    terminal_dirty = true;
+                }
+            }
+            (
+                LidSleepSetup::Ask | LidSleepSetup::Declined,
+                LidSleepStatus::Ready | LidSleepStatus::OnBattery,
+            ) => {
+                // The rule is already present (e.g. installed by another Borg
+                // checkout); record it so the prompt does not reappear.
+                editor_preferences.interaction.lid_sleep_setup = LidSleepSetup::Authorized;
+                dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
+            }
+            _ => {}
+        }
+    }
     loop {
         tokio::select! {
+            result = async {
+                lid_sleep_auth_task
+                    .as_mut()
+                    .expect("lid sleep authorization branch is guarded")
+                    .await
+            }, if lid_sleep_auth_task.is_some() => {
+                lid_sleep_auth_task = None;
+                let notice = match result {
+                    Ok(Ok(())) => {
+                        editor_preferences.interaction.lid_sleep_setup = LidSleepSetup::Authorized;
+                        dispatch_editor_preferences_save(&editor_preferences_tx, &editor_preferences);
+                        sleep_inhibitor.invalidate_lid_authorization();
+                        sleep_setting_notice(prevent_sleep, prevent_lid_sleep, sleep_inhibitor.lid_status())
+                    }
+                    Ok(Err(error)) => format!("Lid-close sleep prevention not enabled: {error}"),
+                    Err(error) => format!("Lid-close sleep authorization task failed: {error}"),
+                };
+                if let Some(terminal) = terminal.as_mut() {
+                    terminal.set_notice(notice);
+                }
+                terminal_dirty = true;
+            }
             result = async { import_task.as_mut().expect("guarded import task").await }, if import_task.is_some() => {
                 import_task = None;
                 if let Some(terminal) = terminal.as_mut() {
@@ -3608,6 +3658,9 @@ async fn run_local_agent_session(
                                 editor_preferences.presentation.refresh_rate_fps,
                             ));
                             prevent_sleep = editor_preferences.interaction.prevent_sleep;
+                            prevent_lid_sleep = editor_preferences.interaction.prevent_lid_sleep;
+                            sleep_inhibitor.set_enabled(prevent_sleep);
+                            sleep_inhibitor.set_lid_enabled(prevent_lid_sleep);
                             steer_active_turn = editor_preferences.interaction.active_messages
                                 == ActiveMessageBehavior::Steer;
                             if let Some(terminal) = terminal.as_mut() {
@@ -4234,7 +4287,7 @@ async fn run_local_agent_session(
                     "/settings" | "/followups" | "/refresh" | "/sleep"
                 ) {
                     println!(
-                        "\n  Settings\n  Model: {}\n  Effort: {}\n  Fast mode: {}\n  Active messages: {}\n  Refresh: {tui_fps} FPS\n  Keep machine awake: {}\n  User label: {}\n  Assistant label: {}\n  Use /model NAME, /effort LEVEL, /fast on|off, /followups steer|queue, /refresh FPS, /sleep on|off, /user-label TEXT, or /assistant-label TEXT.\n",
+                        "\n  Settings\n  Model: {}\n  Effort: {}\n  Fast mode: {}\n  Active messages: {}\n  Refresh: {tui_fps} FPS\n  Keep machine awake: {}\n  User label: {}\n  Assistant label: {}\n  Use /model NAME, /effort LEVEL, /fast on|off, /followups steer|queue, /refresh FPS, /sleep lid|idle|off, /user-label TEXT, or /assistant-label TEXT.\n",
                         current_model.as_deref().unwrap_or("provider default"),
                         current_effort.as_deref().unwrap_or("provider default"),
                         if current_fast { "on" } else { "off" },
@@ -4243,7 +4296,7 @@ async fn run_local_agent_session(
                         } else {
                             "send after the current turn finishes"
                         },
-                        if prevent_sleep { "on" } else { "off" },
+                        sleep_setting_label(prevent_sleep, prevent_lid_sleep),
                         editor_preferences.transcript.user_label,
                         editor_preferences.transcript.assistant_label,
                     );
@@ -4309,20 +4362,37 @@ async fn run_local_agent_session(
                     continue;
                 }
                 if let Some(value) = line.strip_prefix("/sleep ") {
-                    match value.trim() {
-                        "on" => prevent_sleep = true,
-                        "off" => prevent_sleep = false,
-                        _ => {
-                            eprintln!("\n  Choose /sleep on or /sleep off.\n");
-                            continue;
+                    let Some((enabled, lid)) = parse_sleep_setting(value, prevent_lid_sleep) else {
+                        eprintln!("\n  Choose /sleep lid, /sleep idle, or /sleep off.\n");
+                        continue;
+                    };
+                    prevent_sleep = enabled;
+                    prevent_lid_sleep = lid;
+                    sleep_inhibitor.set_enabled(enabled);
+                    sleep_inhibitor.set_lid_enabled(lid);
+                    editor_preferences.interaction.prevent_sleep = enabled;
+                    editor_preferences.interaction.prevent_lid_sleep = lid;
+                    if enabled
+                        && lid
+                        && sleep_inhibitor.lid_status() == LidSleepStatus::NeedsAuthorization
+                    {
+                        // Plain mode has no picker; run the system dialog inline.
+                        println!("\n  Requesting one-time admin authorization (Touch ID or password)…\n");
+                        match authorize_lid_sleep() {
+                            Ok(()) => {
+                                editor_preferences.interaction.lid_sleep_setup =
+                                    LidSleepSetup::Authorized;
+                                sleep_inhibitor.invalidate_lid_authorization();
+                            }
+                            Err(error) => {
+                                eprintln!("\n  Lid-close sleep prevention not enabled: {error}.\n")
+                            }
                         }
                     }
-                    sleep_inhibitor.set_enabled(prevent_sleep);
-                    editor_preferences.interaction.prevent_sleep = prevent_sleep;
                     editor_preferences.save()?;
                     println!(
-                        "\n  Keep machine awake during active turns: {}.\n",
-                        if prevent_sleep { "on" } else { "off" }
+                        "\n  {}.\n",
+                        sleep_setting_notice(enabled, lid, sleep_inhibitor.lid_status())
                     );
                     continue;
                 }
@@ -5106,18 +5176,67 @@ async fn run_local_agent_session(
                             .expect("terminal")
                             .set_notice(format!("Refresh rate set to {tui_fps} FPS"));
                     }
-                    UiAction::SetPreventSleep(enabled) => {
+                    UiAction::SetPreventSleep { enabled, lid } => {
                         prevent_sleep = enabled;
+                        prevent_lid_sleep = lid;
                         sleep_inhibitor.set_enabled(enabled);
+                        sleep_inhibitor.set_lid_enabled(lid);
                         editor_preferences.interaction.prevent_sleep = enabled;
+                        editor_preferences.interaction.prevent_lid_sleep = lid;
                         dispatch_editor_preferences_save(
                             &editor_preferences_tx,
                             &editor_preferences,
                         );
-                        terminal.as_mut().expect("terminal").set_notice(format!(
-                            "Keep machine awake during active turns: {}",
-                            if enabled { "on" } else { "off" }
-                        ));
+                        let terminal = terminal.as_mut().expect("terminal");
+                        if enabled
+                            && lid
+                            && sleep_inhibitor.lid_status() == LidSleepStatus::NeedsAuthorization
+                        {
+                            // An explicit choice re-opens the prompt even after
+                            // an earlier "never ask again".
+                            terminal.open_lid_sleep_authorization_picker();
+                        } else {
+                            terminal.set_notice(sleep_setting_notice(
+                                enabled,
+                                lid,
+                                sleep_inhibitor.lid_status(),
+                            ));
+                        }
+                    }
+                    UiAction::LidSleepAuthorization(choice) => {
+                        use borg_tui::LidSleepAuthorizationChoice;
+                        let terminal = terminal.as_mut().expect("terminal");
+                        match choice {
+                            LidSleepAuthorizationChoice::Authorize => {
+                                if lid_sleep_auth_task.is_none() {
+                                    lid_sleep_auth_task = Some(tokio::task::spawn_blocking(
+                                        authorize_lid_sleep,
+                                    ));
+                                }
+                                terminal.set_notice(
+                                    "Approve the macOS prompt (Touch ID or password) to finish setup",
+                                );
+                            }
+                            LidSleepAuthorizationChoice::NotNow => {
+                                terminal.set_notice(
+                                    "Keeping the Mac awake for idle sleep only this session · /sleep to set up lid-close later",
+                                );
+                            }
+                            LidSleepAuthorizationChoice::Never => {
+                                editor_preferences.interaction.lid_sleep_setup =
+                                    LidSleepSetup::Declined;
+                                prevent_lid_sleep = false;
+                                sleep_inhibitor.set_lid_enabled(false);
+                                editor_preferences.interaction.prevent_lid_sleep = false;
+                                dispatch_editor_preferences_save(
+                                    &editor_preferences_tx,
+                                    &editor_preferences,
+                                );
+                                terminal.set_notice(
+                                    "Lid-close sleep prevention off · /sleep to change",
+                                );
+                            }
+                        }
                     }
                     UiAction::SetSteerActive(enabled) => {
                         steer_active_turn = enabled;
@@ -5807,7 +5926,7 @@ async fn run_local_agent_session(
                             terminal
                                 .as_mut()
                                 .expect("terminal")
-                                .open_prevent_sleep_picker(prevent_sleep);
+                                .open_prevent_sleep_picker(prevent_sleep, prevent_lid_sleep);
                         } else if line == "/expand-edits" && attachments.is_empty() {
                             terminal
                                 .as_mut()
@@ -6184,23 +6303,38 @@ async fn run_local_agent_session(
                         } else if let Some(value) = line.strip_prefix("/sleep ")
                             && attachments.is_empty()
                         {
-                            if let Some(enabled) = parse_on_off(value) {
+                            if let Some((enabled, lid)) =
+                                parse_sleep_setting(value, prevent_lid_sleep)
+                            {
                                 prevent_sleep = enabled;
+                                prevent_lid_sleep = lid;
                                 sleep_inhibitor.set_enabled(enabled);
+                                sleep_inhibitor.set_lid_enabled(lid);
                                 editor_preferences.interaction.prevent_sleep = enabled;
+                                editor_preferences.interaction.prevent_lid_sleep = lid;
                                 dispatch_editor_preferences_save(
                                     &editor_preferences_tx,
                                     &editor_preferences,
                                 );
-                                terminal.as_mut().expect("terminal").set_notice(format!(
-                                    "Keep machine awake during active turns: {}",
-                                    if enabled { "on" } else { "off" }
-                                ));
+                                let terminal = terminal.as_mut().expect("terminal");
+                                if enabled
+                                    && lid
+                                    && sleep_inhibitor.lid_status()
+                                        == LidSleepStatus::NeedsAuthorization
+                                {
+                                    terminal.open_lid_sleep_authorization_picker();
+                                } else {
+                                    terminal.set_notice(sleep_setting_notice(
+                                        enabled,
+                                        lid,
+                                        sleep_inhibitor.lid_status(),
+                                    ));
+                                }
                             } else {
                                 terminal
                                     .as_mut()
                                     .expect("terminal")
-                                    .set_notice("Choose /sleep on or /sleep off");
+                                    .set_notice("Choose /sleep lid, /sleep idle, or /sleep off");
                             }
                         } else if let Some(value) = line.strip_prefix("/expand-edits ")
                             && attachments.is_empty()
@@ -7023,6 +7157,9 @@ async fn run_local_agent_session(
         task.abort();
     }
     if let Some(task) = dictation_setup_task.take() {
+        task.abort();
+    }
+    if let Some(task) = lid_sleep_auth_task.take() {
         task.abort();
     }
     if let Some(task) = dictation_start_task.take() {
@@ -8329,6 +8466,42 @@ fn responsive_tui_frame_interval(
             last_draw.saturating_mul(3)
         })
         .min(MAX_RENDER_BACKOFF_INTERVAL)
+}
+
+/// `/sleep lid|idle|off`, plus `on`/`off` for backwards compatibility where
+/// `on` keeps the current lid preference.
+fn parse_sleep_setting(value: &str, current_lid: bool) -> Option<(bool, bool)> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "lid" => Some((true, true)),
+        "idle" => Some((true, false)),
+        "on" | "true" | "1" => Some((true, current_lid)),
+        "off" | "false" | "0" => Some((false, false)),
+        _ => None,
+    }
+}
+
+fn sleep_setting_label(enabled: bool, lid: bool) -> &'static str {
+    match (enabled, lid) {
+        (true, true) => "on, even with the lid closed",
+        (true, false) => "on, idle sleep only",
+        (false, _) => "off",
+    }
+}
+
+fn sleep_setting_notice(enabled: bool, lid: bool, status: LidSleepStatus) -> String {
+    let label = sleep_setting_label(enabled, lid);
+    let caveat = match (enabled && lid, status) {
+        (true, LidSleepStatus::Unsupported) if cfg!(target_os = "windows") => {
+            " · lid-close override is not available on this platform"
+        }
+        (true, LidSleepStatus::NoLid) => " · this Mac has no lid, so only idle sleep applies",
+        (true, LidSleepStatus::NeedsAuthorization) => {
+            " · lid-close override needs the one-time admin authorization"
+        }
+        (true, LidSleepStatus::OnBattery) => " · lid-close override pauses while on battery",
+        _ => "",
+    };
+    format!("Keep machine awake while Borg works: {label}{caveat}")
 }
 
 fn parse_on_off(value: &str) -> Option<bool> {
