@@ -1181,7 +1181,7 @@ impl AgentToolDispatcher {
     ) -> Result<Value> {
         let mut workflow_approved = workflow_approved;
         let trusted_settings = crate::self_service::trusted_settings_sections(name, &arguments);
-        if (name == "runtime_exec" || !trusted_settings.is_empty())
+        if (matches!(name, "runtime_exec" | "computer_use") || !trusted_settings.is_empty())
             && !workflow_approved
             && self.runtime_permission != crate::PermissionMode::FullAccess
         {
@@ -1204,7 +1204,7 @@ impl AgentToolDispatcher {
                     "tool request is too large to display for approval; split it into smaller calls"
                 );
                 let title = if trusted_settings.is_empty() {
-                    "Use Borg persistent runtime".to_string()
+                    format!("Use Borg {name}")
                 } else {
                     format!("Change trusted settings [{}]", trusted_settings.join(", "))
                 };
@@ -1566,6 +1566,19 @@ impl AgentToolDispatcher {
                     workflow_cancel,
                 )
                 .await
+            }
+            "computer_use" => {
+                ensure!(
+                    self.runtime_permission == crate::PermissionMode::FullAccess
+                        || workflow_approved,
+                    "computer use requires Full Access or explicit approval, including observation"
+                );
+                let cancel = workflow_cancel.unwrap_or_default();
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => bail!("computer use was cancelled; observe before retrying an action"),
+                    result = self.persistent_runtimes.computer_use(self.actor_session_id, arguments) => result,
+                }
             }
             "runtime_exec" => {
                 let args: PersistentRuntimeArgs = serde_json::from_value(arguments)?;
@@ -5739,6 +5752,26 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         "additionalProperties": false
     });
     let mut specs = vec![
+        tool(
+            "computer_use",
+            "Native desktop access, including sensitive screen contents; requires Full Access or approval. Query capabilities first. Linux AT-SPI2 currently supports list_windows, bounded observe (optional since diff), explicit desktop screenshots (scope=desktop or observe screenshot=true plus screenshot_scope=desktop), semantic click and set_value. Actions require window_id, element_id and the latest observation_id; inspect returned state to verify effects. No coordinate/clipboard fallback. Other platforms return unavailable.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "enum": ["capabilities", "list_windows", "observe", "screenshot", "click", "set_value"]},
+                    "window_id": {"type": "string"},
+                    "element_id": {"type": "string"},
+                    "observation_id": {"type": "string"},
+                    "since": {"type": "string"},
+                    "max_nodes": {"type": "integer", "minimum": 1, "maximum": 1000},
+                    "screenshot": {"type": "boolean"},
+                    "scope": {"type": "string", "enum": ["desktop"]},
+                    "screenshot_scope": {"type": "string", "enum": ["desktop"]},
+                    "text": {"type": "string", "maxLength": 16384}
+                },
+                "required": ["op"], "additionalProperties": false
+            }),
+        ),
         tool(
             "list_files",
             "List one workspace directory without following symlinks.",

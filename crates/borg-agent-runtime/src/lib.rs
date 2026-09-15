@@ -6,6 +6,7 @@
 mod agent;
 mod autonomy;
 mod blu_workflow;
+mod computer_use;
 mod contract;
 mod execution;
 mod extension_api;

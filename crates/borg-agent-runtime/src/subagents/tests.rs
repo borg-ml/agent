@@ -3823,3 +3823,111 @@ fn workflow_invocation_description_shows_the_real_program_and_arguments() {
         Some("'bun' '/work/project/flow.ts'")
     );
 }
+
+#[tokio::test]
+async fn computer_use_requires_approval_even_for_observation() {
+    let directory = tempdir().unwrap();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        Uuid::new_v4(),
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::Manual,
+    );
+    for op in [
+        "capabilities",
+        "list_windows",
+        "observe",
+        "screenshot",
+        "click",
+        "set_value",
+    ] {
+        let error = dispatcher
+            .call("computer_use", json!({"op": op}))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires Full Access or explicit approval")
+        );
+    }
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+#[ignore = "requires a live Linux desktop, AT-SPI2, Python, Bun and grim; captures the desktop"]
+async fn computer_use_live_desktop_clients() {
+    let directory = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        session_id,
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    let direct = dispatcher
+        .call("computer_use", json!({"op": "capabilities"}))
+        .await
+        .unwrap();
+    assert_eq!(direct["desktop_available"], true);
+    for (runtime, code) in [
+        ("python", "cua.capabilities()"),
+        ("javascript", "await cua.capabilities()"),
+    ] {
+        let result = dispatcher
+            .call("runtime_exec", json!({"runtime": runtime, "code": code}))
+            .await
+            .unwrap();
+        assert_eq!(result["value"], direct);
+    }
+    for (runtime, code) in [
+        ("python", "cua.screenshot(\"desktop\")"),
+        ("javascript", "await cua.screenshot(\"desktop\")"),
+    ] {
+        let result = dispatcher
+            .call("runtime_exec", json!({"runtime": runtime, "code": code}))
+            .await
+            .unwrap();
+        assert_eq!(result["value"]["scope"], "desktop");
+        assert!(
+            result["value"]["width"]
+                .as_u64()
+                .is_some_and(|width| width > 0)
+        );
+        assert_eq!(result["borg_attachments"][0]["media_type"], "image/png");
+        assert!(
+            result["borg_attachments"][0]["data_base64"]
+                .as_str()
+                .is_some_and(|image| !image.is_empty())
+        );
+        assert!(result["value"].get("borg_attachments").is_none());
+    }
+    dispatcher
+        .persistent_runtimes
+        .stop_session(session_id)
+        .await;
+}

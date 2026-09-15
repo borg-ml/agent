@@ -60,12 +60,28 @@ pub(crate) struct PersistentRuntimeResult {
 /// alive until the session stops.
 #[derive(Clone, Default)]
 pub(crate) struct PersistentRuntimeRegistry {
+    desktop: Arc<Mutex<HashMap<Uuid, Arc<crate::computer_use::ComputerUse>>>>,
     python: Arc<Mutex<HashMap<Uuid, Arc<PersistentRuntimeWorker>>>>,
     bun: Arc<Mutex<HashMap<Uuid, Arc<PersistentRuntimeWorker>>>>,
 }
 
 impl PersistentRuntimeRegistry {
+    pub(crate) async fn computer_use(&self, session_id: Uuid, arguments: Value) -> Result<Value> {
+        let desktop = self
+            .desktop
+            .lock()
+            .await
+            .entry(session_id)
+            .or_default()
+            .clone();
+        desktop.call(arguments).await
+    }
+
     pub(crate) async fn stop_session(&self, session_id: Uuid) {
+        let desktop = self.desktop.lock().await.remove(&session_id);
+        if let Some(desktop) = desktop {
+            desktop.stop().await;
+        }
         for runtimes in [&self.python, &self.bun] {
             let runtime = runtimes.lock().await.remove(&session_id);
             if let Some(runtime) = runtime {
@@ -553,9 +569,14 @@ async fn execute_request(
 async fn write_json_line(writer: &mut ChildStdin, value: &Value) -> Result<()> {
     let mut line = serde_json::to_vec(value)?;
     line.push(b'\n');
+    let limit = if value["type"] == "host_result" {
+        MAX_RUNTIME_LINE_BYTES
+    } else {
+        MAX_RUNTIME_RESULT_BYTES
+    };
     ensure!(
-        line.len() <= MAX_RUNTIME_RESULT_BYTES,
-        "persistent runtime request exceeds {MAX_RUNTIME_RESULT_BYTES} bytes"
+        line.len() <= limit,
+        "persistent runtime request exceeds {limit} bytes"
     );
     writer.write_all(&line).await?;
     writer.flush().await?;
@@ -566,22 +587,27 @@ async fn write_json_line(writer: &mut ChildStdin, value: &Value) -> Result<()> {
 /// the model asked for the value, and a head+tail excerpt with a marker lets
 /// it decide what to re-query, while the marker is honest about the gap.
 fn bound_runtime_result(mut result: PersistentRuntimeResult) -> PersistentRuntimeResult {
+    let (text, attachments) =
+        crate::native_harness::split_tool_result_attachments(result.value.to_string());
+    result.value = serde_json::from_str(&text).unwrap_or(Value::Null);
     let serialized_len = |result: &PersistentRuntimeResult| {
         serde_json::to_vec(result).map_or(usize::MAX, |bytes| bytes.len())
     };
-    if serialized_len(&result) <= MAX_RUNTIME_RESULT_BYTES {
-        return result;
-    }
-    let per_field = MAX_RUNTIME_RESULT_BYTES / 4;
-    result.stdout = bounded_head_tail(result.stdout, per_field);
-    result.stderr = bounded_head_tail(result.stderr, per_field);
     if serialized_len(&result) > MAX_RUNTIME_RESULT_BYTES {
-        let rendered = serde_json::to_string(&result.value).unwrap_or_default();
-        result.value = json!({
-            "truncated": true,
-            "original_bytes": rendered.len(),
-            "preview": bounded_head_tail(rendered, per_field),
-        });
+        let per_field = MAX_RUNTIME_RESULT_BYTES / 4;
+        result.stdout = bounded_head_tail(result.stdout, per_field);
+        result.stderr = bounded_head_tail(result.stderr, per_field);
+        if serialized_len(&result) > MAX_RUNTIME_RESULT_BYTES {
+            let rendered = serde_json::to_string(&result.value).unwrap_or_default();
+            result.value = json!({
+                "truncated": true,
+                "original_bytes": rendered.len(),
+                "preview": bounded_head_tail(rendered, per_field),
+            });
+        }
+    }
+    if !attachments.is_empty() {
+        result.value[crate::native_harness::TOOL_RESULT_ATTACHMENTS_KEY] = json!(attachments);
     }
     result
 }
@@ -996,7 +1022,31 @@ class Rlm:
     list_subagents = list
 
 
+class ComputerUse:
+    def __call__(self, op, **arguments):
+        return NAMESPACE["borg"].tool("computer_use", {**arguments, "op": op})
+
+    def capabilities(self):
+        return self("capabilities")
+
+    def list_windows(self):
+        return self("list_windows")
+
+    def screenshot(self, scope):
+        return self("screenshot", scope=scope)
+
+    def observe(self, window_id, **options):
+        return self("observe", window_id=window_id, **options)
+
+    def click(self, window_id, element_id, observation_id):
+        return self("click", window_id=window_id, element_id=element_id, observation_id=observation_id)
+
+    def set_value(self, window_id, element_id, observation_id, text):
+        return self("set_value", window_id=window_id, element_id=element_id, observation_id=observation_id, text=text)
+
+
 NAMESPACE["borg"] = Borg()
+NAMESPACE["cua"] = ComputerUse()
 
 
 def _run_code(source):
@@ -1263,6 +1313,14 @@ rlm.run = rlm;
 rlm.list_subagents = rlm.list;
 borg.rlm = rlm;
 context.borg = borg;
+const cua = (op, arguments_ = {}) => borg.tool("computer_use", {...arguments_, op});
+cua.capabilities = () => cua("capabilities");
+cua.list_windows = () => cua("list_windows");
+cua.screenshot = (scope) => cua("screenshot", {scope});
+cua.observe = (window_id, options = {}) => cua("observe", {...options, window_id});
+cua.click = (window_id, element_id, observation_id) => cua("click", {window_id, element_id, observation_id});
+cua.set_value = (window_id, element_id, observation_id, text) => cua("set_value", {window_id, element_id, observation_id, text});
+context.cua = cua;
 context.console = runtimeConsole;
 
 function finalExpressionParts(source) {
@@ -1285,26 +1343,18 @@ async function execute(source, runtime) {
     compiled = new Bun.Transpiler({loader: "tsx"}).transformSync(source);
   }
   const parts = finalExpressionParts(compiled);
+  const synchronous = parts ? `${parts.body}\n;(${parts.expression})` : compiled;
+  const asynchronous = parts
+    ? `(async () => {${parts.body}\nreturn (${parts.expression});})()`
+    : `(async () => {${compiled}\n})()`;
+  let script;
   try {
-    if (parts) {
-      try {
-        const evaluated = vm.runInContext(`${parts.body}\n;(${parts.expression})`, context);
-        context.resultSlot = await Promise.resolve(evaluated);
-      } catch (error) {
-        if (!/await|return/.test(String(error))) throw error;
-        context.resultSlot = await vm.runInContext(`(async () => {${parts.body}\nreturn (${parts.expression});})()`, context);
-      }
-    } else {
-      try {
-        context.resultSlot = await Promise.resolve(vm.runInContext(compiled, context));
-      } catch (error) {
-        if (!/await|return/.test(String(error))) throw error;
-        context.resultSlot = await vm.runInContext(`(async () => {${compiled}\n})()`, context);
-      }
-    }
+    script = new vm.Script(synchronous);
   } catch (error) {
-    throw error;
+    if (!(error instanceof SyntaxError)) throw error;
+    script = new vm.Script(asynchronous);
   }
+  context.resultSlot = await script.runInContext(context);
   return {value: jsonSafe(context.resultSlot), stdout, stderr};
 }
 
@@ -1366,6 +1416,35 @@ mod tests {
 
         let small = bounded_head_tail("tiny".to_string(), 1024);
         assert_eq!(small, "tiny");
+    }
+
+    #[test]
+    fn runtime_images_survive_the_text_budget_but_keep_attachment_limits() {
+        let image = "a".repeat(2 * MAX_RUNTIME_RESULT_BYTES);
+        let result = PersistentRuntimeResult {
+            runtime: "python",
+            persistent: true,
+            recovered_from_manifest: false,
+            execution_count: 1,
+            stdout: String::new(),
+            stderr: String::new(),
+            value: json!({"nodes": [], "borg_attachments": [
+                {"media_type": "image/png", "data_base64": image},
+                {"media_type": "image/png", "data_base64": "b".repeat(7 * MAX_RUNTIME_RESULT_BYTES)}
+            ]}),
+        };
+        let bounded = bound_runtime_result(result);
+        assert_eq!(
+            bounded.value["borg_attachments"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(bounded.value["borg_attachments"][0]["data_base64"], image);
+        assert_eq!(bounded.value["nodes"], json!([]));
+        assert!(
+            bounded.value["dropped_attachments"]
+                .as_array()
+                .is_some_and(|notes| !notes.is_empty())
+        );
     }
 
     struct TestHost;
@@ -1711,7 +1790,11 @@ mod tests {
             .expect("second Bun execution");
         assert_eq!(second.value, json!(43));
         let host_call = runtime
-            .execute("borg.call('echo', {value: 7})", None, Arc::new(TestHost))
+            .execute(
+                "await borg.call('echo', {value: 7})",
+                None,
+                Arc::new(TestHost),
+            )
             .await
             .expect("Bun host call execution");
         assert_eq!(host_call.value, json!({"value": 7}));
@@ -1766,6 +1849,26 @@ mod tests {
             .await
             .expect("Bun retrieval adapter test execution");
         assert_eq!(tested.value["passed"], true);
+        struct EffectHost(std::sync::atomic::AtomicUsize);
+        #[async_trait]
+        impl RuntimeHost for EffectHost {
+            async fn call(&self, _: &str, _: Value) -> Result<Value> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(Value::Null)
+            }
+        }
+        let effects = Arc::new(EffectHost(std::sync::atomic::AtomicUsize::new(0)));
+        assert!(
+            runtime
+                .execute(
+                    "borg.call(\"effect\").then(() => { throw new Error(\"await failed\"); })",
+                    None,
+                    effects.clone(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(effects.0.load(std::sync::atomic::Ordering::SeqCst), 1);
         runtime.stop().await;
     }
 

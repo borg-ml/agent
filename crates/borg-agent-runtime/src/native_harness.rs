@@ -1656,7 +1656,10 @@ async fn execute_tool(
     // routes them through the automatic reviewer.
     let mutating_builtin = mutating_builtin_approval(&tool_call.function.name, &input);
     if (shell_command.is_some()
-        || tool_call.function.name == "runtime_exec"
+        || matches!(
+            tool_call.function.name.as_str(),
+            "runtime_exec" | "computer_use"
+        )
         || matches!(
             tool_call.function.name.as_str(),
             "run_workflow" | "run_blu_workflow" | "run_blu_extension"
@@ -1805,7 +1808,12 @@ async fn execute_tool(
 
     let workflow_approved = matches!(
         tool_call.function.name.as_str(),
-        "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec" | "watch"
+        "run_workflow"
+            | "run_blu_workflow"
+            | "run_blu_extension"
+            | "runtime_exec"
+            | "computer_use"
+            | "watch"
     ) && runtime.permission != PermissionMode::FullAccess;
     // A shell command is cancelled by an interrupt but not by a steer: the
     // model reads the steer after its command finishes, which is what a user
@@ -1816,7 +1824,12 @@ async fn execute_tool(
         || shell_exec
         || matches!(
             tool_call.function.name.as_str(),
-            "run_workflow" | "run_blu_workflow" | "run_blu_extension" | "runtime_exec" | "watch"
+            "run_workflow"
+                | "run_blu_workflow"
+                | "run_blu_extension"
+                | "runtime_exec"
+                | "computer_use"
+                | "watch"
         ))
     .then(CancellationToken::new);
     let call = runtime.call(
@@ -2447,7 +2460,7 @@ fn estimated_text_tokens(message: &ModelMessage) -> u64 {
 /// Move a tool result's `borg_attachments` images out of the text and into
 /// typed attachments. Anything that is not a bounded image is dropped with a
 /// note in the text so the model knows why it did not arrive.
-fn split_tool_result_attachments(output: String) -> (String, Vec<ModelInputAttachment>) {
+pub(crate) fn split_tool_result_attachments(output: String) -> (String, Vec<ModelInputAttachment>) {
     let Ok(Value::Object(mut object)) = serde_json::from_str::<Value>(&output) else {
         return (output, Vec::new());
     };
