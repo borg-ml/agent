@@ -8154,6 +8154,7 @@ fn native_replay_preserves_an_interrupted_incomplete_tool_round() {
             ModelMessage::Tool {
                 tool_call_id: "one".to_string(),
                 content: "workspace".to_string(),
+                attachments: Vec::new(),
             },
         ),
         SessionEvent::new(
@@ -8195,7 +8196,7 @@ fn native_replay_preserves_an_interrupted_incomplete_tool_round() {
     assert!(matches!(replay[0], ModelMessage::User { .. }));
     assert!(matches!(replay[2], ModelMessage::Tool { .. }));
     assert!(
-        matches!(&replay[4], ModelMessage::Tool { tool_call_id, content }
+        matches!(&replay[4], ModelMessage::Tool { tool_call_id, content, .. }
         if tool_call_id == "two" && content.contains("outcome unknown"))
     );
 }
@@ -8231,6 +8232,7 @@ fn native_replay_keeps_completed_batch_results_after_failure_or_crash() {
     let completed = ModelMessage::Tool {
         tool_call_id: "completed".to_string(),
         content: "action succeeded exactly once".to_string(),
+        attachments: Vec::new(),
     };
     for error in [
         None,
@@ -8300,7 +8302,7 @@ fn native_replay_keeps_completed_batch_results_after_failure_or_crash() {
         assert_eq!(replay[1], assistant);
         assert_eq!(replay[2], completed);
         assert!(
-            matches!(&replay[3], ModelMessage::Tool { tool_call_id, content }
+            matches!(&replay[3], ModelMessage::Tool { tool_call_id, content, .. }
             if tool_call_id == "uncertain" && content.contains("outcome unknown"))
         );
         assert_eq!(replay[4], ModelMessage::user("stop the remaining actions"));
@@ -8925,6 +8927,7 @@ fn provider_neutral_replay_carries_subscription_tools_across_provider_switches()
         ModelMessage::Tool {
             tool_call_id: "call-1".to_string(),
             content: "workspace contents".to_string(),
+            attachments: Vec::new(),
         }
     );
     assert_eq!(
@@ -8966,6 +8969,7 @@ fn compaction_drops_provider_reasoning_without_mutating_durable_evidence() {
         ModelMessage::Tool {
             tool_call_id: "call-1".into(),
             content: "Build succeeded".into(),
+            attachments: Vec::new(),
         },
     ];
     let original = conversation.clone();

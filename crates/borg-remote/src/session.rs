@@ -5422,6 +5422,7 @@ fn native_conversation(
                 pending_generic.push(borg_provider::provider::ModelMessage::Tool {
                     tool_call_id: tool_call_id.clone(),
                     content: output.clone(),
+                    attachments: Vec::new(),
                 });
             }
             SessionEventKind::TurnCompleted { error: None, .. } => {
@@ -5525,6 +5526,7 @@ fn close_interrupted_native_round(
         .map(|call| ModelMessage::Tool {
             tool_call_id: call.id.clone(),
             content: serde_json::json!({"error": "Execution outcome unknown: the turn ended before a result was recorded. Inspect current state before repeating this action; it may already have run."}).to_string(),
+            attachments: Vec::new(),
         }).collect::<Vec<_>>();
     messages.extend(missing);
     // An accepted steer can be journaled before the loop records its model message.
@@ -5934,6 +5936,7 @@ fn provider_neutral_conversation(
             } => conversation.push(borg_provider::provider::ModelMessage::Tool {
                 tool_call_id: tool_call_id.clone(),
                 content: output.clone(),
+                attachments: Vec::new(),
             }),
             _ => {}
         }
@@ -5985,6 +5988,7 @@ pub(crate) fn prune_conversation_for_compaction(
             ModelMessage::Tool {
                 tool_call_id,
                 content,
+                ..
             } => {
                 let tool_name = tool_names.get(tool_call_id).map(String::as_str);
                 let replacement = if user_turns < 2 {
@@ -6006,8 +6010,15 @@ pub(crate) fn prune_conversation_for_compaction(
                 } else {
                     COMPACTION_OLD_TOOL_RESULT_MARKER.to_string()
                 };
-                if let ModelMessage::Tool { content, .. } = &mut projected[index] {
+                if let ModelMessage::Tool {
+                    content,
+                    attachments,
+                    ..
+                } = &mut projected[index]
+                {
                     *content = replacement;
+                    // A pruned result's images are stale evidence too.
+                    attachments.clear();
                 }
             }
             _ => {}
@@ -6202,6 +6213,7 @@ fn format_subscription_conversation_with_tool_limit(
                 borg_provider::provider::ModelMessage::Tool {
                     tool_call_id,
                     content,
+                    ..
                 },
                 Some(max_chars),
             ) => format_subscription_tool_result_value_with_limit(
@@ -6278,6 +6290,7 @@ fn format_subscription_message(message: &borg_provider::provider::ModelMessage) 
         ModelMessage::Tool {
             tool_call_id,
             content,
+            ..
         } => SubscriptionContextMessage {
             role: "tool",
             content: Some(content),
@@ -6322,6 +6335,7 @@ fn format_subscription_tool_result_value_with_limit(
     format_subscription_message(&borg_provider::provider::ModelMessage::Tool {
         tool_call_id: tool_call_id.to_string(),
         content,
+        attachments: Vec::new(),
     })
 }
 

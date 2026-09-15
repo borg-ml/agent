@@ -84,6 +84,7 @@ async fn probe() -> Result<()> {
     request.messages.push(ModelMessage::Tool {
         tool_call_id: id,
         content: value.clone(),
+        attachments: Vec::new(),
     });
     request.request_id = Some(uuid::Uuid::new_v4().to_string());
     let second = provider

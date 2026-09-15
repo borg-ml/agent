@@ -446,9 +446,8 @@ impl CodexModelProvider {
                 ModelMessage::Tool {
                     tool_call_id,
                     content,
-                } => input.push(json!({
-                    "type": "function_call_output", "call_id": tool_call_id, "output": content
-                })),
+                    attachments,
+                } => input.push(function_call_output(tool_call_id, content, attachments)?),
             }
         }
         let tools: Vec<_> = request
@@ -887,6 +886,35 @@ impl ResponseState {
             response,
         ))
     }
+}
+
+/// A tool result on the Responses wire. Text-only results stay a plain
+/// string; results carrying images become content blocks so the model sees
+/// the pixels (screenshots, rendered charts) rather than a base64 dump.
+fn function_call_output(
+    tool_call_id: &str,
+    content: &str,
+    attachments: &[borg_core::ModelInputAttachment],
+) -> Result<Value> {
+    if attachments.is_empty() {
+        return Ok(json!({
+            "type": "function_call_output", "call_id": tool_call_id, "output": content
+        }));
+    }
+    let mut blocks = vec![json!({"type": "input_text", "text": content})];
+    for attachment in attachments {
+        ensure!(
+            attachment.media_type.starts_with("image/"),
+            "Codex model tool attachment must be an image"
+        );
+        blocks.push(json!({
+            "type": "input_image",
+            "image_url": format!("data:{};base64,{}", attachment.media_type, attachment.data_base64)
+        }));
+    }
+    Ok(json!({
+        "type": "function_call_output", "call_id": tool_call_id, "output": blocks
+    }))
 }
 
 fn response_hit_output_limit(response: &Value) -> bool {
@@ -1343,7 +1371,7 @@ mod tests {
             server.await.unwrap();
             // Simulate Borg's durable serialization before the next tool round.
             request.messages.push(serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap());
-            request.messages.push(ModelMessage::Tool { tool_call_id: "call".into(), content: "ok".into() });
+            request.messages.push(ModelMessage::Tool { tool_call_id: "call".into(), content: "ok".into(), attachments: Vec::new() });
             let provider = CodexModelProvider { model: "gpt-6-astra".into(), effort: "low".into() };
             let replay = provider.request_body(&request).unwrap();
             assert_eq!(&replay["input"].as_array().unwrap()[1..4], expected_output.as_array().unwrap());
@@ -1367,6 +1395,26 @@ mod tests {
         ] {
             assert!(ResponseState::default().finish(response).is_err());
         }
+    }
+
+    #[test]
+    fn tool_results_with_images_become_input_image_blocks() {
+        let plain = function_call_output("call-1", "ok", &[]).unwrap();
+        assert_eq!(plain["output"], "ok");
+        let image = borg_core::ModelInputAttachment {
+            media_type: "image/png".to_string(),
+            data_base64: "AAAA".to_string(),
+            filename: None,
+        };
+        let rich = function_call_output("call-1", "screenshot taken", std::slice::from_ref(&image))
+            .unwrap();
+        assert_eq!(rich["call_id"], "call-1");
+        assert_eq!(rich["output"][0]["type"], "input_text");
+        assert_eq!(rich["output"][1]["type"], "input_image");
+        assert_eq!(rich["output"][1]["image_url"], "data:image/png;base64,AAAA");
+        let mut not_image = image;
+        not_image.media_type = "application/pdf".to_string();
+        assert!(function_call_output("call-1", "x", &[not_image]).is_err());
     }
 
     #[test]

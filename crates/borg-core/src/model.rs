@@ -35,6 +35,11 @@ pub enum ModelMessage {
     Tool {
         tool_call_id: String,
         content: String,
+        /// Images a tool returned alongside its text (screenshots, rendered
+        /// charts, MCP image blocks). Encoders that cannot attach images to a
+        /// tool result carry them in a follow-up user message instead.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<ModelInputAttachment>,
     },
 }
 
@@ -53,6 +58,14 @@ pub struct ModelInputAttachment {
 }
 
 impl ModelMessage {
+    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::Tool {
+            tool_call_id: tool_call_id.into(),
+            content: content.into(),
+            attachments: Vec::new(),
+        }
+    }
+
     pub fn user(content: impl Into<String>) -> Self {
         Self::User {
             content: content.into(),

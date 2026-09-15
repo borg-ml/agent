@@ -26,6 +26,16 @@ use crate::{
 };
 
 const MAX_TOOL_RESULT_BYTES: usize = 1024 * 1024;
+/// A tool result object may carry images for the model under this key
+/// (`[{media_type, data_base64, filename?}]`). The harness strips them from
+/// the text and attaches them to the tool message; MCP `image` content blocks
+/// are lifted into the same channel.
+pub(crate) const TOOL_RESULT_ATTACHMENTS_KEY: &str = "borg_attachments";
+const MAX_TOOL_RESULT_ATTACHMENTS: usize = 4;
+const MAX_TOOL_RESULT_ATTACHMENT_BASE64_BYTES: usize = 6 * 1024 * 1024;
+/// Vision tokens per image are a function of pixels, not bytes; a flat
+/// estimate keeps a screenshot from being counted as a megabyte of text.
+const ESTIMATED_TOKENS_PER_IMAGE: u64 = 1_600;
 const MAX_APPROVAL_DETAIL_BYTES: usize = 8 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
@@ -1161,9 +1171,11 @@ impl NativeToolRuntime {
                 let args: ReadSkillArgs = serde_json::from_value(arguments)?;
                 self.context.read_skill(&args.name).await
             }
-            other if self.mcp.contains(other) => {
-                self.mcp.call(other, arguments, cancellation.as_ref()).await
-            }
+            other if self.mcp.contains(other) => self
+                .mcp
+                .call(other, arguments, cancellation.as_ref())
+                .await
+                .map(lift_mcp_image_blocks),
             other => {
                 self.agent_tools
                     .call_with_workflow_control(other, arguments, workflow_approved, cancellation)
@@ -2075,14 +2087,22 @@ async fn record_native_tool_result(
     output: String,
     is_error: bool,
 ) -> Result<u64> {
+    let (output, attachments) = split_tool_result_attachments(output);
     let output = bounded_tool_content(output);
+    let attachment_count = attachments.len();
     let message = ModelMessage::Tool {
         tool_call_id: tool_call_id.to_string(),
         content: output.clone(),
+        attachments,
     };
     let tokens = estimated_message_tokens(&message);
     record_native_message(events, provider, &message).await?;
     messages.push(message);
+    let output = if attachment_count == 0 {
+        output
+    } else {
+        format!("{output}\n[{attachment_count} image attachment(s) delivered to the model]")
+    };
     send(
         events,
         SessionEventKind::ToolCompleted {
@@ -2290,9 +2310,106 @@ fn retain_recent_native_messages(
 }
 
 fn estimated_message_tokens(message: &ModelMessage) -> u64 {
+    let (text_only, images) = match message {
+        ModelMessage::User {
+            content,
+            attachments,
+        } if !attachments.is_empty() => (ModelMessage::user(content.clone()), attachments.len()),
+        ModelMessage::Tool {
+            tool_call_id,
+            content,
+            attachments,
+        } if !attachments.is_empty() => (
+            ModelMessage::tool(tool_call_id.clone(), content.clone()),
+            attachments.len(),
+        ),
+        _ => return estimated_text_tokens(message),
+    };
+    estimated_text_tokens(&text_only).saturating_add(
+        u64::try_from(images)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(ESTIMATED_TOKENS_PER_IMAGE),
+    )
+}
+
+fn estimated_text_tokens(message: &ModelMessage) -> u64 {
     serde_json::to_string(message).map_or(u64::MAX, |serialized| {
         u64::try_from(serialized.chars().count().div_ceil(4)).unwrap_or(u64::MAX)
     })
+}
+
+/// Move a tool result's `borg_attachments` images out of the text and into
+/// typed attachments. Anything that is not a bounded image is dropped with a
+/// note in the text so the model knows why it did not arrive.
+fn split_tool_result_attachments(output: String) -> (String, Vec<ModelInputAttachment>) {
+    let Ok(Value::Object(mut object)) = serde_json::from_str::<Value>(&output) else {
+        return (output, Vec::new());
+    };
+    let Some(Value::Array(raw)) = object.remove(TOOL_RESULT_ATTACHMENTS_KEY) else {
+        return (output, Vec::new());
+    };
+    let mut attachments = Vec::new();
+    let mut dropped = Vec::new();
+    for (index, entry) in raw.into_iter().enumerate() {
+        let attachment = match serde_json::from_value::<ModelInputAttachment>(entry) {
+            Ok(attachment) => attachment,
+            Err(error) => {
+                dropped.push(format!("#{index}: not an attachment ({error})"));
+                continue;
+            }
+        };
+        if !attachment.media_type.starts_with("image/") {
+            dropped.push(format!(
+                "#{index}: {} is not an image",
+                attachment.media_type
+            ));
+        } else if attachment.data_base64.is_empty() {
+            dropped.push(format!("#{index}: empty image data"));
+        } else if attachment.data_base64.len() > MAX_TOOL_RESULT_ATTACHMENT_BASE64_BYTES {
+            dropped.push(format!(
+                "#{index}: image exceeds {} bytes",
+                MAX_TOOL_RESULT_ATTACHMENT_BASE64_BYTES
+            ));
+        } else if attachments.len() == MAX_TOOL_RESULT_ATTACHMENTS {
+            dropped.push(format!(
+                "#{index}: more than {MAX_TOOL_RESULT_ATTACHMENTS} images per result"
+            ));
+        } else {
+            attachments.push(attachment);
+        }
+    }
+    object.insert("attached_images".to_string(), json!(attachments.len()));
+    if !dropped.is_empty() {
+        object.insert("dropped_attachments".to_string(), json!(dropped));
+    }
+    (Value::Object(object).to_string(), attachments)
+}
+
+/// MCP results carry images as `{"type": "image", "data", "mimeType"}`
+/// content blocks. Lift them into the tool attachment channel so they reach
+/// the model as pixels instead of a base64 string in the JSON text.
+fn lift_mcp_image_blocks(mut result: Value) -> Value {
+    let Some(Value::Array(blocks)) = result.get_mut("content") else {
+        return result;
+    };
+    let mut attachments = Vec::new();
+    blocks.retain(|block| {
+        if block.get("type").and_then(Value::as_str) != Some("image") {
+            return true;
+        }
+        let (Some(data), Some(media_type)) = (
+            block.get("data").and_then(Value::as_str),
+            block.get("mimeType").and_then(Value::as_str),
+        ) else {
+            return true;
+        };
+        attachments.push(json!({ "media_type": media_type, "data_base64": data }));
+        false
+    });
+    if !attachments.is_empty() {
+        result[TOOL_RESULT_ATTACHMENTS_KEY] = Value::Array(attachments);
+    }
+    result
 }
 
 fn parse_tool_arguments(tool_call: &ModelToolCall) -> std::result::Result<Value, String> {
@@ -3183,7 +3300,7 @@ mod tests {
                 let requests = client.requests.lock().unwrap();
                 assert_eq!(requests.len(), tool_rounds + 1);
                 assert!(requests[1].messages.iter().any(|message| matches!(message,
-                    ModelMessage::Tool { tool_call_id, content }
+                    ModelMessage::Tool { tool_call_id, content, .. }
                     if tool_call_id == "second" && content.contains("not executed"))));
                 assert!(requests[1].messages.iter().any(|message| matches!(message,
                     ModelMessage::User { content, .. } if content.contains("stop writing"))));
@@ -3837,11 +3954,98 @@ mod tests {
         let large_tool_result = ModelMessage::Tool {
             tool_call_id: "large-result".to_string(),
             content: "x".repeat(4_000),
+            attachments: Vec::new(),
         };
         assert!(needs(
             &usage(84_000, 100_000),
             estimated_message_tokens(&large_tool_result)
         ));
+    }
+
+    #[test]
+    fn tool_result_images_are_split_into_attachments_with_bounds() {
+        let (text, none) = split_tool_result_attachments("plain text".to_string());
+        assert_eq!(text, "plain text");
+        assert!(none.is_empty());
+
+        let image = |media: &str, data: &str| json!({"media_type": media, "data_base64": data});
+        let output = json!({
+            "ok": true,
+            TOOL_RESULT_ATTACHMENTS_KEY: [
+                image("image/png", "AAAA"),
+                image("application/pdf", "BBBB"),
+                image("image/png", ""),
+                image("image/jpeg", "CCCC"),
+                {"junk": true},
+            ]
+        })
+        .to_string();
+        let (text, attachments) = split_tool_result_attachments(output);
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].media_type, "image/png");
+        assert_eq!(attachments[1].media_type, "image/jpeg");
+        let text: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(text["ok"], true);
+        assert_eq!(text["attached_images"], 2);
+        assert!(text.get(TOOL_RESULT_ATTACHMENTS_KEY).is_none());
+        let dropped = text["dropped_attachments"].as_array().unwrap();
+        assert_eq!(dropped.len(), 3, "{dropped:?}");
+
+        let many = json!({
+            TOOL_RESULT_ATTACHMENTS_KEY: (0..6).map(|_| image("image/png", "AAAA")).collect::<Vec<_>>()
+        })
+        .to_string();
+        let (_, attachments) = split_tool_result_attachments(many);
+        assert_eq!(attachments.len(), MAX_TOOL_RESULT_ATTACHMENTS);
+    }
+
+    #[test]
+    fn mcp_image_blocks_are_lifted_into_the_attachment_channel() {
+        let lifted = lift_mcp_image_blocks(json!({
+            "content": [
+                {"type": "text", "text": "captured"},
+                {"type": "image", "data": "AAAA", "mimeType": "image/png"},
+                {"type": "image", "mimeType": "image/png"}
+            ],
+            "isError": false
+        }));
+        assert_eq!(lifted["content"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            lifted[TOOL_RESULT_ATTACHMENTS_KEY][0]["media_type"],
+            "image/png"
+        );
+        assert_eq!(
+            lifted[TOOL_RESULT_ATTACHMENTS_KEY][0]["data_base64"],
+            "AAAA"
+        );
+        let untouched = lift_mcp_image_blocks(json!({"content": [{"type": "text", "text": "x"}]}));
+        assert!(untouched.get(TOOL_RESULT_ATTACHMENTS_KEY).is_none());
+    }
+
+    #[test]
+    fn image_attachments_are_estimated_as_vision_tokens_not_text() {
+        let big = "A".repeat(2 * 1024 * 1024);
+        let with_image = ModelMessage::Tool {
+            tool_call_id: "shot".to_string(),
+            content: "captured".to_string(),
+            attachments: vec![ModelInputAttachment {
+                media_type: "image/png".to_string(),
+                data_base64: big.clone(),
+                filename: None,
+            }],
+        };
+        let tokens = estimated_message_tokens(&with_image);
+        assert!(tokens < 2 * ESTIMATED_TOKENS_PER_IMAGE, "{tokens}");
+        assert!(tokens >= ESTIMATED_TOKENS_PER_IMAGE);
+        let user = ModelMessage::user_with_attachments(
+            "look",
+            vec![ModelInputAttachment {
+                media_type: "image/png".to_string(),
+                data_base64: big,
+                filename: None,
+            }],
+        );
+        assert!(estimated_message_tokens(&user) < 2 * ESTIMATED_TOKENS_PER_IMAGE);
     }
 
     #[test]
@@ -3855,6 +4059,7 @@ mod tests {
             ModelMessage::Tool {
                 tool_call_id: "big".to_string(),
                 content: "x".repeat(4 * 120_000),
+                attachments: Vec::new(),
             },
         ];
         let budget = native_context_budget(&ProviderCallUsage::default(), &messages, 0);
@@ -3897,6 +4102,7 @@ mod tests {
         let tool_result = |id: &str, size: usize| ModelMessage::Tool {
             tool_call_id: id.to_string(),
             content: "y".repeat(size),
+            attachments: Vec::new(),
         };
         let messages = vec![
             ModelMessage::System {

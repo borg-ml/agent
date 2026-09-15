@@ -270,7 +270,7 @@ impl OpenAiCompatibleProvider {
         let wire_messages = request
             .messages
             .iter()
-            .map(|message| model_message_wire_value(message, deepseek_model))
+            .flat_map(|message| model_message_wire_values(message, deepseek_model))
             .collect::<Vec<_>>();
         let mut body = json!({
             "model": request_model,
@@ -926,6 +926,40 @@ fn openrouter_model_limits_from_response(raw: &Value) -> Option<OpenRouterModelL
 fn compatible_http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// Chat-completions `tool` messages are text-only on every server, so a tool
+/// result that carries images is followed by a `user` message holding them,
+/// labelled with the call id so the model can tie the pixels to the result.
+fn model_message_wire_values(message: &ModelMessage, deepseek_model: bool) -> Vec<Value> {
+    match message {
+        ModelMessage::Tool {
+            tool_call_id,
+            content,
+            attachments,
+        } if !attachments.is_empty() => {
+            let mut blocks = vec![json!({
+                "type": "text",
+                "text": format!("Image output of tool call {tool_call_id}:")
+            })];
+            blocks.extend(attachments.iter().map(|attachment| {
+                json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!(
+                            "data:{};base64,{}",
+                            attachment.media_type, attachment.data_base64
+                        )
+                    }
+                })
+            }));
+            vec![
+                json!({ "role": "tool", "tool_call_id": tool_call_id, "content": content }),
+                json!({ "role": "user", "content": blocks }),
+            ]
+        }
+        _ => vec![model_message_wire_value(message, deepseek_model)],
+    }
 }
 
 fn model_message_wire_value(message: &ModelMessage, deepseek_model: bool) -> Value {
@@ -1886,6 +1920,38 @@ mod tests {
         assert_eq!(
             streamed_tool_action(r#"{"payload":{"action":"nested"},"action":"edit","#).as_deref(),
             Some("edit")
+        );
+    }
+
+    #[test]
+    fn tool_images_are_carried_in_a_follow_up_user_message() {
+        let plain = ModelMessage::tool("call-1", "ok");
+        assert_eq!(model_message_wire_values(&plain, false).len(), 1);
+        let message = ModelMessage::Tool {
+            tool_call_id: "call-1".to_string(),
+            content: "screenshot taken".to_string(),
+            attachments: vec![crate::provider::ModelInputAttachment {
+                media_type: "image/png".to_string(),
+                data_base64: "AAAA".to_string(),
+                filename: None,
+            }],
+        };
+        let wire = model_message_wire_values(&message, false);
+        assert_eq!(wire.len(), 2);
+        assert_eq!(wire[0]["role"], "tool");
+        assert_eq!(wire[0]["tool_call_id"], "call-1");
+        assert_eq!(wire[0]["content"], "screenshot taken");
+        assert_eq!(wire[1]["role"], "user");
+        assert!(
+            wire[1]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("call-1")
+        );
+        assert_eq!(wire[1]["content"][1]["type"], "image_url");
+        assert_eq!(
+            wire[1]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,AAAA"
         );
     }
 
