@@ -14,6 +14,11 @@ use std::io::{self, Stdout, Write as _};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+
+use ratatui_image::{
+    Resize, StatefulImage, picker::Picker as ImagePicker, picker::ProtocolType,
+    protocol::StatefulProtocol,
+};
 use std::process::Command;
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -1521,6 +1526,11 @@ pub struct BorgTerminal {
     entry_hit_areas: Vec<(Rect, usize)>,
     message_hit_areas: Vec<(Rect, usize)>,
     link_hit_areas: Vec<(Rect, String)>,
+    /// Terminal graphics protocol detected at startup (Kitty/Sixel/iTerm2);
+    /// `None` keeps the half-block fallback drawn by the transcript.
+    image_picker: Option<ImagePicker>,
+    /// Encoded previews keyed by source path and tile size in cells.
+    image_protocols: HashMap<(PathBuf, u16, u16), StatefulProtocol>,
     picker_hit_areas: Vec<(Rect, usize)>,
     hovered_tool: Option<usize>,
     hovered_tool_run: Option<(usize, usize)>,
@@ -2537,6 +2547,9 @@ impl BorgTerminal {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )
         .is_ok();
+        // Query before the input thread takes stdin: the probe reads the
+        // terminal's reply itself.
+        let image_picker = detect_image_picker();
         Ok(Self {
             terminal,
             input: TerminalInput::spawn(),
@@ -2624,6 +2637,8 @@ impl BorgTerminal {
             entry_hit_areas: Vec::new(),
             message_hit_areas: Vec::new(),
             link_hit_areas: Vec::new(),
+            image_picker,
+            image_protocols: HashMap::new(),
             picker_hit_areas: Vec::new(),
             hovered_tool: None,
             hovered_tool_run: None,
@@ -7602,6 +7617,48 @@ impl BorgTerminal {
                     );
                 }
                 frame.render_widget(Paragraph::new(visible_transcript), content_area);
+                if let Some(picker) = self.image_picker.as_ref() {
+                    // Replace fully visible half-block tiles with real
+                    // terminal graphics; partially scrolled tiles keep the
+                    // glyph fallback so nothing is drawn outside the viewport.
+                    for slot in image_preview_slots(link_rows) {
+                        if slot.first_row < scroll_start
+                            || slot.first_row + slot.rows
+                                > scroll_start.saturating_add(visible_height)
+                        {
+                            continue;
+                        }
+                        let x = content_area.x.saturating_add(slot.start as u16);
+                        let width = (slot.width as u16).min(content_area.right().saturating_sub(x));
+                        if width == 0 {
+                            continue;
+                        }
+                        let area = Rect {
+                            x,
+                            y: content_area.y + (slot.first_row - scroll_start) as u16,
+                            width,
+                            height: slot.rows as u16,
+                        };
+                        let key = (slot.path.clone(), area.width, area.height);
+                        if !self.image_protocols.contains_key(&key) {
+                            if self.image_protocols.len() >= 64 {
+                                self.image_protocols.clear();
+                            }
+                            let Some(image) = attachments::load_preview_image(&slot.path) else {
+                                continue;
+                            };
+                            self.image_protocols
+                                .insert(key.clone(), picker.new_resize_protocol(image));
+                        }
+                        if let Some(protocol) = self.image_protocols.get_mut(&key) {
+                            frame.render_stateful_widget(
+                                StatefulImage::<StatefulProtocol>::new().resize(Resize::Fit(None)),
+                                area,
+                                protocol,
+                            );
+                        }
+                    }
+                }
                 for link in link_rows.iter().filter(|link| {
                     link.row >= scroll_start
                         && link.row < scroll_start.saturating_add(visible_height)
@@ -15001,4 +15058,66 @@ fn spinner_frame_index() -> usize {
 
 fn cursor_blink_visible(elapsed: Duration) -> bool {
     (elapsed.as_millis() / 500).is_multiple_of(2)
+}
+
+/// One attachment tile in the rendered transcript: consecutive link rows that
+/// share the same image file and column span, minus the trailing label row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImagePreviewSlot {
+    path: PathBuf,
+    first_row: usize,
+    rows: usize,
+    start: usize,
+    width: usize,
+}
+
+fn image_preview_slots(links: &[LinkRowRange]) -> Vec<ImagePreviewSlot> {
+    let mut slots = Vec::new();
+    let mut index = 0;
+    while index < links.len() {
+        let first = &links[index];
+        let mut end = index + 1;
+        while end < links.len()
+            && links[end].url == first.url
+            && links[end].start == first.start
+            && links[end].end == first.end
+            && links[end].row == links[end - 1].row + 1
+        {
+            end += 1;
+        }
+        let rows = end - index;
+        if rows >= 2
+            && let Ok(url) = url::Url::parse(&first.url)
+            && let Ok(path) = url.to_file_path()
+            && attachments::is_supported_image(&path)
+        {
+            slots.push(ImagePreviewSlot {
+                path,
+                first_row: first.row,
+                rows: rows - 1,
+                start: first.start,
+                width: first.end.saturating_sub(first.start),
+            });
+        }
+        index = end;
+    }
+    slots
+}
+
+/// Probe the terminal for a graphics protocol. `BORG_IMAGE_PROTOCOL=halfblocks`
+/// (or `off`) skips the probe and keeps glyph previews.
+fn detect_image_picker() -> Option<ImagePicker> {
+    if std::env::var("BORG_IMAGE_PROTOCOL")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "halfblocks" | "off" | "0" | "none"
+            )
+        })
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let picker = ImagePicker::from_query_stdio().ok()?;
+    (picker.protocol_type() != ProtocolType::Halfblocks).then_some(picker)
 }

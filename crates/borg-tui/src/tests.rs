@@ -13322,3 +13322,39 @@ fn commit_message_fallback_and_cleaning() {
     );
     assert_eq!(clean_commit_message("\n```\n```\n"), None);
 }
+
+#[test]
+fn image_preview_slots_group_tile_rows_and_drop_the_label_row() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("red.png");
+    image::RgbImage::from_pixel(4, 4, image::Rgb([255, 0, 0]))
+        .save(&path)
+        .unwrap();
+    let url = url::Url::from_file_path(&path).unwrap().to_string();
+    let link = |row, start, end, url: &str| LinkRowRange {
+        row,
+        start,
+        end,
+        url: url.to_string(),
+    };
+    let links = vec![
+        link(0, 0, 10, "https://example.com/"),
+        link(3, 2, 26, &url),
+        link(4, 2, 26, &url),
+        link(5, 2, 26, &url),
+        link(6, 2, 26, &url),
+        link(9, 2, 26, &url),
+        link(12, 2, 26, "file:///tmp/not-an-image.txt"),
+        link(13, 2, 26, "file:///tmp/not-an-image.txt"),
+    ];
+    assert_eq!(
+        image_preview_slots(&links),
+        vec![ImagePreviewSlot {
+            path,
+            first_row: 3,
+            rows: 3,
+            start: 2,
+            width: 24,
+        }]
+    );
+}

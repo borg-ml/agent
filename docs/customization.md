@@ -77,6 +77,14 @@ Launch with `BORG_TUI_SHOW_SUBAGENT_MESSAGES=1 borg` to show subagent messages
 in the parent transcript too. The values `true`, `yes`, and `on` also enable
 this option. It applies to both live events and replayed history.
 
+## Image previews
+
+Attachments render as real images when the terminal supports a graphics
+protocol (Kitty, Sixel, or iTerm2 — Ghostty, Kitty, WezTerm, iTerm2); Borg
+probes for it once at startup. Other terminals keep the half-block glyph
+preview. Set `BORG_IMAGE_PROTOCOL=halfblocks` to skip the probe and force the
+glyph fallback.
+
 ## Reasoning effort
 
 When no Claude effort is selected or inherited, Borg explicitly requests `high`.

@@ -68,6 +68,19 @@ pub(super) fn preview(
     )
 }
 
+/// Decode an attachment for a terminal graphics protocol; bounded like `preview`.
+pub(super) fn load_preview_image(path: &Path) -> Option<image::DynamicImage> {
+    if fs::metadata(path).ok()?.len() > MAX_ATTACHMENT_BYTES {
+        return None;
+    }
+    image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PasteOutcome {
     pub text: String,
