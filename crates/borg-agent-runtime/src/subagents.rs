@@ -5079,8 +5079,10 @@ impl SubagentCoordinator {
                     .as_deref()
                     .map(str::trim)
                     .filter(|query| !query.is_empty());
+                let workspace_store = self.workspace_store().await?;
                 let mut instances = Vec::new();
-                for mut instance in self.workspace_store().await?.list_instances().await? {
+                let mut newest_seen = None;
+                for mut instance in workspace_store.list_instances().await? {
                     let binding = self
                         .store
                         .workspace_binding(instance.participant.id)
@@ -5099,10 +5101,47 @@ impl SubagentCoordinator {
                     if query.is_some_and(|query| !instance_matches_query(&instance, query)) {
                         continue;
                     }
+                    if !local {
+                        newest_seen = newest_seen.max(instance.seen_at);
+                    }
+                    let live = local
+                        && tokio::fs::try_exists(crate::session_control_socket_path(
+                            &self.journal_root,
+                            instance.participant.id,
+                        ))
+                        .await
+                        .unwrap_or(false);
+                    let workspace_name = match instance.workspace_id {
+                        Some(workspace_id) => workspace_store.workspace_name(workspace_id).await?,
+                        None => None,
+                    };
+                    let seen_at = instance.seen_at;
                     let mut entry = serde_json::to_value(instance)?;
                     entry["local"] = json!(local);
-                    instances.push(entry);
+                    entry["live"] = json!(live);
+                    entry["workspace_name"] = json!(workspace_name);
+                    instances.push((local, seen_at, entry));
                 }
+                let stale_before = newest_seen.map(|newest| newest - STALE_INSTANCE_GRACE);
+                let is_stale = |local: bool, seen_at: Option<DateTime<Utc>>| {
+                    !local
+                        && stale_before
+                            .is_some_and(|cutoff| seen_at.is_none_or(|seen| seen < cutoff))
+                };
+                let hidden_stale = if args.include_stale {
+                    0
+                } else {
+                    let before = instances.len();
+                    instances.retain(|(local, seen_at, _)| !is_stale(*local, *seen_at));
+                    before - instances.len()
+                };
+                let mut instances = instances
+                    .into_iter()
+                    .map(|(local, seen_at, mut entry)| {
+                        entry["stale"] = json!(is_stale(local, seen_at));
+                        entry
+                    })
+                    .collect::<Vec<_>>();
                 // Newest first so a truncated listing keeps the live instances.
                 instances.reverse();
                 let total = instances.len();
@@ -5118,6 +5157,7 @@ impl SubagentCoordinator {
                     "participant_id": participant_id,
                     "total": total,
                     "truncated": total > instances.len(),
+                    "hidden_stale": hidden_stale,
                     "instances": instances,
                 }))
             }
@@ -5391,11 +5431,12 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "list_instances",
-            "Discover Borg agent instances across all local workspaces and the authenticated remote instance directory. Returns newest first; filter with query/host_id and raise limit when needed. Use participant:<id> with send_message or followup_task. Remote entries require an enrolled host relay and may be offline; discovery does not grant project access.",
+            "Discover Borg agent instances across all local workspaces and the authenticated remote instance directory. Each entry reports local/live (a local session with an open control socket), seen_at (last local registration or directory sync), workspace_name and stale; stale remote entries are hidden unless include_stale is set. Returns newest first; filter with query/host_id and raise limit when needed. Use participant:<id> with send_message or followup_task. Remote entries require an enrolled host relay and may be offline; discovery does not grant project access.",
             json!({"type":"object","properties":{
                 "query":{"type":"string","description":"Case-insensitive display-name substring or participant id prefix."},
                 "host_id":{"type":"string","description":"Only instances on this host UUID."},
-                "limit":{"type":"integer","minimum":1,"description":"Maximum entries, newest first (default 100)."}
+                "limit":{"type":"integer","minimum":1,"description":"Maximum entries, newest first (default 100)."},
+                "include_stale":{"type":"boolean","description":"Also list remote instances the directory stopped reporting."}
             },"additionalProperties":false}),
         ),
         message_tool(
@@ -6392,7 +6433,13 @@ struct ListInstancesArgs {
     host_id: Option<Uuid>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    include_stale: bool,
 }
+
+/// Remote entries absent from the directory for this long after the newest
+/// sync are hidden unless `include_stale` is set.
+const STALE_INSTANCE_GRACE: chrono::Duration = chrono::Duration::minutes(10);
 
 fn instance_matches_query(instance: &crate::workspace::AgentInstance, query: &str) -> bool {
     let query = query.to_ascii_lowercase();

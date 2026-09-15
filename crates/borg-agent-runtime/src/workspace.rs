@@ -16,14 +16,14 @@ use uuid::Uuid;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_MMAP_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 const SQLITE_CACHE_KIB: u64 = 8 * 1024;
-const WORKSPACE_SCHEMA_VERSION: i64 = 2;
+const WORKSPACE_SCHEMA_VERSION: i64 = 3;
 
 /// The canonical schema. Older databases are migrated forward by re-running
 /// this batch and adding the columns it declares that they lack.
 const WORKSPACE_SCHEMA_SQL: &str = r#"
       create table if not exists borg_workspace_schema (id integer primary key check(id=1), version integer not null);
       create table if not exists workspace_participants (id text primary key, display_name text not null, kind text not null, created_at text not null);
-      create table if not exists agent_instances (participant_id text primary key references workspace_participants(id), host_id text, workspace_id text);
+      create table if not exists agent_instances (participant_id text primary key references workspace_participants(id), host_id text, workspace_id text, seen_at text);
       create table if not exists workspaces (id text primary key, name text not null, next_sequence integer not null default 1, created_at text not null);
       create table if not exists workspace_members (workspace_id text not null references workspaces(id) on delete cascade, participant_id text not null references workspace_participants(id), role text not null, joined_at text not null, primary key(workspace_id,participant_id));
       create table if not exists workspace_threads (id text primary key, workspace_id text not null references workspaces(id) on delete cascade, title text not null, created_at text not null);
@@ -62,6 +62,9 @@ pub struct AgentInstance {
     pub participant: Participant,
     pub host_id: Option<Uuid>,
     pub workspace_id: Option<Uuid>,
+    /// When this installation last saw the instance in local registration or
+    /// an authenticated directory sync. Not a liveness guarantee.
+    pub seen_at: Option<DateTime<Utc>>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -590,13 +593,14 @@ impl SqliteWorkspaceStore {
         .execute(&mut *transaction)
         .await?;
         sqlx::query(
-            "insert into agent_instances(participant_id,host_id,workspace_id) values(?,?,?) \
-             on conflict(participant_id) do update set \
-             host_id=excluded.host_id,workspace_id=excluded.workspace_id",
+            "insert into agent_instances(participant_id,host_id,workspace_id,seen_at) \
+             values(?,?,?,?) on conflict(participant_id) do update set \
+             host_id=excluded.host_id,workspace_id=excluded.workspace_id,seen_at=excluded.seen_at",
         )
         .bind(participant.id.to_string())
         .bind(host_id.map(|id| id.to_string()))
         .bind(workspace_id.map(|id| id.to_string()))
+        .bind(Utc::now().to_rfc3339())
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
@@ -605,7 +609,7 @@ impl SqliteWorkspaceStore {
 
     pub async fn list_instances(&self) -> Result<Vec<AgentInstance>> {
         let rows = sqlx::query(
-            "select p.id,p.display_name,p.kind,p.created_at,i.host_id,i.workspace_id \
+            "select p.id,p.display_name,p.kind,p.created_at,i.host_id,i.workspace_id,i.seen_at \
              from workspace_participants p left join agent_instances i on i.participant_id=p.id \
              where p.kind=? order by p.created_at,p.id",
         )
@@ -630,9 +634,22 @@ impl SqliteWorkspaceStore {
                         .try_get::<Option<&str>, _>("workspace_id")?
                         .map(Uuid::parse_str)
                         .transpose()?,
+                    seen_at: row
+                        .try_get::<Option<&str>, _>("seen_at")?
+                        .map(|value| {
+                            DateTime::parse_from_rfc3339(value).map(|t| t.with_timezone(&Utc))
+                        })
+                        .transpose()?,
                 })
             })
             .collect()
+    }
+
+    pub async fn workspace_name(&self, workspace_id: Uuid) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("select name from workspaces where id=?")
+            .bind(workspace_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?)
     }
 
     /// Apply one authenticated relay roster projection idempotently. This is

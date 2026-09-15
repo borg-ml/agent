@@ -2876,6 +2876,22 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
     assert_eq!(listed["truncated"], false);
     assert_eq!(listed["instances"][0]["id"], remote.to_string());
     assert_eq!(listed["instances"][0]["local"], false);
+    assert_eq!(listed["instances"][0]["live"], false);
+    assert_eq!(listed["instances"][0]["stale"], false);
+    assert!(listed["instances"][0]["seen_at"].is_string());
+    let listed = sender_coordinator
+        .call_tool_as(sender, "list_instances", json!({"host_id": host_id}))
+        .await
+        .unwrap();
+    let local_entry = listed["instances"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == recipient.to_string())
+        .expect("local recipient is listed by host");
+    assert_eq!(local_entry["local"], true);
+    assert_eq!(local_entry["live"], cfg!(unix));
+    assert_eq!(local_entry["workspace_name"], "recipient");
 }
 
 #[tokio::test]
