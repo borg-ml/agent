@@ -8793,11 +8793,20 @@ fn automatic_retry_allowed(
     turn_had_side_effects: bool,
     retry_not_attempted: bool,
 ) -> bool {
-    !interrupted
-        && prompt_visible
+    if interrupted || !retry_not_attempted || turn_had_side_effects {
+        return false;
+    }
+    // Recovery-unavailable failures happen before the provider runs at all,
+    // so retrying with a journal replay is safe for any prompt, including
+    // internal and team-delivered ones.
+    if error
+        .to_ascii_lowercase()
+        .contains("durable thread recovery unavailable")
+    {
+        return true;
+    }
+    prompt_visible
         && actor == EventActor::User
-        && retry_not_attempted
-        && !turn_had_side_effects
         && (is_provider_agent_isolation_error(error) || is_safe_automatic_retry_error(error))
 }
 

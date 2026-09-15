@@ -97,6 +97,25 @@ pub(crate) const PROVIDER_CONTEXT_CONTRACT_VERSION: u32 = 1;
 
 const MAX_RESIDENT_CODEX_SUBSCRIPTION_POOLS: usize = 4;
 
+/// A Claude turn built as a delta assumes the pooled process still holds the
+/// whole conversation. Claude sessions are not resumable from disk here, so
+/// when the pool could not append (its lifecycle key changed, or the previous
+/// turn left it unhealthy) sending that delta to a fresh process would start
+/// the model with no history at all. Fail before the provider runs; the
+/// session replays the durable journal and retries.
+fn claude_delta_needs_replay(
+    provider: CodingProvider,
+    reused: bool,
+    provider_session_id: Option<&str>,
+    prompt: &str,
+    prompt_delta: &str,
+) -> bool {
+    provider == CodingProvider::Claude
+        && !reused
+        && provider_session_id.is_some()
+        && prompt == prompt_delta
+}
+
 fn provider_native_orchestration_tool(name: &str) -> bool {
     matches!(
         name,
@@ -1564,6 +1583,22 @@ async fn run_borg_provider_turn(
                 },
             )
             .await;
+        if claude_delta_needs_replay(
+            turn.provider,
+            prepared.reused,
+            turn.provider_session_id.as_deref(),
+            &turn.prompt,
+            &turn.prompt_delta,
+        ) {
+            registry.mark(turn.session_id, turn.provider, false).await;
+            tracing::warn!(
+                session_id = %turn.session_id,
+                "pooled Claude process cannot be appended to; refusing to start a fresh process with a delta-only prompt"
+            );
+            anyhow::bail!(
+                "durable thread recovery unavailable: the pooled Claude process for this session was replaced before this turn could append to it; Borg is replaying the canonical journal"
+            );
+        }
         request.prompt = prepared.prompt.clone();
         request.lifecycle_key = Some(prepared.lifecycle_key.clone());
         request.session_id = prepared.resume_session_id.clone();
@@ -2490,6 +2525,51 @@ async fn send(events: &mpsc::Sender<SessionEventKind>, event: SessionEventKind) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn delta_only_claude_turn_refuses_a_fresh_pooled_process() {
+        use super::claude_delta_needs_replay;
+        use crate::CodingProvider;
+        // Reuse assumed by the session but the pool could not append.
+        assert!(claude_delta_needs_replay(
+            CodingProvider::Claude,
+            false,
+            Some("s"),
+            "delta",
+            "delta"
+        ));
+        // A healthy append is fine.
+        assert!(!claude_delta_needs_replay(
+            CodingProvider::Claude,
+            true,
+            Some("s"),
+            "delta",
+            "delta"
+        ));
+        // A cold turn already carries the full replay.
+        assert!(!claude_delta_needs_replay(
+            CodingProvider::Claude,
+            false,
+            None,
+            "replay+delta",
+            "delta"
+        ));
+        assert!(!claude_delta_needs_replay(
+            CodingProvider::Claude,
+            false,
+            Some("s"),
+            "replay+delta",
+            "delta"
+        ));
+        // Codex resumes from its own durable checkpoint instead.
+        assert!(!claude_delta_needs_replay(
+            CodingProvider::Codex,
+            false,
+            Some("s"),
+            "delta",
+            "delta"
+        ));
+    }
+
     use super::*;
 
     #[cfg(feature = "subscription-adapters")]

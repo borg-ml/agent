@@ -8494,6 +8494,24 @@ fn automatic_transport_recovery_is_single_shot_and_side_effect_free() {
         false,
         true,
     ));
+    // A replaced pooled process is detected before the provider runs, so the
+    // replay retry is safe even for invisible or system-delivered prompts.
+    assert!(automatic_retry_allowed(
+        "durable thread recovery unavailable: the pooled Claude process for this session was replaced",
+        false,
+        false,
+        EventActor::System,
+        false,
+        true,
+    ));
+    assert!(!automatic_retry_allowed(
+        "durable thread recovery unavailable: the pooled Claude process for this session was replaced",
+        false,
+        false,
+        EventActor::System,
+        true,
+        true,
+    ));
 }
 
 #[test]
