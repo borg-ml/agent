@@ -17,12 +17,15 @@ pub(crate) enum LidSleepStatus {
     Unsupported,
     /// A desktop Mac: no lid, so there is nothing to protect against and the
     /// one-time authorization is never requested.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     NoLid,
     /// macOS needs a one-time admin authorization that has not been granted.
     NeedsAuthorization,
     /// Authorized, but the machine is on battery so the override stays off.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     OnBattery,
     /// Authorized and eligible: the lid override engages while work runs.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Ready,
 }
 

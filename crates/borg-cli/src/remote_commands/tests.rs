@@ -260,6 +260,7 @@ fn resume_retries_sqlite_contention_but_not_permanent_errors() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn competing_detached_host_exits_without_waiting_for_database_writer_or_stopping_owner() {
     let root = short_socket_tempdir();
     let session_id = Uuid::new_v4();
