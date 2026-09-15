@@ -114,8 +114,8 @@ pub use session_store::{
     ClaimedActionTransition, EventPersistence, RecoveryParts, SESSION_PROJECTION_VERSION,
     SessionConfiguration, SessionHistoryHit, SessionHistoryIndexDocument, SessionHistoryPage,
     SessionHistoryPayload, SessionHistoryQuery, SessionHistorySearchMode, SessionLiveEvent,
-    SessionRecovery, SessionState, SessionStore, SessionStoreFork, SessionStoreHealth,
-    SessionSummary, SessionUsage, SessionWorkspaceBinding, SqliteSessionStore,
+    SessionRecovery, SessionState, SessionStore, SessionStoreCompaction, SessionStoreFork,
+    SessionStoreHealth, SessionSummary, SessionUsage, SessionWorkspaceBinding, SqliteSessionStore,
 };
 pub use subagents::{
     AgentToolDispatcher, AgentToolServer, DEFAULT_MAX_SUBAGENTS, SpawnSubagent, SubagentActivity,

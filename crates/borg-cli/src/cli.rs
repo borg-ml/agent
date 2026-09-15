@@ -304,6 +304,17 @@ pub(crate) enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Drop journal rows the current release never persists (mirrored
+    /// subagent heartbeats and streaming deltas) and shrink the store file.
+    Compact {
+        /// Delete stale rows but skip the VACUUM that rewrites the file.
+        /// The VACUUM needs exclusive access and free disk roughly equal to
+        /// the live data size.
+        #[arg(long)]
+        no_vacuum: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

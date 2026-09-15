@@ -999,6 +999,7 @@ dependencies = [
  "reqwest",
  "semver",
  "serde",
+ "serde_ignored",
  "serde_json",
  "sha2 0.11.0",
  "shlex 2.0.1",
@@ -1178,10 +1179,12 @@ dependencies = [
  "dirs 6.0.0",
  "pulldown-cmark",
  "serde",
+ "serde_ignored",
  "serde_json",
  "tempfile",
  "tokio",
  "toml 1.1.4+spec-1.1.0",
+ "tracing",
  "uuid",
 ]
 
@@ -6285,7 +6288,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6612,6 +6615,16 @@ version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e497af288b3b95d067a23a4f749f2861121ffcb2f6d8379310dcda040c345ed"
 dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "serde_ignored"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
+dependencies = [
+ "serde",
  "serde_core",
 ]
 

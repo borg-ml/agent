@@ -18,7 +18,7 @@ pub mod preferences;
 pub mod timeline;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct KeybindingConfig {
     pub send: Vec<String>,
     pub queue: Vec<String>,

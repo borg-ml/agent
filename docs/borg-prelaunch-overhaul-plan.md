@@ -18,10 +18,20 @@ Landed behind green tests (remote/provider/cli/tui suites + workspace clippy):
 - H-F: tool-result image channel (see `borg-computer-use-readiness.md` #1). H-G: ranked `search_files`.
 - H-H: LSP initialize budget, per-server locks, diagnostics wait, UTF-16 columns.
 - Claude Code compaction now surfaces as a Borg compaction card (user-reported bug).
+- H-D store growth (found when the machine ran out of disk: a 15 GB `sessions.sqlite3`, 784k rows): mirrored
+  child-session events now inherit the child's persistence class, so provider heartbeats, reasoning deltas and
+  streaming assistant text are live-only in the parent instead of durable rows. `borg session compact
+  [--no-vacuum]` removes the rows earlier builds journaled (same `persistence()` rule, not a SQL copy), cleans
+  the search projection, and the VACUUM switches the file to incremental auto-vacuum.
+- H-A hidden command: `run_workflow` / `run_blu_extension` approvals resolve the extension manifest and show
+  the runtime, entrypoint, cwd, shell-quoted program + args, and artifact hash; the approval card carries the
+  command and the automatic reviewer receives `resolved_execution` next to the raw arguments.
+- Config forward-compat: `editor.toml`, `agent.toml`, and keybindings no longer refuse to load over keys from
+  a newer Borg (they warn, and `editor.toml` saves keep those keys). Extension manifests stay strict.
 
 Not done here by decision: B4 default permission mode stays FullAccess (user choice). Still open: B1
-remainder + provider-credential scrubbing for shell/MCP children, medium/low audit items, and the
-`borg-agent-runtime` crate extraction.
+remainder + provider-credential scrubbing for shell/MCP children, secret scrubbing of tool output and the
+remaining medium/low audit items, and the `borg-agent-runtime` crate extraction.
 
 ## Overall verdict
 

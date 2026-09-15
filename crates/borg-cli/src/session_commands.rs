@@ -81,11 +81,54 @@ pub(crate) async fn run(command: SessionCommand) -> Result<()> {
                     output,
                     json,
                 } => export_session(&store, session, output, json).await,
+                SessionCommand::Compact { no_vacuum, json } => {
+                    compact_store(&store, !no_vacuum, json).await
+                }
                 SessionCommand::Import { .. }
                 | SessionCommand::Snapshot { .. }
                 | SessionCommand::Restore { .. } => unreachable!("handled above"),
             }
         }
+    }
+}
+
+async fn compact_store(store: &SqliteSessionStore, vacuum: bool, json: bool) -> Result<()> {
+    let outcome = store.compact(vacuum).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&outcome)?);
+        return Ok(());
+    }
+    println!(
+        "Removed {} stale mirrored subagent rows and {} orphaned search rows.",
+        outcome.deleted_events, outcome.deleted_search_rows
+    );
+    if outcome.vacuumed {
+        println!(
+            "Session store: {} -> {}",
+            human_bytes(outcome.bytes_before),
+            human_bytes(outcome.bytes_after)
+        );
+    } else {
+        println!(
+            "Session store stays at {}; freed pages are reused. Run without --no-vacuum to shrink the file.",
+            human_bytes(outcome.bytes_before)
+        );
+    }
+    Ok(())
+}
+
+fn human_bytes(bytes: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes.max(0) as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }
 

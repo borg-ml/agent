@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct AgentConfig {
     pub(crate) capabilities: CapabilityConfig,
     pub(crate) extensions: ExtensionConfig,
@@ -25,7 +25,7 @@ pub(crate) struct AgentConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct ConfiguredProvider {
     /// Currently `openai-compatible`; the field makes the config forward
     /// compatible with future provider protocols without hiding semantics.
@@ -56,7 +56,7 @@ impl Default for ConfiguredProvider {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct ConfiguredModel {
     pub(crate) name: Option<String>,
     pub(crate) context_window_tokens: Option<u64>,
@@ -70,7 +70,7 @@ pub(crate) struct ConfiguredModel {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct ConfiguredModelVariant {
     pub(crate) body: BTreeMap<String, toml::Value>,
 }
@@ -86,7 +86,7 @@ pub(crate) struct ConfiguredModelVariant {
 /// session ends; this prevents a later session from inheriting an old local
 /// endpoint or model after its config is reloaded.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct LocalProviderConfig {
     /// Base URL of the OpenAI-compatible endpoint, including `/v1`.
     /// Defaults to `http://127.0.0.1:8000/v1` in the provider when unset.
@@ -212,7 +212,7 @@ pub(crate) enum NativeAccessPolicy {
 
 /// User-owned trust controls for extension catalogs.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct ExtensionConfig {
     /// Compatibility switch for project MCP packages.
     pub(crate) allow_project_mcp: bool,
@@ -235,7 +235,7 @@ impl Default for ExtensionConfig {
 /// Opt-in autonomous-team policy. Leaving `preset` unset keeps the existing
 /// manual subagent coordinator unchanged.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct TeamConfig {
     pub(crate) preset: Option<borg_remote::TeamPreset>,
     pub(crate) worker_concurrency: Option<u32>,
@@ -250,7 +250,7 @@ pub(crate) struct TeamConfig {
 
 /// Provider-neutral feature switches for optional Borg subsystems.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct CapabilityConfig {
     pub(crate) multiplayer: bool,
     pub(crate) subagents: bool,
@@ -304,7 +304,7 @@ impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct UpdateConfig {
     /// Download verified stable releases in the background for the next launch.
     pub(crate) auto_install: bool,
@@ -313,7 +313,7 @@ pub(crate) struct UpdateConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct UsageCountConfig {
     /// Send a content-free, monthly rotating active-install heartbeat.
     pub(crate) enabled: bool,
@@ -335,7 +335,7 @@ impl Default for UpdateConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct CommandConfig {
     /// User-defined slash-command aliases. The key omits the leading slash;
     /// the value is a built-in slash command and may include fixed arguments.
@@ -343,14 +343,14 @@ pub(crate) struct CommandConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct McpConfig {
     /// Local stdio MCP servers exposed as tools to every provider.
     pub(crate) servers: BTreeMap<String, McpServerConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct McpServerConfig {
     pub(crate) enabled: bool,
     pub(crate) command: String,
@@ -376,7 +376,7 @@ impl Default for McpServerConfig {
 pub(crate) use borg_ui::KeybindingConfig;
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(crate) struct ApprovalConfig {
     /// Optional faster/cheaper model for native Auto command reviews.
     pub(crate) reviewer_model: Option<String>,
@@ -399,8 +399,18 @@ impl AgentConfig {
         }
         let source = fs::read_to_string(&path)
             .with_context(|| format!("failed to read agent config {}", path.display()))?;
-        let config: Self = toml::from_str(&source)
-            .with_context(|| format!("invalid agent config {}", path.display()))?;
+        // Keys from a newer Borg load with a warning instead of refusing to
+        // start: a downgrade or side-by-side install must not strand the user.
+        let (config, unknown_keys) =
+            borg_ui::preferences::from_toml_str_lenient::<Self>(&source)
+                .with_context(|| format!("invalid agent config {}", path.display()))?;
+        if !unknown_keys.is_empty() {
+            tracing::warn!(
+                path = %path.display(),
+                keys = %unknown_keys.join(", "),
+                "agent config contains keys this Borg build does not understand; they have no effect"
+            );
+        }
         config
             .validate()
             .with_context(|| format!("invalid agent config {}", path.display()))?;

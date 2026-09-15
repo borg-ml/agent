@@ -549,6 +549,22 @@ impl SessionEventKind {
                 status: MessageStatus::InProgress,
                 ..
             } => EventPersistence::Coalesced,
+            // A mirrored child event is only as durable as the child itself
+            // records it. Provider heartbeats, reasoning deltas, and streaming
+            // assistant text are live state in the child's journal, so the
+            // parent must not turn them into durable rows: one busy
+            // orchestration session otherwise grows the store by gigabytes.
+            // The parent has no live-state key for a child's coalesced event,
+            // so it is delivered live and never journaled.
+            Self::SubagentActivity {
+                event: Some(child_event),
+                ..
+            } => match child_event.kind.persistence() {
+                EventPersistence::Durable => EventPersistence::Durable,
+                EventPersistence::Coalesced | EventPersistence::Ephemeral => {
+                    EventPersistence::Ephemeral
+                }
+            },
             _ => EventPersistence::Durable,
         }
     }
@@ -1553,6 +1569,21 @@ pub trait SessionStore: Send + Sync {
 #[derive(Clone)]
 pub struct SqliteSessionStore {
     pool: SqlitePool,
+}
+
+/// Outcome of `SqliteSessionStore::compact`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStoreCompaction {
+    /// Mirrored subagent rows removed because the live journal would no
+    /// longer persist them.
+    pub deleted_events: u64,
+    /// Search projection rows that no longer had a journal event.
+    pub deleted_search_rows: u64,
+    pub vacuumed: bool,
+    /// Database size in bytes before and after, from the page count. Without
+    /// a vacuum the file keeps its size and the freed pages are reused.
+    pub bytes_before: i64,
+    pub bytes_after: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3302,6 +3333,109 @@ impl SqliteSessionStore {
         .await?;
         self.save_harness_state(session_id, &state).await?;
         Ok(state)
+    }
+
+    /// Remove journal rows that the current persistence rules would never
+    /// have written, drop their orphaned search projections, and optionally
+    /// VACUUM to hand the freed pages back to the filesystem.
+    ///
+    /// Earlier releases journaled every mirrored child-session event as a
+    /// durable `subagent_activity` row in the parent, including provider
+    /// heartbeats, reasoning deltas, and streaming assistant text that the
+    /// child itself kept only as live state. Those rows are not fork
+    /// inheritable and carry no context or recovery value, so removing them
+    /// cannot change what any session replays. The decision is made by the
+    /// same `persistence()` rule the live journal uses, not by a parallel SQL
+    /// copy of it.
+    pub async fn compact(&self, vacuum: bool) -> Result<SessionStoreCompaction> {
+        let page_size: i64 = sqlx::query_scalar("pragma page_size")
+            .fetch_one(&self.pool)
+            .await?;
+        let pages_before: i64 = sqlx::query_scalar("pragma page_count")
+            .fetch_one(&self.pool)
+            .await?;
+        let mut deleted_events = 0u64;
+        let mut cursor: Option<(String, i64)> = None;
+        loop {
+            let (after_session, after_sequence) =
+                cursor.clone().unwrap_or_else(|| (String::new(), -1));
+            let rows: Vec<(String, i64, String)> = sqlx::query_as(
+                "select session_id, sequence, event_json from session_events \
+                 where event_kind = 'subagent_activity' \
+                   and (session_id > ? or (session_id = ? and sequence > ?)) \
+                 order by session_id, sequence \
+                 limit 2000",
+            )
+            .bind(&after_session)
+            .bind(&after_session)
+            .bind(after_sequence)
+            .fetch_all(&self.pool)
+            .await?;
+            let Some((last_session, last_sequence, _)) = rows.last() else {
+                break;
+            };
+            cursor = Some((last_session.clone(), *last_sequence));
+            let stale = rows
+                .iter()
+                .filter(|(_, _, event_json)| {
+                    serde_json::from_str::<SessionEvent>(event_json)
+                        .is_ok_and(|event| event.kind.persistence() != EventPersistence::Durable)
+                })
+                .map(|(session_id, sequence, _)| (session_id.clone(), *sequence))
+                .collect::<Vec<_>>();
+            if stale.is_empty() {
+                continue;
+            }
+            let mut transaction = self.begin_write().await?;
+            for (session_id, sequence) in &stale {
+                sqlx::query("delete from session_events where session_id = ? and sequence = ?")
+                    .bind(session_id)
+                    .bind(sequence)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+            transaction.commit().await?;
+            deleted_events += u64::try_from(stale.len()).unwrap_or(u64::MAX);
+        }
+        let mut transaction = self.begin_write().await?;
+        let deleted_search_rows = sqlx::query(
+            "delete from session_event_search where not exists ( \
+                 select 1 from session_events e \
+                 where e.session_id=session_event_search.session_id \
+                   and e.event_id=session_event_search.event_id \
+             )",
+        )
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        transaction.commit().await?;
+        if vacuum {
+            // A full VACUUM rewrites the file and hands the freed pages back to
+            // the filesystem. It runs on a single connection because it needs
+            // exclusive access; `borg session compact` documents that Borg must
+            // be otherwise idle.
+            let mut connection = self.pool.acquire().await?;
+            sqlx::query("vacuum")
+                .execute(&mut *connection)
+                .await
+                .context(
+                    "vacuum needs exclusive access to the session store; \
+                     stop running Borg sessions and retry",
+                )?;
+            sqlx::query("pragma wal_checkpoint(truncate)")
+                .execute(&mut *connection)
+                .await?;
+        }
+        let pages_after: i64 = sqlx::query_scalar("pragma page_count")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(SessionStoreCompaction {
+            deleted_events,
+            deleted_search_rows,
+            vacuumed: vacuum,
+            bytes_before: pages_before.saturating_mul(page_size),
+            bytes_after: pages_after.saturating_mul(page_size),
+        })
     }
 
     /// Check readiness without scanning the full database contents.

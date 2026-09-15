@@ -11197,16 +11197,50 @@ async fn parent_journal_preserves_full_child_transcript_events() {
             } if text == "I am complete"
         )
     ));
+    // The streaming partial reaches a live observer but is never journaled:
+    // the child itself keeps only coalesced live state for an in-progress
+    // message, so mirroring every keystroke into a durable parent row is what
+    // grew one orchestration session's store into the gigabytes. Only the
+    // durable child events (the tool call and the completed message) persist.
+    let durable_child_events: Vec<_> = persisted
+        .read(parent_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            SessionEventKind::SubagentActivity {
+                event: Some(child_event),
+                ..
+            } => Some(child_event.kind),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        persisted
-            .read(parent_id)
-            .await
-            .unwrap()
-            .iter()
-            .filter(|event| matches!(event.kind, SessionEventKind::SubagentActivity { .. }))
-            .count(),
-        3,
-        "tool, partial message, and completed message updates remain ordered and durable"
+        durable_child_events.len(),
+        2,
+        "the tool call and the completed message persist; the streaming partial does not"
+    );
+    assert!(matches!(
+        durable_child_events[0],
+        SessionEventKind::ToolStarted { ref tool_call_id, .. } if tool_call_id == "call-1"
+    ));
+    assert!(matches!(
+        durable_child_events[1],
+        SessionEventKind::Message {
+            status: MessageStatus::Complete,
+            ref text,
+            ..
+        } if text == "I am complete"
+    ));
+    assert!(
+        !durable_child_events.iter().any(|kind| matches!(
+            kind,
+            SessionEventKind::Message {
+                status: MessageStatus::InProgress,
+                ..
+            }
+        )),
+        "an in-progress child message must not become a durable parent row"
     );
 
     record_subagent_activity(

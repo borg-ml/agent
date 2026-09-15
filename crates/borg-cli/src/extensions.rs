@@ -87,7 +87,17 @@ impl ExtensionCatalog {
                 agent.commands.aliases.insert(alias.clone(), target.clone());
             }
         }
-        let customized: crate::editor_preferences::EditorPreferences = editor_value.try_into()?;
+        // Extension manifests stay strict: an unknown editor key there is a
+        // typo in shipped code, not a setting from a newer Borg.
+        let (customized, unknown_keys) = crate::editor_preferences::deserialize_lenient::<
+            crate::editor_preferences::EditorPreferences,
+            _,
+        >(editor_value)?;
+        anyhow::ensure!(
+            unknown_keys.is_empty(),
+            "extension editor customization sets unknown editor keys: {}",
+            unknown_keys.join(", ")
+        );
         customized.validate()?;
         *editor = customized;
         Ok(())
@@ -899,13 +909,22 @@ fn validate_candidate_declarations(candidate: &mut Candidate, manifest: &Manifes
             &mut editor,
             toml::Value::Table(toml::map::Map::from_iter(manifest.api.editor.clone())),
         );
-        let editor: crate::editor_preferences::EditorPreferences =
-            editor.try_into().with_context(|| {
-                format!(
-                    "extension `{}` has invalid editor customization",
-                    manifest.id
-                )
-            })?;
+        let (editor, unknown_keys) = crate::editor_preferences::deserialize_lenient::<
+            crate::editor_preferences::EditorPreferences,
+            _,
+        >(editor)
+        .with_context(|| {
+            format!(
+                "extension `{}` has invalid editor customization",
+                manifest.id
+            )
+        })?;
+        anyhow::ensure!(
+            unknown_keys.is_empty(),
+            "extension `{}` sets unknown editor keys: {}",
+            manifest.id,
+            unknown_keys.join(", ")
+        );
         editor.validate()?;
     }
     let mut keybindings = crate::agent_config::KeybindingConfig::default();

@@ -1769,6 +1769,29 @@ impl AgentToolDispatcher {
         }
     }
 
+    /// Resolve what a `run_workflow` / `run_blu_extension` call will actually
+    /// execute, so approval surfaces show the real program and arguments from
+    /// the extension manifest instead of the tool name and an opaque
+    /// `extension_id`/`name` pair. Returns `None` when the tool is not a
+    /// workflow runner or the workflow is absent from the current snapshot;
+    /// the call itself then fails with the precise error.
+    pub(crate) fn describe_workflow_invocation(
+        &self,
+        tool_name: &str,
+        arguments: &Value,
+    ) -> Option<WorkflowInvocationDescription> {
+        if !matches!(tool_name, "run_workflow" | "run_blu_extension") {
+            return None;
+        }
+        let extension_id = arguments.get("extension_id")?.as_str()?;
+        let name = arguments.get("name")?.as_str()?;
+        let context = self.blu_workflows.as_ref()?;
+        let workflow = (context.snapshot)()
+            .into_iter()
+            .find(|workflow| workflow.extension_id == extension_id && workflow.name == name)?;
+        Some(describe_workflow_definition(&workflow, &context.root))
+    }
+
     async fn run_workflow_definition(
         &self,
         context: &BluWorkflowToolContext,
@@ -6310,6 +6333,80 @@ struct RunBluExtensionArgs {
     workflow_id: Uuid,
     extension_id: String,
     name: String,
+}
+
+/// The concrete execution behind a workflow tool call, resolved from the
+/// extension snapshot before approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct WorkflowInvocationDescription {
+    pub extension_id: String,
+    pub name: String,
+    pub runtime: crate::WorkflowRuntime,
+    /// Entrypoint and working directory relative to the session root when
+    /// they live inside it.
+    pub entrypoint: PathBuf,
+    pub working_directory: PathBuf,
+    /// The shell command an external runtime runs: program, manifest
+    /// arguments, then the entrypoint. `None` for the embedded Blu VM.
+    pub command: Option<String>,
+    pub artifact_hash: String,
+}
+
+impl WorkflowInvocationDescription {
+    pub fn detail(&self) -> String {
+        let mut detail = format!(
+            "{}:{} · {} runtime · entrypoint {} · cwd {}",
+            self.extension_id,
+            self.name,
+            self.runtime.label(),
+            self.entrypoint.display(),
+            self.working_directory.display()
+        );
+        match &self.command {
+            Some(command) => {
+                detail.push_str("\nRuns: ");
+                detail.push_str(command);
+            }
+            None => detail.push_str("\nRuns inside the embedded Blu VM; no external process"),
+        }
+        let hash_prefix = &self.artifact_hash[..self.artifact_hash.len().min(16)];
+        detail.push_str(&format!("\nartifact sha256 {hash_prefix}"));
+        detail
+    }
+}
+
+pub(crate) fn describe_workflow_definition(
+    workflow: &crate::BluWorkflowDefinition,
+    root: &Path,
+) -> WorkflowInvocationDescription {
+    let relative = |path: &Path| {
+        path.strip_prefix(root)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let command = (!workflow.runtime.is_embedded()).then(|| {
+        let program = workflow
+            .command
+            .clone()
+            .unwrap_or_else(|| workflow.runtime.default_command().to_string());
+        std::iter::once(program)
+            .chain(workflow.args.iter().cloned())
+            .chain(std::iter::once(
+                workflow.entrypoint.to_string_lossy().into_owned(),
+            ))
+            .map(|part| crate::blu_workflow::shell_quote(&part))
+            .collect::<Vec<_>>()
+            .join(" ")
+    });
+    WorkflowInvocationDescription {
+        extension_id: workflow.extension_id.clone(),
+        name: workflow.name.clone(),
+        runtime: workflow.runtime,
+        entrypoint: relative(&workflow.entrypoint),
+        working_directory: relative(&workflow.working_directory),
+        command,
+        artifact_hash: crate::blu_workflow::runtime_artifact_hash(workflow),
+    }
 }
 
 #[derive(Deserialize)]

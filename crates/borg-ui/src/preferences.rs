@@ -3,6 +3,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::localization::UiLanguage;
@@ -14,7 +15,7 @@ const MAX_TRANSCRIPT_LABEL_CHARS: usize = 32;
 const HEX_COLOR_LENGTH: usize = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 #[derive(Default)]
 pub struct EditorPreferences {
     pub transcript: TranscriptPreferences,
@@ -24,7 +25,7 @@ pub struct EditorPreferences {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct LayoutPreferences {
     pub horizontal_margin: u16,
     pub composer_max_height: u16,
@@ -42,7 +43,7 @@ impl Default for LayoutPreferences {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct TranscriptPreferences {
     pub user_label: String,
     pub assistant_label: String,
@@ -103,7 +104,7 @@ pub enum ToolClickBehavior {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct InteractionPreferences {
     pub active_messages: ActiveMessageBehavior,
     pub prevent_sleep: bool,
@@ -128,7 +129,7 @@ impl Default for InteractionPreferences {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct PresentationPreferences {
     pub ui_language: UiLanguage,
     pub refresh_rate_fps: u16,
@@ -187,8 +188,18 @@ impl EditorPreferences {
         }
         let source = fs::read_to_string(path)
             .with_context(|| format!("failed to read editor preferences {}", path.display()))?;
-        let preferences: Self = toml::from_str(&source)
+        // A newer Borg may already have written keys this build does not
+        // know. Refusing to start over them would strand the user on every
+        // downgrade or side-by-side install, so they are reported and kept.
+        let (preferences, unknown_keys) = from_toml_str_lenient::<Self>(&source)
             .with_context(|| format!("invalid editor preferences {}", path.display()))?;
+        if !unknown_keys.is_empty() {
+            tracing::warn!(
+                path = %path.display(),
+                keys = %unknown_keys.join(", "),
+                "editor preferences contain keys this Borg build does not understand; they are kept but have no effect"
+            );
+        }
         preferences
             .validate()
             .with_context(|| format!("invalid editor preferences {}", path.display()))?;
@@ -207,7 +218,24 @@ impl EditorPreferences {
             .context("editor preferences path has no parent directory")?;
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
-        let source = toml::to_string_pretty(self).context("failed to encode editor preferences")?;
+        let toml::Value::Table(mut document) =
+            toml::Value::try_from(self).context("failed to encode editor preferences")?
+        else {
+            anyhow::bail!("editor preferences did not encode as a TOML table");
+        };
+        // Keys written by a newer Borg survive a save from this build, so a
+        // downgrade or a side-by-side install never erases settings the user
+        // has already made.
+        if let Ok(existing_source) = fs::read_to_string(path)
+            && let Ok((_, unknown_keys)) = from_toml_str_lenient::<Self>(&existing_source)
+            && let Ok(existing) = existing_source.parse::<toml::Table>()
+        {
+            for key_path in unknown_keys {
+                copy_toml_path(&existing, &mut document, &key_path);
+            }
+        }
+        let source =
+            toml::to_string_pretty(&document).context("failed to encode editor preferences")?;
         let mut temporary = tempfile::NamedTempFile::new_in(parent)
             .with_context(|| format!("failed to create temporary file in {}", parent.display()))?;
         temporary
@@ -253,6 +281,67 @@ impl EditorPreferences {
             "composer maximum height must be between 3 and 30 rows"
         );
         Ok(())
+    }
+}
+
+/// Deserialize `T` and report the dotted paths of every key `T` ignored.
+///
+/// Config structs accept unknown keys so that a file written by a newer Borg
+/// still loads in an older one; callers decide whether the unknown paths are
+/// a warning (user files) or an error (extension manifests).
+pub fn deserialize_lenient<'de, T, D>(
+    deserializer: D,
+) -> std::result::Result<(T, Vec<String>), D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    let mut unknown_keys = Vec::new();
+    let value = serde_ignored::deserialize(deserializer, |path| {
+        unknown_keys.push(path.to_string());
+    })?;
+    Ok((value, unknown_keys))
+}
+
+/// Parse a TOML document leniently; see [`deserialize_lenient`].
+pub fn from_toml_str_lenient<T: DeserializeOwned>(
+    source: &str,
+) -> std::result::Result<(T, Vec<String>), toml::de::Error> {
+    deserialize_lenient(toml::Deserializer::parse(source)?)
+}
+
+/// Copy the value at a dotted `key_path` from `source` into `target`,
+/// creating intermediate tables. Paths that address array elements are
+/// skipped; preferences never nest tables inside arrays.
+fn copy_toml_path(source: &toml::Table, target: &mut toml::Table, key_path: &str) {
+    if key_path.contains('[') {
+        return;
+    }
+    let mut segments = key_path.split('.').peekable();
+    let mut source_table = source;
+    let mut target_table = target;
+    while let Some(segment) = segments.next() {
+        let Some(value) = source_table.get(segment) else {
+            return;
+        };
+        if segments.peek().is_none() {
+            target_table.insert(segment.to_string(), value.clone());
+            return;
+        }
+        let Some(next_source) = value.as_table() else {
+            return;
+        };
+        source_table = next_source;
+        let entry = target_table
+            .entry(segment.to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if !entry.is_table() {
+            *entry = toml::Value::Table(toml::Table::new());
+        }
+        let Some(next_target) = entry.as_table_mut() else {
+            return;
+        };
+        target_table = next_target;
     }
 }
 
@@ -450,6 +539,39 @@ mod tests {
         assert!(preferences.interaction.prevent_sleep);
         assert_eq!(preferences.presentation.refresh_rate_fps, 60);
         assert_eq!(preferences.layout.horizontal_margin, 0);
+    }
+
+    #[test]
+    fn unknown_keys_are_reported_and_survive_a_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("editor.toml");
+        fs::write(
+            &path,
+            "[interaction]\nprevent_sleep = false\nfuture_flag = \"authorized\"\n\n[future_section]\nenabled = true\n",
+        )
+        .unwrap();
+        let (loaded, mut unknown) =
+            from_toml_str_lenient::<EditorPreferences>(&fs::read_to_string(&path).unwrap())
+                .unwrap();
+        assert!(!loaded.interaction.prevent_sleep);
+        unknown.sort();
+        assert_eq!(unknown, vec!["future_section", "interaction.future_flag"]);
+
+        let mut loaded = EditorPreferences::load_from(&path).unwrap();
+        loaded.interaction.prevent_sleep = true;
+        loaded.save_to(&path).unwrap();
+        let saved = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<toml::Table>()
+            .unwrap();
+        assert_eq!(saved["interaction"]["prevent_sleep"].as_bool(), Some(true));
+        assert_eq!(
+            saved["interaction"]["future_flag"].as_str(),
+            Some("authorized")
+        );
+        assert_eq!(saved["future_section"]["enabled"].as_bool(), Some(true));
+        let reloaded = EditorPreferences::load_from(&path).unwrap();
+        assert!(reloaded.interaction.prevent_sleep);
     }
 
     #[test]

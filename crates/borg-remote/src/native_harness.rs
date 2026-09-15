@@ -1645,8 +1645,25 @@ async fn execute_tool(
         || !trusted_settings.is_empty())
         && runtime.permission != PermissionMode::FullAccess
     {
+        // A workflow tool names an extension and a workflow; the program and
+        // arguments that actually run come from the extension manifest. The
+        // human and the automatic reviewer must see that resolved command,
+        // not the tool name with an opaque id.
+        let workflow_invocation = runtime
+            .agent_tools
+            .describe_workflow_invocation(&tool_call.function.name, &input);
+        let approval_command = shell_command.clone().or_else(|| {
+            workflow_invocation
+                .as_ref()
+                .and_then(|invocation| invocation.command.clone())
+        });
         let (title, detail) = if let Some(command) = shell_command.as_deref() {
             ("Run command", command.to_string())
+        } else if let Some(invocation) = workflow_invocation.as_ref() {
+            (
+                "Run extension workflow",
+                bounded_text(invocation.detail(), MAX_APPROVAL_DETAIL_BYTES),
+            )
         } else if !trusted_settings.is_empty() {
             (
                 "Change trusted settings",
@@ -1673,17 +1690,25 @@ async fn execute_tool(
         let decision = match runtime.permission {
             PermissionMode::FullAccess => ApprovalDecision::AllowOnce,
             PermissionMode::Manual => {
-                request_tool_approval(title, &detail, shell_command, events, controls).await?
+                request_tool_approval(title, &detail, approval_command.clone(), events, controls)
+                    .await?
             }
             PermissionMode::Auto if !trusted_settings.is_empty() => {
                 request_tool_approval(title, &detail, None, events, controls).await?
             }
             PermissionMode::Auto => {
+                let review_input = match workflow_invocation.as_ref() {
+                    Some(invocation) => json!({
+                        "arguments": input,
+                        "resolved_execution": invocation,
+                    }),
+                    None => input.clone(),
+                };
                 match review_tool_automatically(
                     harness,
                     approval_context,
                     &tool_call.function.name,
-                    &input,
+                    &review_input,
                     controls,
                 )
                 .await
@@ -1723,7 +1748,7 @@ async fn execute_tool(
                         request_tool_approval(
                             "Automatic review unavailable",
                             &fallback_detail,
-                            shell_command,
+                            approval_command,
                             events,
                             controls,
                         )

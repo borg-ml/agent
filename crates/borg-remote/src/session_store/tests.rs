@@ -4107,6 +4107,77 @@ fn persistence_and_fork_rules_are_typed_rust_contracts() {
         delivery: Some(crate::PromptDelivery::Queue),
     };
     assert_eq!(user_in_progress.persistence(), EventPersistence::Durable);
+    // A parent journals a mirrored child event exactly when the child would.
+    let child_id = Uuid::new_v4();
+    let snapshot = || crate::SubagentSnapshot {
+        session_id: child_id,
+        parent_session_id: Uuid::new_v4(),
+        task_name: "worker".to_string(),
+        status: crate::SubagentStatus::Running,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        cwd: std::path::PathBuf::from("/tmp"),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        detail: None,
+        final_text: None,
+        usage: crate::SubagentUsage::default(),
+    };
+    let mirrored = |kind: SessionEventKind| SessionEventKind::SubagentActivity {
+        activity: crate::SubagentActivityKind::Updated,
+        agent: snapshot(),
+        event: Some(Box::new(SessionEvent::new(child_id, 0, kind))),
+    };
+    assert_eq!(
+        mirrored(SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "heartbeat".to_string(),
+            payload: serde_json::Value::Null,
+        })
+        .persistence(),
+        EventPersistence::Ephemeral
+    );
+    assert_eq!(
+        mirrored(SessionEventKind::ReasoningDelta {
+            text: "thinking".to_string()
+        })
+        .persistence(),
+        EventPersistence::Ephemeral
+    );
+    assert_eq!(
+        mirrored(SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: crate::EventActor::Assistant,
+            text: "streaming".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        })
+        .persistence(),
+        EventPersistence::Ephemeral
+    );
+    assert_eq!(
+        mirrored(SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: crate::EventActor::Assistant,
+            text: "done".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        })
+        .persistence(),
+        EventPersistence::Durable
+    );
+    assert_eq!(
+        SessionEventKind::SubagentActivity {
+            activity: crate::SubagentActivityKind::Completed,
+            agent: snapshot(),
+            event: None,
+        }
+        .persistence(),
+        EventPersistence::Durable
+    );
     assert!(!user_in_progress.is_fork_inheritable());
     assert_eq!(
         SessionEventKind::Message {
@@ -5135,4 +5206,125 @@ async fn narrowed_recovery_skips_the_context_payloads_a_resume_never_reads() {
         "recovery over {} context events: full {full_elapsed:?}; roster-only {subagents_elapsed:?}; queue-only {queue_elapsed:?}",
         full.context_events.len()
     );
+}
+
+#[tokio::test]
+async fn compact_removes_legacy_mirrored_rows_the_journal_no_longer_persists() {
+    let (_directory, store) = store().await;
+    let parent = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    store.create_session(parent).await.unwrap();
+    let snapshot = crate::SubagentSnapshot {
+        session_id: child,
+        parent_session_id: parent,
+        task_name: "worker".to_string(),
+        status: crate::SubagentStatus::Running,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        cwd: std::path::PathBuf::from("/tmp"),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        detail: None,
+        final_text: None,
+        usage: crate::SubagentUsage::default(),
+    };
+    let mirrored = |kind: SessionEventKind| SessionEventKind::SubagentActivity {
+        activity: crate::SubagentActivityKind::Updated,
+        agent: snapshot.clone(),
+        event: Some(Box::new(SessionEvent::new(child, 7, kind))),
+    };
+    let heartbeat = || SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Codex,
+        kind: "heartbeat".to_string(),
+        payload: serde_json::json!({ "noise": true }),
+    };
+    store
+        .append(SessionEvent::new(
+            parent,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "orchestrate".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            parent,
+            0,
+            mirrored(SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: "child finished".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            }),
+        ))
+        .await
+        .unwrap();
+    // A row an earlier release journaled: the child's provider heartbeat,
+    // mirrored as a durable parent event.
+    let legacy = SessionEvent::new(parent, 3, mirrored(heartbeat()));
+    sqlx::query(
+        "insert into session_events \
+         (session_id, sequence, event_id, event_kind, event_json, projection_json, \
+          fork_inheritable, recovery_relevant, message_id, created_at) \
+         values (?, ?, ?, 'subagent_activity', ?, '{}', 0, 1, null, ?)",
+    )
+    .bind(parent.to_string())
+    .bind(3_i64)
+    .bind(legacy.id.to_string())
+    .bind(serde_json::to_string(&legacy).unwrap())
+    .bind(legacy.created_at.to_rfc3339())
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let count = |store: &SqliteSessionStore| {
+        let pool = store.pool().clone();
+        let parent = parent.to_string();
+        async move {
+            sqlx::query_scalar::<_, i64>("select count(*) from session_events where session_id = ?")
+                .bind(parent)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    assert_eq!(count(&store).await, 3);
+
+    let outcome = store.compact(false).await.unwrap();
+    assert_eq!(outcome.deleted_events, 1);
+    assert!(!outcome.vacuumed);
+    assert_eq!(count(&store).await, 2);
+    let kinds: Vec<String> = sqlx::query_scalar(
+        "select event_kind from session_events where session_id = ? order by sequence",
+    )
+    .bind(parent.to_string())
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(kinds, vec!["message", "subagent_activity"]);
+
+    // The live journal no longer writes that row in the first place.
+    let live = store
+        .append(SessionEvent::new(parent, 0, mirrored(heartbeat())))
+        .await
+        .unwrap();
+    assert_eq!(live.sequence, 0);
+    assert_eq!(count(&store).await, 2);
+
+    let vacuumed = store.compact(true).await.unwrap();
+    assert!(vacuumed.vacuumed);
+    assert_eq!(vacuumed.deleted_events, 0);
+    // The sizes are reported from the page count; a tiny store may not shrink
+    // (a VACUUM can even add a page), so the contract is only that both are
+    // measured, not that the file always gets smaller.
+    assert!(vacuumed.bytes_before > 0 && vacuumed.bytes_after > 0);
 }

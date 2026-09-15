@@ -50,6 +50,7 @@ qrcode = { version = "0.14.1", default-features = false }
 regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+serde_ignored.workspace = true
 serde_json.workspace = true
 semver = "1"
 sha2.workspace = true
