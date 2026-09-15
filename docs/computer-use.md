@@ -130,7 +130,7 @@ visually in the window capture; an empty `since` diff after the action; desktop
 capture at 2880×1800 and isolated window capture at 1396×1200. Element ids are
 scoped to one helper process, as on Linux.
 
-macOS input injection (CGEvent, **not yet verified on the Mac**): `type_text`
+macOS input injection (CGEvent, verified on the Mac — see below): `type_text`
 (Unicode via keyboard events), `key` (one key plus cmd/ctrl/alt/shift, e.g.
 `cmd+s`), `pointer_click` (centre of an observed element, validated like
 `click`, or an explicit `x`,`y` in AX screen points; `button`, `count`),
@@ -151,6 +151,18 @@ a silent no-op. Pointer ops now target the centre of the element's
 elements that are scrolled out of view; text nodes also expose `selected_text`.
 A tree that is still changing right after typing can reject the next action as
 "changed since observation" — re-observe and retry.
+
+Round 4 on the same host (main `58a4a63`, macOS 26.2 arm64) confirmed the
+fixes: `scroll` on a 200-line TextEdit document moved the text area by exactly
+the requested 600 px from the centre of its `visible_bounds`; partially clipped
+elements report the clipped rect and fully hidden Finder rows report
+`visible_bounds: null` with `pointer_click` refused as scrolled out of view;
+`selected_text` reflects `cmd+a`, shift-arrow selection and drag selection; and
+`type_text`, `key`, element-targeted `pointer_click` and `drag` all still pass.
+Observed caveats: one `type_text` returned ok while the focus race dropped the
+text (a fresh observe and retry landed it), and a macOS TCC prompt blocks
+injection with a clean "could not bring the target application to the front"
+error until dismissed.
 
 ## Windows (unverified)
 
