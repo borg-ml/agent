@@ -236,7 +236,7 @@ struct SubscriptionContextToolCall<'a> {
     arguments: &'a str,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct PromptBatchEntry {
     message_id: Uuid,
     text: String,
@@ -244,9 +244,9 @@ struct PromptBatchEntry {
     attachments: Vec<PathBuf>,
 }
 
-#[derive(Clone)]
-struct QueuedPrompt {
-    message_id: Uuid,
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct QueuedPrompt {
+    pub(crate) message_id: Uuid,
     text: String,
     actor: EventActor,
     attachments: Vec<std::path::PathBuf>,
@@ -1792,11 +1792,44 @@ async fn run_agent_session_store_kernel(
     // all other failures remain durable as failed messages instead of being
     // mistaken for completed input.
     let mut automatic_retry_message_ids = HashSet::new();
-    let mut retry_not_before: Option<Instant> = None;
+    let mut retry_not_before = state.usage_limit_retry.as_ref().and_then(|retry| {
+        retry
+            .retry_at
+            .map(|deadline| Instant::now() + (deadline - Utc::now()).to_std().unwrap_or_default())
+    });
     let mut usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
     let mut network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
     let mut network_retry_message_id = None;
-    let mut usage_limit_continuation_id: Option<Uuid> = None;
+    let mut usage_limit_continuation_id = None;
+    if let Some(retry) = state.usage_limit_retry {
+        if retry.continuation {
+            // The process may have died after the atomic retry checkpoint but
+            // before settling its original messages. Settle them before this
+            // checkpoint can be consumed, so a second restart cannot replay them.
+            for original in pending.iter().filter(|prompt| {
+                retry.replaced_message_ids.contains(&prompt.message_id)
+                    && prompt.message_id != retry.prompt.message_id
+            }) {
+                record_prompt_status(
+                    &mut journal,
+                    &events,
+                    session_id,
+                    original,
+                    MessageStatus::Complete,
+                    original.delivery,
+                )
+                .await?;
+            }
+        }
+        pending.retain(|prompt| {
+            prompt.message_id != retry.prompt.message_id
+                && !retry.replaced_message_ids.contains(&prompt.message_id)
+        });
+        if retry.continuation {
+            usage_limit_continuation_id = Some(retry.prompt.message_id);
+        }
+        pending.push_front(retry.prompt);
+    }
     let mut auth_lookup_retries = 0_usize;
     let mut at_turn_boundary = !pending.is_empty();
     let mut projection_repair_started = false;
@@ -2546,6 +2579,17 @@ async fn run_agent_session_store_kernel(
                                         };
                                 }
                                 if retry_selection && retry_not_before.take().is_some() {
+                                    record(
+                                        &mut journal,
+                                        &events,
+                                        session_id,
+                                        SessionEventKind::ProviderEvent {
+                                            provider: launch.provider,
+                                            kind: "usage_limit_retry_released".into(),
+                                            payload: serde_json::json!({}),
+                                        },
+                                    )
+                                    .await?;
                                     usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
                                     break pop_next_pending_prompt(&mut pending, true);
                                 }
@@ -3767,6 +3811,7 @@ async fn run_agent_session_store_kernel(
                             // on. Re-sending it would repeat that work, so the
                             // resume is a continuation rather than a replay.
                             let usage_limit_continue = usage_limit_retry && turn_had_side_effects;
+                            let continuation = usage_limit_continue.then(|| usage_limit_continuation(&prompt));
                             let auth_lookup_failure = provider_error_is_auth_lookup_unavailable(&error);
                             if network_retry_message_id != Some(prompt.message_id) {
                                 auth_lookup_retries = 0;
@@ -3875,7 +3920,19 @@ async fn run_agent_session_store_kernel(
                                 record(&mut journal, &events, session_id, SessionEventKind::ProviderEvent {
                                     provider: launch.provider,
                                     kind: "usage_limit_retry".into(),
-                                    payload: serde_json::json!({"retry_at": Utc::now() + chrono::Duration::from_std(wait).unwrap_or_default()}),
+                                    // Commit the deadline and replacement together before
+                                    // settling the original message, closing the crash gap.
+                                    payload: serde_json::to_value(crate::session_store::PendingUsageLimitRetry {
+                                        retry_at: Some(Utc::now() + chrono::Duration::from_std(wait).unwrap_or_default()),
+                                        prompt: continuation.clone().unwrap_or_else(|| {
+                                            let mut retry = prompt.clone();
+                                            retry.delivery = PromptDelivery::Queue;
+                                            retry
+                                        }),
+                                        replaced_message_ids: prompt.batch_entries().iter().map(|entry| entry.message_id).collect(),
+                                        continuation: usage_limit_continue || !prompt.visible,
+                                        in_progress: false,
+                                    })?,
                                 }).await?;
                                 if usage_limit_reset_delay.is_none() {
                                     usage_limit_retry_delay = usage_limit_retry_delay
@@ -3946,8 +4003,7 @@ async fn run_agent_session_store_kernel(
                                 )
                                 .await?;
                             }
-                            if usage_limit_continue {
-                                let continuation = usage_limit_continuation(&prompt);
+                            if let Some(continuation) = continuation {
                                 usage_limit_continuation_id = Some(continuation.message_id);
                                 pending.push_front(continuation);
                             } else if retry {
@@ -3955,6 +4011,9 @@ async fn run_agent_session_store_kernel(
                                 retry_prompt.delivery = if network_retry && prompt.actor == EventActor::System {
                                     PromptDelivery::Steer
                                 } else { PromptDelivery::Queue };
+                                if usage_limit_retry && !retry_prompt.visible {
+                                    usage_limit_continuation_id = Some(retry_prompt.message_id);
+                                }
                                 pending.push_front(retry_prompt);
                             }
                             next_ready_detail = Some(ready_detail);

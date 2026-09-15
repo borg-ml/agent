@@ -2330,6 +2330,7 @@ async fn usage_limit_after_side_effects_continues_instead_of_replaying_the_promp
     let mut completions = 0;
     let mut user_statuses = Vec::new();
     let mut continuation_message_id = None;
+    let mut checkpoint = None;
     while completions < 2 {
         let Some(event) = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
             .await
@@ -2341,6 +2342,17 @@ async fn usage_limit_after_side_effects_continues_instead_of_replaying_the_promp
             );
         };
         match &event.kind {
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "usage_limit_retry" =>
+            {
+                assert_eq!(event.kind.persistence(), crate::EventPersistence::Durable);
+                checkpoint = Some(
+                    serde_json::from_value::<crate::session_store::PendingUsageLimitRetry>(
+                        payload.clone(),
+                    )
+                    .unwrap(),
+                );
+            }
             SessionEventKind::Message {
                 message_id: id,
                 actor: EventActor::User,
@@ -2374,10 +2386,256 @@ async fn usage_limit_after_side_effects_continues_instead_of_replaying_the_promp
         "user prompt must not return to the queue: {user_statuses:?}"
     );
     assert!(continuation_message_id.is_some());
+    let checkpoint = checkpoint.unwrap();
+    assert!(checkpoint.retry_at.is_some());
+    assert_eq!(Some(checkpoint.prompt.message_id), continuation_message_id);
+    assert_eq!(checkpoint.replaced_message_ids, vec![message_id]);
     let prompts = prompts.lock().unwrap();
+    assert!(prompts[1].contains(&serde_json::to_string(&checkpoint.prompt.text).unwrap()));
     assert!(prompts[0].contains("finish this task"));
     assert!(prompts[1].contains("Continue from exactly where it left off"));
     assert!(prompts[1].contains("finish this task"));
+}
+
+// Seed the crash boundary immediately after the atomic checkpoint, before
+// the old message was settled. Same-process retry tests cannot cover this.
+#[tokio::test(flavor = "current_thread")]
+async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_delivery() {
+    for (continuation, cancel, already_started, model_changed) in [
+        (false, false, false, false),
+        (true, false, false, false),
+        (true, false, true, false),
+        (true, false, false, true),
+        (true, true, false, false),
+    ] {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let original = QueuedPrompt {
+            message_id: Uuid::new_v4(),
+            text: "finish the committed work".into(),
+            actor: EventActor::User,
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+            visible: true,
+            interrupt_batch: true,
+            batch: Vec::new(),
+        };
+        let prompt = if continuation {
+            usage_limit_continuation(&original)
+        } else {
+            original.clone()
+        };
+        let deadline = Utc::now() + chrono::Duration::seconds(2);
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        store.create_session(session_id).await.unwrap();
+        for kind in [
+            SessionEventKind::SessionStarted,
+            SessionEventKind::SessionConfigured {
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+            },
+            SessionEventKind::Message {
+                message_id: original.message_id,
+                actor: original.actor,
+                text: original.text.clone(),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: Some(PromptDelivery::Queue),
+            },
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "usage_limit_retry".into(),
+                payload: serde_json::to_value(crate::session_store::PendingUsageLimitRetry {
+                    retry_at: Some(deadline),
+                    prompt: prompt.clone(),
+                    replaced_message_ids: vec![original.message_id],
+                    continuation,
+                    in_progress: false,
+                })
+                .unwrap(),
+            },
+        ] {
+            store
+                .append(SessionEvent::new(session_id, 0, kind))
+                .await
+                .unwrap();
+        }
+        if already_started {
+            store
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    SessionEventKind::TurnStarted {
+                        message_id: prompt.message_id,
+                        provider: CodingProvider::Codex,
+                        model: model_changed.then(|| "replacement-model".into()),
+                        effort: None,
+                        fast: false,
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        if model_changed {
+            store
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    SessionEventKind::SessionConfigured {
+                        cwd: root.path().to_path_buf(),
+                        provider: CodingProvider::Codex,
+                        model: Some("replacement-model".into()),
+                        effort: None,
+                        fast: false,
+                        response_language: crate::ResponseLanguage::Auto,
+                        permission_mode: PermissionMode::Manual,
+                    },
+                ))
+                .await
+                .unwrap();
+            let retry = store
+                .state(session_id)
+                .await
+                .unwrap()
+                .usage_limit_retry
+                .unwrap();
+            assert!(retry.retry_at.is_none());
+            assert_eq!(retry.prompt, prompt);
+        }
+        let state = store.state(session_id).await.unwrap();
+        let fork_id = Uuid::new_v4();
+        store
+            .fork_before(session_id, fork_id, state.latest_sequence + 1)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .state(fork_id)
+                .await
+                .unwrap()
+                .usage_limit_retry
+                .is_none()
+        );
+        let calls = Arc::new(AtomicUsize::new(1));
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        // A second actor generation must not resurrect the completed original
+        // or a cancelled continuation after the retry checkpoint is gone.
+        for generation in 0..2 {
+            let (command_tx, command_rx) = mpsc::channel(8);
+            let (event_tx, mut event_rx) = mpsc::channel(128);
+            let executor: Arc<dyn AgentTurnExecutor> = Arc::new(UsageLimitThenSuccessExecutor {
+                calls: Arc::clone(&calls),
+                side_effects_before_limit: false,
+                prompts: Arc::clone(&prompts),
+            });
+            let journal_path = root.path().join("session.lock");
+            let cwd = root.path().to_path_buf();
+            let actor = tokio::spawn(async move {
+                run_agent_session_with_executor(
+                    &journal_path,
+                    session_id,
+                    LaunchSession {
+                        request_id: Uuid::new_v4(),
+                        cwd,
+                        provider: CodingProvider::Codex,
+                        model: model_changed.then(|| "replacement-model".into()),
+                        effort: None,
+                        fast: Some(false),
+                        response_language: crate::ResponseLanguage::Auto,
+                        permission_mode: PermissionMode::Manual,
+                        name: None,
+                        initial_prompt: None,
+                        capabilities: Default::default(),
+                        subagent_concurrency_limit: None,
+                        extension_skill_roots: Vec::new(),
+                        team_policy: None,
+                    },
+                    command_rx,
+                    event_tx,
+                    executor,
+                )
+                .await
+            });
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                match event.kind {
+                    SessionEventKind::TurnStarted { message_id, .. } => {
+                        assert_eq!(generation, 0);
+                        assert!(!cancel);
+                        assert_eq!(message_id, prompt.message_id);
+                        assert!(already_started || model_changed || Utc::now() >= deadline);
+                    }
+                    SessionEventKind::TurnCompleted { error, .. } => {
+                        assert!(error.is_none());
+                        break;
+                    }
+                    SessionEventKind::StatusChanged {
+                        status: SessionStatus::Ready,
+                        ..
+                    } if generation == 1 || cancel => break,
+                    _ => {}
+                }
+            }
+            if generation == 0 && cancel {
+                assert!(
+                    Utc::now() < deadline,
+                    "cancel while the deadline is pending"
+                );
+                command_tx
+                    .send(HostCommand::Interrupt { session_id })
+                    .await
+                    .unwrap();
+                loop {
+                    let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if matches!(
+                        event.kind,
+                        SessionEventKind::UserStopChanged { engaged: true }
+                    ) {
+                        break;
+                    }
+                }
+            }
+            if generation == 1 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            command_tx
+                .send(HostCommand::Stop { session_id })
+                .await
+                .unwrap();
+            actor.await.unwrap().unwrap();
+            assert!(
+                store
+                    .state(session_id)
+                    .await
+                    .unwrap()
+                    .usage_limit_retry
+                    .is_none()
+            );
+            assert!(
+                recover_prompts_on_resume(&store.recovery(session_id).await.unwrap().queue_events)
+                    .is_empty()
+            );
+        }
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), usize::from(!cancel));
+        if !cancel {
+            assert!(prompts[0].contains(&serde_json::to_string(&prompt.text).unwrap()));
+        }
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -512,7 +512,11 @@ impl SessionEventKind {
             Self::ProviderEvent { kind, .. }
                 if matches!(
                     kind.as_str(),
-                    "native_model_message" | "native_tool_round_completed"
+                    "native_model_message"
+                        | "native_tool_round_completed"
+                        | "usage_limit_retry"
+                        | "usage_limit_retry_cancelled"
+                        | "usage_limit_retry_released"
                 ) =>
             {
                 EventPersistence::Durable
@@ -570,6 +574,11 @@ impl SessionEventKind {
     }
 
     pub fn is_fork_inheritable(&self) -> bool {
+        if matches!(self, Self::ProviderEvent { kind, .. }
+            if matches!(kind.as_str(), "usage_limit_retry" | "usage_limit_retry_cancelled" | "usage_limit_retry_released"))
+        {
+            return false;
+        }
         !matches!(
             self,
             Self::ProviderSessionLinked { .. }
@@ -840,6 +849,17 @@ pub struct SessionUsage {
     pub context_window_tokens: Option<u64>,
 }
 
+/// One atomic checkpoint preserves the exact replacement prompt and deadline.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingUsageLimitRetry {
+    pub(crate) retry_at: Option<DateTime<Utc>>,
+    pub(crate) prompt: crate::session::QueuedPrompt,
+    pub(crate) replaced_message_ids: Vec<Uuid>,
+    pub(crate) continuation: bool,
+    #[serde(default)]
+    pub(crate) in_progress: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SessionState {
@@ -897,6 +917,7 @@ pub struct SessionState {
     /// background input override a stop until the human re-engages.
     #[serde(default)]
     pub user_stopped: bool,
+    pub usage_limit_retry: Option<PendingUsageLimitRetry>,
 }
 
 impl SessionState {
@@ -978,6 +999,9 @@ impl SessionState {
                     permission_mode: *permission_mode,
                 });
                 if context_identity_changed {
+                    if let Some(retry) = &mut self.usage_limit_retry {
+                        retry.retry_at = None;
+                    }
                     self.context_generation = self.context_generation.saturating_add(1);
                     // A model change starts a new Borg context generation, but
                     // an acknowledged Codex thread remains resumable under
@@ -1023,11 +1047,58 @@ impl SessionState {
                     self.pending_provider_context_contract_version = None;
                 }
             }
+            SessionEventKind::TurnStarted { message_id, .. } => {
+                if let Some(retry) = &mut self.usage_limit_retry {
+                    if retry.prompt.message_id == *message_id {
+                        retry.in_progress = true;
+                        retry.retry_at = None;
+                    } else {
+                        self.usage_limit_retry = None;
+                    }
+                }
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "usage_limit_retry" =>
+            {
+                // Legacy events recorded only a deadline, not a recoverable prompt.
+                self.usage_limit_retry = if payload.get("prompt").is_some() {
+                    Some(serde_json::from_value(payload.clone())?)
+                } else {
+                    None
+                };
+            }
+            SessionEventKind::ProviderEvent { kind, .. }
+                if kind == "usage_limit_retry_cancelled" =>
+            {
+                self.usage_limit_retry = None;
+            }
+            SessionEventKind::ProviderEvent { kind, .. }
+                if kind == "usage_limit_retry_released" =>
+            {
+                if let Some(retry) = &mut self.usage_limit_retry {
+                    retry.retry_at = None;
+                }
+            }
+            SessionEventKind::PromptRecalled { message_id, .. } => {
+                if self.usage_limit_retry.as_ref().is_some_and(|retry| {
+                    retry.prompt.message_id == *message_id
+                        || retry.replaced_message_ids.contains(message_id)
+                }) {
+                    self.usage_limit_retry = None;
+                }
+            }
             SessionEventKind::TurnCompleted {
                 provider_session_id,
                 error,
                 ..
             } => {
+                if self
+                    .usage_limit_retry
+                    .as_ref()
+                    .is_some_and(|retry| retry.in_progress)
+                {
+                    self.usage_limit_retry = None;
+                }
                 // A provider id is resumable only at a durable terminal
                 // boundary. Successful turns and acknowledged interrupts are
                 // valid checkpoints; uncertain failures explicitly unlink the
@@ -1076,8 +1147,16 @@ impl SessionState {
                 self.pending_provider_interaction_payload = None;
             }
             SessionEventKind::WatchesChanged { watches } => self.watches = watches.clone(),
-            SessionEventKind::GoalUpdated { goal } => self.goal = Some(goal.clone()),
-            SessionEventKind::GoalCleared { .. } => self.goal = None,
+            SessionEventKind::GoalUpdated { goal } => {
+                if !goal.status.is_active() {
+                    self.usage_limit_retry = None;
+                }
+                self.goal = Some(goal.clone());
+            }
+            SessionEventKind::GoalCleared { .. } => {
+                self.usage_limit_retry = None;
+                self.goal = None;
+            }
             SessionEventKind::PlanUpdated { items } => self.todos = items.clone(),
             SessionEventKind::UsageUpdated {
                 provider_duration_ms,
@@ -1166,6 +1245,9 @@ impl SessionState {
                 self.latest_response = Some(text.trim().to_string());
             }
             SessionEventKind::UserStopChanged { engaged } => {
+                if *engaged {
+                    self.usage_limit_retry = None;
+                }
                 self.user_stopped = *engaged;
             }
             _ => {}
@@ -1181,6 +1263,7 @@ impl SessionState {
         // A fork is a fresh human-initiated branch; it never inherits a
         // parent's user-stop gate.
         state.user_stopped = false;
+        state.usage_limit_retry = None;
         state.provider_session_id = None;
         state.provider_turn_id = None;
         state.pending_provider_turn_id = None;
