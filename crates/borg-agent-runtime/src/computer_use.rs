@@ -82,7 +82,7 @@ const CONSEQUENTIAL_WORDS: &[&str] = &[
 
 /// Whether an effect on this element needs explicit human confirmation.
 pub(crate) fn action_is_consequential(op: &str, element: &ObservedElement) -> bool {
-    if !matches!(op, "click" | "set_value") {
+    if !matches!(op, "click" | "set_value" | "pointer_click" | "type_text") {
         return false;
     }
     let lowered = element.name.to_ascii_lowercase();
@@ -134,7 +134,17 @@ impl ComputerUse {
         ensure!(
             matches!(
                 op,
-                "capabilities" | "list_windows" | "observe" | "screenshot" | "click" | "set_value"
+                "capabilities"
+                    | "list_windows"
+                    | "observe"
+                    | "screenshot"
+                    | "click"
+                    | "set_value"
+                    | "type_text"
+                    | "key"
+                    | "pointer_click"
+                    | "scroll"
+                    | "drag"
             ),
             "unsupported computer-use operation `{op}`"
         );
@@ -215,7 +225,7 @@ impl ComputerUse {
     /// Refuse to act on a consequential element unless the caller states that
     /// the human already confirmed this specific action (`confirmed: true`).
     async fn gate_consequential_action(&self, op: &str, arguments: &Value) -> Result<()> {
-        if !matches!(op, "click" | "set_value") {
+        if !matches!(op, "click" | "set_value" | "pointer_click") {
             return Ok(());
         }
         let window_id = arguments
@@ -443,6 +453,10 @@ mod tests {
         assert!(!action_is_consequential(
             "observe",
             &element("push button", "Send")
+        ));
+        assert!(action_is_consequential(
+            "pointer_click",
+            &element("AXButton", "Pay now")
         ));
     }
 

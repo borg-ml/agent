@@ -1044,6 +1044,21 @@ class ComputerUse:
     def set_value(self, window_id, element_id, observation_id, text, confirmed=False):
         return self("set_value", window_id=window_id, element_id=element_id, observation_id=observation_id, text=text, **({"confirmed": True} if confirmed else {}))
 
+    def type_text(self, window_id, text):
+        return self("type_text", window_id=window_id, text=text)
+
+    def key(self, window_id, keys):
+        return self("key", window_id=window_id, keys=keys)
+
+    def pointer_click(self, window_id, **options):
+        return self("pointer_click", window_id=window_id, **options)
+
+    def scroll(self, window_id, dx=0, dy=0, **options):
+        return self("scroll", window_id=window_id, dx=dx, dy=dy, **options)
+
+    def drag(self, window_id, from_x, from_y, to_x, to_y, **options):
+        return self("drag", window_id=window_id, from_x=from_x, from_y=from_y, to_x=to_x, to_y=to_y, **options)
+
 
 NAMESPACE["borg"] = Borg()
 NAMESPACE["cua"] = ComputerUse()
@@ -1320,6 +1335,11 @@ cua.screenshot = (scope, window_id) => cua("screenshot", window_id ? {scope, win
 cua.observe = (window_id, options = {}) => cua("observe", {...options, window_id});
 cua.click = (window_id, element_id, observation_id, options = {}) => cua("click", {...options, window_id, element_id, observation_id});
 cua.set_value = (window_id, element_id, observation_id, text, options = {}) => cua("set_value", {...options, window_id, element_id, observation_id, text});
+cua.type_text = (window_id, text) => cua("type_text", {window_id, text});
+cua.key = (window_id, keys) => cua("key", {window_id, keys});
+cua.pointer_click = (window_id, options = {}) => cua("pointer_click", {...options, window_id});
+cua.scroll = (window_id, dx = 0, dy = 0, options = {}) => cua("scroll", {...options, window_id, dx, dy});
+cua.drag = (window_id, from_x, from_y, to_x, to_y, options = {}) => cua("drag", {...options, window_id, from_x, from_y, to_x, to_y});
 context.cua = cua;
 context.console = runtimeConsole;
 

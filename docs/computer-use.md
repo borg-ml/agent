@@ -79,7 +79,17 @@ granted; `list_windows`; `observe` of a TextEdit window (45 nodes); `set_value`
 of "Borg macOS ✓" into its `AXTextArea`, confirmed both in the returned tree and
 visually in the window capture; an empty `since` diff after the action; desktop
 capture at 2880×1800 and isolated window capture at 1396×1200. Element ids are
-scoped to one helper process, as on Linux. Input injection is not implemented.
+scoped to one helper process, as on Linux.
+
+macOS input injection (CGEvent, **not yet verified on the Mac**): `type_text`
+(Unicode via keyboard events), `key` (one key plus cmd/ctrl/alt/shift, e.g.
+`cmd+s`), `pointer_click` (centre of an observed element, validated like
+`click`, or an explicit `x`,`y` in AX screen points; `button`, `count`),
+`scroll` (`dx`,`dy` pixels; positive `dy` scrolls content down) and `drag`
+(`from_x`,`from_y`,`to_x`,`to_y`). Every injection raises the target window
+first and consumes the window's observation; results carry the settled tree.
+Coordinate clicks bypass name-based confirmation gating because no element is
+named; element-targeted `pointer_click` is gated like `click`.
 
 ## Windows (unverified)
 
