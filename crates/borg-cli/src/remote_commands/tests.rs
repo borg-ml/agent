@@ -244,6 +244,22 @@ async fn prompt_dispatch_does_not_block_input_while_sqlite_is_locked() {
 }
 
 #[test]
+fn relaunching_the_same_session_carries_the_unsent_composer_draft() {
+    let session = Uuid::new_v4();
+    let draft = Some(("half typed".to_string(), vec![PathBuf::from("/tmp/a.png")]));
+    let explicit = Some(("detached".to_string(), Vec::new()));
+    assert_eq!(
+        relaunch_prompt(None, draft.clone(), session, session),
+        draft.clone()
+    );
+    assert_eq!(
+        relaunch_prompt(explicit.clone(), draft.clone(), session, session),
+        explicit
+    );
+    assert_eq!(relaunch_prompt(None, draft, Uuid::new_v4(), session), None);
+}
+
+#[test]
 fn resume_retries_sqlite_contention_but_not_permanent_errors() {
     assert!(local_resume_error_is_retryable(&anyhow::anyhow!(
         "pool timed out while waiting for an open connection"

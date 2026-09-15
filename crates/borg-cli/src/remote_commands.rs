@@ -451,6 +451,13 @@ impl TuiCrashContext {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(notice);
     }
 
+    fn has_retry_notice(&self) -> bool {
+        self.retry_notice
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
     fn take_retry_notice(&self) -> Option<String> {
         self.retry_notice
             .lock()
@@ -1258,7 +1265,10 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
                 selected_session = Some(next_session);
                 restored_prompt = next_prompt;
                 reusable_terminal = next_terminal;
-                if resume_requested {
+                // Back off only when the session came back because of an
+                // error. A deliberate relaunch (owner handoff, session
+                // switch, reacquired ownership) must not stall the UI.
+                if resume_requested && crash_context.has_retry_notice() {
                     tokio::time::sleep(resume_retry_delay).await;
                     resume_retry_delay = next_local_resume_retry_delay(resume_retry_delay);
                 } else {
@@ -7182,6 +7192,10 @@ async fn run_local_agent_session(
         terminal.set_dictation_state(DictationState::Idle);
     }
     let tui_was_active = crash_context.tui_active.load(Ordering::Acquire);
+    // A relaunch of this same session (owner handoff, reacquired ownership,
+    // transient reconnect) reuses or recreates the terminal, and both paths
+    // reset the composer. Capture the draft now so typed text survives.
+    let composer_draft = terminal.as_ref().and_then(BorgTerminal::composer_draft);
     let preserve_terminal = resume_session.is_some() && !user_requested_exit && terminal.is_some();
     if !preserve_terminal {
         shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
@@ -7228,7 +7242,12 @@ async fn run_local_agent_session(
         if discarded_empty_session {
             return Err(error);
         }
-        let retry_prompt = detached_prompt.clone().or_else(|| rewind_prompt.clone());
+        let retry_prompt = relaunch_prompt(
+            detached_prompt.clone().or_else(|| rewind_prompt.clone()),
+            composer_draft.clone(),
+            resume_session.unwrap_or(session_id),
+            session_id,
+        );
         if actor_panicked && tui_was_active {
             if let Some(next_session) = resume_session {
                 return Ok(Some((next_session, retry_prompt, terminal)));
@@ -7286,7 +7305,12 @@ async fn run_local_agent_session(
     }
     let reopen_after_detach =
         detached_prompt.is_some() && !user_requested_exit && resume_session.is_none();
-    let next_prompt = detached_prompt.or(rewind_prompt);
+    let next_prompt = relaunch_prompt(
+        detached_prompt.or(rewind_prompt),
+        composer_draft,
+        resume_session.unwrap_or(session_id),
+        session_id,
+    );
     if reopen_after_detach {
         return Ok(Some((session_id, next_prompt, None)));
     }
@@ -7699,6 +7723,22 @@ fn repeated_ctrl_c(last: &mut Option<std::time::Instant>, now: std::time::Instan
         .is_some_and(|previous| now.saturating_duration_since(previous) <= DOUBLE_CTRL_C_WINDOW);
     *last = (!repeated).then_some(now);
     repeated
+}
+
+/// Prompt text to seed into the relaunched session's composer. An explicit
+/// detached/rewind prompt wins; otherwise the unsent composer draft carries
+/// over only when the same session is being relaunched.
+fn relaunch_prompt(
+    explicit: Option<(String, Vec<PathBuf>)>,
+    composer_draft: Option<(String, Vec<PathBuf>)>,
+    next_session: Uuid,
+    session_id: Uuid,
+) -> Option<(String, Vec<PathBuf>)> {
+    explicit.or_else(|| {
+        (next_session == session_id)
+            .then_some(composer_draft)
+            .flatten()
+    })
 }
 
 fn local_resume_error_is_retryable(error: &anyhow::Error) -> bool {
