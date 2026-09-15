@@ -486,14 +486,20 @@ fn modern_result(mut result: Value) -> Value {
 }
 
 fn legacy_tool_result(value: Value) -> Value {
-    json!({
+    let mut result = json!({
         "content": [{
             "type": "text",
             "text": serde_json::to_string(&value).unwrap_or_default()
         }],
-        "structuredContent": value,
         "isError": false
-    })
+    });
+    // MCP requires structuredContent to be a JSON object; array results
+    // (list_watchers, list_unread_team_messages) are carried by the text
+    // content only, so strict clients do not reject the call.
+    if value.is_object() {
+        result["structuredContent"] = value;
+    }
+    result
 }
 
 fn modern_tool_result(value: Value) -> Value {
