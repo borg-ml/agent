@@ -253,13 +253,13 @@ impl SubscriptionAccess {
             OpenAiAuthMode, openai_api_key, openai_auth_mode, openai_uses_api_key,
         };
         let mode = openai_auth_mode()?;
-        if mode == Some(OpenAiAuthMode::ApiKey) || (mode.is_none() && openai_uses_api_key()) {
-            if let Some(token) = openai_api_key() {
-                return Ok(Self {
-                    token,
-                    account_id: String::new(),
-                });
-            }
+        if (mode == Some(OpenAiAuthMode::ApiKey) || (mode.is_none() && openai_uses_api_key()))
+            && let Some(token) = openai_api_key()
+        {
+            return Ok(Self {
+                token,
+                account_id: String::new(),
+            });
         }
         let response = tokio::time::timeout(
             Duration::from_secs(60),
