@@ -2866,7 +2866,7 @@ impl SubagentCoordinator {
             return Ok((
                 TeamInboxMessage {
                     message_id: Uuid::new_v4(),
-                    text: attributed_team_message(actor, message),
+                    text: attributed_team_message(actor, actor, message),
                     report_text: message.to_string(),
                     sender_session_id: actor_session_id,
                     delivery: prompt_delivery,
@@ -2897,7 +2897,7 @@ impl SubagentCoordinator {
                 )
                 .await?
         };
-        let text = attributed_team_message(actor, message);
+        let text = attributed_team_message(actor, actor, message);
         let idempotency_id = Uuid::new_v4();
         let receipt = workspace_store
             .append_message(NewWorkspaceMessage {
@@ -2952,21 +2952,25 @@ impl SubagentCoordinator {
                 let WorkspaceEventKind::Message { message, .. } = event.kind else {
                     continue;
                 };
-                let actor = match self.task_name_for_session(message.author_id).await {
-                    Ok(task_name) => task_name,
-                    Err(_) => workspace_store
-                        .participant(message.author_id)
-                        .await?
-                        .map(|participant| {
-                            format!("{} ({})", participant.display_name, message.author_id)
-                        })
-                        .unwrap_or_else(|| message.author_id.to_string()),
-                };
+                let (actor, reply_target) =
+                    match self.task_name_for_session(message.author_id).await {
+                        Ok(task_name) => (task_name.clone(), task_name),
+                        Err(_) => (
+                            workspace_store
+                                .participant(message.author_id)
+                                .await?
+                                .map(|participant| {
+                                    format!("{} ({})", participant.display_name, message.author_id)
+                                })
+                                .unwrap_or_else(|| message.author_id.to_string()),
+                            format!("participant:{}", message.author_id),
+                        ),
+                    };
                 messages.push((
                     ordering,
                     TeamInboxMessage {
                         message_id: message.id,
-                        text: attributed_team_message(&actor, &message.body.text),
+                        text: attributed_team_message(&actor, &reply_target, &message.body.text),
                         report_text: message.body.text,
                         sender_session_id: message.author_id,
                         delivery: match delivery.mode {
@@ -4367,7 +4371,7 @@ impl SubagentCoordinator {
             .await?;
         let inbox = TeamInboxMessage {
             message_id: receipt.message_id,
-            text: attributed_team_message(&actor, &message),
+            text: attributed_team_message(&actor, &actor, &message),
             report_text: message,
             sender_session_id: actor_session_id,
             delivery: PromptDelivery::Queue,
@@ -4443,33 +4447,27 @@ impl SubagentCoordinator {
                 id.and_then(|id| table.entries.get(&id).map(|entry| entry.snapshot.status));
             (actor, id, table.root_session_id, status)
         };
-        if local_id.is_none()
-            && let Some(participant_id) = parse_workspace_participant_target(target)?
-        {
-            return self
-                .route_workspace_participant_message_as(
-                    actor_session_id,
-                    participant_id,
-                    &message,
-                    options,
-                    DeliveryMode::NextTurn,
-                )
-                .await;
-        }
         let id = match local_id {
             Some(id) => id,
-            None => parse_session_message_target(target)?,
+            None => match self.resolve_remote_message_target(target).await? {
+                RemoteMessageTarget::Participant(participant_id) => {
+                    return self
+                        .route_workspace_participant_message_as(
+                            actor_session_id,
+                            participant_id,
+                            &message,
+                            options,
+                            DeliveryMode::NextTurn,
+                        )
+                        .await;
+                }
+                RemoteMessageTarget::Session(id) => id,
+            },
         };
         ensure!(
             id != actor_session_id,
             "message recipient must differ from its author"
         );
-        if local_id.is_none() {
-            self.store
-                .workspace_binding(id)
-                .await?
-                .with_context(|| format!("unknown session message target: {id}"))?;
-        }
         if status.is_some_and(SubagentStatus::is_terminal) {
             bail!("subagent {target} is not running");
         }
@@ -4624,33 +4622,27 @@ impl SubagentCoordinator {
                 id.and_then(|id| table.entries.get(&id).map(|entry| entry.snapshot.status));
             (actor, id, table.root_session_id, status)
         };
-        if local_id.is_none()
-            && let Some(participant_id) = parse_workspace_participant_target(target)?
-        {
-            return self
-                .route_workspace_participant_message_as(
-                    actor_session_id,
-                    participant_id,
-                    &message,
-                    options,
-                    DeliveryMode::Wake,
-                )
-                .await;
-        }
         let id = match local_id {
             Some(id) => id,
-            None => parse_session_message_target(target)?,
+            None => match self.resolve_remote_message_target(target).await? {
+                RemoteMessageTarget::Participant(participant_id) => {
+                    return self
+                        .route_workspace_participant_message_as(
+                            actor_session_id,
+                            participant_id,
+                            &message,
+                            options,
+                            DeliveryMode::Wake,
+                        )
+                        .await;
+                }
+                RemoteMessageTarget::Session(id) => id,
+            },
         };
         ensure!(
             id != actor_session_id,
             "message recipient must differ from its author"
         );
-        if local_id.is_none() {
-            self.store
-                .workspace_binding(id)
-                .await?
-                .with_context(|| format!("unknown session message target: {id}"))?;
-        }
         if status.is_some_and(SubagentStatus::is_terminal) {
             bail!("subagent {target} is not running");
         }
@@ -4754,6 +4746,40 @@ impl SubagentCoordinator {
             .await?
             .and_then(|binding| binding.host_id);
         Ok(sender_host.is_some() && recipient_host.is_some() && sender_host != recipient_host)
+    }
+
+    /// Resolve a non-local message target. A `session:`/bare UUID (or the
+    /// `name (UUID)` label used in attributed team messages) routes as a
+    /// session when a local workspace binding exists and otherwise falls
+    /// back to the discovered participant with that id.
+    async fn resolve_remote_message_target(&self, target: &str) -> Result<RemoteMessageTarget> {
+        let (id, explicit_participant) = parse_remote_message_target(target)?;
+        if explicit_participant {
+            return Ok(RemoteMessageTarget::Participant(id));
+        }
+        if self.store.workspace_binding(id).await?.is_some() {
+            return Ok(RemoteMessageTarget::Session(id));
+        }
+        if self
+            .workspace_store()
+            .await?
+            .participant(id)
+            .await?
+            .is_some()
+        {
+            return Ok(RemoteMessageTarget::Participant(id));
+        }
+        bail!(
+            "unknown message target {id}: no local session or discovered participant has that \
+             id; run list_instances and use participant:<id>"
+        )
+    }
+
+    async fn with_sender_address(&self, actor_session_id: Uuid, mut value: Value) -> Result<Value> {
+        if let Some(binding) = self.store.workspace_binding(actor_session_id).await? {
+            value["sender"] = json!(format!("participant:{}", binding.participant_id));
+        }
+        Ok(value)
     }
 
     async fn route_workspace_participant_message_as(
@@ -5047,7 +5073,12 @@ impl SubagentCoordinator {
                 }))
             }
             "list_instances" => {
-                let _: NoArgs = serde_json::from_value(arguments)?;
+                let args: ListInstancesArgs = serde_json::from_value(arguments)?;
+                let query = args
+                    .query
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|query| !query.is_empty());
                 let mut instances = Vec::new();
                 for mut instance in self.workspace_store().await?.list_instances().await? {
                     let binding = self
@@ -5059,11 +5090,36 @@ impl SubagentCoordinator {
                         instance.host_id = binding.host_id.or(instance.host_id);
                         instance.workspace_id = Some(binding.workspace_id);
                     }
+                    if args
+                        .host_id
+                        .is_some_and(|host_id| instance.host_id != Some(host_id))
+                    {
+                        continue;
+                    }
+                    if query.is_some_and(|query| !instance_matches_query(&instance, query)) {
+                        continue;
+                    }
                     let mut entry = serde_json::to_value(instance)?;
                     entry["local"] = json!(local);
                     instances.push(entry);
                 }
-                Ok(json!({ "session_id": actor_session_id, "instances": instances }))
+                // Newest first so a truncated listing keeps the live instances.
+                instances.reverse();
+                let total = instances.len();
+                let limit = args.limit.unwrap_or(DEFAULT_INSTANCE_LIMIT).max(1);
+                instances.truncate(limit);
+                let participant_id = self
+                    .store
+                    .workspace_binding(actor_session_id)
+                    .await?
+                    .map(|binding| binding.participant_id);
+                Ok(json!({
+                    "session_id": actor_session_id,
+                    "participant_id": participant_id,
+                    "total": total,
+                    "truncated": total > instances.len(),
+                    "instances": instances,
+                }))
             }
             "send_message" => {
                 let args: MessageArgs = serde_json::from_value(arguments)?;
@@ -5084,7 +5140,8 @@ impl SubagentCoordinator {
                     )
                     .await?
                 };
-                Ok(routed_message_json(routed, "queued"))
+                self.with_sender_address(actor_session_id, routed_message_json(routed, "queued"))
+                    .await
             }
             "followup_task" => {
                 let args: MessageArgs = serde_json::from_value(arguments)?;
@@ -5096,7 +5153,8 @@ impl SubagentCoordinator {
                         args.options(),
                     )
                     .await?;
-                Ok(routed_message_json(routed, "accepted"))
+                self.with_sender_address(actor_session_id, routed_message_json(routed, "accepted"))
+                    .await
             }
             "broadcast_team" => {
                 let args: BroadcastArgs = serde_json::from_value(arguments)?;
@@ -5333,8 +5391,12 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "list_instances",
-            "Discover Borg agent instances across all local workspaces and the authenticated remote instance directory. Use participant:<id> with send_message or followup_task. Remote entries require an enrolled host relay and may be offline; discovery does not grant project access.",
-            json!({"type":"object","properties":{},"additionalProperties":false}),
+            "Discover Borg agent instances across all local workspaces and the authenticated remote instance directory. Returns newest first; filter with query/host_id and raise limit when needed. Use participant:<id> with send_message or followup_task. Remote entries require an enrolled host relay and may be offline; discovery does not grant project access.",
+            json!({"type":"object","properties":{
+                "query":{"type":"string","description":"Case-insensitive display-name substring or participant id prefix."},
+                "host_id":{"type":"string","description":"Only instances on this host UUID."},
+                "limit":{"type":"integer","minimum":1,"description":"Maximum entries, newest first (default 100)."}
+            },"additionalProperties":false}),
         ),
         message_tool(
             "send_message",
@@ -6319,6 +6381,29 @@ pub(crate) struct HistoryIndexArgs {
 #[serde(deny_unknown_fields)]
 struct NoArgs {}
 
+const DEFAULT_INSTANCE_LIMIT: usize = 100;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListInstancesArgs {
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    host_id: Option<Uuid>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+fn instance_matches_query(instance: &crate::workspace::AgentInstance, query: &str) -> bool {
+    let query = query.to_ascii_lowercase();
+    instance
+        .participant
+        .display_name
+        .to_ascii_lowercase()
+        .contains(&query)
+        || instance.participant.id.to_string().starts_with(&query)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WebSearchArgs {
@@ -6964,22 +7049,35 @@ fn required_message(message: &str) -> Result<String> {
     Ok(message.to_string())
 }
 
-fn parse_session_message_target(target: &str) -> Result<Uuid> {
-    let target = target.trim();
-    let target = target.strip_prefix("session:").unwrap_or(target);
-    Uuid::parse_str(target).with_context(|| {
-        "unknown team target; use a visible task name or session:<UUID> for an independent session"
-    })
+enum RemoteMessageTarget {
+    Session(Uuid),
+    Participant(Uuid),
 }
 
-fn parse_workspace_participant_target(target: &str) -> Result<Option<Uuid>> {
-    let target = target.trim();
-    let Some(target) = target.strip_prefix("participant:") else {
-        return Ok(None);
-    };
-    Ok(Some(Uuid::parse_str(target).with_context(
-        || "workspace participant target must be participant:<UUID>",
-    )?))
+/// Extract the UUID from `participant:<UUID>`, `session:<UUID>`, a bare UUID,
+/// or a `display name (<UUID>)` label. The flag is true only for the explicit
+/// `participant:` form.
+fn parse_remote_message_target(target: &str) -> Result<(Uuid, bool)> {
+    let trimmed = target.trim();
+    if let Some(id) = trimmed.strip_prefix("participant:") {
+        return Uuid::parse_str(id.trim())
+            .map(|id| (id, true))
+            .with_context(|| "workspace participant target must be participant:<UUID>");
+    }
+    let candidate = trimmed.strip_prefix("session:").unwrap_or(trimmed).trim();
+    let labelled = trimmed
+        .strip_suffix(')')
+        .and_then(|inner| inner.rsplit_once('('))
+        .map(|(_, id)| id.trim());
+    Uuid::parse_str(candidate)
+        .or_else(|error| labelled.map_or(Err(error), Uuid::parse_str))
+        .map(|id| (id, false))
+        .with_context(|| {
+            format!(
+                "unknown message target {target:?}; use a visible task name, session:<UUID> for \
+                 a local session, or participant:<UUID> from list_instances"
+            )
+        })
 }
 
 fn routed_message_json(routed: RoutedTeamMessage, accepted_field: &str) -> Value {
@@ -7039,12 +7137,12 @@ fn optional_tool_text(value: Option<String>) -> Option<String> {
     })
 }
 
-fn attributed_team_message(actor: &str, message: &str) -> String {
+fn attributed_team_message(actor: &str, reply_target: &str, message: &str) -> String {
     format!(
         "Team message from {actor}:\n\n{message}\n\n\
          ({actor} is another Borg instance, not the human user. In the main thread, address your \
          updates to the user; send replies or acknowledgments to {actor} via send_message with \
-         target \"{actor}\".)"
+         target \"{reply_target}\".)"
     )
 }
 

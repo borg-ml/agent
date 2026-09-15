@@ -2828,8 +2828,54 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
             .await
             .unwrap_err()
             .to_string()
-            .contains("unknown session message target")
+            .contains("unknown message target")
     );
+
+    // A discovered remote instance has no local binding; session-style and
+    // attributed-label targets must fall back to participant routing.
+    let remote = Uuid::new_v4();
+    workspace
+        .upsert_instance(
+            crate::workspace::Participant {
+                id: remote,
+                display_name: "remote-agent".to_string(),
+                kind: crate::workspace::ParticipantKind::Agent,
+                created_at: chrono::Utc::now(),
+            },
+            Some(Uuid::new_v4()),
+            None,
+        )
+        .await
+        .unwrap();
+    for target in [
+        format!("session:{remote}"),
+        format!("remote-agent ({remote})"),
+    ] {
+        let routed = sender_coordinator
+            .call_tool_as(
+                sender,
+                "send_message",
+                json!({"target": target, "message": "handoff to remote"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(routed["delivery_state"], "relay_pending");
+        assert_eq!(routed["recipient_ids"][0], remote.to_string());
+        assert_eq!(routed["sender"], format!("participant:{sender}"));
+    }
+    let listed = sender_coordinator
+        .call_tool_as(
+            sender,
+            "list_instances",
+            json!({"query": "REMOTE-", "limit": 1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed["participant_id"], sender.to_string());
+    assert_eq!(listed["total"], 1);
+    assert_eq!(listed["truncated"], false);
+    assert_eq!(listed["instances"][0]["id"], remote.to_string());
+    assert_eq!(listed["instances"][0]["local"], false);
 }
 
 #[tokio::test]
