@@ -590,6 +590,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/dictate", "start or stop local dictation"),
     ("/queue", "send after the current turn finishes"),
     ("/steer", "send now and redirect the current turn"),
+    ("/team", "message every agent in the team"),
     ("/interrupt", "interrupt the current turn"),
     ("/stop", "alias for /interrupt"),
     ("/login", "switch ChatGPT / API key billing"),
@@ -831,6 +832,11 @@ pub enum UiAction {
         message_id: Uuid,
         text: String,
         attachments: Vec<PathBuf>,
+    },
+    /// `/team <message>`: queue one message to every non-terminal agent in the
+    /// team (subagents plus root). Always addressed at the director session.
+    Broadcast {
+        text: String,
     },
     Approve {
         target: Option<Uuid>,
@@ -9343,6 +9349,19 @@ impl BorgTerminal {
                 self.find_in_thread(&pattern);
                 return Ok(UiAction::None);
             }
+            if self.composer.attachments.is_empty()
+                && let Some(message) = self.composer.text.trim().strip_prefix("/team")
+                && message.chars().next().is_none_or(char::is_whitespace)
+            {
+                let message = message.trim().to_string();
+                if message.is_empty() {
+                    self.notice = Some("Usage: /team <message>".to_string());
+                    return Ok(UiAction::None);
+                }
+                self.composer.clear();
+                self.notice = None;
+                return Ok(UiAction::Broadcast { text: message });
+            }
             let (text, attachments) = self.composer.take();
             if text.trim().is_empty() && attachments.is_empty() {
                 return Ok(UiAction::None);
@@ -13169,7 +13188,7 @@ fn next_thread_match(matches: &[usize], previous_row: Option<usize>) -> (usize, 
 fn slash_command_needs_argument(command: &str) -> bool {
     matches!(
         command,
-        "/ask" | "/director" | "/claude" | "/gpt" | "/peer" | "/queue" | "/steer"
+        "/ask" | "/director" | "/claude" | "/gpt" | "/peer" | "/queue" | "/steer" | "/team"
     )
 }
 

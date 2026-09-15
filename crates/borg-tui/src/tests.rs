@@ -7394,12 +7394,13 @@ fn only_argument_taking_commands_are_inserted_rather_than_run() {
     assert!(slash_command_needs_argument("/peer"));
     assert!(slash_command_needs_argument("/queue"));
     assert!(slash_command_needs_argument("/steer"));
+    assert!(slash_command_needs_argument("/team"));
     assert_eq!(slash_matches("/copy")[0].0, "/copy");
     assert!(!slash_command_needs_argument("/copy"));
     for (command, _) in SLASH_COMMANDS.iter().filter(|(command, _)| {
         !matches!(
             *command,
-            "/ask" | "/director" | "/claude" | "/gpt" | "/peer" | "/queue" | "/steer"
+            "/ask" | "/director" | "/claude" | "/gpt" | "/peer" | "/queue" | "/steer" | "/team"
         )
     }) {
         assert!(

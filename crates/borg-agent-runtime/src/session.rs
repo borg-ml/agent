@@ -2689,6 +2689,20 @@ async fn run_agent_session_store_kernel(
                         .await?;
                         continue;
                     }
+                    Some(HostCommand::Broadcast {
+                        session_id: command_session_id,
+                        text,
+                    }) if command_session_id == session_id => {
+                        broadcast_team_message(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            subagents.as_ref(),
+                            text,
+                        )
+                        .await?;
+                        continue;
+                    }
                     Some(HostCommand::Compact {
                         session_id: command_session_id,
                     }) if command_session_id == session_id => {
@@ -4938,6 +4952,16 @@ async fn run_agent_session_store_kernel(
                             )
                             .await?;
                         }
+                        HostCommand::Broadcast { text, .. } => {
+                            broadcast_team_message(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                subagents.as_ref(),
+                                text,
+                            )
+                            .await?;
+                        }
                         HostCommand::Interrupt { .. } => {
                             pause_active_goal(
                                 &mut journal,
@@ -6853,6 +6877,37 @@ fn recall_withdrawable_steers(
     }
     *pending_steers = retained;
     recalled
+}
+
+/// A frontend asked to broadcast a message to the whole agent team (the
+/// `/team` command). Reuses the same queue-to-every-non-terminal-child path as
+/// the `broadcast_team` agent tool. Failures and the "no team" case surface as
+/// visible errors rather than panicking.
+async fn broadcast_team_message(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    subagents: Option<&SubagentCoordinator>,
+    text: String,
+) -> Result<()> {
+    let message = match subagents {
+        Some(coordinator) => coordinator.broadcast_message_as(session_id, &text).await,
+        None => Err(anyhow::anyhow!(
+            "no agent team is active to broadcast to; spawn a subagent first"
+        )),
+    };
+    if let Err(error) = message {
+        record(
+            journal,
+            events,
+            session_id,
+            SessionEventKind::Error {
+                message: format!("team broadcast failed: {error:#}"),
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// A frontend asked to stop a watch (watches panel). Failures are visible

@@ -3263,7 +3263,10 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
         let attachment = metadata
             .as_ref()
             .and_then(|metadata| metadata.attachment.as_ref());
-        if matches!(command, HostCommand::TeamPrompt { .. }) {
+        if matches!(
+            command,
+            HostCommand::TeamPrompt { .. } | HostCommand::Broadcast { .. }
+        ) {
             tracing::warn!(%session_id, "rejected host-local team prompt from remote command queue");
             return true;
         }
@@ -4201,7 +4204,10 @@ fn authorize_workspace_command(
     attachment: &WorkspaceAttachment,
     command: &HostCommand,
 ) -> Result<()> {
-    if matches!(command, HostCommand::TeamPrompt { .. }) {
+    if matches!(
+        command,
+        HostCommand::TeamPrompt { .. } | HostCommand::Broadcast { .. }
+    ) {
         bail!("team prompts are host-local and cannot be remotely authorized");
     }
     let Some(authority) = &attachment.command_authority else {
@@ -4209,7 +4215,9 @@ fn authorize_workspace_command(
     };
     let kind = match command {
         HostCommand::Prompt { .. } => crate::ParticipantCommandKind::Prompt,
-        HostCommand::TeamPrompt { .. } => unreachable!("rejected above"),
+        HostCommand::TeamPrompt { .. } | HostCommand::Broadcast { .. } => {
+            unreachable!("rejected above")
+        }
         HostCommand::RecallQueuedPrompt { .. } => crate::ParticipantCommandKind::RecallQueuedPrompt,
         HostCommand::FlushPendingInput { .. } => crate::ParticipantCommandKind::Prompt,
         HostCommand::Configure { .. } => crate::ParticipantCommandKind::Configure,

@@ -4911,6 +4911,12 @@ async fn run_local_agent_session(
                             },
                         );
                     }
+                    UiAction::Broadcast { text } => {
+                        dispatch_ui_command(
+                            &ui_interaction_tx,
+                            HostCommand::Broadcast { session_id, text },
+                        );
+                    }
                     UiAction::FlushPendingInput { target, prompt } => {
                         if let Some((message_id, text, attachments)) = prompt {
                             let command = target.map_or_else(
@@ -9810,6 +9816,7 @@ fn remote_command_name(command: &HostCommand) -> &'static str {
             }
         }
         HostCommand::RecallQueuedPrompt { .. } => "recall queued prompt",
+        HostCommand::Broadcast { .. } => "team broadcast",
         HostCommand::FlushPendingInput { .. } => "flush pending input",
         HostCommand::Configure { .. } => "configure",
         HostCommand::Approve { .. } => "approval",

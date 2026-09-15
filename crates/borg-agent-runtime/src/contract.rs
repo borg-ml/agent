@@ -1147,6 +1147,13 @@ pub enum HostCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         message_id: Option<Uuid>,
     },
+    /// A human `/team` broadcast: queue one message to every non-terminal
+    /// child plus root. Host-local like `TeamPrompt`; never accepted from a
+    /// remote participant.
+    Broadcast {
+        session_id: Uuid,
+        text: String,
+    },
     /// Promote every queued human prompt into the active provider turn.
     /// Unlike `Interrupt`, this never cancels the turn.
     FlushPendingInput {
@@ -1230,6 +1237,7 @@ impl HostCommand {
             Self::Launch { session_id, .. }
             | Self::Prompt { session_id, .. }
             | Self::TeamPrompt { session_id, .. }
+            | Self::Broadcast { session_id, .. }
             | Self::RecallQueuedPrompt { session_id, .. }
             | Self::FlushPendingInput { session_id }
             | Self::Configure { session_id, .. }
