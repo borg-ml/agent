@@ -54,8 +54,22 @@ AT-SPI coordinates on Wayland are **not** assumed to be screenshot coordinates.
 The local Niri compositor omitted visible-window geometry and rejected isolated
 `grim -T` capture. Those experiments are not advertised as supported window capture.
 
-Still missing: native macOS and Windows drivers and real-host verification;
+## macOS (unverified)
+
+`computer_use/macos.swift` implements the same contract on AXUIElement: window
+enumeration over regular apps, bounded tree observation with diffs, `AXPress`
+clicks, settable `AXValue` replacement (secure text fields refused), and
+`screencapture` for `scope: "desktop"` or `scope: "window"` (isolated capture by
+CGWindowID; ambiguous titles refused; images over 4 MiB are downscaled). The
+dispatcher compiles the helper once per source revision with `swiftc` into
+`~/.borg/state/computer-use/`, so the Xcode Command Line Tools are required, plus
+Accessibility and Screen Recording permission for the terminal running Borg.
+`capabilities` reports both permission states. **This has not yet been built or
+exercised on a real Mac**; treat it as unverified until this section records the
+host, commit and observed effects.
+
+Still missing: Windows driver, macOS real-host verification;
 keyboard/pointer injection, scrolling and dragging; isolated window capture;
 full cross-provider image/desktop task verification; installation and broadcast
-verification. `capabilities` on macOS/Windows explicitly returns unavailable.
+verification. `capabilities` on Windows explicitly returns unavailable.
 Installing a binary does not upgrade an already-running Borg process.
