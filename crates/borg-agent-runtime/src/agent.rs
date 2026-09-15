@@ -565,6 +565,22 @@ impl SubscriptionPoolRegistry {
     }
 }
 
+/// Model/effort as they contribute to the pool lifecycle key. Claude applies
+/// model and effort changes to a live process (`set_model` /
+/// `apply_flag_settings`), keeping its conversation, so they must not split
+/// the slot. Codex still restarts its app-server per model.
+fn lifecycle_model_material<'a>(
+    provider: CodingProvider,
+    model: Option<&'a str>,
+    effort: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if provider == CodingProvider::Claude {
+        (None, None)
+    } else {
+        (model, effort)
+    }
+}
+
 fn subscription_lifecycle_key(
     turn: &AgentTurn,
     request: &ChatStreamRequest,
@@ -583,13 +599,18 @@ fn subscription_lifecycle_key(
             })
         })
         .collect::<Vec<_>>();
+    let (model, effort) = lifecycle_model_material(
+        turn.provider,
+        request.model.as_deref(),
+        request.effort.as_deref(),
+    );
     let material = serde_json::json!({
-        "version": 2,
+        "version": 3,
         "session_id": turn.session_id,
         "context_generation": turn.context_generation,
         "provider": turn.provider.catalog_backend(),
-        "model": request.model,
-        "effort": request.effort,
+        "model": model,
+        "effort": effort,
         "fast": request.fast,
         "permission": format!("{permission:?}"),
         "cwd": request.working_directory.as_ref().map(|path| path.to_string_lossy()),
@@ -1371,10 +1392,27 @@ fn next_harness_prompt_context(
 #[cfg(test)]
 mod prompt_context_tests {
     use super::{
-        CLEARED_HARNESS_PROMPT_CONTEXT, append_prompt_context, next_harness_prompt_context,
+        CLEARED_HARNESS_PROMPT_CONTEXT, CodingProvider, append_prompt_context,
+        lifecycle_model_material, next_harness_prompt_context,
     };
 
     use borg_provider::provider::ModelMessage;
+
+    #[test]
+    fn claude_model_and_effort_switch_in_place_so_they_do_not_split_the_pool() {
+        assert_eq!(
+            lifecycle_model_material(
+                CodingProvider::Claude,
+                Some("claude-fable-5-1"),
+                Some("max")
+            ),
+            (None, None)
+        );
+        assert_eq!(
+            lifecycle_model_material(CodingProvider::Codex, Some("gpt-6-astra"), Some("high")),
+            (Some("gpt-6-astra"), Some("high"))
+        );
+    }
 
     #[test]
     fn mutable_context_is_appended_after_the_existing_prompt() {
@@ -1629,6 +1667,23 @@ async fn run_borg_provider_turn(
                 }
                 if provider_event_is_transient(&kind) {
                     continue;
+                }
+                if kind == "claude.mcp_server_errors" {
+                    // The CLI skipped --mcp-config entries; Borg's own tool
+                    // server may be among them, so say so where the user looks.
+                    send(
+                        &events,
+                        SessionEventKind::Error {
+                            message: format!(
+                                "Claude skipped MCP servers from its config: {}",
+                                payload
+                                    .get("errors")
+                                    .map(|errors| errors.to_string())
+                                    .unwrap_or_default()
+                            ),
+                        },
+                    )
+                    .await;
                 }
                 send(
                     &events,

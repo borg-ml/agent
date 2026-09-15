@@ -981,6 +981,9 @@ struct ClaudeSubscriptionPoolState {
     // Claude's streaming-input result cost is cumulative for the live process;
     // keep the prior total beside the pooled process so Borg emits a turn delta.
     cost_tracker: ClaudeCostTracker,
+    /// Model/effort the cached command was built for. A change rebuilds the
+    /// command; the native pool then switches the live process in place.
+    model_effort: Option<(Option<String>, Option<String>)>,
     _auth_home: Option<TempDir>,
     _mcp_setup: Option<(TempDir, ProviderMcpSetup)>,
 }
@@ -1387,12 +1390,28 @@ async fn run_claude_subscription_process_pooled(
                 .await?;
         state.lifecycle_key = Some(lifecycle_key.clone());
         state.command = Some(command);
+        state.model_effort = Some((request.model.clone(), request.effort.clone()));
         *state
             .cost_tracker
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         state._auth_home = auth_home;
         state._mcp_setup = mcp_setup;
+    } else if state.model_effort.as_ref() != Some(&(request.model.clone(), request.effort.clone()))
+    {
+        let mcp_config_path = state
+            ._mcp_setup
+            .as_ref()
+            .and_then(|(_, setup)| setup.claude_config_path.as_deref());
+        let command = build_claude_command_spec(
+            &request,
+            permission,
+            state._auth_home.as_ref(),
+            mcp_config_path,
+        )
+        .await?;
+        state.command = Some(command);
+        state.model_effort = Some((request.model.clone(), request.effort.clone()));
     }
     let command = state
         .command

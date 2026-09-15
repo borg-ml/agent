@@ -8411,6 +8411,7 @@ fn provider_error_is_usage_limited(error: &str) -> bool {
         .collect::<String>();
     compact.contains(r#""kind":"rate_limit""#)
         || compact.contains(r#""kind":"billing_error""#)
+        || compact.contains(r#""status":429"#)
         || compact.contains("ratelimit")
         || compact.contains("usagelimit")
         || compact.contains("quotaexceeded")
@@ -8483,6 +8484,28 @@ fn is_safe_automatic_retry_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("returned an empty response")
         || error.contains("durable thread recovery unavailable")
+        || provider_error_is_transient_api_failure(&error)
+}
+
+/// Structured termination markers the Claude stream-json adapter appends to a
+/// failed result (`"status":N` from `api_error_status`, `"terminal_reason"`
+/// from the result frame). Overload and gateway failures are safe to retry;
+/// 429 is a usage limit and handled separately.
+fn provider_error_is_transient_api_failure(error: &str) -> bool {
+    let compact = error
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>();
+    [
+        "\"status\":529",
+        "\"status\":503",
+        "\"status\":502",
+        "\"status\":500",
+    ]
+    .iter()
+    .any(|marker| compact.contains(marker))
+        || (compact.contains("\"terminal_reason\":\"api_error\"")
+            && !compact.contains("\"status\":4"))
 }
 
 fn is_provider_agent_isolation_error(error: &str) -> bool {

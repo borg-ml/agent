@@ -466,6 +466,25 @@ async fn accepted_steers_settle_in_fifo_order_when_acknowledgements_arrive_out_o
     assert!(pending_steers.is_empty());
 }
 
+#[test]
+fn structured_claude_result_terminations_classify_without_prose() {
+    assert!(is_safe_automatic_retry_error(
+        r#"claude SDK error_during_execution: upstream failed "terminal_reason":"api_error" "status":529"#
+    ));
+    assert!(is_safe_automatic_retry_error(
+        r#"claude SDK error_during_execution: gateway "terminal_reason":"api_error""#
+    ));
+    assert!(!is_safe_automatic_retry_error(
+        r#"claude SDK error_during_execution: bad request "terminal_reason":"api_error" "status":400"#
+    ));
+    assert!(provider_error_is_usage_limited(
+        r#"claude SDK error_during_execution: slow down "terminal_reason":"api_error" "status":429"#
+    ));
+    assert!(!is_safe_automatic_retry_error(
+        "claude SDK error_max_turns: stopped"
+    ));
+}
+
 #[tokio::test]
 async fn claude_steers_stay_pending_input_until_the_cli_reports_consumption() {
     let root = tempdir().unwrap();
