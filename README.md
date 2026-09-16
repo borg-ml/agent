@@ -8,6 +8,7 @@ experimental `borg-gui` frontend is developed and built separately.
 [Repository](https://github.com/borg-ml/agent) ·
 [Blu language](https://github.com/borg-ml/blu) ·
 [Documentation](docs/) ·
+[Backend architecture](docs/architecture.md) ·
 [简体中文](docs/zh-Hans/README.md) ·
 [Español](docs/es/README.md) ·
 [Русский](docs/ru/README.md)
