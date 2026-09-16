@@ -12010,6 +12010,17 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
             {
                 completed_tools += 1;
             }
+            assert!(
+                completed_tools == 0 || !matches!(
+                    &event.kind,
+                    SessionEventKind::Message {
+                        message_id: id,
+                        status: MessageStatus::Queued,
+                        ..
+                    } if *id == message_id
+                ),
+                "a delivered prompt must not reappear in pending input during reconnect: {event:?}"
+            );
             if matches!(
                 event.kind,
                 SessionEventKind::TurnCompleted {

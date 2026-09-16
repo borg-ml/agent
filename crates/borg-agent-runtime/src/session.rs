@@ -3925,12 +3925,6 @@ async fn run_agent_session_store_kernel(
                                 goal_turn_failures.reset();
                                 network_retry_message_id = Some(prompt.message_id);
                                 retry_not_before = Some(Instant::now() + network_retry_delay);
-                                record(&mut journal, &events, session_id, SessionEventKind::ProviderEvent {
-                                    provider: launch.provider,
-                                    kind: "network_retry".into(),
-                                    payload: serde_json::json!({"delay_ms": network_retry_delay.as_millis() as u64, "auth_lookup_retry": auth_lookup_failure.then_some(auth_lookup_retries)}),
-                                }).await?;
-                                network_retry_delay = network_retry_delay.saturating_mul(2).min(NETWORK_RETRY_MAX_DELAY);
                             } else if let Some(wait) = usage_limit_wait {
                                 goal_turn_failures.reset();
                                 retry_not_before = Some(Instant::now() + wait);
@@ -3999,6 +3993,14 @@ async fn run_agent_session_store_kernel(
                                 },
                             )
                             .await?;
+                            if network_retry {
+                                record(&mut journal, &events, session_id, SessionEventKind::ProviderEvent {
+                                    provider: launch.provider,
+                                    kind: "network_retry".into(),
+                                    payload: serde_json::json!({"message_ids": prompt.batch_entries().iter().map(|entry| entry.message_id).collect::<Vec<_>>(), "delay_ms": network_retry_delay.as_millis() as u64, "auth_lookup_retry": auth_lookup_failure.then_some(auth_lookup_retries)}),
+                                }).await?;
+                                network_retry_delay = network_retry_delay.saturating_mul(2).min(NETWORK_RETRY_MAX_DELAY);
+                            }
                             if prompt.visible {
                                 record_prompt_status(
                                     &mut journal,
@@ -4007,6 +4009,8 @@ async fn run_agent_session_store_kernel(
                                     &prompt,
                                     if usage_limit_continue {
                                         MessageStatus::Complete
+                                    } else if network_retry {
+                                        MessageStatus::InProgress
                                     } else if retry {
                                         MessageStatus::Queued
                                     } else {

@@ -514,6 +514,7 @@ impl SessionEventKind {
                     kind.as_str(),
                     "native_model_message"
                         | "native_tool_round_completed"
+                        | "network_retry"
                         | "usage_limit_retry"
                         | "usage_limit_retry_cancelled"
                         | "usage_limit_retry_released"
@@ -575,7 +576,7 @@ impl SessionEventKind {
 
     pub fn is_fork_inheritable(&self) -> bool {
         if matches!(self, Self::ProviderEvent { kind, .. }
-            if matches!(kind.as_str(), "usage_limit_retry" | "usage_limit_retry_cancelled" | "usage_limit_retry_released"))
+            if matches!(kind.as_str(), "network_retry" | "usage_limit_retry" | "usage_limit_retry_cancelled" | "usage_limit_retry_released"))
         {
             return false;
         }
@@ -5673,6 +5674,23 @@ async fn sync_session_action(
                 None,
             )
             .await?;
+        }
+        SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "network_retry" => {
+            // Retry admission is explicit: an ordinary in-progress replay must
+            // still never resurrect a terminal action.
+            if let Some(ids) = payload.get("message_ids").and_then(serde_json::Value::as_array) {
+                for id in ids {
+                    let id: Uuid = serde_json::from_value(id.clone())?;
+                    if let Some(row) = sqlx::query("select * from session_actions where action_id = ? and session_id = ?")
+                        .bind(id.to_string())
+                        .bind(event.session_id.to_string())
+                        .fetch_optional(&mut **transaction)
+                        .await?
+                    {
+                        requeue_failed_action(transaction, decode_action(&row)?).await?;
+                    }
+                }
+            }
         }
         SessionEventKind::TurnStarted { message_id, .. } => {
             advance_action(
