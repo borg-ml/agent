@@ -1227,27 +1227,37 @@ reasoning_format = "deepseek"
     }
 
     #[test]
-    fn steer_reply_prompt_is_a_provider_allowlist() {
+    fn steer_reply_prompt_is_a_provider_and_model_allowlist() {
         use borg_remote::CodingProvider;
         let config: AgentConfig = toml::from_str("").unwrap();
         assert_eq!(
             config.capabilities.steer_reply_prompt.0,
-            vec![CodingProvider::Claude, CodingProvider::OpenCode]
+            ["claude-fable-5-1"]
         );
+        let capabilities = borg_remote::SessionCapabilities::from(&config.capabilities);
+        assert!(capabilities.frames_steers_for(CodingProvider::Claude, Some("claude-fable-5-1")));
+        assert!(!capabilities.frames_steers_for(CodingProvider::Claude, Some("claude-opus-5")));
+        assert!(!capabilities.frames_steers_for(CodingProvider::Claude, None));
+        assert!(!capabilities.frames_steers_for(CodingProvider::Codex, Some("gpt-6-astra")));
         let config: AgentConfig =
             toml::from_str("[capabilities]\nsteer_reply_prompt = false\n").unwrap();
         assert!(config.capabilities.steer_reply_prompt.0.is_empty());
         let config: AgentConfig =
             toml::from_str("[capabilities]\nsteer_reply_prompt = true\n").unwrap();
-        assert_eq!(config.capabilities.steer_reply_prompt.0.len(), 2);
+        assert_eq!(
+            config.capabilities.steer_reply_prompt.0,
+            ["claude-fable-5-1"]
+        );
         let config: AgentConfig =
             toml::from_str("[capabilities]\nsteer_reply_prompt = [\"codex\"]\n").unwrap();
         let capabilities = borg_remote::SessionCapabilities::from(&config.capabilities);
-        assert!(capabilities.frames_steers_for(CodingProvider::Codex));
-        assert!(!capabilities.frames_steers_for(CodingProvider::Claude));
+        assert!(capabilities.frames_steers_for(CodingProvider::Codex, Some("gpt-6-astra")));
+        assert!(!capabilities.frames_steers_for(CodingProvider::Claude, Some("claude-fable-5-1")));
         assert!(
-            toml::from_str::<AgentConfig>("[capabilities]\nsteer_reply_prompt = [\"gpt\"]\n")
-                .is_err()
+            toml::from_str::<AgentConfig>(
+                "[capabilities]\nsteer_reply_prompt = [\"not a model\"]\n"
+            )
+            .is_err()
         );
     }
 

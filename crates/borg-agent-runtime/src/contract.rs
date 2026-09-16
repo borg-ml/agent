@@ -856,11 +856,11 @@ pub struct SessionCapabilities {
     /// usage limits have had time to clear.
     #[serde(default = "default_true")]
     pub auto_resume_usage_limits: bool,
-    /// Providers whose mid-turn human messages are framed with an instruction
-    /// to address them in the next visible response. Their models otherwise
-    /// fold the bare text silently into the running task; Codex answers such
-    /// messages promptly on its own and is not framed by default. Accepts
-    /// `true` (the default set), `false` (nobody), or a provider list.
+    /// Providers or model ids whose mid-turn human messages are framed with an
+    /// instruction to address them in the next visible response. Those models
+    /// otherwise fold the bare text silently into the running task; Codex
+    /// answers such messages promptly on its own. Accepts `true` (the default
+    /// set), `false` (nobody), or a list of provider names and model ids.
     #[serde(default)]
     #[ts(type = "Array<string>")]
     pub steer_reply_prompt: SteerReplyPrompt,
@@ -904,22 +904,29 @@ impl Default for SessionCapabilities {
 const fn default_true() -> bool {
     true
 }
-/// Providers whose mid-turn human messages are framed with the reply
-/// instruction. Serializes as the provider list; deserializes from `true`
-/// (the default set), `false` (nobody), or an explicit provider list.
+/// Providers or model ids whose mid-turn human messages are framed with the
+/// reply instruction. Serializes as the list; deserializes from `true` (the
+/// default set), `false` (nobody), or an explicit list of provider names
+/// (`"claude"`) and model ids (`"claude-fable-5-1"`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
-pub struct SteerReplyPrompt(pub Vec<CodingProvider>);
+pub struct SteerReplyPrompt(pub Vec<String>);
 impl Default for SteerReplyPrompt {
-    /// Measured on real sessions: Claude answers a mid-turn message after a
-    /// median of nine tool calls and OpenCode after six; Codex answers at once.
+    /// Measured on real sessions: claude-fable-5-1 answers a mid-turn message
+    /// after a median of nine tool calls; Codex answers at once.
     fn default() -> Self {
-        Self(vec![CodingProvider::Claude, CodingProvider::OpenCode])
+        Self(vec!["claude-fable-5-1".to_string()])
     }
 }
 impl SteerReplyPrompt {
-    pub fn frames(&self, provider: CodingProvider) -> bool {
-        self.0.contains(&provider)
+    pub fn frames(&self, provider: CodingProvider, model: Option<&str>) -> bool {
+        let provider_key = serde_json::to_value(provider)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default();
+        self.0
+            .iter()
+            .any(|entry| entry == &provider_key || model.is_some_and(|model| entry == model))
     }
 }
 impl<'de> Deserialize<'de> for SteerReplyPrompt {
@@ -931,20 +938,30 @@ impl<'de> Deserialize<'de> for SteerReplyPrompt {
         #[serde(untagged)]
         enum Setting {
             Enabled(bool),
-            Providers(Vec<CodingProvider>),
+            Entries(Vec<String>),
         }
         Ok(match Setting::deserialize(deserializer)? {
             Setting::Enabled(true) => Self::default(),
             Setting::Enabled(false) => Self(Vec::new()),
-            Setting::Providers(providers) => Self(providers),
+            Setting::Entries(entries) => {
+                if let Some(bad) = entries
+                    .iter()
+                    .find(|entry| entry.trim().is_empty() || entry.chars().any(char::is_whitespace))
+                {
+                    return Err(serde::de::Error::custom(format!(
+                        "steer_reply_prompt entry {bad:?} is not a provider name or model id"
+                    )));
+                }
+                Self(entries)
+            }
         })
     }
 }
 impl SessionCapabilities {
     /// Whether a human steer sent to `provider` is framed with the reply
     /// instruction.
-    pub fn frames_steers_for(&self, provider: CodingProvider) -> bool {
-        self.steer_reply_prompt.frames(provider)
+    pub fn frames_steers_for(&self, provider: CodingProvider, model: Option<&str>) -> bool {
+        self.steer_reply_prompt.frames(provider, model)
     }
 }
 

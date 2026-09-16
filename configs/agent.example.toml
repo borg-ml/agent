@@ -26,11 +26,12 @@ telemetry = false
 # Keep in-progress Claude, Codex, and OpenCode work queued when a subscription
 # limit is reached, then retry periodically until the limit clears.
 auto_resume_usage_limits = true
-# Providers whose models get a message typed while the agent is working framed
-# with an instruction to address it in the next visible response (Claude and
-# OpenCode otherwise fold it silently into the running task; Codex answers on
-# its own). `true` selects this default set, `false` delivers the bare text.
-steer_reply_prompt = ["claude", "open_code"]
+# Provider names or model ids whose model gets a message typed while the agent
+# is working framed with an instruction to address it in the next visible
+# response (claude-fable-5-1 otherwise folds it silently into the running task;
+# Codex answers on its own). `true` selects this default set, `false` always
+# delivers the bare text; e.g. ["claude"] frames every Claude model.
+steer_reply_prompt = ["claude-fable-5-1"]
 # `borg` is the default shell-first harness; `native` exposes direct tools.
 harness = "borg"
 # `shared_work`, `presence`, `cloud_sync`, `web_relay`, and `telemetry` are

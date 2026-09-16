@@ -2153,13 +2153,15 @@ fn validate_settings_shape(root: &toml::Value) -> Result<()> {
         if let Some(value) = capabilities.get("steer_reply_prompt") {
             let valid = value.as_bool().is_some()
                 || value.as_array().is_some_and(|items| {
-                    items
-                        .iter()
-                        .all(|item| item.clone().try_into::<crate::CodingProvider>().is_ok())
+                    items.iter().all(|item| {
+                        item.as_str().is_some_and(|entry| {
+                            !entry.trim().is_empty() && !entry.chars().any(char::is_whitespace)
+                        })
+                    })
                 });
             ensure!(
                 valid,
-                "capabilities.steer_reply_prompt must be a boolean or a list of provider names"
+                "capabilities.steer_reply_prompt must be a boolean or a list of provider names and model ids"
             );
         }
     }
