@@ -1315,30 +1315,24 @@ pub async fn run_agent_turn_controlled(
         })
         .await
         .ok();
-    match turn.provider {
-        CodingProvider::Kimi
-        | CodingProvider::Glm
-        | CodingProvider::OpenRouter
-        | CodingProvider::OpenAiCompatible => {
-            NativeHarness::default().run(turn, events, controls).await
-        }
-        CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
-            run_borg_provider_turn(
-                turn,
-                events,
-                controls,
-                BorgProviderTurnRuntime {
-                    request_template: None,
-                    local: true,
-                    subscription_pools: None,
-                    #[cfg(feature = "profiling")]
-                    profiler: None,
-                },
-                true,
-            )
-            .await
-        }
+    let executor = LocalAgentTurnExecutor::default();
+    let bound = if let Some(store) = turn.agent_tools.session_store() {
+        executor.for_session(turn.session_id, &store).await?
+    } else {
+        None
+    };
+    let executor: &dyn AgentTurnExecutor = bound.as_deref().unwrap_or(&executor);
+    #[cfg(feature = "subscription-adapters")]
+    if turn.provider == CodingProvider::Codex
+        && !executor.uses_native_harness(CodingProvider::Codex)
+    {
+        // Fail closed: without durable routing this turn would silently run
+        // the provider-owned compatibility loop at the public entry point.
+        anyhow::bail!(
+            "Codex execution requires durable harness routing; start a new session for Borg-owned execution"
+        );
     }
+    executor.execute(turn, events, controls).await
 }
 
 struct BorgProviderTurnRuntime {
@@ -2751,6 +2745,40 @@ mod tests {
                 .for_session(legacy, &store)
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn controlled_codex_entry_requires_durable_routing_before_provider_launch() {
+        let directory = tempfile::tempdir().unwrap();
+        // A nonexistent cwd prevents a provider process even on the broken route.
+        let mut turn = lifecycle_test_turn(&directory.path().join("missing"));
+        turn.provider = CodingProvider::Codex;
+        turn.model = Some(borg_provider::codex_product_model().to_string());
+        let (events, mut received) = mpsc::channel(128);
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_agent_turn_controlled(turn, events, None),
+        )
+        .await
+        .expect("entry must reject before provider execution")
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Codex execution requires durable harness routing"),
+            "{error:#}"
+        );
+        assert!(matches!(
+            received.recv().await,
+            Some(SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                ..
+            })
+        ));
+        assert!(
+            received.recv().await.is_none(),
+            "no provider events on rejected access"
         );
     }
 
