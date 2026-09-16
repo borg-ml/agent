@@ -129,7 +129,7 @@ impl NativeHarness {
             store: turn.agent_tools.session_store(),
         };
         let (bound, steers) = await_model_admission(
-            self.with_model_access(turn.provider, &access),
+            self.with_model_access_for(turn.provider, turn.model.as_deref(), &access),
             &mut controls,
         )
         .await?;
@@ -141,6 +141,24 @@ impl NativeHarness {
         provider: crate::CodingProvider,
         access: &crate::ModelAccessContext,
     ) -> Result<Self> {
+        self.with_model_access_for(provider, None, access).await
+    }
+
+    /// Bind model access for a turn whose model is known.
+    ///
+    /// The model matters for OpenCode: only the `opencode-go` aliases have an
+    /// API Borg can call directly, so the wire gateway — including the routing
+    /// header the service requires — can only be built once the model is in
+    /// hand. Providers whose access is model-independent ignore it.
+    pub(crate) async fn with_model_access_for(
+        &self,
+        provider: crate::CodingProvider,
+        model: Option<&str>,
+        access: &crate::ModelAccessContext,
+    ) -> Result<Self> {
+        if provider == crate::CodingProvider::OpenCode {
+            return self.with_opencode_go_access(model, access).await;
+        }
         #[cfg(not(feature = "subscription-adapters"))]
         let _ = (provider, access);
         #[cfg(feature = "subscription-adapters")]
@@ -163,6 +181,43 @@ impl NativeHarness {
             return Ok(scoped);
         }
         Ok(self.clone())
+    }
+
+    /// Bind the OpenCode Go access gateway for a session already pinned to
+    /// Borg's harness.
+    ///
+    /// This refuses rather than falls back. Quietly serving an OpenCode turn
+    /// from the CLI route instead would move the conversation to a
+    /// provider-owned history, and quietly serving a non-Go OpenCode model
+    /// here would bill a different account's allowance.
+    async fn with_opencode_go_access(
+        &self,
+        model: Option<&str>,
+        access: &crate::ModelAccessContext,
+    ) -> Result<Self> {
+        let model = model.context("OpenCode native sessions require an explicit model")?;
+        let store = access
+            .store
+            .as_ref()
+            .context("OpenCode model access requires durable Borg session storage")?;
+        let native = store
+            .uses_native_opencode_harness(access.session_id, Some(model))
+            .await?;
+        anyhow::ensure!(
+            native,
+            "this session retains its OpenCode compatibility route; start a new session to run \
+             {model} on Borg's harness"
+        );
+        let gateway = borg_provider::provider::opencode_model::gateway(model, access.session_id)?;
+        Ok(Self {
+            model_client: Arc::new(ProviderModelClient {
+                gateway: Some(gateway),
+                configured_model_gateways: Default::default(),
+                #[cfg(feature = "subscription-adapters")]
+                codex_account: None,
+            }),
+            ..self.clone()
+        })
     }
 
     async fn run_bound(
@@ -986,6 +1041,16 @@ impl NativeModelClient for ProviderModelClient {
             crate::CodingProvider::Glm => OpenAiCompatibleProfile::Glm,
             crate::CodingProvider::OpenRouter => OpenAiCompatibleProfile::OpenRouter,
             crate::CodingProvider::OpenAiCompatible => OpenAiCompatibleProfile::Generic,
+            // OpenCode reaches the native client only through the Go access
+            // gateway. Without it the CLI still owns the conversation, so the
+            // refusal below stands for every other OpenCode route.
+            crate::CodingProvider::OpenCode
+                if gateway.is_some_and(|gateway| {
+                    gateway.label.as_deref() == Some(borg_provider::provider::opencode_model::LABEL)
+                }) =>
+            {
+                OpenAiCompatibleProfile::Generic
+            }
             crate::CodingProvider::Codex
             | crate::CodingProvider::Claude
             | crate::CodingProvider::OpenCode => {

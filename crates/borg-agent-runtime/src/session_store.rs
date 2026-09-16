@@ -38,6 +38,11 @@ const SQLITE_WRITE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROMPT_ADMISSION_SESSION_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Borg's catalog alias prefix for the OpenCode Go route. It is the only
+/// OpenCode route with an authenticated API Borg can call directly, so it is
+/// the only one eligible for the native harness.
+const OPENCODE_GO_MODEL_PREFIX: &str = "opencode-go/";
 const SQLITE_MMAP_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 const SQLITE_CACHE_KIB: u64 = 8 * 1024;
 pub const MAX_HOST_LAUNCH_METADATA_BYTES: usize = 512 * 1024;
@@ -1922,6 +1927,125 @@ impl SqliteSessionStore {
             "child Codex harness differs from its owner's durable route; start a new child session"
         );
         Ok(native)
+    }
+
+    /// Resolve, and durably pin, this session's OpenCode harness route.
+    ///
+    /// `model` is the session's selected model when the caller knows it (a
+    /// fresh launch has not persisted one yet); otherwise the durable state is
+    /// used. Returns `false` while the route is still undecidable.
+    pub(crate) async fn uses_native_opencode_harness(
+        &self,
+        session_id: Uuid,
+        model: Option<&str>,
+    ) -> Result<bool> {
+        let mut transaction = self.begin_write().await?;
+        let native =
+            Self::resolve_opencode_harness(&mut transaction, session_id, model, None).await?;
+        transaction.commit().await?;
+        Ok(native.unwrap_or(false))
+    }
+
+    /// Resolve, and durably pin, the OpenCode harness route for `session_id`.
+    ///
+    /// Unlike Codex, this route is *model-aware*: only the `opencode-go`
+    /// aliases expose an OpenAI-compatible endpoint Borg can drive itself, so
+    /// every other OpenCode model stays on the `opencode` CLI. The decision is
+    /// pinned on first resolution, which is what makes a later model switch
+    /// safe: a conversation can never migrate between a Borg-owned history and
+    /// a CLI-owned one, in either direction.
+    ///
+    /// Returns `None` while the route is still undecidable — a fresh session
+    /// with no history and no model yet. Pinning that case would strand the
+    /// session on the compatibility route before its model was ever known.
+    async fn resolve_opencode_harness(
+        transaction: &mut Transaction<'_, Sqlite>,
+        session_id: Uuid,
+        model: Option<&str>,
+        inherited: Option<bool>,
+    ) -> Result<Option<bool>> {
+        let existing: Option<bool> = sqlx::query_scalar(
+            "select native from session_harness_routes where session_id=? and provider='open_code'",
+        )
+        .bind(session_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?;
+        if let Some(existing) = existing {
+            ensure!(
+                inherited.is_none_or(|owner| owner == existing),
+                "child OpenCode harness differs from its owner's durable route; start a new child session"
+            );
+            return Ok(Some(existing));
+        }
+
+        // `native_history` means Borg already owns this conversation. Anything
+        // else on an OpenCode session — a linked CLI thread, or simply
+        // existing events — means the `opencode` CLI owns the transcript, so
+        // only it can replay that history. A model switch clears
+        // `provider_session_id`, hence the second signal.
+        let row = sqlx::query(
+            "with recursive lineage(id) as (select ? union all \
+             select s.parent_session_id from sessions s join lineage l on s.id=l.id \
+             where s.parent_session_id is not null) \
+             select \
+             exists(select 1 from lineage l cross join session_events e on e.session_id=l.id \
+             where json_extract(e.event_json, '$.kind.provider')='open_code' \
+             and json_extract(e.event_json, '$.kind.kind')='native_model_message') as native_history, \
+             exists(select 1 from lineage l join sessions s on s.id=l.id \
+             where json_extract(s.state_json, '$.configuration.provider')='open_code' \
+             and (json_extract(s.state_json, '$.provider_session_id') is not null \
+             or json_extract(s.state_json, '$.latest_sequence') > 0)) as legacy_history, \
+             (select json_extract(state_json, '$.configuration.model') from sessions where id=?) \
+             as durable_model",
+        )
+        .bind(session_id.to_string())
+        .bind(session_id.to_string())
+        .fetch_one(&mut **transaction)
+        .await?;
+        let native_history: bool = row.try_get("native_history")?;
+        let legacy_history: bool = row.try_get("legacy_history")?;
+        let durable_model: Option<String> = row.try_get("durable_model")?;
+
+        if let Some(inherited) = inherited {
+            ensure!(
+                !(inherited && legacy_history) && !(!inherited && native_history),
+                "child OpenCode harness differs from its owner's durable route; start a new child session"
+            );
+        }
+
+        let selected = model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned)
+            .or(durable_model);
+        let native = if let Some(inherited) = inherited {
+            // A child or fork shares its owner's history, so a split route
+            // would give one conversation two different owners.
+            inherited
+        } else if native_history {
+            true
+        } else if legacy_history {
+            false
+        } else {
+            match selected.as_deref() {
+                // Must agree with the adapter's own alias check: pinning a
+                // route the gateway then refuses would strand the session.
+                Some(selected) => selected
+                    .trim()
+                    .strip_prefix(OPENCODE_GO_MODEL_PREFIX)
+                    .is_some_and(|upstream| !upstream.trim().is_empty()),
+                None => return Ok(None),
+            }
+        };
+
+        sqlx::query(
+            "insert into session_harness_routes (session_id, provider, native) values (?, 'open_code', ?)",
+        )
+        .bind(session_id.to_string())
+        .bind(native)
+        .execute(&mut **transaction)
+        .await?;
+        Ok(Some(native))
     }
 
     #[cfg(any(feature = "subscription-adapters", test))]
@@ -4113,6 +4237,12 @@ impl SqliteSessionStore {
         let owner_native =
             Self::resolve_codex_harness(&mut transaction, owner_session_id, None).await?;
         Self::resolve_codex_harness(&mut transaction, session_id, Some(owner_native)).await?;
+        // A child shares its owner's conversation, so it must share the route
+        // that owns it. An owner whose route is still undecided leaves the
+        // child free to resolve its own.
+        let owner_opencode =
+            Self::resolve_opencode_harness(&mut transaction, owner_session_id, None, None).await?;
+        Self::resolve_opencode_harness(&mut transaction, session_id, None, owner_opencode).await?;
         if let Some(existing_owner) = existing_owner {
             anyhow::ensure!(
                 existing_owner == owner_session_id.to_string(),
@@ -7031,6 +7161,16 @@ impl SessionStore for SqliteSessionStore {
         sqlx::query("insert into session_harness_routes (session_id, provider, native) values (?, 'codex', ?)")
             .bind(session_id.to_string()).bind(parent_native)
             .execute(&mut *transaction).await?;
+        // A fork inherits the parent's transcript, so it inherits whichever
+        // harness owns that transcript. An undecided parent leaves the fork
+        // undecided too.
+        if let Some(parent_opencode) =
+            Self::resolve_opencode_harness(&mut transaction, parent_session_id, None, None).await?
+        {
+            sqlx::query("insert into session_harness_routes (session_id, provider, native) values (?, 'open_code', ?)")
+                .bind(session_id.to_string()).bind(parent_opencode)
+                .execute(&mut *transaction).await?;
+        }
         let parent_workspace: Option<String> = sqlx::query_scalar(
             "select workspace_id from session_workspace_bindings where session_id=?",
         )

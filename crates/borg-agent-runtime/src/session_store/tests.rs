@@ -5258,3 +5258,185 @@ async fn compact_removes_legacy_mirrored_rows_the_journal_no_longer_persists() {
     // measured, not that the file always gets smaller.
     assert!(vacuumed.bytes_before > 0 && vacuumed.bytes_after > 0);
 }
+
+fn opencode_configured(model: &str) -> SessionEventKind {
+    SessionEventKind::SessionConfigured {
+        cwd: std::path::PathBuf::from("/tmp"),
+        provider: CodingProvider::OpenCode,
+        model: Some(model.to_string()),
+        effort: None,
+        fast: false,
+        response_language: crate::ResponseLanguage::default(),
+        permission_mode: crate::PermissionMode::Auto,
+    }
+}
+
+/// Only the Go aliases have an API Borg can call directly, so the route is
+/// decided by the model. Getting this wrong either strands a working route on
+/// the CLI or, worse, points a non-Go model at the Go allowance.
+#[tokio::test]
+async fn opencode_route_is_native_only_for_go_models() {
+    let (_directory, store) = store().await;
+    for (model, native) in [
+        ("opencode-go/kimi-k2.7-code", true),
+        ("opencode-go/glm-5.3", true),
+        ("opencode/kimi-k2.7-code", false),
+        ("opencode-go/", false),
+        ("claude-opus-5", false),
+    ] {
+        let session_id = Uuid::new_v4();
+        store.create_session(session_id).await.unwrap();
+        assert_eq!(
+            store
+                .uses_native_opencode_harness(session_id, Some(model))
+                .await
+                .unwrap(),
+            native,
+            "{model}"
+        );
+    }
+}
+
+/// The route is pinned on first resolution. A session that has been answering
+/// through the `opencode` CLI keeps a transcript only that CLI can replay, so
+/// switching to a Go model must not move the conversation onto Borg's harness
+/// — and a session Borg already owns must not be handed back.
+#[tokio::test]
+async fn a_pinned_opencode_route_survives_model_switches_and_restart() {
+    let (directory, store) = store().await;
+
+    // Pinned native, then switched to a route with no Borg-reachable API.
+    let native_session = Uuid::new_v4();
+    store.create_session(native_session).await.unwrap();
+    assert!(
+        store
+            .uses_native_opencode_harness(native_session, Some("opencode-go/kimi-k2.7-code"))
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .uses_native_opencode_harness(native_session, Some("opencode/kimi-k2.7-code"))
+            .await
+            .unwrap(),
+        "a pinned native session keeps its Borg-owned history across a model switch"
+    );
+
+    // A CLI-owned conversation that later selects a Go model.
+    let legacy_session = Uuid::new_v4();
+    store.create_session(legacy_session).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            legacy_session,
+            0,
+            opencode_configured("opencode/kimi-k2.7-code"),
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            legacy_session,
+            0,
+            SessionEventKind::ProviderSessionLinked {
+                provider_session_id: "opencode-cli-thread".to_string(),
+                provider_turn_id: None,
+                context_contract_version: None,
+            },
+        ))
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .uses_native_opencode_harness(legacy_session, Some("opencode-go/kimi-k2.7-code"))
+            .await
+            .unwrap(),
+        "legacy OpenCode history must not be adopted by Borg's harness"
+    );
+
+    store.pool.close().await;
+    let reopened = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    assert!(
+        reopened
+            .uses_native_opencode_harness(native_session, None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !reopened
+            .uses_native_opencode_harness(legacy_session, None)
+            .await
+            .unwrap()
+    );
+}
+
+/// A fork or child shares its owner's transcript, so it must share whichever
+/// harness owns it; otherwise one conversation would have two owners.
+#[tokio::test]
+async fn opencode_route_is_inherited_by_forks_and_children() {
+    let (_directory, store) = store().await;
+    for (model, native) in [
+        ("opencode-go/kimi-k2.7-code", true),
+        ("opencode/glm", false),
+    ] {
+        let parent = Uuid::new_v4();
+        store.create_session(parent).await.unwrap();
+        assert_eq!(
+            store
+                .uses_native_opencode_harness(parent, Some(model))
+                .await
+                .unwrap(),
+            native
+        );
+        store
+            .append(SessionEvent::new(parent, 0, opencode_configured(model)))
+            .await
+            .unwrap();
+
+        let fork = Uuid::new_v4();
+        store.fork_before(parent, fork, 1).await.unwrap();
+        let child = Uuid::new_v4();
+        store.register_child_session(parent, child).await.unwrap();
+        for inheritor in [fork, child] {
+            assert_eq!(
+                store
+                    .uses_native_opencode_harness(inheritor, None)
+                    .await
+                    .unwrap(),
+                native,
+                "{model}"
+            );
+            // Re-resolving under the opposite model cannot rewrite the route.
+            assert_eq!(
+                store
+                    .uses_native_opencode_harness(inheritor, Some("opencode-go/other"))
+                    .await
+                    .unwrap(),
+                native
+            );
+        }
+    }
+}
+
+/// A fresh session with no model yet must stay undecided. Pinning it here
+/// would strand it on the compatibility route before its model was ever known.
+#[tokio::test]
+async fn an_unknown_opencode_model_does_not_pin_the_route() {
+    let (_directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    assert!(
+        !store
+            .uses_native_opencode_harness(session_id, None)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .uses_native_opencode_harness(session_id, Some("opencode-go/kimi-k2.7-code"))
+            .await
+            .unwrap(),
+        "the route is still open once the model is known"
+    );
+}

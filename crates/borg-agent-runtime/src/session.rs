@@ -5574,6 +5574,24 @@ fn native_conversation(
     // on its terminal event put every user message *after* the reply it
     // produced and dropped interrupted prompts entirely.
     let mut placed_prompts: HashSet<Uuid> = HashSet::new();
+    // The recovery view collapses each prompt to its terminal row, so the
+    // admission event may be absent on replay. Every row of a prompt carries
+    // the same text; remember it so `TurnStarted` can anchor the prompt at
+    // the real start of its turn instead of after the reply.
+    let mut prompt_texts: HashMap<Uuid, (EventActor, String)> = HashMap::new();
+    for event in events {
+        if let SessionEventKind::Message {
+            message_id,
+            actor: actor @ (EventActor::User | EventActor::System),
+            text,
+            ..
+        } = &event.kind
+        {
+            prompt_texts
+                .entry(*message_id)
+                .or_insert_with(|| (*actor, text.clone()));
+        }
+    }
     let mut active_provider = None;
     let mut native_structured_in_turn = false;
     let non_interrupted_failed_turns = events
@@ -5611,7 +5629,11 @@ fn native_conversation(
                 active_provider = None;
                 native_structured_in_turn = false;
             }
-            SessionEventKind::TurnStarted { provider, .. } => {
+            SessionEventKind::TurnStarted {
+                message_id,
+                provider,
+                ..
+            } => {
                 if !pending_native.is_empty() {
                     close_interrupted_native_round(&mut pending_native, &mut pending_generic);
                     conversation.append(&mut pending_native);
@@ -5622,6 +5644,20 @@ fn native_conversation(
                 failed_prompts.clear();
                 active_provider = Some(*provider);
                 native_structured_in_turn = false;
+                // Generic subscription turns carry no `native_prompt_context`;
+                // the turn boundary is the durable anchor for their prompt.
+                if !provider.uses_native_harness()
+                    && !placed_prompts.contains(message_id)
+                    && let Some((actor, text)) = prompt_texts.get(message_id)
+                {
+                    placed_prompts.insert(*message_id);
+                    pending_generic.push(match actor {
+                        EventActor::System => borg_provider::provider::ModelMessage::System {
+                            content: text.clone(),
+                        },
+                        _ => borg_provider::provider::ModelMessage::user(text.clone()),
+                    });
+                }
             }
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "native_prompt_context" =>

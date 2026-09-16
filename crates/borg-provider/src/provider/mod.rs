@@ -3,6 +3,11 @@ pub mod chat_stream;
 mod codex_model;
 mod model_turn;
 mod openai_compatible;
+/// Access-only adapter for the OpenCode Go subscription route. Model-only:
+/// it resolves endpoint, credential, wire model, and the required routing
+/// header, and owns no tool loop. Every other OpenCode route keeps the
+/// compatibility path through the `opencode` CLI.
+pub mod opencode_model;
 #[cfg(feature = "codex")]
 pub use codex_model::CodexModelProvider;
 

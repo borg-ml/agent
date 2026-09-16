@@ -13620,3 +13620,143 @@ fn interrupted_subscription_turn_keeps_its_delivered_output() {
         "interrupted prompt must appear exactly once: {replay:?}"
     );
 }
+
+/// Manual probe: replicate the live turn-start path against a real store.
+/// `BORG_PROBE_STORE=~/.borg/remote/sessions/sessions.sqlite3 BORG_PROBE_SESSION=<uuid> \
+///  cargo test -p borg-agent-runtime --lib -- probe_live_store_recovery_projection --ignored --nocapture`
+#[tokio::test]
+#[ignore]
+async fn probe_live_store_recovery_projection() {
+    let (Ok(path), Ok(session)) = (
+        std::env::var("BORG_PROBE_STORE"),
+        std::env::var("BORG_PROBE_SESSION"),
+    ) else {
+        return;
+    };
+    let session_id: Uuid = session.parse().expect("session uuid");
+    let store = SqliteSessionStore::open(&path).await.expect("open store");
+    let recovery = store.recovery(session_id).await.expect("recovery");
+    let events = &recovery.context_events;
+    eprintln!(
+        "PROBE context_events={} first_sequence={:?} last_sequence={:?}",
+        events.len(),
+        events.first().map(|event| event.sequence),
+        events.last().map(|event| event.sequence)
+    );
+    let mut kinds = std::collections::BTreeMap::<String, usize>::new();
+    for event in events {
+        let kind = serde_json::to_value(&event.kind)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        *kinds.entry(kind).or_default() += 1;
+    }
+    eprintln!("PROBE kinds={kinds:?}");
+    let context = retained_conversation_context(events).expect("context");
+    eprintln!("PROBE context_chars={}", context.chars().count());
+    for (index, line) in context.lines().enumerate() {
+        for needle in [
+            "first i want you to read",
+            "Understood — if you didn't",
+            "Read the whole window",
+            "we absolutely need to fix",
+            "Agreed — this is a correctness",
+            "Fixed, tested, installed",
+            "ok all i was trying",
+            "Short answers to both",
+            "what the fuck you didnt",
+        ] {
+            if line.contains(needle) {
+                eprintln!("PROBE frame {index:5}: {needle}");
+            }
+        }
+    }
+}
+
+#[test]
+fn collapsed_recovery_journal_still_places_prompts_before_their_replies() {
+    use borg_provider::provider::ModelMessage;
+
+    // The recovery view keeps only a prompt's terminal row, which lands after
+    // the reply. The turn boundary must still anchor the prompt correctly.
+    let session_id = Uuid::new_v4();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let turn_started = |message_id| SessionEventKind::TurnStarted {
+        message_id,
+        provider: CodingProvider::Claude,
+        model: Some("claude-fable-5-1".to_string()),
+        effort: Some("medium".to_string()),
+        fast: false,
+    };
+    let message = |message_id, actor, text: &str, status| SessionEventKind::Message {
+        message_id,
+        actor,
+        text: text.to_string(),
+        attachments: Vec::new(),
+        status,
+        delivery: None,
+    };
+    let kinds = vec![
+        turn_started(first),
+        message(
+            Uuid::new_v4(),
+            EventActor::Assistant,
+            "first reply",
+            MessageStatus::Complete,
+        ),
+        message(
+            first,
+            EventActor::User,
+            "first request",
+            MessageStatus::Complete,
+        ),
+        SessionEventKind::TurnCompleted {
+            message_id: first,
+            provider_session_id: None,
+            final_text: "first reply".to_string(),
+            error: None,
+        },
+        turn_started(second),
+        message(
+            Uuid::new_v4(),
+            EventActor::Assistant,
+            "second reply",
+            MessageStatus::Complete,
+        ),
+        message(
+            second,
+            EventActor::User,
+            "second request",
+            MessageStatus::Complete,
+        ),
+        SessionEventKind::TurnCompleted {
+            message_id: second,
+            provider_session_id: None,
+            final_text: "second reply".to_string(),
+            error: None,
+        },
+    ];
+    let events = kinds
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| SessionEvent::new(session_id, index as u64 + 1, kind))
+        .collect::<Vec<_>>();
+
+    let replay = native_conversation(&events, CodingProvider::Claude).unwrap();
+    assert_eq!(
+        replay,
+        vec![
+            ModelMessage::user("first request"),
+            ModelMessage::assistant(Some("first reply".into()), None, None, Vec::new()),
+            ModelMessage::user("second request"),
+            ModelMessage::assistant(Some("second reply".into()), None, None, Vec::new()),
+        ],
+        "{replay:?}"
+    );
+}
