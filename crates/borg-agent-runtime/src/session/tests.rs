@@ -4076,7 +4076,8 @@ async fn assert_interrupted_fifo(
 
     if provider == CodingProvider::OpenCode {
         assert!(!events.iter().any(|event| matches!(
-            event.kind, SessionEventKind::UserStopChanged { engaged: true, .. }
+            event.kind,
+            SessionEventKind::UserStopChanged { engaged: true, .. }
         )));
     }
     let seen = seen.lock().unwrap();
@@ -4667,7 +4668,10 @@ async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
 
     assert_eq!(
         steers.lock().unwrap().as_slice(),
-        [("inspect this [Image 1]".to_string(), vec![image.clone()])]
+        [(
+            frame_mid_turn_human_message("inspect this [Image 1]"),
+            vec![image.clone()]
+        )]
     );
     let turns = turns.lock().unwrap();
     assert_eq!(turns.len(), 2);
@@ -4937,7 +4941,10 @@ async fn escape_flush_keeps_the_turn_running_after_admission_and_steers_queued_i
     }
     assert_eq!(
         *steers.lock().unwrap(),
-        ["already admitted before escape", "queued one\n\nqueued two"]
+        [
+            frame_mid_turn_human_message("already admitted before escape"),
+            frame_mid_turn_human_message("queued one\n\nqueued two"),
+        ]
     );
     assert!(
         !interrupted.load(Ordering::Acquire),
@@ -11878,12 +11885,14 @@ impl AgentTurnExecutor for NetworkThenSuccessExecutor {
         if attempt < self.failures {
             anyhow::bail!(self.error);
         }
-        events.send(SessionEventKind::ToolStarted {
-            tool_call_id: "resumed-work".into(),
-            name: "exec".into(),
-            input: json!({"cmd": "git status"}),
-            input_ref: None,
-        }).await?;
+        events
+            .send(SessionEventKind::ToolStarted {
+                tool_call_id: "resumed-work".into(),
+                name: "exec".into(),
+                input: json!({"cmd": "git status"}),
+                input_ref: None,
+            })
+            .await?;
         tokio::time::sleep(Duration::from_millis(20)).await;
         if self.failures > 10 {
             turn.agent_tools
@@ -11925,7 +11934,11 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
     for (error, failures, expected_attempts) in [
         ("Codex subscription connection failed", 3, 4),
         ("Codex model catalog disconnected", 3, 4),
-        ("openrouter request failed with HTTP 502: Provider returned error", 3, 4),
+        (
+            "openrouter request failed with HTTP 502: Provider returned error",
+            3,
+            4,
+        ),
         ("authentication failed", 3, 1),
         (
             "Codex subscription credentials rejected; reconnect Codex",
@@ -12037,11 +12050,16 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
             {
                 retry_delays.push(payload["delay_ms"].as_u64().unwrap());
             }
-            if matches!(&event.kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "network_recovered") {
+            if matches!(&event.kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "network_recovered")
+            {
                 recovered = true;
             }
-            if matches!(&event.kind, SessionEventKind::ToolStarted { tool_call_id, .. } if tool_call_id == "resumed-work") {
-                assert!(recovered, "reconnect status must clear before resumed work finishes");
+            if matches!(&event.kind, SessionEventKind::ToolStarted { tool_call_id, .. } if tool_call_id == "resumed-work")
+            {
+                assert!(
+                    recovered,
+                    "reconnect status must clear before resumed work finishes"
+                );
             }
             if matches!(&event.kind, SessionEventKind::Error { message } if message == error) {
                 visible_errors += 1;
@@ -12051,14 +12069,15 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
                 completed_tools += 1;
             }
             assert!(
-                completed_tools == 0 || !matches!(
-                    &event.kind,
-                    SessionEventKind::Message {
-                        message_id: id,
-                        status: MessageStatus::Queued,
-                        ..
-                    } if *id == message_id
-                ),
+                completed_tools == 0
+                    || !matches!(
+                        &event.kind,
+                        SessionEventKind::Message {
+                            message_id: id,
+                            status: MessageStatus::Queued,
+                            ..
+                        } if *id == message_id
+                    ),
                 "a delivered prompt must not reappear in pending input during reconnect: {event:?}"
             );
             if matches!(
@@ -12671,7 +12690,7 @@ async fn shared_steer_batch_retries_and_targeted_recall_preserve_siblings() {
             attempt_boundary: 0,
         });
     }
-    retry_pending_steers(&control_tx, &result_tx, &mut pending, 1).await;
+    retry_pending_steers(&control_tx, &result_tx, &mut pending, 1, false).await;
     let AgentTurnControl::Steer {
         text,
         attachments,
@@ -12694,7 +12713,7 @@ second"
     );
     let old_attempt = pending[0].acknowledgement_id;
     assert_eq!(old_attempt, pending[1].acknowledgement_id);
-    retry_pending_steers(&control_tx, &result_tx, &mut pending, 2).await;
+    retry_pending_steers(&control_tx, &result_tx, &mut pending, 2, false).await;
     assert!(
         controls.try_recv().is_err(),
         "a shared attempt must not revoke itself"
@@ -12712,7 +12731,7 @@ second"
         },
         attempt_boundary: 2,
     });
-    retry_pending_steers(&control_tx, &result_tx, &mut pending, 2).await;
+    retry_pending_steers(&control_tx, &result_tx, &mut pending, 2, false).await;
     assert!(!old_admission.accept());
     let _ = old_ack.send(Err("rebatched".into()));
     let AgentTurnControl::Steer {
@@ -12748,7 +12767,7 @@ third"
     assert_eq!(pending[0].prompt.message_id, sibling);
     assert_ne!(pending[0].acknowledgement_id, old_attempt);
     let _ = old_ack.send(Err("withdrawn".into()));
-    retry_pending_steers(&control_tx, &result_tx, &mut pending, 3).await;
+    retry_pending_steers(&control_tx, &result_tx, &mut pending, 3, false).await;
     let AgentTurnControl::Steer {
         text,
         attachments,
@@ -13758,5 +13777,71 @@ fn collapsed_recovery_journal_still_places_prompts_before_their_replies() {
             ModelMessage::assistant(Some("second reply".into()), None, None, Vec::new()),
         ],
         "{replay:?}"
+    );
+}
+
+#[tokio::test]
+async fn human_mid_turn_steers_are_framed_with_a_reply_instruction() {
+    fn steer(text: &str, actor: EventActor) -> PendingSteer {
+        PendingSteer {
+            prompt: QueuedPrompt {
+                message_id: Uuid::new_v4(),
+                text: text.into(),
+                actor,
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+                visible: true,
+                interrupt_batch: actor == EventActor::User,
+                batch: Vec::new(),
+            },
+            acknowledgement_id: Uuid::new_v4(),
+            admission: SteerAdmission::pending(),
+            state: PendingSteerState::RetryAtBoundary {
+                error: "boundary".into(),
+            },
+            attempt_boundary: 0,
+        }
+    }
+    async fn dispatched(pending: &mut VecDeque<PendingSteer>, reply_prompt: bool) -> String {
+        let (control_tx, mut controls) = mpsc::channel(4);
+        let (result_tx, _results) = mpsc::channel(4);
+        retry_pending_steers(&control_tx, &result_tx, pending, 1, reply_prompt).await;
+        let AgentTurnControl::Steer { text, .. } = controls.recv().await.unwrap() else {
+            panic!("expected steer")
+        };
+        text
+    }
+
+    let human = "you dont have my saved world from before?";
+    let mut pending = VecDeque::from([steer(human, EventActor::User)]);
+    let framed = dispatched(&mut pending, true).await;
+    assert_eq!(framed, super::frame_mid_turn_human_message(human));
+    assert!(framed.ends_with(human), "the human's words stay verbatim");
+    assert!(framed.contains("next visible response"));
+
+    let mut pending = VecDeque::from([steer(human, EventActor::User)]);
+    assert_eq!(
+        dispatched(&mut pending, false).await,
+        human,
+        "the option delivers the bare text"
+    );
+
+    let team = "Team message from worker: build finished";
+    let mut pending = VecDeque::from([steer(team, EventActor::System)]);
+    assert_eq!(
+        dispatched(&mut pending, true).await,
+        team,
+        "team input is never framed as the human's words"
+    );
+
+    let mut pending = VecDeque::from([
+        steer(human, EventActor::User),
+        steer(team, EventActor::System),
+    ]);
+    assert_eq!(
+        dispatched(&mut pending, true).await,
+        format!("{human}\n\n{team}"),
+        "a mixed batch is not framed as the human's words"
     );
 }

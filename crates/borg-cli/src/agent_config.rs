@@ -261,6 +261,9 @@ pub(crate) struct CapabilityConfig {
     pub(crate) web_relay: bool,
     pub(crate) telemetry: bool,
     pub(crate) auto_resume_usage_limits: bool,
+    /// Frame messages typed while a turn is running with an instruction to
+    /// address them in the next visible response.
+    pub(crate) steer_reply_prompt: bool,
     /// Model-facing harness. `borg` is the curated shell-first surface;
     /// `native` is the explicit direct-tool fallback.
     #[serde(alias = "tool_mode")]
@@ -279,6 +282,7 @@ impl Default for CapabilityConfig {
             web_relay: true,
             telemetry: false,
             auto_resume_usage_limits: true,
+            steer_reply_prompt: true,
             harness: borg_remote::HarnessMode::Borg,
         }
     }
@@ -296,6 +300,7 @@ impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
             web_relay: value.web_relay,
             telemetry: value.telemetry,
             auto_resume_usage_limits: value.auto_resume_usage_limits,
+            steer_reply_prompt: value.steer_reply_prompt,
             provider_capabilities: Vec::new(),
             runtime_mcp_context: None,
             resource_limits: None,
@@ -1219,6 +1224,20 @@ reasoning_format = "deepseek"
         config.validate().unwrap();
         assert_eq!(config.expand_command("/quick"), "/fast on");
         assert!(config.capabilities.auto_resume_usage_limits);
+    }
+
+    #[test]
+    fn steer_reply_prompt_defaults_on_and_can_be_disabled() {
+        let config: AgentConfig = toml::from_str("").unwrap();
+        assert!(config.capabilities.steer_reply_prompt);
+        let config: AgentConfig = toml::from_str(
+            "[capabilities]
+steer_reply_prompt = false
+",
+        )
+        .unwrap();
+        assert!(!config.capabilities.steer_reply_prompt);
+        assert!(!borg_remote::SessionCapabilities::from(&config.capabilities).steer_reply_prompt);
     }
 
     #[test]

@@ -856,6 +856,11 @@ pub struct SessionCapabilities {
     /// usage limits have had time to clear.
     #[serde(default = "default_true")]
     pub auto_resume_usage_limits: bool,
+    /// Frame a human message that arrives mid-turn with an instruction to
+    /// address it in the next visible response. The bare text is otherwise
+    /// folded silently into the running task most of the time.
+    #[serde(default = "default_true")]
+    pub steer_reply_prompt: bool,
     /// Host-local provider authentication and admission state. This is safe
     /// model metadata, never a credential, and is refreshed at session launch
     /// by local and enrolled hosts.
@@ -885,6 +890,7 @@ impl Default for SessionCapabilities {
             web_relay: true,
             telemetry: false,
             auto_resume_usage_limits: true,
+            steer_reply_prompt: true,
             provider_capabilities: Vec::new(),
             runtime_mcp_context: None,
             resource_limits: None,

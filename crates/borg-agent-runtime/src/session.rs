@@ -4178,7 +4178,7 @@ async fn run_agent_session_store_kernel(
                             &control_tx,
                             &steer_result_tx,
                             &mut pending_steers,
-                            steer_boundary_generation,
+                            steer_boundary_generation, launch.capabilities.steer_reply_prompt,
                         )
                         .await;
                     }
@@ -4456,7 +4456,7 @@ async fn run_agent_session_store_kernel(
                                     &control_tx,
                                     &steer_result_tx,
                                     &mut pending_steers,
-                                    steer_boundary_generation,
+                                    steer_boundary_generation, launch.capabilities.steer_reply_prompt,
                                 )
                                 .await;
                             }
@@ -4631,7 +4631,7 @@ async fn run_agent_session_store_kernel(
                                     &steer_result_tx,
                                     &prompt,
                                     admission.clone(),
-                                    acknowledgement_id,
+                                    acknowledgement_id, launch.capabilities.steer_reply_prompt,
                                 )
                                 .await
                             };
@@ -4653,7 +4653,7 @@ async fn run_agent_session_store_kernel(
                                 attempt_boundary: steer_boundary_generation,
                             });
                             if has_pending && !context_compaction_in_progress && !user_stop && !interrupted {
-                                retry_pending_steers(&control_tx, &steer_result_tx, &mut pending_steers, steer_boundary_generation).await;
+                                retry_pending_steers(&control_tx, &steer_result_tx, &mut pending_steers, steer_boundary_generation, launch.capabilities.steer_reply_prompt).await;
                             }
                         }
                         HostCommand::Prompt {
@@ -4799,7 +4799,7 @@ async fn run_agent_session_store_kernel(
                                 &mut pending,
                                 &mut pending_steers,
                                 steer_boundary_generation,
-                                context_compaction_in_progress,
+                                context_compaction_in_progress, launch.capabilities.steer_reply_prompt,
                             )
                             .await;
                         }
@@ -7534,18 +7534,37 @@ fn context_compaction_status(kind: &SessionEventKind) -> Option<&str> {
         .filter(|status| !status.is_empty())
 }
 
+/// Frame a human message that reaches the model mid-turn so it is answered in
+/// the next visible response instead of being folded silently into the
+/// running task (measured on real sessions: 12 of 15 bare steers got no reply
+/// before the next tool call). Only the provider payload is framed; the
+/// journal keeps the human's text verbatim.
+pub(crate) fn frame_mid_turn_human_message(text: &str) -> String {
+    format!(
+        "A message from the human arrived while you were working. Address it in your next \
+         visible response before continuing: answer it briefly (if that needs a check, say \
+         what you will check), and adapt your plan if it changes what you should do. Do not \
+         merely acknowledge receipt.\n\nHuman message:\n{text}"
+    )
+}
 async fn dispatch_steer(
     control_tx: &mpsc::Sender<AgentTurnControl>,
     steer_result_tx: &mpsc::Sender<(Uuid, std::result::Result<(), String>)>,
     prompt: &QueuedPrompt,
     admission: SteerAdmission,
     acknowledgement_id: Uuid,
+    reply_prompt: bool,
 ) -> bool {
     let (ack, result) = oneshot::channel();
+    let text = if reply_prompt && prompt.actor == EventActor::User {
+        frame_mid_turn_human_message(&prompt.text)
+    } else {
+        prompt.text.clone()
+    };
     if control_tx
         .send(AgentTurnControl::Steer {
             message_id: prompt.message_id,
-            text: prompt.text.clone(),
+            text,
             attachments: prompt.attachments.clone(),
             admission,
             // Fold every steer in at the next tool boundary, as Claude Code's
@@ -7580,6 +7599,7 @@ async fn retry_pending_steers(
     steer_result_tx: &mpsc::Sender<(Uuid, std::result::Result<(), String>)>,
     pending_steers: &mut VecDeque<PendingSteer>,
     boundary_generation: u64,
+    reply_prompt: bool,
 ) {
     let attempts = pending_steers
         .iter()
@@ -7615,6 +7635,14 @@ async fn retry_pending_steers(
         return;
     };
     let mut prompt = pending_steers[first].prompt.clone();
+    if !indices
+        .iter()
+        .all(|&index| pending_steers[index].prompt.actor == EventActor::User)
+    {
+        // A batch that folds team input in with human input is never framed
+        // as the human's words.
+        prompt.actor = EventActor::System;
+    }
     for &index in indices.iter().skip(1) {
         let next = &pending_steers[index].prompt;
         prompt.text.push_str("\n\n");
@@ -7635,6 +7663,7 @@ async fn retry_pending_steers(
         &prompt,
         admission,
         acknowledgement_id,
+        reply_prompt,
     )
     .await
     {
@@ -7653,6 +7682,7 @@ async fn flush_pending_input_into_active_turn(
     pending_steers: &mut VecDeque<PendingSteer>,
     boundary_generation: u64,
     context_compaction_in_progress: bool,
+    reply_prompt: bool,
 ) {
     if !provider_supports_active_turn_control(provider) {
         return;
@@ -7682,6 +7712,7 @@ async fn flush_pending_input_into_active_turn(
             steer_result_tx,
             pending_steers,
             boundary_generation,
+            reply_prompt,
         )
         .await;
     }

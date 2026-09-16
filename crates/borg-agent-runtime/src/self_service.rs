@@ -2144,6 +2144,8 @@ fn validate_settings_shape(root: &toml::Value) -> Result<()> {
                 "cloud_sync",
                 "web_relay",
                 "telemetry",
+                "auto_resume_usage_limits",
+                "steer_reply_prompt",
             ],
             "capabilities",
         )?;

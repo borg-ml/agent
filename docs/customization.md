@@ -35,6 +35,15 @@ persisted to `editor.toml`.
 | Transcript labels | `/user-label`, `/assistant-label` | `transcript.user_label`, `transcript.assistant_label` |
 | Transcript colors | `/colors`, `/color` | the four `transcript.*_color` values in `#RRGGBB` form |
 
+Messages sent while a turn is running (`/followups steer`) reach the model at
+its next tool boundary. By default Borg frames each one with an instruction to
+address it in the agent's next visible response, because the bare text tends
+to be folded into the running task without a word. Set
+`capabilities.steer_reply_prompt = false` in `agent.toml` (see
+`configs/agent.example.toml`) to deliver the bare text. The session journal
+keeps your message verbatim either way, and team messages are never framed as
+yours.
+
 The click preference applies to expandable tool, action, plan, and compaction details. Fullscreen details wrap long lines and retain complete text; Escape returns to the timeline. Action-group headers still open or close their group, and message context menus keep their copy/edit actions.
 
 

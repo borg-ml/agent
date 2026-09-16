@@ -26,6 +26,10 @@ telemetry = false
 # Keep in-progress Claude, Codex, and OpenCode work queued when a subscription
 # limit is reached, then retry periodically until the limit clears.
 auto_resume_usage_limits = true
+# Frame a message typed while the agent is working with an instruction to
+# address it in the next visible response instead of silently folding it into
+# the running task. Set to false to deliver the bare text.
+steer_reply_prompt = true
 # `borg` is the default shell-first harness; `native` exposes direct tools.
 harness = "borg"
 # `shared_work`, `presence`, `cloud_sync`, `web_relay`, and `telemetry` are
