@@ -13416,3 +13416,156 @@ fn subscription_prompts_precede_their_replies_and_survive_interrupts() {
         ]
     );
 }
+
+/// Manual probe: run the canonical projection over a real journal dump.
+/// `BORG_PROBE_EVENTS=/path/to/events.jsonl cargo test -p borg-agent-runtime --lib -- probe_real_journal_projection --ignored --nocapture`
+#[test]
+#[ignore]
+fn probe_real_journal_projection() {
+    use borg_provider::provider::ModelMessage;
+    let Ok(path) = std::env::var("BORG_PROBE_EVENTS") else {
+        return;
+    };
+    let text = std::fs::read_to_string(&path).expect("read journal dump");
+    let events = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<SessionEvent>(line).expect("journal event parses"))
+        .collect::<Vec<_>>();
+    eprintln!("PROBE events={}", events.len());
+    let conversation = native_conversation(&events, CodingProvider::Claude).unwrap();
+    eprintln!("PROBE projected messages={}", conversation.len());
+    let tail = conversation.len().saturating_sub(16);
+    let all = std::env::var("BORG_PROBE_ALL").is_ok();
+    for (index, message) in conversation.iter().enumerate() {
+        let is_dialogue = matches!(message, ModelMessage::User { .. })
+            || matches!(message, ModelMessage::Assistant { tool_calls, content: Some(text), .. } if tool_calls.is_empty() && !text.trim().is_empty());
+        if !(index >= tail || (all && is_dialogue)) {
+            continue;
+        }
+        let (role, body) = match message {
+            ModelMessage::User { content, .. } => ("user", content.as_str()),
+            ModelMessage::System { content } => ("system", content.as_str()),
+            ModelMessage::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => (
+                if tool_calls.is_empty() {
+                    "assistant"
+                } else {
+                    "assistant+tools"
+                },
+                content.as_deref().unwrap_or(""),
+            ),
+            ModelMessage::Tool { content, .. } => ("tool", content.as_str()),
+        };
+        let preview = body.chars().take(96).collect::<String>().replace('\n', " ");
+        eprintln!("PROBE {index:5} {role:16} {preview}");
+    }
+}
+
+#[test]
+fn interrupted_subscription_turn_keeps_its_delivered_output() {
+    use borg_provider::provider::ModelMessage;
+
+    let session_id = Uuid::new_v4();
+    let interrupted = Uuid::new_v4();
+    let next = Uuid::new_v4();
+    let turn_started = |message_id| SessionEventKind::TurnStarted {
+        message_id,
+        provider: CodingProvider::Claude,
+        model: Some("claude-fable-5-1".to_string()),
+        effort: Some("medium".to_string()),
+        fast: false,
+    };
+    let user = |message_id, text: &str, status, delivery| SessionEventKind::Message {
+        message_id,
+        actor: EventActor::User,
+        text: text.to_string(),
+        attachments: Vec::new(),
+        status,
+        delivery: Some(delivery),
+    };
+    // The real runtime order for a steer that the human interrupts with
+    // Escape after the reply text and a tool call were already on screen.
+    let kinds = vec![
+        user(
+            interrupted,
+            "the ui still looks bad",
+            MessageStatus::InProgress,
+            PromptDelivery::Steer,
+        ),
+        turn_started(interrupted),
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "Short answers to both, then the UI.".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+        SessionEventKind::ToolStarted {
+            tool_call_id: "toolu_1".to_string(),
+            name: "Bash".to_string(),
+            input: serde_json::json!({"command": "pgrep -x UnrealEditor"}),
+            input_ref: None,
+        },
+        SessionEventKind::UserStopChanged { engaged: true },
+        user(
+            interrupted,
+            "the ui still looks bad",
+            MessageStatus::Failed,
+            PromptDelivery::Queue,
+        ),
+        SessionEventKind::TurnCompleted {
+            message_id: interrupted,
+            provider_session_id: None,
+            final_text: String::new(),
+            error: Some("turn interrupted".to_string()),
+        },
+        user(
+            next,
+            "why are you replying to my older messages?",
+            MessageStatus::InProgress,
+            PromptDelivery::Steer,
+        ),
+        turn_started(next),
+    ];
+    let events = kinds
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| SessionEvent::new(session_id, index as u64 + 1, kind))
+        .collect::<Vec<_>>();
+
+    let replay = native_conversation(&events, CodingProvider::Claude).unwrap();
+    assert!(
+        matches!(&replay[0], ModelMessage::User { content, .. } if content == "the ui still looks bad"),
+        "{replay:?}"
+    );
+    assert!(
+        matches!(replay.last(), Some(ModelMessage::User { content, .. }) if content == "why are you replying to my older messages?"),
+        "{replay:?}"
+    );
+    let middle = &replay[1..replay.len() - 1];
+    assert!(
+        middle.iter().any(|message| matches!(message, ModelMessage::Assistant { content: Some(text), .. } if text == "Short answers to both, then the UI.")),
+        "delivered reply dropped: {replay:?}"
+    );
+    assert!(
+        middle.iter().any(|message| matches!(message, ModelMessage::Assistant { tool_calls, .. } if tool_calls.iter().any(|call| call.id == "toolu_1"))),
+        "tool call dropped: {replay:?}"
+    );
+    assert!(
+        middle.iter().any(|message| matches!(message, ModelMessage::Tool { tool_call_id, content, .. } if tool_call_id == "toolu_1" && content.contains("outcome unknown"))),
+        "dangling tool call left open: {replay:?}"
+    );
+    assert_eq!(
+        replay
+            .iter()
+            .filter(|message| matches!(message, ModelMessage::User { content, .. } if content == "the ui still looks bad"))
+            .count(),
+        1,
+        "interrupted prompt must appear exactly once: {replay:?}"
+    );
+}

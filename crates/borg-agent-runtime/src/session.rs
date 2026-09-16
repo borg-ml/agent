@@ -5749,27 +5749,31 @@ fn native_conversation(
                 active_provider = None;
                 native_structured_in_turn = false;
             }
-            SessionEventKind::TurnCompleted {
-                error: Some(error), ..
-            } if !is_interrupted_turn_error(error) => {
-                let unresolved_prompts = pending_generic
-                    .drain(..)
-                    .filter(is_context_prompt)
-                    .collect::<Vec<_>>();
-                conversation.extend(unresolved_prompts.iter().cloned());
-                failed_prompts.extend(unresolved_prompts);
-                pending_native.clear();
-                active_provider = None;
-                native_structured_in_turn = false;
-            }
             SessionEventKind::TurnCompleted { error: Some(_), .. } => {
-                let unresolved_prompts = pending_generic
-                    .drain(..)
-                    .filter(is_context_prompt)
-                    .collect::<Vec<_>>();
-                conversation.extend(unresolved_prompts.iter().cloned());
-                failed_prompts.extend(unresolved_prompts);
-                pending_native.clear();
+                // The human already saw whatever this failed or interrupted
+                // turn delivered, so it stays in the transcript. Tool calls
+                // that never recorded a result are closed as "outcome
+                // unknown", exactly as a crashed native round is closed, and
+                // the prompt is also kept in the exact tail so a later
+                // compaction summary cannot erase it.
+                if !pending_native.is_empty() {
+                    close_interrupted_native_round(&mut pending_native, &mut pending_generic);
+                    failed_prompts.extend(
+                        pending_native
+                            .iter()
+                            .filter(|message| is_context_prompt(message))
+                            .cloned(),
+                    );
+                    conversation.append(&mut pending_native);
+                }
+                close_dangling_tool_calls(&mut pending_generic);
+                failed_prompts.extend(
+                    pending_generic
+                        .iter()
+                        .filter(|message| is_context_prompt(message))
+                        .cloned(),
+                );
+                conversation.append(&mut pending_generic);
                 active_provider = None;
                 native_structured_in_turn = false;
             }
@@ -5795,6 +5799,31 @@ fn close_interrupted_native_round(
 ) {
     use borg_provider::provider::ModelMessage;
 
+    close_dangling_tool_calls(messages);
+    // An accepted steer can be journaled before the loop records its model message.
+    for prompt in generic.drain(..).filter(is_context_prompt) {
+        let recorded = messages.iter().any(|message| match (&prompt, message) {
+            (
+                ModelMessage::User { content: left, .. },
+                ModelMessage::User { content: right, .. },
+            )
+            | (ModelMessage::System { content: left }, ModelMessage::System { content: right }) => {
+                left == right
+            }
+            _ => false,
+        });
+        if !recorded {
+            messages.push(prompt);
+        }
+    }
+}
+
+/// Give every tool call that never recorded a result an explicit "outcome
+/// unknown" result, so a turn that ended mid-round still projects as a valid
+/// call/result sequence.
+fn close_dangling_tool_calls(messages: &mut Vec<borg_provider::provider::ModelMessage>) {
+    use borg_provider::provider::ModelMessage;
+
     let completed = messages
         .iter()
         .filter_map(|message| match message {
@@ -5812,22 +5841,6 @@ fn close_interrupted_native_round(
             attachments: Vec::new(),
         }).collect::<Vec<_>>();
     messages.extend(missing);
-    // An accepted steer can be journaled before the loop records its model message.
-    for prompt in generic.drain(..).filter(is_context_prompt) {
-        let recorded = messages.iter().any(|message| match (&prompt, message) {
-            (
-                ModelMessage::User { content: left, .. },
-                ModelMessage::User { content: right, .. },
-            )
-            | (ModelMessage::System { content: left }, ModelMessage::System { content: right }) => {
-                left == right
-            }
-            _ => false,
-        });
-        if !recorded {
-            messages.push(prompt);
-        }
-    }
 }
 
 fn compaction_restarts_replay(payload: &Value) -> bool {
