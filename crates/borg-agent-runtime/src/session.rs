@@ -3843,6 +3843,7 @@ async fn run_agent_session_store_kernel(
                                 auth_lookup_retries = 0;
                             }
                             let network_retry = !interrupted && (provider_error_is_connection_lost(&error)
+                                || provider_error_is_transient_api_failure(&error)
                                 || auth_lookup_failure);
                             let retry = network_retry || usage_limit_retry || automatic_retry_allowed(
                                 &error,
@@ -3891,7 +3892,7 @@ async fn run_agent_session_store_kernel(
                                 if network_retry && auth_lookup_failure {
                                     format!("Codex authentication lookup unavailable · retry {} in {}s · Esc to cancel. Your work is saved.", auth_lookup_retries.saturating_add(1), network_retry_delay.as_secs())
                                 } else if network_retry {
-                                    format!("Connection interrupted · retrying in {}s · Esc to cancel. Your work is saved.", network_retry_delay.as_secs())
+                                    format!("Provider temporarily unavailable · retrying in {}s · Esc to cancel. Your work is saved.", network_retry_delay.as_secs())
                                 } else if let Some(wait) = usage_limit_wait {
                                     if usage_limit_continue {
                                         format!(
@@ -8870,11 +8871,21 @@ fn is_safe_automatic_retry_error(error: &str) -> bool {
         || provider_error_is_transient_api_failure(&error)
 }
 
-/// Structured termination markers the Claude stream-json adapter appends to a
-/// failed result (`"status":N` from `api_error_status`, `"terminal_reason"`
+/// HTTP failures from native adapters and structured termination markers the
+/// Claude stream-json adapter appends to a failed result (`"status":N` from `api_error_status`, `"terminal_reason"`
 /// from the result frame). Overload and gateway failures are safe to retry;
 /// 429 is a usage limit and handled separately.
 fn provider_error_is_transient_api_failure(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    if let Some(status) = error
+        .split("request failed with http ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|status| status.trim_end_matches(':').parse::<u16>().ok())
+        && (500..600).contains(&status)
+    {
+        return true;
+    }
     let compact = error
         .chars()
         .filter(|character| !character.is_ascii_whitespace())

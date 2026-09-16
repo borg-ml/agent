@@ -468,6 +468,17 @@ async fn accepted_steers_settle_in_fifo_order_when_acknowledgements_arrive_out_o
 
 #[test]
 fn structured_claude_result_terminations_classify_without_prose() {
+    for status in [500, 502, 503, 504, 529] {
+        assert!(provider_error_is_transient_api_failure(&format!(
+            "openrouter request failed with HTTP {status}: Provider returned error"
+        )));
+    }
+    for status in [400, 401, 403, 404, 429, 5020] {
+        assert!(!provider_error_is_transient_api_failure(&format!(
+            "openrouter request failed with HTTP {status}: Provider returned error"
+        )));
+    }
+
     assert!(is_safe_automatic_retry_error(
         r#"claude SDK error_during_execution: upstream failed "terminal_reason":"api_error" "status":529"#
     ));
@@ -11914,6 +11925,7 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
     for (error, failures, expected_attempts) in [
         ("Codex subscription connection failed", 3, 4),
         ("Codex model catalog disconnected", 3, 4),
+        ("openrouter request failed with HTTP 502: Provider returned error", 3, 4),
         ("authentication failed", 3, 1),
         (
             "Codex subscription credentials rejected; reconnect Codex",
