@@ -3391,6 +3391,11 @@ impl BorgTerminal {
             &event.kind,
             &mut self.requeue_cursor,
         );
+        if self.notice.as_deref() == Some("Sending pending input")
+            && self.active_queued_prompts().is_empty()
+        {
+            self.notice = None;
+        }
         if let SessionEventKind::Message {
             message_id,
             actor: EventActor::User,

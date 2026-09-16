@@ -3579,6 +3579,7 @@ async fn run_agent_session_store_kernel(
             mpsc::channel::<(Uuid, std::result::Result<(), String>)>(32);
         let mut provider_events_open = true;
         let mut interrupted = false;
+        let mut network_recovery_pending = network_retry_message_id.is_some();
         let mut turn_had_side_effects = false;
         let mut retryable_provider_errors = Vec::new();
         let mut turn_reported_error = false;
@@ -3649,6 +3650,14 @@ async fn run_agent_session_store_kernel(
                         result
                     };
                     while let Ok(kind) = provider_events.try_recv() {
+                        if network_recovery_pending && provider_event_is_progress(&kind) {
+                            network_recovery_pending = false;
+                            record(&mut journal, &events, session_id, SessionEventKind::ProviderEvent {
+                                provider: launch.provider,
+                                kind: "network_recovered".into(),
+                                payload: serde_json::json!({}),
+                            }).await?;
+                        }
                         let Some(kind) = generation.observe(kind, tokio::time::Instant::now()) else { continue; };
                         if is_executor_lifecycle_status(&kind) {
                             continue;
@@ -4065,6 +4074,14 @@ async fn run_agent_session_store_kernel(
                     // Classify liveness on the raw event: coalescing drops
                     // streaming fragments, which are still real progress.
                     let progress = provider_event_is_progress(&kind);
+                    if network_recovery_pending && provider_event_is_progress(&kind) {
+                        network_recovery_pending = false;
+                        record(&mut journal, &events, session_id, SessionEventKind::ProviderEvent {
+                            provider: launch.provider,
+                            kind: "network_recovered".into(),
+                            payload: serde_json::json!({}),
+                        }).await?;
+                    }
                     let Some(kind) = generation.observe(kind, tokio::time::Instant::now()) else {
                         // Fragments end a stall episode like any other output,
                         // so the reported stall has to be withdrawn here too.
@@ -4741,6 +4758,37 @@ async fn run_agent_session_store_kernel(
                                 )
                                 .await?;
                             }
+                        }
+                        HostCommand::FlushPendingInput { .. }
+                            if !provider_supports_active_turn_control(launch.provider) =>
+                        {
+                            if !pending.iter().any(|queued| queued.actor == EventActor::User) {
+                                continue;
+                            }
+                            // OpenCode has no steering channel. End its old turn
+                            // and immediately admit the pending human input,
+                            // without latching user-stop or pausing the goal.
+                            running.0.abort();
+                            let _ = (&mut running.0).await;
+                            executor.stop_session(session_id).await?;
+                            subscription_context_reusable = false;
+                            provider_session_id = None;
+                            provider_fork_turn_id = None;
+                            deny_pending_approval(&mut journal, &events, session_id, &mut pending_approval).await?;
+                            cancel_pending_provider_interaction(&mut journal, &events, session_id, &mut pending_provider_interaction).await?;
+                            if prompt.visible {
+                                record_prompt_status(&mut journal, &events, session_id, &prompt,
+                                    MessageStatus::Complete, prompt.delivery).await?;
+                            }
+                            record(&mut journal, &events, session_id, SessionEventKind::TurnCompleted {
+                                message_id: prompt.message_id,
+                                provider_session_id: None,
+                                final_text: String::new(),
+                                error: Some("turn interrupted by pending input".into()),
+                            }).await?;
+                            batch_pending_after_interrupt = true;
+                            interrupted = true;
+                            break;
                         }
                         HostCommand::FlushPendingInput { .. } => {
                             flush_pending_input_into_active_turn(

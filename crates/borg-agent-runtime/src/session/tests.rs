@@ -3945,6 +3945,11 @@ async fn claude_interrupt_preserves_queue_and_only_normalizes_expected_aborts() 
     }
 }
 
+#[tokio::test]
+async fn escape_flush_opencode_redirects_pending_input_without_user_stop() {
+    assert_interrupted_fifo(CodingProvider::OpenCode, None, true).await;
+}
+
 async fn assert_interrupted_fifo(
     provider: CodingProvider,
     abort_error: Option<&'static str>,
@@ -4016,7 +4021,11 @@ async fn assert_interrupted_fifo(
         .await
         .expect("first turn starts");
     command_tx
-        .send(HostCommand::Interrupt { session_id })
+        .send(if provider == CodingProvider::OpenCode {
+            HostCommand::FlushPendingInput { session_id }
+        } else {
+            HostCommand::Interrupt { session_id }
+        })
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), called.notified())
@@ -4035,7 +4044,7 @@ async fn assert_interrupted_fifo(
             SessionEventKind::TurnCompleted {
                 error: Some(error),
                 ..
-            } if error == "turn interrupted"
+            } if error.starts_with("turn interrupted")
         )),
         expected_interrupt
     );
@@ -4054,6 +4063,11 @@ async fn assert_interrupted_fifo(
         );
     }
 
+    if provider == CodingProvider::OpenCode {
+        assert!(!events.iter().any(|event| matches!(
+            event.kind, SessionEventKind::UserStopChanged { engaged: true, .. }
+        )));
+    }
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 2);
     assert_eq!(
@@ -11853,6 +11867,13 @@ impl AgentTurnExecutor for NetworkThenSuccessExecutor {
         if attempt < self.failures {
             anyhow::bail!(self.error);
         }
+        events.send(SessionEventKind::ToolStarted {
+            tool_call_id: "resumed-work".into(),
+            name: "exec".into(),
+            input: json!({"cmd": "git status"}),
+            input_ref: None,
+        }).await?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
         if self.failures > 10 {
             turn.agent_tools
                 .call("update_goal", serde_json::json!({"status": "complete"}))
@@ -11993,6 +12014,7 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
         let mut visible_errors = 0;
         let mut completed_tools = 0;
         let mut retry_delays = Vec::new();
+        let mut recovered = false;
         while completions < expected_attempts {
             let event = tokio::time::timeout(Duration::from_secs(60), event_rx.recv())
                 .await
@@ -12002,6 +12024,12 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
                 && kind == "network_retry"
             {
                 retry_delays.push(payload["delay_ms"].as_u64().unwrap());
+            }
+            if matches!(&event.kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "network_recovered") {
+                recovered = true;
+            }
+            if matches!(&event.kind, SessionEventKind::ToolStarted { tool_call_id, .. } if tool_call_id == "resumed-work") {
+                assert!(recovered, "reconnect status must clear before resumed work finishes");
             }
             if matches!(&event.kind, SessionEventKind::Error { message } if message == error) {
                 visible_errors += 1;
