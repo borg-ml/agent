@@ -173,6 +173,14 @@ pub struct AgentTurn {
     pub extension_api: crate::ExtensionApiSnapshot,
     /// Trusted runtime context appended to the provider system prompt.
     pub system_prompt_appendix: String,
+    /// Runtime context that changes between turns without changing what the
+    /// process is for (provider usage percentages, reset times). It is
+    /// appended to a fresh process's system prompt but is excluded from the
+    /// subscription pool lifecycle key, so a refreshed snapshot never
+    /// replaces a healthy pooled process and forces a canonical replay. A
+    /// reused process keeps the snapshot it started with; the prompt already
+    /// directs the model to `get_provider_capabilities` for fresh numbers.
+    pub volatile_system_prompt_appendix: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -602,6 +610,20 @@ fn lifecycle_model_material<'a>(
     } else {
         (model, effort)
     }
+}
+
+/// Append the turn's volatile context to a request's system prompt. Callers
+/// derive the subscription lifecycle key before this runs: the key must cover
+/// only the material a pooled process cannot absorb, and this section is
+/// deliberately not part of it (see `AgentTurn::volatile_system_prompt_appendix`).
+fn append_volatile_system_prompt(request: &mut ChatStreamRequest, turn: &AgentTurn) {
+    if turn.volatile_system_prompt_appendix.is_empty() {
+        return;
+    }
+    request.system_prompt.push_str("\n\n");
+    request
+        .system_prompt
+        .push_str(&turn.volatile_system_prompt_appendix);
 }
 
 fn subscription_lifecycle_key(
@@ -1132,6 +1154,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         request.fork_turn_id = None;
         request.resume_unavailable_prompt = prepared.resume_unavailable_prompt.clone();
         request.persist_session = Some(true);
+        append_volatile_system_prompt(&mut request, &turn);
         let pool = match prepared.pool {
             SubscriptionPool::Codex(pool) => pool,
             SubscriptionPool::Claude(_) => unreachable!("Codex slot contained Claude pool"),
@@ -1616,6 +1639,9 @@ async fn run_borg_provider_turn(
     } else {
         None
     };
+    // Only now, with the lifecycle key derived, does the volatile context join
+    // the prompt a fresh process would be started with.
+    append_volatile_system_prompt(&mut request, &pool_turn);
     let pooled_claude = pool_invocation
         .as_ref()
         .and_then(|(_, prepared)| match &prepared.pool {
@@ -2547,6 +2573,101 @@ async fn send(events: &mpsc::Sender<SessionEventKind>, event: SessionEventKind) 
 
 #[cfg(test)]
 mod tests {
+    fn lifecycle_test_turn(cwd: &std::path::Path) -> super::AgentTurn {
+        let session_id = uuid::Uuid::new_v4();
+        super::AgentTurn {
+            session_id,
+            message_id: uuid::Uuid::new_v4(),
+            context_generation: 0,
+            provider: crate::CodingProvider::Claude,
+            provider_session_id: None,
+            provider_fork_turn_id: None,
+            cwd: cwd.to_path_buf(),
+            prompt_delta: "hello".to_string(),
+            prompt: "hello".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            model: Some("claude-fable-5-1".to_string()),
+            effort: None,
+            fast: None,
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: crate::PermissionMode::FullAccess,
+            conversation: Vec::new(),
+            agent_mcp_server: borg_provider::mcp::ExternalMcpServer {
+                name: "test".to_string(),
+                command: "test".to_string(),
+                ..Default::default()
+            },
+            agent_tools: crate::AgentToolDispatcher::new(
+                crate::session::SessionGoalTools::disconnected(),
+                crate::session::SessionTodoTools::disconnected(),
+                None,
+                crate::LspService::new(cwd),
+                crate::CodingProvider::Claude,
+                session_id,
+                false,
+                None,
+                None,
+                cwd.to_path_buf(),
+                None,
+                None,
+                Vec::new(),
+                None,
+                crate::native_process::ProcessManager::default(),
+                crate::PermissionMode::FullAccess,
+            ),
+            external_mcp_servers: Vec::new(),
+            runtime_mcp_context: Default::default(),
+            extension_skill_roots: Vec::new(),
+            extension_workflows: Vec::new(),
+            extension_api: Default::default(),
+            system_prompt_appendix: "extension context".to_string(),
+            volatile_system_prompt_appendix: "usage: 5-hour 65% left".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn volatile_system_prompt_context_never_changes_the_pool_lifecycle_key() {
+        use super::{
+            append_volatile_system_prompt, direct_chat_stream_request, subscription_lifecycle_key,
+        };
+        let cwd = std::env::temp_dir();
+        let turn = lifecycle_test_turn(&cwd);
+        let mut request = direct_chat_stream_request(&turn, true, "");
+        let key = subscription_lifecycle_key(&turn, &request, turn.permission_mode);
+        assert!(!request.system_prompt.contains("usage: 5-hour"));
+        append_volatile_system_prompt(&mut request, &turn);
+        assert!(
+            request
+                .system_prompt
+                .ends_with("extension context\n\nusage: 5-hour 65% left"),
+            "a fresh process still receives the volatile context"
+        );
+
+        // A refreshed usage snapshot must append to the same pooled process
+        // instead of replacing it and replaying the canonical journal.
+        let mut refreshed = turn.clone();
+        refreshed.volatile_system_prompt_appendix = "usage: 5-hour 40% left".to_string();
+        let refreshed_request = direct_chat_stream_request(&refreshed, true, "");
+        assert_eq!(
+            subscription_lifecycle_key(&refreshed, &refreshed_request, refreshed.permission_mode),
+            key
+        );
+
+        // Stable runtime context still needs a fresh process.
+        let mut reconfigured = turn.clone();
+        reconfigured.system_prompt_appendix = "different extension context".to_string();
+        let reconfigured_request = direct_chat_stream_request(&reconfigured, true, "");
+        assert_ne!(
+            subscription_lifecycle_key(
+                &reconfigured,
+                &reconfigured_request,
+                reconfigured.permission_mode
+            ),
+            key
+        );
+    }
+
     #[test]
     fn delta_only_claude_turn_refuses_a_fresh_pooled_process() {
         use super::claude_delta_needs_replay;

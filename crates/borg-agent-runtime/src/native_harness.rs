@@ -241,9 +241,14 @@ impl NativeHarness {
             .await;
             system_prompt.push_str(&format!("\nExternal MCP server {} is unavailable for this turn. Its tools are not available; do not claim to have used them.", serde_json::to_string(server)?));
         }
-        if !turn.system_prompt_appendix.is_empty() {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(&turn.system_prompt_appendix);
+        for appendix in [
+            &turn.system_prompt_appendix,
+            &turn.volatile_system_prompt_appendix,
+        ] {
+            if !appendix.is_empty() {
+                system_prompt.push_str("\n\n");
+                system_prompt.push_str(appendix);
+            }
         }
         if let Some(instruction) = turn.response_language.instruction() {
             system_prompt.push_str("\n\n");
@@ -3413,6 +3418,7 @@ mod tests {
                 extension_workflows: Vec::new(),
                 extension_api: Default::default(),
                 system_prompt_appendix: String::new(),
+                volatile_system_prompt_appendix: String::new(),
             };
             // One event of backpressure makes the first result a deterministic control boundary.
             let (events_tx, mut events_rx) = mpsc::channel(1);

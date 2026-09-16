@@ -2816,9 +2816,11 @@ async fn run_agent_session_store_kernel(
                                         extension_skill_roots: launch.extension_skill_roots.clone(),
                                         extension_workflows: Vec::new(),
                                         extension_api: crate::ExtensionApiSnapshot::default(),
-                                        system_prompt_appendix: crate::provider_capabilities_prompt(
-                                            &launch.capabilities.provider_capabilities,
-                                        ),
+                                        system_prompt_appendix: String::new(),
+                                        volatile_system_prompt_appendix:
+                                            crate::provider_capabilities_prompt(
+                                                &launch.capabilities.provider_capabilities,
+                                            ),
                                     })
                                     .await?
                                     .unwrap_or_default();
@@ -3535,7 +3537,8 @@ async fn run_agent_session_store_kernel(
             extension_skill_roots: launch.extension_skill_roots.clone(),
             extension_workflows: Vec::new(),
             extension_api: crate::ExtensionApiSnapshot::default(),
-            system_prompt_appendix: crate::provider_capabilities_prompt(
+            system_prompt_appendix: String::new(),
+            volatile_system_prompt_appendix: crate::provider_capabilities_prompt(
                 &launch.capabilities.provider_capabilities,
             ),
         };
@@ -6010,9 +6013,9 @@ async fn compact_subscription_context_for_budget(
             extension_skill_roots: Vec::new(),
             extension_workflows: Vec::new(),
             extension_api: crate::ExtensionApiSnapshot::default(),
-            system_prompt_appendix: format!(
-                "{RETAINED_COMPACTION_SYSTEM_PROMPT}\n\n{}",
-                crate::provider_capabilities_prompt(&launch.capabilities.provider_capabilities)
+            system_prompt_appendix: RETAINED_COMPACTION_SYSTEM_PROMPT.to_string(),
+            volatile_system_prompt_appendix: crate::provider_capabilities_prompt(
+                &launch.capabilities.provider_capabilities,
             ),
         })
         .await?;
