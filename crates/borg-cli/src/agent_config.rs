@@ -261,9 +261,9 @@ pub(crate) struct CapabilityConfig {
     pub(crate) web_relay: bool,
     pub(crate) telemetry: bool,
     pub(crate) auto_resume_usage_limits: bool,
-    /// Frame messages typed while a turn is running with an instruction to
-    /// address them in the next visible response.
-    pub(crate) steer_reply_prompt: bool,
+    /// Providers whose mid-turn human messages are framed with an instruction
+    /// to address them next: `true` (default set), `false`, or a list.
+    pub(crate) steer_reply_prompt: borg_remote::SteerReplyPrompt,
     /// Model-facing harness. `borg` is the curated shell-first surface;
     /// `native` is the explicit direct-tool fallback.
     #[serde(alias = "tool_mode")]
@@ -282,7 +282,7 @@ impl Default for CapabilityConfig {
             web_relay: true,
             telemetry: false,
             auto_resume_usage_limits: true,
-            steer_reply_prompt: true,
+            steer_reply_prompt: borg_remote::SteerReplyPrompt::default(),
             harness: borg_remote::HarnessMode::Borg,
         }
     }
@@ -300,7 +300,7 @@ impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
             web_relay: value.web_relay,
             telemetry: value.telemetry,
             auto_resume_usage_limits: value.auto_resume_usage_limits,
-            steer_reply_prompt: value.steer_reply_prompt,
+            steer_reply_prompt: value.steer_reply_prompt.clone(),
             provider_capabilities: Vec::new(),
             runtime_mcp_context: None,
             resource_limits: None,
@@ -1227,17 +1227,28 @@ reasoning_format = "deepseek"
     }
 
     #[test]
-    fn steer_reply_prompt_defaults_on_and_can_be_disabled() {
+    fn steer_reply_prompt_is_a_provider_allowlist() {
+        use borg_remote::CodingProvider;
         let config: AgentConfig = toml::from_str("").unwrap();
-        assert!(config.capabilities.steer_reply_prompt);
-        let config: AgentConfig = toml::from_str(
-            "[capabilities]
-steer_reply_prompt = false
-",
-        )
-        .unwrap();
-        assert!(!config.capabilities.steer_reply_prompt);
-        assert!(!borg_remote::SessionCapabilities::from(&config.capabilities).steer_reply_prompt);
+        assert_eq!(
+            config.capabilities.steer_reply_prompt.0,
+            vec![CodingProvider::Claude, CodingProvider::OpenCode]
+        );
+        let config: AgentConfig =
+            toml::from_str("[capabilities]\nsteer_reply_prompt = false\n").unwrap();
+        assert!(config.capabilities.steer_reply_prompt.0.is_empty());
+        let config: AgentConfig =
+            toml::from_str("[capabilities]\nsteer_reply_prompt = true\n").unwrap();
+        assert_eq!(config.capabilities.steer_reply_prompt.0.len(), 2);
+        let config: AgentConfig =
+            toml::from_str("[capabilities]\nsteer_reply_prompt = [\"codex\"]\n").unwrap();
+        let capabilities = borg_remote::SessionCapabilities::from(&config.capabilities);
+        assert!(capabilities.frames_steers_for(CodingProvider::Codex));
+        assert!(!capabilities.frames_steers_for(CodingProvider::Claude));
+        assert!(
+            toml::from_str::<AgentConfig>("[capabilities]\nsteer_reply_prompt = [\"gpt\"]\n")
+                .is_err()
+        );
     }
 
     #[test]

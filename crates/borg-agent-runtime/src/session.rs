@@ -4178,7 +4178,7 @@ async fn run_agent_session_store_kernel(
                             &control_tx,
                             &steer_result_tx,
                             &mut pending_steers,
-                            steer_boundary_generation, launch.capabilities.steer_reply_prompt,
+                            steer_boundary_generation, launch.capabilities.frames_steers_for(launch.provider),
                         )
                         .await;
                     }
@@ -4456,7 +4456,7 @@ async fn run_agent_session_store_kernel(
                                     &control_tx,
                                     &steer_result_tx,
                                     &mut pending_steers,
-                                    steer_boundary_generation, launch.capabilities.steer_reply_prompt,
+                                    steer_boundary_generation, launch.capabilities.frames_steers_for(launch.provider),
                                 )
                                 .await;
                             }
@@ -4631,7 +4631,7 @@ async fn run_agent_session_store_kernel(
                                     &steer_result_tx,
                                     &prompt,
                                     admission.clone(),
-                                    acknowledgement_id, launch.capabilities.steer_reply_prompt,
+                                    acknowledgement_id, launch.capabilities.frames_steers_for(launch.provider),
                                 )
                                 .await
                             };
@@ -4653,7 +4653,7 @@ async fn run_agent_session_store_kernel(
                                 attempt_boundary: steer_boundary_generation,
                             });
                             if has_pending && !context_compaction_in_progress && !user_stop && !interrupted {
-                                retry_pending_steers(&control_tx, &steer_result_tx, &mut pending_steers, steer_boundary_generation, launch.capabilities.steer_reply_prompt).await;
+                                retry_pending_steers(&control_tx, &steer_result_tx, &mut pending_steers, steer_boundary_generation, launch.capabilities.frames_steers_for(launch.provider)).await;
                             }
                         }
                         HostCommand::Prompt {
@@ -4799,7 +4799,7 @@ async fn run_agent_session_store_kernel(
                                 &mut pending,
                                 &mut pending_steers,
                                 steer_boundary_generation,
-                                context_compaction_in_progress, launch.capabilities.steer_reply_prompt,
+                                context_compaction_in_progress, launch.capabilities.frames_steers_for(launch.provider),
                             )
                             .await;
                         }

@@ -856,11 +856,14 @@ pub struct SessionCapabilities {
     /// usage limits have had time to clear.
     #[serde(default = "default_true")]
     pub auto_resume_usage_limits: bool,
-    /// Frame a human message that arrives mid-turn with an instruction to
-    /// address it in the next visible response. The bare text is otherwise
-    /// folded silently into the running task most of the time.
-    #[serde(default = "default_true")]
-    pub steer_reply_prompt: bool,
+    /// Providers whose mid-turn human messages are framed with an instruction
+    /// to address them in the next visible response. Their models otherwise
+    /// fold the bare text silently into the running task; Codex answers such
+    /// messages promptly on its own and is not framed by default. Accepts
+    /// `true` (the default set), `false` (nobody), or a provider list.
+    #[serde(default)]
+    #[ts(type = "Array<string>")]
+    pub steer_reply_prompt: SteerReplyPrompt,
     /// Host-local provider authentication and admission state. This is safe
     /// model metadata, never a credential, and is refreshed at session launch
     /// by local and enrolled hosts.
@@ -890,7 +893,7 @@ impl Default for SessionCapabilities {
             web_relay: true,
             telemetry: false,
             auto_resume_usage_limits: true,
-            steer_reply_prompt: true,
+            steer_reply_prompt: SteerReplyPrompt::default(),
             provider_capabilities: Vec::new(),
             runtime_mcp_context: None,
             resource_limits: None,
@@ -900,6 +903,49 @@ impl Default for SessionCapabilities {
 
 const fn default_true() -> bool {
     true
+}
+/// Providers whose mid-turn human messages are framed with the reply
+/// instruction. Serializes as the provider list; deserializes from `true`
+/// (the default set), `false` (nobody), or an explicit provider list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct SteerReplyPrompt(pub Vec<CodingProvider>);
+impl Default for SteerReplyPrompt {
+    /// Measured on real sessions: Claude answers a mid-turn message after a
+    /// median of nine tool calls and OpenCode after six; Codex answers at once.
+    fn default() -> Self {
+        Self(vec![CodingProvider::Claude, CodingProvider::OpenCode])
+    }
+}
+impl SteerReplyPrompt {
+    pub fn frames(&self, provider: CodingProvider) -> bool {
+        self.0.contains(&provider)
+    }
+}
+impl<'de> Deserialize<'de> for SteerReplyPrompt {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Setting {
+            Enabled(bool),
+            Providers(Vec<CodingProvider>),
+        }
+        Ok(match Setting::deserialize(deserializer)? {
+            Setting::Enabled(true) => Self::default(),
+            Setting::Enabled(false) => Self(Vec::new()),
+            Setting::Providers(providers) => Self(providers),
+        })
+    }
+}
+impl SessionCapabilities {
+    /// Whether a human steer sent to `provider` is framed with the reply
+    /// instruction.
+    pub fn frames_steers_for(&self, provider: CodingProvider) -> bool {
+        self.steer_reply_prompt.frames(provider)
+    }
 }
 
 /// Render the secret-free provider admission snapshot that is appended to a

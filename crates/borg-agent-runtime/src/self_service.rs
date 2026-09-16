@@ -2149,7 +2149,19 @@ fn validate_settings_shape(root: &toml::Value) -> Result<()> {
             ],
             "capabilities",
         )?;
-        check_bool_values(capabilities, "capabilities")?;
+        check_bool_values_except(capabilities, "capabilities", &["steer_reply_prompt"])?;
+        if let Some(value) = capabilities.get("steer_reply_prompt") {
+            let valid = value.as_bool().is_some()
+                || value.as_array().is_some_and(|items| {
+                    items
+                        .iter()
+                        .all(|item| item.clone().try_into::<crate::CodingProvider>().is_ok())
+                });
+            ensure!(
+                valid,
+                "capabilities.steer_reply_prompt must be a boolean or a list of provider names"
+            );
+        }
     }
     if let Some(extensions) = root.get("extensions") {
         check_keys(extensions, &["allow_project_mcp"], "extensions")?;
@@ -2533,6 +2545,19 @@ fn check_table_keys(
         ensure!(
             allowed.contains(&key.as_str()),
             "unsupported setting `{section}.{key}`"
+        );
+    }
+    Ok(())
+}
+
+fn check_bool_values_except(value: &toml::Value, section: &str, except: &[&str]) -> Result<()> {
+    for (key, value) in value.as_table().expect("checked table") {
+        if except.contains(&key.as_str()) {
+            continue;
+        }
+        ensure!(
+            value.as_bool().is_some(),
+            "{section}.{key} must be a boolean"
         );
     }
     Ok(())

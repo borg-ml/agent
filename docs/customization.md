@@ -36,11 +36,13 @@ persisted to `editor.toml`.
 | Transcript colors | `/colors`, `/color` | the four `transcript.*_color` values in `#RRGGBB` form |
 
 Messages sent while a turn is running (`/followups steer`) reach the model at
-its next tool boundary. By default Borg frames each one with an instruction to
-address it in the agent's next visible response, because the bare text tends
-to be folded into the running task without a word. Set
-`capabilities.steer_reply_prompt = false` in `agent.toml` (see
-`configs/agent.example.toml`) to deliver the bare text. The session journal
+its next tool boundary. For Claude and OpenCode, Borg frames each one with an instruction to address it
+in the agent's next visible response, because those models tend to fold the
+bare text into the running task without a word (Codex answers such messages
+promptly on its own, so it is not framed). `capabilities.steer_reply_prompt`
+in `agent.toml` is that provider list: `["claude", "open_code"]` by default,
+`false` to always deliver the bare text, `true` for the default set (see
+`configs/agent.example.toml`). The session journal
 keeps your message verbatim either way, and team messages are never framed as
 yours.
 

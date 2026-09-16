@@ -4668,10 +4668,7 @@ async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
 
     assert_eq!(
         steers.lock().unwrap().as_slice(),
-        [(
-            frame_mid_turn_human_message("inspect this [Image 1]"),
-            vec![image.clone()]
-        )]
+        [("inspect this [Image 1]".to_string(), vec![image.clone()])]
     );
     let turns = turns.lock().unwrap();
     assert_eq!(turns.len(), 2);
@@ -4941,10 +4938,7 @@ async fn escape_flush_keeps_the_turn_running_after_admission_and_steers_queued_i
     }
     assert_eq!(
         *steers.lock().unwrap(),
-        [
-            frame_mid_turn_human_message("already admitted before escape"),
-            frame_mid_turn_human_message("queued one\n\nqueued two"),
-        ]
+        ["already admitted before escape", "queued one\n\nqueued two"]
     );
     assert!(
         !interrupted.load(Ordering::Acquire),
