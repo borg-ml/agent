@@ -7470,6 +7470,35 @@ fn only_an_uncommitted_steer_is_withdrawable_from_the_active_turn() {
 }
 
 #[test]
+fn coalescing_keeps_the_last_prompts_attachments_on_its_batch_entry() {
+    // A retried prompt is pushed back and coalesced on its own before the
+    // next admission. Its journaled batch entry must keep the attachments,
+    // otherwise the transcript loses the image preview on retry.
+    let image = PathBuf::from("/tmp/only.png");
+    let id = Uuid::new_v4();
+    let mut pending = VecDeque::from([QueuedPrompt {
+        message_id: id,
+        text: "why [Image 1]".to_string(),
+        actor: EventActor::User,
+        attachments: vec![image.clone()],
+        output_schema: None,
+        delivery: PromptDelivery::Queue,
+        visible: true,
+        interrupt_batch: true,
+        batch: Vec::new(),
+    }]);
+
+    coalesce_queued_prompts(&mut pending);
+
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].attachments, [image.clone()]);
+    let entries = pending[0].batch_entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].message_id, id);
+    assert_eq!(entries[0].attachments, [image]);
+}
+
+#[test]
 fn escape_batch_coalesces_queued_prompts_in_fifo_order() {
     let first_image = PathBuf::from("/tmp/first.png");
     let last_image = PathBuf::from("/tmp/last.png");

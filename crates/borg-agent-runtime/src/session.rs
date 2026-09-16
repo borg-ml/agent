@@ -7066,8 +7066,10 @@ fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
         }
         text.push_str(&combined.text);
     }
-    attachments.append(&mut combined.attachments);
+    // Take the batch entry before draining the attachments: the entry is
+    // what gets journaled for this message, so it must keep them.
     batch.extend(combined.batch_entries());
+    attachments.append(&mut combined.attachments);
     combined.text = text;
     combined.attachments = attachments;
     combined.delivery = PromptDelivery::Queue;
@@ -7398,9 +7400,13 @@ async fn dispatch_steer(
             text: prompt.text.clone(),
             attachments: prompt.attachments.clone(),
             admission,
-            // Only the human preempts the running task; reminders and team
-            // notices fold in at the next boundary.
-            preempt: prompt.actor == EventActor::User,
+            // Fold every steer in at the next tool boundary, as Claude Code's
+            // own TUI does for a message typed mid-turn: the CLI then wraps it
+            // in its "The user sent a new message while you were working"
+            // framing. A priority-`now` steer instead cancels the running
+            // command and lands as a bare user block, which the model is
+            // measurably less likely to answer.
+            preempt: false,
             ack,
         })
         .await
