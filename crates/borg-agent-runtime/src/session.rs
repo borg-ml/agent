@@ -5638,10 +5638,6 @@ fn native_conversation(
                     close_interrupted_native_round(&mut pending_native, &mut pending_generic);
                     conversation.append(&mut pending_native);
                 }
-                // If a failed prompt was followed by another turn without a
-                // compaction boundary, it is already part of `conversation`;
-                // it no longer needs the exact-tail escape hatch.
-                failed_prompts.clear();
                 active_provider = Some(*provider);
                 native_structured_in_turn = false;
                 // Generic subscription turns carry no `native_prompt_context`;
@@ -5746,6 +5742,11 @@ fn native_conversation(
                     ),
                     EventActor::Tool => unreachable!("tool messages use ToolCompleted"),
                 };
+                // Record the placement so the `TurnStarted` anchor does not
+                // place the same prompt a second time.
+                if matches!(actor, EventActor::User | EventActor::System) {
+                    placed_prompts.insert(*message_id);
+                }
                 pending_generic.push(message);
             }
             SessionEventKind::ToolStarted {
@@ -5798,6 +5799,12 @@ fn native_conversation(
                 });
             }
             SessionEventKind::TurnCompleted { error: None, .. } => {
+                // A turn completed normally after the failed prompts, so the
+                // human has a result that follows them in `conversation`;
+                // the exact-tail escape hatch has done its job. Clearing it
+                // any earlier (at the next `TurnStarted`) let a compaction
+                // between that start and its completion erase the prompt.
+                failed_prompts.clear();
                 conversation.append(&mut pending_native);
                 if native_structured_in_turn {
                     pending_generic.clear();
