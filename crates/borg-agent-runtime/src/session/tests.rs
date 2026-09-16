@@ -11101,14 +11101,18 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
     assert_eq!(compaction_calls.load(Ordering::Acquire), 0);
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
-    assert_eq!(
-        seen[0].0,
-        format_subscription_provider_prompt(
-            Some(&retained_before_crash),
-            EventActor::User,
-            "recover the active request"
-        )
-    );
+    // The interrupted prompt is part of the durable branch, but the recovered
+    // turn re-issues it as the live request, so it must appear exactly once:
+    // as the current request at the end, never duplicated in the history.
+    let recovered = &seen[0].0;
+    assert_eq!(recovered.matches("recover the active request").count(), 1);
+    assert!(recovered.starts_with(SUBSCRIPTION_CONTEXT_HEADER));
+    assert!(recovered.contains("Previous conversation summary"));
+    assert!(!recovered.contains("old-user-context"));
+    assert!(!recovered.contains("historical agent"));
+    assert!(recovered.ends_with(&format_subscription_frame(
+        &format_subscription_actor_value(EventActor::User, "recover the active request")
+    )));
     assert_eq!(seen[0].1, None);
     assert_eq!(seen[0].2, None);
     assert_eq!(seen[0].3, 0);
@@ -13277,4 +13281,138 @@ fn retry_prompts_carry_prior_checkpoints_without_repeating_completed_work() {
         "long checkpoint state is truncated: {with}"
     );
     assert!(with.len() < 3_000, "{}", with.len());
+}
+
+/// Journals a subscription turn in the exact order the runtime writes it:
+/// prompt admission (`InProgress`) before `TurnStarted`, the assistant reply,
+/// then the prompt's terminal status, then `TurnCompleted`. An interrupted
+/// turn writes `Failed` before its `TurnCompleted`.
+fn subscription_turn_events(
+    session_id: Uuid,
+    sequence: &mut u64,
+    prompt: &str,
+    reply: Option<&str>,
+) -> Vec<SessionEvent> {
+    let message_id = Uuid::new_v4();
+    let mut next = || {
+        *sequence += 1;
+        *sequence
+    };
+    let user = |status: MessageStatus, delivery: PromptDelivery| SessionEventKind::Message {
+        message_id,
+        actor: EventActor::User,
+        text: prompt.to_string(),
+        attachments: Vec::new(),
+        status,
+        delivery: Some(delivery),
+    };
+    let mut events = vec![
+        SessionEvent::new(
+            session_id,
+            next(),
+            user(MessageStatus::Queued, PromptDelivery::Steer),
+        ),
+        SessionEvent::new(
+            session_id,
+            next(),
+            user(MessageStatus::InProgress, PromptDelivery::Queue),
+        ),
+        SessionEvent::new(
+            session_id,
+            next(),
+            SessionEventKind::TurnStarted {
+                message_id,
+                provider: CodingProvider::Claude,
+                model: Some("claude-fable-5-1".to_string()),
+                effort: Some("medium".to_string()),
+                fast: false,
+            },
+        ),
+    ];
+    match reply {
+        Some(reply) => {
+            events.push(SessionEvent::new(
+                session_id,
+                next(),
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: reply.to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ));
+            events.push(SessionEvent::new(
+                session_id,
+                next(),
+                user(MessageStatus::Complete, PromptDelivery::Queue),
+            ));
+            events.push(SessionEvent::new(
+                session_id,
+                next(),
+                SessionEventKind::TurnCompleted {
+                    message_id,
+                    provider_session_id: None,
+                    final_text: reply.to_string(),
+                    error: None,
+                },
+            ));
+        }
+        None => {
+            events.push(SessionEvent::new(
+                session_id,
+                next(),
+                user(MessageStatus::Failed, PromptDelivery::Queue),
+            ));
+            events.push(SessionEvent::new(
+                session_id,
+                next(),
+                SessionEventKind::TurnCompleted {
+                    message_id,
+                    provider_session_id: None,
+                    final_text: String::new(),
+                    error: Some("turn interrupted".to_string()),
+                },
+            ));
+        }
+    }
+    events
+}
+
+#[test]
+fn subscription_prompts_precede_their_replies_and_survive_interrupts() {
+    use borg_provider::provider::ModelMessage;
+
+    let session_id = Uuid::new_v4();
+    let mut sequence = 0;
+    let mut events = subscription_turn_events(
+        session_id,
+        &mut sequence,
+        "first request",
+        Some("first reply"),
+    );
+    events.extend(subscription_turn_events(
+        session_id,
+        &mut sequence,
+        "this still looks wrong [Image 1]",
+        None,
+    ));
+    events.extend(subscription_turn_events(
+        session_id,
+        &mut sequence,
+        "the ui",
+        Some("third reply"),
+    ));
+
+    assert_eq!(
+        native_conversation(&events, CodingProvider::Claude).unwrap(),
+        vec![
+            ModelMessage::user("first request"),
+            ModelMessage::assistant(Some("first reply".to_string()), None, None, Vec::new()),
+            ModelMessage::user("this still looks wrong [Image 1]"),
+            ModelMessage::user("the ui"),
+            ModelMessage::assistant(Some("third reply".to_string()), None, None, Vec::new()),
+        ]
+    );
 }

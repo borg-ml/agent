@@ -5515,6 +5515,12 @@ fn native_conversation(
     // tail after every compaction summary so an empty/interrupted provider
     // turn cannot erase the user's request from the next context.
     let mut failed_prompts = Vec::new();
+    // Prompts placed at their admission (`InProgress`) event. Subscription
+    // turns journal that admission before `TurnStarted` and the prompt's
+    // terminal status only after the assistant reply, so placing the prompt
+    // on its terminal event put every user message *after* the reply it
+    // produced and dropped interrupted prompts entirely.
+    let mut placed_prompts: HashSet<Uuid> = HashSet::new();
     let mut active_provider = None;
     let mut native_structured_in_turn = false;
     let non_interrupted_failed_turns = events
@@ -5594,13 +5600,43 @@ fn native_conversation(
             }
             SessionEventKind::Message {
                 message_id,
+                actor: actor @ (EventActor::User | EventActor::System),
+                text,
+                status: MessageStatus::InProgress,
+                ..
+            } if turn_providers
+                .get(message_id)
+                .copied()
+                .or(active_provider)
+                .is_some_and(|provider| !provider.uses_native_harness()) =>
+            {
+                // Native-harness turns carry their prompt in
+                // `native_prompt_context`; generic subscription turns only
+                // have this admission event to mark where the prompt sits.
+                if placed_prompts.insert(*message_id) {
+                    let message = match actor {
+                        EventActor::System => borg_provider::provider::ModelMessage::System {
+                            content: text.clone(),
+                        },
+                        _ => borg_provider::provider::ModelMessage::user(text.clone()),
+                    };
+                    if native_structured_in_turn {
+                        pending_native.push(message);
+                    } else {
+                        pending_generic.push(message);
+                    }
+                }
+            }
+            SessionEventKind::Message {
+                message_id,
                 actor,
                 text,
                 status: status @ (MessageStatus::Complete | MessageStatus::Failed),
                 ..
-            } if active_provider
-                .or_else(|| turn_providers.get(message_id).copied())
-                .is_some()
+            } if !placed_prompts.contains(message_id)
+                && active_provider
+                    .or_else(|| turn_providers.get(message_id).copied())
+                    .is_some()
                 && (*status == MessageStatus::Complete
                     || non_interrupted_failed_turns.contains(message_id))
                 && matches!(
