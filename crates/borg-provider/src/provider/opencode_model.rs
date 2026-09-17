@@ -139,13 +139,13 @@ fn context_windows() -> &'static RwLock<Option<HashMap<String, u64>>> {
     CONTEXT_WINDOWS.get_or_init(|| RwLock::new(None))
 }
 
-/// The context window the Go service advertises for `model`.
+/// The context window for a Go-route `model`.
 ///
-/// The chat-completions response carries no context metadata, so without this
-/// `UsageUpdated` reports a null window: the context meter stays blank and
-/// auto-compaction never engages. The service's own model list is the
-/// authority, so it is fetched once per process and cached. An unknown model
-/// stays `None` rather than guessing a window.
+/// Neither the chat-completions response nor the Go `/models` list carries a
+/// window, so without this `UsageUpdated` reports null: the context meter stays
+/// blank and auto-compaction never engages. models.dev is the catalog OpenCode
+/// itself resolves limits from, so it is consulted once per process and cached.
+/// An unknown model stays `None` rather than guessing a window.
 pub async fn context_window_tokens(model: &str) -> Option<u64> {
     let id = wire_model(model).unwrap_or_else(|| model.trim());
     if id.is_empty() {
@@ -167,11 +167,14 @@ pub async fn context_window_tokens(model: &str) -> Option<u64> {
         .and_then(|cache| cache.as_ref()?.get(id).copied())
 }
 
+const MODELS_DEV_CATALOG_URL: &str = "https://models.dev/api.json";
+const MODELS_DEV_PROVIDER: &str = "opencode-go";
+
 async fn fetch_context_windows() -> Result<HashMap<String, u64>> {
     let response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
         .build()?
-        .get(format!("{BASE_URL}/models"))
+        .get(MODELS_DEV_CATALOG_URL)
         .send()
         .await?
         .error_for_status()?;
@@ -181,17 +184,16 @@ async fn fetch_context_windows() -> Result<HashMap<String, u64>> {
 
 fn parse_context_windows(payload: &serde_json::Value) -> HashMap<String, u64> {
     payload
-        .get("data")
-        .and_then(serde_json::Value::as_array)
+        .get(MODELS_DEV_PROVIDER)
+        .and_then(|provider| provider.get("models"))
+        .and_then(serde_json::Value::as_object)
         .into_iter()
         .flatten()
-        .filter_map(|model| {
-            let id = model.get("id")?.as_str()?.trim();
+        .filter_map(|(id, model)| {
             let context = model
-                .get("context_length")
-                .or_else(|| model.get("contextLength"))
+                .pointer("/limit/context")
                 .and_then(serde_json::Value::as_u64)?;
-            (!id.is_empty() && context > 0).then(|| (id.to_string(), context))
+            (!id.trim().is_empty() && context > 0).then(|| (id.clone(), context))
         })
         .collect()
 }
@@ -299,25 +301,31 @@ mod tests {
         }
     }
 
-    /// The chat-completions payload carries no window, so the model list is the
-    /// authority. Losing `context_length` would silently blank the context meter
-    /// and disable auto-compaction rather than fail loudly.
+    /// models.dev carries the window under the Go provider's `limit.context`.
+    /// Losing that field would silently blank the context meter and disable
+    /// auto-compaction rather than fail loudly.
     #[test]
-    fn context_windows_are_read_from_the_model_list() {
+    fn context_windows_are_read_from_the_models_dev_catalog() {
         let payload = serde_json::json!({
-            "data": [
-                {"id": "kimi-k2.7-code", "context_length": 262_144},
-                {"id": "glm-5.3", "contextLength": 200_000},
-                {"id": "no-window"},
-                {"id": "zero", "context_length": 0},
-                {"id": "  spaced  ", "context_length": 131_072},
-            ]
+            "opencode-go": {
+                "models": {
+                    "kimi-k2.7-code": {"limit": {"context": 262_144, "output": 262_144}},
+                    "glm-5.3": {"limit": {"context": 1_000_000}},
+                    "no-window": {"limit": {"output": 100}},
+                    "zero": {"limit": {"context": 0}},
+                }
+            },
+            "openrouter": {
+                "models": {"deepseek/deepseek-v4.1-flash": {"limit": {"context": 1_048_576}}}
+            }
         });
         let windows = parse_context_windows(&payload);
+        assert_eq!(windows.len(), 2);
         assert_eq!(windows.get("kimi-k2.7-code"), Some(&262_144));
-        assert_eq!(windows.get("glm-5.3"), Some(&200_000));
-        assert_eq!(windows.get("spaced"), Some(&131_072));
+        assert_eq!(windows.get("glm-5.3"), Some(&1_000_000));
         assert!(!windows.contains_key("no-window"));
         assert!(!windows.contains_key("zero"));
+        // Another provider's models must not leak into the Go route.
+        assert!(!windows.contains_key("deepseek/deepseek-v4.1-flash"));
     }
 }
