@@ -7038,6 +7038,149 @@ async fn resuming_an_idle_goal_emits_starting_before_running() {
     assert!(store.state(session_id).await.unwrap().goal.is_some());
 }
 
+/// A human resume that arrives while a turn is already running must release
+/// the stop latch. Otherwise the durable goal reads `active` while the latch
+/// still parks every automatic continuation at the next boundary, so the
+/// session stops with an apparently active goal.
+#[tokio::test]
+async fn resuming_a_goal_mid_turn_releases_the_stop_latch() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+    let mut goal = SessionGoal::new("Keep going".to_string(), None);
+    goal.status = GoalStatus::Paused;
+    for event in [
+        SessionEvent::new(session_id, 0, SessionEventKind::SessionStarted),
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::SessionConfigured {
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+            },
+        ),
+        SessionEvent::new(session_id, 0, SessionEventKind::GoalUpdated { goal }),
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::UserStopChanged { engaged: true },
+        ),
+        // A prompt queued before the stop still runs when the actor resumes,
+        // but it does not clear the latch on admission.
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "the pre-stop prompt".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ),
+    ] {
+        journal.append(event).await.unwrap();
+    }
+    drop(journal);
+
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                Arc::new(HungProviderExecutor),
+            )
+            .await
+        }
+    });
+
+    // The pre-stop prompt opens a turn that the hung executor never finishes.
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("the queued prompt starts a turn")
+            .expect("session event stream remains open");
+        if matches!(
+            event.kind,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+
+    command_tx
+        .send(HostCommand::Goal {
+            session_id,
+            action: GoalAction::Resume,
+        })
+        .await
+        .unwrap();
+
+    let resumed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let Some(event) = event_rx.recv().await else {
+                panic!("session event stream closed before the latch cleared");
+            };
+            if matches!(
+                event.kind,
+                SessionEventKind::UserStopChanged { engaged: false }
+            ) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        resumed.is_ok(),
+        "a mid-turn goal resume must release the stop latch"
+    );
+    assert!(
+        store
+            .state(session_id)
+            .await
+            .unwrap()
+            .goal
+            .is_some_and(|goal| goal.status == GoalStatus::Active)
+    );
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+}
+
 #[tokio::test]
 async fn goal_state_is_recoverable_from_the_session_journal() {
     let root = tempdir().unwrap();

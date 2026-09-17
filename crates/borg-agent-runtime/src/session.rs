@@ -4950,13 +4950,30 @@ async fn run_agent_session_store_kernel(
                                 action,
                             )
                             .await?;
-                            if objective_changed
-                                && let Some(active_goal) = goal
-                                    .as_ref()
-                                    .filter(|goal| goal.status == GoalStatus::Active)
+                            if let Some(active_goal) = goal
+                                .as_ref()
+                                .filter(|goal| goal.status == GoalStatus::Active)
                             {
-                                let text = objective_updated_prompt(active_goal);
-                                if provider_supports_active_turn_control(launch.provider)
+                                // A human resume or a new objective that lands
+                                // while a turn is already running must release
+                                // the stop latch exactly as the idle handler
+                                // does. Otherwise the goal reads `active` while
+                                // the latch still parks every automatic
+                                // continuation at the next boundary, and the
+                                // session stops with an apparently active goal.
+                                let steer = objective_changed
+                                    .then(|| objective_updated_prompt(active_goal));
+                                set_user_stop(
+                                    &mut journal,
+                                    &events,
+                                    session_id,
+                                    &mut user_stop,
+                                    false,
+                                )
+                                .await?;
+                                stale_user_prompts.clear();
+                                if let Some(text) = steer
+                                    && provider_supports_active_turn_control(launch.provider)
                                 {
                                     let (ack, _result) = oneshot::channel();
                                     control_tx
