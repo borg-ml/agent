@@ -2360,13 +2360,10 @@ pub enum SessionEventKind {
         sender_name: String,
         text: String,
     },
-    /// Durable record of the explicit user-stop gate toggling. Engaged by a
-    /// human Escape (turn boundary, active turn, or idle reconnect wait);
-    /// cleared only by an explicit human prompt or an explicit goal resume.
-    /// While engaged, no background input (team Steer/Queue prompts, queued
-    /// internal prompts, watch events, autonomy jobs, automatic retries)
-    /// may open a provider turn. Survives session-actor reload so the
-    /// NEVER-override-Escape contract holds across restarts.
+    /// Legacy explicit user-stop gate. Borg no longer emits this: Escape pauses
+    /// the active goal, and the goal status is the single stop/resume control.
+    /// The variant is retained so journals written before the change still
+    /// deserialize; replay ignores it and reads the goal state instead.
     UserStopChanged {
         engaged: bool,
     },
