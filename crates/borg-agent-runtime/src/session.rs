@@ -2831,7 +2831,7 @@ async fn run_agent_session_store_kernel(
                                     provider_session_id: Some(provider_session_id.to_string()),
                                 }))
                             } else {
-                                let context = retained_compaction_context_with_budget(
+                                let projection = retained_compaction_context_with_budget(
                                     journal.context_events(),
                                     subscription_compaction_context_budget(EventActor::User, ""),
                                 )
@@ -2843,7 +2843,7 @@ async fn run_agent_session_store_kernel(
                                         launch: &launch,
                                         agent_mcp_server: &agent_mcp_server,
                                         dispatcher: &dispatcher,
-                                        context: &context,
+                                        context: &projection.context,
                                         actor: EventActor::User,
                                         current_prompt: "",
                                     },
@@ -3273,9 +3273,20 @@ async fn run_agent_session_store_kernel(
                 .take()
                 .expect("oversized subscription context was present");
             let replay_budget = subscription_replay_context_budget(prompt.actor, &prompt.text);
-            let projected_context =
-                retained_compaction_context_with_budget(journal.context_events(), replay_budget)
-                    .unwrap_or_else(|| truncate_compaction_context(&full_context, replay_budget));
+            let projection =
+                retained_compaction_context_with_budget(journal.context_events(), replay_budget);
+            let (projected_context, messages_before, messages_omitted) = match projection {
+                Some(projection) => (
+                    projection.context,
+                    projection.messages_before,
+                    projection.messages_omitted,
+                ),
+                None => (
+                    truncate_compaction_context(&full_context, replay_budget),
+                    0,
+                    0,
+                ),
+            };
             let context_chars = full_context.chars().count();
             let projected_chars = projected_context.chars().count();
             retained_context = Some(projected_context);
@@ -3293,6 +3304,8 @@ async fn run_agent_session_store_kernel(
                         "context_chars_before": context_chars,
                         "context_chars_after": projected_chars,
                         "input_budget_chars": SUBSCRIPTION_INPUT_BUDGET_CHARS,
+                        "messages_before": messages_before,
+                        "messages_omitted": messages_omitted,
                     }),
                 },
             )
@@ -3503,6 +3516,30 @@ async fn run_agent_session_store_kernel(
             let recovery = "\n\nThe previous attempt lost its network connection. Continue from the recorded progress above. Do not repeat completed actions. Check the state of any interrupted command before deciding whether to run it again.";
             provider_prompt.push_str(recovery);
             prompt_delta.push_str(recovery);
+        }
+        if !native_provider {
+            // Durable audit of the exact text this turn handed the provider, so
+            // a later reader can see it instead of re-deriving the framing and
+            // projection. The native path journals its structured messages.
+            let sent_prompt = if reuse_subscription_context {
+                &prompt_delta
+            } else {
+                &provider_prompt
+            };
+            record(
+                &mut journal,
+                &events,
+                session_id,
+                SessionEventKind::ProviderEvent {
+                    provider: launch.provider,
+                    kind: crate::PROVIDER_PROMPT_EVENT_KIND.to_string(),
+                    payload: serde_json::json!({
+                        "prompt": sent_prompt,
+                        "provider_context_reused": reuse_subscription_context,
+                    }),
+                },
+            )
+            .await?;
         }
         let turn = AgentTurn {
             session_id,
@@ -6189,7 +6226,7 @@ fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
 fn retained_compaction_context_with_budget(
     events: &[SessionEvent],
     max_chars: usize,
-) -> Option<String> {
+) -> Option<CompactionProjection> {
     let conversation = provider_neutral_conversation(events)?;
     Some(fit_compaction_context(&conversation, max_chars))
 }
@@ -6446,14 +6483,30 @@ fn compaction_tool_is_high_value(tool_name: Option<&str>, content: &str) -> bool
     .any(|needle| lower.contains(needle))
 }
 
+/// A provider-replay projection plus what it had to drop to fit the budget.
+///
+/// The journal records this summary on `context_replay_projected`, so a reader
+/// can see that a replay silently dropped durable history without re-running
+/// the projection in code.
+struct CompactionProjection {
+    context: String,
+    messages_before: usize,
+    messages_omitted: usize,
+}
+
 fn fit_compaction_context(
     conversation: &[borg_provider::provider::ModelMessage],
     max_chars: usize,
-) -> String {
+) -> CompactionProjection {
+    let messages_before = conversation.len();
     let mut projected = prune_conversation_for_compaction(conversation);
     let mut rendered = format_subscription_conversation_with_tool_limit(&projected, None);
     if rendered.chars().count() <= max_chars {
-        return rendered;
+        return CompactionProjection {
+            context: rendered,
+            messages_before,
+            messages_omitted: 0,
+        };
     }
 
     // If non-tool messages themselves are unusually large, reduce them at
@@ -6495,7 +6548,11 @@ fn fit_compaction_context(
         content_limit /= 2;
     }
     if rendered.chars().count() <= max_chars {
-        return rendered;
+        return CompactionProjection {
+            context: rendered,
+            messages_before,
+            messages_omitted: 0,
+        };
     }
 
     // A pathological transcript can contain more non-tool text than the
@@ -6506,6 +6563,7 @@ fn fit_compaction_context(
     let recent_user_indices = recent_user_turn_indices(&projected, 2);
     let mut selected = Vec::with_capacity(projected.len());
     let mut omitted = false;
+    let mut messages_omitted = 0usize;
     for (index, message) in projected.into_iter().enumerate() {
         let keep = matches!(
             message,
@@ -6522,6 +6580,7 @@ fn fit_compaction_context(
             selected.push(message);
         } else {
             omitted = true;
+            messages_omitted += 1;
         }
     }
     if omitted {
@@ -6530,10 +6589,14 @@ fn fit_compaction_context(
         ));
     }
     rendered = format_subscription_conversation_with_tool_limit(&selected, None);
-    if rendered.chars().count() > max_chars {
-        truncate_compaction_context(&rendered, max_chars)
-    } else {
-        rendered
+    CompactionProjection {
+        context: if rendered.chars().count() > max_chars {
+            truncate_compaction_context(&rendered, max_chars)
+        } else {
+            rendered
+        },
+        messages_before,
+        messages_omitted,
     }
 }
 

@@ -961,6 +961,9 @@ impl Transcript {
                     *detail = format!("“{}”", compact_text(&query, 120));
                 }
             }
+            // Provider prompts are attached to their own provider event, never
+            // to a tool row, so there is nothing to hydrate here.
+            SessionPayloadKind::ProviderPrompt => {}
         }
         payload_refs.retain(|candidate| candidate.id != payload.id);
         Ok(())
@@ -1918,6 +1921,36 @@ impl Transcript {
                         .to_string(),
                     time: local_event_time(event),
                 });
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "context_replay_projected" =>
+            {
+                // Truncation is silent bulk reduction; dropping whole messages
+                // changes what the model can see, so say so. The journal keeps
+                // the record either way.
+                let omitted = payload
+                    .get("messages_omitted")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                if omitted > 0 {
+                    let before = payload
+                        .get("context_chars_before")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let after = payload
+                        .get("context_chars_after")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    self.order.push(TranscriptEntry::Info {
+                        title: "Older history omitted".to_string(),
+                        text: format!(
+                            "{omitted} older messages were left out of this provider request to \
+                             fit its budget ({before} → {after} characters); the durable journal \
+                             retains them."
+                        ),
+                        time: local_event_time(event),
+                    });
+                }
             }
             SessionEventKind::ProviderEvent { kind, .. } if kind == "context_compaction_failed" => {
                 self.finish_reasoning(event.created_at);

@@ -1995,6 +1995,10 @@ pub enum SessionPayloadKind {
     ToolInput,
     ToolOutput,
     ToolResultInput,
+    /// The exact text handed to a subscription provider for one turn. It is
+    /// journaled so a later reader can audit what the model actually received
+    /// instead of re-deriving the framing and projection in code.
+    ProviderPrompt,
 }
 
 impl SessionPayloadKind {
@@ -2003,9 +2007,17 @@ impl SessionPayloadKind {
             Self::ToolInput => "tool_input",
             Self::ToolOutput => "tool_output",
             Self::ToolResultInput => "tool_result_input",
+            Self::ProviderPrompt => "provider_prompt",
         }
     }
 }
+
+/// Provider-event kind carrying the exact text one subscription turn received.
+/// The `prompt` field is deferred to a [`SessionPayloadKind::ProviderPrompt`]
+/// payload when it exceeds the inline limit.
+pub const PROVIDER_PROMPT_EVENT_KIND: &str = "provider_prompt";
+pub const PROVIDER_PROMPT_FIELD: &str = "prompt";
+pub const PROVIDER_PROMPT_REF_FIELD: &str = "prompt_ref";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]

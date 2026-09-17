@@ -7517,7 +7517,7 @@ fn coalescing_keeps_the_last_prompts_attachments_on_its_batch_entry() {
     coalesce_queued_prompts(&mut pending);
 
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].attachments, [image.clone()]);
+    assert_eq!(pending[0].attachments, std::slice::from_ref(&image));
     let entries = pending[0].batch_entries();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].message_id, id);
@@ -9734,7 +9734,9 @@ fn subscription_compaction_projection_truncates_large_tool_results() {
 
     let full_context = retained_conversation_context(&events).unwrap();
     let compaction_context =
-        retained_compaction_context_with_budget(&events, SUBSCRIPTION_INPUT_BUDGET_CHARS).unwrap();
+        retained_compaction_context_with_budget(&events, SUBSCRIPTION_INPUT_BUDGET_CHARS)
+            .unwrap()
+            .context;
 
     assert!(compaction_context.contains("recent-tool-output-"));
     assert!(!compaction_context.contains(&tool_output));
@@ -9784,9 +9786,37 @@ fn deterministic_recovery_projection_fits_the_complete_provider_request() {
     .unwrap();
 
     assert!(
-        subscription_prompt_chars(Some(&projection), EventActor::User, current_prompt)
+        subscription_prompt_chars(Some(&projection.context), EventActor::User, current_prompt)
             <= SUBSCRIPTION_INPUT_BUDGET_CHARS
     );
+}
+
+/// A pathological replay drops whole messages. The projection must report how
+/// many, so the durable `context_replay_projected` event explains the omission
+/// marker instead of leaving a reader to re-derive the projection in code.
+#[test]
+fn replay_projection_reports_the_messages_it_omitted() {
+    use borg_provider::provider::ModelMessage;
+
+    let filler = "u".repeat(2_000);
+    let mut conversation = Vec::new();
+    for index in 0..6 {
+        conversation.push(ModelMessage::user(format!("user turn {index} {filler}")));
+        conversation.push(ModelMessage::assistant(
+            Some(format!("assistant turn {index}")),
+            None,
+            None,
+            Vec::new(),
+        ));
+    }
+    conversation.push(ModelMessage::user("the newest request".to_string()));
+
+    let projection = fit_compaction_context(&conversation, 2_048);
+
+    assert_eq!(projection.messages_before, conversation.len());
+    assert!(projection.messages_omitted > 0);
+    assert!(projection.messages_omitted < projection.messages_before);
+    assert!(projection.context.chars().count() <= 2_048);
 }
 
 #[test]

@@ -532,12 +532,19 @@ impl SessionEventKind {
                     kind.as_str(),
                     "context_compaction"
                         | "context_compaction_failed"
+                        | "context_replay_projected"
+                        | "context_replay_fallback"
                         | "item/started:contextCompaction"
                         | "item/completed:contextCompaction"
                         | "item/started:context_compaction"
                         | "item/completed:context_compaction"
                 ) =>
             {
+                EventPersistence::Durable
+            }
+            // The exact provider input is audit evidence: a reader must be able
+            // to see what a turn sent after the fact, not only while it is live.
+            Self::ProviderEvent { kind, .. } if kind == crate::PROVIDER_PROMPT_EVENT_KIND => {
                 EventPersistence::Durable
             }
             Self::ProviderEvent { kind, .. }
@@ -2583,7 +2590,7 @@ impl SqliteSessionStore {
         let mut references = Vec::new();
         history_payload_refs(&event.kind, &mut references);
         for reference in references {
-            let payload = self.load_payload(reference).await?;
+            let payload = self.load_payload(&reference).await?;
             body.push('\n');
             body.push_str(&String::from_utf8_lossy(&payload));
         }
@@ -2608,11 +2615,12 @@ impl SqliteSessionStore {
                 }
                 let take = (*payload_budget)
                     .min(usize::try_from(reference.byte_len).unwrap_or(usize::MAX));
-                let bytes = self.history_payload_prefix(reference, take).await?;
+                let bytes = self.history_payload_prefix(&reference, take).await?;
                 *payload_budget = payload_budget.saturating_sub(bytes.len());
+                let truncated = bytes.len() as u64 != reference.byte_len;
                 payloads.push(SessionHistoryPayload {
-                    reference: reference.clone(),
-                    truncated: bytes.len() as u64 != reference.byte_len,
+                    reference,
+                    truncated,
                     text: String::from_utf8_lossy(&bytes).into_owned(),
                 });
             }
@@ -5148,6 +5156,28 @@ impl SqliteSessionStore {
                         }
                     }
                 }
+                SessionEventKind::ProviderEvent { kind, payload, .. }
+                    if kind == crate::PROVIDER_PROMPT_EVENT_KIND =>
+                {
+                    let prompt = payload
+                        .get(crate::PROVIDER_PROMPT_FIELD)
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|prompt| prompt.len() > INLINE_SESSION_PAYLOAD_BYTES)
+                        .map(str::to_string);
+                    if let Some(prompt) = prompt {
+                        let reference = store_payload(
+                            transaction,
+                            event,
+                            SessionPayloadKind::ProviderPrompt,
+                            prompt.as_bytes(),
+                        )
+                        .await?;
+                        payload[crate::PROVIDER_PROMPT_FIELD] =
+                            serde_json::Value::String(deferred_text_payload(&prompt, &reference));
+                        payload[crate::PROVIDER_PROMPT_REF_FIELD] =
+                            serde_json::to_value(&reference)?;
+                    }
+                }
                 SessionEventKind::SubagentActivity {
                     event: Some(child_event),
                     ..
@@ -7609,24 +7639,31 @@ fn history_match_snippet(body: &str, start: usize, end: usize) -> String {
     format!("{prefix}{}{suffix}", &body[left..right])
 }
 
-fn history_payload_refs<'a>(
-    kind: &'a SessionEventKind,
-    references: &mut Vec<&'a SessionPayloadRef>,
-) {
+fn history_payload_refs(kind: &SessionEventKind, references: &mut Vec<SessionPayloadRef>) {
     match kind {
         SessionEventKind::ToolStarted {
             input_ref: Some(reference),
             ..
-        } => references.push(reference),
+        } => references.push(reference.clone()),
         SessionEventKind::ToolCompleted {
             output_ref,
             input_ref,
             ..
         } => {
             if let Some(reference) = output_ref {
-                references.push(reference);
+                references.push(reference.clone());
             }
             if let Some(reference) = input_ref {
+                references.push(reference.clone());
+            }
+        }
+        SessionEventKind::ProviderEvent { payload, .. } => {
+            // A deferred provider prompt carries its reference beside the
+            // preview inside the event payload.
+            if let Some(reference) = payload.get(crate::PROVIDER_PROMPT_REF_FIELD)
+                && let Ok(reference) =
+                    serde_json::from_value::<SessionPayloadRef>(reference.clone())
+            {
                 references.push(reference);
             }
         }

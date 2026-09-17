@@ -3762,6 +3762,88 @@ async fn large_tool_payloads_are_loaded_only_by_reference() {
     );
 }
 
+/// The exact text a subscription turn handed its provider is journaled as a
+/// deferred payload. Without the embedded-reference extraction, history
+/// expansion would silently return the preview instead of the real prompt.
+#[tokio::test]
+async fn large_provider_prompts_are_stored_by_reference_and_expandable() {
+    let (directory, store) = store().await;
+    let session_id = Uuid::new_v4();
+    let needle = "uniqueprompt8675309";
+    let prompt = format!(
+        "{} {needle}",
+        "p".repeat(INLINE_SESSION_PAYLOAD_BYTES + 1024)
+    );
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(directory.path()),
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    let appended = store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Claude,
+                kind: crate::PROVIDER_PROMPT_EVENT_KIND.to_string(),
+                payload: serde_json::json!({
+                    "prompt": prompt,
+                    "search_marker": needle,
+                    "provider_context_reused": false,
+                }),
+            },
+        ))
+        .await
+        .unwrap();
+
+    let SessionEventKind::ProviderEvent { payload, .. } = &appended.kind else {
+        panic!("provider prompt event should round-trip");
+    };
+    let reference: SessionPayloadRef = serde_json::from_value(
+        payload
+            .get(crate::PROVIDER_PROMPT_REF_FIELD)
+            .expect("deferred prompt carries a reference")
+            .clone(),
+    )
+    .unwrap();
+    assert_eq!(reference.kind, SessionPayloadKind::ProviderPrompt);
+    assert_ne!(
+        payload
+            .get(crate::PROVIDER_PROMPT_FIELD)
+            .and_then(serde_json::Value::as_str),
+        Some(prompt.as_str())
+    );
+    assert_eq!(
+        store.load_payload(&reference).await.unwrap(),
+        prompt.as_bytes()
+    );
+
+    let hit = store
+        .query_history(
+            session_id,
+            SessionHistoryQuery {
+                text: Some(needle.to_string()),
+                expand_payloads: true,
+                max_payload_bytes: Some(INLINE_SESSION_PAYLOAD_BYTES * 2),
+                ..SessionHistoryQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        hit.hits.iter().any(|hit| hit
+            .payloads
+            .iter()
+            .any(|payload| payload.text.contains(needle))),
+        "expanded history must surface the deferred provider prompt"
+    );
+}
+
 #[tokio::test]
 async fn history_query_resolves_fts_regex_exact_and_full_payload_hits_to_canonical_events() {
     let (_directory, store) = store().await;

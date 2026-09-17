@@ -9222,6 +9222,40 @@ fn failed_compaction_withdraws_the_in_progress_card() {
     );
 }
 
+/// A replay that only truncated bulk is silent; one that dropped whole messages
+/// changed what the model could see, so it must say so.
+#[test]
+fn projected_replay_history_is_surfaced_only_when_messages_were_dropped() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    let replay = |sequence: u64, omitted: u64| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "context_replay_projected".to_string(),
+                payload: serde_json::json!({
+                    "status": "completed",
+                    "context_chars_before": 1_500_000,
+                    "context_chars_after": 900_000,
+                    "messages_omitted": omitted,
+                }),
+            },
+        )
+    };
+
+    transcript.apply(&replay(1, 0));
+    assert!(transcript.order.is_empty());
+
+    transcript.apply(&replay(2, 7));
+    assert!(matches!(
+        transcript.order.last(),
+        Some(TranscriptEntry::Info { title, text, .. })
+            if title == "Older history omitted" && text.contains("7 older messages")
+    ));
+}
+
 #[test]
 fn compaction_completion_updates_the_live_card_and_can_expand() {
     let session_id = Uuid::new_v4();
