@@ -2612,12 +2612,9 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
                         .await
                         .unwrap()
                         .unwrap();
-                    // Escape cancels the pending automatic retry; the durable
-                    // proof is the retry-cancelled provider event.
                     if matches!(
                         event.kind,
-                        SessionEventKind::ProviderEvent { ref kind, .. }
-                            if kind == "usage_limit_retry_cancelled"
+                        SessionEventKind::UserStopChanged { engaged: true }
                     ) {
                         break;
                     }
@@ -3960,7 +3957,7 @@ async fn claude_interrupt_preserves_queue_and_only_normalizes_expected_aborts() 
 }
 
 #[tokio::test]
-async fn escape_flush_opencode_redirects_pending_input() {
+async fn escape_flush_opencode_redirects_pending_input_without_user_stop() {
     assert_interrupted_fifo(CodingProvider::OpenCode, None, true).await;
 }
 
@@ -4077,6 +4074,12 @@ async fn assert_interrupted_fifo(
         );
     }
 
+    if provider == CodingProvider::OpenCode {
+        assert!(!events.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::UserStopChanged { engaged: true, .. }
+        )));
+    }
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 2);
     assert_eq!(
@@ -4116,188 +4119,42 @@ third"
     }
 }
 
-/// Holds the first provider turn until it is interrupted, then completes any
-/// later turn immediately. The active goal starts the first turn by itself.
-struct HoldFirstTurnExecutor {
-    turns: Arc<AtomicUsize>,
-    called: Arc<Notify>,
-}
-
-#[async_trait::async_trait]
-impl AgentTurnExecutor for HoldFirstTurnExecutor {
-    async fn execute(
-        &self,
-        _turn: AgentTurn,
-        _events: mpsc::Sender<SessionEventKind>,
-        controls: Option<mpsc::Receiver<AgentTurnControl>>,
-    ) -> Result<AgentTurnResult> {
-        let turn = self.turns.fetch_add(1, Ordering::AcqRel);
-        self.called.notify_one();
-        if turn == 0 {
-            let mut controls = controls.expect("active native turn has controls");
-            while !matches!(
-                controls.recv().await,
-                Some(AgentTurnControl::Interrupt) | None
-            ) {}
-            anyhow::bail!("native provider turn interrupted");
-        }
-        Ok(AgentTurnResult {
-            provider_session_id: Some("provider-session".to_string()),
-            final_text: String::new(),
-        })
-    }
-}
-
-fn launch_for(root: &tempfile::TempDir) -> LaunchSession {
-    LaunchSession {
-        request_id: Uuid::new_v4(),
-        cwd: root.path().to_path_buf(),
-        provider: CodingProvider::Codex,
-        model: None,
-        effort: None,
-        fast: Some(false),
-        response_language: crate::ResponseLanguage::Auto,
-        permission_mode: PermissionMode::Manual,
-        name: None,
-        initial_prompt: None,
-        capabilities: Default::default(),
-        subagent_concurrency_limit: None,
-        extension_skill_roots: Vec::new(),
-        team_policy: None,
-    }
-}
-
-/// Escape pauses the active goal, which is the single stop control: no further
-/// automatic continuation turn may start until the goal is explicitly resumed.
 #[tokio::test]
-async fn escape_pauses_the_active_goal_and_halts_automatic_continuation() {
-    let root = tempdir().unwrap();
-    let journal_path = root.path().join("session.lock");
-    let sqlite_path = root.path().join("sessions.sqlite3");
-    let session_id = Uuid::new_v4();
-    let (command_tx, command_rx) = mpsc::channel(16);
-    let (event_tx, _event_rx) = mpsc::channel(256);
-    let turns = Arc::new(AtomicUsize::new(0));
-    let called = Arc::new(Notify::new());
-    let executor = Arc::new(HoldFirstTurnExecutor {
-        turns: Arc::clone(&turns),
-        called: Arc::clone(&called),
-    });
-    let store = SqliteSessionStore::open(&sqlite_path).await.unwrap();
-    store.create_session(session_id).await.unwrap();
-    for kind in [
-        SessionEventKind::SessionStarted,
-        SessionEventKind::SessionConfigured {
-            cwd: root.path().to_path_buf(),
-            provider: CodingProvider::Codex,
-            model: None,
-            effort: None,
-            fast: false,
-            response_language: crate::ResponseLanguage::Auto,
-            permission_mode: PermissionMode::Manual,
-        },
-        // An active goal is what drives automatic continuation.
-        SessionEventKind::GoalUpdated {
-            goal: SessionGoal::new("keep improving the game".to_string(), None),
-        },
-    ] {
-        store
-            .append(SessionEvent::new(session_id, 0, kind))
-            .await
-            .unwrap();
-    }
-    drop(store);
-
-    let launch = launch_for(&root);
-    let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
-            &journal_path,
-            session_id,
-            launch,
-            command_rx,
-            event_tx,
-            executor,
-        )
-        .await
-    });
-
-    // The active goal opens a continuation turn on its own.
-    tokio::time::timeout(Duration::from_secs(5), called.notified())
-        .await
-        .expect("an active goal starts a continuation turn");
-
-    // Escape pauses the goal and interrupts the running turn.
-    command_tx
-        .send(HostCommand::Interrupt { session_id })
-        .await
-        .unwrap();
-    command_tx
-        .send(HostCommand::Stop { session_id })
-        .await
-        .unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
-
-    let store = SqliteSessionStore::open(&sqlite_path).await.unwrap();
-    let state = store.state(session_id).await.unwrap();
-    assert_eq!(
-        state.goal.as_ref().map(|goal| goal.status),
-        Some(GoalStatus::Paused),
-        "Escape must leave the goal paused"
-    );
-    assert_eq!(
-        turns.load(Ordering::Acquire),
-        1,
-        "a paused goal must not start another automatic continuation turn"
-    );
-}
-
-/// While no goal is active, an internal report is settled into the transcript
-/// instead of spending a provider turn; resuming the goal starts the next
-/// continuation turn.
-#[tokio::test]
-async fn a_paused_goal_settles_background_reports_until_resumed() {
+async fn user_stop_gate_holds_background_turns_until_a_human_prompt() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(16);
     let (event_tx, mut event_rx) = mpsc::channel(256);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let provider_sessions = Arc::new(Mutex::new(Vec::new()));
     let called = Arc::new(Notify::new());
-    let executor = Arc::new(RecordingExecutor {
-        seen: Arc::new(Mutex::new(Vec::new())),
+    let executor = Arc::new(InterruptibleQueueExecutor {
+        abort_error: None,
+        seen: Arc::clone(&seen),
+        provider_sessions: Arc::clone(&provider_sessions),
         called: Arc::clone(&called),
     });
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
-    store.create_session(session_id).await.unwrap();
-    let mut goal = SessionGoal::new("keep improving the game".to_string(), None);
-    goal.status = GoalStatus::Paused;
-    for kind in [
-        SessionEventKind::SessionStarted,
-        SessionEventKind::SessionConfigured {
-            cwd: root.path().to_path_buf(),
-            provider: CodingProvider::Codex,
-            model: None,
-            effort: None,
-            fast: false,
-            response_language: crate::ResponseLanguage::Auto,
-            permission_mode: PermissionMode::Manual,
-        },
-        SessionEventKind::GoalUpdated { goal },
-    ] {
-        store
-            .append(SessionEvent::new(session_id, 0, kind))
-            .await
-            .unwrap();
-    }
-    drop(store);
-
-    let launch = launch_for(&root);
     let actor = tokio::spawn(async move {
         run_agent_session_with_executor(
             &journal_path,
             session_id,
-            launch,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
             command_rx,
             event_tx,
             executor,
@@ -4305,6 +4162,47 @@ async fn a_paused_goal_settles_background_reports_until_resumed() {
         .await
     });
 
+    // A human turn is running, with one more prompt queued behind it.
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "first".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
+        .await
+        .expect("first turn starts");
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "queued-before-escape".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+
+    // The human presses Escape.
+    command_tx
+        .send(HostCommand::Interrupt { session_id })
+        .await
+        .unwrap();
+
+    // Input queued before the Escape still runs, but it must not count as the
+    // human re-engaging: the gate stays latched afterwards.
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
+        .await
+        .expect("the prompt queued before Escape still runs");
+
+    // A subagent reply arrives as a Steer team prompt while the session is
+    // stopped. It must stay visible but never open a provider turn.
     command_tx
         .send(HostCommand::TeamPrompt {
             session_id,
@@ -4312,36 +4210,92 @@ async fn a_paused_goal_settles_background_reports_until_resumed() {
             text: "Team message from /root/worker:\n\nbackground report".to_string(),
             attachments: Vec::new(),
             output_schema: None,
-            delivery: PromptDelivery::Queue,
+            delivery: PromptDelivery::Steer,
         })
         .await
         .unwrap();
     assert!(
-        tokio::time::timeout(Duration::from_millis(500), called.notified())
+        tokio::time::timeout(Duration::from_millis(750), called.notified())
             .await
             .is_err(),
-        "a paused goal must not admit a background team turn"
+        "a stopped session must not admit a background team turn"
+    );
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        2,
+        "provider saw only the human turns"
     );
 
+    // A fresh human prompt after the stop clears the gate.
     command_tx
-        .send(HostCommand::Goal {
+        .send(HostCommand::Prompt {
             session_id,
-            action: GoalAction::Resume,
+            message_id: Uuid::new_v4(),
+            text: "second".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
         })
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), called.notified())
         .await
-        .expect("resuming the goal starts a continuation turn");
+        .expect("an explicit human prompt clears the gate and starts a turn");
     command_tx
         .send(HostCommand::Stop { session_id })
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
 
-    let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 3);
+    assert!(seen[1].0.contains("queued-before-escape"));
+    assert!(seen[2].0.contains("second"));
     assert!(
-        events.iter().any(|event| matches!(
+        !seen.iter().any(|turn| turn.0.contains("background report")),
+        "the held team report never became a provider turn"
+    );
+
+    let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                &event.kind,
+                SessionEventKind::UserStopChanged { engaged: true }
+            ))
+            .count(),
+        1,
+        "Escape engages the durable gate exactly once"
+    );
+    let stop_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::UserStopChanged { engaged: true }
+            )
+        })
+        .expect("stop engaged");
+    let clear_index = events
+        .iter()
+        .position(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::UserStopChanged { engaged: false }
+            )
+        })
+        .expect("stop cleared by the fresh human prompt");
+    assert!(stop_index < clear_index);
+    let between = &events[stop_index..clear_index];
+    assert!(
+        between
+            .iter()
+            .any(|event| matches!(&event.kind, SessionEventKind::TurnStarted { .. })),
+        "the prompt queued before Escape runs while the gate is still latched"
+    );
+    assert!(
+        events[..clear_index].iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::Message {
                 actor: EventActor::System,
@@ -4350,8 +4304,164 @@ async fn a_paused_goal_settles_background_reports_until_resumed() {
                 ..
             } if text.contains("background report")
         )),
-        "the paused goal settles the report visibly instead of spending a turn"
+        "the held team report is settled visible before the human resumes"
     );
+}
+
+#[tokio::test]
+async fn user_stop_gate_is_re_engaged_from_durable_state_after_actor_restart() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let first_id = Uuid::new_v4();
+    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    store.create_session(session_id).await.unwrap();
+    // A prior actor generation ran a turn and then the human pressed Escape.
+    for kind in [
+        SessionEventKind::SessionStarted,
+        SessionEventKind::SessionConfigured {
+            cwd: root.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::Manual,
+        },
+        SessionEventKind::Message {
+            message_id: first_id,
+            actor: EventActor::User,
+            text: "first".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::TurnStarted {
+            message_id: first_id,
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+        },
+        SessionEventKind::ProviderSessionLinked {
+            provider_session_id: "codex-thread".to_string(),
+            provider_turn_id: Some("codex-turn".to_string()),
+            context_contract_version: Some(crate::agent::PROVIDER_CONTEXT_CONTRACT_VERSION),
+        },
+        SessionEventKind::TurnCompleted {
+            message_id: first_id,
+            provider_session_id: Some("codex-thread".to_string()),
+            final_text: String::new(),
+            error: Some("turn interrupted".to_string()),
+        },
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: Some("Interrupted".to_string()),
+        },
+        SessionEventKind::UserStopChanged { engaged: true },
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let (command_tx, command_rx) = mpsc::channel(16);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let provider_sessions = Arc::new(Mutex::new(Vec::new()));
+    let called = Arc::new(Notify::new());
+    let executor = Arc::new(InterruptibleQueueExecutor {
+        abort_error: None,
+        seen: Arc::clone(&seen),
+        provider_sessions: Arc::clone(&provider_sessions),
+        called: Arc::clone(&called),
+    });
+    let actor = tokio::spawn(async move {
+        run_agent_session_with_executor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+        )
+        .await
+    });
+
+    // The restarted actor never saw the Escape in-process; it must re-engage
+    // the gate purely from the durable `UserStopChanged` event.
+    command_tx
+        .send(HostCommand::TeamPrompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "Team message from /root/worker:\n\npost-restart report".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(750), called.notified())
+            .await
+            .is_err(),
+        "a reloaded stopped session must not admit a background team turn"
+    );
+    assert!(seen.lock().unwrap().is_empty());
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "second".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), called.notified())
+        .await
+        .expect("an explicit human prompt clears the reloaded gate");
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    assert_eq!(seen.lock().unwrap().len(), 1);
+    let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+    assert!(events.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::Message {
+            actor: EventActor::System,
+            status: MessageStatus::Complete,
+            text,
+            ..
+        } if text.contains("post-restart report")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        &event.kind,
+        SessionEventKind::UserStopChanged { engaged: false }
+    )));
 }
 
 #[tokio::test]
@@ -5327,13 +5437,22 @@ async fn compaction_defers_steers_preserves_next_attachments_and_respects_stop()
             );
             active.finish.send(()).unwrap();
             // Escape cancels the active turn, not already-queued human input.
-            // Rejected steers join that input.
+            // Rejected steers join that input without clearing the stop gate.
             let queued = next(&mut turns).await;
             assert_eq!(queued.turn.message_id, queued_id);
             assert_eq!(
                 queued.turn.attachments,
                 vec![PathBuf::from("screenshot.png"); if stop { 3 } else { 1 }]
             );
+            if stop {
+                assert!(
+                    std::iter::from_fn(|| event_rx.try_recv().ok()).all(|event| !matches!(
+                        event.kind,
+                        SessionEventKind::UserStopChanged { engaged: false }
+                    )),
+                    "pre-stop human input must not clear the background-work stop gate"
+                );
+            }
             queued.finish.send(()).unwrap();
             command_tx
                 .send(HostCommand::Stop { session_id })
@@ -6919,6 +7038,149 @@ async fn resuming_an_idle_goal_emits_starting_before_running() {
     assert!(store.state(session_id).await.unwrap().goal.is_some());
 }
 
+/// A human resume that arrives while a turn is already running must release
+/// the stop latch. Otherwise the durable goal reads `active` while the latch
+/// still parks every automatic continuation at the next boundary, so the
+/// session stops with an apparently active goal.
+#[tokio::test]
+async fn resuming_a_goal_mid_turn_releases_the_stop_latch() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+    let mut goal = SessionGoal::new("Keep going".to_string(), None);
+    goal.status = GoalStatus::Paused;
+    for event in [
+        SessionEvent::new(session_id, 0, SessionEventKind::SessionStarted),
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::SessionConfigured {
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+            },
+        ),
+        SessionEvent::new(session_id, 0, SessionEventKind::GoalUpdated { goal }),
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::UserStopChanged { engaged: true },
+        ),
+        // A prompt queued before the stop still runs when the actor resumes,
+        // but it does not clear the latch on admission.
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "the pre-stop prompt".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ),
+    ] {
+        journal.append(event).await.unwrap();
+    }
+    drop(journal);
+
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                Arc::new(HungProviderExecutor),
+            )
+            .await
+        }
+    });
+
+    // The pre-stop prompt opens a turn that the hung executor never finishes.
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+            .await
+            .expect("the queued prompt starts a turn")
+            .expect("session event stream remains open");
+        if matches!(
+            event.kind,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+
+    command_tx
+        .send(HostCommand::Goal {
+            session_id,
+            action: GoalAction::Resume,
+        })
+        .await
+        .unwrap();
+
+    let resumed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let Some(event) = event_rx.recv().await else {
+                panic!("session event stream closed before the latch cleared");
+            };
+            if matches!(
+                event.kind,
+                SessionEventKind::UserStopChanged { engaged: false }
+            ) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        resumed.is_ok(),
+        "a mid-turn goal resume must release the stop latch"
+    );
+    assert!(
+        store
+            .state(session_id)
+            .await
+            .unwrap()
+            .goal
+            .is_some_and(|goal| goal.status == GoalStatus::Active)
+    );
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+}
+
 #[tokio::test]
 async fn goal_state_is_recoverable_from_the_session_journal() {
     let root = tempdir().unwrap();
@@ -7675,9 +7937,16 @@ async fn inactive_team_reports_settle_without_starting_a_provider_turn() {
         batch: Vec::new(),
     }]);
 
-    settle_inactive_team_notifications(&mut runtime, &event_tx, session_id, &mut pending, None)
-        .await
-        .unwrap();
+    settle_inactive_team_notifications(
+        &mut runtime,
+        &event_tx,
+        session_id,
+        &mut pending,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert!(pending.is_empty());
     let event = event_rx.recv().await.unwrap();
@@ -7718,9 +7987,16 @@ async fn inactive_wake_report_is_retained_for_the_root_provider_turn() {
         batch: Vec::new(),
     }]);
 
-    settle_inactive_team_notifications(&mut runtime, &event_tx, session_id, &mut pending, None)
-        .await
-        .unwrap();
+    settle_inactive_team_notifications(
+        &mut runtime,
+        &event_tx,
+        session_id,
+        &mut pending,
+        false,
+        None,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].message_id, message_id);
@@ -7759,6 +8035,7 @@ async fn turn_boundary_collects_all_emitted_prompts_before_escape() {
     let mut pending = VecDeque::new();
     let mut deferred = VecDeque::new();
     let mut team_message_ids = HashSet::new();
+    let mut stale_user_prompts = HashSet::new();
     let interrupted = collect_input_at_turn_boundary(
         &mut journal,
         &event_tx,
@@ -7767,6 +8044,7 @@ async fn turn_boundary_collects_all_emitted_prompts_before_escape() {
         &mut command_rx,
         &mut deferred,
         &mut team_message_ids,
+        &mut stale_user_prompts,
     )
     .await
     .unwrap();
@@ -7774,6 +8052,11 @@ async fn turn_boundary_collects_all_emitted_prompts_before_escape() {
     assert!(interrupted);
     assert!(deferred.is_empty());
     assert_eq!(pending.len(), 2);
+    assert_eq!(
+        stale_user_prompts,
+        pending.iter().map(|prompt| prompt.message_id).collect(),
+        "prompts queued before Escape are snapshotted as pre-stop"
+    );
     coalesce_queued_prompts(&mut pending);
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].message_id, last_id);
