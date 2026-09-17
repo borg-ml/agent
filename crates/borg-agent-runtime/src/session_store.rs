@@ -5808,14 +5808,19 @@ async fn sync_session_action(
         SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "network_retry" => {
             // Retry admission is explicit: an ordinary in-progress replay must
             // still never resurrect a terminal action.
-            if let Some(ids) = payload.get("message_ids").and_then(serde_json::Value::as_array) {
+            if let Some(ids) = payload
+                .get("message_ids")
+                .and_then(serde_json::Value::as_array)
+            {
                 for id in ids {
                     let id: Uuid = serde_json::from_value(id.clone())?;
-                    if let Some(row) = sqlx::query("select * from session_actions where action_id = ? and session_id = ?")
-                        .bind(id.to_string())
-                        .bind(event.session_id.to_string())
-                        .fetch_optional(&mut **transaction)
-                        .await?
+                    if let Some(row) = sqlx::query(
+                        "select * from session_actions where action_id = ? and session_id = ?",
+                    )
+                    .bind(id.to_string())
+                    .bind(event.session_id.to_string())
+                    .fetch_optional(&mut **transaction)
+                    .await?
                     {
                         requeue_failed_action(transaction, decode_action(&row)?).await?;
                     }
