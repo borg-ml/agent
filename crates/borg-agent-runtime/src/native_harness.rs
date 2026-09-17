@@ -1073,6 +1073,24 @@ impl NativeModelClient for ProviderModelClient {
                 });
             }
         };
+        // The Go gateway advertises no context window, and the chat-completions
+        // payload carries none. Without it the context meter stays blank and
+        // auto-compaction never engages, so resolve the service's advertised
+        // window here (cached per process) before the turn reports usage.
+        let resolved_gateway = match gateway {
+            Some(gateway)
+                if gateway.context_window_tokens.is_none()
+                    && gateway.label.as_deref()
+                        == Some(borg_provider::provider::opencode_model::LABEL) =>
+            {
+                let mut resolved = gateway.clone();
+                resolved.context_window_tokens =
+                    borg_provider::provider::opencode_model::context_window_tokens(model).await;
+                Some(resolved)
+            }
+            _ => None,
+        };
+        let gateway = resolved_gateway.as_ref().or(gateway);
         let wire_model = gateway
             .and_then(|gateway| gateway.model.as_deref())
             .unwrap_or(model);
@@ -1443,6 +1461,20 @@ async fn call_model_streaming(
                     stream: ProviderProgressStream::Stdout,
                     chunk,
                 }) => {
+                    // The model reasons before it writes. A throttled thinking
+                    // disclosure still buffered when prose begins must reach the
+                    // screen first; otherwise the answer renders above the
+                    // thinking block that produced it.
+                    if !pending_reasoning.is_empty() {
+                        send(
+                            context.events,
+                            SessionEventKind::ReasoningDelta {
+                                text: std::mem::take(&mut pending_reasoning),
+                            },
+                        )
+                        .await;
+                        last_reasoning_emit = Instant::now();
+                    }
                     text.push_str(&String::from_utf8_lossy(&chunk));
                     if last_text_emit.elapsed() >= crate::agent::live_output_interval()
                         || chunk.ends_with(b"\n")
@@ -1558,11 +1590,10 @@ async fn call_model_streaming(
         }
 
         if completed.is_some() && !progress_open {
-            // Nothing will arrive to force the throttled tail out now, and the
+            // Nothing will arrive to force the throttled tails out now, and the
             // durable message can trail the stream close by a tool round.
-            if text.len() != emitted_text_len {
-                send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
-            }
+            // Thinking precedes the prose it produced, so it must be published
+            // first or the final answer is emitted above its own reasoning.
             if !pending_reasoning.is_empty() {
                 send(
                     context.events,
@@ -1571,6 +1602,9 @@ async fn call_model_streaming(
                     },
                 )
                 .await;
+            }
+            if text.len() != emitted_text_len {
+                send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
             }
             return completed
                 .take()
@@ -3804,6 +3838,92 @@ mod tests {
             );
         })
         .await;
+    }
+
+    /// Streams a throttled thinking tail and then the prose it produced, then
+    /// holds the turn open. The rate limiter holds the second delta, so only
+    /// the first prose byte can force it out.
+    struct ReasoningThenProseClient;
+
+    #[async_trait]
+    impl NativeModelClient for ReasoningThenProseClient {
+        async fn model_turn(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+            _request: ModelTurnRequest,
+            progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+        ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+            let progress = progress.unwrap();
+            for text in ["weighing ", "the next step"] {
+                progress.send(reasoning_progress(text)).unwrap();
+            }
+            progress
+                .send(ProviderProgress::Bytes {
+                    stream: ProviderProgressStream::Stdout,
+                    chunk: b"The lifecycle regression passed.".to_vec(),
+                })
+                .unwrap();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn throttled_reasoning_precedes_the_prose_that_follows_it() {
+        let client = ReasoningThenProseClient;
+        let (events_tx, mut events_rx) = mpsc::channel(16);
+        let message_id = Uuid::new_v4();
+        let mut controls = None;
+        let call = call_model_streaming(
+            &client,
+            crate::CodingProvider::Codex,
+            "test-model",
+            None,
+            ModelTurnRequest {
+                fast: false,
+                request_id: None,
+                session_id: None,
+                prompt_cache_key: None,
+                messages: vec![ModelMessage::user("hello")],
+                tools: Vec::new(),
+                output_schema: None,
+            },
+            ModelStreamContext {
+                coding_provider: crate::CodingProvider::Codex,
+                assistant_message_id: message_id,
+                events: &events_tx,
+                controls: &mut controls,
+            },
+        );
+        tokio::pin!(call);
+        let observe = async {
+            assert!(matches!(
+                events_rx.recv().await,
+                Some(SessionEventKind::ReasoningDelta { text }) if text == "weighing "
+            ));
+            // The model reasons before it writes, so the throttled tail must
+            // reach the reader before the prose it produced.
+            assert!(matches!(
+                events_rx.recv().await,
+                Some(SessionEventKind::ReasoningDelta { text }) if text == "the next step"
+            ));
+            assert!(matches!(
+                events_rx.recv().await,
+                Some(SessionEventKind::Message {
+                    message_id: id,
+                    text,
+                    status: MessageStatus::InProgress,
+                    ..
+                }) if id == message_id && text == "The lifecycle regression passed."
+            ));
+        };
+        tokio::select! {
+            _ = &mut call => panic!("model must remain unfinished while generating"),
+            result = tokio::time::timeout(Duration::from_secs(1), observe) => {
+                result.expect("reasoning must reach the stream before the prose");
+            }
+        }
     }
 
     #[derive(Clone)]

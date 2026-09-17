@@ -34,7 +34,8 @@
 //! credential writes. It never falls back to another vendor's key: doing so
 //! would silently move spend onto a different account.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{OnceLock, RwLock};
 
 use anyhow::{Result, bail};
 use uuid::Uuid;
@@ -128,6 +129,71 @@ pub fn gateway_with_key(model: &str, session_id: Uuid, api_key: &str) -> Result<
     gateway.label = Some(LABEL.to_string());
     gateway.headers = headers;
     Ok(gateway)
+}
+
+/// Per-process cache of the Go route's advertised context windows, keyed by the
+/// bare upstream model id. `None` means the model list has not been fetched.
+static CONTEXT_WINDOWS: OnceLock<RwLock<Option<HashMap<String, u64>>>> = OnceLock::new();
+
+fn context_windows() -> &'static RwLock<Option<HashMap<String, u64>>> {
+    CONTEXT_WINDOWS.get_or_init(|| RwLock::new(None))
+}
+
+/// The context window the Go service advertises for `model`.
+///
+/// The chat-completions response carries no context metadata, so without this
+/// `UsageUpdated` reports a null window: the context meter stays blank and
+/// auto-compaction never engages. The service's own model list is the
+/// authority, so it is fetched once per process and cached. An unknown model
+/// stays `None` rather than guessing a window.
+pub async fn context_window_tokens(model: &str) -> Option<u64> {
+    let id = wire_model(model).unwrap_or_else(|| model.trim());
+    if id.is_empty() {
+        return None;
+    }
+    if let Ok(cache) = context_windows().read()
+        && let Some(windows) = cache.as_ref()
+    {
+        return windows.get(id).copied();
+    }
+    if let Ok(windows) = fetch_context_windows().await
+        && let Ok(mut cache) = context_windows().write()
+    {
+        *cache = Some(windows);
+    }
+    context_windows()
+        .read()
+        .ok()
+        .and_then(|cache| cache.as_ref()?.get(id).copied())
+}
+
+async fn fetch_context_windows() -> Result<HashMap<String, u64>> {
+    let response = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()?
+        .get(format!("{BASE_URL}/models"))
+        .send()
+        .await?
+        .error_for_status()?;
+    let payload: serde_json::Value = response.json().await?;
+    Ok(parse_context_windows(&payload))
+}
+
+fn parse_context_windows(payload: &serde_json::Value) -> HashMap<String, u64> {
+    payload
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model.get("id")?.as_str()?.trim();
+            let context = model
+                .get("context_length")
+                .or_else(|| model.get("contextLength"))
+                .and_then(serde_json::Value::as_u64)?;
+            (!id.is_empty() && context > 0).then(|| (id.to_string(), context))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -231,5 +297,27 @@ mod tests {
                 .expect_err("blank key must not build a gateway");
             assert!(error.to_string().contains("empty"), "{error}");
         }
+    }
+
+    /// The chat-completions payload carries no window, so the model list is the
+    /// authority. Losing `context_length` would silently blank the context meter
+    /// and disable auto-compaction rather than fail loudly.
+    #[test]
+    fn context_windows_are_read_from_the_model_list() {
+        let payload = serde_json::json!({
+            "data": [
+                {"id": "kimi-k2.7-code", "context_length": 262_144},
+                {"id": "glm-5.3", "contextLength": 200_000},
+                {"id": "no-window"},
+                {"id": "zero", "context_length": 0},
+                {"id": "  spaced  ", "context_length": 131_072},
+            ]
+        });
+        let windows = parse_context_windows(&payload);
+        assert_eq!(windows.get("kimi-k2.7-code"), Some(&262_144));
+        assert_eq!(windows.get("glm-5.3"), Some(&200_000));
+        assert_eq!(windows.get("spaced"), Some(&131_072));
+        assert!(!windows.contains_key("no-window"));
+        assert!(!windows.contains_key("zero"));
     }
 }
