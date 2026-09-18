@@ -352,6 +352,116 @@ fn complete_tool_action(input: &Value) -> Option<String> {
     (!action.is_empty() && action.chars().count() <= 64).then(|| action.to_string())
 }
 
+/// Why a provider turn failed, decided where the cause is still known.
+///
+/// Downstream retry policy used to be recovered by matching substrings against
+/// whatever prose the failure happened to carry. That is guesswork: a genuine
+/// disconnect worded as "unexpected EOF during chunk size line" matched nothing
+/// and was billed as a goal failure. The transport layer holds a typed
+/// `reqwest::Error`/`io::Error` and knows the answer exactly, so it decides
+/// once, here, and the decision travels with the error.
+///
+/// `Unknown` is not a failure of this scheme: it marks errors reported *by* a
+/// provider as text (a model API's own message), where prose matching remains
+/// the only signal available and stays the fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderErrorKind {
+    /// The transport died mid-flight: reset, refused, timed out, DNS failure,
+    /// or a body that stopped before it was complete. Always worth retrying,
+    /// and never evidence that the work itself is failing.
+    ConnectionLost,
+    /// The provider is alive and refusing for a reason retrying cannot fix
+    /// (auth, billing, quota). Retrying burns budget and hides the cause.
+    Fatal,
+    /// No typed signal available; fall back to inspecting the message text.
+    Unknown,
+}
+
+/// A provider failure that still knows why it happened.
+///
+/// Carried through the existing `anyhow` plumbing so the session layer can
+/// downcast for the typed kind instead of re-reading the formatted string.
+#[derive(Debug, Clone)]
+pub struct ProviderStreamError {
+    pub kind: ProviderErrorKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for ProviderStreamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProviderStreamError {}
+
+impl ProviderErrorKind {
+    /// Classify a transport error while the typed cause is still in hand.
+    ///
+    /// A truncated body is the case that motivated all of this: hyper reports
+    /// it as a decode error, but the turn died because the connection did.
+    pub fn from_transport(error: &reqwest::Error) -> Self {
+        if error.is_connect() || error.is_timeout() || error.is_request() {
+            return Self::ConnectionLost;
+        }
+        if error.is_body() || error.is_decode() {
+            // Distinguish a body that stopped early from a body that arrived
+            // intact but was unparseable: only the former is a lost connection.
+            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+            while let Some(error) = source {
+                let text = error.to_string().to_ascii_lowercase();
+                if text.contains("unexpected eof")
+                    || text.contains("incomplete")
+                    || text.contains("connection")
+                    || text.contains("end of file")
+                {
+                    return Self::ConnectionLost;
+                }
+                source = error.source();
+            }
+        }
+        Self::Unknown
+    }
+}
+
+/// Recover the typed kind from an error that has already been wrapped in
+/// context on its way up.
+///
+/// `anyhow` keeps the whole cause chain, so the original `reqwest::Error` is
+/// still reachable behind however many `.context(...)` layers were added. That
+/// is the difference between reading the cause and guessing from the rendered
+/// message: the classification here is the same one the transport would have
+/// made at the moment it failed.
+pub fn classify_provider_error(error: &anyhow::Error) -> ProviderErrorKind {
+    for cause in error.chain() {
+        if let Some(typed) = cause.downcast_ref::<ProviderStreamError>() {
+            return typed.kind;
+        }
+        if let Some(transport) = cause.downcast_ref::<reqwest::Error>() {
+            let kind = ProviderErrorKind::from_transport(transport);
+            if kind != ProviderErrorKind::Unknown {
+                return kind;
+            }
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind;
+            if matches!(
+                io.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::ConnectionRefused
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+                    | ErrorKind::TimedOut
+                    | ErrorKind::NotConnected
+            ) {
+                return ProviderErrorKind::ConnectionLost;
+            }
+        }
+    }
+    ProviderErrorKind::Unknown
+}
+
 #[derive(Debug, Clone)]
 pub enum ChatStreamEvent {
     ProviderEvent {
@@ -420,6 +530,9 @@ pub enum ChatStreamEvent {
     },
     Failed {
         error: String,
+        /// Decided at the point of failure; `Unknown` means the message text is
+        /// the only signal and prose matching remains the fallback.
+        kind: ProviderErrorKind,
     },
 }
 
@@ -1174,6 +1287,7 @@ pub fn run_claude_local_chat_stream_pooled(
             if let Err(error) = result {
                 let _ = events
                     .send(ChatStreamEvent::Failed {
+                        kind: classify_provider_error(&error),
                         error: format!("{error:#}"),
                     })
                     .await;
@@ -1256,6 +1370,7 @@ pub fn run_codex_local_chat_stream_pooled(
             if let Err(error) = result {
                 let _ = events
                     .send(ChatStreamEvent::Failed {
+                        kind: classify_provider_error(&error),
                         error: format!("{error:#}"),
                     })
                     .await;
@@ -1289,6 +1404,7 @@ fn run_subscription_stream(
         if let Err(error) = result {
             let _ = events
                 .send(ChatStreamEvent::Failed {
+                    kind: classify_provider_error(&error),
                     error: format!("{error:#}"),
                 })
                 .await;
@@ -1304,7 +1420,11 @@ fn unavailable_stream(provider: &str, feature: &str) -> mpsc::Receiver<ChatStrea
         format!("{provider} subscription adapter is not compiled; enable the {feature} feature");
     tokio::spawn(async move {
         let _ = events
-            .send(ChatStreamEvent::Failed { error: message })
+            .send(ChatStreamEvent::Failed {
+                error: message,
+                // A missing compile-time feature is not going to fix itself.
+                kind: ProviderErrorKind::Fatal,
+            })
             .await;
     });
     receiver
@@ -1813,7 +1933,12 @@ fn map_claude_event_with_correlation(
             session_id,
             provider_turn_id: None,
         },
-        claude_agents::ChatStreamEvent::Failed { error } => ChatStreamEvent::Failed { error },
+        claude_agents::ChatStreamEvent::Failed { error } => ChatStreamEvent::Failed {
+            error,
+            // Reported by the Claude agent SDK as text; prose matching stays
+            // the only available signal for these.
+            kind: ProviderErrorKind::Unknown,
+        },
     }
 }
 

@@ -11511,7 +11511,7 @@ fn consultation_profiles_resolve_aliases_and_catalog_models() {
         resolve_consultation_profile("claude").unwrap(),
         (
             CodingProvider::Claude,
-            Some("claude-sonnet-5".to_string()),
+            Some("claude-opus-5".to_string()),
             None
         )
     );
@@ -12049,6 +12049,139 @@ async fn parent_journal_preserves_full_child_transcript_events() {
     assert!(event_rx.try_recv().is_err());
 }
 
+/// Streams durable events as fast as the channel accepts them and never
+/// finishes on its own, recording when the turn is finally cancelled.
+struct FloodingExecutor {
+    aborted_at: Arc<Mutex<Option<std::time::Instant>>>,
+}
+
+struct AbortMarker(Arc<Mutex<Option<std::time::Instant>>>);
+
+impl Drop for AbortMarker {
+    fn drop(&mut self) {
+        let mut slot = self.0.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(std::time::Instant::now());
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for FloodingExecutor {
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        let _marker = AbortMarker(Arc::clone(&self.aborted_at));
+        let mut index = 0u64;
+        loop {
+            index += 1;
+            events
+                .send(SessionEventKind::ToolStarted {
+                    tool_call_id: format!("flood-{index}"),
+                    name: "exec_command".into(),
+                    input: serde_json::json!({"cmd": "echo"}),
+                    input_ref: None,
+                })
+                .await
+                .ok();
+            events
+                .send(SessionEventKind::ToolCompleted {
+                    tool_call_id: format!("flood-{index}"),
+                    output: "ok".into(),
+                    output_ref: None,
+                    is_error: false,
+                    input: None,
+                    input_ref: None,
+                })
+                .await
+                .ok();
+        }
+    }
+}
+
+/// An operator pressing Escape must be heard while the provider is streaming.
+/// Commands and provider events share one `select!`, so any unbounded work in
+/// the provider arm is time the interrupt spends waiting in the queue.
+#[tokio::test(flavor = "current_thread")]
+async fn interrupt_is_honoured_while_a_stalled_observer_backs_up_the_event_stream() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    // Deliberately never drained: models a wedged or far-behind observer.
+    let (event_tx, _event_rx) = mpsc::channel(128);
+    let aborted_at = Arc::new(Mutex::new(None));
+    let executor = Arc::new(FloodingExecutor {
+        aborted_at: Arc::clone(&aborted_at),
+    });
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                    name: None,
+                    initial_prompt: Some("stream forever".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        }
+    });
+
+    // Let the stream saturate the observer before interrupting.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let requested_at = std::time::Instant::now();
+    command_tx
+        .send(HostCommand::Interrupt { session_id })
+        .await
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let observed = loop {
+        if let Some(at) = *aborted_at.lock().unwrap() {
+            break Some(at);
+        }
+        if std::time::Instant::now() > deadline {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let latency = observed
+        .expect("interrupt must cancel the turn")
+        .duration_since(requested_at);
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .ok();
+    let _ = tokio::time::timeout(Duration::from_secs(10), actor).await;
+
+    assert!(
+        latency < Duration::from_secs(3),
+        "interrupt took {latency:?} to reach the provider turn",
+    );
+}
+
 struct NetworkThenSuccessExecutor {
     calls: Arc<AtomicUsize>,
     failures: usize,
@@ -12086,7 +12219,22 @@ impl AgentTurnExecutor for NetworkThenSuccessExecutor {
                 .await
                 .unwrap();
         } else {
-            assert!(turn.prompt.contains("Do not repeat completed actions"));
+            // The first attempt ran a tool, so every later attempt must tell
+            // the model to resume rather than carry the request out afresh:
+            // redoing `exec_command` unattended is the failure mode here.
+            assert!(
+                turn.prompt.contains("do not repeat completed actions"),
+                "attempt {attempt}, error {}, prompt {}",
+                self.error,
+                turn.prompt
+            );
+            assert!(
+                turn.prompt
+                    .contains("not as a new instruction to carry out from the start"),
+                "the resend must be demoted from instruction to history: attempt {attempt}, error {}, prompt {}",
+                self.error,
+                turn.prompt
+            );
             assert!(
                 turn.prompt.contains("completed-work") || turn.prompt.contains("git status"),
                 "attempt {attempt}, error {}, prompt {}",
@@ -12136,9 +12284,61 @@ fn connection_retry_does_not_retry_authentication_or_command_failures() {
         "error sending request for url",
         "stream disconnected before completion",
         "ConnectionError: connection closed",
+        // Observed in production: OpenCode's event stream dropping mid-turn.
+        // A truncated HTTP body is a lost connection, and must be retried
+        // rather than counted as a goal failure.
+        "failed reading OpenCode server events: error decoding response body: error reading a body from connection: unexpected EOF during chunk size line",
+        "error decoding response body: unexpected end of file",
+        "connection closed before message completed",
     ] {
         assert!(provider_error_is_connection_lost(error), "{error}");
     }
+}
+
+#[test]
+fn a_typed_transport_failure_is_retried_whatever_its_wording() {
+    use borg_provider::provider::{ProviderErrorKind, ProviderStreamError};
+
+    // Deliberately worded so no substring in the prose allowlist can match:
+    // the only signal is the typed kind the transport recorded.
+    let opaque = "glorp 7 terminated";
+    assert!(
+        !provider_error_is_connection_lost(opaque),
+        "prose matching must genuinely not recognise this wording",
+    );
+
+    let typed = anyhow::Error::new(ProviderStreamError {
+        kind: ProviderErrorKind::ConnectionLost,
+        message: opaque.to_string(),
+    })
+    .context("provider turn failed");
+    assert!(
+        turn_error_is_connection_lost(&typed, &format!("{typed:#}")),
+        "a typed connection loss must be retried even when its text says nothing",
+    );
+
+    // The typed kind must also be able to *prevent* a retry that prose would
+    // have wrongly allowed: an auth failure that happens to mention a timeout.
+    let fatal = anyhow::Error::new(ProviderStreamError {
+        kind: ProviderErrorKind::Fatal,
+        message: "connection reset".to_string(),
+    });
+    assert!(
+        !turn_error_is_connection_lost(&fatal, &format!("{fatal:#}")),
+        "a typed fatal error must not be retried because its text looks transient",
+    );
+
+    // With no typed cause, prose matching still decides.
+    let untyped = anyhow::anyhow!("network is unreachable");
+    assert!(turn_error_is_connection_lost(
+        &untyped,
+        &format!("{untyped:#}")
+    ));
+    let untyped_fatal = anyhow::anyhow!("invalid api key");
+    assert!(!turn_error_is_connection_lost(
+        &untyped_fatal,
+        &format!("{untyped_fatal:#}")
+    ));
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -141,7 +141,9 @@ async fn opencode_generates_before_complete_arguments_and_finishes() -> anyhow::
                         );
                         results += 1;
                     }
-                    ChatStreamEvent::Failed { error } => anyhow::bail!("{error}"),
+                    ChatStreamEvent::Failed { error, kind } => {
+                        anyhow::bail!("{error} ({kind:?})")
+                    }
                     ChatStreamEvent::Done { final_text, .. } => {
                         assert_eq!(generations, 1);
                         assert_eq!(results, 1);

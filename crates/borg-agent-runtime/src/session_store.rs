@@ -577,13 +577,54 @@ impl SessionEventKind {
                 event: Some(child_event),
                 ..
             } => match child_event.kind.persistence() {
-                EventPersistence::Durable => EventPersistence::Durable,
                 EventPersistence::Coalesced | EventPersistence::Ephemeral => {
                     EventPersistence::Ephemeral
                 }
+                // A child's provider audit trail - full model messages, native
+                // tool rounds, compaction and retry markers - is durable in the
+                // child's own journal and is never rendered or replayed from
+                // the parent's rows. Mirroring it durably into the parent is a
+                // second copy of the largest payloads in the store: measured on
+                // one orchestration session, child `native_model_message`
+                // alone was 424 MB of that session's 1,132 MB of subagent rows.
+                // The parent still receives them live, and the child's
+                // transcript events (tools, messages, approvals, status) stay
+                // durable so ordered subagent replay is unchanged.
+                EventPersistence::Durable
+                    if matches!(child_event.kind, Self::ProviderEvent { .. })
+                        || child_event.kind.is_own_session_metadata() =>
+                {
+                    EventPersistence::Ephemeral
+                }
+                EventPersistence::Durable => EventPersistence::Durable,
             },
             _ => EventPersistence::Durable,
         }
+    }
+
+    /// Metadata a session records about itself rather than about its
+    /// transcript: provider admission, the usage counters, the stop gate,
+    /// watches, provider linkage and configuration.
+    ///
+    /// A parent mirrors its children's streams, and these describe the child's
+    /// session, not anything the parent renders or reconstructs on replay - the
+    /// parent already carries the child's usage and status in the activity
+    /// snapshot itself, and the child's own journal is the record for the rest.
+    /// Measured across the 25 most recent sessions, mirrored child
+    /// `provider_capabilities_updated` alone was 7 MB of 29 MB of subagent
+    /// rows. These are still delivered live; only the durable copy is dropped.
+    fn is_own_session_metadata(&self) -> bool {
+        matches!(
+            self,
+            Self::SessionStarted
+                | Self::SessionConfigured { .. }
+                | Self::ProviderCapabilitiesUpdated { .. }
+                | Self::EffectiveCapabilitiesUpdated { .. }
+                | Self::ProviderSessionLinked { .. }
+                | Self::UsageUpdated { .. }
+                | Self::UserStopChanged { .. }
+                | Self::WatchesChanged { .. }
+        )
     }
 
     pub fn is_fork_inheritable(&self) -> bool {

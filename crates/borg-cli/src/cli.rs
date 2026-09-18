@@ -490,8 +490,11 @@ pub(crate) struct LocalAgentCliArgs {
     /// Project directory. On resume, omit this to reuse the recorded directory.
     #[arg(long)]
     pub(crate) cwd: Option<PathBuf>,
-    #[arg(long, value_enum, default_value_t = RemoteProviderArg::Codex)]
-    pub(crate) provider: RemoteProviderArg,
+    /// Provider for this session. Omitted, it resolves to the first provider
+    /// with usable credentials on this machine, so a fresh launch never opens a
+    /// sign-in prompt for a provider the user is not using.
+    #[arg(long, value_enum)]
+    pub(crate) provider: Option<RemoteProviderArg>,
     #[arg(long)]
     pub(crate) model: Option<String>,
     #[arg(long)]
@@ -536,12 +539,50 @@ pub(crate) struct LocalAgentCliArgs {
     pub(crate) session_host: Option<Uuid>,
 }
 
+/// Provider preference used when no `--provider` was given. Codex stays first
+/// so an existing ChatGPT login keeps its behaviour; every later entry is only
+/// reached when the providers before it have no credentials on this machine.
+pub(crate) const DEFAULT_PROVIDER_PREFERENCE: [RemoteProviderArg; 7] = [
+    RemoteProviderArg::Codex,
+    RemoteProviderArg::Claude,
+    RemoteProviderArg::OpenCode,
+    RemoteProviderArg::Kimi,
+    RemoteProviderArg::Glm,
+    RemoteProviderArg::OpenRouter,
+    RemoteProviderArg::OpenAiCompatible,
+];
+
+/// The provider a fresh session starts on when the user did not name one.
+/// Picking a connected provider here is what keeps Borg from asking for a
+/// ChatGPT sign-in merely because Codex is first in the catalog.
+pub(crate) fn default_provider() -> RemoteProviderArg {
+    default_provider_with(|candidate| {
+        borg_remote::provider_credentials_present(candidate.into())
+    })
+}
+
+fn default_provider_with(
+    credentials_present: impl Fn(RemoteProviderArg) -> bool,
+) -> RemoteProviderArg {
+    DEFAULT_PROVIDER_PREFERENCE
+        .into_iter()
+        .find(|candidate| credentials_present(*candidate))
+        // Nothing is connected: keep the historical provider so the sign-in
+        // guidance names one route instead of an arbitrary last entry.
+        .unwrap_or(RemoteProviderArg::Codex)
+}
+
 impl LocalAgentCliArgs {
+    /// The explicit `--provider`, or the first connected provider.
+    pub(crate) fn provider(&self) -> RemoteProviderArg {
+        self.provider.unwrap_or_else(default_provider)
+    }
+
     fn interactive() -> Self {
         Self {
             prompt: Vec::new(),
             cwd: None,
-            provider: RemoteProviderArg::Codex,
+            provider: None,
             model: None,
             effort: None,
             peer_provider: None,
@@ -566,7 +607,7 @@ impl LocalAgentCliArgs {
         Self {
             prompt: Vec::new(),
             cwd: None,
-            provider: RemoteProviderArg::Codex,
+            provider: None,
             model: None,
             effort: None,
             peer_provider: None,
@@ -924,6 +965,25 @@ mod tests {
     }
 
     #[test]
+    fn the_default_provider_skips_providers_without_credentials() {
+        assert!(matches!(
+            default_provider_with(|candidate| matches!(candidate, RemoteProviderArg::Claude)),
+            RemoteProviderArg::Claude
+        ));
+        assert!(matches!(
+            default_provider_with(|candidate| matches!(
+                candidate,
+                RemoteProviderArg::Codex | RemoteProviderArg::Claude
+            )),
+            RemoteProviderArg::Codex
+        ));
+        assert!(matches!(
+            default_provider_with(|_| false),
+            RemoteProviderArg::Codex
+        ));
+    }
+
+    #[test]
     fn mixed_provider_peer_requires_a_new_thread_prompt() {
         let command = try_parse_direct([
             "borg",
@@ -939,7 +999,7 @@ mod tests {
         let Command::Agent(args) = command else {
             panic!("agent command expected");
         };
-        assert!(matches!(args.provider, RemoteProviderArg::Codex));
+        assert!(matches!(args.provider, Some(RemoteProviderArg::Codex)));
         assert!(matches!(
             args.peer_provider,
             Some(RemoteProviderArg::Claude)

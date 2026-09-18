@@ -4119,7 +4119,8 @@ fn persistence_and_fork_rules_are_typed_rust_contracts() {
         delivery: Some(crate::PromptDelivery::Queue),
     };
     assert_eq!(user_in_progress.persistence(), EventPersistence::Durable);
-    // A parent journals a mirrored child event exactly when the child would.
+    // A parent journals a mirrored child event only when the child would AND
+    // the parent replays something from it. See is_parent_replayable.
     let child_id = Uuid::new_v4();
     let snapshot = || crate::SubagentSnapshot {
         session_id: child_id,
@@ -5521,4 +5522,307 @@ async fn an_unknown_opencode_model_does_not_pin_the_route() {
             .unwrap(),
         "the route is still open once the model is known"
     );
+}
+
+/// The parent mirrors a child's whole event stream so the UI can follow a child
+/// live, but a child's provider audit trail is already durable in the child's
+/// own journal and nothing renders or replays it from the parent. Measured on
+/// one orchestration session, mirrored child `native_model_message` rows alone
+/// were 424 MB of 1,132 MB. Ordered subagent replay of the child's transcript
+/// events must be unaffected.
+#[test]
+fn mirrored_child_provider_audit_events_are_live_only() {
+    let child_id = Uuid::new_v4();
+    let snapshot = || crate::SubagentSnapshot {
+        session_id: child_id,
+        parent_session_id: Uuid::new_v4(),
+        task_name: "worker".to_string(),
+        status: crate::SubagentStatus::Running,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        cwd: std::path::PathBuf::from("/tmp"),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        detail: None,
+        final_text: None,
+        usage: crate::SubagentUsage::default(),
+    };
+    let mirrored = |kind: SessionEventKind| SessionEventKind::SubagentActivity {
+        activity: crate::SubagentActivityKind::Updated,
+        agent: snapshot(),
+        event: Some(Box::new(SessionEvent::new(child_id, 0, kind))),
+    };
+
+    // Durable in the child, but provider audit records the parent never reads.
+    for kind in [
+        "native_model_message",
+        "native_tool_round_completed",
+        "context_compaction",
+    ] {
+        let child = SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: kind.to_string(),
+            payload: serde_json::json!({"content": "a full model message"}),
+        };
+        assert_eq!(
+            child.persistence(),
+            EventPersistence::Durable,
+            "fixture must be durable in the child: {kind}"
+        );
+        assert_eq!(
+            mirrored(child).persistence(),
+            EventPersistence::Ephemeral,
+            "the parent must not journal a child's provider audit trail: {kind}"
+        );
+    }
+
+    // A child's own session metadata describes the child's session, not its
+    // transcript. The parent renders and replays none of it.
+    for kind in [
+        SessionEventKind::ProviderCapabilitiesUpdated {
+            providers: Vec::new(),
+        },
+        SessionEventKind::UserStopChanged { engaged: true },
+    ] {
+        assert_eq!(
+            kind.persistence(),
+            EventPersistence::Durable,
+            "fixture must be durable in the child: {kind:?}"
+        );
+        assert_eq!(
+            mirrored(kind.clone()).persistence(),
+            EventPersistence::Ephemeral,
+            "the parent must not journal a child's own session metadata: {kind:?}"
+        );
+    }
+
+    // The child's transcript events stay durable in the parent: commit 84b03b9
+    // requires them to remain replayable after the live projection disconnects.
+    let replayable = [
+        SessionEventKind::ToolStarted {
+            tool_call_id: "call-1".to_string(),
+            name: "exec".to_string(),
+            input: serde_json::json!({"cmd": "cargo test"}),
+            input_ref: None,
+        },
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "call-1".to_string(),
+            output: "ok".to_string(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+        },
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: crate::EventActor::Assistant,
+            text: "report".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+        SessionEventKind::StatusChanged {
+            status: crate::SessionStatus::Ready,
+            detail: None,
+        },
+    ];
+    for kind in replayable {
+        assert_eq!(
+            mirrored(kind.clone()).persistence(),
+            EventPersistence::Durable,
+            "ordered subagent replay must keep this durable: {kind:?}"
+        );
+    }
+
+    // A child's live stream stays live-only, and snapshot-only activity is
+    // always durable.
+    assert_eq!(
+        mirrored(SessionEventKind::ReasoningDelta {
+            text: "thinking".to_string()
+        })
+        .persistence(),
+        EventPersistence::Ephemeral
+    );
+    assert_eq!(
+        SessionEventKind::SubagentActivity {
+            activity: crate::SubagentActivityKind::Completed,
+            agent: snapshot(),
+            event: None,
+        }
+        .persistence(),
+        EventPersistence::Durable
+    );
+}
+
+/// Journal rows written by older builds must still load. Two shapes matter and
+/// both are taken verbatim from the live 59 GB journal:
+///
+/// * a July `subagent_activity` whose agent snapshot predates the `usage`
+///   field entirely, and
+/// * a row whose mirrored child event is a kind current code no longer
+///   journals - dropping the *write* must never drop the *read*, or 3.4 GB of
+///   existing history stops rendering.
+#[test]
+fn historical_subagent_activity_rows_still_deserialise() {
+    // Verbatim from the journal: session 479bc6e5, 2026-07-26, before the agent
+    // snapshot carried `usage`.
+    let legacy_july = r#"{"id":"4d85aa4b-e17d-413b-a94c-eb050d98a783","session_id":"479bc6e5-9272-4efa-b2a3-641adf31c379","sequence":33,"created_at":"2026-07-26T01:01:45.889433205Z","kind":{"type":"subagent_activity","activity":"started","agent":{"session_id":"1e293f97-280c-40b8-bade-9dc7fc5da93c","parent_session_id":"479bc6e5-9272-4efa-b2a3-641adf31c379","task_name":"/root/smoke_child","status":"starting","provider":"codex","model":"gpt-5.6-sol","effort":"medium","cwd":"/home/shulgin/borg","created_at":"2026-07-26T01:01:45.861616732Z","updated_at":"2026-07-26T01:01:45.861616732Z","detail":null,"final_text":null},"event":null}}"#;
+
+    let event: SessionEvent =
+        serde_json::from_str(legacy_july).expect("a pre-`usage` agent snapshot must still load");
+    let SessionEventKind::SubagentActivity {
+        activity,
+        agent,
+        event: child,
+    } = &event.kind
+    else {
+        panic!("expected subagent_activity, got {:?}", event.kind);
+    };
+    assert_eq!(*activity, crate::SubagentActivityKind::Started);
+    assert_eq!(agent.task_name, "/root/smoke_child");
+    assert_eq!(agent.status, crate::SubagentStatus::Starting);
+    assert!(child.is_none());
+    // The missing field defaults rather than failing the whole row.
+    assert_eq!(agent.usage.total_tokens, 0);
+
+    // A row whose child event is a kind we now keep live-only. Current code
+    // will not write this again, but 3.4 GB of journal already contains it and
+    // it must still load and still render the same agent state.
+    let mirrored_provider_audit = r#"{"id":"0fe32fee-495d-4a9e-8271-6246f98ca113","session_id":"bd254d05-e129-4703-af86-68e9aafc3223","sequence":293527,"created_at":"2026-09-02T16:57:19.433426094Z","kind":{"type":"subagent_activity","activity":"updated","agent":{"session_id":"eee819c7-ae35-45c9-af95-cf3a3efc33b7","parent_session_id":"bd254d05-e129-4703-af86-68e9aafc3223","task_name":"/root/worker","status":"running","provider":"codex","model":"gpt-5.6-luna","effort":"max","cwd":"/home/shulgin/free-radicals","created_at":"2026-09-02T10:03:11.028415785Z","updated_at":"2026-09-02T16:57:19.423451668Z","detail":"turn phase: provider active","final_text":"a report","usage":{"input_tokens":1158104,"output_tokens":171134,"total_tokens":28811094,"context_tokens":124146,"cost_microusd":null,"cost_basis":"unavailable"}},"event":{"id":"42169e93-e4f8-4674-bb39-2e26ebdadb84","session_id":"eee819c7-ae35-45c9-af95-cf3a3efc33b7","sequence":0,"created_at":"2026-09-02T16:57:19.423451668Z","kind":{"type":"provider_event","provider":"codex","kind":"native_model_message","payload":{"content":"anything"}}}}}"#;
+
+    let event: SessionEvent = serde_json::from_str(mirrored_provider_audit)
+        .expect("an already-journaled provider-audit row must still load");
+    let SessionEventKind::SubagentActivity {
+        agent,
+        event: Some(child),
+        ..
+    } = &event.kind
+    else {
+        panic!("expected a mirrored child event, got {:?}", event.kind);
+    };
+    assert_eq!(agent.usage.total_tokens, 28_811_094);
+    assert_eq!(agent.detail.as_deref(), Some("turn phase: provider active"));
+    assert!(matches!(
+        child.kind,
+        SessionEventKind::ProviderEvent { ref kind, .. } if kind == "native_model_message"
+    ));
+    // Reading it back is unaffected by the write rule; only new writes stop.
+    assert_eq!(event.kind.persistence(), EventPersistence::Ephemeral);
+}
+
+/// Keeping a mirrored child event out of the journal must not change what the
+/// UI reconstructs from history. borg-ui's `rebuild_agents` walks the durable
+/// history and lets the LAST `subagent_activity` per child win, so the risk is
+/// that the dropped row was the last one and carried fresher agent state than
+/// the row before it.
+///
+/// It does not, and the reason is structural: the agent snapshot only moves
+/// when the child does transcript work, and those rows stay durable. Verified
+/// against the live journal too - across the 25 most recent sessions, all 23
+/// agents reconstruct a byte-identical final snapshot with and without the
+/// dropped rows, even though 16 of them end on a row that is now dropped.
+#[test]
+fn dropping_live_only_child_rows_does_not_change_the_reconstructed_roster() {
+    let child_id = Uuid::new_v4();
+    let parent_id = Uuid::new_v4();
+    let snapshot = |detail: &str, total_tokens: u64| crate::SubagentSnapshot {
+        session_id: child_id,
+        parent_session_id: parent_id,
+        task_name: "worker".to_string(),
+        status: crate::SubagentStatus::Running,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        cwd: std::path::PathBuf::from("/tmp"),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+        detail: Some(detail.to_string()),
+        final_text: None,
+        usage: crate::SubagentUsage {
+            total_tokens,
+            ..Default::default()
+        },
+    };
+    let row = |agent: crate::SubagentSnapshot, child: Option<SessionEventKind>| {
+        SessionEventKind::SubagentActivity {
+            activity: crate::SubagentActivityKind::Updated,
+            agent,
+            event: child.map(|kind| Box::new(SessionEvent::new(child_id, 0, kind))),
+        }
+    };
+
+    // The agent snapshot advances on transcript work, then the child emits
+    // provider audit and capability rows that carry the SAME snapshot - which
+    // is what the live journal actually looks like, and why the last row being
+    // dropped is harmless.
+    let settled = snapshot("ran a tool", 2_048);
+    let history = vec![
+        row(
+            snapshot("starting", 0),
+            Some(SessionEventKind::StatusChanged {
+                status: crate::SessionStatus::Running,
+                detail: None,
+            }),
+        ),
+        row(
+            settled.clone(),
+            Some(SessionEventKind::ToolCompleted {
+                tool_call_id: "call-1".to_string(),
+                output: "ok".to_string(),
+                output_ref: None,
+                is_error: false,
+                input: None,
+                input_ref: None,
+            }),
+        ),
+        // Both of these are now live-only, and both are LAST.
+        row(
+            settled.clone(),
+            Some(SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "native_model_message".to_string(),
+                payload: serde_json::json!({"content": "big"}),
+            }),
+        ),
+        row(
+            settled.clone(),
+            Some(SessionEventKind::ProviderCapabilitiesUpdated {
+                providers: Vec::new(),
+            }),
+        ),
+    ];
+
+    // Mirrors borg-ui rebuild_agents: last activity per child wins.
+    let latest_agent = |events: &[SessionEventKind]| {
+        events
+            .iter()
+            .filter_map(|kind| match kind {
+                SessionEventKind::SubagentActivity { agent, .. } => Some(agent.clone()),
+                _ => None,
+            })
+            .next_back()
+            .expect("at least one activity")
+    };
+
+    let durable: Vec<SessionEventKind> = history
+        .iter()
+        .filter(|kind| kind.persistence() == EventPersistence::Durable)
+        .cloned()
+        .collect();
+
+    assert_eq!(
+        durable.len(),
+        2,
+        "the provider-audit and capability rows must be live-only"
+    );
+    let from_everything = latest_agent(&history);
+    let from_journal = latest_agent(&durable);
+    assert_eq!(from_journal.detail, from_everything.detail);
+    assert_eq!(
+        from_journal.usage.total_tokens,
+        from_everything.usage.total_tokens
+    );
+    assert_eq!(from_journal.status, from_everything.status);
+    assert_eq!(from_journal.session_id, from_everything.session_id);
 }

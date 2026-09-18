@@ -6,7 +6,10 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 
-use super::{ChatStreamEvent, ChatStreamRequest, LocalAgentPermission, complete_tool_action};
+use super::{
+    ChatStreamEvent, ChatStreamRequest, LocalAgentPermission, ProviderErrorKind,
+    ProviderStreamError, classify_provider_error, complete_tool_action,
+};
 use crate::runtime::ProviderCallUsage;
 
 /// OpenCode owns its tool loop in a private local server. Subscribe before
@@ -24,12 +27,39 @@ pub fn run_opencode_local_chat_stream(
         if let Err(error) = result {
             let _ = events
                 .send(ChatStreamEvent::Failed {
+                    kind: classify_provider_error(&error),
                     error: format!("{error:#}"),
                 })
                 .await;
         }
     });
     receiver
+}
+
+/// OpenCode's `question` tool parks the turn until a human answers it through
+/// OpenCode's own UI, which Borg never renders: the call just burns the turn's
+/// clock and then resolves empty. Borg already owns asking the human (steers,
+/// approvals, provider interactions), so the tool is taken away rather than
+/// left to time out.
+///
+/// The prompt-level `tools` override is the lever that actually works: a
+/// top-level `tools` key in the config file is ignored by OpenCode (verified
+/// against 1.18.31), so only per-prompt and per-agent overrides bite. This
+/// permission entry is the backstop for the agents Borg does not prompt
+/// directly — `task` subagents inherit config, not our prompt body — where
+/// denying at least fails the call immediately instead of hanging the turn.
+fn blocked_tools() -> Value {
+    serde_json::json!({ "question": false })
+}
+
+fn opencode_base_config(permission: LocalAgentPermission) -> Value {
+    let mut config = serde_json::json!({});
+    if permission == LocalAgentPermission::FullAccess {
+        config["permission"] = serde_json::json!({"*": "allow", "question": "deny"});
+    } else {
+        config["permission"] = serde_json::json!({"question": "deny"});
+    }
+    config
 }
 
 async fn run(
@@ -60,10 +90,7 @@ async fn run(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let mut config = serde_json::json!({});
-    if permission == LocalAgentPermission::FullAccess {
-        config["permission"] = serde_json::json!({"*": "allow"});
-    }
+    let mut config = opencode_base_config(permission);
     if !request.mcp_external_servers.is_empty() {
         let servers = request
             .mcp_external_servers
@@ -133,14 +160,14 @@ async fn run(
             .context("OpenCode session response missing id")?
             .to_string(),
     };
-    let mut server_events = client
-        .get(format!("{server_url}/event"))
-        .basic_auth("opencode", Some(&password))
-        .query(&[("directory", &cwd)])
-        .send()
-        .await?
-        .error_for_status()?;
-    let mut server_pending = Vec::new();
+    let mut server_events = EventStream::connect(
+        client.clone(),
+        server_url.clone(),
+        password.clone(),
+        cwd.clone(),
+        session_id.clone(),
+    )
+    .await?;
     let prompt = if request.session_id.is_none() && !request.system_prompt.trim().is_empty() {
         format!(
             "{}\n\nUser request:\n{}",
@@ -173,6 +200,7 @@ async fn run(
         .context("OpenCode model must be provider/model")?;
     let mut input = serde_json::json!({
         "model": {"providerID": provider_id, "modelID": model_id},
+        "tools": blocked_tools(),
         "parts": parts,
     });
     if let Some(effort) = request.effort {
@@ -199,7 +227,7 @@ async fn run(
     loop {
         let event = tokio::select! {
             _ = events.closed() => return Ok(()),
-            event = next_server_event(&mut server_events, &mut server_pending) => event?,
+            event = server_events.next() => event?,
         };
         let props = &event["properties"];
         let kind = event
@@ -383,30 +411,180 @@ async fn run(
     Ok(())
 }
 
-async fn next_server_event(
-    response: &mut reqwest::Response,
-    pending: &mut Vec<u8>,
-) -> Result<Value> {
-    loop {
-        while let Some(end) = pending.iter().position(|byte| *byte == b'\n') {
-            let line = pending.drain(..=end).collect::<Vec<_>>();
-            let Some(data) = line.strip_prefix(b"data:") else {
-                continue;
-            };
-            let event: Value =
-                serde_json::from_slice(data).context("invalid OpenCode server event")?;
-            return Ok(event);
+/// OpenCode's `/event` bus is a plain chunked HTTP stream with no resume
+/// cursor, and it does drop mid-turn on long tool calls. The work itself lives
+/// in the OpenCode server, not in this connection, so losing the socket must
+/// not lose the turn: reconnect, replay the session's parts to recover what was
+/// missed, and ask whether the session went idle while we were disconnected.
+///
+/// Replay is safe because every consumer downstream already de-duplicates by
+/// part id (`completed_parts`) or tool id (`started_tools` / `completed_tools`),
+/// so re-delivering parts we have already seen is a no-op.
+struct EventStream {
+    client: reqwest::Client,
+    server_url: String,
+    password: String,
+    cwd: std::path::PathBuf,
+    session_id: String,
+    response: reqwest::Response,
+    pending: Vec<u8>,
+    replay: std::collections::VecDeque<Value>,
+    reconnects: u32,
+}
+
+/// Enough to ride out a server hiccup without spinning forever on a server that
+/// is genuinely gone.
+const MAX_RECONNECTS: u32 = 64;
+const RECONNECT_ATTEMPTS: u32 = 5;
+
+impl EventStream {
+    async fn connect(
+        client: reqwest::Client,
+        server_url: String,
+        password: String,
+        cwd: std::path::PathBuf,
+        session_id: String,
+    ) -> Result<Self> {
+        let response = Self::subscribe(&client, &server_url, &password, &cwd).await?;
+        Ok(Self {
+            client,
+            server_url,
+            password,
+            cwd,
+            session_id,
+            response,
+            pending: Vec::new(),
+            replay: std::collections::VecDeque::new(),
+            reconnects: 0,
+        })
+    }
+
+    async fn subscribe(
+        client: &reqwest::Client,
+        server_url: &str,
+        password: &str,
+        cwd: &std::path::Path,
+    ) -> Result<reqwest::Response> {
+        Ok(client
+            .get(format!("{server_url}/event"))
+            .basic_auth("opencode", Some(password))
+            .query(&[("directory", &cwd)])
+            .send()
+            .await?
+            .error_for_status()?)
+    }
+
+    async fn next(&mut self) -> Result<Value> {
+        loop {
+            if let Some(event) = self.replay.pop_front() {
+                return Ok(event);
+            }
+            while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
+                let line = self.pending.drain(..=end).collect::<Vec<_>>();
+                let Some(data) = line.strip_prefix(b"data:") else {
+                    continue;
+                };
+                let event: Value =
+                    serde_json::from_slice(data).context("invalid OpenCode server event")?;
+                return Ok(event);
+            }
+            // Both a read error and a clean end-of-stream mean the same thing
+            // here: this socket is finished, but the turn may not be.
+            match self.response.chunk().await {
+                Ok(Some(chunk)) => {
+                    anyhow::ensure!(
+                        self.pending.len().saturating_add(chunk.len()) <= 8 * 1024 * 1024,
+                        "OpenCode server event exceeded 8 MiB"
+                    );
+                    self.pending.extend_from_slice(&chunk);
+                }
+                Ok(None) => self.recover(None).await?,
+                Err(error) => self.recover(Some(error)).await?,
+            }
         }
-        let chunk = response
-            .chunk()
-            .await
-            .context("failed reading OpenCode server events")?
-            .context("OpenCode server event stream closed")?;
-        anyhow::ensure!(
-            pending.len().saturating_add(chunk.len()) <= 8 * 1024 * 1024,
-            "OpenCode server event exceeded 8 MiB"
-        );
-        pending.extend_from_slice(&chunk);
+    }
+
+    /// Re-establish the stream, then reconcile: queue every part of this
+    /// session for replay, and if the session is no longer busy queue the
+    /// `session.idle` the caller is waiting for. Resubscribing *before*
+    /// reconciling is deliberate — the other order can miss a session that goes
+    /// idle in the window between the two calls, hanging the turn forever.
+    async fn recover(&mut self, error: Option<reqwest::Error>) -> Result<()> {
+        self.reconnects = self.reconnects.saturating_add(1);
+        if self.reconnects > MAX_RECONNECTS {
+            let detail = error
+                .map(|error| format!("{error}"))
+                .unwrap_or_else(|| "stream closed".to_string());
+            return Err(anyhow::Error::new(ProviderStreamError {
+                kind: ProviderErrorKind::ConnectionLost,
+                message: format!("OpenCode server event stream kept dropping ({detail})"),
+            }));
+        }
+        let mut last: Option<anyhow::Error> = None;
+        for attempt in 0..RECONNECT_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(100 * u64::from(attempt) * 2 + 50)).await;
+            match Self::subscribe(&self.client, &self.server_url, &self.password, &self.cwd).await {
+                Ok(response) => {
+                    self.response = response;
+                    self.pending.clear();
+                    return self.resync().await;
+                }
+                Err(error) => last = Some(error),
+            }
+        }
+        let context = last
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_else(|| "unknown error".to_string());
+        Err(anyhow::Error::new(ProviderStreamError {
+            kind: ProviderErrorKind::ConnectionLost,
+            message: format!("failed reading OpenCode server events: reconnect failed ({context})"),
+        }))
+    }
+
+    async fn resync(&mut self) -> Result<()> {
+        let messages = self
+            .client
+            .get(format!(
+                "{}/session/{}/message",
+                self.server_url, self.session_id
+            ))
+            .basic_auth("opencode", Some(&self.password))
+            .query(&[("directory", &self.cwd)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        for message in messages.as_array().into_iter().flatten() {
+            for part in message
+                .get("parts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                self.replay.push_back(serde_json::json!({
+                    "type": "message.part.updated",
+                    "properties": {"part": part},
+                }));
+            }
+        }
+        let status = self
+            .client
+            .get(format!("{}/session/status", self.server_url))
+            .basic_auth("opencode", Some(&self.password))
+            .query(&[("directory", &self.cwd)])
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        if status.get(&self.session_id).is_none() {
+            self.replay.push_back(serde_json::json!({
+                "type": "session.idle",
+                "properties": {"sessionID": self.session_id},
+            }));
+        }
+        Ok(())
     }
 }
 
@@ -610,10 +788,165 @@ fn parse_usage(value: &Value) -> Option<ProviderCallUsage> {
 mod tests {
     use std::collections::{HashMap, HashSet};
 
+    use std::time::Duration;
+
     use serde_json::json;
     use tokio::sync::mpsc;
 
-    use super::{ChatStreamEvent, emit_tool, parse_usage};
+    use super::{
+        ChatStreamEvent, EventStream, LocalAgentPermission, blocked_tools, emit_tool,
+        opencode_base_config, parse_usage,
+    };
+
+    /// A stand-in OpenCode server that aborts the event stream the way the real
+    /// one does: mid-chunk, so reqwest surfaces "unexpected EOF during chunk
+    /// size line" rather than a clean end of body.
+    async fn serve_flaky_event_stream(listener: tokio::net::TcpListener, session_id: &'static str) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut event_requests = 0;
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let head = loop {
+                let mut chunk = [0u8; 2048];
+                let Ok(read) = socket.read(&mut chunk).await else {
+                    return;
+                };
+                if read == 0 {
+                    break None;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break Some(end);
+                }
+            };
+            if head.is_none() {
+                continue;
+            }
+            let head = String::from_utf8_lossy(&request).to_string();
+            let target = head.lines().next().unwrap_or_default().to_string();
+
+            if target.contains("/event") {
+                event_requests += 1;
+                let first = event_requests == 1;
+                tokio::spawn(async move {
+                    let event = json!({
+                        "type": "message.part.updated",
+                        "properties": {"part": {
+                            "id": if first { "prt_first" } else { "prt_second" },
+                            "sessionID": session_id,
+                            "type": "text",
+                            "text": "streamed",
+                            "time": {"start": 0, "end": 1},
+                        }},
+                    })
+                    .to_string();
+                    let payload = format!("data: {event}\n\n");
+                    let _ = socket
+                        .write_all(
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{payload}\r\n",
+                                payload.len()
+                            )
+                            .as_bytes(),
+                        )
+                        .await;
+                    if first {
+                        // Truncate in the middle of the next chunk-size line.
+                        let _ = socket.write_all(b"1").await;
+                        let _ = socket.shutdown().await;
+                    } else {
+                        // Stay open so the test observes the replayed catch-up
+                        // rather than a second reconnect.
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                });
+                continue;
+            }
+
+            let body = if target.contains("/message") {
+                json!([{ "parts": [
+                    {"id": "prt_missed", "sessionID": session_id, "type": "text",
+                     "text": "missed while disconnected", "time": {"start": 0, "end": 1}},
+                ]}])
+                .to_string()
+            } else {
+                // No entry for this session: it went idle during the outage.
+                json!({}).to_string()
+            };
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_event_stream_reconnects_and_recovers_the_turn() -> anyhow::Result<()> {
+        const SESSION: &str = "ses_test";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(serve_flaky_event_stream(listener, SESSION));
+
+        let mut stream = EventStream::connect(
+            reqwest::Client::builder().no_proxy().build()?,
+            format!("http://{address}"),
+            "p".to_string(),
+            std::env::temp_dir(),
+            SESSION.to_string(),
+        )
+        .await?;
+
+        let first = stream.next().await?;
+        assert_eq!(first["properties"]["part"]["id"], json!("prt_first"));
+
+        // The stream is now severed mid-chunk. Previously this returned an
+        // error and killed the turn; it must instead replay what was missed...
+        let recovered = tokio::time::timeout(Duration::from_secs(10), stream.next()).await??;
+        assert_eq!(recovered["properties"]["part"]["id"], json!("prt_missed"));
+
+        // ...and then report the idle the caller is blocked on, so the turn
+        // ends normally instead of hanging.
+        let idle = tokio::time::timeout(Duration::from_secs(10), stream.next()).await??;
+        assert_eq!(idle["type"], json!("session.idle"));
+        assert_eq!(idle["properties"]["sessionID"], json!(SESSION));
+        Ok(())
+    }
+
+    #[test]
+    fn question_tool_is_blocked_in_every_permission_mode() {
+        // The prompt body is what actually removes the tool; the config only
+        // backstops agents Borg does not prompt directly.
+        assert_eq!(blocked_tools(), json!({"question": false}));
+        for permission in [
+            LocalAgentPermission::Manual,
+            LocalAgentPermission::Auto,
+            LocalAgentPermission::FullAccess,
+        ] {
+            let config = opencode_base_config(permission);
+            assert_eq!(config["permission"]["question"], json!("deny"));
+            // A top-level `tools` key is silently ignored by OpenCode, so it
+            // must not be how we claim to block anything.
+            assert!(config.get("tools").is_none());
+        }
+        assert_eq!(
+            opencode_base_config(LocalAgentPermission::FullAccess)["permission"]["*"],
+            json!("allow")
+        );
+        assert!(
+            opencode_base_config(LocalAgentPermission::Manual)["permission"]
+                .get("*")
+                .is_none()
+        );
+    }
 
     #[test]
     fn step_finish_usage_preserves_cache_tokens_and_cost() {

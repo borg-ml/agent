@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use borg_provider::provider::{
     ChatApprovalDecision, ChatStreamControl, ChatStreamEvent, ChatStreamRequest,
-    ClaudeSubscriptionPool, CodexSubscriptionPool, LocalAgentPermission, SteerAdmission,
-    run_claude_chat_stream_with_control, run_claude_local_chat_stream,
+    ClaudeSubscriptionPool, CodexSubscriptionPool, LocalAgentPermission, ProviderStreamError,
+    SteerAdmission, run_claude_chat_stream_with_control, run_claude_local_chat_stream,
     run_claude_local_chat_stream_pooled, run_codex_chat_stream_with_control,
     run_codex_local_chat_stream, run_codex_local_chat_stream_pooled,
     run_opencode_local_chat_stream,
@@ -2207,7 +2207,7 @@ async fn run_borg_provider_turn(
                     .await;
                 }
             }
-            ChatStreamEvent::Failed { error } => {
+            ChatStreamEvent::Failed { error, kind } => {
                 flush_pending_reasoning(&events, &mut pending_reasoning).await;
                 if let Some((registry, _)) = pool_invocation.as_ref() {
                     registry.mark(turn.session_id, turn.provider, false).await;
@@ -2220,7 +2220,14 @@ async fn run_borg_provider_turn(
                     },
                 )
                 .await;
-                bail!("{error}");
+                // Return the classification alongside the text instead of
+                // `bail!`-ing a bare string. `bail!` would drop the kind the
+                // transport already determined and force the session layer
+                // back to guessing from prose.
+                return Err(anyhow::Error::new(ProviderStreamError {
+                    kind,
+                    message: error,
+                }));
             }
         }
     }

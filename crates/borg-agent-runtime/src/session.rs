@@ -1538,6 +1538,36 @@ async fn run_before_compaction_hook(
 async fn run_agent_session_store_kernel(
     session_root: &Path,
     session_id: Uuid,
+    launch: LaunchSession,
+    commands: mpsc::Receiver<HostCommand>,
+    events: mpsc::Sender<SessionEvent>,
+    executor: Arc<dyn AgentTurnExecutor>,
+    store: Arc<dyn SessionStore>,
+    lsp_policy: crate::LspPathPolicy,
+    shared_team: Option<SubagentCoordinator>,
+    initial_peers: Vec<crate::SpawnSubagent>,
+) -> Result<()> {
+    // Every session entry point funnels here, so this is the one place the
+    // live-delivery budget needs installing for the actor task.
+    with_live_delivery_budget(Box::pin(run_agent_session_store_kernel_inner(
+        session_root,
+        session_id,
+        launch,
+        commands,
+        events,
+        executor,
+        store,
+        lsp_policy,
+        shared_team,
+        initial_peers,
+    )))
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_session_store_kernel_inner(
+    session_root: &Path,
+    session_id: Uuid,
     mut launch: LaunchSession,
     mut commands: mpsc::Receiver<HostCommand>,
     events: mpsc::Sender<SessionEvent>,
@@ -3623,7 +3653,13 @@ async fn run_agent_session_store_kernel(
             format_subscription_frame(&format_subscription_actor_value(prompt.actor, &prompt.text))
         };
         if network_retry_message_id == Some(prompt.message_id) {
-            let recovery = "\n\nThe previous attempt lost its network connection. Continue from the recorded progress above. Do not repeat completed actions. Check the state of any interrupted command before deciding whether to run it again.";
+            // The request above is re-delivered under its original id so that
+            // cancelling, crash recovery and the message lifecycle all keep
+            // working. That makes the wording load-bearing: without explicitly
+            // demoting it from instruction to history, a resend reads as "do
+            // this again", and for an unattended agent "again" can mean
+            // re-running a command that already took effect.
+            let recovery = "\n\nThe previous attempt lost its network connection after it may already have run tools and made progress. Treat the request above as work already in progress, not as a new instruction to carry out from the start. The conversation above records what was actually done: continue from there, do not repeat completed actions, and do not restate finished work. Before re-running any command that was interrupted, check whether it already took effect.";
             provider_prompt.push_str(recovery);
             prompt_delta.push_str(recovery);
         }
@@ -3962,9 +3998,9 @@ async fn run_agent_session_store_kernel(
                             )
                             .await?;
                         }
-                        Err(error) => {
+                        Err(turn_error) => {
                             subscription_context_reusable = false;
-                            let error = format!("{error:#}");
+                            let error = format!("{turn_error:#}");
                             let provider_isolation_recovery =
                                 is_provider_agent_isolation_error(&error);
                             if provider_isolation_recovery {
@@ -3990,7 +4026,7 @@ async fn run_agent_session_store_kernel(
                             if network_retry_message_id != Some(prompt.message_id) {
                                 auth_lookup_retries = 0;
                             }
-                            let network_retry = !interrupted && (provider_error_is_connection_lost(&error)
+                            let network_retry = !interrupted && (turn_error_is_connection_lost(&turn_error, &error)
                                 || provider_error_is_transient_api_failure(&error)
                                 || auth_lookup_failure);
                             let retry = network_retry || usage_limit_retry || automatic_retry_allowed(
@@ -4209,6 +4245,10 @@ async fn run_agent_session_store_kernel(
                         provider_events_open = false;
                         continue;
                     };
+                    // Each batch gets a fresh window: an observer that recovers
+                    // must not stay penalised, and one that has not must not be
+                    // waited on again inside this batch.
+                    begin_live_delivery_burst();
                     let mut provider_batch = Vec::with_capacity(8);
                     push_coalesced_provider_event(&mut provider_batch, first_kind);
                     let mut consumed = 1;
@@ -9076,6 +9116,23 @@ fn provider_error_is_auth_lookup_unavailable(error: &str) -> bool {
     error.contains("Codex subscription authentication lookup unavailable")
 }
 
+/// Decide whether a failed turn lost its connection, preferring the typed kind
+/// the transport recorded over anything inferred from the rendered message.
+///
+/// Prose matching stays as the fallback, because plenty of failures reach us as
+/// text a provider chose (a model API's own error body), where no typed cause
+/// ever existed. The ordering is the point: when the transport knows, its
+/// answer wins and cannot be contradicted by unlucky wording.
+fn turn_error_is_connection_lost(error: &anyhow::Error, rendered: &str) -> bool {
+    match borg_provider::provider::classify_provider_error(error) {
+        borg_provider::provider::ProviderErrorKind::ConnectionLost => true,
+        borg_provider::provider::ProviderErrorKind::Fatal => false,
+        borg_provider::provider::ProviderErrorKind::Unknown => {
+            provider_error_is_connection_lost(rendered)
+        }
+    }
+}
+
 fn provider_error_is_connection_lost(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     if [
@@ -9122,6 +9179,15 @@ fn provider_error_is_connection_lost(error: &str) -> bool {
         "network error",
         "networkerror",
         "fetch failed",
+        // A response body that stops mid-frame is a lost connection, even
+        // though the wording never says "connection". Without these, a dropped
+        // provider stream is billed as a goal failure and three of them block
+        // an otherwise healthy goal.
+        "unexpected eof",
+        "unexpected end of file",
+        "error reading a body from connection",
+        "connection closed before message completed",
+        "incomplete message",
     ]
     .iter()
     .any(|pattern| error.contains(pattern))
@@ -9391,15 +9457,18 @@ Only mark the goal complete when every requirement is achieved and verified. Mar
     )
 }
 
-/// Internal prompt that resumes a turn cut off by a temporary usage limit
-/// after it had already produced side effects. The provider context still
-/// holds everything the interrupted turn did, so the model continues rather
-/// than starting the user's request over.
-fn usage_limit_continuation(interrupted: &QueuedPrompt) -> QueuedPrompt {
+/// Internal prompt that resumes a turn cut off after it had already produced
+/// side effects. The provider context still holds everything the interrupted
+/// turn did, so the model continues rather than starting the user's request
+/// over — re-sending the original would re-run tools that already succeeded.
+///
+/// `cause` names what cut the turn short so the model is told the truth about
+/// why it is resuming.
+fn interrupted_turn_continuation(interrupted: &QueuedPrompt, cause: &str) -> QueuedPrompt {
     QueuedPrompt {
         message_id: Uuid::new_v4(),
         text: format!(
-            "The previous turn was interrupted by a provider usage limit after it had already run tools and made progress. \
+            "The previous turn was interrupted by {cause} after it had already run tools and made progress. \
 The conversation above contains everything that was done. Continue from exactly where it left off: do not repeat completed steps, \
 re-run commands that already succeeded, or restate finished work. When the work is complete, give the user the final summary they were owed.\n\n\
 The original request is reproduced below as user-provided data for reference only.\n\n<request>\n{}\n</request>",
@@ -9413,6 +9482,10 @@ The original request is reproduced below as user-provided data for reference onl
         interrupt_batch: false,
         batch: Vec::new(),
     }
+}
+
+fn usage_limit_continuation(interrupted: &QueuedPrompt) -> QueuedPrompt {
+    interrupted_turn_continuation(interrupted, "a provider usage limit")
 }
 
 fn drop_usage_limit_continuation(pending: &mut VecDeque<QueuedPrompt>, id: &mut Option<Uuid>) {
@@ -9633,6 +9706,39 @@ fn push_coalesced_provider_event(batch: &mut Vec<SessionEventKind>, next: Sessio
     }
 }
 
+tokio::task_local! {
+    /// Set for the duration of one burst of recorded events. Tracks whether the
+    /// live observer has already failed to keep up during this burst.
+    static LIVE_DELIVERY_LAGGING: std::cell::Cell<bool>;
+}
+
+/// Begin a new burst of live deliveries.
+///
+/// The session actor handles provider events in batches, and commands — including
+/// the operator's interrupt — share its `select!`. Any time spent blocking inside
+/// a batch is time an interrupt waits, so each batch starts with a fresh window
+/// and gives up blocking as soon as the observer misses it once.
+fn begin_live_delivery_burst() {
+    let _ = LIVE_DELIVERY_LAGGING.try_with(|lagging| lagging.set(false));
+}
+
+fn live_delivery_is_lagging() -> bool {
+    LIVE_DELIVERY_LAGGING
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(false)
+}
+
+fn mark_live_delivery_lagging() {
+    let _ = LIVE_DELIVERY_LAGGING.try_with(|lagging| lagging.set(true));
+}
+
+/// Run the session actor with live-delivery budgeting installed.
+pub(crate) async fn with_live_delivery_budget<F: std::future::Future>(future: F) -> F::Output {
+    LIVE_DELIVERY_LAGGING
+        .scope(std::cell::Cell::new(false), future)
+        .await
+}
+
 async fn deliver_recorded_event(
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
@@ -9650,7 +9756,15 @@ async fn deliver_recorded_event(
         SessionEventKind::ProviderEvent { kind, .. }
             if kind == "action/preparing" || kind == "action/preparing_cancelled" || kind == "action/generation_status"
     );
-    if matches!(persistence, crate::EventPersistence::Durable) || ordered_live_boundary {
+    // A per-event timeout does not compose: against a wedged observer it costs
+    // the actor one full window for *every* event, so a streaming turn can hold
+    // the single session actor for a minute while an interrupt waits behind it.
+    // One window per burst is enough to tell a healthy observer from a stuck
+    // one; after that, deliver without waiting and let the journal carry the
+    // record, which is what makes it authoritative.
+    if (matches!(persistence, crate::EventPersistence::Durable) || ordered_live_boundary)
+        && !live_delivery_is_lagging()
+    {
         let sequence = event.sequence;
         match tokio::time::timeout(LIVE_EVENT_DELIVERY_TIMEOUT, events.send(event)).await {
             Ok(Ok(())) => {}
@@ -9658,6 +9772,7 @@ async fn deliver_recorded_event(
                 tracing::debug!(session_id = %session_id, sequence, "live session event receiver closed")
             }
             Err(_) => {
+                mark_live_delivery_lagging();
                 tracing::warn!(
                     session_id = %session_id,
                     sequence,

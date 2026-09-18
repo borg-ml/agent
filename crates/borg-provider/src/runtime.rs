@@ -47,7 +47,7 @@ pub const CLAUDE_SELECTABLE_MODELS: [(&str, &str); 4] = [
 pub const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 pub const CLAUDE_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
     backend: "claude",
-    default_model: "claude-sonnet-5",
+    default_model: "claude-opus-5",
     selectable_models: &CLAUDE_SELECTABLE_MODELS,
     effort_levels: &CLAUDE_EFFORT_LEVELS,
 };
@@ -70,7 +70,7 @@ pub fn codex_product_model() -> &'static str {
 }
 
 pub fn claude_default_effort() -> &'static str {
-    "high"
+    "medium"
 }
 
 pub fn codex_default_effort() -> &'static str {

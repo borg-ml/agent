@@ -1577,7 +1577,7 @@ fn append_session_host_arguments(
     }
     command
         .arg("--provider")
-        .arg(provider_argument(args.provider));
+        .arg(provider_argument(args.provider()));
     if let Some(model) = args.model.as_ref() {
         command.arg("--model").arg(model);
     }
@@ -2109,7 +2109,7 @@ async fn run_local_agent_session(
     {
         CodingProvider::OpenAiCompatible
     } else {
-        args.provider.into()
+        args.provider().into()
     };
     let requested_model = args.model.clone().or_else(|| match requested_provider {
         CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
