@@ -1,0 +1,433 @@
+//! PostgreSQL backend for the Borg session journal.
+//!
+//! WHY THIS EXISTS: SQLite permits exactly one writer per FILE, and every Borg
+//! process on a machine shares one journal file. Under real load that produced
+//! measured lock starvation -- 171,861 "database is locked" waits in a single
+//! log window, rising to 8,537/hour. Postgres serialises writers per SESSION
+//! ROW instead (see the `next_sequence` allocator in postgres_schema.sql), so
+//! concurrent agents writing to different sessions never block each other.
+//!
+//! This module owns connection lifecycle, schema bootstrap and health only.
+//! The `SessionStore` implementation is layered on top of it.
+
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
+use sqlx::{ConnectOptions, Executor};
+
+use super::{SESSION_SCHEMA_VERSION, SessionStoreHealth};
+
+pub mod body;
+pub mod actions;
+pub mod cold;
+pub mod fork;
+pub mod harness;
+pub mod host;
+pub mod maintenance;
+pub mod recovery;
+pub mod search;
+pub mod store;
+pub mod sync;
+
+#[cfg(test)]
+pub(crate) mod testing;
+
+/// The journal schema, applied verbatim and idempotently. Every statement in
+/// the file is `create ... if not exists`, so bootstrap is safe to run from
+/// every process on every open and needs no migration runner yet.
+const POSTGRES_SCHEMA_SQL: &str = include_str!("postgres_schema.sql");
+
+/// The satellite tiers -- workspaces, autonomy, plugin state, receipts and the
+/// relay queue. They share the journal's database because they shared the
+/// SQLite file; the difference is that here sharing a database no longer means
+/// sharing one write lock.
+const POSTGRES_SATELLITE_SCHEMA_SQL: &str = include_str!("postgres_satellite_schema.sql");
+
+/// Environment override for the journal connection string.
+pub const SESSIONS_URL_ENV: &str = "BORG_SESSIONS_URL";
+
+/// Connections held per process. SQLite was capped at 4 because additional
+/// connections only deepened contention on the single write lock. Postgres has
+/// no such ceiling; this is sized so one busy process can overlap reads with
+/// its writer without monopolising a 200-connection server shared by dozens of
+/// agent processes.
+const POSTGRES_MAX_CONNECTIONS: u32 = 8;
+const POSTGRES_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Advisory lock key guarding schema bootstrap. Arbitrary but fixed: every
+/// process must choose the same number for the lock to mean anything.
+const SCHEMA_BOOTSTRAP_LOCK: i64 = 0x0B01_6_5E55_101;
+
+/// The durable session journal, backed by PostgreSQL.
+#[derive(Debug, Clone)]
+pub struct PostgresSessionStore {
+    pool: PgPool,
+    /// Dictionaries are append-only and immutable, so caching one is safe for
+    /// the life of the process and saves a fetch per cold read.
+    dictionaries: cold::DictionaryCache,
+}
+
+impl PostgresSessionStore {
+    /// Connect to `url` and bring the schema up to the current version.
+    pub async fn connect(url: &str) -> Result<Self> {
+        let options: PgConnectOptions = url
+            .parse::<PgConnectOptions>()
+            .with_context(|| format!("invalid Postgres session store URL: {url}"))?
+            .application_name("borg-session-journal")
+            // Statement logging at INFO would echo event bodies into the
+            // process log; the journal is the authority for that content.
+            .log_statements(tracing::log::LevelFilter::Debug);
+        let pool = PgPoolOptions::new()
+            .max_connections(POSTGRES_MAX_CONNECTIONS)
+            .acquire_timeout(POSTGRES_ACQUIRE_TIMEOUT)
+            .connect_with(options)
+            .await
+            .with_context(|| format!("failed to connect to Postgres session store: {url}"))?;
+        Self::from_pool(pool).await
+    }
+
+    /// Adopt an existing pool. Tests and embedded callers use this to share one
+    /// server across stores without reconnecting.
+    pub async fn from_pool(pool: PgPool) -> Result<Self> {
+        let store = Self {
+            pool,
+            dictionaries: cold::DictionaryCache::default(),
+        };
+        store.ensure_schema().await?;
+        Ok(store)
+    }
+
+    /// The connection string this process should use, from the environment.
+    pub fn url_from_env() -> Option<String> {
+        std::env::var(SESSIONS_URL_ENV)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
+    /// Apply the schema and record its version.
+    ///
+    /// Every borg process bootstraps on open, so concurrent first boots are the
+    /// normal case, not an edge case. `create ... if not exists` is NOT safe
+    /// under that concurrency: the existence check and the creation are not
+    /// atomic, so two sessions both observing "absent" both proceed and the
+    /// loser fails with a duplicate key on `pg_class`. Observed, not theorised
+    /// -- two tests bootstrapping in parallel reproduced it immediately.
+    ///
+    /// A transaction-scoped advisory lock serialises the whole bootstrap across
+    /// processes and releases automatically on commit, rollback, or a crashed
+    /// connection, so a process that dies mid-bootstrap cannot wedge the rest.
+    pub async fn ensure_schema(&self) -> Result<()> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .context("failed to begin the Postgres schema bootstrap")?;
+        sqlx::query("select pg_advisory_xact_lock($1)")
+            .bind(SCHEMA_BOOTSTRAP_LOCK)
+            .execute(&mut *transaction)
+            .await
+            .context("failed to take the Postgres schema bootstrap lock")?;
+        // gin_trgm_ops in the schema requires pg_trgm. Attempted here rather
+        // than in the .sql file because it needs privileges the journal role
+        // may not hold in a managed deployment, where an operator installs it
+        // once up front; a failure is only fatal if the dependent index is
+        // then missing, which the schema application below surfaces.
+        if let Err(error) = transaction
+            .execute("create extension if not exists pg_trgm")
+            .await
+        {
+            tracing::debug!(%error, "pg_trgm extension not created; assuming it is already installed");
+        }
+        sqlx::raw_sql(POSTGRES_SCHEMA_SQL)
+            .execute(&mut *transaction)
+            .await
+            .context("failed to apply the Postgres session schema")?;
+        sqlx::raw_sql(POSTGRES_SATELLITE_SCHEMA_SQL)
+            .execute(&mut *transaction)
+            .await
+            .context("failed to apply the Postgres satellite schema")?;
+        // `id` is `generated always as identity` with `check (id = 1)`, so the
+        // single row must be written with an explicit id and OVERRIDING SYSTEM
+        // VALUE; a plain insert would allocate id=2 and trip the check.
+        sqlx::query(
+            "insert into borg_session_schema (id, version) overriding system value \
+             values (1, $1) \
+             on conflict (id) do update set version = excluded.version",
+        )
+        .bind(SESSION_SCHEMA_VERSION)
+        .execute(&mut *transaction)
+        .await
+        .context("failed to record the Postgres session schema version")?;
+        transaction
+            .commit()
+            .await
+            .context("failed to commit the Postgres schema bootstrap")?;
+        Ok(())
+    }
+
+    /// Whether the connected database already carries the current schema.
+    pub async fn has_current_schema(&self) -> Result<bool> {
+        let version: Option<i64> =
+            sqlx::query_scalar("select version from borg_session_schema where id = 1")
+                .fetch_optional(&self.pool)
+                .await
+                .unwrap_or(None);
+        Ok(version == Some(SESSION_SCHEMA_VERSION))
+    }
+
+    /// Reject a database written by a newer Borg than this binary.
+    pub async fn validate_current_schema(&self) -> Result<()> {
+        let version: Option<i64> =
+            sqlx::query_scalar("select version from borg_session_schema where id = 1")
+                .fetch_optional(&self.pool)
+                .await?;
+        match version {
+            Some(version) if version > SESSION_SCHEMA_VERSION => anyhow::bail!(
+                "unsupported future Borg session schema version {version}; current is {SESSION_SCHEMA_VERSION}"
+            ),
+            _ => Ok(()),
+        }
+    }
+
+    /// Cheap liveness snapshot, without the expensive integrity check.
+    pub async fn readiness(&self) -> Result<SessionStoreHealth> {
+        self.health_snapshot(false).await
+    }
+
+    /// Full health snapshot.
+    pub async fn health(&self) -> Result<SessionStoreHealth> {
+        self.health_snapshot(true).await
+    }
+
+    async fn health_snapshot(&self, check_integrity: bool) -> Result<SessionStoreHealth> {
+        // SessionStoreHealth was shaped for SQLite pragmas. The fields are
+        // mapped to their Postgres equivalents rather than renamed, so existing
+        // health reporting and `is_ready` keep working across both backends.
+        let integrity = if check_integrity {
+            // Postgres has no `quick_check`. The equivalent cheap assertion is
+            // that the journal is readable and its constraints are intact;
+            // deep verification belongs to amcheck, which is not assumed here.
+            sqlx::query_scalar::<_, i64>("select count(*) from borg_session_schema")
+                .fetch_one(&self.pool)
+                .await
+                .map(|_| "ok".to_string())?
+        } else {
+            "not_checked".to_string()
+        };
+        let synchronous_commit: String = sqlx::query_scalar("show synchronous_commit")
+            .fetch_one(&self.pool)
+            .await?;
+        let sessions: i64 = sqlx::query_scalar("select count(*) from sessions")
+            .fetch_one(&self.pool)
+            .await?;
+        let events: i64 = sqlx::query_scalar("select count(*) from session_events")
+            .fetch_one(&self.pool)
+            .await?;
+        let actions: i64 = sqlx::query_scalar("select count(*) from session_actions")
+            .fetch_one(&self.pool)
+            .await?;
+        let payloads: i64 = sqlx::query_scalar("select count(*) from session_payloads")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(SessionStoreHealth {
+            integrity,
+            integrity_checked: check_integrity,
+            // Postgres is always write-ahead logged; reporting "wal" keeps
+            // `SessionStoreHealth::is_ready` meaningful for both backends.
+            journal_mode: "wal".to_string(),
+            // `is_ready` demands >= 2, which for SQLite meant FULL. The
+            // Postgres analogue of a durable commit is synchronous_commit=on.
+            synchronous: if matches!(
+                synchronous_commit.as_str(),
+                "on" | "remote_apply" | "remote_write"
+            ) {
+                2
+            } else {
+                0
+            },
+            foreign_keys: true,
+            journal_size_limit_bytes: 0,
+            // There is no per-file WAL busy counter to expose: writer waits are
+            // per session row, which is the entire point of this backend.
+            wal_busy: 0,
+            wal_log_frames: 0,
+            wal_checkpointed_frames: 0,
+            sessions,
+            events,
+            actions,
+            payloads,
+            projection_version: super::SESSION_PROJECTION_VERSION,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// These tests need a real server: Postgres semantics (identity columns,
+    /// `overriding system value`, extension availability) are exactly what a
+    /// mock would get wrong. Without one they skip rather than fail, so the
+    /// suite still runs on a machine with no database.
+    use super::testing::{ScratchDatabase, test_url};
+
+    #[tokio::test]
+    async fn concurrent_bootstraps_do_not_race_on_schema_objects() {
+        let Some(url) = test_url() else {
+            eprintln!("skipping: BORG_TEST_SESSIONS_URL is not set");
+            return;
+        };
+        let scratch = ScratchDatabase::create(&url).await;
+        let scratch_url = scratch.url.clone();
+
+        // Every borg process bootstraps on open, so a cold start with several
+        // agents launching at once hits exactly this path. Before the advisory
+        // lock, `create index if not exists` raced and the loser failed with a
+        // duplicate key on pg_class.
+        let mut bootstraps = tokio::task::JoinSet::new();
+        for _ in 0..8 {
+            let url = scratch_url.clone();
+            bootstraps.spawn(async move { PostgresSessionStore::connect(&url).await.map(|_| ()) });
+        }
+        let mut failures = Vec::new();
+        while let Some(joined) = bootstraps.join_next().await {
+            if let Err(error) = joined.expect("bootstrap task panicked") {
+                failures.push(format!("{error:#}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "concurrent bootstrap must serialise, got: {failures:?}"
+        );
+
+        let store = PostgresSessionStore::connect(&scratch_url)
+            .await
+            .expect("connect after concurrent bootstrap");
+        let rows: i64 = sqlx::query_scalar("select count(*) from borg_session_schema")
+            .fetch_one(store.pool())
+            .await
+            .expect("count schema rows");
+        assert_eq!(rows, 1);
+        drop(store);
+
+        scratch.discard().await;
+    }
+
+    #[tokio::test]
+    async fn schema_bootstrap_is_idempotent_and_reports_health() {
+        let Some(url) = test_url() else {
+            eprintln!("skipping: BORG_TEST_SESSIONS_URL is not set");
+            return;
+        };
+        let store = PostgresSessionStore::connect(&url)
+            .await
+            .expect("connect and bootstrap");
+        assert!(
+            store.has_current_schema().await.expect("schema version"),
+            "bootstrap must record the current schema version"
+        );
+
+        // Re-running bootstrap is what every process does on open.
+        store.ensure_schema().await.expect("second bootstrap");
+        store.validate_current_schema().await.expect("validate");
+        assert!(store.has_current_schema().await.expect("schema version"));
+
+        // The version row is constrained to exactly one row; a second
+        // bootstrap must update it rather than insert beside it.
+        let rows: i64 = sqlx::query_scalar("select count(*) from borg_session_schema")
+            .fetch_one(store.pool())
+            .await
+            .expect("count schema rows");
+        assert_eq!(rows, 1, "schema marker must stay a single row");
+
+        let health = store.health().await.expect("health");
+        assert_eq!(health.integrity, "ok");
+        assert!(health.integrity_checked);
+        assert_eq!(health.journal_mode, "wal");
+        assert!(health.foreign_keys);
+        assert_eq!(health.wal_busy, 0);
+        assert_eq!(health.projection_version, crate::SESSION_PROJECTION_VERSION);
+
+        let readiness = store.readiness().await.expect("readiness");
+        assert_eq!(readiness.integrity, "not_checked");
+        assert!(!readiness.integrity_checked);
+        assert!(
+            readiness.is_ready(),
+            "a freshly bootstrapped journal must report ready: {readiness:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_schema_object_the_store_depends_on_exists() {
+        let Some(url) = test_url() else {
+            eprintln!("skipping: BORG_TEST_SESSIONS_URL is not set");
+            return;
+        };
+        let store = PostgresSessionStore::connect(&url).await.expect("connect");
+        for table in [
+            "sessions",
+            "session_events",
+            "session_event_dicts",
+            "session_live_state",
+            "session_payloads",
+            "session_event_search",
+            "session_actions",
+            "session_action_transitions",
+        ] {
+            let present: bool = sqlx::query_scalar("select to_regclass($1) is not null")
+                .bind(table)
+                .fetch_one(store.pool())
+                .await
+                .expect("table lookup");
+            assert!(present, "missing table {table}");
+        }
+
+        // Every satellite tier must be present too: leaving one in SQLite
+        // would keep its writers on that file's single write lock.
+        for table in [
+            "workspaces",
+            "workspace_participants",
+            "workspace_members",
+            "workspace_events",
+            "workspace_deliveries",
+            "workspace_threads",
+            "workspace_work_items",
+            "workspace_work_claims",
+            "workspace_work_dependencies",
+            "workspace_presence_leases",
+            "agent_instances",
+            "autonomy_jobs",
+            "autonomy_job_transitions",
+            "autonomy_checkpoints",
+            "plugin_state",
+            "plugin_artifacts",
+            "plugin_mutation_receipts",
+            "receipt_records",
+            "receipt_transitions",
+            "host_operation_queue",
+        ] {
+            let present: bool = sqlx::query_scalar("select to_regclass($1) is not null")
+                .bind(table)
+                .fetch_one(store.pool())
+                .await
+                .expect("table lookup");
+            assert!(present, "missing satellite table {table}");
+        }
+
+        // The trigram index cannot be created without pg_trgm, so its presence
+        // proves the extension bootstrap worked rather than silently skipping.
+        let trigram_index: bool = sqlx::query_scalar(
+            "select exists(select 1 from pg_indexes where indexname = 'idx_session_event_search_trgm')",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("index lookup");
+        assert!(trigram_index, "trigram search index is missing");
+    }
+}
