@@ -208,7 +208,7 @@ async fn probe() -> Result<()> {
         )), "native tool-round boundary was not persisted");
         if resumed {
             let consultation = LocalAgentTurnExecutor::default()
-                .for_session(session_id, &store)
+                .for_session(session_id, &store, None)
                 .await?
                 .context("local executor did not resolve the session route")?
                 .consult(ConsultationRequest {

@@ -2502,6 +2502,82 @@ async fn sibling_messages_use_the_shared_team_directory() {
 }
 
 #[tokio::test]
+async fn a_cross_participant_message_names_a_reply_target_the_recipient_can_reach() {
+    // "/root" resolves to the reader's OWN root in every process, so telling a
+    // peer to reply there addressed it back to itself and failed as "message
+    // recipient must differ from its author". A peer must be handed its
+    // sender's participant address instead.
+    let directory = tempdir().unwrap();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    let store = Arc::new(
+        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap(),
+    );
+    store
+        .create_session_in_workspace(first, workspace_id)
+        .await
+        .unwrap();
+    store
+        .create_session_in_workspace(second, workspace_id)
+        .await
+        .unwrap();
+    let workspace = store.workspace_store().await.unwrap().unwrap();
+    let human = crate::local_human_participant_id("Human");
+    for (session, label) in [(first, "First root"), (second, "Second root")] {
+        workspace
+            .ensure_execution_workspace(
+                workspace_id,
+                "shared project",
+                human,
+                "Human",
+                session,
+                label,
+            )
+            .await
+            .unwrap();
+    }
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        first,
+        launch(),
+        1,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store,
+    )
+    .unwrap();
+
+    let (inbox, _receipt) = coordinator
+        .persist_team_message(
+            first,
+            second,
+            "/root",
+            "density pass is done",
+            crate::contract::PromptDelivery::Queue,
+            DeliveryMode::NextTurn,
+            TeamMessageOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        inbox.text.contains(&format!("participant:{first}")),
+        "a peer in another process must be given an addressable reply target, got: {}",
+        inbox.text
+    );
+    assert!(
+        !inbox.text.contains("target \"/root\""),
+        "\"/root\" addresses the recipient back to itself, got: {}",
+        inbox.text
+    );
+    // The sender is still identified by its task name; only the reply
+    // address changes.
+    assert!(inbox.text.contains("Team message from /root:"));
+}
+
+#[tokio::test]
 async fn independent_sessions_share_workspace_broadcasts_exactly_once() {
     let directory = tempdir().unwrap();
     let first = Uuid::new_v4();

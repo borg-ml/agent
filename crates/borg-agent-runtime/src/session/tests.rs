@@ -8167,12 +8167,31 @@ fn active_provider_steer_uses_turn_control_across_provider_lanes() {
         CodingProvider::OpenRouter,
         CodingProvider::OpenAiCompatible,
     ] {
-        assert!(steers_active_provider_turn(provider, PromptDelivery::Steer));
+        let native = provider.uses_native_harness();
+        assert!(steers_active_provider_turn(
+            provider,
+            PromptDelivery::Steer,
+            native
+        ));
         assert!(!steers_active_provider_turn(
             provider,
-            PromptDelivery::Queue
+            PromptDelivery::Queue,
+            native
         ));
     }
+    // `opencode-go` steers because its session runs Borg's native harness even
+    // though the billing provider itself is not native; the CLI compatibility
+    // route (native_harness=false) still cannot take a steer.
+    assert!(steers_active_provider_turn(
+        CodingProvider::OpenCode,
+        PromptDelivery::Steer,
+        true
+    ));
+    assert!(!steers_active_provider_turn(
+        CodingProvider::OpenCode,
+        PromptDelivery::Steer,
+        false
+    ));
 }
 
 #[test]
@@ -10041,6 +10060,32 @@ async fn subscription_compaction_truncates_provider_summary_before_replay() {
         allowed_tools: Vec::new(),
     };
     let executor: Arc<dyn AgentTurnExecutor> = Arc::new(OversizedCompactionExecutor);
+    let prompt_id = Uuid::new_v4();
+    let events = vec![
+        SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::TurnStarted {
+                message_id: prompt_id,
+                provider: CodingProvider::Codex,
+                model: Some("test-model".to_string()),
+                effort: Some("medium".to_string()),
+                fast: false,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::Message {
+                message_id: prompt_id,
+                actor: EventActor::User,
+                text: "durable context".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ),
+    ];
 
     let compaction = compact_subscription_context_for_budget(SubscriptionCompactionRequest {
         executor: &executor,
@@ -10048,7 +10093,7 @@ async fn subscription_compaction_truncates_provider_summary_before_replay() {
         launch: &launch,
         agent_mcp_server: &agent_mcp_server,
         dispatcher: &dispatcher,
-        context: "durable context",
+        events: &events,
         actor: EventActor::User,
         current_prompt: "continue",
     })
@@ -14011,4 +14056,180 @@ async fn human_mid_turn_steers_are_framed_with_a_reply_instruction() {
         format!("{human}\n\n{team}"),
         "a mixed batch is not framed as the human's words"
     );
+}
+
+/// A turn that ends while a steer is still in flight must not strand the
+/// message. The provider takes the steer, never acknowledges it (the ack
+/// channel is dropped as the turn ends), and the session must promote the
+/// still-uncommitted prompt into a brand new turn rather than parking it in
+/// `pending_steers` forever while reporting `ready`.
+struct TurnEndsWithSteerInFlightExecutor {
+    turns: RecordedPromptTurns,
+    first_started: Arc<Notify>,
+    steer_taken: Arc<Notify>,
+    second_started: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for TurnEndsWithSteerInFlightExecutor {
+    async fn execute(
+        &self,
+        turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        let attempt = {
+            let mut turns = self.turns.lock().unwrap();
+            turns.push((turn.prompt.clone(), turn.attachments.clone()));
+            turns.len()
+        };
+        if attempt > 1 {
+            // The promoted steer became its own turn: answer it.
+            self.second_started.notify_one();
+            return Ok(AgentTurnResult {
+                provider_session_id: Some("provider-session".to_string()),
+                final_text: "answered the promoted steer".to_string(),
+            });
+        }
+        self.first_started.notify_one();
+        let mut controls = controls.expect("the first turn is steerable");
+        // Take the steer and end the turn without acknowledging it. Dropping
+        // `ack` is exactly what a provider process does when its turn finishes
+        // before the steer is merged.
+        match tokio::time::timeout(Duration::from_secs(5), controls.recv()).await {
+            Ok(Some(AgentTurnControl::Steer { ack, .. })) => {
+                drop(ack);
+                self.steer_taken.notify_one();
+            }
+            other => panic!("expected a steer on the first turn, got {other:?}"),
+        }
+        Ok(AgentTurnResult {
+            provider_session_id: Some("provider-session".to_string()),
+            final_text: "first turn ended".to_string(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn steer_in_flight_when_the_turn_ends_starts_a_new_turn() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let followup_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let turns: RecordedPromptTurns = Arc::new(Mutex::new(Vec::new()));
+    let first_started = Arc::new(Notify::new());
+    let steer_taken = Arc::new(Notify::new());
+    let second_started = Arc::new(Notify::new());
+    let executor = Arc::new(TurnEndsWithSteerInFlightExecutor {
+        turns: Arc::clone(&turns),
+        first_started: Arc::clone(&first_started),
+        steer_taken: Arc::clone(&steer_taken),
+        second_started: Arc::clone(&second_started),
+    });
+    let actor = tokio::spawn(async move {
+        run_agent_session_with_executor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+        )
+        .await
+    });
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "first".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), first_started.notified())
+        .await
+        .expect("the first turn starts");
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: followup_id,
+            text: "typed while the turn was running".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), steer_taken.notified())
+        .await
+        .expect("the provider takes the steer");
+
+    // The steer was never acknowledged, so it must be promoted into a new turn
+    // instead of sitting in `pending_steers` while the session goes ready.
+    tokio::time::timeout(Duration::from_secs(5), second_started.notified())
+        .await
+        .expect("an unacknowledged steer starts a new turn instead of being dropped");
+
+    let recorded = turns.lock().unwrap().clone();
+    assert_eq!(recorded.len(), 2, "the promoted steer runs as its own turn");
+    assert!(
+        recorded[1].0.contains("typed while the turn was running"),
+        "the new turn carries the steered text, got {:?}",
+        recorded[1].0
+    );
+
+    // The promoted prompt keeps its original message id and reaches Complete,
+    // so the UI shows one message answered rather than a duplicate or a
+    // message stuck in flight.
+    let mut completed = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(500), event_rx.recv()).await
+        else {
+            continue;
+        };
+        if matches!(
+            event.kind,
+            SessionEventKind::Message {
+                message_id,
+                status: MessageStatus::Complete,
+                ..
+            } if message_id == followup_id
+        ) {
+            completed = true;
+            break;
+        }
+    }
+    assert!(
+        completed,
+        "the promoted steer must be answered under its original message id"
+    );
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
 }

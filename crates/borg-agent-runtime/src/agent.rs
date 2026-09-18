@@ -289,6 +289,7 @@ pub trait AgentTurnExecutor: Send + Sync {
         &self,
         _session_id: Uuid,
         _store: &dyn crate::SessionStore,
+        _model: Option<&str>,
     ) -> Result<Option<Arc<dyn AgentTurnExecutor>>> {
         Ok(None)
     }
@@ -375,6 +376,10 @@ pub struct LocalAgentTurnExecutor {
     native_harness: NativeHarness,
     codex_model_only: bool,
     codex_session_native: bool,
+    /// The durable OpenCode route pinned for this session. Only the
+    /// `opencode-go` aliases have an API Borg calls directly; a legacy CLI
+    /// history stays on the OpenCode compatibility route.
+    opencode_session_native: bool,
     runtime_extensions: Arc<RwLock<RuntimeExtensions>>,
     runtime_extension_loader: Option<RuntimeExtensionLoader>,
     subscription_pools: Arc<SubscriptionPoolRegistry>,
@@ -398,6 +403,7 @@ impl Default for LocalAgentTurnExecutor {
             native_harness: NativeHarness::default(),
             codex_model_only: false,
             codex_session_native: false,
+            opencode_session_native: false,
             runtime_extensions: Arc::new(RwLock::new(RuntimeExtensions::default())),
             runtime_extension_loader: None,
             subscription_pools: Arc::new(SubscriptionPoolRegistry::default()),
@@ -946,6 +952,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         &self,
         session_id: Uuid,
         store: &dyn crate::SessionStore,
+        model: Option<&str>,
     ) -> Result<Option<Arc<dyn AgentTurnExecutor>>> {
         let autonomy = store.autonomy_store().await?;
         let store = autonomy
@@ -957,8 +964,17 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             !self.codex_model_only || native,
             "this session retains its Codex compatibility route; start a new session for Borg-owned execution"
         );
+        // Resolve the pinned OpenCode route too. A `opencode-go` session must
+        // run Borg's native harness (gateway, steering, structured context);
+        // a legacy CLI history must keep the compatibility route. The model
+        // decides a fresh session, so pass the launch model; pinning happens
+        // on first resolution and is then stable across restarts.
+        let opencode_native = store
+            .uses_native_opencode_harness(session_id, model)
+            .await?;
         let mut executor = self.clone();
         executor.codex_session_native = native;
+        executor.opencode_session_native = opencode_native;
         Ok(Some(Arc::new(executor)))
     }
 
@@ -966,6 +982,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         provider.uses_native_harness()
             || ((self.codex_model_only || self.codex_session_native)
                 && provider == CodingProvider::Codex)
+            || (self.opencode_session_native && provider == CodingProvider::OpenCode)
     }
 
     fn web_search_provider(&self) -> Option<Arc<dyn borg_search::WebSearchProvider>> {
@@ -1317,7 +1334,9 @@ pub async fn run_agent_turn_controlled(
         .ok();
     let executor = LocalAgentTurnExecutor::default();
     let bound = if let Some(store) = turn.agent_tools.session_store() {
-        executor.for_session(turn.session_id, &store).await?
+        executor
+            .for_session(turn.session_id, &store, turn.model.as_deref())
+            .await?
     } else {
         None
     };
@@ -2730,22 +2749,60 @@ mod tests {
             .await
             .unwrap();
         let native = LocalAgentTurnExecutor::default()
-            .for_session(fresh, &store)
+            .for_session(fresh, &store, None)
             .await
             .unwrap()
             .unwrap();
         assert!(native.uses_native_harness(CodingProvider::Codex));
         assert!(!native.supports_subscription_context_reuse(CodingProvider::Codex));
-        let compatibility = native.for_session(legacy, &store).await.unwrap().unwrap();
+        let compatibility = native
+            .for_session(legacy, &store, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!compatibility.uses_native_harness(CodingProvider::Codex));
         assert!(compatibility.supports_subscription_context_reuse(CodingProvider::Codex));
         assert!(
             LocalAgentTurnExecutor::default()
                 .with_codex_model_only()
-                .for_session(legacy, &store)
+                .for_session(legacy, &store, None)
                 .await
                 .is_err()
         );
+    }
+
+    /// An `opencode-go` session must run Borg's native harness so it gets the
+    /// Go gateway, steering, and structured context; a legacy CLI-owned
+    /// OpenCode transcript must keep the compatibility route. Getting this
+    /// wrong sends the session to the CLI route, which has no steer channel
+    /// and re-sends the entire durable replay every turn.
+    #[cfg(feature = "subscription-adapters")]
+    #[tokio::test]
+    async fn opencode_go_resolves_to_the_native_harness_and_legacy_stays_on_the_cli() {
+        use crate::SessionStore;
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+
+        let go = Uuid::new_v4();
+        store.create_session(go).await.unwrap();
+        let go_executor = LocalAgentTurnExecutor::default()
+            .for_session(go, &store, Some("opencode-go/deepseek-v4.1-flash"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(go_executor.uses_native_harness(CodingProvider::OpenCode));
+        assert!(!go_executor.supports_subscription_context_reuse(CodingProvider::OpenCode));
+
+        let cli = Uuid::new_v4();
+        store.create_session(cli).await.unwrap();
+        let cli_executor = LocalAgentTurnExecutor::default()
+            .for_session(cli, &store, Some("opencode/kimi-k2.7-code"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!cli_executor.uses_native_harness(CodingProvider::OpenCode));
     }
 
     #[tokio::test]

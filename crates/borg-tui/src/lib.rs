@@ -2409,6 +2409,31 @@ fn model_picker_options_with_configured(
         }
     }
 
+    // The canonical fixed order is Codex, Claude, then OpenCode Go, then
+    // OpenRouter. OpenCode Go is a first-class subscription destination, so it
+    // stays adjacent to the other fixed catalogs rather than trailing the
+    // open-ended OpenRouter list.
+    let go_models = borg_provider::opencode_go_model_entries();
+    if go_models.is_empty() {
+        let mut option = PickerOption::new("Connect OpenCode Go…", "/connect-go");
+        option.section = Some("OpenCode Go".to_string());
+        option.preview =
+            Some("Add your Go subscription key and load the available models.".to_string());
+        options.push(option);
+    }
+    let mut first_go = true;
+    for model in go_models {
+        if options.iter().any(|option| option.value == model.id) {
+            continue;
+        }
+        let mut option = PickerOption::new(model.label, model.id);
+        option.preview = model.detail;
+        if first_go {
+            option.section = Some("OpenCode Go".to_string());
+            first_go = false;
+        }
+        options.push(option);
+    }
     // OpenRouter is open-ended rather than a compile-time catalog, but it is
     // still a first-class destination from every provider. Keep the cached
     // catalog in the same picker so `/model` is a real fuzzy switcher instead
@@ -2431,27 +2456,6 @@ fn model_picker_options_with_configured(
             }
             options.push(option);
         }
-    }
-    let go_models = borg_provider::opencode_go_model_entries();
-    if go_models.is_empty() {
-        let mut option = PickerOption::new("Connect OpenCode Go…", "/connect-go");
-        option.section = Some("OpenCode Go".to_string());
-        option.preview =
-            Some("Add your Go subscription key and load the available models.".to_string());
-        options.push(option);
-    }
-    let mut first_go = true;
-    for model in go_models {
-        if options.iter().any(|option| option.value == model.id) {
-            continue;
-        }
-        let mut option = PickerOption::new(model.label, model.id);
-        option.preview = model.detail;
-        if first_go {
-            option.section = Some("OpenCode Go".to_string());
-            first_go = false;
-        }
-        options.push(option);
     }
     options
 }

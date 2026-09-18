@@ -70,6 +70,10 @@ const COMPACTION_CONTEXT_ELISION: &str =
 // also expressed in characters for the Codex app-server route.
 const COMPACTION_PRUNE_PROTECT_CHARS: usize = 40_000 * 4;
 const COMPACTION_HIGH_VALUE_TOOL_RESULT_MAX_CHARS: usize = 8_000;
+// Room kept for the running summary in a multi-pass compaction fold, so a fold
+// prompt (running summary + next chunk + wrapper) always fits the provider
+// input budget.
+const COMPACTION_RUNNING_SUMMARY_BUDGET_CHARS: usize = 128 * 1024;
 const COMPACTION_OLD_TOOL_RESULT_MARKER: &str =
     "[Old tool result content cleared for compaction; tool call retained]";
 const COMPACTION_OLD_ASSISTANT_MARKER: &str = "[Earlier assistant narrative retained in the durable journal but omitted from this compaction input]";
@@ -715,7 +719,12 @@ impl RuntimeSessionStore {
     }
 }
 
-const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_secs(3);
+// A cooperative interrupt usually ends the turn in under a second; this is
+// only the cap before a hard abort. Keep it short so a provider that ignores
+// the cooperative signal cannot make Escape feel unresponsive. Aborting drops
+// the provider session, and the next turn replays the durable journal either
+// way, so a shorter grace changes no durable outcome.
+const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_millis(1_000);
 #[cfg(not(test))]
 const PROVIDER_SETUP_LIVENESS_TIMEOUT: Duration = Duration::from_secs(120);
 #[cfg(test)]
@@ -1548,7 +1557,7 @@ async fn run_agent_session_store_kernel(
     let runtime_mcp_servers = runtime_mcp_context.provider_external_servers();
     store.create_session(session_id).await?;
     let executor = executor
-        .for_session(session_id, store.as_ref())
+        .for_session(session_id, store.as_ref(), launch.model.as_deref())
         .await?
         .unwrap_or(executor);
     let initial_state = store.state(session_id).await?;
@@ -2831,11 +2840,6 @@ async fn run_agent_session_store_kernel(
                                     provider_session_id: Some(provider_session_id.to_string()),
                                 }))
                             } else {
-                                let projection = retained_compaction_context_with_budget(
-                                    journal.context_events(),
-                                    subscription_compaction_context_budget(EventActor::User, ""),
-                                )
-                                .context("there is no conversation to compact yet")?;
                                 compact_subscription_context_for_budget(
                                     SubscriptionCompactionRequest {
                                         executor: &executor,
@@ -2843,7 +2847,7 @@ async fn run_agent_session_store_kernel(
                                         launch: &launch,
                                         agent_mcp_server: &agent_mcp_server,
                                         dispatcher: &dispatcher,
-                                        context: &projection.context,
+                                        events: journal.context_events(),
                                         actor: EventActor::User,
                                         current_prompt: "",
                                     },
@@ -3259,6 +3263,112 @@ async fn run_agent_session_store_kernel(
             retained_context = retained_conversation_context(journal.context_events());
         }
 
+        // The replay no longer fits the provider input budget. For a
+        // subscription turnaround Borg owns, the one lossy step must be an LLM
+        // summary with a durable `context_compaction` boundary that restarts
+        // replay — the same shape Pi and the native auto-compaction path use.
+        // The deterministic projection that drops whole messages is only a
+        // defensive backstop when compaction itself cannot run.
+        if !native_provider
+            && retained_context.as_deref().is_some_and(|context| {
+                subscription_context_needs_projection(
+                    context,
+                    prompt.actor,
+                    &prompt.text,
+                    reuse_subscription_context,
+                )
+            })
+            && matches!(
+                launch.provider,
+                CodingProvider::Codex | CodingProvider::Claude
+            )
+        {
+            let full_context = retained_context
+                .take()
+                .expect("oversized subscription context was present");
+            record(
+                &mut journal,
+                &events,
+                session_id,
+                SessionEventKind::ProviderEvent {
+                    provider: launch.provider,
+                    kind: "context_compaction".to_string(),
+                    payload: serde_json::json!({
+                        "status": "started",
+                        "summary": "Compacting context…",
+                        "automatic": true,
+                        "trigger": "provider_input_size",
+                    }),
+                },
+            )
+            .await?;
+            let result = compact_subscription_context_for_budget(SubscriptionCompactionRequest {
+                executor: &executor,
+                session_id,
+                launch: &launch,
+                agent_mcp_server: &agent_mcp_server,
+                dispatcher: &dispatcher,
+                events: journal.context_events(),
+                actor: prompt.actor,
+                current_prompt: &prompt.text,
+            })
+            .await;
+            match result {
+                Ok(compaction) => {
+                    record(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        native_usage_event(&compaction.usage, None),
+                    )
+                    .await?;
+                    record(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        SessionEventKind::ProviderEvent {
+                            provider: launch.provider,
+                            kind: "context_compaction".to_string(),
+                            payload: serde_json::json!({
+                                "status": "completed",
+                                "summary": compaction.summary,
+                                "automatic": true,
+                                "trigger": "provider_input_size",
+                            }),
+                        },
+                    )
+                    .await?;
+                    journal.ensure_complete_context(session_id).await?;
+                    retained_context = retained_conversation_context(journal.context_events());
+                }
+                Err(error) => {
+                    // Compaction could not run; restore the oversized context so
+                    // the announced projection below still bounds the request.
+                    retained_context = Some(full_context);
+                    tracing::warn!(
+                        session_id = %session_id,
+                        %error,
+                        "automatic subscription replay compaction failed; using the projection backstop"
+                    );
+                    record(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        SessionEventKind::ProviderEvent {
+                            provider: launch.provider,
+                            kind: "context_compaction_failed".to_string(),
+                            payload: serde_json::json!({
+                                "automatic": true,
+                                "trigger": "provider_input_size",
+                                "error": format!("{error:#}"),
+                            }),
+                        },
+                    )
+                    .await?;
+                }
+            }
+        }
+
         if !native_provider
             && retained_context.as_deref().is_some_and(|context| {
                 subscription_context_needs_projection(
@@ -3670,8 +3780,9 @@ async fn run_agent_session_store_kernel(
                     };
                     let result = if interrupted && executor.uses_native_harness(launch.provider) {
                         // Cooperative turn cancellation does not stop session-owned processes.
-                        // Reap them before publishing the interrupted terminal boundary.
-                        executor.stop_session(session_id).await?;
+                        // Reap them before publishing the interrupted terminal boundary, but
+                        // never let an unresponsive process hold that boundary hostage.
+                        let _ = stop_session_bounded(&executor, session_id).await;
                         Ok(crate::AgentTurnResult {
                             provider_session_id: None,
                             final_text: String::new(),
@@ -4278,7 +4389,7 @@ async fn run_agent_session_store_kernel(
                     provider_fork_turn_id = None;
                     running.0.abort();
                     let _ = (&mut running.0).await;
-                    executor.stop_session(session_id).await?;
+                    let _ = stop_session_bounded(&executor, session_id).await;
                     deny_pending_approval(
                         &mut journal,
                         &events,
@@ -4574,7 +4685,11 @@ async fn run_agent_session_store_kernel(
                             output_schema,
                             delivery,
                             ..
-                        } if steers_active_provider_turn(launch.provider, delivery) => {
+                        } if steers_active_provider_turn(
+                            launch.provider,
+                            delivery,
+                            executor.uses_native_harness(launch.provider),
+                        ) => {
                             if prompt.message_id == message_id
                                 || prompt
                                     .batch
@@ -4798,7 +4913,10 @@ async fn run_agent_session_store_kernel(
                             }
                         }
                         HostCommand::FlushPendingInput { .. }
-                            if !provider_supports_active_turn_control(launch.provider) =>
+                            if !provider_supports_active_turn_control(
+                                launch.provider,
+                                executor.uses_native_harness(launch.provider),
+                            ) =>
                         {
                             if !pending.iter().any(|queued| queued.actor == EventActor::User) {
                                 continue;
@@ -4808,7 +4926,7 @@ async fn run_agent_session_store_kernel(
                             // without latching user-stop or pausing the goal.
                             running.0.abort();
                             let _ = (&mut running.0).await;
-                            executor.stop_session(session_id).await?;
+                            let _ = stop_session_bounded(&executor, session_id).await;
                             subscription_context_reusable = false;
                             provider_session_id = None;
                             provider_fork_turn_id = None;
@@ -4831,6 +4949,7 @@ async fn run_agent_session_store_kernel(
                         HostCommand::FlushPendingInput { .. } => {
                             flush_pending_input_into_active_turn(
                                 launch.provider,
+                                executor.uses_native_harness(launch.provider),
                                 &control_tx,
                                 &steer_result_tx,
                                 &mut pending,
@@ -4973,7 +5092,10 @@ async fn run_agent_session_store_kernel(
                                 .await?;
                                 stale_user_prompts.clear();
                                 if let Some(text) = steer
-                                    && provider_supports_active_turn_control(launch.provider)
+                                    && provider_supports_active_turn_control(
+                                        launch.provider,
+                                        executor.uses_native_harness(launch.provider),
+                                    )
                                 {
                                     let (ack, _result) = oneshot::channel();
                                     control_tx
@@ -5012,7 +5134,10 @@ async fn run_agent_session_store_kernel(
                         }
                         HostCommand::Interrupt { .. } if interrupted => {}
                         HostCommand::Interrupt { .. }
-                            if provider_supports_active_turn_control(launch.provider) =>
+                            if provider_supports_active_turn_control(
+                                launch.provider,
+                                executor.uses_native_harness(launch.provider),
+                            ) =>
                         {
                             pause_active_goal(
                                 &mut journal,
@@ -5094,7 +5219,7 @@ async fn run_agent_session_store_kernel(
                             retry_not_before = None;
                             running.0.abort();
                             let _ = (&mut running.0).await;
-                            executor.stop_session(session_id).await?;
+                            let _ = stop_session_bounded(&executor, session_id).await;
                             subscription_context_reusable = false;
                             provider_session_id = None;
                             provider_fork_turn_id = None;
@@ -5192,7 +5317,7 @@ async fn run_agent_session_store_kernel(
                             ).await?;
                             running.0.abort();
                             let _ = (&mut running.0).await;
-                            executor.stop_session(session_id).await?;
+                            let _ = stop_session_bounded(&executor, session_id).await;
                             deny_pending_approval(
                                 &mut journal,
                                 &events,
@@ -6139,11 +6264,19 @@ struct SubscriptionCompactionRequest<'a> {
     launch: &'a LaunchSession,
     agent_mcp_server: &'a borg_provider::mcp::ExternalMcpServer,
     dispatcher: &'a crate::AgentToolDispatcher,
-    context: &'a str,
+    events: &'a [SessionEvent],
     actor: EventActor,
     current_prompt: &'a str,
 }
 
+/// Compact an oversized subscription replay without omitting whole messages.
+///
+/// A long-lived journal can exceed the provider input budget many times over.
+/// Dropping whole messages to fit would be silent context loss, so the
+/// conversation is split at message boundaries and folded through the provider
+/// oldest-first: each pass updates a running summary with the next bounded
+/// chunk. Every message reaches the summarizer and every provider request stays
+/// inside the hard input budget.
 async fn compact_subscription_context_for_budget(
     request: SubscriptionCompactionRequest<'_>,
 ) -> Result<AgentCompaction> {
@@ -6153,31 +6286,82 @@ async fn compact_subscription_context_for_budget(
         launch,
         agent_mcp_server,
         dispatcher,
-        context,
+        events,
         actor,
         current_prompt,
     } = request;
-    let context_budget = subscription_compaction_context_budget(actor, current_prompt);
-    anyhow::ensure!(!context.is_empty(), "retained context is empty");
-    anyhow::ensure!(
-        context.chars().count() <= context_budget,
-        "semantic compaction projection remains {} characters after pruning (budget {})",
-        context.chars().count(),
-        context_budget
-    );
     anyhow::ensure!(
         subscription_prompt_chars(None, actor, current_prompt) <= SUBSCRIPTION_INPUT_BUDGET_CHARS,
         "current subscription prompt exceeds the {}-character provider input budget",
         SUBSCRIPTION_INPUT_BUDGET_CHARS
     );
+    // Reserve the fold wrapper and split the remainder between the running
+    // summary and the next chunk, so a fold prompt can never exceed the budget.
+    let fold_wrapper_chars = retained_fold_compaction_prompt("", "").chars().count();
+    let summary_budget = COMPACTION_RUNNING_SUMMARY_BUDGET_CHARS;
+    let chunk_budget = SUBSCRIPTION_INPUT_BUDGET_CHARS
+        .saturating_sub(fold_wrapper_chars)
+        .saturating_sub(summary_budget);
+    let conversation =
+        provider_neutral_conversation(events).context("there is no conversation to compact yet")?;
+    let chunks = compaction_context_chunks(&conversation, chunk_budget);
+    anyhow::ensure!(!chunks.is_empty(), "retained context is empty");
 
-    let prompt = retained_compaction_prompt(context);
+    let mut summary = String::new();
+    let mut usage = borg_provider::ProviderCallUsage::default();
+    let mut provider_session_id = None;
+    for chunk in &chunks {
+        let prompt = if summary.is_empty() {
+            retained_compaction_prompt(chunk)
+        } else {
+            retained_fold_compaction_prompt(&summary, chunk)
+        };
+        anyhow::ensure!(
+            prompt.chars().count() <= SUBSCRIPTION_INPUT_BUDGET_CHARS,
+            "subscription compaction prompt exceeds the {}-character provider input budget",
+            SUBSCRIPTION_INPUT_BUDGET_CHARS
+        );
+        let compaction = run_retained_compaction(
+            executor,
+            session_id,
+            launch,
+            agent_mcp_server,
+            dispatcher,
+            prompt,
+        )
+        .await?;
+        anyhow::ensure!(
+            !compaction.summary.trim().is_empty(),
+            "subscription context compaction returned an empty summary"
+        );
+        summary = truncate_compaction_context(&compaction.summary, summary_budget);
+        usage = compaction.usage;
+        provider_session_id = compaction.provider_session_id;
+    }
+
     anyhow::ensure!(
-        prompt.chars().count() <= SUBSCRIPTION_INPUT_BUDGET_CHARS,
-        "subscription compaction prompt exceeds the {}-character provider input budget",
+        subscription_prompt_chars(Some(&summary), actor, current_prompt)
+            <= SUBSCRIPTION_INPUT_BUDGET_CHARS,
+        "subscription context compaction summary exceeds the {}-character provider input budget",
         SUBSCRIPTION_INPUT_BUDGET_CHARS
     );
-    let compaction = executor
+    Ok(AgentCompaction {
+        summary,
+        usage,
+        provider_session_id,
+    })
+}
+
+/// Run one internal compaction provider turn and return its summary.
+async fn run_retained_compaction(
+    executor: &Arc<dyn AgentTurnExecutor>,
+    session_id: Uuid,
+    launch: &LaunchSession,
+    agent_mcp_server: &borg_provider::mcp::ExternalMcpServer,
+    dispatcher: &crate::AgentToolDispatcher,
+    prompt: String,
+) -> Result<AgentCompaction> {
+    executor
         .compact_retained_context(AgentTurn {
             session_id,
             message_id: Uuid::new_v4(),
@@ -6217,23 +6401,40 @@ async fn compact_subscription_context_for_budget(
                 &launch.capabilities.provider_capabilities,
             ),
         })
-        .await?;
-    anyhow::ensure!(
-        !compaction.summary.trim().is_empty(),
-        "subscription context compaction returned an empty summary"
-    );
-    let summary = truncate_compaction_context(&compaction.summary, context_budget);
-    anyhow::ensure!(
-        subscription_prompt_chars(Some(&summary), actor, current_prompt)
-            <= SUBSCRIPTION_INPUT_BUDGET_CHARS,
-        "subscription context compaction summary exceeds the {}-character provider input budget",
-        SUBSCRIPTION_INPUT_BUDGET_CHARS
-    );
-    Ok(AgentCompaction {
-        summary,
-        usage: compaction.usage,
-        provider_session_id: compaction.provider_session_id,
-    })
+        .await
+}
+
+/// Split a conversation into frame-aligned chunks that each render within
+/// `max_chars`, shrinking oversized individual messages first. No whole message
+/// is omitted; the caller folds every chunk through the provider.
+fn compaction_context_chunks(
+    conversation: &[borg_provider::provider::ModelMessage],
+    max_chars: usize,
+) -> Vec<String> {
+    let per_message = (max_chars / 4).max(1_024);
+    let mut projected = prune_conversation_for_compaction(conversation);
+    for message in &mut projected {
+        compact_message_for_budget(message, per_message);
+    }
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for message in &projected {
+        let frame = format_subscription_frame(&format_subscription_message(message));
+        let separator = usize::from(!current.is_empty());
+        if !current.is_empty()
+            && current.chars().count() + separator + frame.chars().count() > max_chars
+        {
+            chunks.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(&frame);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {
@@ -6246,14 +6447,6 @@ fn retained_compaction_context_with_budget(
 ) -> Option<CompactionProjection> {
     let conversation = provider_neutral_conversation(events)?;
     Some(fit_compaction_context(&conversation, max_chars))
-}
-
-fn subscription_compaction_context_budget(actor: EventActor, current_prompt: &str) -> usize {
-    let compaction_wrapper_chars = retained_compaction_prompt("").chars().count();
-    let replay_wrapper_chars = subscription_prompt_chars(None, actor, current_prompt);
-    SUBSCRIPTION_INPUT_BUDGET_CHARS
-        .saturating_sub(compaction_wrapper_chars)
-        .min(SUBSCRIPTION_INPUT_BUDGET_CHARS.saturating_sub(replay_wrapper_chars))
 }
 
 fn subscription_replay_context_budget(actor: EventActor, current_prompt: &str) -> usize {
@@ -6846,6 +7039,14 @@ fn format_subscription_frame(value: &Value) -> String {
 fn retained_compaction_prompt(context: &str) -> String {
     format!(
         "{COMPACTION_SUMMARY_PROMPT}\n\n<prior_provider_conversation>\n{context}\n</prior_provider_conversation>"
+    )
+}
+
+/// A fold pass for a history too long for one compaction call: update the
+/// running summary with the next chunk of provider conversation.
+fn retained_fold_compaction_prompt(previous_summary: &str, context: &str) -> String {
+    format!(
+        "{COMPACTION_SUMMARY_PROMPT}\n\n<prior_summary>\n{previous_summary}\n</prior_summary>\n\n<prior_provider_conversation>\n{context}\n</prior_provider_conversation>"
     )
 }
 
@@ -7548,13 +7749,22 @@ async fn collect_input_at_turn_boundary(
     Ok(interrupted)
 }
 
-fn provider_supports_active_turn_control(provider: CodingProvider) -> bool {
-    matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
-        || provider.uses_native_harness()
+/// Whether a provider turn can accept mid-turn control.
+///
+/// This is the executor's route decision, not the billing provider's: an
+/// `opencode-go` session runs Borg's native harness (and its steer channel)
+/// even though `CodingProvider::OpenCode` itself is not a native provider.
+fn provider_supports_active_turn_control(provider: CodingProvider, native_harness: bool) -> bool {
+    matches!(provider, CodingProvider::Codex | CodingProvider::Claude) || native_harness
 }
 
-fn steers_active_provider_turn(provider: CodingProvider, delivery: PromptDelivery) -> bool {
-    provider_supports_active_turn_control(provider) && delivery == PromptDelivery::Steer
+fn steers_active_provider_turn(
+    provider: CodingProvider,
+    delivery: PromptDelivery,
+    native_harness: bool,
+) -> bool {
+    provider_supports_active_turn_control(provider, native_harness)
+        && delivery == PromptDelivery::Steer
 }
 
 fn is_executor_lifecycle_status(kind: &SessionEventKind) -> bool {
@@ -7756,6 +7966,7 @@ async fn retry_pending_steers(
 #[allow(clippy::too_many_arguments)]
 async fn flush_pending_input_into_active_turn(
     provider: CodingProvider,
+    native_harness: bool,
     control_tx: &mpsc::Sender<AgentTurnControl>,
     steer_result_tx: &mpsc::Sender<(Uuid, std::result::Result<(), String>)>,
     pending: &mut VecDeque<QueuedPrompt>,
@@ -7764,7 +7975,7 @@ async fn flush_pending_input_into_active_turn(
     context_compaction_in_progress: bool,
     reply_prompt: bool,
 ) {
-    if !provider_supports_active_turn_control(provider) {
+    if !provider_supports_active_turn_control(provider, native_harness) {
         return;
     }
 

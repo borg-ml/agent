@@ -1202,6 +1202,17 @@ fn model_and_effort_pickers_use_the_provider_catalog() {
             .map(|(model, _)| *model)
             .collect::<Vec<_>>()[..]
     );
+    // Fixed destinations read Codex, Claude, OpenCode Go, then open-ended
+    // OpenRouter; OpenCode Go must not trail the OpenRouter list.
+    let go = options
+        .iter()
+        .position(|option| option.section.as_deref() == Some("OpenCode Go"))
+        .expect("OpenCode Go section");
+    let openrouter = options
+        .iter()
+        .position(|option| option.section.as_deref() == Some("OpenRouter"))
+        .expect("OpenRouter section");
+    assert!(go < openrouter, "OpenCode Go must precede OpenRouter");
     assert_eq!(
         effort_picker_options(Some(CodingProvider::Codex)),
         catalog.effort_levels

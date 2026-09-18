@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -834,6 +835,33 @@ async fn upload_event_page(
     Ok(EventUploadOutcome::Complete)
 }
 
+/// Live-state batches the relay rejected outright, skipped to keep the stream
+/// moving. Surfaced on every skip so a wedged stream is visible in the log
+/// instead of silently stalling behind an unadvanceable cursor.
+static SKIPPED_LIVE_STATE_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+/// Is this status a permanent, client-side rejection of the batch itself?
+///
+/// A 4xx other than 408/429 means the relay understood the request and refused
+/// it: replaying the identical bytes can only produce the identical refusal.
+/// 5xx, 408, 429 and transport errors stay retryable - those are the relay or
+/// the network being temporarily unhappy, not the payload being wrong.
+fn is_permanent_live_state_rejection(status: StatusCode) -> bool {
+    status.is_client_error()
+        && status != StatusCode::REQUEST_TIMEOUT
+        && status != StatusCode::TOO_MANY_REQUESTS
+}
+
+fn live_event_kind(event: &SessionLiveEvent) -> String {
+    serde_json::to_value(&event.event.kind)
+        .ok()
+        .as_ref()
+        .and_then(|kind| kind.get("type"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 async fn upload_live_state(
     client: &Client,
     config: &HostConfig,
@@ -847,38 +875,110 @@ async fn upload_live_state(
     if live.is_empty() {
         return Ok(true);
     }
-    let response = client
-        .post(endpoint(&config.server, "/api/remote/host/live-state"))
-        .bearer_auth(&config.host_token)
-        .json(&LiveStateBatch {
-            session_id,
-            events: &live,
-        })
-        .send()
-        .await;
-    match response {
-        Ok(response) if response.status().is_success() => {
-            *uploaded_revision = live
-                .last()
-                .map_or(*uploaded_revision, |event| event.revision);
-            Ok(true)
-        }
-        Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
-            Err(response.error_for_status().unwrap_err())
-                .context("remote host token was rejected; enroll this host again")
-        }
-        Ok(response) => {
-            tracing::warn!(
-                status = %response.status(),
-                "remote live-state upload failed; retained for replay"
-            );
-            Ok(false)
-        }
-        Err(error) => {
-            tracing::warn!(%error, "remote live-state upload failed; retained for replay");
-            Ok(false)
+    // Walk the batch as a work queue so a permanent rejection can be bisected
+    // down to the single offending event instead of discarding everything the
+    // relay would have accepted. Ranges stay in revision order, so the cursor
+    // only ever moves forward.
+    let mut ranges: VecDeque<Range<usize>> = VecDeque::new();
+    ranges.push_back(0..live.len());
+    while let Some(range) = ranges.pop_front() {
+        let batch = &live[range.clone()];
+        let response = client
+            .post(endpoint(&config.server, "/api/remote/host/live-state"))
+            .bearer_auth(&config.host_token)
+            .json(&LiveStateBatch {
+                session_id,
+                events: batch,
+            })
+            .send()
+            .await;
+        match response {
+            Ok(response) if response.status().is_success() => {
+                if let Some(last) = batch.last() {
+                    *uploaded_revision = last.revision;
+                }
+            }
+            Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
+                return Err(response.error_for_status().unwrap_err())
+                    .context("remote host token was rejected; enroll this host again");
+            }
+            Ok(response)
+                if is_permanent_live_state_rejection(response.status()) && batch.len() > 1 =>
+            {
+                // Bisect in order: the left half is retried first so the cursor
+                // keeps advancing over the events the relay does accept.
+                let middle = range.start + range.len() / 2;
+                tracing::debug!(
+                    status = %response.status(),
+                    %session_id,
+                    first_revision = batch[0].revision,
+                    last_revision = batch[batch.len() - 1].revision,
+                    events = batch.len(),
+                    "remote relay rejected a live-state batch; bisecting to isolate the event"
+                );
+                ranges.push_front(middle..range.end);
+                ranges.push_front(range.start..middle);
+            }
+            Ok(response) if is_permanent_live_state_rejection(response.status()) => {
+                // One irreducible event the relay will never accept. Skip it so
+                // the live stream cannot wedge forever on a poison batch, and
+                // log the response body - a bare status is what let thousands of
+                // these failures go undiagnosed.
+                let status = response.status();
+                let event_kind = live_event_kind(&batch[0]);
+                let detail = response
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(512)
+                    .collect::<String>();
+                let skipped = SKIPPED_LIVE_STATE_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+                tracing::warn!(
+                    %status,
+                    %detail,
+                    %session_id,
+                    revision = batch[0].revision,
+                    %event_kind,
+                    skipped_live_state_events = skipped,
+                    "remote relay permanently rejected a live-state event; skipping it to keep the live stream moving"
+                );
+                *uploaded_revision = batch[0].revision;
+            }
+            Ok(response) => {
+                let status = response.status();
+                let detail = response
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .chars()
+                    .take(512)
+                    .collect::<String>();
+                tracing::warn!(
+                    %status,
+                    %detail,
+                    %session_id,
+                    first_revision = batch[0].revision,
+                    last_revision = batch[batch.len() - 1].revision,
+                    events = batch.len(),
+                    "remote live-state upload failed; retained for replay"
+                );
+                return Ok(false);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    %session_id,
+                    first_revision = batch[0].revision,
+                    last_revision = batch[batch.len() - 1].revision,
+                    events = batch.len(),
+                    "remote live-state upload failed; retained for replay"
+                );
+                return Ok(false);
+            }
         }
     }
+    Ok(true)
 }
 
 pub async fn enroll_host(
@@ -7733,6 +7833,200 @@ mod tests {
             server.await.unwrap(),
             vec![vec![1, 2, 3, 4], vec![1, 2], vec![3, 4]]
         );
+    }
+
+    /// Serve `statuses` in order on /api/remote/host/live-state, recording the
+    /// revisions each request carried.
+    async fn live_state_server(
+        statuses: Vec<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<Vec<Vec<u64>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut delivered = Vec::new();
+            for status in statuses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (_, request) = read_http_request(&mut stream).await;
+                let body: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                delivered.push(
+                    body["events"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|event| event["revision"].as_u64().unwrap())
+                        .collect::<Vec<_>>(),
+                );
+                let payload = r#"{"error":"unknown variant `auto`"}"#;
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                            payload.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            delivered
+        });
+        (format!("http://{address}"), server)
+    }
+
+    /// Seed `count` distinct live-state rows. Live state is only written for
+    /// coalesced events on a running session, so the session is moved to
+    /// Running first and each row gets its own `tool_call_id` live key.
+    async fn seed_live_events(
+        config: &HostConfig,
+        store: &SqliteSessionStore,
+        root: &Path,
+        session_id: Uuid,
+        count: usize,
+    ) {
+        store.create_session(session_id).await.unwrap();
+        let launch = bootstrap_test_launch(root);
+        persist_launch_metadata(config, store, session_id, &launch, None)
+            .await
+            .unwrap();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                1,
+                crate::SessionEventKind::StatusChanged {
+                    status: crate::SessionStatus::Running,
+                    detail: None,
+                },
+            ))
+            .await
+            .unwrap();
+        for index in 0..count {
+            store
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    crate::SessionEventKind::ProviderEvent {
+                        provider: launch.provider,
+                        kind: "action/generation_status".to_string(),
+                        payload: serde_json::json!({"tool_call_id": format!("call-{index}")}),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.live_events_after(session_id, 0).await.unwrap().len(),
+            count,
+            "the fixture must actually produce live state"
+        );
+    }
+
+    /// A 400 is a permanent rejection of the batch. It must bisect down to the
+    /// offending event and then advance the cursor past it, so one poison event
+    /// cannot wedge the session's live stream forever.
+    #[tokio::test]
+    async fn permanent_live_state_rejection_advances_the_cursor_instead_of_wedging() {
+        let (server_url, server) = live_state_server(vec![
+            "400 Bad Request",
+            "400 Bad Request",
+            "400 Bad Request",
+        ])
+        .await;
+        let root = tempdir().unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let session_id = Uuid::new_v4();
+        let config = HostConfig {
+            server: server_url,
+            ..test_config(root.path())
+        };
+        seed_live_events(&config, &store, root.path(), session_id, 2).await;
+        let mut uploaded_revision = 0;
+
+        let progressed = upload_live_state(
+            &Client::new(),
+            &config,
+            &store,
+            session_id,
+            &mut uploaded_revision,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            progressed,
+            "a permanently rejected batch must not ask the caller to retry it"
+        );
+        let delivered = server.await.unwrap();
+        assert_eq!(
+            delivered.len(),
+            3,
+            "the rejected pair is bisected into two singletons: {delivered:?}"
+        );
+        assert_eq!(delivered[0].len(), 2, "the whole batch is tried first");
+        let last = *delivered[0].last().unwrap();
+        assert_eq!(
+            uploaded_revision, last,
+            "the cursor moves past every skipped event so the stream cannot wedge"
+        );
+        assert!(
+            store
+                .live_events_after(session_id, uploaded_revision)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no live event is left behind the cursor to be retried forever"
+        );
+    }
+
+    /// 5xx, 408, 429 stay retryable: the payload is fine, the relay is not.
+    #[tokio::test]
+    async fn transient_live_state_rejection_is_retried_without_advancing() {
+        let (server_url, server) = live_state_server(vec!["503 Service Unavailable"]).await;
+        let root = tempdir().unwrap();
+        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            .await
+            .unwrap();
+        let session_id = Uuid::new_v4();
+        let config = HostConfig {
+            server: server_url,
+            ..test_config(root.path())
+        };
+        seed_live_events(&config, &store, root.path(), session_id, 2).await;
+        let mut uploaded_revision = 0;
+
+        let progressed = upload_live_state(
+            &Client::new(),
+            &config,
+            &store,
+            session_id,
+            &mut uploaded_revision,
+        )
+        .await
+        .unwrap();
+
+        assert!(!progressed, "a 5xx must be retried");
+        assert_eq!(
+            uploaded_revision, 0,
+            "a transient failure must not drop live state"
+        );
+        assert_eq!(server.await.unwrap().len(), 1, "no bisection on a 5xx");
+    }
+
+    #[test]
+    fn live_state_rejection_classification_matches_retry_policy() {
+        for status in [StatusCode::BAD_REQUEST, StatusCode::UNPROCESSABLE_ENTITY] {
+            assert!(is_permanent_live_state_rejection(status), "{status}");
+        }
+        for status in [
+            StatusCode::REQUEST_TIMEOUT,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(!is_permanent_live_state_rejection(status), "{status}");
+        }
     }
 
     #[tokio::test]

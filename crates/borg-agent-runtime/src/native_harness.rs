@@ -44,6 +44,11 @@ const MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 /// message and asks the model to resume, instead of discarding the turn.
 const MAX_LENGTH_CONTINUATIONS: usize = 2;
 const LENGTH_CONTINUATION_PROMPT: &str = "Your previous reply was cut off at the output-token limit. Continue exactly where it stopped, without repeating what was already written.";
+/// How long a running command gets to observe an interrupt's cancel signal
+/// before the turn is abandoned. The cancel token is the real kill switch and
+/// session teardown reaps anything that lingers, so this only bounds how long
+/// Escape can feel unresponsive.
+const INTERRUPT_TOOL_CANCEL_DRAIN: Duration = Duration::from_millis(300);
 #[derive(Clone)]
 pub(crate) struct NativeHarness {
     model_client: Arc<dyn NativeModelClient>,
@@ -1968,7 +1973,11 @@ async fn await_tool_with_controls(
                     if let Some(cancel) = &call_cancel {
                         cancel.cancel();
                     }
-                    let _ = tokio::time::timeout(Duration::from_secs(2), &mut call).await;
+                    // The cancel token is the real kill signal; wait only
+                    // briefly for the command to observe it. Session teardown
+                    // reaps anything still running, so a long wait here would
+                    // only make Escape feel slow.
+                    let _ = tokio::time::timeout(INTERRUPT_TOOL_CANCEL_DRAIN, &mut call).await;
                     bail!("native provider turn interrupted")
                 }
                 Some(AgentTurnControl::Steer {

@@ -364,6 +364,36 @@ fn write_local_session_owner_metadata(sessions_dir: &Path, session_id: Uuid) -> 
     Ok(())
 }
 
+/// Whether a session's control socket currently has a listener.
+///
+/// A `<session>.control.sock` file outlives the process that created it, so
+/// its mere existence reports long-dead sessions as reachable. Connecting is
+/// the only honest test: a stale path refuses immediately, and this is the
+/// same thing `send_local_session_command` learns when it dispatches, so
+/// discovery and delivery agree instead of contradicting each other.
+///
+/// The owner process being alive is NOT sufficient either — a running owner
+/// that has stopped serving its socket still refuses connections.
+#[cfg(unix)]
+pub async fn session_control_socket_is_reachable(socket_path: &Path) -> bool {
+    use tokio::net::UnixStream;
+
+    // Bounded so one unresponsive peer cannot stall a whole listing.
+    matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            UnixStream::connect(socket_path),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+#[cfg(not(unix))]
+pub async fn session_control_socket_is_reachable(_socket_path: &Path) -> bool {
+    false
+}
+
 /// Send one typed command to the process holding a session's writer lease.
 #[cfg(unix)]
 pub async fn send_local_session_command(
@@ -1024,6 +1054,44 @@ mod tests {
 
     const MAX_UNIX_SOCKET_TEMP_ROOT_LENGTH: usize = 32;
 
+    #[tokio::test]
+    async fn reachability_distinguishes_a_stale_socket_file_from_a_served_one() {
+        // A <session>.control.sock file outlives the process that made it.
+        // Discovery used to report mere existence as liveness, so a dead
+        // session stayed "live" forever while every send to it fell back to
+        // queued_offline.
+        let directory = short_socket_tempdir();
+        let path = directory.path().join("probe.sock");
+
+        assert!(
+            !session_control_socket_is_reachable(&path).await,
+            "a missing socket is not reachable"
+        );
+
+        // A plain file at the socket path is the stale-entry case.
+        std::fs::write(&path, b"stale").unwrap();
+        assert!(
+            !session_control_socket_is_reachable(&path).await,
+            "a leftover file with no listener must not read as reachable"
+        );
+        std::fs::remove_file(&path).unwrap();
+
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        assert!(
+            session_control_socket_is_reachable(&path).await,
+            "a bound socket with a listener is reachable"
+        );
+
+        // Dropping the listener leaves the path behind: this is exactly the
+        // state that used to be misreported as live.
+        drop(listener);
+        assert!(path.exists(), "the socket path outlives its listener");
+        assert!(
+            !session_control_socket_is_reachable(&path).await,
+            "an abandoned socket path must read as unreachable"
+        );
+    }
+
     fn short_socket_tempdir() -> tempfile::TempDir {
         let temp_root = std::env::var_os("TMPDIR")
             .map(PathBuf::from)
@@ -1443,6 +1511,47 @@ mod tests {
             .expect("attachment should notice released ownership")
             .expect("attachment task should not panic")
             .expect("owner loss is a clean detach");
+    }
+
+    #[tokio::test]
+    async fn reachability_separates_a_stale_socket_file_from_a_served_one() {
+        // list_instances used to report liveness from the socket PATH alone.
+        // A control socket file outlives the process that bound it, so every
+        // dead session stayed "live" forever while send_message - which
+        // actually connects - quietly downgraded those peers to
+        // queued_offline. Discovery and delivery must agree.
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let socket_path = session_control_socket_path(root.path(), session_id);
+
+        assert!(
+            !session_control_socket_is_reachable(&socket_path).await,
+            "a session that never existed is not reachable"
+        );
+
+        // Bind then drop: the file remains, the listener does not. This is
+        // exactly what a crashed or exited session leaves behind.
+        let stale = tokio::net::UnixListener::bind(&socket_path).unwrap();
+        drop(stale);
+        assert!(socket_path.exists(), "the stale socket file survives");
+        assert!(
+            !session_control_socket_is_reachable(&socket_path).await,
+            "an existing socket file with no listener must not read as live"
+        );
+
+        let lock_path = root.path().join(format!("{session_id}.lock"));
+        let writer = SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .unwrap();
+        let (owner_tx, _owner_rx) = mpsc::channel(1);
+        let server =
+            LocalSessionControlServer::start(socket_path.clone(), session_id, &writer, owner_tx)
+                .unwrap();
+        assert!(
+            session_control_socket_is_reachable(&socket_path).await,
+            "a served socket is reachable"
+        );
+        drop(server);
     }
 
     #[tokio::test]

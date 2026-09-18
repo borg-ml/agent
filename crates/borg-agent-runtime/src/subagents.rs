@@ -2910,7 +2910,25 @@ impl SubagentCoordinator {
                 )
                 .await?
         };
-        let text = attributed_team_message(actor, actor, message);
+        // The sender's task name ("/root", "/root/worker") only means
+        // something inside the sender's own process: every session resolves
+        // "/root" to ITSELF. Telling a peer in another process to reply to
+        // "/root" therefore addresses the recipient back to itself, which
+        // fails as "message recipient must differ from its author" - or, for
+        // a peer on a different frontend, is simply not a reachable name.
+        // Local subagents share this table, so the task name still works for
+        // them; anyone else is given the participant address instead.
+        let recipient_is_local_task = {
+            let table = self.table.lock().await;
+            recipient_session_id == table.root_session_id
+                || table.entries.contains_key(&recipient_session_id)
+        };
+        let reply_target = if recipient_is_local_task {
+            actor.to_string()
+        } else {
+            format!("participant:{}", actor_binding.participant_id)
+        };
+        let text = attributed_team_message(actor, &reply_target, message);
         let idempotency_id = Uuid::new_v4();
         let receipt = workspace_store
             .append_message(NewWorkspaceMessage {
@@ -5117,12 +5135,29 @@ impl SubagentCoordinator {
                     if !local {
                         newest_seen = newest_seen.max(instance.seen_at);
                     }
-                    let live = local
-                        && tokio::fs::try_exists(crate::session_control_socket_path(
+                    // Liveness is a connect test, not a file test. A stale
+                    // <session>.control.sock outlives its process, so
+                    // try_exists reported dead sessions as live and discovery
+                    // disagreed with delivery: send_message connects, and
+                    // silently fell back to queued_offline for peers this
+                    // listing had just advertised as live.
+                    //
+                    // owner_running is reported separately because the two
+                    // genuinely differ. An owner process can still be alive
+                    // while no longer serving its socket, and that peer is
+                    // discoverable but unreachable - which is the state worth
+                    // seeing rather than collapsing into either answer.
+                    let socket_path = crate::session_control_socket_path(
+                        &self.journal_root,
+                        instance.participant.id,
+                    );
+                    let live =
+                        local && crate::session_control_socket_is_reachable(&socket_path).await;
+                    let owner_running = local
+                        && crate::local_session_owner_is_active(
                             &self.journal_root,
                             instance.participant.id,
-                        ))
-                        .await
+                        )
                         .unwrap_or(false);
                     let workspace_name = match instance.workspace_id {
                         Some(workspace_id) => workspace_store.workspace_name(workspace_id).await?,
@@ -5132,6 +5167,7 @@ impl SubagentCoordinator {
                     let mut entry = serde_json::to_value(instance)?;
                     entry["local"] = json!(local);
                     entry["live"] = json!(live);
+                    entry["owner_running"] = json!(owner_running);
                     entry["workspace_name"] = json!(workspace_name);
                     instances.push((local, seen_at, entry));
                 }
