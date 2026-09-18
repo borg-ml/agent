@@ -11,11 +11,12 @@ use crate::runtime::elapsed_millis_u64;
 
 use super::{
     ChatCompletionResponseFormat, ModelMessage, ModelToolCall, ModelTurnRequest, ModelTurnResult,
-    Provider, ProviderAttemptTrace, ProviderCallError, ProviderCallResult, ProviderInvocation,
-    ProviderProgress, StreamedToolAction, StructuredOutputDialect, apply_provider_request_timeout,
-    chat_completion_response_format, extract_chat_completions_usage, nonempty_env,
-    parse_chat_completion_json_text, provider_cost_usd_to_microusd,
-    read_provider_error_response_text, read_provider_success_response_text, truncate_provider_text,
+    Provider, ProviderAttemptTrace, ProviderCallError, ProviderCallResult, ProviderErrorKind,
+    ProviderInvocation, ProviderProgress, StreamedToolAction, StructuredOutputDialect,
+    apply_provider_request_timeout, chat_completion_response_format,
+    extract_chat_completions_usage, nonempty_env, parse_chat_completion_json_text,
+    provider_cost_usd_to_microusd, read_provider_error_response_text,
+    read_provider_success_response_text, truncate_provider_text,
 };
 
 const COMPATIBLE_STREAM_MAX_BYTES: usize = 128 * 1024 * 1024;
@@ -235,6 +236,7 @@ impl OpenAiCompatibleProvider {
                 message: "fast mode is not supported by this compatible model route".to_string(),
                 trace: Box::new(trace),
                 session_id: None,
+                kind: ProviderErrorKind::Unknown,
             });
         }
         let api_key = gateway
@@ -263,6 +265,7 @@ impl OpenAiCompatibleProvider {
                 },
                 trace: Box::new(trace),
                 session_id: None,
+                kind: ProviderErrorKind::Unknown,
             });
         }
         let request_id = request.request_id.clone();
@@ -335,6 +338,7 @@ impl OpenAiCompatibleProvider {
                         message,
                         trace: Box::new(trace.clone()),
                         session_id: None,
+                        kind: ProviderErrorKind::Unknown,
                     })?
                 {
                     let body_object = body.as_object_mut().expect("request body is an object");
@@ -473,6 +477,7 @@ impl OpenAiCompatibleProvider {
                         message: format!("{provider_label} request failed: {error}"),
                         trace: Box::new(trace),
                         session_id: None,
+                        kind: ProviderErrorKind::from_transport(&error),
                     });
                 }
             }
@@ -493,6 +498,7 @@ impl OpenAiCompatibleProvider {
                 ),
                 trace: Box::new(trace),
                 session_id: None,
+                kind: ProviderErrorKind::Unknown,
             });
         }
 
@@ -504,9 +510,13 @@ impl OpenAiCompatibleProvider {
         )
         .await
         .map_err(|error| ProviderCallError {
-            message: format!("{provider_label} streaming response failed: {error}"),
+            message: format!(
+                "{provider_label} streaming response failed: {}",
+                error.message
+            ),
             trace: Box::new(trace.clone()),
             session_id: None,
+            kind: error.kind,
         })?;
         trace.stdout = streamed.raw.to_string();
         trace.exit_status = Some(0);
@@ -618,6 +628,7 @@ impl OpenAiCompatibleProvider {
                 message: error,
                 trace: Box::new(trace.clone()),
                 session_id: None,
+                kind: ProviderErrorKind::Unknown,
             })?
         {
             merge_object(&mut body, extra_body);
@@ -640,6 +651,7 @@ impl OpenAiCompatibleProvider {
                     message: format!("OpenAI-compatible request failed: {error}"),
                     trace: Box::new(trace.clone()),
                     session_id: None,
+                    kind: ProviderErrorKind::from_transport(&error),
                 }
             })?;
         trace.invocation.args.push("attempts=1".to_string());
@@ -655,6 +667,7 @@ impl OpenAiCompatibleProvider {
                         message: format!("OpenAI-compatible response read failed: {error}"),
                         trace: Box::new(trace),
                         session_id: None,
+                        kind: ProviderErrorKind::Unknown,
                     });
                 }
             }
@@ -668,6 +681,7 @@ impl OpenAiCompatibleProvider {
                         message: format!("OpenAI-compatible error response read failed: {error}"),
                         trace: Box::new(trace),
                         session_id: None,
+                        kind: ProviderErrorKind::Unknown,
                     });
                 }
             }
@@ -684,6 +698,7 @@ impl OpenAiCompatibleProvider {
                 ),
                 trace: Box::new(trace),
                 session_id: None,
+                kind: ProviderErrorKind::Unknown,
             });
         }
 
@@ -695,6 +710,7 @@ impl OpenAiCompatibleProvider {
                     message: format!("OpenAI-compatible endpoint returned invalid JSON: {error}"),
                     trace: Box::new(trace),
                     session_id: None,
+                    kind: ProviderErrorKind::Unknown,
                 });
             }
         };
@@ -1091,12 +1107,47 @@ fn reasoning_detail_text(detail: &Value) -> Option<String> {
     }
 }
 
+/// A streaming-read failure that remembers whether the transport died.
+///
+/// The body of a streaming response can stop mid-frame, which is a lost
+/// connection and worth retrying — but it reads as a parse failure once it has
+/// been turned into a bare string. Keeping the kind here is what stops a
+/// truncated stream from being billed as a failed turn.
+#[derive(Debug)]
+struct CompatibleStreamError {
+    kind: ProviderErrorKind,
+    message: String,
+}
+
+impl std::fmt::Display for CompatibleStreamError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl From<String> for CompatibleStreamError {
+    /// Content-level problems (bad UTF-8, malformed SSE JSON) carry no
+    /// transport signal, so they stay `Unknown` and fall back to prose.
+    fn from(message: String) -> Self {
+        Self {
+            kind: ProviderErrorKind::Unknown,
+            message,
+        }
+    }
+}
+
+impl From<&str> for CompatibleStreamError {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_string())
+    }
+}
+
 async fn read_compatible_model_stream(
     response: reqwest::Response,
     progress: Option<&UnboundedSender<ProviderProgress>>,
     model: &str,
     effort: Option<&str>,
-) -> Result<CompatibleModelStream, String> {
+) -> Result<CompatibleModelStream, CompatibleStreamError> {
     let mut stream = response.bytes_stream();
     let mut pending = Vec::new();
     let mut total_bytes = 0_usize;
@@ -1112,12 +1163,16 @@ async fn read_compatible_model_stream(
     let mut saw_done = false;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| error.to_string())?;
+        let chunk = chunk.map_err(|error| CompatibleStreamError {
+            kind: ProviderErrorKind::from_transport(&error),
+            message: error.to_string(),
+        })?;
         total_bytes = total_bytes.saturating_add(chunk.len());
         if total_bytes > COMPATIBLE_STREAM_MAX_BYTES {
             return Err(format!(
                 "stream exceeded the {COMPATIBLE_STREAM_MAX_BYTES} byte response limit"
-            ));
+            )
+            .into());
         }
         pending.extend_from_slice(&chunk);
         let mut consumed = 0_usize;
@@ -1290,11 +1345,14 @@ async fn read_compatible_model_stream(
         }
         .to_string(),
         (None, false) => {
-            return Err(format!(
-                "stream ended before a finish_reason or data: [DONE] marker ({} content characters and {} tool calls received)",
-                content.chars().count(),
-                tool_calls.len()
-            ));
+            return Err(CompatibleStreamError {
+                kind: ProviderErrorKind::ConnectionLost,
+                message: format!(
+                    "stream ended before a finish_reason or data: [DONE] marker ({} content characters and {} tool calls received)",
+                    content.chars().count(),
+                    tool_calls.len()
+                ),
+            });
         }
     };
     let tool_calls = tool_calls
@@ -1315,10 +1373,9 @@ async fn read_compatible_model_stream(
     let mut tool_call_ids = HashSet::with_capacity(tool_calls.len());
     for tool_call in &tool_calls {
         if !tool_call_ids.insert(tool_call.id.as_str()) {
-            return Err(format!(
-                "stream returned duplicate tool call id `{}`",
-                tool_call.id
-            ));
+            return Err(
+                format!("stream returned duplicate tool call id `{}`", tool_call.id).into(),
+            );
         }
     }
     let message = ModelMessage::assistant(
@@ -2038,7 +2095,11 @@ mod tests {
         let Err(error) = error else {
             panic!("a stream with neither marker is truncated");
         };
-        assert!(error.contains("4 content characters"), "{error}");
+        assert!(error.message.contains("4 content characters"), "{error}");
+        // A stream that stops before its terminator is a lost connection, and
+        // must say so in its type rather than relying on the wording happening
+        // to match a pattern downstream.
+        assert_eq!(error.kind, ProviderErrorKind::ConnectionLost);
     }
 
     #[tokio::test]

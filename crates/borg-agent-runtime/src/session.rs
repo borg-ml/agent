@@ -1549,19 +1549,20 @@ async fn run_agent_session_store_kernel(
 ) -> Result<()> {
     // Every session entry point funnels here, so this is the one place the
     // live-delivery budget needs installing for the actor task.
-    with_live_delivery_budget(Box::pin(run_agent_session_store_kernel_inner(
-        session_root,
-        session_id,
-        launch,
-        commands,
-        events,
-        executor,
-        store,
-        lsp_policy,
-        shared_team,
-        initial_peers,
-    )))
-    .await
+    let kernel: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> =
+        Box::pin(run_agent_session_store_kernel_inner(
+            session_root,
+            session_id,
+            launch,
+            commands,
+            events,
+            executor,
+            store,
+            lsp_policy,
+            shared_team,
+            initial_peers,
+        ));
+    with_live_delivery_budget(kernel).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9733,7 +9734,13 @@ fn mark_live_delivery_lagging() {
 }
 
 /// Run the session actor with live-delivery budgeting installed.
-pub(crate) async fn with_live_delivery_budget<F: std::future::Future>(future: F) -> F::Output {
+///
+/// Takes an erased future on purpose: the session kernel's future is already
+/// deep enough that wrapping its concrete type here pushes auto-trait
+/// resolution past the recursion limit in downstream crates.
+pub(crate) async fn with_live_delivery_budget(
+    future: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>,
+) -> Result<()> {
     LIVE_DELIVERY_LAGGING
         .scope(std::cell::Cell::new(false), future)
         .await

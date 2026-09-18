@@ -437,6 +437,13 @@ pub fn classify_provider_error(error: &anyhow::Error) -> ProviderErrorKind {
         if let Some(typed) = cause.downcast_ref::<ProviderStreamError>() {
             return typed.kind;
         }
+        // The native path fails with this instead, and it flattens its cause
+        // into a string, so its recorded kind is the only signal left.
+        if let Some(typed) = cause.downcast_ref::<super::ProviderCallError>()
+            && typed.kind != ProviderErrorKind::Unknown
+        {
+            return typed.kind;
+        }
         if let Some(transport) = cause.downcast_ref::<reqwest::Error>() {
             let kind = ProviderErrorKind::from_transport(transport);
             if kind != ProviderErrorKind::Unknown {

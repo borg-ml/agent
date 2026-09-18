@@ -461,6 +461,9 @@ impl CodexModelProvider {
                     message,
                     trace: Box::new(trace),
                     session_id: None,
+                    // The subscription call fails through anyhow, so the
+                    // transport cause is still reachable in its chain.
+                    kind: crate::provider::classify_provider_error(&error),
                 })
             }
         }

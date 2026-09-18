@@ -12170,10 +12170,7 @@ async fn interrupt_is_honoured_while_a_stalled_observer_backs_up_the_event_strea
         .expect("interrupt must cancel the turn")
         .duration_since(requested_at);
 
-    command_tx
-        .send(HostCommand::Stop { session_id })
-        .await
-        .ok();
+    command_tx.send(HostCommand::Stop { session_id }).await.ok();
     let _ = tokio::time::timeout(Duration::from_secs(10), actor).await;
 
     assert!(
@@ -12326,6 +12323,22 @@ fn a_typed_transport_failure_is_retried_whatever_its_wording() {
     assert!(
         !turn_error_is_connection_lost(&fatal, &format!("{fatal:#}")),
         "a typed fatal error must not be retried because its text looks transient",
+    );
+
+    // The native path (Codex subscription, OpenRouter, Kimi, GLM,
+    // OpenAI-compatible) fails with ProviderCallError, which flattens its cause
+    // into a string. Its recorded kind is therefore the only signal left, and
+    // it has to survive the trip to this decision.
+    let native = anyhow::Error::new(borg_provider::provider::ProviderCallError {
+        message: opaque.to_string(),
+        trace: Default::default(),
+        session_id: None,
+        kind: ProviderErrorKind::ConnectionLost,
+    })
+    .context("native provider turn failed");
+    assert!(
+        turn_error_is_connection_lost(&native, &format!("{native:#}")),
+        "a native transport failure must be retried even when its text says nothing",
     );
 
     // With no typed cause, prose matching still decides.

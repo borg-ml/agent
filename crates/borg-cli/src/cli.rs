@@ -556,9 +556,7 @@ pub(crate) const DEFAULT_PROVIDER_PREFERENCE: [RemoteProviderArg; 7] = [
 /// Picking a connected provider here is what keeps Borg from asking for a
 /// ChatGPT sign-in merely because Codex is first in the catalog.
 pub(crate) fn default_provider() -> RemoteProviderArg {
-    default_provider_with(|candidate| {
-        borg_remote::provider_credentials_present(candidate.into())
-    })
+    default_provider_with(|candidate| borg_remote::provider_credentials_present(candidate.into()))
 }
 
 fn default_provider_with(

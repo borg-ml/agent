@@ -862,7 +862,7 @@ impl NativeHarness {
                 None,
             )
             .await
-            .map_err(|error| anyhow::anyhow!(error.message))?;
+            .map_err(anyhow::Error::new)?;
         let ModelMessage::Assistant {
             content,
             tool_calls,
@@ -943,7 +943,7 @@ Return only the internal continuation checkpoint.",
                 None,
             )
             .await
-            .map_err(|error| anyhow::anyhow!(error.message))?;
+            .map_err(anyhow::Error::new)?;
         let ModelMessage::Assistant {
             content,
             tool_calls,
@@ -1075,6 +1075,8 @@ impl NativeModelClient for ProviderModelClient {
                         stderr: "invalid native provider".to_string(),
                     }),
                     session_id: None,
+                    // A misconfigured route will not fix itself on a retry.
+                    kind: borg_provider::provider::ProviderErrorKind::Fatal,
                 });
             }
         };
@@ -1440,7 +1442,7 @@ async fn call_model_streaming(
                 completed = Some(result
                     .map(Box::new)
                     .map(NativeModelOutcome::Completed)
-                    .map_err(|error| anyhow::anyhow!(error.message)));
+                    .map_err(anyhow::Error::new));
             }
             () = tokio::time::sleep(pending_text_flush.unwrap_or_default()),
                 if pending_text_flush.is_some() =>
@@ -2103,7 +2105,7 @@ async fn review_tool_automatically(
         }
     }
     .context("automatic approval review timed out")?
-    .map_err(|error| anyhow::anyhow!(error.message))?;
+    .map_err(anyhow::Error::new)?;
     let ModelMessage::Assistant {
         content,
         tool_calls,

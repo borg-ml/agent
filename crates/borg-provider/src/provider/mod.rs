@@ -421,6 +421,14 @@ pub struct ProviderCallError {
     pub message: String,
     pub trace: Box<ProviderAttemptTrace>,
     pub session_id: Option<String>,
+    /// Why the call failed, decided while the transport error was still in
+    /// hand.
+    ///
+    /// This type flattens its cause into `message` and has no `source()`, so
+    /// without this field a dropped connection on the native path arrives at
+    /// the retry decision as prose and has to be guessed at. `Unknown` keeps
+    /// that guess as the fallback for failures that were only ever text.
+    pub kind: crate::provider::chat_stream::ProviderErrorKind,
 }
 
 impl fmt::Display for ProviderCallError {
@@ -437,6 +445,21 @@ impl ProviderCallError {
             message: message.into(),
             trace: Box::new(trace),
             session_id: None,
+            kind: crate::provider::chat_stream::ProviderErrorKind::Unknown,
+        }
+    }
+
+    /// Record a failure whose transport cause is still available, so the retry
+    /// decision reads the classification instead of re-deriving it from the
+    /// formatted message.
+    pub fn from_transport(
+        error: &reqwest::Error,
+        message: impl Into<String>,
+        trace: ProviderAttemptTrace,
+    ) -> Self {
+        Self {
+            kind: crate::provider::chat_stream::ProviderErrorKind::from_transport(error),
+            ..Self::new(message, trace)
         }
     }
 }
