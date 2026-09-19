@@ -342,7 +342,6 @@ async fn a_detached_host_coming_back_keeps_the_row_startup_demands() {
         session_id_if_present(store, session_id).await
     }
 
-    let directory = tempdir().expect("temporary session root");
     let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
 
     // Reopening after a detach: the draft is what brings the session back, and
@@ -868,7 +867,6 @@ fn first_resume_scan_is_bounded_before_history_is_selected() {
 
 #[tokio::test]
 async fn first_resume_frame_keeps_latest_updates_from_a_long_autonomous_turn() {
-    let directory = tempdir().unwrap();
     let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
@@ -939,7 +937,6 @@ async fn first_resume_frame_keeps_latest_updates_from_a_long_autonomous_turn() {
 /// that, which is what this builds.
 #[tokio::test]
 async fn first_resume_frame_reaches_a_conversation_end_buried_behind_a_long_event_tail() {
-    let directory = tempdir().unwrap();
     let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
@@ -1037,7 +1034,6 @@ async fn first_resume_frame_reaches_a_conversation_end_buried_behind_a_long_even
 /// bound the splice would depend on where a fork's rows happen to start.
 #[tokio::test]
 async fn first_resume_frame_reaches_a_forked_conversation_end_in_logical_sequence_space() {
-    let directory = tempdir().unwrap();
     let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let parent_id = Uuid::new_v4();
     store.create_session(parent_id).await.unwrap();
@@ -1274,7 +1270,6 @@ fn trimmed_resume_tail_keeps_paging_contiguous() {
 
 #[tokio::test]
 async fn first_resume_frame_splices_in_the_latest_completed_compaction() {
-    let directory = tempdir().unwrap();
     let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
@@ -1542,7 +1537,6 @@ fn history_reprojection_uses_delivered_durable_and_live_projection() {
 
 #[tokio::test]
 async fn delivered_projection_repairs_durable_workflow_events_missing_from_live_stream() {
-    let root = tempdir().unwrap();
     let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
@@ -1769,7 +1763,6 @@ async fn resumed_roster_prefers_the_child_terminal_ledger_over_a_stale_parent_mi
 
 #[tokio::test]
 async fn child_history_excludes_fork_inherited_director_events() {
-    let directory = tempdir().expect("tempdir");
     let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let parent = Uuid::new_v4();
     let child = Uuid::new_v4();

@@ -1367,10 +1367,6 @@ fn should_use_detached_session_host(args: &LocalAgentCliArgs) -> bool {
 // this must not re-verify a schema that is already current: the extra work
 // would stall the menu before it can draw.
 async fn open_local_session_store() -> Result<Arc<dyn SessionStore>> {
-    let sessions_dir = default_host_config_path()
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("sessions");
     // Journal only: these callers read a single session's state to decide what
     // the menu should show, and must not pay to build satellite tiers -- see
     // `OpenSessionStore` for why resolving them is deferred.
