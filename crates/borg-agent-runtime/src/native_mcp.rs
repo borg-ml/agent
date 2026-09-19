@@ -15,6 +15,13 @@ use tokio_util::sync::CancellationToken;
 const MAX_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const MCP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+// A server that closed stdout is on its way out; wait only long enough to read
+// its exit status rather than stalling the turn behind a wedged child.
+const EXIT_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_millis(500);
+const STARTUP_FAILURE_COOLDOWN: Duration = Duration::from_secs(120);
+const MAX_REMEMBERED_STARTUP_FAILURES: usize = 64;
+const MAX_STDERR_TAIL_LINES: usize = 10;
+const MAX_STDERR_TAIL_BYTES: usize = 2048;
 const CURRENT_PROTOCOL_VERSION: &str = "2026-07-28";
 const LEGACY_PROTOCOL_VERSION: &str = "2024-11-05";
 const PROTOCOL_VERSION_META: &str = "io.modelcontextprotocol/protocolVersion";
@@ -26,7 +33,19 @@ pub(crate) struct NativeMcpRuntime {
     servers: Vec<ExternalMcpServer>,
     tools: HashMap<String, NativeMcpTool>,
     definitions: Vec<ModelToolDefinition>,
-    pub(crate) startup_failures: Vec<(String, String)>,
+    pub(crate) startup_failures: Vec<McpStartupFailure>,
+}
+
+/// One server that has no tools this turn.
+///
+/// `notify` separates a fresh launch attempt from a failure already reported:
+/// the model is told about the missing tools on every turn, while the user
+/// sees a warning only when something actually changed (a first failure, a
+/// changed configuration, or a real retry after the cooldown).
+pub(crate) struct McpStartupFailure {
+    pub(crate) server: String,
+    pub(crate) error: String,
+    pub(crate) notify: bool,
 }
 
 #[derive(Clone)]
@@ -36,15 +55,37 @@ struct NativeMcpTool {
 }
 
 impl NativeMcpRuntime {
-    pub(crate) async fn start(servers: Vec<ExternalMcpServer>) -> Result<Self> {
+    /// `session_id` scopes remembered startup failures: one session never
+    /// suppresses another session's first warning about the same server.
+    pub(crate) async fn start(
+        session_id: uuid::Uuid,
+        servers: Vec<ExternalMcpServer>,
+    ) -> Result<Self> {
         let mut clients = Vec::with_capacity(servers.len());
         let mut configured_servers = Vec::with_capacity(servers.len());
         let mut tools = HashMap::new();
         let mut definitions = Vec::new();
         let mut startup_failures = Vec::new();
-        let mut startups = servers
-            .into_iter()
-            .map(|server| async move {
+        // A server that just failed to start almost always fails again on the
+        // next turn for the same reason (an editor that is not running, a
+        // binary that was never built). Relaunching it every turn pays the
+        // full launch cost repeatedly; the remembered failure is still
+        // reported every turn, so nothing is hidden.
+        let mut startups = FuturesOrdered::new();
+        for server in servers {
+            if let Some(remembered) = recent_startup_failure(session_id, &server) {
+                tracing::debug!(
+                    server = %server.name,
+                    "external MCP server still in its startup-failure cooldown; reusing the recorded cause"
+                );
+                startup_failures.push(McpStartupFailure {
+                    server: server.name,
+                    error: remembered,
+                    notify: false,
+                });
+                continue;
+            }
+            startups.push_back(async move {
                 let started = async {
                     let mut client = NativeMcpClient::start(&server).await?;
                     let listed = client.list_tools().await?;
@@ -52,15 +93,20 @@ impl NativeMcpRuntime {
                 }
                 .await;
                 (server, started)
-            })
-            .collect::<FuturesOrdered<_>>();
+            });
+        }
         while let Some((server, started)) = startups.next().await {
             let (client, listed) = match started {
                 Ok(started) => started,
                 Err(error) => {
                     let error = truncate(&format!("{error:#}"), 2048).to_string();
                     tracing::warn!(server = %server.name, %error, "external MCP server unavailable; continuing without its tools");
-                    startup_failures.push((server.name, error));
+                    remember_startup_failure(session_id, &server, &error);
+                    startup_failures.push(McpStartupFailure {
+                        server: server.name,
+                        error,
+                        notify: true,
+                    });
                     continue;
                 }
             };
@@ -97,6 +143,7 @@ impl NativeMcpRuntime {
                     .map_err(anyhow::Error::msg)?,
                 );
             }
+            clear_startup_failure(session_id, &server);
             clients.push(Mutex::new(client));
             configured_servers.push(server);
         }
@@ -148,7 +195,11 @@ struct NativeMcpClient {
     mode: McpMode,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
-    _child: Child,
+    // A server that dies during initialize explains itself on stderr and in
+    // its exit status. Keep both so the failure is reported with its cause
+    // instead of a bare "closed its stdout".
+    stderr_tail: StderrTail,
+    child: Child,
 }
 
 impl Drop for NativeMcpClient {
@@ -156,7 +207,7 @@ impl Drop for NativeMcpClient {
         // Runtime extension grants can be replaced between turns. Tokio does
         // not kill a child merely because its Child handle is dropped, so make
         // the replacement boundary terminate the old MCP process as well.
-        let _ = self._child.start_kill();
+        let _ = self.child.start_kill();
     }
 }
 
@@ -236,16 +287,21 @@ impl NativeMcpClient {
             .stdout
             .take()
             .with_context(|| format!("MCP server `{}` has no stdout", server.name))?;
+        let stderr_tail = StderrTail::default();
         if let Some(stderr) = child.stderr.take() {
             let name = server.name.clone();
+            let tail = stderr_tail.clone();
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    let line =
+                        crate::secret_scrub::scrub_secrets(truncate(&line, 4096)).into_owned();
                     tracing::debug!(
                         server = %name,
-                        message = %truncate(&line, 4096),
+                        message = %line,
                         "native MCP server stderr"
                     );
+                    tail.push(line);
                 }
             });
         }
@@ -255,7 +311,8 @@ impl NativeMcpClient {
             mode: McpMode::Probing,
             stdin,
             stdout: BufReader::new(stdout),
-            _child: child,
+            stderr_tail,
+            child,
         };
         Ok(client)
     }
@@ -464,8 +521,8 @@ impl NativeMcpClient {
     }
 
     async fn terminate(&mut self) {
-        let _ = self._child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(1), self._child.wait()).await;
+        let _ = self.child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(1), self.child.wait()).await;
     }
 
     async fn read_response(&mut self, id: &Value) -> Result<Value> {
@@ -511,6 +568,34 @@ impl NativeMcpClient {
         Ok(())
     }
 
+    /// Why the server stopped talking: its exit status when it has already
+    /// finished, plus the tail of its own stderr. Optional plugins that are
+    /// simply not running explain themselves here instead of surfacing as an
+    /// unexplained transport failure.
+    async fn exit_diagnostics(&mut self) -> String {
+        let status = match self.child.try_wait() {
+            Ok(Some(status)) => Some(status),
+            // A server can close stdout a moment before the process is reaped.
+            Ok(None) => tokio::time::timeout(EXIT_DIAGNOSTIC_TIMEOUT, self.child.wait())
+                .await
+                .ok()
+                .and_then(Result::ok),
+            Err(_) => None,
+        };
+        let mut diagnostics = String::new();
+        match status {
+            Some(status) => {
+                diagnostics.push_str(&format!(" after exiting with {status}"));
+            }
+            None => diagnostics.push_str(" while still running"),
+        }
+        let stderr = self.stderr_tail.render();
+        if !stderr.is_empty() {
+            diagnostics.push_str(&format!("; its stderr said: {stderr}"));
+        }
+        diagnostics
+    }
+
     async fn read_message(&mut self) -> Result<Value> {
         let mut line = String::new();
         let bytes =
@@ -518,7 +603,11 @@ impl NativeMcpClient {
                 format!("failed reading from MCP server `{}`", self.server_name)
             })?;
         if bytes == 0 {
-            bail!("MCP server `{}` closed its stdout", self.server_name);
+            let diagnostics = self.exit_diagnostics().await;
+            bail!(
+                "MCP server `{}` closed its stdout{diagnostics}",
+                self.server_name
+            );
         }
         if bytes > MAX_MCP_MESSAGE_BYTES {
             bail!(
@@ -584,6 +673,112 @@ fn normalize_tool_name(name: &str) -> String {
         .collect()
 }
 
+/// Remembered startup failures, keyed by a hash of the launch specification so
+/// no command, argument, or environment text is retained here. A configuration
+/// change produces a different key and retries immediately; an unchanged
+/// configuration retries once the cooldown elapses, so a server that becomes
+/// available again (its editor starts, its binary is built) recovers on its
+/// own.
+static STARTUP_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<u64, (std::time::Instant, String)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+fn startup_key(session_id: uuid::Uuid, server: &ExternalMcpServer) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    session_id.hash(&mut hasher);
+    server.name.hash(&mut hasher);
+    server.command.hash(&mut hasher);
+    server.args.hash(&mut hasher);
+    for (key, value) in &server.env {
+        key.hash(&mut hasher);
+        value.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// The recorded cause when this exact server failed recently, annotated so the
+/// report says it is a remembered failure rather than a fresh launch attempt.
+fn recent_startup_failure(session_id: uuid::Uuid, server: &ExternalMcpServer) -> Option<String> {
+    let mut failures = STARTUP_FAILURES.lock().ok()?;
+    let key = startup_key(session_id, server);
+    let (recorded, error) = failures.get(&key)?;
+    let age = recorded.elapsed();
+    let cooldown = STARTUP_FAILURE_COOLDOWN;
+    if age >= cooldown {
+        failures.remove(&key);
+        return None;
+    }
+    let retry_in = (cooldown - age).as_secs();
+    Some(format!(
+        "{error} (recorded {}s ago; not relaunched again until {retry_in}s from now)",
+        age.as_secs()
+    ))
+}
+
+fn remember_startup_failure(session_id: uuid::Uuid, server: &ExternalMcpServer, error: &str) {
+    let Ok(mut failures) = STARTUP_FAILURES.lock() else {
+        return;
+    };
+    // Every edit to a server's configuration produces a new key, so prune on
+    // insert instead of waiting for the stale key to be queried again, and cap
+    // the map so a long session cannot accumulate entries without bound.
+    let cooldown = STARTUP_FAILURE_COOLDOWN;
+    failures.retain(|_, (recorded, _)| recorded.elapsed() < cooldown);
+    while failures.len() >= MAX_REMEMBERED_STARTUP_FAILURES {
+        let Some(oldest) = failures
+            .iter()
+            .min_by_key(|(_, (recorded, _))| *recorded)
+            .map(|(key, _)| *key)
+        else {
+            break;
+        };
+        failures.remove(&oldest);
+    }
+    failures.insert(
+        startup_key(session_id, server),
+        (std::time::Instant::now(), error.to_string()),
+    );
+}
+
+fn clear_startup_failure(session_id: uuid::Uuid, server: &ExternalMcpServer) {
+    if let Ok(mut failures) = STARTUP_FAILURES.lock() {
+        failures.remove(&startup_key(session_id, server));
+    }
+}
+
+/// A bounded, shared view of a child's stderr. The reader task owns the pipe;
+/// the client reads the tail only when reporting a failure.
+#[derive(Clone, Default)]
+struct StderrTail(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
+
+impl StderrTail {
+    fn push(&self, line: String) {
+        let Ok(mut lines) = self.0.lock() else {
+            return;
+        };
+        // Server stderr can echo tokens from its own environment, and this
+        // tail is reported to the model and the UI. Scrub before it is stored.
+        lines.push_back(crate::secret_scrub::scrub_secrets(&line).into_owned());
+        while lines.len() > MAX_STDERR_TAIL_LINES {
+            lines.pop_front();
+        }
+    }
+
+    fn render(&self) -> String {
+        let Ok(lines) = self.0.lock() else {
+            return String::new();
+        };
+        let joined = lines
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("; ");
+        truncate(&joined, MAX_STDERR_TAIL_BYTES).to_string()
+    }
+}
+
 fn truncate(value: &str, max: usize) -> &str {
     if value.len() <= max {
         return value;
@@ -628,25 +823,28 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"map.generate"
 read _call
 printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"ok"}]}}'
 "#;
-        let runtime = NativeMcpRuntime::start(vec![
-            ExternalMcpServer {
-                name: "unavailable".to_string(),
-                command: "sh".to_string(),
-                args: vec!["-c".to_string(), "exit 127".to_string()],
-                ..Default::default()
-            },
-            ExternalMcpServer {
-                name: "fake-server".to_string(),
-                command: "sh".to_string(),
-                args: vec!["-c".to_string(), script.to_string()],
-                env: BTreeMap::new(),
-                allowed_tools: vec!["map.generate".to_string()],
-            },
-        ])
+        let runtime = NativeMcpRuntime::start(
+            uuid::Uuid::new_v4(),
+            vec![
+                ExternalMcpServer {
+                    name: "unavailable".to_string(),
+                    command: "sh".to_string(),
+                    args: vec!["-c".to_string(), "exit 127".to_string()],
+                    ..Default::default()
+                },
+                ExternalMcpServer {
+                    name: "fake-server".to_string(),
+                    command: "sh".to_string(),
+                    args: vec!["-c".to_string(), script.to_string()],
+                    env: BTreeMap::new(),
+                    allowed_tools: vec!["map.generate".to_string()],
+                },
+            ],
+        )
         .await
         .unwrap();
         assert_eq!(runtime.startup_failures.len(), 1);
-        assert_eq!(runtime.startup_failures[0].0, "unavailable");
+        assert_eq!(runtime.startup_failures[0].server, "unavailable");
         assert!(runtime.contains("mcp__fake_server__map_generate"));
         assert!(!runtime.contains("mcp__fake_server__hidden"));
         assert_eq!(runtime.definitions().len(), 1);
@@ -659,6 +857,164 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
             .await
             .unwrap();
         assert_eq!(result["content"][0]["text"], "ok");
+    }
+
+    #[tokio::test]
+    async fn startup_failure_reports_the_server_exit_status_and_stderr() {
+        // A launcher that refuses to start (no built binary, editor not
+        // running) explains itself on stderr. That reason has to survive into
+        // the reported failure, otherwise every turn shows only an opaque
+        // closed-stdout transport error.
+        let runtime = NativeMcpRuntime::start(
+            uuid::Uuid::new_v4(),
+            vec![ExternalMcpServer {
+                name: "surf-lab__lab".to_string(),
+                command: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "echo 'no fresh surf_lab executable found' >&2; exit 127".to_string(),
+                ],
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(runtime.definitions().len(), 0);
+        let failure = runtime.startup_failures.first().expect("startup failure");
+        let (name, error) = (&failure.server, &failure.error);
+        assert!(failure.notify, "a fresh failure warns the user");
+        assert_eq!(name, "surf-lab__lab");
+        assert!(
+            error.contains("no fresh surf_lab executable found"),
+            "failure should quote the server's own stderr: {error}"
+        );
+        assert!(
+            error.contains("127"),
+            "failure should report the exit status: {error}"
+        );
+    }
+
+    /// Counts how many times the launcher actually ran, so the memo is tested
+    /// by observed launches rather than by its own bookkeeping.
+    fn launcher(directory: &std::path::Path, marker: &str) -> Vec<String> {
+        let log = directory.join(marker);
+        vec![
+            "-c".to_string(),
+            format!(
+                "echo launched >> {}; echo 'no fresh binary' >&2; exit 127",
+                log.display()
+            ),
+        ]
+    }
+
+    fn launch_count(directory: &std::path::Path, marker: &str) -> usize {
+        std::fs::read_to_string(directory.join(marker))
+            .map(|log| log.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn remembered_failure_skips_relaunch_until_config_change_or_cooldown_expiry() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let server = |args: Vec<String>| ExternalMcpServer {
+            name: "cooldown-server".to_string(),
+            command: "sh".to_string(),
+            args,
+            ..Default::default()
+        };
+        let original = launcher(directory.path(), "launches");
+        // One session: the memo is scoped per session, so all four attempts
+        // below must share this id to exercise it.
+        let session = uuid::Uuid::new_v4();
+
+        // One attempt can spawn more than once (the modern probe falls back to
+        // the legacy handshake), so the memo is judged by launch deltas.
+        let first = NativeMcpRuntime::start(session, vec![server(original.clone())])
+            .await
+            .unwrap();
+        let after_first = launch_count(directory.path(), "launches");
+        assert!(after_first >= 1, "the first attempt launches the server");
+        assert!(first.startup_failures[0].notify, "first failure warns");
+
+        // Same configuration inside the cooldown: reported, but not relaunched
+        // and not re-warned.
+        let second = NativeMcpRuntime::start(session, vec![server(original.clone())])
+            .await
+            .unwrap();
+        assert_eq!(
+            launch_count(directory.path(), "launches"),
+            after_first,
+            "a remembered failure must not pay the launch cost again"
+        );
+        assert_eq!(second.startup_failures.len(), 1, "still reported");
+        assert!(
+            !second.startup_failures[0].notify,
+            "a cached failure must not warn the user again"
+        );
+        assert!(
+            second.startup_failures[0].error.contains("no fresh binary"),
+            "the cached report keeps the real cause: {}",
+            second.startup_failures[0].error
+        );
+
+        // A configuration change re-keys the memo and retries immediately.
+        let mut changed = original.clone();
+        changed[1].push_str(" # changed");
+        let third = NativeMcpRuntime::start(session, vec![server(changed)])
+            .await
+            .unwrap();
+        let after_change = launch_count(directory.path(), "launches");
+        assert!(
+            after_change > after_first,
+            "a changed configuration retries at once"
+        );
+        assert!(third.startup_failures[0].notify, "a retry warns again");
+
+        // An expired cooldown retries the unchanged configuration.
+        STARTUP_FAILURES
+            .lock()
+            .unwrap()
+            .get_mut(&startup_key(session, &server(original.clone())))
+            .expect("the original failure remains cached")
+            .0 = std::time::Instant::now() - STARTUP_FAILURE_COOLDOWN;
+        let fourth = NativeMcpRuntime::start(session, vec![server(original)])
+            .await
+            .unwrap();
+        assert!(
+            launch_count(directory.path(), "launches") > after_change,
+            "an expired cooldown retries"
+        );
+        assert!(fourth.startup_failures[0].notify, "a real retry warns");
+    }
+
+    #[tokio::test]
+    async fn reported_stderr_is_scrubbed_of_secrets() {
+        let runtime = NativeMcpRuntime::start(
+            uuid::Uuid::new_v4(),
+            vec![ExternalMcpServer {
+                name: "leaky-server".to_string(),
+                command: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "echo 'auth failed for sk-ant-abcdefghijklmnopqrstuvwxyz0123' >&2; exit 1"
+                        .to_string(),
+                ],
+                ..Default::default()
+            }],
+        )
+        .await
+        .unwrap();
+
+        let error = &runtime.startup_failures[0].error;
+        assert!(
+            !error.contains("sk-ant-abcdefghijklmnopqrstuvwxyz0123"),
+            "the reported stderr must not carry a credential: {error}"
+        );
+        assert!(
+            error.contains("[redacted:anthropic-key]"),
+            "the secret is redacted in place: {error}"
+        );
     }
 
     #[tokio::test]
@@ -679,13 +1035,16 @@ case "$_call" in
   *) exit 4 ;;
 esac
 "#;
-        let runtime = NativeMcpRuntime::start(vec![ExternalMcpServer {
-            name: "modern-server".to_string(),
-            command: "sh".to_string(),
-            args: vec!["-c".to_string(), script.to_string()],
-            env: BTreeMap::new(),
-            allowed_tools: vec![],
-        }])
+        let runtime = NativeMcpRuntime::start(
+            uuid::Uuid::new_v4(),
+            vec![ExternalMcpServer {
+                name: "modern-server".to_string(),
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), script.to_string()],
+                env: BTreeMap::new(),
+                allowed_tools: vec![],
+            }],
+        )
         .await
         .unwrap();
         assert!(runtime.contains("mcp__modern_server__echo"));
@@ -736,13 +1095,16 @@ esac
             marker.display(),
             marker.display()
         );
-        let runtime = NativeMcpRuntime::start(vec![ExternalMcpServer {
-            name: "restart-server".to_string(),
-            command: "sh".to_string(),
-            args: vec!["-c".to_string(), script],
-            env: BTreeMap::new(),
-            allowed_tools: Vec::new(),
-        }])
+        let runtime = NativeMcpRuntime::start(
+            uuid::Uuid::new_v4(),
+            vec![ExternalMcpServer {
+                name: "restart-server".to_string(),
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), script],
+                env: BTreeMap::new(),
+                allowed_tools: Vec::new(),
+            }],
+        )
         .await
         .unwrap();
         let cancel = CancellationToken::new();
@@ -833,10 +1195,12 @@ printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools"
                 env: BTreeMap::new(),
                 allowed_tools: Vec::new(),
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         let started = Instant::now();
-        let runtime = NativeMcpRuntime::start(servers).await.unwrap();
+        let runtime = NativeMcpRuntime::start(uuid::Uuid::new_v4(), servers)
+            .await
+            .unwrap();
         let elapsed = started.elapsed();
         assert_eq!(runtime.definitions().len(), SERVER_COUNT);
         assert_eq!(

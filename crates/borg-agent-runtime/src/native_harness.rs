@@ -280,18 +280,26 @@ impl NativeHarness {
             )),
         }
         system_prompt.push_str(&runtime.context.prompt_appendix());
-        for (server, error) in &runtime.mcp.startup_failures {
-            let message =
-                format!("MCP server {server} unavailable; continuing without its tools. {error}");
-            send(
-                &events,
-                SessionEventKind::ProviderEvent {
-                    provider: turn.provider,
-                    kind: "mcp_server_unavailable".to_string(),
-                    payload: json!({"server": server, "error": error, "message": message}),
-                },
-            )
-            .await;
+        for failure in &runtime.mcp.startup_failures {
+            let (server, error) = (&failure.server, &failure.error);
+            // The model needs to know the tools are missing on every turn. The
+            // user only needs to hear about it when the situation changed, so
+            // an unreachable optional server does not reprint a warning each
+            // turn while it stays unreachable.
+            if failure.notify {
+                let message = format!(
+                    "MCP server {server} unavailable; continuing without its tools. {error}"
+                );
+                send(
+                    &events,
+                    SessionEventKind::ProviderEvent {
+                        provider: turn.provider,
+                        kind: "mcp_server_unavailable".to_string(),
+                        payload: json!({"server": server, "error": error, "message": message}),
+                    },
+                )
+                .await;
+            }
             system_prompt.push_str(&format!("\nExternal MCP server {} is unavailable for this turn. Its tools are not available; do not claim to have used them.", serde_json::to_string(server)?));
         }
         if !turn.system_prompt_appendix.is_empty() {
@@ -1166,7 +1174,11 @@ impl NativeToolRuntime {
             root: config.root,
             permission: config.permission,
             agent_tools: config.agent_tools,
-            mcp: crate::native_mcp::NativeMcpRuntime::start(config.external_mcp_servers).await?,
+            mcp: crate::native_mcp::NativeMcpRuntime::start(
+                config.session_id,
+                config.external_mcp_servers,
+            )
+            .await?,
             execution_provider: config.execution_provider,
             workflow_process_manager: config.workflow_process_manager,
             session_store: config.session_store,

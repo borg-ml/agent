@@ -875,8 +875,11 @@ impl AgentToolDispatcher {
         );
         if state.runtime.is_none() {
             state.runtime = Some(
-                crate::native_mcp::NativeMcpRuntime::start(state.configured_servers.clone())
-                    .await?,
+                crate::native_mcp::NativeMcpRuntime::start(
+                    self.actor_session_id,
+                    state.configured_servers.clone(),
+                )
+                .await?,
             );
         }
         Ok(serde_json::to_value(
@@ -896,8 +899,11 @@ impl AgentToolDispatcher {
         );
         if state.runtime.is_none() {
             state.runtime = Some(
-                crate::native_mcp::NativeMcpRuntime::start(state.configured_servers.clone())
-                    .await?,
+                crate::native_mcp::NativeMcpRuntime::start(
+                    self.actor_session_id,
+                    state.configured_servers.clone(),
+                )
+                .await?,
             );
         }
         state
