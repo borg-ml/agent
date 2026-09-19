@@ -1,6 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -13,7 +12,7 @@ use uuid::Uuid;
 
 use crate::session_action::{SessionAction, SessionActionState, SessionActionTransition};
 use crate::{
-    CodingProvider, EventActor, MessageStatus, PermissionMode, PlanItem, ResponseLanguage,
+    CodingProvider, MessageStatus, PermissionMode, PlanItem, ResponseLanguage,
     SessionEvent, SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef,
     SessionStatus,
 };
