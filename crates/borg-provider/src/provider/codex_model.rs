@@ -825,7 +825,8 @@ impl ResponseState {
     fn finish(self, mut response: Value) -> Result<(ModelMessage, Value)> {
         ensure!(
             response["status"] == "completed" || response_hit_output_limit(&response),
-            "Codex model response was not completed"
+            "Codex model response was not completed ({})",
+            response_failure_detail(&response, None)
         );
         let output = response["output"]
             .as_array()
@@ -880,7 +881,8 @@ impl ResponseState {
         // continue from the preserved reasoning instead of failing the turn.
         ensure!(
             !content.is_empty() || !calls.is_empty() || response_hit_output_limit(&response),
-            "Codex returned no answer or tool calls"
+            "Codex returned no answer or tool calls ({})",
+            response_failure_detail(&response, Some(&output))
         );
         response["output"] = json!(output);
         Ok((
@@ -926,6 +928,93 @@ fn function_call_output(
     Ok(json!({
         "type": "function_call_output", "call_id": tool_call_id, "output": blocks
     }))
+}
+
+/// Response statuses Borg recognises; anything else is reported as `other`.
+const KNOWN_STATUSES: [&str; 6] = [
+    "completed",
+    "incomplete",
+    "failed",
+    "in_progress",
+    "queued",
+    "cancelled",
+];
+/// `incomplete_details.reason` values Borg recognises.
+const KNOWN_INCOMPLETE_REASONS: [&str; 2] = ["max_output_tokens", "content_filter"];
+/// The output item types [`ResponseState::finish`] handles. Any other type is
+/// counted as `other`, which still shows that an unsupported item arrived
+/// without repeating whatever the backend called it.
+const KNOWN_ITEM_TYPES: [&str; 3] = ["message", "function_call", "reasoning"];
+
+/// Reduce a backend string to a known token. Unrecognised values collapse to
+/// `other` and missing ones to `unknown`, so no backend-controlled text ever
+/// reaches the error message.
+fn known_or_other(value: Option<&str>, allowed: &[&'static str]) -> &'static str {
+    match value {
+        Some(value) => allowed
+            .iter()
+            .find(|candidate| **candidate == value)
+            .copied()
+            .unwrap_or("other"),
+        None => "unknown",
+    }
+}
+
+/// Structured detail for the guards that fail a turn in [`ResponseState::finish`].
+/// A turn that dies there records no usage and no status anywhere, so after the
+/// fact the incident cannot be told apart from a refusal, a reasoning-only stop
+/// or a dropped stream. Every string here is mapped through a fixed allowlist by
+/// [`known_or_other`] and every number is a token count, so the message cannot
+/// carry reasoning (plaintext or encrypted), message text, tool arguments, call
+/// ids, tool names, account identity or any other backend-controlled text.
+/// `output` is the reconciled item list where the caller already has one,
+/// otherwise the response's own array is borrowed.
+fn response_failure_detail<'a>(response: &'a Value, output: Option<&'a [Value]>) -> String {
+    let output = output
+        .or_else(|| response["output"].as_array().map(Vec::as_slice))
+        .unwrap_or_default();
+    let mut parts = vec![format!(
+        "status={}",
+        known_or_other(response["status"].as_str(), &KNOWN_STATUSES)
+    )];
+    if let Some(reason) = response.pointer("/incomplete_details/reason") {
+        parts.push(format!(
+            "incomplete_reason={}",
+            known_or_other(reason.as_str(), &KNOWN_INCOMPLETE_REASONS)
+        ));
+    }
+    parts.push(format!("output_items={}", output.len()));
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for item in output {
+        *counts
+            .entry(known_or_other(item["type"].as_str(), &KNOWN_ITEM_TYPES))
+            .or_default() += 1;
+    }
+    if !counts.is_empty() {
+        let types = counts
+            .iter()
+            .map(|(name, count)| format!("{name}={count}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        parts.push(format!("item_types[{types}]"));
+    }
+    for (label, pointer) in [
+        ("input_tokens", "/usage/input_tokens"),
+        (
+            "cached_input_tokens",
+            "/usage/input_tokens_details/cached_tokens",
+        ),
+        ("output_tokens", "/usage/output_tokens"),
+        (
+            "reasoning_tokens",
+            "/usage/output_tokens_details/reasoning_tokens",
+        ),
+    ] {
+        if let Some(value) = response.pointer(pointer).and_then(Value::as_u64) {
+            parts.push(format!("{label}={value}"));
+        }
+    }
+    parts.join(" ")
 }
 
 fn response_hit_output_limit(response: &Value) -> bool {
@@ -1583,6 +1672,81 @@ mod tests {
             ResponseState::default()
                 .finish(json!({"status":"completed","output":[{"type":"reasoning"}]}))
                 .is_err()
+        );
+        // That failure has to explain itself: a dropped turn records no usage
+        // or status anywhere else, so the guard message is the only evidence
+        // the incident leaves behind.
+        let failure = ResponseState::default()
+            .finish(json!({
+                "status": "completed",
+                "output": [{"type":"reasoning","encrypted_content":"opaque","summary":[]}],
+                "usage": {
+                    "input_tokens": 78323,
+                    "output_tokens": 540,
+                    "input_tokens_details": {"cached_tokens": 1792},
+                    "output_tokens_details": {"reasoning_tokens": 512},
+                },
+            }))
+            .expect_err("a completed response with no answer is a failure");
+        let detail = failure.to_string();
+        for expected in [
+            "status=completed",
+            "output_items=1",
+            "item_types[reasoning=1]",
+            "input_tokens=78323",
+            "cached_input_tokens=1792",
+            "output_tokens=540",
+            "reasoning_tokens=512",
+        ] {
+            assert!(
+                detail.contains(expected),
+                "{expected} missing from {detail}"
+            );
+        }
+        // Diagnostics stay metadata-only: no reasoning, encrypted or not.
+        assert!(!detail.contains("opaque"));
+        // An incomplete stop that is not a length cut reports its own reason
+        // rather than being flattened into the same opaque failure.
+        let refusal = ResponseState::default()
+            .finish(json!({
+                "status": "incomplete",
+                "incomplete_details": {"reason": "content_filter"},
+                "output": [],
+            }))
+            .expect_err("a non-length incomplete stop is still a failure");
+        assert!(
+            refusal
+                .to_string()
+                .contains("incomplete_reason=content_filter")
+        );
+        // Diagnostics must never echo backend-controlled text. An unrecognised
+        // status, reason or item type could carry anything, so each one is
+        // reported only as the fact that it was unrecognised.
+        let secret = "sk-live-must-not-appear";
+        let leaked = ResponseState::default()
+            .finish(json!({
+                "status": format!("weird-{secret}"),
+                "incomplete_details": {"reason": format!("reason-{secret}")},
+                "output": [],
+            }))
+            .expect_err("an unrecognised status is still a failure");
+        let leaked = leaked.to_string();
+        assert!(
+            !leaked.contains(secret),
+            "detail leaked a raw value: {leaked}"
+        );
+        assert!(leaked.contains("status=other"));
+        assert!(leaked.contains("incomplete_reason=other"));
+        // Unsupported item types are counted, never named. `finish` rejects the
+        // item itself, so the guard detail is reached through the status check.
+        let untyped = response_failure_detail(
+            &json!({"output": [{"type": format!("tool-{secret}")}, {"no_type": true}]}),
+            None,
+        );
+        assert!(!untyped.contains(secret), "item type leaked: {untyped}");
+        assert_eq!(
+            untyped,
+            "status=unknown output_items=2 item_types[other=1,unknown=1]"
         );
     }
 }
