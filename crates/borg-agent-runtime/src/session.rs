@@ -17,13 +17,12 @@ use crate::subagents::{SharedWorkToolContext, TeamInboxMessage};
 use crate::{
     AgentCompaction, AgentTurn, AgentTurnControl, AgentTurnExecutor, CodingProvider,
     ConsultationRequest, ConsultationResult, EventActor, GoalAction, GoalStatus, HostCommand,
-    LaunchSession, LocalAgentTurnExecutor, MessageStatus, ModelGoalStatus, PlanItem,
-    PlanItemStatus, PromptDelivery, SessionEvent, SessionEventKind, SessionGoal,
-    SessionGoalToolRequest, SessionGoalToolResponse, SessionState, SessionStatus, SessionStore,
-    SessionTodoToolRequest, SessionTodoToolResponse, SessionWriterLease, SqliteSessionStore,
-    SubagentAction, SubagentActivity, SubagentActivityKind, SubagentControlOutcome,
-    SubagentCoordinator, TodoAction, TodoItemUpdate, WorkspaceEvent, WorkspaceEventKind,
-    WorkspaceStore,
+    LaunchSession, MessageStatus, ModelGoalStatus, PlanItem, PlanItemStatus, PromptDelivery,
+    SessionEvent, SessionEventKind, SessionGoal, SessionGoalToolRequest, SessionGoalToolResponse,
+    SessionState, SessionStatus, SessionStore, SessionTodoToolRequest, SessionTodoToolResponse,
+    SessionWriterLease, SubagentAction, SubagentActivity, SubagentActivityKind,
+    SubagentControlOutcome, SubagentCoordinator, TodoAction, TodoItemUpdate, WorkspaceEvent,
+    WorkspaceEventKind, WorkspaceStore,
 };
 
 pub struct AbortTask<T = ()>(pub tokio::task::JoinHandle<T>);
@@ -426,7 +425,7 @@ impl WorkspaceProjection {
     /// rejection here surfaces only as a warn-level projection diagnostic.
     /// Tolerance therefore belongs in this caller, which knows a replayed or
     /// already-settled delivery is ordinary, rather than in the shared
-    /// contract that both the SQLite and Postgres backends rely on to keep
+    /// contract that the Postgres backend relies on to keep
     /// delivery state monotonic.
     ///
     /// Returning `Ok(())` for an unknown message or an unaddressed
@@ -1276,94 +1275,6 @@ impl SessionConsultationTools {
     }
 }
 
-/// Run one durable Borg agent session.
-///
-/// This is the canonical interactive/headless session state machine. Callers
-/// provide typed commands and observe durable events; terminal rendering,
-/// relay upload, and database projection remain adapters outside this kernel.
-pub async fn run_agent_session(
-    lock_path: &Path,
-    session_id: Uuid,
-    launch: LaunchSession,
-    commands: mpsc::Receiver<HostCommand>,
-    events: mpsc::Sender<SessionEvent>,
-) -> Result<()> {
-    run_agent_session_with_executor(
-        lock_path,
-        session_id,
-        launch,
-        commands,
-        events,
-        Arc::new(LocalAgentTurnExecutor::default()),
-    )
-    .await
-}
-
-/// Run a local session with an already-acquired writer lease.
-///
-/// Local launchers use this after deciding whether to own or attach so the
-/// ownership decision remains valid through actor startup.
-pub async fn run_agent_session_with_writer(
-    lock_path: &Path,
-    session_id: Uuid,
-    launch: LaunchSession,
-    commands: mpsc::Receiver<HostCommand>,
-    events: mpsc::Sender<SessionEvent>,
-    writer: SessionWriterLease,
-) -> Result<()> {
-    run_agent_session_kernel(
-        lock_path,
-        session_id,
-        launch,
-        commands,
-        events,
-        Arc::new(LocalAgentTurnExecutor::default()),
-        Some(writer),
-    )
-    .await
-}
-
-/// Run a local session with both an acquired writer lease and an explicit
-/// execution adapter.
-pub async fn run_agent_session_with_executor_and_writer(
-    lock_path: &Path,
-    session_id: Uuid,
-    launch: LaunchSession,
-    commands: mpsc::Receiver<HostCommand>,
-    events: mpsc::Sender<SessionEvent>,
-    executor: Arc<dyn AgentTurnExecutor>,
-    writer: SessionWriterLease,
-) -> Result<()> {
-    run_agent_session_kernel(
-        lock_path,
-        session_id,
-        launch,
-        commands,
-        events,
-        executor,
-        Some(writer),
-    )
-    .await
-}
-
-/// Run the canonical Borg session actor with an execution-location adapter.
-///
-/// Different hosts share this actor while injecting the execution adapter
-/// appropriate to their provider credentials and process location.
-pub async fn run_agent_session_with_executor(
-    lock_path: &Path,
-    session_id: Uuid,
-    launch: LaunchSession,
-    commands: mpsc::Receiver<HostCommand>,
-    events: mpsc::Sender<SessionEvent>,
-    executor: Arc<dyn AgentTurnExecutor>,
-) -> Result<()> {
-    run_agent_session_kernel(
-        lock_path, session_id, launch, commands, events, executor, None,
-    )
-    .await
-}
-
 /// Run the canonical session actor against a caller-owned typed store.
 ///
 /// Local callers must hold their per-session writer lease for the duration of
@@ -1489,45 +1400,6 @@ pub(crate) async fn run_agent_session_with_store_and_writer_and_team(
         store,
         crate::LspPathPolicy::unrestricted(),
         Some(team),
-        Vec::new(),
-    ))
-    .await
-}
-
-async fn run_agent_session_kernel(
-    lock_path: &Path,
-    session_id: Uuid,
-    launch: LaunchSession,
-    commands: mpsc::Receiver<HostCommand>,
-    events: mpsc::Sender<SessionEvent>,
-    executor: Arc<dyn AgentTurnExecutor>,
-    writer: Option<SessionWriterLease>,
-) -> Result<()> {
-    anyhow::ensure!(
-        !launch.fast.unwrap_or(false) || launch.provider.supports_fast(),
-        "fast mode is not supported by the {:?} transport",
-        launch.provider
-    );
-    let _writer_lease = match writer {
-        Some(writer) => writer,
-        None => SessionWriterLease::acquire(lock_path)?,
-    };
-    let session_root = lock_path.parent().unwrap_or_else(|| Path::new("."));
-    let store = Arc::new(SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await?);
-    if !store.contains_session(session_id).await? {
-        store.create_session(session_id).await?;
-    }
-    let runtime_store: Arc<dyn SessionStore> = store;
-    Box::pin(run_agent_session_store_kernel(
-        session_root,
-        session_id,
-        launch,
-        commands,
-        events,
-        executor,
-        runtime_store,
-        crate::LspPathPolicy::unrestricted(),
-        None,
         Vec::new(),
     ))
     .await
@@ -1660,10 +1532,9 @@ async fn run_agent_session_store_kernel_inner(
             .workspace_binding(session_id)
             .await?
             .with_context(|| format!("session {session_id} has no workspace binding"))?;
-        let workspace_store = store
-            .workspace_store()
-            .await?
-            .with_context(|| "multiplayer requires a SQLite workspace projection on the canonical session database")?;
+        let workspace_store = store.workspace_store().await?.with_context(
+            || "multiplayer requires a workspace projection on the canonical session database",
+        )?;
         let human_display_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
         let human_participant_id = crate::local_human_participant_id(&human_display_name);
         let workspace_name = launch
@@ -2069,7 +1940,7 @@ async fn run_agent_session_store_kernel_inner(
             dispatch: autonomy_dispatch_tx,
             cancel: autonomy_cancel.clone(),
         });
-        let supervisor = crate::SqliteAutonomySupervisor::new(
+        let supervisor = crate::AutonomySupervisor::new(
             autonomy_store,
             handler,
             format!("session-actor:{session_id}"),

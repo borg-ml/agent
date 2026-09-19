@@ -633,9 +633,7 @@ async fn dispatcher_and_python_share_the_canonical_lossless_history_query() {
         return;
     }
     let directory = tempdir().unwrap();
-    let store = crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
     store
@@ -679,7 +677,7 @@ async fn dispatcher_and_python_share_the_canonical_lossless_history_query() {
         .call("query_history", json!({ "text": "alpha evidence" }))
         .await
         .unwrap();
-    assert_eq!(direct["backend"], "sqlite_fts5");
+    assert_eq!(direct["backend"], "postgres_tsvector");
     assert_eq!(direct["hits"].as_array().unwrap().len(), 1);
 
     let direct_index = dispatcher
@@ -714,14 +712,12 @@ async fn dispatcher_and_python_share_the_canonical_lossless_history_query() {
             .as_str()
             .is_some_and(|content| content.contains("alpha evidence"))
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn history_index_reports_oversized_documents_without_exceeding_runtime_budget() {
-    let directory = tempdir().unwrap();
-    let store = crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
     let event = SessionEvent::new(
@@ -761,6 +757,7 @@ async fn history_index_reports_oversized_documents_without_exceeding_runtime_bud
             .as_u64()
             .is_some_and(|bytes| bytes > 768 * 1024)
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -1041,9 +1038,7 @@ async fn persistent_runtime_rehydrates_explicit_checkpoint_after_worker_restart(
         return;
     }
     let directory = tempdir().unwrap();
-    let store = crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
     let first_autonomy: Option<std::sync::Arc<dyn crate::autonomy::AutonomyStore>> =
@@ -1123,6 +1118,7 @@ async fn persistent_runtime_rehydrates_explicit_checkpoint_after_worker_restart(
         .await
         .unwrap();
     assert_eq!(restored["value"], 42);
+    scratch.discard().await;
 }
 
 #[derive(Clone)]
@@ -1146,7 +1142,7 @@ impl crate::AgentTurnExecutor for CanonicalDogfoodExecutor {
         events: mpsc::Sender<SessionEventKind>,
         _controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
     ) -> Result<crate::AgentTurnResult> {
-        // The canonical fixture performs several SQLite-backed tool calls
+        // The canonical fixture performs several store-backed tool calls
         // before it can produce its assistant result. Announce provider
         // progress first so the test-only setup watchdog does not mistake
         // durable tool work for a dead provider under CI load.
@@ -1424,7 +1420,7 @@ impl crate::AgentTurnExecutor for CanonicalDogfoodExecutor {
 async fn run_canonical_dogfood_actor(
     directory: &Path,
     session_id: Uuid,
-    store: Arc<crate::SqliteSessionStore>,
+    store: Arc<crate::session_store::postgres::PostgresSessionStore>,
     executor: Arc<dyn crate::AgentTurnExecutor>,
     send_prompt: bool,
 ) -> Result<Vec<crate::SessionEvent>> {
@@ -1519,11 +1515,8 @@ async fn canonical_runtime_dogfood_completes_goal_through_restart() {
     }
 
     let directory = tempdir().unwrap();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
     let executor = Arc::new(CanonicalDogfoodExecutor::new());
@@ -1565,11 +1558,12 @@ async fn canonical_runtime_dogfood_completes_goal_through_restart() {
             .as_u64()
             .is_some_and(|cursor| cursor > 0)
     );
+    scratch.discard().await;
 }
 
 async fn bind_test_team(
     directory: &Path,
-    store: &crate::SqliteSessionStore,
+    store: &crate::session_store::postgres::PostgresSessionStore,
     root: Uuid,
     children: &[Uuid],
 ) {
@@ -1577,7 +1571,7 @@ async fn bind_test_team(
         .workspace_store()
         .await
         .unwrap()
-        .expect("SQLite session store exposes the canonical workspace projection");
+        .expect("session store exposes the canonical workspace projection");
     let human = crate::local_human_participant_id("Human");
     workspace
         .ensure_execution_workspace(root, "test team", human, "Human", root, "Director")
@@ -1622,11 +1616,8 @@ fn child_identity_is_stable_and_inherits_execution_context() {
 async fn spawn_tool_reuses_a_compatible_ready_worker_for_a_new_task() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     let prompts = Arc::new(StdMutex::new(Vec::new()));
     let executor = RecordingPeerExecutor {
@@ -1699,17 +1690,15 @@ async fn spawn_tool_reuses_a_compatible_ready_worker_for_a_new_task() {
     assert!(prompts[1].contains("second bounded task"));
 
     coordinator.stop_all().await;
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn ensuring_a_sidecar_reuses_one_idle_provider_session() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     let mut root_launch = launch();
     root_launch.capabilities.multiplayer = false;
@@ -1760,17 +1749,15 @@ async fn ensuring_a_sidecar_reuses_one_idle_provider_session() {
         .unwrap();
     assert_eq!(resumed.session_id, first.session_id);
     coordinator.stop("/root/claude").await.unwrap();
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn rotating_a_sidecar_archives_the_old_identity_and_rebinds_the_lane() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     let mut root_launch = launch();
     root_launch.capabilities.multiplayer = false;
@@ -1828,17 +1815,15 @@ async fn rotating_a_sidecar_archives_the_old_identity_and_rebinds_the_lane() {
     assert_eq!(coordinator.list(None).await.len(), 2);
 
     coordinator.stop("/root/gpt").await.unwrap();
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn subagent_admission_rejects_a_provider_without_host_authentication() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     let mut root_launch = launch();
     let claude = root_launch
@@ -1873,17 +1858,15 @@ async fn subagent_admission_rejects_a_provider_without_host_authentication() {
         .to_string();
     assert!(error.contains("Claude cannot spawn"));
     assert!(error.contains("not authenticated"));
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn subagent_admission_rejects_an_exhausted_subscription() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     let mut root_launch = launch();
     let claude = root_launch
@@ -1926,17 +1909,15 @@ async fn subagent_admission_rejects_an_exhausted_subscription() {
         .to_string();
     assert!(error.contains("Claude cannot spawn"));
     assert!(error.contains("usage is exhausted"));
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn persistent_peer_consultation_reuses_the_sidecar_and_returns_to_the_primary() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     let prompts = Arc::new(StdMutex::new(Vec::new()));
     let executor = RecordingPeerExecutor {
@@ -1993,17 +1974,15 @@ async fn persistent_peer_consultation_reuses_the_sidecar_and_returns_to_the_prim
     assert!(prompts[2].contains("As the Claude primary"));
     coordinator.stop("/root/claude").await.unwrap();
     coordinator.stop("/root/gpt").await.unwrap();
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn canceled_peer_consultation_is_queued_privately_and_cannot_satisfy_the_next_call() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let first_started = Arc::new(tokio::sync::Notify::new());
@@ -2102,17 +2081,15 @@ async fn canceled_peer_consultation_is_queued_privately_and_cannot_satisfy_the_n
     assert_eq!(abandoned_result.delivery, PromptDelivery::Queue);
     assert!(abandoned_result.text.contains("original tool call ended"));
     coordinator.stop("/root/claude").await.unwrap();
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn persistent_peer_empty_turn_fails_at_its_correlated_completion_boundary() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     let mut root_launch = launch();
     root_launch.capabilities.multiplayer = false;
@@ -2137,6 +2114,7 @@ async fn persistent_peer_empty_turn_fails_at_its_correlated_completion_boundary(
     .to_string();
     assert!(error.contains("empty response"));
     coordinator.stop("/root/claude").await.unwrap();
+    scratch.discard().await;
 }
 
 #[test]
@@ -2237,11 +2215,8 @@ fn ready_children_do_not_consume_live_child_limit() {
 async fn child_messages_are_team_scoped_and_can_report_to_root() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
@@ -2309,17 +2284,15 @@ async fn child_messages_are_team_scoped_and_can_report_to_root() {
         .unwrap();
     assert_eq!(receipt["delivery_mode"], "boundary");
     assert!(wake.recv().await.unwrap().text.contains("explicit wake"));
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn durable_root_inbox_poll_replays_a_report_when_wake_delivery_was_missed() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
@@ -2366,17 +2339,15 @@ async fn durable_root_inbox_poll_replays_a_report_when_wake_delivery_was_missed(
     assert_eq!(wake.delivery, PromptDelivery::Steer);
     assert!(wake.text.contains("durable result"));
     assert!(coordinator.take_root_inbox().await.is_empty());
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn durable_root_wake_retries_after_the_receiver_is_lost() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
@@ -2416,17 +2387,15 @@ async fn durable_root_wake_retries_after_the_receiver_is_lost() {
     let message = wake.recv().await.unwrap();
     assert_eq!(message.delivery, PromptDelivery::Steer);
     assert!(message.text.contains("retry this report"));
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn sibling_messages_use_the_shared_team_directory() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
@@ -2487,7 +2456,7 @@ async fn sibling_messages_use_the_shared_team_directory() {
         .workspace_store()
         .await
         .unwrap()
-        .expect("SQLite session store exposes the canonical workspace projection");
+        .expect("session store exposes the canonical workspace projection");
     let binding = store
         .workspace_binding(recipient.session_id)
         .await
@@ -2515,6 +2484,7 @@ async fn sibling_messages_use_the_shared_team_directory() {
             .iter()
             .all(|message| message.message_id != broadcast.message_id)
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -2527,11 +2497,8 @@ async fn a_cross_participant_message_names_a_reply_target_the_recipient_can_reac
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
     let workspace_id = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store
         .create_session_in_workspace(first, workspace_id)
         .await
@@ -2591,6 +2558,7 @@ async fn a_cross_participant_message_names_a_reply_target_the_recipient_can_reac
     // The sender is still identified by its task name; only the reply
     // address changes.
     assert!(inbox.text.contains("Team message from /root:"));
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -2599,11 +2567,8 @@ async fn independent_sessions_share_workspace_broadcasts_exactly_once() {
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
     let workspace_id = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store
         .create_session_in_workspace(first, workspace_id)
         .await
@@ -2717,6 +2682,7 @@ async fn independent_sessions_share_workspace_broadcasts_exactly_once() {
             .iter()
             .any(|message| message.message_id == direct_id)
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -2730,11 +2696,8 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
     let directory = tempdir().unwrap();
     let sender = Uuid::new_v4();
     let recipient = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(sender).await.unwrap();
     store.create_session(recipient).await.unwrap();
     let workspace = store.workspace_store().await.unwrap().unwrap();
@@ -2995,17 +2958,15 @@ async fn explicitly_addressed_sessions_get_an_authorized_cross_workspace_channel
     assert_eq!(local_entry["local"], true);
     assert_eq!(local_entry["live"], cfg!(unix));
     assert_eq!(local_entry["workspace_name"], "recipient");
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn focused_human_prompt_and_recall_target_the_exact_child_actor() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
@@ -3104,17 +3065,15 @@ async fn focused_human_prompt_and_recall_target_the_exact_child_actor() {
     };
     assert_eq!(session_id, child.session_id);
     assert_eq!(recalled_id, Some(message_id));
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn broadcast_is_rejected_when_multiplayer_is_disabled() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     let mut disabled = launch();
     disabled.capabilities.multiplayer = false;
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
@@ -3132,6 +3091,7 @@ async fn broadcast_is_rejected_when_multiplayer_is_disabled() {
             .await
             .is_err()
     );
+    scratch.discard().await;
 }
 
 #[test]
@@ -3285,13 +3245,15 @@ fn persistent_peer_tool_is_root_only_and_not_recursive() {
 
 #[tokio::test]
 async fn shared_work_tools_are_idempotent_atomic_and_replayable() {
-    let directory = tempdir().unwrap();
     let workspace_id = Uuid::new_v4();
     let human_id = Uuid::new_v4();
     let agent_id = Uuid::new_v4();
-    let store = crate::SqliteWorkspaceStore::open(directory.path().join("sessions.sqlite3"))
+    let (scratch, session) = crate::session_store::postgres::testing::session_store().await;
+    let store = session
+        .workspace_store()
         .await
-        .unwrap();
+        .unwrap()
+        .expect("session store exposes the canonical workspace projection");
     store
         .ensure_execution_workspace(
             workspace_id,
@@ -3303,7 +3265,7 @@ async fn shared_work_tools_are_idempotent_atomic_and_replayable() {
         )
         .await
         .unwrap();
-    let tools = SharedWorkToolContext::new(std::sync::Arc::new(store), workspace_id, agent_id);
+    let tools = SharedWorkToolContext::new(store, workspace_id, agent_id);
 
     let create_args = json!({
         "title": "Verify boundary delivery",
@@ -3366,6 +3328,7 @@ async fn shared_work_tools_are_idempotent_atomic_and_replayable() {
     assert_eq!(events[0]["kind"]["type"], "work_created");
     assert_eq!(events[1]["kind"]["type"], "work_claimed");
     assert_eq!(events[2]["kind"]["type"], "review_requested");
+    scratch.discard().await;
 }
 
 #[test]
@@ -3527,11 +3490,8 @@ async fn durable_parent_activity_restores_child_topology() {
             event: None,
         },
     );
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
@@ -3622,6 +3582,7 @@ async fn durable_parent_activity_restores_child_topology() {
     );
     coordinator.restore_from_events(&[receipt]).await.unwrap();
     assert!(coordinator.root_message_is_projected(message_id).await);
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -3656,11 +3617,8 @@ async fn restore_mirrors_a_child_stop_journaled_before_the_parent_crashed() {
         },
     );
     let child_path = child_lock_path(directory.path(), child_id);
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     store.append(parent_event.clone()).await.unwrap();
     store.create_session(child_id).await.unwrap();
@@ -3716,6 +3674,7 @@ async fn restore_mirrors_a_child_stop_journaled_before_the_parent_crashed() {
         .unwrap()
         .expect("a reconciled stopped child remains dormant");
     drop(idle_writer);
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -3750,11 +3709,8 @@ async fn restored_live_child_stays_dormant_and_stops_with_its_root() {
             event: None,
         },
     );
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     store.append(parent_event.clone()).await.unwrap();
     store.create_session(child_id).await.unwrap();
@@ -3846,6 +3802,7 @@ async fn restored_live_child_stays_dormant_and_stops_with_its_root() {
         .unwrap()
         .expect("root stop must release the child writer");
     drop(released_writer);
+    scratch.discard().await;
 }
 
 #[test]
@@ -4038,11 +3995,8 @@ async fn computer_use_live_desktop_clients() {
 async fn acknowledging_an_already_admitted_team_message_is_idempotent() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(root).await.unwrap();
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
@@ -4125,6 +4079,7 @@ async fn acknowledging_an_already_admitted_team_message_is_idempotent() {
         .acknowledge_message_for_session(worker.session_id, message_id)
         .await
         .expect("acknowledgement must be idempotent");
+    scratch.discard().await;
 }
 
 /// Failure mode: the sender wrote `BORG_AGENT_TOOL_PROVIDER` in kebab-case while

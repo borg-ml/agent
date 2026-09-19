@@ -2852,7 +2852,7 @@ impl SubagentCoordinator {
         self.workspace_store
             .get_or_try_init(|| async {
                 self.store.workspace_store().await?.with_context(
-                    || "subagent multiplayer requires the canonical SQLite workspace projection",
+                    || "subagent multiplayer requires the canonical workspace projection",
                 )
             })
             .await

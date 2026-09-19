@@ -9,7 +9,42 @@ use tokio::sync::Notify;
 use borg_provider::ProviderCallUsage;
 
 use super::*;
-use crate::{AgentCompaction, AgentTurnResult, CodingProvider, PermissionMode};
+use crate::{
+    AgentCompaction, AgentTurnResult, CodingProvider, LocalAgentTurnExecutor, PermissionMode,
+    PostgresSessionStore,
+};
+
+/// Run the canonical session actor against a caller-owned Postgres store.
+///
+/// The path-based entry points are gone with the file-backed store: a filesystem
+/// path no longer implies a store. Tests therefore own the store, and this
+/// mirrors what the removed wrapper did around the writer lease so the call
+/// sites keep reading as "run the actor over this journal".
+async fn run_session_actor(
+    lock_path: &std::path::Path,
+    session_id: Uuid,
+    launch: LaunchSession,
+    commands: mpsc::Receiver<HostCommand>,
+    events: mpsc::Sender<SessionEvent>,
+    executor: Arc<dyn AgentTurnExecutor>,
+    store: Arc<dyn SessionStore>,
+) -> anyhow::Result<()> {
+    let writer = SessionWriterLease::acquire(lock_path)?;
+    let session_root = lock_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    run_agent_session_with_store_and_writer(
+        session_root,
+        session_id,
+        launch,
+        commands,
+        events,
+        executor,
+        store,
+        writer,
+    )
+    .await
+}
 
 type RecordedTurns = Arc<Mutex<Vec<(PathBuf, Option<serde_json::Value>)>>>;
 type RecordedPromptTurns = Arc<Mutex<Vec<(String, Vec<PathBuf>)>>>;
@@ -49,12 +84,9 @@ async fn aborting_session_cancels_its_provider_turn_and_action_heartbeat() {
     let root_path = root.path().to_path_buf();
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
-    let sqlite = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
-    let store: Arc<dyn SessionStore> = sqlite.clone();
+    let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+    let postgres = Arc::new(postgres);
+    let store: Arc<dyn SessionStore> = postgres.clone();
     let writer =
         SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
     let (_commands, command_rx) = mpsc::channel(8);
@@ -96,7 +128,7 @@ async fn aborting_session_cancels_its_provider_turn_and_action_heartbeat() {
     tokio::time::timeout(Duration::from_secs(5), started.notified())
         .await
         .unwrap();
-    let before = sqlite
+    let before = postgres
         .action(session_id, message_id)
         .await
         .unwrap()
@@ -113,7 +145,7 @@ async fn aborting_session_cancels_its_provider_turn_and_action_heartbeat() {
             .is_some()
     );
     tokio::time::sleep(Duration::from_secs(16)).await;
-    let after = sqlite
+    let after = postgres
         .action(session_id, message_id)
         .await
         .unwrap()
@@ -122,7 +154,7 @@ async fn aborting_session_cancels_its_provider_turn_and_action_heartbeat() {
         after.lease_heartbeat_at, before.lease_heartbeat_at,
         "an abandoned actor must not keep renewing its action lease"
     );
-    let recovered = sqlite
+    let recovered = postgres
         .recover_expired_actions(session_id, Utc::now() + chrono::Duration::seconds(120), 8)
         .await
         .unwrap();
@@ -131,6 +163,7 @@ async fn aborting_session_cancels_its_provider_turn_and_action_heartbeat() {
             .iter()
             .any(|action| action.action_id == message_id)
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -185,6 +218,9 @@ async fn session_generation_waits_on_silence_and_resumes_without_exposing_fragme
     }
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(128);
     let resume = Arc::new(Notify::new());
@@ -193,8 +229,9 @@ async fn session_generation_waits_on_silence_and_resumes_without_exposing_fragme
         resume: resume.clone(),
         finish: finish.clone(),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &root.path().join("session.lock"),
             session_id,
             LaunchSession {
@@ -216,6 +253,7 @@ async fn session_generation_waits_on_silence_and_resumes_without_exposing_fragme
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -259,6 +297,7 @@ async fn session_generation_waits_on_silence_and_resumes_without_exposing_fragme
         .unwrap()
         .unwrap()
         .unwrap();
+    scratch.discard().await;
 }
 
 fn subscription_prompt_ends_with(prompt: &str, text: &str) -> bool {
@@ -373,26 +412,25 @@ fn provider_event_batch_coalescing_preserves_text_and_boundaries() {
     ));
 }
 
-async fn sqlite_runtime_store(
-    root: &tempfile::TempDir,
+async fn runtime_store(
     session_id: Uuid,
-) -> (Arc<dyn SessionStore>, RuntimeSessionStore) {
-    let sqlite = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
-    sqlite.create_session(session_id).await.unwrap();
-    let store: Arc<dyn SessionStore> = sqlite;
+) -> (
+    crate::session_store::postgres::testing::ScratchDatabase,
+    Arc<dyn SessionStore>,
+    RuntimeSessionStore,
+) {
+    let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+    let postgres = Arc::new(postgres);
+    postgres.create_session(session_id).await.unwrap();
+    let store: Arc<dyn SessionStore> = postgres;
     let runtime = RuntimeSessionStore::new(Arc::clone(&store), Vec::new(), true);
-    (store, runtime)
+    (scratch, store, runtime)
 }
 
 #[tokio::test]
 async fn accepted_steers_settle_in_fifo_order_when_acknowledgements_arrive_out_of_order() {
-    let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let (_store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+    let (scratch, _store, mut journal) = runtime_store(session_id).await;
     let (events, mut event_rx) = mpsc::channel(8);
     let first_id = Uuid::new_v4();
     let second_id = Uuid::new_v4();
@@ -464,6 +502,7 @@ async fn accepted_steers_settle_in_fifo_order_when_acknowledgements_arrive_out_o
         ]
     );
     assert!(pending_steers.is_empty());
+    scratch.discard().await;
 }
 
 #[test]
@@ -498,9 +537,8 @@ fn structured_claude_result_terminations_classify_without_prose() {
 
 #[tokio::test]
 async fn claude_steers_stay_pending_input_until_the_cli_reports_consumption() {
-    let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let (_store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+    let (scratch, _store, mut journal) = runtime_store(session_id).await;
     let (events, mut event_rx) = mpsc::channel(16);
     let consumed_id = Uuid::new_v4();
     let leftover_id = Uuid::new_v4();
@@ -603,17 +641,15 @@ async fn claude_steers_stay_pending_input_until_the_cli_reports_consumption() {
             (leftover_id, MessageStatus::Complete),
         ]
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn durable_session_events_project_once_into_the_bound_workspace() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let session_store = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, session_store) = crate::session_store::postgres::testing::session_store().await;
+    let session_store = Arc::new(session_store);
     session_store.create_session(session_id).await.unwrap();
     let binding = session_store
         .workspace_binding(session_id)
@@ -801,17 +837,14 @@ async fn durable_session_events_project_once_into_the_bound_workspace() {
             ..
         } if projected_session == session_id && session_event_id == queued.id
     ));
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn pending_prompt_admission_does_not_wait_for_workspace_repair() {
-    let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let session_store = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, session_store) = crate::session_store::postgres::testing::session_store().await;
+    let session_store = Arc::new(session_store);
     session_store.create_session(session_id).await.unwrap();
     let binding = session_store
         .workspace_binding(session_id)
@@ -877,17 +910,14 @@ async fn pending_prompt_admission_does_not_wait_for_workspace_repair() {
     })
     .await
     .expect("deferred repair must still project the queued prompt");
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn projection_delivery_failure_is_durable_and_does_not_fail_the_session_append() {
-    let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let session_store = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, session_store) = crate::session_store::postgres::testing::session_store().await;
+    let session_store = Arc::new(session_store);
     session_store.create_session(session_id).await.unwrap();
     let projection = WorkspaceProjection::new(
         session_store.workspace_store().await.unwrap().unwrap(),
@@ -931,6 +961,7 @@ async fn projection_delivery_failure_is_durable_and_does_not_fail_the_session_ap
             if message.contains("workspace projection delivery failed")
                 && message.contains("sequence 1")
     )));
+    scratch.discard().await;
 }
 
 /// A rewind forks the session into the parent's workspace under a brand new
@@ -939,13 +970,9 @@ async fn projection_delivery_failure_is_durable_and_does_not_fail_the_session_ap
 /// participant was never an audience of.
 #[tokio::test]
 async fn a_forked_session_never_reprojects_the_inherited_ancestry() {
-    let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let session_store = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, session_store) = crate::session_store::postgres::testing::session_store().await;
+    let session_store = Arc::new(session_store);
     session_store.create_session(session_id).await.unwrap();
     let binding = session_store
         .workspace_binding(session_id)
@@ -1117,6 +1144,7 @@ async fn a_forked_session_never_reprojects_the_inherited_ancestry() {
             .unwrap()
             .is_none()
     );
+    scratch.discard().await;
 }
 
 struct RecordingExecutor {
@@ -2100,6 +2128,9 @@ async fn empty_provider_response_retries_without_losing_user_prompt() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -2109,11 +2140,12 @@ async fn empty_provider_response_retries_without_losing_user_prompt() {
         calls: Arc::clone(&calls),
         prompts: Arc::clone(&prompts),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = journal_path.clone();
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -2135,6 +2167,7 @@ async fn empty_provider_response_retries_without_losing_user_prompt() {
                 command_rx,
                 event_tx,
                 executor,
+                actor_store,
             )
             .await
         }
@@ -2182,7 +2215,7 @@ async fn empty_provider_response_retries_without_losing_user_prompt() {
         .unwrap();
     actor.await.unwrap().unwrap();
 
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
         .await
         .unwrap();
     let action = store.action(session_id, message_id).await.unwrap().unwrap();
@@ -2209,12 +2242,16 @@ async fn empty_provider_response_retries_without_losing_user_prompt() {
         ]
     );
     assert_eq!(prompts.lock().unwrap().len(), 2);
+    scratch.discard().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn usage_limited_prompt_resumes_automatically_after_the_retry_delay() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -2224,11 +2261,12 @@ async fn usage_limited_prompt_resumes_automatically_after_the_retry_delay() {
         side_effects_before_limit: false,
         prompts: Arc::default(),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = root.path().join("session.lock");
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -2250,6 +2288,7 @@ async fn usage_limited_prompt_resumes_automatically_after_the_retry_delay() {
                 command_rx,
                 event_tx,
                 executor,
+                actor_store,
             )
             .await
         }
@@ -2279,7 +2318,7 @@ async fn usage_limited_prompt_resumes_automatically_after_the_retry_delay() {
     actor.await.unwrap().unwrap();
     assert_eq!(calls.load(Ordering::Acquire), 2);
 
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
         .await
         .unwrap();
     assert_eq!(
@@ -2291,12 +2330,16 @@ async fn usage_limited_prompt_resumes_automatically_after_the_retry_delay() {
             .state,
         crate::SessionActionState::Completed
     );
+    scratch.discard().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn usage_limit_after_side_effects_continues_instead_of_replaying_the_prompt() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(256);
@@ -2307,11 +2350,12 @@ async fn usage_limit_after_side_effects_continues_instead_of_replaying_the_promp
         side_effects_before_limit: true,
         prompts: Arc::clone(&prompts),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = root.path().join("session.lock");
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -2333,6 +2377,7 @@ async fn usage_limit_after_side_effects_continues_instead_of_replaying_the_promp
                 command_rx,
                 event_tx,
                 executor,
+                actor_store,
             )
             .await
         }
@@ -2406,6 +2451,7 @@ async fn usage_limit_after_side_effects_continues_instead_of_replaying_the_promp
     assert!(prompts[0].contains("finish this task"));
     assert!(prompts[1].contains("Continue from exactly where it left off"));
     assert!(prompts[1].contains("finish this task"));
+    scratch.discard().await;
 }
 
 // Seed the crash boundary immediately after the atomic checkpoint, before
@@ -2438,9 +2484,9 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
             original.clone()
         };
         let deadline = Utc::now() + chrono::Duration::seconds(2);
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        store.create_session(session_id).await.unwrap();
         store.create_session(session_id).await.unwrap();
         for kind in [
             SessionEventKind::SessionStarted,
@@ -2549,8 +2595,9 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
             });
             let journal_path = root.path().join("session.lock");
             let cwd = root.path().to_path_buf();
+            let actor_store = Arc::clone(&store);
             let actor = tokio::spawn(async move {
-                run_agent_session_with_executor(
+                run_session_actor(
                     &journal_path,
                     session_id,
                     LaunchSession {
@@ -2572,6 +2619,7 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
                     command_rx,
                     event_tx,
                     executor,
+                    actor_store,
                 )
                 .await
             });
@@ -2646,6 +2694,7 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
         if !cancel {
             assert!(prompts[0].contains(&serde_json::to_string(&prompt.text).unwrap()));
         }
+        scratch.discard().await;
     }
 }
 
@@ -2653,6 +2702,9 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
 async fn queued_retry_can_be_recalled_while_waiting_without_later_delivery() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -2662,11 +2714,12 @@ async fn queued_retry_can_be_recalled_while_waiting_without_later_delivery() {
         side_effects_before_limit: false,
         prompts: Arc::default(),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = root.path().join("session.lock");
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -2688,6 +2741,7 @@ async fn queued_retry_can_be_recalled_while_waiting_without_later_delivery() {
                 command_rx,
                 event_tx,
                 executor,
+                actor_store,
             )
             .await
         }
@@ -2736,6 +2790,7 @@ async fn queued_retry_can_be_recalled_while_waiting_without_later_delivery() {
         .unwrap();
     actor.await.unwrap().unwrap();
     assert_eq!(calls.load(Ordering::Acquire), 1);
+    scratch.discard().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2744,6 +2799,9 @@ async fn ready_is_emitted_only_after_all_queued_turn_events_are_complete() {
     let journal_path = root.path().join("session.lock");
     let cwd = root.path().to_path_buf();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let initial_message_id = Uuid::new_v4();
     let queued_message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
@@ -2754,8 +2812,9 @@ async fn ready_is_emitted_only_after_all_queued_turn_events_are_complete() {
         first_started: Arc::clone(&first_started),
         release_first: Arc::clone(&release_first),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -2777,6 +2836,7 @@ async fn ready_is_emitted_only_after_all_queued_turn_events_are_complete() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -2908,6 +2968,7 @@ async fn ready_is_emitted_only_after_all_queued_turn_events_are_complete() {
         ready[0] > completed[1],
         "Ready must follow the final queued TurnCompleted event"
     );
+    scratch.discard().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2915,14 +2976,18 @@ async fn provider_setup_stall_has_a_durable_terminal_boundary() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = journal_path.clone();
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -2944,6 +3009,7 @@ async fn provider_setup_stall_has_a_durable_terminal_boundary() {
                 command_rx,
                 event_tx,
                 Arc::new(HungProviderExecutor),
+                actor_store,
             )
             .await
         }
@@ -2992,12 +3058,10 @@ async fn provider_setup_stall_has_a_durable_terminal_boundary() {
             && error.contains("liveness timeout while awaiting provider")
     )));
 
-    let durable = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-        .await
-        .unwrap()
-        .read(session_id)
+    let durable = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
         .await
         .unwrap();
+    let durable = durable.read(session_id).await.unwrap();
     assert!(durable.iter().any(|event| matches!(
         &event.kind,
         SessionEventKind::TurnCompleted {
@@ -3007,6 +3071,7 @@ async fn provider_setup_stall_has_a_durable_terminal_boundary() {
         } if *completed == message_id
             && error.contains("liveness timeout while awaiting provider")
     )));
+    scratch.discard().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3014,14 +3079,18 @@ async fn intermediate_narration_does_not_start_provider_drain_timeout() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = journal_path.clone();
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -3043,6 +3112,7 @@ async fn intermediate_narration_does_not_start_provider_drain_timeout() {
                 command_rx,
                 event_tx,
                 Arc::new(NarrationThenDelayedCompletionExecutor),
+                actor_store,
             )
             .await
         }
@@ -3089,6 +3159,7 @@ async fn intermediate_narration_does_not_start_provider_drain_timeout() {
         SessionEventKind::Error { message }
             if message.contains("provider draining")
     )));
+    scratch.discard().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3096,14 +3167,18 @@ async fn executor_ready_has_a_bounded_provider_drain() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = journal_path.clone();
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -3125,6 +3200,7 @@ async fn executor_ready_has_a_bounded_provider_drain() {
                 command_rx,
                 event_tx,
                 Arc::new(ReadyThenHungExecutor),
+                actor_store,
             )
             .await
         }
@@ -3191,6 +3267,7 @@ async fn executor_ready_has_a_bounded_provider_drain() {
             ..
         } if text == "final answer"
     )));
+    scratch.discard().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3199,6 +3276,9 @@ async fn idle_immediate_input_is_persisted_as_queue_before_turn_admission() {
     let journal_path = root.path().join("session.lock");
     let cwd = root.path().to_path_buf();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -3208,8 +3288,9 @@ async fn idle_immediate_input_is_persisted_as_queue_before_turn_admission() {
         seen: Arc::clone(&seen),
         called,
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -3231,6 +3312,7 @@ async fn idle_immediate_input_is_persisted_as_queue_before_turn_admission() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -3282,13 +3364,14 @@ async fn idle_immediate_input_is_persisted_as_queue_before_turn_admission() {
         .unwrap();
     actor.await.unwrap().unwrap();
 
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
         .await
         .unwrap();
     let action = store.action(session_id, message_id).await.unwrap().unwrap();
     assert_eq!(action.kind, crate::SessionActionKind::Prompt);
     assert_eq!(action.state, crate::SessionActionState::Completed);
     assert_eq!(seen.lock().unwrap().len(), 1);
+    scratch.discard().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3296,14 +3379,18 @@ async fn stopping_an_active_turn_marks_its_prompt_failed() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = journal_path.clone();
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -3325,6 +3412,7 @@ async fn stopping_an_active_turn_marks_its_prompt_failed() {
                 command_rx,
                 event_tx,
                 Arc::new(HungProviderExecutor),
+                actor_store,
             )
             .await
         }
@@ -3385,12 +3473,10 @@ async fn stopping_an_active_turn_marks_its_prompt_failed() {
         } if *event_message_id == message_id && error == "session stopped during turn"
     )));
 
-    let durable = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-        .await
-        .unwrap()
-        .read(session_id)
+    let durable = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
         .await
         .unwrap();
+    let durable = durable.read(session_id).await.unwrap();
     assert!(durable.iter().any(|event| matches!(
         &event.kind,
         SessionEventKind::Message {
@@ -3399,6 +3485,7 @@ async fn stopping_an_active_turn_marks_its_prompt_failed() {
             ..
         } if *event_message_id == message_id
     )));
+    scratch.discard().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3410,15 +3497,14 @@ async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
     let (command_tx, command_rx) = mpsc::channel(2);
     let (event_tx, event_rx) = mpsc::channel(1);
     drop(event_rx);
-    let session_store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, session_store) = crate::session_store::postgres::testing::session_store().await;
     session_store.create_session(session_id).await.unwrap();
     let (actor_result_tx, mut actor_result_rx) = tokio::sync::oneshot::channel();
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let cwd = root.path().to_path_buf();
         async move {
-            let result = run_agent_session_with_executor(
+            let result = run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -3440,6 +3526,7 @@ async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
                 command_rx,
                 event_tx,
                 Arc::new(HungProviderExecutor),
+                actor_store,
             )
             .await;
             let _ = actor_result_tx.send(result.as_ref().map(|_| ()).map_err(ToString::to_string));
@@ -3522,6 +3609,7 @@ async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
             ..
         })
     ));
+    scratch.discard().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3529,6 +3617,9 @@ async fn all_queued_prompts_can_be_recalled_at_the_turn_completion_boundary() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let queued_message_ids = [Uuid::new_v4(), Uuid::new_v4()];
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -3540,8 +3631,9 @@ async fn all_queued_prompts_can_be_recalled_at_the_turn_completion_boundary() {
         first_started: Arc::clone(&first_started),
         release_first: Arc::clone(&release_first),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -3563,6 +3655,7 @@ async fn all_queued_prompts_can_be_recalled_at_the_turn_completion_boundary() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -3649,6 +3742,7 @@ async fn all_queued_prompts_can_be_recalled_at_the_turn_completion_boundary() {
                 Vec::new()
             )]
         );
+    scratch.discard().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3656,8 +3750,10 @@ async fn recalled_queue_prompt_is_not_started_after_the_pre_turn_handoff() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let queued_message_id = Uuid::new_v4();
-    let session_db_path = root.path().join("sessions.sqlite3");
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel::<SessionEvent>(64);
     let turns = Arc::new(Mutex::new(Vec::new()));
@@ -3704,8 +3800,9 @@ async fn recalled_queue_prompt_is_not_started_after_the_pre_turn_handoff() {
             }
         }
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -3727,6 +3824,7 @@ async fn recalled_queue_prompt_is_not_started_after_the_pre_turn_handoff() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -3784,7 +3882,9 @@ async fn recalled_queue_prompt_is_not_started_after_the_pre_turn_handoff() {
     collector.await.unwrap();
 
     assert_eq!(turns.lock().unwrap().len(), 1);
-    let store = SqliteSessionStore::open(session_db_path).await.unwrap();
+    let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+        .await
+        .unwrap();
     assert_eq!(
         store
             .action(session_id, queued_message_id)
@@ -3808,6 +3908,7 @@ async fn recalled_queue_prompt_is_not_started_after_the_pre_turn_handoff() {
                 } if message_id == queued_message_id
             ))
     );
+    scratch.discard().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -3815,6 +3916,9 @@ async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() 
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let queued_message_ids = [Uuid::new_v4(), Uuid::new_v4()];
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -3826,8 +3930,9 @@ async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() 
         first_started: Arc::clone(&first_started),
         release_first: Arc::clone(&release_first),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -3849,6 +3954,7 @@ async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() 
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -3929,6 +4035,7 @@ async fn multiple_queue_mode_prompts_drain_fifo_after_a_natural_turn_boundary() 
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -3969,6 +4076,9 @@ async fn assert_interrupted_fifo(
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(128);
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -3980,8 +4090,9 @@ async fn assert_interrupted_fifo(
         provider_sessions: Arc::clone(&provider_sessions),
         called: Arc::clone(&called),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -4003,6 +4114,7 @@ async fn assert_interrupted_fifo(
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -4117,6 +4229,7 @@ third"
             "interrupting a Codex turn must preserve its provider thread"
         );
     }
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -4124,6 +4237,9 @@ async fn user_stop_gate_holds_background_turns_until_a_human_prompt() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let (command_tx, command_rx) = mpsc::channel(16);
     let (event_tx, mut event_rx) = mpsc::channel(256);
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -4135,8 +4251,9 @@ async fn user_stop_gate_holds_background_turns_until_a_human_prompt() {
         provider_sessions: Arc::clone(&provider_sessions),
         called: Arc::clone(&called),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -4158,6 +4275,7 @@ async fn user_stop_gate_holds_background_turns_until_a_human_prompt() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -4306,6 +4424,7 @@ async fn user_stop_gate_holds_background_turns_until_a_human_prompt() {
         )),
         "the held team report is settled visible before the human resumes"
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -4314,9 +4433,9 @@ async fn user_stop_gate_is_re_engaged_from_durable_state_after_actor_restart() {
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
     let first_id = Uuid::new_v4();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     store.create_session(session_id).await.unwrap();
     // A prior actor generation ran a turn and then the human pressed Escape.
     for kind in [
@@ -4379,8 +4498,9 @@ async fn user_stop_gate_is_re_engaged_from_durable_state_after_actor_restart() {
         provider_sessions: Arc::clone(&provider_sessions),
         called: Arc::clone(&called),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -4402,6 +4522,7 @@ async fn user_stop_gate_is_re_engaged_from_durable_state_after_actor_restart() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -4462,6 +4583,7 @@ async fn user_stop_gate_is_re_engaged_from_durable_state_after_actor_restart() {
         &event.kind,
         SessionEventKind::UserStopChanged { engaged: false }
     )));
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -4478,6 +4600,9 @@ async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
     let started = Arc::new(Notify::new());
@@ -4490,8 +4615,9 @@ async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
         release_cleanup: Arc::clone(&release_cleanup),
         cleanup_calls: AtomicUsize::new(0),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -4513,6 +4639,7 @@ async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -4582,6 +4709,7 @@ async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -4589,6 +4717,9 @@ async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, _event_rx) = mpsc::channel(32);
     let turns = Arc::new(Mutex::new(Vec::new()));
@@ -4601,8 +4732,9 @@ async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
         turn_started: Arc::clone(&turn_started),
         steer_seen: Arc::clone(&steer_seen),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -4624,6 +4756,7 @@ async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -4684,6 +4817,7 @@ async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
         "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"inspect this [Image 1]\",\"role\":\"user\"}</borg-message>"
     );
     assert_eq!(turns[1].1, [image]);
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -4691,6 +4825,9 @@ async fn accepted_codex_steer_is_settled_before_turn_is_interrupted() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let followup_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -4700,8 +4837,9 @@ async fn accepted_codex_steer_is_settled_before_turn_is_interrupted() {
         turn_started: Arc::clone(&turn_started),
         steer_accepted: Arc::clone(&steer_accepted),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -4723,6 +4861,7 @@ async fn accepted_codex_steer_is_settled_before_turn_is_interrupted() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -4795,6 +4934,7 @@ async fn accepted_codex_steer_is_settled_before_turn_is_interrupted() {
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -4802,6 +4942,9 @@ async fn escape_flush_keeps_the_turn_running_after_admission_and_steers_queued_i
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let admitted_id = Uuid::new_v4();
     let queued_ids = [Uuid::new_v4(), Uuid::new_v4()];
     let (command_tx, command_rx) = mpsc::channel(16);
@@ -4816,8 +4959,9 @@ async fn escape_flush_keeps_the_turn_running_after_admission_and_steers_queued_i
         steer_seen: Arc::clone(&steer_seen),
         interrupted: Arc::clone(&interrupted),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -4839,6 +4983,7 @@ async fn escape_flush_keeps_the_turn_running_after_admission_and_steers_queued_i
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -4978,6 +5123,7 @@ async fn escape_flush_keeps_the_turn_running_after_admission_and_steers_queued_i
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -4985,6 +5131,9 @@ async fn accepted_claude_steer_is_settled_before_turn_is_interrupted() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let followup_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -4994,8 +5143,9 @@ async fn accepted_claude_steer_is_settled_before_turn_is_interrupted() {
         turn_started: Arc::clone(&turn_started),
         steer_accepted: Arc::clone(&steer_accepted),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -5017,6 +5167,7 @@ async fn accepted_claude_steer_is_settled_before_turn_is_interrupted() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -5096,6 +5247,7 @@ async fn accepted_claude_steer_is_settled_before_turn_is_interrupted() {
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -5103,6 +5255,9 @@ async fn rejected_codex_steer_retries_at_the_next_tool_boundary() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let followup_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
@@ -5116,8 +5271,9 @@ async fn rejected_codex_steer_retries_at_the_next_tool_boundary() {
         release_tool_boundary: Arc::clone(&release_tool_boundary),
         retry_accepted: Arc::clone(&retry_accepted),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -5139,6 +5295,7 @@ async fn rejected_codex_steer_retries_at_the_next_tool_boundary() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -5223,6 +5380,7 @@ async fn rejected_codex_steer_retries_at_the_next_tool_boundary() {
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -5287,11 +5445,15 @@ async fn compaction_defers_steers_preserves_next_attachments_and_respects_stop()
             let root = tempdir().unwrap();
             let journal_path = root.path().join("session.lock");
             let session_id = Uuid::new_v4();
+            let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+            let store: Arc<dyn SessionStore> = Arc::new(store);
+            store.create_session(session_id).await.unwrap();
             let (command_tx, command_rx) = mpsc::channel(8);
             let (event_tx, mut event_rx) = mpsc::channel(128);
             let (turn_tx, mut turns) = mpsc::channel(8);
+            let actor_store = Arc::clone(&store);
             let actor = tokio::spawn(async move {
-                run_agent_session_with_executor(
+                run_session_actor(
                     &journal_path,
                     session_id,
                     LaunchSession {
@@ -5313,6 +5475,7 @@ async fn compaction_defers_steers_preserves_next_attachments_and_respects_stop()
                     command_rx,
                     event_tx,
                     Arc::new(ControlledExecutor(turn_tx)),
+                    actor_store,
                 )
                 .await
             });
@@ -5459,6 +5622,7 @@ async fn compaction_defers_steers_preserves_next_attachments_and_respects_stop()
                 .await
                 .unwrap();
             actor.await.unwrap().unwrap();
+            scratch.discard().await;
         }
     }
 }
@@ -5468,6 +5632,9 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(32);
     let turns = Arc::new(Mutex::new(Vec::new()));
@@ -5478,8 +5645,9 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
         turn_started: Arc::clone(&turn_started),
         steer_seen: Arc::clone(&steer_seen),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -5501,6 +5669,7 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -5596,6 +5765,7 @@ async fn unacknowledged_steer_does_not_block_interrupt_or_fifo_fallback() {
             (MessageStatus::Complete, PromptDelivery::Queue),
         ]
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -5603,6 +5773,9 @@ async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(32);
     let turns = Arc::new(Mutex::new(Vec::new()));
@@ -5613,8 +5786,9 @@ async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
         turn_started: Arc::clone(&turn_started),
         steer_seen: Arc::clone(&steer_seen),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -5636,6 +5810,7 @@ async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -5700,6 +5875,7 @@ async fn recalling_unacknowledged_active_steer_emits_prompt_recalled() {
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -5708,6 +5884,9 @@ async fn session_semantics_are_independent_of_turn_execution_location() {
     let journal_path = root.path().join("session.lock");
     std::fs::create_dir_all(root.path().join("managed-workspace")).unwrap();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let (command_tx, command_rx) = mpsc::channel(2);
     let (event_tx, mut event_rx) = mpsc::channel(16);
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -5732,14 +5911,16 @@ async fn session_semantics_are_independent_of_turn_execution_location() {
         extension_skill_roots: Vec::new(),
         team_policy: None,
     };
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             launch,
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -5814,6 +5995,7 @@ async fn session_semantics_are_independent_of_turn_execution_location() {
     }
     assert!(observed_managed_response);
     assert!(observed_turn_completion);
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -5821,6 +6003,9 @@ async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() 
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
     let seen = Arc::new(Mutex::new(Vec::new()));
@@ -5829,10 +6014,11 @@ async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() 
         seen: Arc::clone(&seen),
         compacted: Arc::clone(&compacted),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -5854,6 +6040,7 @@ async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() 
                 command_rx,
                 event_tx,
                 executor,
+                actor_store,
             )
             .await
         }
@@ -5966,6 +6153,7 @@ async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() 
                 ),
             ]
         );
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -5973,14 +6161,18 @@ async fn clear_context_starts_the_next_turn_without_provider_or_retained_context
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(32);
     let seen = Arc::new(Mutex::new(Vec::new()));
     let executor = Arc::new(ContextRecordingExecutor {
         seen: Arc::clone(&seen),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -6002,6 +6194,7 @@ async fn clear_context_starts_the_next_turn_without_provider_or_retained_context
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -6068,6 +6261,7 @@ async fn clear_context_starts_the_next_turn_without_provider_or_retained_context
                 ),
             ]
         );
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -6083,7 +6277,10 @@ async fn fresh_idle_session_has_one_durable_lifecycle() {
         .unwrap();
     drop(command_tx);
 
-    run_agent_session(
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    run_session_actor(
         &journal_path,
         session_id,
         LaunchSession {
@@ -6104,6 +6301,8 @@ async fn fresh_idle_session_has_one_durable_lifecycle() {
         },
         command_rx,
         event_tx,
+        Arc::new(LocalAgentTurnExecutor::default()),
+        Arc::clone(&store),
     )
     .await
     .unwrap();
@@ -6136,12 +6335,10 @@ async fn fresh_idle_session_has_one_durable_lifecycle() {
             ..
         }
     ));
-    let journal_events = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-        .await
-        .unwrap()
-        .read(session_id)
+    let journal_events = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
         .await
         .unwrap();
+    let journal_events = journal_events.read(session_id).await.unwrap();
     assert_eq!(
         journal_events
             .iter()
@@ -6152,6 +6349,7 @@ async fn fresh_idle_session_has_one_durable_lifecycle() {
             .map(|event| (event.id, event.sequence))
             .collect::<Vec<_>>()
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -6162,12 +6360,9 @@ async fn durably_preadmitted_prompt_executes_once_after_actor_handoff() {
     let message_id = Uuid::new_v4();
     let writer =
         SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
-    let sqlite = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
-    let store: Arc<dyn SessionStore> = sqlite.clone();
+    let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+    let postgres = Arc::new(postgres);
+    let store: Arc<dyn SessionStore> = postgres.clone();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
     let called = Arc::new(Notify::new());
@@ -6299,19 +6494,17 @@ async fn durably_preadmitted_prompt_executes_once_after_actor_handoff() {
             .state,
         crate::SessionActionState::Completed
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
-async fn sqlite_store_runs_the_canonical_session_actor() {
+async fn the_session_store_runs_the_canonical_session_actor() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
     let writer =
         SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     let (command_tx, command_rx) = mpsc::channel(2);
     let (event_tx, mut event_rx) = mpsc::channel(8);
     command_tx
@@ -6368,19 +6561,17 @@ async fn sqlite_store_runs_the_canonical_session_actor() {
         store.state(session_id).await.unwrap().status,
         Some(SessionStatus::Stopped)
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
-async fn sqlite_autonomy_job_runs_through_the_session_turn_boundary() {
+async fn an_autonomy_job_runs_through_the_session_turn_boundary() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
     let writer =
         SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     let autonomy = store.autonomy_store().await.unwrap();
     let job = autonomy
         .enqueue(crate::EnqueueAutonomyJob {
@@ -6460,19 +6651,17 @@ async fn sqlite_autonomy_job_runs_through_the_session_turn_boundary() {
         .unwrap();
     actor.await.unwrap().unwrap();
     while event_rx.try_recv().is_ok() {}
+    scratch.discard().await;
 }
 
 #[tokio::test]
-async fn sqlite_blu_workflow_job_runs_without_blocking_the_session_actor() {
+async fn a_blu_workflow_job_runs_without_blocking_the_session_actor() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
     let writer =
         SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     let autonomy = store.autonomy_store().await.unwrap();
     let job = autonomy
         .enqueue(crate::EnqueueAutonomyJob {
@@ -6562,6 +6751,7 @@ async fn sqlite_blu_workflow_job_runs_without_blocking_the_session_actor() {
         .unwrap();
     actor.await.unwrap().unwrap();
     while event_rx.try_recv().is_ok() {}
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -6570,11 +6760,8 @@ async fn crash_reconciled_child_stop_is_durable_before_resumed_ready() {
     let session_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
     let cwd = root.path().to_path_buf();
-    let store = Arc::new(
-        crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     store.create_session(session_id).await.unwrap();
     for kind in [
         SessionEventKind::SessionStarted,
@@ -6729,16 +6916,20 @@ async fn crash_reconciled_child_stop_is_durable_before_resumed_ready() {
         .unwrap()
         .expect("crash reconciliation must not start the child actor");
     drop(idle_writer);
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn initial_mixed_provider_peer_starts_with_isolated_provider_configuration() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let writer =
         SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
     let store = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
             .await
             .unwrap(),
     );
@@ -6821,6 +7012,7 @@ async fn initial_mixed_provider_peer_starts_with_isolated_provider_configuration
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -6828,6 +7020,9 @@ async fn model_consultation_dispatches_a_freeform_briefing_to_an_isolated_provid
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let (command_tx, command_rx) = mpsc::channel(4);
     let (event_tx, _event_rx) = mpsc::channel(64);
     let seen_tool = Arc::new(Mutex::new(Vec::new()));
@@ -6857,14 +7052,16 @@ async fn model_consultation_dispatches_a_freeform_briefing_to_an_isolated_provid
         extension_skill_roots: Vec::new(),
         team_policy: None,
     };
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             launch,
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -6904,13 +7101,14 @@ async fn model_consultation_dispatches_a_freeform_briefing_to_an_isolated_provid
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn resuming_an_idle_goal_emits_starting_before_running() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let (store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+    let (scratch, store, mut journal) = runtime_store(session_id).await;
     let mut goal = SessionGoal::new("Keep going".to_string(), None);
     goal.status = GoalStatus::Paused;
     journal
@@ -6953,11 +7151,12 @@ async fn resuming_an_idle_goal_emits_starting_before_running() {
         seen: Arc::new(Mutex::new(Vec::new())),
         called: Arc::new(Notify::new()),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = root.path().join("session.lock");
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -6979,6 +7178,7 @@ async fn resuming_an_idle_goal_emits_starting_before_running() {
                 command_rx,
                 event_tx,
                 executor,
+                actor_store,
             )
             .await
         }
@@ -7036,6 +7236,7 @@ async fn resuming_an_idle_goal_emits_starting_before_running() {
         .unwrap()
         .unwrap();
     assert!(store.state(session_id).await.unwrap().goal.is_some());
+    scratch.discard().await;
 }
 
 /// A human resume that arrives while a turn is already running must release
@@ -7046,7 +7247,7 @@ async fn resuming_an_idle_goal_emits_starting_before_running() {
 async fn resuming_a_goal_mid_turn_releases_the_stop_latch() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let (store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+    let (scratch, store, mut journal) = runtime_store(session_id).await;
     let mut goal = SessionGoal::new("Keep going".to_string(), None);
     goal.status = GoalStatus::Paused;
     for event in [
@@ -7091,11 +7292,12 @@ async fn resuming_a_goal_mid_turn_releases_the_stop_latch() {
 
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(128);
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = root.path().join("session.lock");
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -7117,6 +7319,7 @@ async fn resuming_a_goal_mid_turn_releases_the_stop_latch() {
                 command_rx,
                 event_tx,
                 Arc::new(HungProviderExecutor),
+                actor_store,
             )
             .await
         }
@@ -7179,13 +7382,13 @@ async fn resuming_a_goal_mid_turn_releases_the_stop_latch() {
         .await
         .unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(2), actor).await;
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn goal_state_is_recoverable_from_the_session_journal() {
-    let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let (store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+    let (scratch, store, mut journal) = runtime_store(session_id).await;
     let (event_tx, mut event_rx) = mpsc::channel(16);
     let mut goal = None;
     let mut active_since = None;
@@ -7273,6 +7476,7 @@ async fn goal_state_is_recoverable_from_the_session_journal() {
             SessionEventKind::GoalCleared { .. }
         ]
     ));
+    scratch.discard().await;
 }
 
 #[test]
@@ -7288,9 +7492,8 @@ fn automatic_goal_continuation_supports_unbudgeted_goals() {
 
 #[tokio::test]
 async fn model_can_mark_an_active_goal_blocked() {
-    let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let (store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+    let (scratch, store, mut journal) = runtime_store(session_id).await;
     let (event_tx, _event_rx) = mpsc::channel(16);
     let mut goal = Some(SessionGoal::new("Need user input".to_string(), None));
     let mut active_since = Some(Instant::now());
@@ -7317,6 +7520,7 @@ async fn model_can_mark_an_active_goal_blocked() {
         store.state(session_id).await.unwrap().goal.unwrap().status,
         GoalStatus::Blocked
     );
+    scratch.discard().await;
 }
 
 #[test]
@@ -7403,9 +7607,8 @@ fn usage_limit_auto_resume_is_restricted_to_subscription_cli_providers() {
 
 #[tokio::test]
 async fn usage_limit_failure_stops_an_active_goal() {
-    let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let (store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+    let (scratch, store, mut journal) = runtime_store(session_id).await;
     let (event_tx, _event_rx) = mpsc::channel(16);
     let mut goal = Some(SessionGoal::new("Keep working".to_string(), None));
     let mut active_since = Some(Instant::now());
@@ -7429,6 +7632,7 @@ async fn usage_limit_failure_stops_an_active_goal() {
         store.state(session_id).await.unwrap().goal.unwrap().status,
         GoalStatus::UsageLimited
     );
+    scratch.discard().await;
 }
 
 #[test]
@@ -7747,9 +7951,8 @@ fn escape_batch_coalesces_queued_prompts_in_fifo_order() {
 
 #[tokio::test]
 async fn batched_prompt_status_settles_every_durable_message() {
-    let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let (_store, mut runtime) = sqlite_runtime_store(&root, session_id).await;
+    let (scratch, _store, mut runtime) = runtime_store(session_id).await;
     let (events, mut received) = mpsc::channel(16);
     let first_id = Uuid::new_v4();
     let second_id = Uuid::new_v4();
@@ -7796,6 +7999,7 @@ async fn batched_prompt_status_settles_every_durable_message() {
         }
     }
     assert_eq!(settled, [first_id, second_id, last_id]);
+    scratch.discard().await;
 }
 
 #[test]
@@ -7923,7 +8127,7 @@ fn resumed_team_backlog_is_deferred_behind_the_triggering_user_prompt() {
 async fn inactive_team_reports_settle_without_starting_a_provider_turn() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let (store, mut runtime) = sqlite_runtime_store(&root, session_id).await;
+    let (scratch, store, mut runtime) = runtime_store(session_id).await;
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let mut pending = VecDeque::from([QueuedPrompt {
         message_id: Uuid::new_v4(),
@@ -7966,13 +8170,14 @@ async fn inactive_team_reports_settle_without_starting_a_provider_turn() {
             .iter()
             .any(|event| { matches!(event.kind, SessionEventKind::TurnStarted { .. }) })
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn inactive_wake_report_is_retained_for_the_root_provider_turn() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let (_store, mut runtime) = sqlite_runtime_store(&root, session_id).await;
+    let (scratch, _store, mut runtime) = runtime_store(session_id).await;
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let message_id = Uuid::new_v4();
     let mut pending = VecDeque::from([QueuedPrompt {
@@ -8001,13 +8206,13 @@ async fn inactive_wake_report_is_retained_for_the_root_provider_turn() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].message_id, message_id);
     assert!(event_rx.try_recv().is_err());
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn turn_boundary_collects_all_emitted_prompts_before_escape() {
-    let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let (_store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+    let (scratch, _store, mut journal) = runtime_store(session_id).await;
     let (event_tx, _event_rx) = mpsc::channel(8);
     let (command_tx, mut command_rx) = mpsc::channel(8);
     let last_id = Uuid::new_v4();
@@ -8061,6 +8266,7 @@ async fn turn_boundary_collects_all_emitted_prompts_before_escape() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].message_id, last_id);
     assert_eq!(pending[0].text, "first follow-up\n\nsecond follow-up");
+    scratch.discard().await;
 }
 
 #[test]
@@ -8308,9 +8514,9 @@ async fn resumed_session_drains_unresolved_input_and_preserves_last_context_usag
     let session_id = Uuid::new_v4();
     let stale_id = Uuid::new_v4();
     let next_id = Uuid::new_v4();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     store.create_session(session_id).await.unwrap();
     for kind in [
         SessionEventKind::SessionStarted,
@@ -8361,12 +8567,13 @@ async fn resumed_session_drains_unresolved_input_and_preserves_last_context_usag
     let called = Arc::new(Notify::new());
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let root = root.path().to_path_buf();
         let seen = Arc::clone(&seen);
         let called = Arc::clone(&called);
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -8388,6 +8595,7 @@ async fn resumed_session_drains_unresolved_input_and_preserves_last_context_usag
                 command_rx,
                 event_tx,
                 Arc::new(RecordingExecutor { seen, called }),
+                actor_store,
             )
             .await
         }
@@ -8467,6 +8675,7 @@ async fn resumed_session_drains_unresolved_input_and_preserves_last_context_usag
             .state,
         crate::SessionActionState::Completed
     );
+    scratch.discard().await;
 }
 
 #[test]
@@ -10673,6 +10882,9 @@ async fn reusable_subscription_pool_does_not_compact_large_durable_replay() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let first_id = Uuid::new_v4();
     let second_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
@@ -10683,8 +10895,9 @@ async fn reusable_subscription_pool_does_not_compact_large_durable_replay() {
         prompt_lengths: Arc::clone(&prompt_lengths),
         called: Arc::clone(&called),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -10706,6 +10919,7 @@ async fn reusable_subscription_pool_does_not_compact_large_durable_replay() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -10771,6 +10985,7 @@ async fn reusable_subscription_pool_does_not_compact_large_durable_replay() {
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -10778,6 +10993,9 @@ async fn same_provider_model_switch_does_not_compact_reusable_context() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let first_id = Uuid::new_v4();
     let second_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
@@ -10788,8 +11006,9 @@ async fn same_provider_model_switch_does_not_compact_reusable_context() {
         prompt_lengths: Arc::clone(&prompt_lengths),
         called: Arc::clone(&called),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -10811,6 +11030,7 @@ async fn same_provider_model_switch_does_not_compact_reusable_context() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -10913,6 +11133,7 @@ async fn same_provider_model_switch_does_not_compact_reusable_context() {
     let prompt_lengths = prompt_lengths.lock().unwrap().clone();
     assert_eq!(prompt_lengths.len(), 2);
     assert!(prompt_lengths[1] < SUBSCRIPTION_INPUT_BUDGET_CHARS);
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -10922,9 +11143,9 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
     let session_id = Uuid::new_v4();
     let previous_id = Uuid::new_v4();
     let next_id = Uuid::new_v4();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     store.create_session(session_id).await.unwrap();
     for kind in [
         SessionEventKind::SessionStarted,
@@ -10992,8 +11213,9 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
         called: Arc::clone(&called),
         compaction_calls: Arc::clone(&compaction_calls),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -11015,6 +11237,7 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -11052,6 +11275,7 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
     assert_eq!(seen[0].1.as_deref(), Some("resumed-codex-thread"));
     assert_eq!(seen[0].2, None);
     assert_eq!(seen[0].3, 0);
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -11061,9 +11285,9 @@ async fn crash_resume_forks_the_last_completed_codex_turn_before_replaying_input
     let session_id = Uuid::new_v4();
     let completed_id = Uuid::new_v4();
     let interrupted_id = Uuid::new_v4();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     store.create_session(session_id).await.unwrap();
     for kind in [
         SessionEventKind::SessionStarted,
@@ -11155,8 +11379,9 @@ async fn crash_resume_forks_the_last_completed_codex_turn_before_replaying_input
         called: Arc::clone(&called),
         compaction_calls: Arc::clone(&compaction_calls),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -11178,6 +11403,7 @@ async fn crash_resume_forks_the_last_completed_codex_turn_before_replaying_input
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -11204,6 +11430,7 @@ async fn crash_resume_forks_the_last_completed_codex_turn_before_replaying_input
     assert_eq!(seen[0].1.as_deref(), Some("codex-thread-before-crash"));
     assert_eq!(seen[0].2.as_deref(), Some("codex-turn-before-crash"));
     assert_eq!(seen[0].3, 0);
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -11327,9 +11554,9 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
     assert!(!retained_before_crash.contains("old-user-context"));
     assert!(!retained_before_crash.contains("historical agent"));
 
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     store.create_session(session_id).await.unwrap();
     for event in before_crash {
         store.append(event).await.unwrap();
@@ -11345,8 +11572,9 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
         called: Arc::clone(&called),
         compaction_calls: Arc::clone(&compaction_calls),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -11368,6 +11596,7 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -11399,6 +11628,7 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
     assert_eq!(seen[0].1, None);
     assert_eq!(seen[0].2, None);
     assert_eq!(seen[0].3, 0);
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -11406,6 +11636,9 @@ async fn acknowledged_codex_escape_does_not_compact_a_reusable_large_context() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let first_id = Uuid::new_v4();
     let interrupted_id = Uuid::new_v4();
     let corrected_id = Uuid::new_v4();
@@ -11420,8 +11653,9 @@ async fn acknowledged_codex_escape_does_not_compact_a_reusable_large_context() {
         calls: AtomicUsize::new(0),
         compaction_calls: Arc::clone(&compaction_calls),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -11443,6 +11677,7 @@ async fn acknowledged_codex_escape_does_not_compact_a_reusable_large_context() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -11526,6 +11761,7 @@ async fn acknowledged_codex_escape_does_not_compact_a_reusable_large_context() {
                     == Some("provider_input_size")
     )));
     assert_eq!(prompt_lengths.lock().unwrap().len(), 3);
+    scratch.discard().await;
 }
 
 #[test]
@@ -11640,6 +11876,9 @@ async fn borg_tool_approvals_route_and_cancel_without_provider_controls() {
         let root = tempdir().unwrap();
         let journal_path = root.path().join("session.lock");
         let session_id = Uuid::new_v4();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        store.create_session(session_id).await.unwrap();
         let (command_tx, command_rx) = mpsc::channel(8);
         let (event_tx, mut event_rx) = mpsc::channel(256);
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -11648,8 +11887,9 @@ async fn borg_tool_approvals_route_and_cancel_without_provider_controls() {
             cancel: cancel.clone(),
             result: result.clone(),
         });
+        let actor_store = Arc::clone(&store);
         let actor = tokio::spawn(async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -11671,6 +11911,7 @@ async fn borg_tool_approvals_route_and_cancel_without_provider_controls() {
                 command_rx,
                 event_tx,
                 executor,
+                actor_store,
             )
             .await
         });
@@ -11769,14 +12010,14 @@ async fn borg_tool_approvals_route_and_cancel_without_provider_controls() {
             .await
             .unwrap();
         actor.await.unwrap().unwrap();
+        scratch.discard().await;
     }
 }
 
 #[tokio::test]
 async fn cancelling_a_turn_resolves_its_pending_approval_as_denied() {
-    let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let (_store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+    let (scratch, _store, mut journal) = runtime_store(session_id).await;
     let (events, mut event_rx) = mpsc::channel(4);
     let (response, receiver) = oneshot::channel();
     let mut pending = Some(PendingApproval {
@@ -11801,13 +12042,13 @@ async fn cancelling_a_turn_resolves_its_pending_approval_as_denied() {
             decision: crate::ApprovalDecision::Deny,
         } if approval_id == "approval-1"
     ));
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn cancelling_a_turn_resolves_its_pending_provider_interaction() {
-    let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
-    let (_store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+    let (scratch, _store, mut journal) = runtime_store(session_id).await;
     let (events, mut event_rx) = mpsc::channel(4);
     let mut pending = Some("interaction-1".to_string());
 
@@ -11824,6 +12065,7 @@ async fn cancelling_a_turn_resolves_its_pending_provider_interaction() {
             response: serde_json::Value::Null,
         } if interaction_id == "interaction-1"
     ));
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -11831,12 +12073,9 @@ async fn parent_journal_preserves_full_child_transcript_events() {
     let root = tempdir().unwrap();
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
-    let sqlite = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
-    sqlite.create_session(parent_id).await.unwrap();
+    let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+    let postgres = Arc::new(postgres);
+    postgres.create_session(parent_id).await.unwrap();
     let launch = LaunchSession {
         request_id: Uuid::new_v4(),
         cwd: root.path().to_path_buf(),
@@ -11859,7 +12098,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
         launch,
         16,
         Arc::new(LocalAgentTurnExecutor::default()),
-        sqlite.clone(),
+        postgres.clone(),
     )
     .unwrap();
     let snapshot = crate::SubagentSnapshot {
@@ -11890,8 +12129,8 @@ async fn parent_journal_preserves_full_child_transcript_events() {
         .await
         .unwrap();
 
-    let persisted = sqlite.clone();
-    let store: Arc<dyn SessionStore> = sqlite;
+    let persisted = postgres.clone();
+    let store: Arc<dyn SessionStore> = postgres;
     let mut journal = RuntimeSessionStore::new(store, Vec::new(), true);
     let (events, mut event_rx) = mpsc::channel(4);
     let child_event = SessionEvent::new(
@@ -12086,6 +12325,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
     .await
     .unwrap();
     assert!(event_rx.try_recv().is_err());
+    scratch.discard().await;
 }
 
 /// Streams durable events as fast as the channel accepts them and never
@@ -12150,6 +12390,9 @@ impl AgentTurnExecutor for FloodingExecutor {
 async fn interrupt_is_honoured_while_a_stalled_observer_backs_up_the_event_stream() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     // Deliberately never drained: models a wedged or far-behind observer.
@@ -12160,11 +12403,12 @@ async fn interrupt_is_honoured_while_a_stalled_observer_backs_up_the_event_strea
         aborted_at: Arc::clone(&aborted_at),
         sent: Arc::clone(&sent),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = root.path().join("session.lock");
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -12186,6 +12430,7 @@ async fn interrupt_is_honoured_while_a_stalled_observer_backs_up_the_event_strea
                 command_rx,
                 event_tx,
                 executor,
+                actor_store,
             )
             .await
         }
@@ -12255,6 +12500,7 @@ async fn interrupt_is_honoured_while_a_stalled_observer_backs_up_the_event_strea
         crate::session::LIVE_DELIVERY_BURSTS.load(std::sync::atomic::Ordering::Relaxed),
         crate::session::LIVE_DELIVERY_BLOCKED.load(std::sync::atomic::Ordering::Relaxed),
     );
+    scratch.discard().await;
 }
 
 struct NetworkThenSuccessExecutor {
@@ -12462,8 +12708,11 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
         let root = tempdir().unwrap();
         let session_id = Uuid::new_v4();
         let message_id = Uuid::new_v4();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        store.create_session(session_id).await.unwrap();
         if failures > 10 {
-            let (_store, mut journal) = sqlite_runtime_store(&root, session_id).await;
+            let mut journal = RuntimeSessionStore::new(Arc::clone(&store), Vec::new(), true);
             journal
                 .append(SessionEvent::new(
                     session_id,
@@ -12507,11 +12756,12 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
             error,
             failures,
         });
+        let actor_store = Arc::clone(&store);
         let actor = tokio::spawn({
             let journal_path = root.path().join("session.lock");
             let cwd = root.path().to_path_buf();
             async move {
-                run_agent_session_with_executor(
+                run_session_actor(
                     &journal_path,
                     session_id,
                     LaunchSession {
@@ -12533,6 +12783,7 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
                     command_rx,
                     event_tx,
                     executor,
+                    actor_store,
                 )
                 .await
             }
@@ -12611,7 +12862,7 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
         }
         assert_eq!(visible_errors, usize::from(failures >= expected_attempts));
 
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
             .await
             .unwrap();
         if failures > 10 {
@@ -12633,6 +12884,7 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
                 crate::SessionActionState::Completed
             }
         );
+        scratch.discard().await;
     }
 }
 
@@ -12676,6 +12928,9 @@ impl AgentTurnExecutor for MonitorWakeExecutor {
 async fn monitor_event_wakes_an_idle_session_without_an_active_goal() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -12683,11 +12938,12 @@ async fn monitor_event_wakes_an_idle_session_without_an_active_goal() {
     let executor = Arc::new(MonitorWakeExecutor {
         calls: Arc::clone(&calls),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = root.path().join("session.lock");
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -12709,6 +12965,7 @@ async fn monitor_event_wakes_an_idle_session_without_an_active_goal() {
                 command_rx,
                 event_tx,
                 executor,
+                actor_store,
             )
             .await
         }
@@ -12732,7 +12989,7 @@ async fn monitor_event_wakes_an_idle_session_without_an_active_goal() {
     actor.await.unwrap().unwrap();
     assert_eq!(calls.load(Ordering::Acquire), 2);
 
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
         .await
         .unwrap();
     assert_eq!(
@@ -12744,12 +13001,16 @@ async fn monitor_event_wakes_an_idle_session_without_an_active_goal() {
             .state,
         crate::SessionActionState::Completed
     );
+    scratch.discard().await;
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn escape_cancels_connection_retry_without_losing_the_prompt() {
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(128);
@@ -12759,11 +13020,12 @@ async fn escape_cancels_connection_retry_without_losing_the_prompt() {
         error: "Codex subscription authentication lookup unavailable",
         failures: 3,
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = root.path().join("session.lock");
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -12785,6 +13047,7 @@ async fn escape_cancels_connection_retry_without_losing_the_prompt() {
                 command_rx,
                 event_tx,
                 executor,
+                actor_store,
             )
             .await
         }
@@ -12817,7 +13080,7 @@ async fn escape_cancels_connection_retry_without_losing_the_prompt() {
     actor.await.unwrap().unwrap();
     assert_eq!(calls.load(Ordering::Acquire), 1);
 
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+    let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
         .await
         .unwrap();
     assert_eq!(
@@ -12829,14 +13092,12 @@ async fn escape_cancels_connection_retry_without_losing_the_prompt() {
             .state,
         crate::SessionActionState::Failed
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn imported_conversation_is_atomic_and_replays_both_sides_without_live_provider_state() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = SqliteSessionStore::open(directory.path().join("import.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
     let id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     let mut events = vec![
@@ -12898,6 +13159,7 @@ async fn imported_conversation_is_atomic_and_replays_both_sides_without_live_pro
     assert!(serialized.contains("Imported answer"));
     assert_eq!(replay.len(), 2);
     assert!(store.state(id).await.unwrap().provider_session_id.is_none());
+    scratch.discard().await;
 }
 
 struct RelayPromptExecutor {
@@ -12937,22 +13199,19 @@ async fn imported_relay_message_wakes_the_actor_as_system_provenance() {
     let session_id = Uuid::new_v4();
     let writer =
         SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
-    let sqlite = Arc::new(
-        SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
-    sqlite.create_session(session_id).await.unwrap();
-    let binding = sqlite
+    let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+    let postgres = Arc::new(postgres);
+    postgres.create_session(session_id).await.unwrap();
+    let binding = postgres
         .workspace_binding(session_id)
         .await
         .unwrap()
         .expect("a durable session is bound to its workspace participant");
-    let workspace = sqlite
+    let workspace = postgres
         .workspace_store()
         .await
         .unwrap()
-        .expect("SQLite session store exposes the canonical workspace projection");
+        .expect("session store exposes the canonical workspace projection");
     let human_id = crate::local_human_participant_id("Human");
     workspace
         .ensure_execution_workspace(
@@ -13000,7 +13259,7 @@ async fn imported_relay_message_wakes_the_actor_as_system_provenance() {
         format!("relay-message:{relay_message_id}")
     );
 
-    let store: Arc<dyn SessionStore> = sqlite.clone();
+    let store: Arc<dyn SessionStore> = postgres.clone();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(256);
     let seen: RecordedPromptTurns = Arc::new(Mutex::new(Vec::new()));
@@ -13146,6 +13405,7 @@ async fn imported_relay_message_wakes_the_actor_as_system_provenance() {
             .any(|(prompt, _)| prompt.contains("peer-instance")),
         "imported author attribution survives the relay import: {prompts:?}"
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -13598,14 +13858,18 @@ async fn a_provider_stall_is_visible_before_the_turn_fails() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = journal_path.clone();
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -13627,6 +13891,7 @@ async fn a_provider_stall_is_visible_before_the_turn_fails() {
                 command_rx,
                 event_tx,
                 Arc::new(ActiveThenSilentExecutor),
+                actor_store,
             )
             .await
         }
@@ -13685,6 +13950,7 @@ async fn a_provider_stall_is_visible_before_the_turn_fails() {
         stalled < failed,
         "the stall status must precede the terminal failure"
     );
+    scratch.discard().await;
 }
 
 struct InteractionThenHungExecutor;
@@ -13716,14 +13982,18 @@ async fn a_pending_provider_interaction_suspends_the_watchdog() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(64);
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = journal_path.clone();
         let cwd = root.path().to_path_buf();
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -13745,6 +14015,7 @@ async fn a_pending_provider_interaction_suspends_the_watchdog() {
                 command_rx,
                 event_tx,
                 Arc::new(InteractionThenHungExecutor),
+                actor_store,
             )
             .await
         }
@@ -13812,6 +14083,7 @@ async fn a_pending_provider_interaction_suspends_the_watchdog() {
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+    scratch.discard().await;
 }
 
 #[test]
@@ -14144,7 +14416,7 @@ fn interrupted_subscription_turn_keeps_its_delivered_output() {
 }
 
 /// Manual probe: replicate the live turn-start path against a real store.
-/// `BORG_PROBE_STORE=~/.borg/remote/sessions/sessions.sqlite3 BORG_PROBE_SESSION=<uuid> \
+/// `BORG_PROBE_STORE=postgres://localhost/borg_sessions BORG_PROBE_SESSION=<uuid> \
 ///  cargo test -p borg-agent-runtime --lib -- probe_live_store_recovery_projection --ignored --nocapture`
 #[tokio::test]
 #[ignore]
@@ -14156,7 +14428,9 @@ async fn probe_live_store_recovery_projection() {
         return;
     };
     let session_id: Uuid = session.parse().expect("session uuid");
-    let store = SqliteSessionStore::open(&path).await.expect("open store");
+    let store = PostgresSessionStore::connect_with_pool_size(&path, 2)
+        .await
+        .expect("open store");
     let recovery = store.recovery(session_id).await.expect("recovery");
     let events = &recovery.context_events;
     eprintln!(
@@ -14406,6 +14680,9 @@ async fn steer_in_flight_when_the_turn_ends_starts_a_new_turn() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let followup_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(256);
@@ -14419,8 +14696,9 @@ async fn steer_in_flight_when_the_turn_ends_starts_a_new_turn() {
         steer_taken: Arc::clone(&steer_taken),
         second_started: Arc::clone(&second_started),
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn(async move {
-        run_agent_session_with_executor(
+        run_session_actor(
             &journal_path,
             session_id,
             LaunchSession {
@@ -14442,6 +14720,7 @@ async fn steer_in_flight_when_the_turn_ends_starts_a_new_turn() {
             command_rx,
             event_tx,
             executor,
+            actor_store,
         )
         .await
     });
@@ -14523,6 +14802,7 @@ async fn steer_in_flight_when_the_turn_ends_starts_a_new_turn() {
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+    scratch.discard().await;
 }
 
 /// Build a workspace directed at `recipient` and return its stores plus a
@@ -14530,18 +14810,16 @@ async fn steer_in_flight_when_the_turn_ends_starts_a_new_turn() {
 async fn team_delivery_fixture(
     root: &std::path::Path,
 ) -> (
+    crate::session_store::postgres::testing::ScratchDatabase,
     Uuid,
-    Arc<SqliteSessionStore>,
+    Arc<PostgresSessionStore>,
     Arc<dyn WorkspaceStore>,
     crate::SessionWorkspaceBinding,
     WorkspaceProjection,
 ) {
     let session_id = Uuid::new_v4();
-    let session_store = Arc::new(
-        SqliteSessionStore::open(root.join("sessions.sqlite3"))
-            .await
-            .unwrap(),
-    );
+    let (scratch, session_store) = crate::session_store::postgres::testing::session_store().await;
+    let session_store = Arc::new(session_store);
     session_store.create_session(session_id).await.unwrap();
     let binding = session_store
         .workspace_binding(session_id)
@@ -14570,6 +14848,7 @@ async fn team_delivery_fixture(
         0,
     );
     (
+        scratch,
         session_id,
         session_store,
         workspace_store,
@@ -14659,7 +14938,7 @@ async fn delivery_state(
 #[tokio::test]
 async fn an_accepted_steer_settles_a_long_running_child_team_delivery() {
     let root = tempdir().unwrap();
-    let (session_id, session_store, workspace_store, binding, projection) =
+    let (scratch, session_id, session_store, workspace_store, binding, projection) =
         team_delivery_fixture(root.path()).await;
     let message_id = append_team_message(
         &workspace_store,
@@ -14727,6 +15006,7 @@ async fn an_accepted_steer_settles_a_long_running_child_team_delivery() {
         unread_ids(&workspace_store, &binding).await.is_empty(),
         "a consumed steer must not replay as unread on a still-running child"
     );
+    scratch.discard().await;
 }
 
 /// The queued path reached `TurnCompleted`, but `Pending -> Acknowledged` is
@@ -14735,7 +15015,7 @@ async fn an_accepted_steer_settles_a_long_running_child_team_delivery() {
 #[tokio::test]
 async fn a_completed_queued_team_turn_acknowledges_its_delivery() {
     let root = tempdir().unwrap();
-    let (session_id, session_store, workspace_store, binding, projection) =
+    let (scratch, session_id, session_store, workspace_store, binding, projection) =
         team_delivery_fixture(root.path()).await;
     let message_id = append_team_message(
         &workspace_store,
@@ -14806,6 +15086,7 @@ async fn a_completed_queued_team_turn_acknowledges_its_delivery() {
         delivery_state(&workspace_store, &binding, message_id).await,
         crate::DeliveryState::Acknowledged
     );
+    scratch.discard().await;
 }
 
 /// The first turn starts a silent watcher and yields on it through the real
@@ -14923,6 +15204,9 @@ async fn assert_watcher_yield_blocks_automatic_turns(queue_reports: bool) {
     let root = tempdir().unwrap();
     let root_path = root.path().to_path_buf();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(256);
@@ -14936,12 +15220,13 @@ async fn assert_watcher_yield_blocks_automatic_turns(queue_reports: bool) {
         stop_after_yield: false,
         command: "sleep 30",
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = root_path.join("session.lock");
         let cwd = root_path.clone();
         let executor = Arc::clone(&executor);
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -14963,6 +15248,7 @@ async fn assert_watcher_yield_blocks_automatic_turns(queue_reports: bool) {
                 command_rx,
                 event_tx,
                 executor,
+                actor_store,
             )
             .await
         }
@@ -15063,6 +15349,7 @@ async fn assert_watcher_yield_blocks_automatic_turns(queue_reports: bool) {
         .await
         .unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
+    scratch.discard().await;
 }
 
 /// Stopping a watcher cancels it, so it never flushes a final event. Nothing
@@ -15074,6 +15361,9 @@ async fn a_stopped_silent_watcher_ends_the_yield_instead_of_stranding_the_goal()
     let root = tempdir().unwrap();
     let root_path = root.path().to_path_buf();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(256);
@@ -15087,12 +15377,13 @@ async fn a_stopped_silent_watcher_ends_the_yield_instead_of_stranding_the_goal()
         stop_after_yield: true,
         command: "sleep 30",
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = root_path.join("session.lock");
         let cwd = root_path.clone();
         let executor = Arc::clone(&executor);
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -15114,6 +15405,7 @@ async fn a_stopped_silent_watcher_ends_the_yield_instead_of_stranding_the_goal()
                 command_rx,
                 event_tx,
                 executor,
+                actor_store,
             )
             .await
         }
@@ -15158,6 +15450,7 @@ async fn a_stopped_silent_watcher_ends_the_yield_instead_of_stranding_the_goal()
         .await
         .unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
+    scratch.discard().await;
 }
 
 /// Interrupting a session that is parked on a yield is a stop, and a stop has
@@ -15171,6 +15464,9 @@ async fn an_interrupt_while_yielded_holds_watcher_output_until_a_human_returns()
     let root = tempdir().unwrap();
     let root_path = root.path().to_path_buf();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, mut event_rx) = mpsc::channel(256);
@@ -15186,12 +15482,13 @@ async fn an_interrupt_while_yielded_holds_watcher_output_until_a_human_returns()
         // under test and not a race with the first flush.
         command: "sleep 2; printf 'progress\\n'; sleep 30",
     });
+    let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
         let journal_path = root_path.join("session.lock");
         let cwd = root_path.clone();
         let executor = Arc::clone(&executor);
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -15213,6 +15510,7 @@ async fn an_interrupt_while_yielded_holds_watcher_output_until_a_human_returns()
                 command_rx,
                 event_tx,
                 executor,
+                actor_store,
             )
             .await
         }
@@ -15274,6 +15572,7 @@ async fn an_interrupt_while_yielded_holds_watcher_output_until_a_human_returns()
         .await
         .unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
+    scratch.discard().await;
 }
 
 /// A watcher that finishes on its own while the session is parked on a yield.
@@ -15294,6 +15593,9 @@ async fn a_watcher_that_finishes_while_yielded_resumes_the_goal_without_ending_t
     let root = tempdir().unwrap();
     let root_path = root.path().to_path_buf();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
     let message_id = Uuid::new_v4();
     let (command_tx, command_rx) = mpsc::channel(8);
     let (event_tx, _event_rx) = mpsc::channel(256);
@@ -15309,12 +15611,13 @@ async fn a_watcher_that_finishes_while_yielded_resumes_the_goal_without_ending_t
         // itself while the session is parked in the idle select.
         command: "sleep 2",
     });
+    let actor_store = Arc::clone(&store);
     let mut actor = tokio::spawn({
         let journal_path = root_path.join("session.lock");
         let cwd = root_path.clone();
         let executor = Arc::clone(&executor);
         async move {
-            run_agent_session_with_executor(
+            run_session_actor(
                 &journal_path,
                 session_id,
                 LaunchSession {
@@ -15336,6 +15639,7 @@ async fn a_watcher_that_finishes_while_yielded_resumes_the_goal_without_ending_t
                 command_rx,
                 event_tx,
                 executor,
+                actor_store,
             )
             .await
         }
@@ -15366,4 +15670,5 @@ async fn a_watcher_that_finishes_while_yielded_resumes_the_goal_without_ending_t
         .await
         .unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
+    scratch.discard().await;
 }
