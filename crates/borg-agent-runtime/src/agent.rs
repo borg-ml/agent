@@ -2523,7 +2523,6 @@ mod tests {
     #[tokio::test]
     async fn codex_executor_migrates_legacy_routes_without_provider_thread_reuse() {
         use crate::SessionStore;
-        let directory = tempfile::tempdir().unwrap();
         let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let fresh = Uuid::new_v4();
         let legacy = Uuid::new_v4();
@@ -2573,7 +2572,6 @@ mod tests {
     #[tokio::test]
     async fn opencode_go_resolves_to_the_native_harness_and_legacy_stays_on_the_cli() {
         use crate::SessionStore;
-        let directory = tempfile::tempdir().unwrap();
         let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
 
         let go = Uuid::new_v4();

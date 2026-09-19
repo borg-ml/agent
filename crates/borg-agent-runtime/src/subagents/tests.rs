@@ -652,7 +652,7 @@ async fn dispatcher_and_python_share_the_canonical_lossless_history_query() {
         .await
         .unwrap();
     let autonomy: Option<std::sync::Arc<dyn crate::autonomy::AutonomyStore>> =
-        Some(std::sync::Arc::new(store.autonomy_store().await.unwrap()));
+        store.autonomy_store().await.unwrap();
     let dispatcher = AgentToolDispatcher::new(
         SessionGoalTools::disconnected(),
         SessionTodoTools::disconnected(),
@@ -1042,7 +1042,7 @@ async fn persistent_runtime_rehydrates_explicit_checkpoint_after_worker_restart(
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
     let first_autonomy: Option<std::sync::Arc<dyn crate::autonomy::AutonomyStore>> =
-        Some(std::sync::Arc::new(store.autonomy_store().await.unwrap()));
+        store.autonomy_store().await.unwrap();
     let first = AgentToolDispatcher::new(
         SessionGoalTools::disconnected(),
         SessionTodoTools::disconnected(),
@@ -1076,7 +1076,7 @@ async fn persistent_runtime_rehydrates_explicit_checkpoint_after_worker_restart(
     drop(first);
 
     let second_autonomy: Option<std::sync::Arc<dyn crate::autonomy::AutonomyStore>> =
-        Some(std::sync::Arc::new(store.autonomy_store().await.unwrap()));
+        store.autonomy_store().await.unwrap();
     let second = AgentToolDispatcher::new(
         SessionGoalTools::disconnected(),
         SessionTodoTools::disconnected(),
