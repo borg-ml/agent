@@ -17,8 +17,8 @@ use anyhow::{Context, Result};
 use borg_remote::{
     ApprovalDecision, EventActor, HostCommand, LaunchSession, MessageStatus, PlanItemStatus,
     PromptDelivery, ResponseLanguage, SessionCapabilities, SessionConfiguration, SessionEvent,
-    SessionEventKind, SessionStore, SessionWriterLease, SqliteSessionStore,
-    default_host_config_path, probe_provider_admission_capabilities, run_agent_session_with_writer,
+    SessionEventKind, SessionStore, SessionWriterLease, default_host_config_path,
+    probe_provider_admission_capabilities, run_agent_session_with_writer,
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
 use uuid::Uuid;
@@ -31,7 +31,7 @@ struct AcpRuntime {
     args: AcpArgs,
     config: AgentConfig,
     sessions_dir: PathBuf,
-    store: Arc<SqliteSessionStore>,
+    store: Arc<dyn SessionStore>,
     sessions: Arc<Mutex<HashMap<SessionId, AcpSession>>>,
 }
 
@@ -48,7 +48,15 @@ pub(crate) async fn run(args: AcpArgs) -> Result<()> {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("sessions");
-    let store = Arc::new(SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?);
+    let store = Arc::clone(
+        borg_remote::session_store::factory::open(
+            &borg_remote::session_store::factory::SessionStoreConfig::from_env(
+                sessions_dir.join("sessions.sqlite3"),
+            ),
+        )
+        .await?
+        .session(),
+    );
     let runtime = AcpRuntime {
         args,
         config,

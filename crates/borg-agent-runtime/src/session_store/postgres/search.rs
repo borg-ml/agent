@@ -18,13 +18,13 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use super::PostgresSessionStore;
+use crate::SessionEvent;
 use crate::session_store::{
     MAX_HISTORY_QUERY_BYTES, SessionHistoryHit, SessionHistoryIndexDocument, SessionHistoryPage,
     SessionHistoryQuery, SessionHistorySearchMode, event_actor, event_kind,
     history_event_matches_filters, history_index_document_id, history_limit, history_match_snippet,
     history_payload_budget, history_payload_refs, history_regex, history_scan_limit,
 };
-use crate::SessionEvent;
 
 /// Rows projected per transaction. Small enough that a session with a long
 /// history never holds one transaction open for the whole backfill.
@@ -248,7 +248,9 @@ impl PostgresSessionStore {
         // ids and sequences. Composing in Rust is the only way to search the
         // renumbered view a caller actually sees.
         if session.inherited_event_count > 0 {
-            return self.query_history_composed(session_id, &query, text.as_deref()).await;
+            return self
+                .query_history_composed(session_id, &query, text.as_deref())
+                .await;
         }
         if text.is_some() {
             self.ensure_history_projection(session_id).await?;
@@ -640,8 +642,8 @@ impl PostgresSessionStore {
                 if *payload_budget == 0 {
                     break;
                 }
-                let take =
-                    (*payload_budget).min(usize::try_from(reference.byte_len).unwrap_or(usize::MAX));
+                let take = (*payload_budget)
+                    .min(usize::try_from(reference.byte_len).unwrap_or(usize::MAX));
                 let row = sqlx::query(
                     "select payload_kind, byte_len, substring(payload from 1 for $1) as payload \
                      from session_payloads where id = $2",
@@ -725,10 +727,7 @@ mod tests {
     use crate::session_store::SessionStore;
     use crate::{EventActor, MessageStatus, SessionEventKind};
 
-    async fn session_with(
-        store: &PostgresSessionStore,
-        texts: &[(EventActor, &str)],
-    ) -> Uuid {
+    async fn session_with(store: &PostgresSessionStore, texts: &[(EventActor, &str)]) -> Uuid {
         let session_id = Uuid::new_v4();
         store.create_session(session_id).await.expect("create");
         store
@@ -783,7 +782,9 @@ mod tests {
             return;
         };
         let scratch = ScratchDatabase::create(&url).await;
-        let store = PostgresSessionStore::connect(&scratch.url).await.expect("connect");
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+            .await
+            .expect("connect");
         let session_id = session_with(
             &store,
             &[
@@ -799,8 +800,14 @@ mod tests {
             .await
             .expect("search");
         assert_eq!(page.backend, "postgres_tsvector");
-        assert_eq!(hit_texts(&page), vec!["please migrate the journal to postgres"]);
-        assert!(page.hits[0].score.is_some(), "a ranked hit must carry a score");
+        assert_eq!(
+            hit_texts(&page),
+            vec!["please migrate the journal to postgres"]
+        );
+        assert!(
+            page.hits[0].score.is_some(),
+            "a ranked hit must carry a score"
+        );
         assert!(
             page.hits[0]
                 .snippet
@@ -829,10 +836,19 @@ mod tests {
             return;
         };
         let scratch = ScratchDatabase::create(&url).await;
-        let store = PostgresSessionStore::connect(&scratch.url).await.expect("connect");
-        let first = session_with(&store, &[(EventActor::User, "the deadlock was in the ager")]).await;
-        let second =
-            session_with(&store, &[(EventActor::Assistant, "I fixed the deadlock yesterday")]).await;
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+            .await
+            .expect("connect");
+        let first = session_with(
+            &store,
+            &[(EventActor::User, "the deadlock was in the ager")],
+        )
+        .await;
+        let second = session_with(
+            &store,
+            &[(EventActor::Assistant, "I fixed the deadlock yesterday")],
+        )
+        .await;
         session_with(&store, &[(EventActor::User, "something else entirely")]).await;
 
         // The capability SQLite could not offer: one query, every session.
@@ -862,36 +878,42 @@ mod tests {
             return;
         };
         let scratch = ScratchDatabase::create(&url).await;
-        let store = PostgresSessionStore::connect(&scratch.url).await.expect("connect");
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+            .await
+            .expect("connect");
         let session_id = session_with(&store, &[(EventActor::User, "indexed lazily")]).await;
 
         // Appending must not touch the projection. SQLite rebuilt its FTS index
         // while holding the write lock, which is what stalled other agents.
-        let projected: i64 = sqlx::query_scalar(
-            "select count(*) from session_event_search where session_id = $1",
-        )
-        .bind(session_id)
-        .fetch_one(store.pool())
-        .await
-        .expect("count");
-        assert_eq!(projected, 0, "append must not populate the search projection");
+        let projected: i64 =
+            sqlx::query_scalar("select count(*) from session_event_search where session_id = $1")
+                .bind(session_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("count");
+        assert_eq!(
+            projected, 0,
+            "append must not populate the search projection"
+        );
 
         store
             .query_history(session_id, lexical("indexed"))
             .await
             .expect("search");
-        let projected: i64 = sqlx::query_scalar(
-            "select count(*) from session_event_search where session_id = $1",
-        )
-        .bind(session_id)
-        .fetch_one(store.pool())
-        .await
-        .expect("count");
+        let projected: i64 =
+            sqlx::query_scalar("select count(*) from session_event_search where session_id = $1")
+                .bind(session_id)
+                .fetch_one(store.pool())
+                .await
+                .expect("count");
         assert!(projected > 0, "searching must build the projection");
 
         // Rebuilding is idempotent: a second pass adds nothing.
         assert_eq!(
-            store.ensure_history_projection(session_id).await.expect("reproject"),
+            store
+                .ensure_history_projection(session_id)
+                .await
+                .expect("reproject"),
             0
         );
         scratch.discard().await;
@@ -904,7 +926,9 @@ mod tests {
             return;
         };
         let scratch = ScratchDatabase::create(&url).await;
-        let store = PostgresSessionStore::connect(&scratch.url).await.expect("connect");
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+            .await
+            .expect("connect");
         let session_id = session_with(
             &store,
             &[
@@ -936,7 +960,10 @@ mod tests {
             )
             .await
             .expect("search");
-        assert!(by_kind.hits.is_empty(), "a kind filter must exclude messages");
+        assert!(
+            by_kind.hits.is_empty(),
+            "a kind filter must exclude messages"
+        );
 
         // An empty query is a typed/range read that never consults the index.
         let ranged = store
@@ -963,7 +990,9 @@ mod tests {
             return;
         };
         let scratch = ScratchDatabase::create(&url).await;
-        let store = PostgresSessionStore::connect(&scratch.url).await.expect("connect");
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+            .await
+            .expect("connect");
         let session_id = session_with(
             &store,
             &[
@@ -973,12 +1002,19 @@ mod tests {
         )
         .await;
 
+        // Two things this pattern has to survive, both learned the hard way:
+        // regex runs over the WHOLE serialised event body -- ids, timestamps
+        // and all -- and `history_regex` is case-insensitive unless asked
+        // otherwise. A bare `E\d{4}` therefore also matches a lowercase `e`
+        // followed by four digits inside a random UUID, which made this test
+        // fail roughly one run in three depending on the ids generated.
         let page = store
             .query_history(
                 session_id,
                 SessionHistoryQuery {
-                    text: Some(r"E\d{4}".to_string()),
+                    text: Some(r"code E\d{4}".to_string()),
                     mode: SessionHistorySearchMode::Regex,
+                    case_sensitive: true,
                     ..Default::default()
                 },
             )
@@ -992,8 +1028,9 @@ mod tests {
             .query_history(
                 session_id,
                 SessionHistoryQuery {
-                    text: Some(r"E\d{4}".to_string()),
+                    text: Some(r"code E\d{4}".to_string()),
                     mode: SessionHistorySearchMode::Regex,
+                    case_sensitive: true,
                     prefilter: Some("returned".to_string()),
                     ..Default::default()
                 },
@@ -1001,7 +1038,10 @@ mod tests {
             .await
             .expect("prefiltered regex");
         assert_eq!(prefiltered.backend, "postgres_regex_tsquery_prefilter");
-        assert_eq!(hit_texts(&prefiltered), vec!["error code E1042 was returned"]);
+        assert_eq!(
+            hit_texts(&prefiltered),
+            vec!["error code E1042 was returned"]
+        );
 
         // A prefilter is meaningless for lexical mode and is refused.
         assert!(
@@ -1026,9 +1066,14 @@ mod tests {
             return;
         };
         let scratch = ScratchDatabase::create(&url).await;
-        let store = PostgresSessionStore::connect(&scratch.url).await.expect("connect");
-        let session_id =
-            session_with(&store, &[(EventActor::User, "a memorable phrase worth finding")]).await;
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+            .await
+            .expect("connect");
+        let session_id = session_with(
+            &store,
+            &[(EventActor::User, "a memorable phrase worth finding")],
+        )
+        .await;
 
         // Age the session into the cold tier BEFORE it has ever been projected,
         // so the projection has to decode compressed bodies to build itself.
@@ -1062,7 +1107,9 @@ mod tests {
             return;
         };
         let scratch = ScratchDatabase::create(&url).await;
-        let store = PostgresSessionStore::connect(&scratch.url).await.expect("connect");
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+            .await
+            .expect("connect");
         let session_id = session_with(
             &store,
             &[(EventActor::User, "first"), (EventActor::User, "second")],

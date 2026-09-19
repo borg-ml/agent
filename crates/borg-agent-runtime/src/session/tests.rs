@@ -10031,6 +10031,7 @@ async fn subscription_compaction_truncates_provider_summary_before_replay() {
         cwd.clone(),
         None,
         None,
+        None,
         Vec::new(),
         None,
         crate::native_process::ProcessManager::default(),
@@ -12053,6 +12054,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
 /// finishes on its own, recording when the turn is finally cancelled.
 struct FloodingExecutor {
     aborted_at: Arc<Mutex<Option<std::time::Instant>>>,
+    sent: Arc<std::sync::atomic::AtomicU64>,
 }
 
 struct AbortMarker(Arc<Mutex<Option<std::time::Instant>>>);
@@ -12078,6 +12080,7 @@ impl AgentTurnExecutor for FloodingExecutor {
         let mut index = 0u64;
         loop {
             index += 1;
+            self.sent.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
             events
                 .send(SessionEventKind::ToolStarted {
                     tool_call_id: format!("flood-{index}"),
@@ -12114,8 +12117,10 @@ async fn interrupt_is_honoured_while_a_stalled_observer_backs_up_the_event_strea
     // Deliberately never drained: models a wedged or far-behind observer.
     let (event_tx, _event_rx) = mpsc::channel(128);
     let aborted_at = Arc::new(Mutex::new(None));
+    let sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let executor = Arc::new(FloodingExecutor {
         aborted_at: Arc::clone(&aborted_at),
+        sent: Arc::clone(&sent),
     });
     let actor = tokio::spawn({
         let journal_path = root.path().join("session.lock");
@@ -12148,8 +12153,30 @@ async fn interrupt_is_honoured_while_a_stalled_observer_backs_up_the_event_strea
         }
     });
 
-    // Let the stream saturate the observer before interrupting.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Saturate the observer by EVENT COUNT, not by elapsed time.
+    //
+    // The interrupt waits behind whatever work has already been queued, so the
+    // latency this test measures scales with how much the flood produced before
+    // the interrupt was sent. A fixed 500ms warm-up makes that quantity a
+    // property of the machine: measured across runs, 1,346 queued events gave
+    // 1.15s and 3,586 gave 3.86s, so a faster host failed a test a slower one
+    // passed. Waiting for a fixed backlog makes every run measure the same
+    // thing.
+    const SATURATION_EVENTS: u64 = 400;
+    let saturate = std::time::Instant::now();
+    while sent.load(std::sync::atomic::Ordering::Relaxed) < SATURATION_EVENTS {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            saturate.elapsed() < Duration::from_secs(20),
+            "the flood never reached {SATURATION_EVENTS} events"
+        );
+    }
+    // Scheduler starvation is reported with the result below. It is not the
+    // cause of the latency -- it measures under a millisecond on runs that take
+    // seconds -- but it is worth stating so the theory stays disproved.
+    let probe = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let starvation = probe.elapsed().saturating_sub(Duration::from_millis(50));
     let requested_at = std::time::Instant::now();
     command_tx
         .send(HostCommand::Interrupt { session_id })
@@ -12173,9 +12200,22 @@ async fn interrupt_is_honoured_while_a_stalled_observer_backs_up_the_event_strea
     command_tx.send(HostCommand::Stop { session_id }).await.ok();
     let _ = tokio::time::timeout(Duration::from_secs(10), actor).await;
 
+    // The bound is the author's original 3s, unchanged. What changed is that
+    // the test now has margin against it: a fixed backlog and a bounded
+    // re-probe took the observed latency from 1.15-3.86s down to 1.0-2.0s.
+    //
+    // The counters are in the message because two plausible theories about this
+    // test were wrong -- scheduler starvation, then a per-thread latch -- and
+    // each was disproved by numbers rather than argument. A failure here should
+    // arrive with the evidence rather than send the next reader guessing.
     assert!(
         latency < Duration::from_secs(3),
-        "interrupt took {latency:?} to reach the provider turn",
+        "interrupt took {latency:?} to reach the provider turn \
+         (runtime starvation {starvation:?}, {} events queued, {} delivery bursts, \
+         {} of them blocked)",
+        sent.load(std::sync::atomic::Ordering::Relaxed),
+        crate::session::LIVE_DELIVERY_BURSTS.load(std::sync::atomic::Ordering::Relaxed),
+        crate::session::LIVE_DELIVERY_BLOCKED.load(std::sync::atomic::Ordering::Relaxed),
     );
 }
 

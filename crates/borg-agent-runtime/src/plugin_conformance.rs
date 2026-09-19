@@ -51,7 +51,7 @@ async fn harnesses() -> Vec<Harness> {
 
     if let Some(url) = test_url() {
         let scratch = ScratchDatabase::create(&url).await;
-        let session = PostgresSessionStore::connect(&scratch.url)
+        let session = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
             .await
             .expect("bootstrap postgres schema");
         harnesses.push(Harness {
@@ -315,10 +315,7 @@ async fn a_recorded_artifact_is_verified_against_the_file_on_disk() {
         let root = tempfile::tempdir().expect("workspace root");
         let contents = b"artifact bytes";
         std::fs::write(root.path().join("out.bin"), contents).expect("write artifact");
-        let content_hash = format!(
-            "sha256:{}",
-            hex::encode(sha2::Sha256::digest(contents))
-        );
+        let content_hash = format!("sha256:{}", hex::encode(sha2::Sha256::digest(contents)));
         let prepared = PreparedArtifact {
             input: ArtifactInput {
                 artifact_id: "artifact-1".to_string(),
@@ -390,6 +387,109 @@ async fn a_recorded_artifact_is_verified_against_the_file_on_disk() {
             .await
             .expect("verify");
         assert_eq!(missing["found"], json!(false), "[{name}]");
+        harness.discard().await;
+    }
+}
+
+/// The dispatch entry point, not just the storage methods underneath it.
+///
+/// `plugin_store::call` carries all the backend-agnostic policy -- request
+/// validation, scope resolution, idempotency hashing -- and was lifted out of
+/// the SQLite store so a second engine could reuse it rather than reimplement
+/// it. This drives that exact entry point on both backends; without it the
+/// suite would only prove the five storage primitives agree, while the rules
+/// built on top of them went untested on Postgres.
+#[tokio::test]
+async fn the_call_entry_point_behaves_identically_on_both_backends() {
+    for harness in harnesses().await {
+        let name = harness.name;
+        let root = tempfile::tempdir().expect("temp root");
+        let session_id = Uuid::new_v4();
+
+        let committed = crate::plugin_store::call(
+            harness.store.as_ref(),
+            session_id,
+            root.path(),
+            Some(EXTENSION),
+            json!({
+                "op": "commit",
+                "scope": "session",
+                "idempotency_key": "call-entry-1",
+                "writes": [{"op": "put", "key": "a/b", "value": {"n": 1}}],
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] commit: {error:#}"));
+        assert_eq!(committed["replayed"], json!(false), "[{name}]");
+
+        // The same key replays rather than applying twice.
+        let replayed = crate::plugin_store::call(
+            harness.store.as_ref(),
+            session_id,
+            root.path(),
+            Some(EXTENSION),
+            json!({
+                "op": "commit",
+                "scope": "session",
+                "idempotency_key": "call-entry-1",
+                "writes": [{"op": "put", "key": "a/b", "value": {"n": 1}}],
+            }),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] replay: {error:#}"));
+        assert_eq!(replayed["replayed"], json!(true), "[{name}]");
+
+        let fetched = crate::plugin_store::call(
+            harness.store.as_ref(),
+            session_id,
+            root.path(),
+            Some(EXTENSION),
+            json!({"op": "get", "scope": "session", "key": "a/b"}),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] get: {error:#}"));
+        assert_eq!(fetched["entry"]["value"], json!({"n": 1}), "[{name}]");
+
+        let listed = crate::plugin_store::call(
+            harness.store.as_ref(),
+            session_id,
+            root.path(),
+            Some(EXTENSION),
+            json!({"op": "list", "scope": "session", "prefix": "a/"}),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("[{name}] list: {error:#}"));
+        assert_eq!(
+            listed["entries"].as_array().map(Vec::len),
+            Some(1),
+            "[{name}] {listed}"
+        );
+
+        // Policy failures must come from the shared layer, not the backend.
+        let unknown = crate::plugin_store::call(
+            harness.store.as_ref(),
+            session_id,
+            root.path(),
+            Some(EXTENSION),
+            json!({"op": "nonsense", "scope": "session"}),
+        )
+        .await;
+        assert!(unknown.is_err(), "[{name}] unknown op must be refused");
+
+        let mismatched = crate::plugin_store::call(
+            harness.store.as_ref(),
+            session_id,
+            root.path(),
+            Some(EXTENSION),
+            json!({"op": "get", "scope": "session", "key": "a/b",
+                   "extension_id": "some-other-extension"}),
+        )
+        .await;
+        assert!(
+            mismatched.is_err(),
+            "[{name}] a request must not read another extension's state"
+        );
+
         harness.discard().await;
     }
 }

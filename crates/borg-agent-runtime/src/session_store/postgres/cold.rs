@@ -428,7 +428,7 @@ mod tests {
             return;
         };
         let scratch = ScratchDatabase::create(&url).await;
-        let store = PostgresSessionStore::connect(&scratch.url)
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
             .await
             .expect("connect");
         let cold = seed_session(&store, chrono::Duration::days(8), 6).await;
@@ -458,7 +458,7 @@ mod tests {
             return;
         };
         let scratch = ScratchDatabase::create(&url).await;
-        let store = PostgresSessionStore::connect(&scratch.url)
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
             .await
             .expect("connect");
         let session_id = seed_session(&store, chrono::Duration::days(30), 4).await;
@@ -507,7 +507,7 @@ mod tests {
             return;
         };
         let scratch = ScratchDatabase::create(&url).await;
-        let store = PostgresSessionStore::connect(&scratch.url)
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
             .await
             .expect("connect");
         let session_id = seed_session(&store, chrono::Duration::days(9), 7).await;
@@ -570,7 +570,10 @@ mod tests {
         assert_eq!(stale, 0);
 
         assert_eq!(
-            store.reheat_session(session_id).await.expect("reheat again"),
+            store
+                .reheat_session(session_id)
+                .await
+                .expect("reheat again"),
             0,
             "re-heating an already hot session must be a no-op"
         );
@@ -584,7 +587,7 @@ mod tests {
             return;
         };
         let scratch = ScratchDatabase::create(&url).await;
-        let store = PostgresSessionStore::connect(&scratch.url)
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
             .await
             .expect("connect");
         let session_id = seed_session(&store, chrono::Duration::days(14), 5).await;

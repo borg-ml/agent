@@ -21,7 +21,13 @@ use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::BillingLane;
-use crate::receipt::{ReceiptState, SqliteReceiptStore};
+use crate::receipt::{ReceiptBackend, ReceiptState};
+// Only the tests build a concrete receipt store; production resolves the tier
+// through the session store so the backend stays configurable.
+#[cfg(test)]
+use crate::receipt::SqliteReceiptStore;
+// Test fixtures still build a concrete journal directly; production resolves
+// the backend through the factory.
 use crate::session::AbortTask;
 use crate::{
     AgentRuntimeCommandEnvelope, AgentRuntimeEventEnvelope, AgentTurnExecutor, Audience,
@@ -31,15 +37,16 @@ use crate::{
     OpenTerminalRequest, OpenTerminalResponse, Participant, ParticipantKind, PermissionMode,
     ProviderAuthMethod, ProviderCapability, REMOTE_PROTOCOL_VERSION, RemoteHost,
     RemoteHostIdentity, RuntimeMcpContext, SessionEvent, SessionLiveEvent, SessionPayloadRef,
-    SessionStore, SessionWriterLease, SqliteSessionStore, SqliteWorkspaceStore,
-    WorkspaceAttachment, WorkspaceCommandErrorCode, WorkspaceCommandOutcome,
-    WorkspaceCommandRequest, WorkspaceCommandResponse, WorkspaceEventKind,
+    SessionStore, SessionWriterLease, WorkspaceAttachment, WorkspaceCommandErrorCode,
+    WorkspaceCommandOutcome, WorkspaceCommandRequest, WorkspaceCommandResponse, WorkspaceEventKind,
     WorkspaceFilesystemErrorCode, WorkspaceFilesystemOutcome, WorkspaceFilesystemRequest,
     WorkspaceFilesystemResponse, WorkspaceRole, WorkspaceStore,
     execute_host_shell_command_with_limits, execute_workspace_command_with_limits,
     execute_workspace_filesystem_with_limits,
     run_agent_session_with_store_and_writer_and_lsp_policy,
 };
+#[cfg(test)]
+use borg_agent_runtime::SqliteSessionStore;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct HostConfig {
@@ -1932,9 +1939,18 @@ pub async fn run_host_with_executor_factory(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("sessions");
-    let session_store =
-        Arc::new(SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await?);
-    let receipts = Arc::new(SqliteReceiptStore::open(session_store.pool().clone()).await?);
+    // The relay picks its backend from BORG_SESSIONS_URL like every other
+    // entry point, and resolves every tier before starting any loop -- this
+    // process is long-running by definition, so there is no ownership race to
+    // settle first and nothing to defer.
+    let resolved = crate::session_store::factory::open_resolved(
+        &crate::session_store::factory::SessionStoreConfig::from_env(
+            session_root.join("sessions.sqlite3"),
+        ),
+    )
+    .await?;
+    let session_store = Arc::clone(resolved.session());
+    let receipts = Arc::clone(resolved.receipts());
     let mut capabilities =
         probe_capabilities_with_profile(config.roots.clone(), config.execution_profile).await;
     capabilities.resource_limits = config.resource_limits.clone();
@@ -1976,7 +1992,7 @@ pub async fn run_host_with_executor_factory(
             &config,
             &session_root,
             &sessions,
-            &session_store,
+            session_store.as_ref(),
             &executor_factory,
         )
         .await
@@ -2083,7 +2099,7 @@ fn deferred_host_operation_id(command: &HostCommand) -> Option<Uuid> {
 async fn run_host_operation_loop(
     client: Client,
     config: HostConfig,
-    receipts: Arc<SqliteReceiptStore>,
+    receipts: Arc<dyn ReceiptBackend>,
     session_root: PathBuf,
 ) {
     loop {
@@ -2110,7 +2126,7 @@ async fn run_host_operation_loop(
             let Some(_operation_owner) = SessionWriterLease::try_acquire(
                 session_root.join(format!("host-operation-{request_id}.lock")),
             )? else { return Ok(false) };
-            if !execute_host_operation(&client, &config, &receipts, &command).await {
+            if !execute_host_operation(&client, &config, receipts.as_ref(), &command).await {
                 return Ok(false);
             }
             receipts
@@ -2129,7 +2145,7 @@ async fn run_host_operation_loop(
 }
 
 async fn cancel_queued_workspace_command(
-    receipts: &SqliteReceiptStore,
+    receipts: &dyn ReceiptBackend,
     host_id: Uuid,
     session_root: &Path,
     request_id: Uuid,
@@ -2183,7 +2199,7 @@ async fn cancel_queued_workspace_command(
 async fn execute_host_operation(
     client: &Client,
     config: &HostConfig,
-    receipts: &SqliteReceiptStore,
+    receipts: &dyn ReceiptBackend,
     command: &HostCommand,
 ) -> bool {
     match command {
@@ -2220,7 +2236,7 @@ async fn execute_host_operation(
 async fn run_host_journal_recovery_loop(
     client: Client,
     config: HostConfig,
-    store: Arc<SqliteSessionStore>,
+    store: Arc<dyn SessionStore>,
     sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
 ) {
     let mut after = None;
@@ -2251,7 +2267,7 @@ async fn run_host_journal_recovery_loop(
             }
             let result = tokio::time::timeout(
                 Duration::from_secs(10),
-                recover_host_journal(&client, &config, &store, session_id),
+                recover_host_journal(&client, &config, store.as_ref(), session_id),
             )
             .await;
             match result {
@@ -2281,7 +2297,7 @@ async fn run_host_journal_recovery_loop(
 async fn recover_host_journal(
     client: &Client,
     config: &HostConfig,
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     session_id: Uuid,
 ) -> Result<Instant> {
     ensure_host_launch_owner(client, config, store, session_id).await?;
@@ -2310,7 +2326,7 @@ async fn recover_host_journal(
 async fn run_host_workspace_recovery_loop(
     client: Client,
     config: HostConfig,
-    store: Arc<SqliteSessionStore>,
+    store: Arc<dyn SessionStore>,
     sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
 ) {
     let workspace = loop {
@@ -2372,7 +2388,12 @@ async fn run_host_workspace_recovery_loop(
             let result = tokio::time::timeout(
                 Duration::from_secs(10),
                 recover_host_workspace_messages(
-                    &client, &config, &store, &workspace, session_id, sync,
+                    &client,
+                    &config,
+                    store.as_ref(),
+                    workspace.as_ref(),
+                    session_id,
+                    sync,
                 ),
             )
             .await;
@@ -2391,8 +2412,8 @@ async fn run_host_workspace_recovery_loop(
 async fn recover_host_workspace_messages(
     client: &Client,
     config: &HostConfig,
-    store: &SqliteSessionStore,
-    workspace: &SqliteWorkspaceStore,
+    store: &dyn SessionStore,
+    workspace: &dyn WorkspaceStore,
     session_id: Uuid,
     sync: &mut JournalSync,
 ) -> Result<()> {
@@ -2468,7 +2489,7 @@ async fn flush_host_workspace_messages(
     client: &Client,
     config: &HostConfig,
     store: &dyn SessionStore,
-    workspace: Option<&SqliteWorkspaceStore>,
+    workspace: Option<&dyn WorkspaceStore>,
     session_id: Uuid,
     execution_workspace: Option<Uuid>,
     sync: &mut JournalSync,
@@ -2978,7 +2999,7 @@ pub async fn mirror_local_session(
                 &client,
                 &config,
                 store.as_ref(),
-                workspace_store.as_ref(),
+                workspace_store.as_deref(),
                 session_id,
                 None,
                 &mut workspace_sync,
@@ -3115,8 +3136,8 @@ struct DispatchContext {
     config: HostConfig,
     session_root: PathBuf,
     sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
-    session_store: Arc<SqliteSessionStore>,
-    receipts: Arc<SqliteReceiptStore>,
+    session_store: Arc<dyn SessionStore>,
+    receipts: Arc<dyn ReceiptBackend>,
     executor_factory: HostExecutorFactory,
 }
 
@@ -3132,7 +3153,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
     } = context;
     if let Some(request_id) = deferred_host_operation_id(&command) {
         return match receipts
-            .enqueue_host_operation(config.host_id, request_id, &command)
+            .enqueue_host_command(config.host_id, request_id, &command)
             .await
         {
             Ok(()) => true,
@@ -3143,7 +3164,8 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
         };
     }
     if let HostCommand::OpenTerminal { request } = &command {
-        let Some(response) = open_terminal_response(&receipts, &config, request).await else {
+        let Some(response) = open_terminal_response(receipts.as_ref(), &config, request).await
+        else {
             return false;
         };
         return upload_host_action_result(
@@ -3156,7 +3178,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
         .await;
     }
     if let HostCommand::WorkspaceFilesystem { request } = &command {
-        let Some(response) = filesystem_response(&receipts, &config, request).await else {
+        let Some(response) = filesystem_response(receipts.as_ref(), &config, request).await else {
             return false;
         };
         let result = client
@@ -3202,7 +3224,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
     }
     if let HostCommand::CancelWorkspaceCommand { request_id } = &command {
         return match cancel_queued_workspace_command(
-            &receipts,
+            receipts.as_ref(),
             config.host_id,
             &session_root,
             *request_id,
@@ -3218,7 +3240,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
     }
     if let Some(session_id) = command.session_id() {
         let authorized: Result<()> = async {
-            validate_stored_host_identity(&config, &session_store, session_id).await?;
+            validate_stored_host_identity(&config, session_store.as_ref(), session_id).await?;
             ensure!(
                 session_store
                     .load_host_launch_metadata(session_id)
@@ -3243,7 +3265,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
     {
         let rejection = match persist_launch_metadata(
             &config,
-            &session_store,
+            session_store.as_ref(),
             session_id,
             &request,
             attachment.as_ref(),
@@ -3263,7 +3285,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             }
             sessions_guard.len() >= config.resource_limits.max_concurrent_sessions as usize
         };
-        match stored_host_session_state(&session_store, session_id).await {
+        match stored_host_session_state(session_store.as_ref(), session_id).await {
             Ok(Some(state))
                 if state.started_at.is_none()
                     && matches!(
@@ -3275,7 +3297,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                     &client,
                     &config,
                     &session_root,
-                    &session_store,
+                    session_store.as_ref(),
                     session_id,
                     "launch already rejected",
                     true,
@@ -3294,7 +3316,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             {
                 return settle_inactive_host_session(
                     &config,
-                    &session_store,
+                    session_store.as_ref(),
                     &session_root,
                     session_id,
                     false,
@@ -3315,7 +3337,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                 &client,
                 &config,
                 &session_root,
-                &session_store,
+                session_store.as_ref(),
                 session_id,
                 &reason,
                 true,
@@ -3342,12 +3364,12 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
         return true;
     }
     if let Some(session_id) = command.session_id() {
-        let metadata = match load_launch_metadata(&session_store, session_id).await {
+        let metadata = match load_launch_metadata(session_store.as_ref(), session_id).await {
             Ok(Some(StoredHostLaunch::Launch(metadata))) => Some(*metadata),
             Ok(Some(StoredHostLaunch::Rejected { .. })) => {
                 return settle_inactive_host_session(
                     &config,
-                    &session_store,
+                    session_store.as_ref(),
                     &session_root,
                     session_id,
                     false,
@@ -3365,7 +3387,9 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             .and_then(|metadata| metadata.attachment.as_ref());
         if matches!(
             command,
-            HostCommand::TeamPrompt { .. } | HostCommand::Broadcast { .. }
+            HostCommand::TeamPrompt { .. }
+                | HostCommand::Broadcast { .. }
+                | HostCommand::BroadcastInstances { .. }
         ) {
             tracing::warn!(%session_id, "rejected host-local team prompt from remote command queue");
             return true;
@@ -3379,7 +3403,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
             // command forever and head-of-line block every later command.
             return true;
         }
-        let state = match stored_host_session_state(&session_store, session_id).await {
+        let state = match stored_host_session_state(session_store.as_ref(), session_id).await {
             Ok(state) => state,
             Err(error) => {
                 tracing::warn!(%error, %session_id, "failed to read launch state; retaining command for retry");
@@ -3404,7 +3428,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                     if terminal {
                         return settle_inactive_host_session(
                             &config,
-                            &session_store,
+                            session_store.as_ref(),
                             &session_root,
                             session_id,
                             false,
@@ -3423,7 +3447,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                     if matches!(command, HostCommand::Stop { .. }) {
                         return settle_inactive_host_session(
                             &config,
-                            &session_store,
+                            session_store.as_ref(),
                             &session_root,
                             session_id,
                             true,
@@ -3539,7 +3563,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
 
 async fn settle_inactive_host_session(
     config: &HostConfig,
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     session_root: &Path,
     session_id: Uuid,
     stop: bool,
@@ -3587,7 +3611,7 @@ async fn settle_inactive_host_session(
 }
 
 async fn stored_host_session_state(
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     session_id: Uuid,
 ) -> Result<Option<crate::SessionState>> {
     if store.contains_session(session_id).await? {
@@ -3602,7 +3626,7 @@ async fn reject_host_launch(
     client: &Client,
     config: &HostConfig,
     session_root: &Path,
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     session_id: Uuid,
     reason: &str,
     publish_before_ack: bool,
@@ -3750,7 +3774,7 @@ async fn upload_host_action_result<T: Serialize>(
 }
 
 async fn filesystem_response(
-    receipts: &SqliteReceiptStore,
+    receipts: &dyn ReceiptBackend,
     config: &HostConfig,
     request: &WorkspaceFilesystemRequest,
 ) -> Option<WorkspaceFilesystemResponse> {
@@ -3799,7 +3823,7 @@ async fn filesystem_response(
 }
 
 async fn persist_filesystem_terminal(
-    receipts: &SqliteReceiptStore,
+    receipts: &dyn ReceiptBackend,
     request: &WorkspaceFilesystemRequest,
     response: &WorkspaceFilesystemResponse,
 ) -> Option<WorkspaceFilesystemResponse> {
@@ -3826,7 +3850,7 @@ fn indeterminate_filesystem_response(
 }
 
 async fn shell_command_response(
-    receipts: &SqliteReceiptStore,
+    receipts: &dyn ReceiptBackend,
     config: &HostConfig,
     request: &HostShellCommandRequest,
 ) -> Option<HostShellCommandResponse> {
@@ -3871,7 +3895,7 @@ async fn shell_command_response(
 }
 
 async fn persist_shell_terminal(
-    receipts: &SqliteReceiptStore,
+    receipts: &dyn ReceiptBackend,
     request: &HostShellCommandRequest,
     response: &HostShellCommandResponse,
 ) -> Option<HostShellCommandResponse> {
@@ -3897,7 +3921,7 @@ fn indeterminate_shell_response(
 }
 
 async fn open_terminal_response(
-    receipts: &SqliteReceiptStore,
+    receipts: &dyn ReceiptBackend,
     config: &HostConfig,
     request: &OpenTerminalRequest,
 ) -> Option<OpenTerminalResponse> {
@@ -3937,7 +3961,7 @@ async fn open_terminal_response(
 }
 
 async fn persist_terminal_terminal(
-    receipts: &SqliteReceiptStore,
+    receipts: &dyn ReceiptBackend,
     request: &OpenTerminalRequest,
     response: &OpenTerminalResponse,
 ) -> Option<OpenTerminalResponse> {
@@ -4191,7 +4215,7 @@ fn path_is_executable(path: &Path) -> bool {
 }
 
 async fn workspace_command_response(
-    receipts: &SqliteReceiptStore,
+    receipts: &dyn ReceiptBackend,
     config: &HostConfig,
     request: &WorkspaceCommandRequest,
 ) -> Option<WorkspaceCommandResponse> {
@@ -4236,7 +4260,7 @@ async fn workspace_command_response(
 }
 
 async fn persist_command_terminal(
-    receipts: &SqliteReceiptStore,
+    receipts: &dyn ReceiptBackend,
     request: &WorkspaceCommandRequest,
     response: &WorkspaceCommandResponse,
 ) -> Option<WorkspaceCommandResponse> {
@@ -4306,7 +4330,9 @@ fn authorize_workspace_command(
 ) -> Result<()> {
     if matches!(
         command,
-        HostCommand::TeamPrompt { .. } | HostCommand::Broadcast { .. }
+        HostCommand::TeamPrompt { .. }
+            | HostCommand::Broadcast { .. }
+            | HostCommand::BroadcastInstances { .. }
     ) {
         bail!("team prompts are host-local and cannot be remotely authorized");
     }
@@ -4315,7 +4341,9 @@ fn authorize_workspace_command(
     };
     let kind = match command {
         HostCommand::Prompt { .. } => crate::ParticipantCommandKind::Prompt,
-        HostCommand::TeamPrompt { .. } | HostCommand::Broadcast { .. } => {
+        HostCommand::TeamPrompt { .. }
+        | HostCommand::Broadcast { .. }
+        | HostCommand::BroadcastInstances { .. } => {
             unreachable!("rejected above")
         }
         HostCommand::RecallQueuedPrompt { .. } => crate::ParticipantCommandKind::RecallQueuedPrompt,
@@ -4360,7 +4388,7 @@ fn host_relay_origin(config: &HostConfig) -> Result<String> {
 async fn ensure_host_launch_owner(
     client: &Client,
     config: &HostConfig,
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     session_id: Uuid,
 ) -> Result<()> {
     validate_stored_host_identity(config, store, session_id).await?;
@@ -4379,7 +4407,7 @@ async fn ensure_host_launch_owner(
 
 async fn validate_stored_host_identity(
     config: &HostConfig,
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     session_id: Uuid,
 ) -> Result<()> {
     if let Some((host_id, origin)) = store.host_launch_owner(session_id).await? {
@@ -4412,7 +4440,7 @@ async fn validate_stored_host_identity(
 
 async fn persist_launch_metadata(
     config: &HostConfig,
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     session_id: Uuid,
     request: &LaunchSession,
     attachment: Option<&WorkspaceAttachment>,
@@ -4476,7 +4504,7 @@ async fn persist_launch_metadata(
 }
 
 async fn load_launch_metadata(
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     session_id: Uuid,
 ) -> Result<Option<StoredHostLaunch>> {
     store
@@ -4513,7 +4541,7 @@ async fn resume_pending_host_sessions(
     config: &HostConfig,
     session_root: &Path,
     sessions: &Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
-    session_store: &SqliteSessionStore,
+    session_store: &dyn SessionStore,
     executor_factory: &HostExecutorFactory,
 ) -> Result<usize> {
     let mut available = config
@@ -4696,9 +4724,18 @@ async fn spawn_host_session(
             tracing::error!(session_id = %session_id, %error, "remote agent session failed");
             // A fresh launch has no action for ordinary prompt recovery yet.
             // Keep its bootstrap marker until terminal settlement is durable.
-            if let Ok(store) = SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await
+            // Best-effort cleanup on a failed launch: open the configured
+            // backend, and if even that fails, leave the bootstrap marker
+            // rather than guessing at the session's state.
+            if let Ok(opened) = crate::session_store::factory::open(
+                &crate::session_store::factory::SessionStoreConfig::from_env(
+                    session_root.join("sessions.sqlite3"),
+                ),
+            )
+            .await
             {
-                match stored_host_session_state(&store, session_id).await {
+                let store = Arc::clone(opened.session());
+                match stored_host_session_state(store.as_ref(), session_id).await {
                     Ok(state)
                         if state
                             .as_ref()
@@ -4708,7 +4745,7 @@ async fn spawn_host_session(
                             &client,
                             &config,
                             &session_root,
-                            &store,
+                            store.as_ref(),
                             session_id,
                             "remote session failed during startup; check host logs",
                             true,
@@ -4742,7 +4779,7 @@ fn remaining_host_session_duration(
 
 async fn expire_host_session(
     config: &HostConfig,
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     session_id: Uuid,
     _writer: &SessionWriterLease,
 ) -> Result<()> {
@@ -4788,19 +4825,27 @@ async fn run_session(
     } = launch_request;
     launch.cwd = validate_host_cwd(&config.roots, &launch.cwd)?;
     discard_serialized_extension_roots(&mut launch);
-    let sqlite_store =
-        Arc::new(SqliteSessionStore::open(session_root.join("sessions.sqlite3")).await?);
-    ensure_host_launch_owner(&client, &config, &sqlite_store, session_id).await?;
+    // This session is about to run, so resolve every tier before starting it.
+    let sqlite_store = Arc::clone(
+        crate::session_store::factory::open_resolved(
+            &crate::session_store::factory::SessionStoreConfig::from_env(
+                session_root.join("sessions.sqlite3"),
+            ),
+        )
+        .await?
+        .session(),
+    );
+    ensure_host_launch_owner(&client, &config, sqlite_store.as_ref(), session_id).await?;
     // Expired recovery must not depend on relay availability or create a provider.
-    if stored_host_session_state(&sqlite_store, session_id)
+    if stored_host_session_state(sqlite_store.as_ref(), session_id)
         .await?
         .as_ref()
         .is_some_and(|state| remaining_host_session_duration(&config, Some(state)).is_zero())
     {
         let writer = SessionWriterLease::acquire(session_root.join(format!("{session_id}.lock")))?;
-        let state = stored_host_session_state(&sqlite_store, session_id).await?;
+        let state = stored_host_session_state(sqlite_store.as_ref(), session_id).await?;
         if remaining_host_session_duration(&config, state.as_ref()).is_zero() {
-            expire_host_session(&config, &sqlite_store, session_id, &writer).await?;
+            expire_host_session(&config, sqlite_store.as_ref(), session_id, &writer).await?;
             return Ok(());
         }
     }
@@ -4809,10 +4854,10 @@ async fn run_session(
     }
     let lock_path = session_root.join(format!("{session_id}.lock"));
     let writer = Arc::new(SessionWriterLease::acquire(&lock_path)?);
-    validate_stored_host_identity(&config, &sqlite_store, session_id).await?;
+    validate_stored_host_identity(&config, sqlite_store.as_ref(), session_id).await?;
     // Another host may have stopped this session while startup awaited the relay.
     // Recheck under writer ownership before constructing an actor or provider.
-    if stored_host_session_state(&sqlite_store, session_id)
+    if stored_host_session_state(sqlite_store.as_ref(), session_id)
         .await?
         .is_some_and(|state| {
             matches!(
@@ -4901,7 +4946,7 @@ async fn run_session(
         &client,
         &config,
         sqlite_store.as_ref(),
-        workspace_store.as_ref(),
+        workspace_store.as_deref(),
         session_id,
         workspace_attachment.map(|(workspace_id, _)| workspace_id),
         &mut sync,
@@ -4913,7 +4958,7 @@ async fn run_session(
     let remaining =
         remaining_host_session_duration(&config, Some(&sqlite_store.state(session_id).await?));
     if remaining.is_zero() {
-        expire_host_session(&config, &sqlite_store, session_id, &writer).await?;
+        expire_host_session(&config, sqlite_store.as_ref(), session_id, &writer).await?;
         return Ok(());
     }
     let session_deadline = tokio::time::Instant::now() + remaining;
@@ -4954,7 +4999,7 @@ async fn run_session(
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
             if !bootstrap_finished {
-                match finish_ready_host_bootstrap(&sqlite_store, session_id, initial_prompt_id).await {
+                match finish_ready_host_bootstrap(sqlite_store.as_ref(), session_id, initial_prompt_id).await {
                     Ok(finished) => bootstrap_finished = finished,
                     Err(error) => {
                         tracing::warn!(%error, %session_id, "cannot settle host bootstrap; retaining recovery marker")
@@ -4967,7 +5012,7 @@ async fn run_session(
                     &client,
                     &config,
                     sqlite_store.as_ref(),
-                    workspace_store.as_ref(),
+                    workspace_store.as_deref(),
                     session_id,
                     workspace_attachment.map(|(workspace_id, _)| workspace_id),
                     &mut sync,
@@ -5001,17 +5046,17 @@ async fn run_session(
         let _ = (&mut actor.0).await;
         // Keep writer ownership through settlement; final publication belongs
         // to the independent journal/message workers, not an unavailable relay.
-        expire_host_session(&config, &sqlite_store, session_id, &writer).await?;
+        expire_host_session(&config, sqlite_store.as_ref(), session_id, &writer).await?;
         tracing::warn!(%session_id, "host session duration expired; terminal output queued for recovery");
         return Ok(());
     }
-    finish_ready_host_bootstrap(&sqlite_store, session_id, initial_prompt_id).await?;
+    finish_ready_host_bootstrap(sqlite_store.as_ref(), session_id, initial_prompt_id).await?;
     flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
     flush_host_workspace_messages(
         &client,
         &config,
         sqlite_store.as_ref(),
-        workspace_store.as_ref(),
+        workspace_store.as_deref(),
         session_id,
         workspace_attachment.map(|(workspace_id, _)| workspace_id),
         &mut sync,
@@ -5021,7 +5066,7 @@ async fn run_session(
 }
 
 async fn finish_ready_host_bootstrap(
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     session_id: Uuid,
     initial_prompt_id: Option<Uuid>,
 ) -> Result<bool> {
@@ -5379,7 +5424,7 @@ impl JournalSync {
 async fn sync_instance_directory(
     client: &Client,
     config: &HostConfig,
-    store: &SqliteWorkspaceStore,
+    store: &dyn WorkspaceStore,
     session_id: Uuid,
 ) -> Result<usize> {
     let directory: RelayInstanceDirectory = client
@@ -5424,8 +5469,18 @@ pub async fn sync_remote_session(
         .parent()
         .context("host config has no parent")?
         .join("sessions/sessions.sqlite3");
-    ensure!(database.is_file(), "session database does not exist");
-    let store = SqliteSessionStore::open(database).await?;
+    let config_store = crate::session_store::factory::SessionStoreConfig::from_env(&database);
+    // Only SQLite keeps its journal in a file, so only SQLite can be missing
+    // one. A configured Postgres URL is expected to be reachable, and a
+    // connection failure there is reported rather than read as "no database".
+    if config_store.backend() == crate::session_store::factory::SessionBackend::Sqlite {
+        ensure!(database.is_file(), "session database does not exist");
+    }
+    let store = Arc::clone(
+        crate::session_store::factory::open(&config_store)
+            .await?
+            .session(),
+    );
     let binding = store
         .workspace_binding(session_id)
         .await?
@@ -5444,12 +5499,12 @@ pub async fn sync_remote_session(
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(35))
         .build()?;
-    let count = sync_instance_directory(&client, &config, &workspace, session_id).await?;
+    let count = sync_instance_directory(&client, &config, workspace.as_ref(), session_id).await?;
     ensure!(
         sync_relay_inbox(
             &client,
             &config,
-            &workspace,
+            workspace.as_ref(),
             session_id,
             binding.participant_id
         )
@@ -5462,8 +5517,11 @@ pub async fn sync_remote_session(
             uploaded_sequence: 0,
             uploaded_live_revision: 0,
             workspace_retry_at: HashMap::new(),
+            // The trait method, not the SQLite-specific one it used to call:
+            // the cursor set is the same either way, and reaching for the
+            // backend-specific name here would pin this path to SQLite.
             uploaded_workspace_sequences: store
-                .sqlite_host_workspace_cursors(config.host_id, session_id)
+                .host_workspace_cursors(config.host_id, session_id)
                 .await?,
             workspace_relay_available: false,
             instance_relay_available: true,
@@ -5476,8 +5534,8 @@ pub async fn sync_remote_session(
             flush_host_workspace_messages(
                 &client,
                 &config,
-                &store,
-                Some(&workspace),
+                store.as_ref(),
+                Some(workspace.as_ref()),
                 session_id,
                 None,
                 &mut sync,
@@ -5492,7 +5550,7 @@ pub async fn sync_remote_session(
 async fn sync_relay_inbox(
     client: &Client,
     config: &HostConfig,
-    store: &SqliteWorkspaceStore,
+    store: &dyn WorkspaceStore,
     session_id: Uuid,
     participant_id: Uuid,
 ) -> Result<bool> {
@@ -5547,7 +5605,7 @@ async fn flush_workspace_messages(
     client: &Client,
     config: &HostConfig,
     session_store: &dyn SessionStore,
-    workspace_store: Option<&SqliteWorkspaceStore>,
+    workspace_store: Option<&dyn WorkspaceStore>,
     session_id: Uuid,
     execution_workspace_id: Option<Uuid>,
     sync: &mut JournalSync,
@@ -6217,14 +6275,14 @@ mod tests {
             config.server = format!("http://{}", listener.local_addr().unwrap());
             let config_path = root.path().join("host.json");
             write_config(&config_path, &config).unwrap();
-            let store = Arc::new(
+            let store: Arc<dyn SessionStore> = Arc::new(
                 SqliteSessionStore::open(root.path().join("sessions/sessions.sqlite3"))
                     .await
                     .unwrap(),
             );
             let id = Uuid::new_v4();
             let launch = bootstrap_test_launch(root.path());
-            persist_launch_metadata(&config, &store, id, &launch, None)
+            persist_launch_metadata(&config, store.as_ref(), id, &launch, None)
                 .await
                 .unwrap();
             store.create_session(id).await.unwrap();
@@ -6647,7 +6705,7 @@ mod tests {
         });
 
         let root = tempdir().unwrap();
-        let store = Arc::new(
+        let store: Arc<dyn SessionStore> = Arc::new(
             crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
                 .await
                 .unwrap(),
@@ -6866,14 +6924,26 @@ mod tests {
             ..test_config(root.path())
         };
         assert!(
-            sync_relay_inbox(&Client::new(), &config, &workspace, recipient, recipient)
-                .await
-                .is_err()
+            sync_relay_inbox(
+                &Client::new(),
+                &config,
+                workspace.as_ref(),
+                recipient,
+                recipient
+            )
+            .await
+            .is_err()
         );
         assert!(
-            sync_relay_inbox(&Client::new(), &config, &workspace, recipient, recipient)
-                .await
-                .unwrap()
+            sync_relay_inbox(
+                &Client::new(),
+                &config,
+                workspace.as_ref(),
+                recipient,
+                recipient
+            )
+            .await
+            .unwrap()
         );
         server.await.unwrap();
         let pending = workspace
@@ -7081,7 +7151,7 @@ mod tests {
             &Client::new(),
             &config,
             &store,
-            Some(&workspace),
+            Some(workspace.as_ref()),
             sender,
             None,
             &mut sync,
@@ -7096,7 +7166,7 @@ mod tests {
                 &Client::new(),
                 &config,
                 &store,
-                Some(&workspace),
+                Some(workspace.as_ref()),
                 sender,
                 None,
                 &mut sync,
@@ -7110,7 +7180,7 @@ mod tests {
                 &Client::new(),
                 &config,
                 &store,
-                Some(&workspace),
+                Some(workspace.as_ref()),
                 sender,
                 None,
                 &mut sync,
@@ -7163,7 +7233,7 @@ mod tests {
         assert_eq!(stale_deliveries[0].state, crate::DeliveryState::Failed);
         assert!(
             workspace
-                .list_instances()
+                .list_instances(false)
                 .await
                 .unwrap()
                 .iter()
@@ -7628,7 +7698,7 @@ mod tests {
                 &client,
                 &config,
                 &store,
-                Some(&workspace),
+                Some(workspace.as_ref()),
                 session_id,
                 Some(binding.workspace_id),
                 &mut sync,
@@ -7878,7 +7948,7 @@ mod tests {
     /// Running first and each row gets its own `tool_call_id` live key.
     async fn seed_live_events(
         config: &HostConfig,
-        store: &SqliteSessionStore,
+        store: &dyn SessionStore,
         root: &Path,
         session_id: Uuid,
         count: usize,
@@ -8206,14 +8276,14 @@ mod tests {
             extension_skill_roots: Vec::new(),
             team_policy: None,
         };
-        let session_store = Arc::new(
+        let session_store: Arc<dyn SessionStore> = Arc::new(
             SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
                 .await
                 .unwrap(),
         );
         persist_launch_metadata(
             &config,
-            &session_store,
+            session_store.as_ref(),
             session_id,
             &launch,
             Some(&attachment),
@@ -8221,7 +8291,7 @@ mod tests {
         .await
         .unwrap();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
-        let receipts = Arc::new(sqlite_receipts().await);
+        let receipts: Arc<dyn ReceiptBackend> = Arc::new(sqlite_receipts().await);
 
         assert!(
             dispatch(
@@ -9211,7 +9281,7 @@ mod tests {
             .await
             .unwrap();
         drop(store);
-        let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
         assert!(
             store.host_launch_owner(id).await.unwrap().is_none(),
             "schema upgrade must not invent an owner"
@@ -9253,7 +9323,7 @@ mod tests {
         for rejection in [404, 401, 503, 1] {
             mode.store(rejection, Ordering::SeqCst);
             assert!(
-                ensure_host_launch_owner(&client, &config, &store, id)
+                ensure_host_launch_owner(&client, &config, store.as_ref(), id)
                     .await
                     .is_err()
             );
@@ -9284,7 +9354,7 @@ mod tests {
             &config,
             root.path(),
             &sessions,
-            &store,
+            store.as_ref(),
             &executor,
         )
         .await
@@ -9319,20 +9389,20 @@ mod tests {
             store.host_launch_owner(id).await.unwrap(),
             Some((config.host_id, host_relay_origin(&config).unwrap()))
         );
-        ensure_host_launch_owner(&client, &config, &store, id)
+        ensure_host_launch_owner(&client, &config, store.as_ref(), id)
             .await
             .unwrap();
         let mut foreign = config.clone();
         foreign.host_id = Uuid::new_v4();
         assert!(
-            ensure_host_launch_owner(&client, &foreign, &store, id)
+            ensure_host_launch_owner(&client, &foreign, store.as_ref(), id)
                 .await
                 .is_err()
         );
         foreign = config.clone();
         foreign.server = "https://other.invalid".to_string();
         assert!(
-            ensure_host_launch_owner(&client, &foreign, &store, id)
+            ensure_host_launch_owner(&client, &foreign, store.as_ref(), id)
                 .await
                 .is_err()
         );
@@ -9349,7 +9419,7 @@ mod tests {
         let task_store = Arc::clone(&store);
         let task_config = config.clone();
         let mut authorization = AbortTask(tokio::spawn(async move {
-            ensure_host_launch_owner(&client, &task_config, &task_store, racing).await
+            ensure_host_launch_owner(&client, &task_config, task_store.as_ref(), racing).await
         }));
         assert_eq!(
             requests.recv().await.unwrap(),
@@ -9419,7 +9489,7 @@ mod tests {
     async fn reenrolled_host_cannot_rebind_or_settle_another_host_session() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let root = tempdir().unwrap();
-        let store = Arc::new(
+        let store: Arc<dyn SessionStore> = Arc::new(
             SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
                 .await
                 .unwrap(),
@@ -9433,7 +9503,7 @@ mod tests {
         let mut owner_config = config.clone();
         owner_config.host_id = original_host;
         let launch = bootstrap_test_launch(root.path());
-        persist_launch_metadata(&owner_config, &store, session_id, &launch, None)
+        persist_launch_metadata(&owner_config, store.as_ref(), session_id, &launch, None)
             .await
             .unwrap();
         store.create_session(session_id).await.unwrap();
@@ -9500,11 +9570,8 @@ mod tests {
             "foreign durable identity must be rejected before network/provider startup"
         );
         let sessions = Arc::new(Mutex::new(HashMap::new()));
-        let receipts = Arc::new(
-            SqliteReceiptStore::open(store.pool().clone())
-                .await
-                .unwrap(),
-        );
+        // Same authority as the journal, obtained the way production does.
+        let receipts = store.receipt_store().await.unwrap();
         let command_context = |config: &HostConfig| DispatchContext {
             client: Client::new(),
             config: config.clone(),
@@ -9530,7 +9597,7 @@ mod tests {
             &config,
             root.path(),
             &sessions,
-            &store,
+            store.as_ref(),
             &executor,
         )
         .await
@@ -9549,7 +9616,7 @@ mod tests {
             1
         );
         assert!(
-            recover_host_journal(&Client::new(), &config, &store, session_id)
+            recover_host_journal(&Client::new(), &config, store.as_ref(), session_id)
                 .await
                 .is_err()
         );
@@ -9570,16 +9637,22 @@ mod tests {
             approval_provenance: None,
             reconnect_sync_cursors: None,
         };
-        persist_launch_metadata(&owner_config, &store, unstarted, &launch, Some(&attachment))
-            .await
-            .unwrap();
+        persist_launch_metadata(
+            &owner_config,
+            store.as_ref(),
+            unstarted,
+            &launch,
+            Some(&attachment),
+        )
+        .await
+        .unwrap();
         store.begin_host_bootstrap(unstarted).await.unwrap();
         assert!(
             !reject_host_launch(
                 &Client::new(),
                 &config,
                 root.path(),
-                &store,
+                store.as_ref(),
                 unstarted,
                 "wrong host startup failed",
                 true,
@@ -9602,7 +9675,7 @@ mod tests {
             &config,
             root.path(),
             &sessions,
-            &store,
+            store.as_ref(),
             &executor,
         )
         .await
@@ -9634,9 +9707,15 @@ mod tests {
         let current = Uuid::new_v4();
         let mut current_attachment = attachment.clone();
         current_attachment.host_identity.as_mut().unwrap().host_id = config.host_id;
-        persist_launch_metadata(&config, &store, current, &launch, Some(&current_attachment))
-            .await
-            .unwrap();
+        persist_launch_metadata(
+            &config,
+            store.as_ref(),
+            current,
+            &launch,
+            Some(&current_attachment),
+        )
+        .await
+        .unwrap();
         store.begin_host_bootstrap(current).await.unwrap();
         assert_eq!(
             store
@@ -10009,7 +10088,8 @@ mod tests {
             config.server = format!("http://{}", listener.local_addr().unwrap());
             config.resource_limits.max_concurrent_sessions = capacity;
             let path = root.path().join("sessions.sqlite3");
-            let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+            let store: Arc<dyn SessionStore> =
+                Arc::new(SqliteSessionStore::open(&path).await.unwrap());
             let session_id = Uuid::new_v4();
             let active_id = Uuid::new_v4();
             let launch = bootstrap_test_launch(root.path());
@@ -10068,8 +10148,8 @@ mod tests {
             let executor: HostExecutorFactory =
                 Arc::new(|_, _| panic!("expired lease cannot authorize actor restoration"));
             let client = Client::new();
-            let receipts = Arc::new(sqlite_receipts().await);
-            let context = |store: &Arc<SqliteSessionStore>| DispatchContext {
+            let receipts: Arc<dyn ReceiptBackend> = Arc::new(sqlite_receipts().await);
+            let context = |store: &Arc<dyn SessionStore>| DispatchContext {
                 client: client.clone(),
                 config: config.clone(),
                 session_root: root.path().to_path_buf(),
@@ -10157,7 +10237,8 @@ mod tests {
             assert!(workspace.contains_message(message_id).await.unwrap());
             drop(workspace);
             drop(store);
-            let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+            let store: Arc<dyn SessionStore> =
+                Arc::new(SqliteSessionStore::open(&path).await.unwrap());
             for field in ["text", "attachments", "delivery"] {
                 let mut conflicting = prompt();
                 let HostCommand::Prompt {
@@ -10226,7 +10307,7 @@ mod tests {
                 &config,
                 root.path(),
                 &sessions,
-                &store,
+                store.as_ref(),
                 &executor,
             )
             .await
@@ -10383,10 +10464,10 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         config.server = format!("http://{}", listener.local_addr().unwrap());
         let path = root.path().join("sessions.sqlite3");
-        let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
         let session_id = Uuid::new_v4();
         let launch = bootstrap_test_launch(root.path());
-        persist_launch_metadata(&config, &store, session_id, &launch, None)
+        persist_launch_metadata(&config, store.as_ref(), session_id, &launch, None)
             .await
             .unwrap();
         store.create_session(session_id).await.unwrap();
@@ -10411,11 +10492,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let receipts = Arc::new(
-            SqliteReceiptStore::open(store.pool().clone())
-                .await
-                .unwrap(),
-        );
+        // Same authority as the journal, obtained the way production does.
+        let receipts = store.receipt_store().await.unwrap();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let active_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::channel(2);
@@ -10424,7 +10502,7 @@ mod tests {
             .timeout(Duration::from_secs(1))
             .build()
             .unwrap();
-        let context = |store: &Arc<SqliteSessionStore>| DispatchContext {
+        let context = |store: &Arc<dyn SessionStore>| DispatchContext {
             client: client.clone(),
             config: config.clone(),
             session_root: root.path().to_path_buf(),
@@ -10466,7 +10544,8 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(HostCommand::Stop { session_id }) if session_id == active_id)
         );
-        let reopened = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let reopened: Arc<dyn SessionStore> =
+            Arc::new(SqliteSessionStore::open(&path).await.unwrap());
         assert!(
             reopened
                 .contains_message(session_id, message_id)
@@ -10486,7 +10565,7 @@ mod tests {
             &config,
             root.path(),
             &sessions,
-            &reopened,
+            reopened.as_ref(),
             &executor,
         )
         .await
@@ -10522,7 +10601,7 @@ mod tests {
             &config,
             root.path(),
             &sessions,
-            &reopened,
+            reopened.as_ref(),
             &executor,
         )
         .await
@@ -10684,12 +10763,15 @@ connection: close
             assert_eq!(responses[2]["outcome"]["code"], "cancelled");
         });
         let path = root.path().join("sessions.sqlite3");
-        let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
-        let receipts = Arc::new(
-            SqliteReceiptStore::open(store.pool().clone())
-                .await
-                .unwrap(),
-        );
+        let sqlite = SqliteSessionStore::open(&path).await.unwrap();
+        // Kept alongside the trait handle purely so the assertion below can
+        // read `quarantine_reason` directly. The queue API deliberately does
+        // not expose that column -- quarantine is a terminal state callers act
+        // on, not inspect -- so the probe reaches past the trait on purpose.
+        let probe_pool = sqlite.pool().clone();
+        let store: Arc<dyn SessionStore> = Arc::new(sqlite);
+        // Same authority as the journal, obtained the way production does.
+        let receipts = store.receipt_store().await.unwrap();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let active_id = Uuid::new_v4();
         let (tx, mut rx) = mpsc::channel(2);
@@ -10709,7 +10791,7 @@ connection: close
         };
         let poisoned = Uuid::new_v4();
         receipts
-            .enqueue_host_operation(
+            .enqueue_host_command(
                 config.host_id,
                 poisoned,
                 &serde_json::json!({"type": "unknown_future_command"}),
@@ -10772,7 +10854,7 @@ connection: close
         );
         let mismatched = Uuid::new_v4();
         receipts
-            .enqueue_host_operation(
+            .enqueue_host_command(
                 config.host_id,
                 mismatched,
                 &HostCommand::WorkspaceCommand {
@@ -10916,11 +10998,8 @@ connection: close
         drop(store);
 
         let store = SqliteSessionStore::open(&path).await.unwrap();
-        let receipts = Arc::new(
-            SqliteReceiptStore::open(store.pool().clone())
-                .await
-                .unwrap(),
-        );
+        // Same authority as the journal, obtained the way production does.
+        let receipts = store.receipt_store().await.unwrap();
         let _worker = AbortTask(tokio::spawn(run_host_operation_loop(
             client,
             config.clone(),
@@ -10953,7 +11032,7 @@ connection: close
             "select quarantine_reason from host_operation_queue where request_id=?",
         )
         .bind(poisoned.to_string())
-        .fetch_one(receipts.pool())
+        .fetch_one(&probe_pool)
         .await
         .unwrap();
         assert!(
@@ -11059,7 +11138,7 @@ connection: close
                 &client,
                 &config,
                 &store,
-                Some(&workspace),
+                Some(workspace.as_ref()),
                 id,
                 Some(binding.workspace_id),
                 &mut sync,
@@ -11090,7 +11169,7 @@ connection: close
                 &client,
                 &config,
                 &store,
-                Some(&workspace),
+                Some(workspace.as_ref()),
                 id,
                 Some(binding.workspace_id),
                 &mut sync,
@@ -11120,7 +11199,7 @@ connection: close
             &client,
             &config,
             &store,
-            Some(&workspace),
+            Some(workspace.as_ref()),
             id,
             Some(binding.workspace_id),
             &mut sync,
@@ -11265,7 +11344,7 @@ connection: close
                 &client,
                 &config,
                 &store,
-                Some(&workspace),
+                Some(workspace.as_ref()),
                 session_id,
                 Some(binding.workspace_id),
                 &mut sync,
@@ -11339,7 +11418,7 @@ connection: close
                 &client,
                 &config,
                 &store,
-                Some(&workspace),
+                Some(workspace.as_ref()),
                 session_id,
                 Some(binding.workspace_id),
                 &mut sync
@@ -11373,7 +11452,7 @@ connection: close
             .await
             .unwrap();
         drop(store);
-        let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
         let session_id = Uuid::new_v4();
         let recipient = Uuid::new_v4();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -11394,7 +11473,7 @@ connection: close
         };
         persist_launch_metadata(
             &config,
-            &store,
+            store.as_ref(),
             session_id,
             &bootstrap_test_launch(root.path()),
             Some(&attachment),
@@ -11525,8 +11604,8 @@ connection: close
         recover_host_workspace_messages(
             &client,
             &config,
-            &store,
-            &workspace,
+            store.as_ref(),
+            workspace.as_ref(),
             session_id,
             &mut recovery_sync,
         )
@@ -11544,7 +11623,7 @@ connection: close
         );
         drop(workspace);
         drop(store);
-        let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
         let workspace = store.workspace_store().await.unwrap().unwrap();
         for rejected in [0, 401] {
             status.store(rejected, Ordering::SeqCst);
@@ -11559,8 +11638,8 @@ connection: close
             let result = recover_host_workspace_messages(
                 &client,
                 &config,
-                &store,
-                &workspace,
+                store.as_ref(),
+                workspace.as_ref(),
                 session_id,
                 &mut recovery_sync,
             )
@@ -11667,7 +11746,7 @@ connection: close
             &client,
             &config,
             &store,
-            &workspace,
+            workspace.as_ref(),
             session_id,
             &mut recovery_sync,
         )
@@ -11698,7 +11777,7 @@ connection: close
                 &client,
                 &other_host,
                 &store,
-                &workspace,
+                workspace.as_ref(),
                 session_id,
                 &mut recovery_sync
             )
@@ -11726,7 +11805,7 @@ connection: close
             &client,
             &config,
             &store,
-            &workspace,
+            workspace.as_ref(),
             session_id,
             &mut recovery_sync,
         )
@@ -11751,7 +11830,7 @@ connection: close
             &client,
             &config,
             &store,
-            &workspace,
+            workspace.as_ref(),
             session_id,
             &mut recovery_sync,
         )
@@ -11766,7 +11845,7 @@ connection: close
                 .is_empty()
         );
         // A later private message must not inherit the shared route backoff.
-        let store = Arc::new(store);
+        let store: Arc<dyn SessionStore> = Arc::new(store);
         workspace
             .append_message(crate::NewWorkspaceMessage {
                 workspace_id: binding.workspace_id,
@@ -12008,7 +12087,7 @@ connection: close
         );
         drop(store);
 
-        let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let active_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel(1);
@@ -12058,7 +12137,7 @@ connection: close
         config.server = format!("http://{}", listener.local_addr().unwrap());
         config.resource_limits.max_concurrent_sessions = 1;
         let path = root.path().join("sessions.sqlite3");
-        let store = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
         let [expired, locked, started, active, foreign, legacy] =
             std::array::from_fn(|_| Uuid::new_v4());
         let metadata = serde_json::to_value(PersistedLaunchMetadata {
@@ -12131,7 +12210,7 @@ connection: close
                 &config,
                 root.path(),
                 &sessions,
-                &store,
+                store.as_ref(),
                 &executor,
             ),
         )
@@ -12336,7 +12415,7 @@ connection: close
             }
             uploads
         });
-        let store = Arc::new(
+        let store: Arc<dyn SessionStore> = Arc::new(
             SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
                 .await
                 .unwrap(),
@@ -12396,7 +12475,7 @@ connection: close
             1
         );
         drop(store);
-        let store = Arc::new(
+        let store: Arc<dyn SessionStore> = Arc::new(
             SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
                 .await
                 .unwrap(),
@@ -12407,7 +12486,7 @@ connection: close
             &config,
             root.path(),
             &sessions,
-            &store,
+            store.as_ref(),
             &executor,
         )
         .await
@@ -12451,7 +12530,7 @@ connection: close
                 .unwrap()
                 .contains(&session_id)
         );
-        recover_host_journal(&client, &config, &store, session_id)
+        recover_host_journal(&client, &config, store.as_ref(), session_id)
             .await
             .unwrap();
         let uploads = tokio::time::timeout(Duration::from_secs(5), server)
@@ -12647,7 +12726,7 @@ connection: close
                 }),
                 _ => None,
             };
-            let session_store = Arc::new(
+            let session_store: Arc<dyn SessionStore> = Arc::new(
                 SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
                     .await
                     .unwrap(),
@@ -12655,8 +12734,8 @@ connection: close
             let sessions = Arc::new(Mutex::new(HashMap::new()));
             let (active_tx, mut active_rx) = mpsc::channel(1);
             sessions.lock().await.insert(active_id, active_tx);
-            let receipts = Arc::new(sqlite_receipts().await);
-            let context = |store: &Arc<SqliteSessionStore>| DispatchContext {
+            let receipts: Arc<dyn ReceiptBackend> = Arc::new(sqlite_receipts().await);
+            let context = |store: &Arc<dyn SessionStore>| DispatchContext {
                 client: Client::new(),
                 config: config.clone(),
                 session_root: root.path().to_path_buf(),
@@ -12810,7 +12889,7 @@ connection: close
                 assert_eq!(
                     persist_launch_metadata(
                         &config,
-                        &session_store,
+                        session_store.as_ref(),
                         rejected_id,
                         &launch,
                         Some(&future_attachment)
@@ -12835,17 +12914,23 @@ connection: close
             };
             if oversized {
                 assert!(
-                    persist_launch_metadata(&config, &session_store, session_id, &launch, None)
-                        .await
-                        .unwrap()
-                        .is_some()
+                    persist_launch_metadata(
+                        &config,
+                        session_store.as_ref(),
+                        session_id,
+                        &launch,
+                        None
+                    )
+                    .await
+                    .unwrap()
+                    .is_some()
                 );
                 assert!(!dispatch(context(&session_store), HostCommand::Stop { session_id }).await);
                 assert!(!session_store.contains_session(session_id).await.unwrap());
             }
             // Restart after metadata admission but before the failure journal exists.
             drop(session_store);
-            let session_store = Arc::new(
+            let session_store: Arc<dyn SessionStore> = Arc::new(
                 SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
                     .await
                     .unwrap(),
@@ -12881,7 +12966,7 @@ connection: close
                 assert!(
                     persist_launch_metadata(
                         &config,
-                        &session_store,
+                        session_store.as_ref(),
                         session_id,
                         &changed,
                         attachment.as_ref()
@@ -12924,7 +13009,7 @@ connection: close
             );
             // Failed publication must survive process restart with exactly the same journal.
             drop(session_store);
-            let session_store = Arc::new(
+            let session_store: Arc<dyn SessionStore> = Arc::new(
                 SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
                     .await
                     .unwrap(),
@@ -12947,7 +13032,7 @@ connection: close
 
             // Reopen the durable journal after the slot is free: rejection must not
             // turn into a deferred launch or accept a new prompt into an actor.
-            let session_store = Arc::new(
+            let session_store: Arc<dyn SessionStore> = Arc::new(
                 SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
                     .await
                     .unwrap(),
@@ -13025,7 +13110,7 @@ connection: close
             extension_skill_roots: Vec::new(),
             team_policy: None,
         };
-        let session_store = Arc::new(
+        let session_store: Arc<dyn SessionStore> = Arc::new(
             SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
                 .await
                 .unwrap(),
@@ -13048,7 +13133,7 @@ connection: close
                 .await
                 .unwrap();
         }
-        persist_launch_metadata(&config, &session_store, session_id, &launch, None)
+        persist_launch_metadata(&config, session_store.as_ref(), session_id, &launch, None)
             .await
             .unwrap();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -13214,10 +13299,10 @@ connection: close
                 recursive: false,
             },
         };
-        let receipts = sqlite_receipts().await;
+        let receipts: Arc<dyn ReceiptBackend> = Arc::new(sqlite_receipts().await);
         receipts.begin(request.request_id, &request).await.unwrap();
 
-        let response = filesystem_response(&receipts, &test_config(root.path()), &request)
+        let response = filesystem_response(receipts.as_ref(), &test_config(root.path()), &request)
             .await
             .unwrap();
 
@@ -13257,12 +13342,13 @@ connection: close
             timeout_ms: 1_000,
             output_max_bytes: 1_024,
         };
-        let receipts = sqlite_receipts().await;
+        let receipts: Arc<dyn ReceiptBackend> = Arc::new(sqlite_receipts().await);
         receipts.begin(request.request_id, &request).await.unwrap();
 
-        let response = workspace_command_response(&receipts, &test_config(root.path()), &request)
-            .await
-            .unwrap();
+        let response =
+            workspace_command_response(receipts.as_ref(), &test_config(root.path()), &request)
+                .await
+                .unwrap();
 
         assert!(
             !marker.exists(),

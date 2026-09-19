@@ -7,9 +7,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::native_process::{ProcessManager, ProcessSnapshot};
-use crate::{
-    HostResourceLimits, SqliteSessionStore, WorkspaceFilesystemRequest, WorkspaceFilesystemResponse,
-};
+use crate::{HostResourceLimits, WorkspaceFilesystemRequest, WorkspaceFilesystemResponse};
 
 /// One command executed in an agent's execution world.
 #[derive(Clone)]
@@ -21,7 +19,7 @@ pub struct ExecutionCommandRequest {
     pub yield_time_ms: Option<u64>,
     pub max_output_tokens: Option<usize>,
     pub timeout_ms: u64,
-    pub journal: Option<SqliteSessionStore>,
+    pub journal: Option<std::sync::Arc<dyn crate::SessionStore>>,
     /// Session-scoped capability transport inherited by model-authored child
     /// processes. Provider and deployment credentials are never added here.
     pub environment: BTreeMap<String, String>,
@@ -70,7 +68,11 @@ pub struct ExecutionSearchRequest {
 /// protocol.
 #[async_trait]
 pub trait ExecutionProvider: Send + Sync {
-    async fn recover_session(&self, session_id: Uuid, store: SqliteSessionStore) -> Result<()>;
+    async fn recover_session(
+        &self,
+        session_id: Uuid,
+        store: std::sync::Arc<dyn crate::SessionStore>,
+    ) -> Result<()>;
 
     async fn filesystem(
         &self,
@@ -133,7 +135,11 @@ impl LocalExecutionProvider {
 
 #[async_trait]
 impl ExecutionProvider for LocalExecutionProvider {
-    async fn recover_session(&self, session_id: Uuid, store: SqliteSessionStore) -> Result<()> {
+    async fn recover_session(
+        &self,
+        session_id: Uuid,
+        store: std::sync::Arc<dyn crate::SessionStore>,
+    ) -> Result<()> {
         self.processes.recover_session(session_id, store).await
     }
 

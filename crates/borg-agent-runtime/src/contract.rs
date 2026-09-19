@@ -1223,6 +1223,14 @@ pub enum HostCommand {
         session_id: Uuid,
         text: String,
     },
+    /// A human `/broadcast`: deliver one message to every Borg instance
+    /// running on this machine, not just this session's team. Host-local for
+    /// the same reason as `Broadcast` - accepting it from a remote participant
+    /// would turn one relayed command into machine-wide fan-out.
+    BroadcastInstances {
+        session_id: Uuid,
+        text: String,
+    },
     /// Promote every queued human prompt into the active provider turn.
     /// Unlike `Interrupt`, this never cancels the turn.
     FlushPendingInput {
@@ -1307,6 +1315,7 @@ impl HostCommand {
             | Self::Prompt { session_id, .. }
             | Self::TeamPrompt { session_id, .. }
             | Self::Broadcast { session_id, .. }
+            | Self::BroadcastInstances { session_id, .. }
             | Self::RecallQueuedPrompt { session_id, .. }
             | Self::FlushPendingInput { session_id }
             | Self::Configure { session_id, .. }

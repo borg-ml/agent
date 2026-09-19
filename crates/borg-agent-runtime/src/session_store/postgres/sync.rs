@@ -30,7 +30,7 @@ use crate::{MessageStatus, SessionEvent, SessionEventKind};
 /// one is audited, which is what makes a crash mid-turn reconstructable.
 /// A terminal action is left alone: a late or replayed event must never
 /// resurrect finished work.
-async fn advance_action(
+pub(super) async fn advance_action(
     transaction: &mut Transaction<'_, Postgres>,
     session_id: Uuid,
     action_id: Uuid,
@@ -349,12 +349,7 @@ pub(super) async fn sync_session_action(
                 None,
             )?;
             action.created_at = event.created_at;
-            upsert_event_action(
-                transaction,
-                &action,
-                *status == MessageStatus::InProgress,
-            )
-            .await?;
+            upsert_event_action(transaction, &action, *status == MessageStatus::InProgress).await?;
         }
         SessionEventKind::Message {
             message_id,
@@ -466,9 +461,12 @@ pub(super) async fn sync_session_action(
                     .await?;
                 }
                 Some("completed") => {
-                    if let Some(action_id) =
-                        latest_action_id(transaction, event.session_id, SessionActionKind::Compaction)
-                            .await?
+                    if let Some(action_id) = latest_action_id(
+                        transaction,
+                        event.session_id,
+                        SessionActionKind::Compaction,
+                    )
+                    .await?
                     {
                         advance_action(
                             transaction,
@@ -620,13 +618,13 @@ mod tests {
     use super::super::PostgresSessionStore;
     use super::super::testing::{ScratchDatabase, test_url};
     use super::*;
+    use crate::CodingProvider;
     use crate::session_store::SessionStore;
     use crate::{EventActor, PromptDelivery};
-    use crate::CodingProvider;
 
     async fn running_session(url: &str) -> (ScratchDatabase, PostgresSessionStore, Uuid) {
         let scratch = ScratchDatabase::create(url).await;
-        let store = PostgresSessionStore::connect(&scratch.url)
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
             .await
             .expect("connect");
         let session_id = Uuid::new_v4();
@@ -711,7 +709,12 @@ mod tests {
             .await
             .expect("turn started");
         assert_eq!(
-            store.action(session_id, message_id).await.unwrap().unwrap().state,
+            store
+                .action(session_id, message_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             SessionActionState::Running
         );
 
@@ -720,7 +723,12 @@ mod tests {
             .await
             .expect("turn completed");
         assert_eq!(
-            store.action(session_id, message_id).await.unwrap().unwrap().state,
+            store
+                .action(session_id, message_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             SessionActionState::Completed
         );
 
@@ -745,7 +753,13 @@ mod tests {
                 SessionActionState::Completed,
             ]
         );
-        assert!(store.pending_actions(session_id, 10).await.unwrap().is_empty());
+        assert!(
+            store
+                .pending_actions(session_id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         scratch.discard().await;
     }
 
@@ -766,7 +780,11 @@ mod tests {
             .await
             .expect("turn started");
         store
-            .append(turn_completed(session_id, message_id, Some("connection reset")))
+            .append(turn_completed(
+                session_id,
+                message_id,
+                Some("connection reset"),
+            ))
             .await
             .expect("turn failed");
         let failed = store.action(session_id, message_id).await.unwrap().unwrap();
@@ -788,7 +806,12 @@ mod tests {
             .await
             .expect("network retry");
         assert_eq!(
-            store.action(session_id, message_id).await.unwrap().unwrap().state,
+            store
+                .action(session_id, message_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             SessionActionState::Queued,
             "a retry must requeue the existing action, not strand it"
         );
@@ -822,7 +845,13 @@ mod tests {
         let action = store.action(session_id, message_id).await.unwrap().unwrap();
         assert_eq!(action.state, SessionActionState::Cancelled);
         assert_eq!(action.error.as_deref(), Some("recalled before execution"));
-        assert!(store.pending_actions(session_id, 10).await.unwrap().is_empty());
+        assert!(
+            store
+                .pending_actions(session_id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         scratch.discard().await;
     }
 
@@ -910,7 +939,12 @@ mod tests {
             .await
             .expect("compaction completed");
         assert_eq!(
-            store.action(session_id, started.id).await.unwrap().unwrap().state,
+            store
+                .action(session_id, started.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
             SessionActionState::Completed
         );
         scratch.discard().await;
@@ -940,8 +974,14 @@ mod tests {
             .expect("prompt");
         let action = store.action(session_id, queued_id).await.unwrap().unwrap();
         assert_eq!(action.kind, SessionActionKind::Prompt);
-        assert_eq!(action.delivery, crate::ActionDeliveryPolicy::NextTurnBoundary);
-        assert_eq!(store.pending_actions(session_id, 10).await.unwrap().len(), 2);
+        assert_eq!(
+            action.delivery,
+            crate::ActionDeliveryPolicy::NextTurnBoundary
+        );
+        assert_eq!(
+            store.pending_actions(session_id, 10).await.unwrap().len(),
+            2
+        );
         scratch.discard().await;
     }
 }

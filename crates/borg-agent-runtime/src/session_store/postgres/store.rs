@@ -22,11 +22,16 @@ use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use super::PostgresSessionStore;
+#[cfg(any(feature = "subscription-adapters", test))]
+use crate::CodingProvider;
 use crate::session_store::{
-    ClaimedActionTransition, EventPersistence, INLINE_SESSION_PAYLOAD_BYTES, SessionAction,
+    ClaimedActionTransition, EventPersistence, INLINE_SESSION_PAYLOAD_BYTES, RawSessionEvent,
+    RuntimeCheckpoint, RuntimeManifest, RuntimeManifestActivation, SessionAction,
     SessionActionState, SessionActionTransition, SessionEvent, SessionEventKind,
-    SessionLiveEvent, SessionPayloadKind, SessionPayloadRef, SessionRecovery, SessionState,
-    SessionStatus, SessionStore, SessionStoreFork, SessionSummary, deferred_json_payload,
+    SessionHistoryIndexDocument, SessionHistoryPage, SessionHistoryQuery, SessionHistorySearchMode,
+    SessionLineage, SessionLiveEvent, SessionPayloadKind, SessionPayloadRef, SessionRecovery,
+    SessionState, SessionStatus, SessionStore, SessionStoreCompaction, SessionStoreFork,
+    SessionStoreHealth, SessionSummary, SessionWorkspaceBinding, deferred_json_payload,
     deferred_text_payload, event_kind, historical_projection_json,
 };
 
@@ -130,6 +135,77 @@ impl PostgresSessionStore {
         })
     }
 
+    /// Page backwards over a session's message rows, newest first.
+    ///
+    /// WHY NOT A SQL PREDICATE: the SQLite store filters on actor and status
+    /// with `json_extract` in the query. That is impossible here for a COLD
+    /// row, whose body is compressed bytes the planner cannot read -- a jsonb
+    /// predicate would silently skip every aged session, and the tail of an
+    /// aged session is exactly what these callers want. So the index narrows to
+    /// message rows (`idx_session_events_message_sequence`, partial on
+    /// `event_kind = 'message'` and already ordered by descending sequence) and
+    /// the predicate runs in Rust over decoded bodies.
+    ///
+    /// Bounded work: it stops as soon as `limit` matches are found, so a chatty
+    /// session costs one page rather than a full read.
+    async fn recent_messages_matching(
+        &self,
+        session_id: Uuid,
+        after_sequence: u64,
+        limit: usize,
+        matches: impl Fn(&SessionEvent) -> bool,
+    ) -> Result<Vec<SessionEvent>> {
+        const PAGE: i64 = 256;
+        let mut found: Vec<SessionEvent> = Vec::new();
+        let mut before = i64::MAX;
+        loop {
+            let rows = sqlx::query(
+                "select sequence, event_json, event_body, dict_id from session_events \
+                 where session_id = $1 and event_kind = 'message' \
+                   and sequence > $2 and sequence < $3 \
+                 order by sequence desc limit $4",
+            )
+            .bind(session_id)
+            .bind(i64::try_from(after_sequence).unwrap_or(i64::MAX))
+            .bind(before)
+            .bind(PAGE)
+            .fetch_all(self.pool())
+            .await?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in &rows {
+                before = before.min(row.try_get::<i64, _>("sequence")?);
+                let body = match row.try_get::<Option<serde_json::Value>, _>("event_json")? {
+                    Some(body) => body,
+                    None => {
+                        let bytes: Option<Vec<u8>> = row.try_get("event_body")?;
+                        let dict_id: Option<i32> = row.try_get("dict_id")?;
+                        let dictionary = match dict_id {
+                            Some(dict_id) => Some(self.dictionary(dict_id).await?),
+                            None => None,
+                        };
+                        let dictionary = dictionary.map(|dictionary| (*dictionary).clone());
+                        serde_json::from_slice(&super::body::decompress(
+                            &bytes.unwrap_or_default(),
+                            dictionary.as_ref(),
+                        )?)?
+                    }
+                };
+                let event: SessionEvent = serde_json::from_value(body)?;
+                if matches(&event) {
+                    found.push(event);
+                    if found.len() >= limit {
+                        found.reverse();
+                        return Ok(found);
+                    }
+                }
+            }
+        }
+        found.reverse();
+        Ok(found)
+    }
+
     /// Append one durable event under a per-session row lock.
     async fn append_durable(&self, event: SessionEvent) -> Result<SessionEvent> {
         let mut transaction = self.pool().begin().await?;
@@ -149,7 +225,6 @@ impl PostgresSessionStore {
         transaction: &mut Transaction<'_, Postgres>,
         mut event: SessionEvent,
     ) -> Result<SessionEvent> {
-
         // `for update` is the whole design: it serialises writers for THIS
         // session and no other. Two agents appending to two sessions proceed
         // in parallel, which is what SQLite's single file writer made
@@ -180,7 +255,25 @@ impl PostgresSessionStore {
         state.apply(&event)?;
         let stored_event_kind = event_kind(&event.kind)?;
         let compact_event = self.compact_payloads(transaction, &event).await?;
-        let body = serde_json::to_value(&compact_event)?;
+        // POSTGRES CANNOT PUT \u0000 IN JSONB. `jsonb` parses to a normalised
+        // tree whose strings are Postgres `text`, and text cannot contain a NUL
+        // -- the server rejects the whole insert with "unsupported Unicode
+        // escape sequence". SQLite's JSON is just text, so it accepts these
+        // happily; 246 events in the journal this was measured against carry
+        // one, almost all of them tool output that captured a binary byte.
+        //
+        // Dropping or replacing the NUL would corrupt the evidence a journal
+        // exists to preserve, so such an event goes to the `event_body` bytea
+        // tier instead, uncompressed, with a null `dict_id`. The schema already
+        // allows either column per row and every read already handles both, so
+        // this costs one branch rather than a new mechanism. The trade is that
+        // these rows are opaque to ad-hoc SQL -- exactly the documented trade
+        // for any cold row.
+        let body_value = serde_json::to_value(&compact_event)?;
+        let body_text = serde_json::to_string(&compact_event)?;
+        let nul_bearing = body_text.contains("\\u0000");
+        let body = if nul_bearing { None } else { Some(body_value) };
+        let body_bytes = nul_bearing.then(|| body_text.into_bytes());
         let projection_json = serde_json::to_string(&state)?;
         // Only checkpoint rows carry a projection; the rest replay forward from
         // the newest one. Identical policy to SQLite, and the single largest
@@ -194,16 +287,17 @@ impl PostgresSessionStore {
 
         sqlx::query(
             "insert into session_events \
-             (session_id, sequence, event_id, event_kind, event_json, projection_json, \
-              fork_inheritable, recovery_relevant, message_id, created_at, \
+             (session_id, sequence, event_id, event_kind, event_json, event_body, \
+              projection_json, fork_inheritable, recovery_relevant, message_id, created_at, \
               subagent_session_id, provider_event_kind) \
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(event.session_id)
         .bind(i64::try_from(event.sequence).context("session sequence exceeds a bigint")?)
         .bind(event.id)
         .bind(&stored_event_kind)
         .bind(&body)
+        .bind(body_bytes.as_deref())
         .bind(historical_projection)
         .bind(event.kind.is_fork_inheritable())
         .bind(event.kind.is_recovery_relevant())
@@ -265,13 +359,12 @@ impl PostgresSessionStore {
             .context("coalesced session event has no live-state key")?;
         event.sequence = 0;
         let mut transaction = self.pool().begin().await?;
-        let row = sqlx::query(
-            "select live_revision, state_json from sessions where id = $1 for update",
-        )
-        .bind(event.session_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .with_context(|| format!("session {} does not exist", event.session_id))?;
+        let row =
+            sqlx::query("select live_revision, state_json from sessions where id = $1 for update")
+                .bind(event.session_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .with_context(|| format!("session {} does not exist", event.session_id))?;
 
         for key in event.kind.cleared_live_state_keys() {
             sqlx::query("delete from session_live_state where session_id = $1 and live_key = $2")
@@ -490,7 +583,12 @@ impl SessionStore for PostgresSessionStore {
     async fn read(&self, session_id: Uuid) -> Result<Vec<SessionEvent>> {
         // A session that owns its whole history reads straight from its own
         // rows; only a fork pays for composing an inherited prefix.
-        if self.session_row(session_id).await?.parent_session_id.is_none() {
+        if self
+            .session_row(session_id)
+            .await?
+            .parent_session_id
+            .is_none()
+        {
             return self.events_query(session_id, 0, None).await;
         }
         self.composed_events(session_id, None).await
@@ -502,7 +600,12 @@ impl SessionStore for PostgresSessionStore {
         sequence: u64,
         limit: usize,
     ) -> Result<Vec<SessionEvent>> {
-        if self.session_row(session_id).await?.parent_session_id.is_none() {
+        if self
+            .session_row(session_id)
+            .await?
+            .parent_session_id
+            .is_none()
+        {
             return self
                 .events_query(
                     session_id,
@@ -654,6 +757,687 @@ impl SessionStore for PostgresSessionStore {
         Ok(sessions)
     }
 
+    /// The workspace tier on the same database.
+    ///
+    /// This is what stops a Postgres-backed session from reporting "no
+    /// workspace store": host.rs retries that condition forever rather than
+    /// degrading, so a backend that cannot supply every tier must fail at
+    /// startup instead of at first use.
+    async fn workspace_store(&self) -> Result<Option<std::sync::Arc<dyn crate::WorkspaceStore>>> {
+        Ok(Some(std::sync::Arc::new(
+            crate::workspace_postgres::PostgresWorkspaceStore::from_pool(self.pool().clone()),
+        )))
+    }
+
+    // The persistent-runtime tier. These forward to the inherent methods of the
+    // same name: the inherent versions predate the trait and are still called
+    // directly through concrete handles, so the trait adopts them rather than
+    // duplicating their bodies.
+
+    async fn activate_runtime_manifest(
+        &self,
+        session_id: Uuid,
+        runtime: &str,
+        root: &str,
+        command: &str,
+        worker_id: Uuid,
+    ) -> Result<RuntimeManifestActivation> {
+        Self::activate_runtime_manifest(self, session_id, runtime, root, command, worker_id).await
+    }
+
+    async fn record_runtime_execution(
+        &self,
+        session_id: Uuid,
+        worker_id: Uuid,
+        code_hash: &str,
+        worker_failed: bool,
+        error: Option<&str>,
+    ) -> Result<()> {
+        Self::record_runtime_execution(self, session_id, worker_id, code_hash, worker_failed, error)
+            .await
+    }
+
+    async fn stop_runtime_manifest(&self, session_id: Uuid, worker_id: Uuid) -> Result<()> {
+        Self::stop_runtime_manifest(self, session_id, worker_id).await
+    }
+
+    async fn runtime_manifest(&self, session_id: Uuid) -> Result<Option<RuntimeManifest>> {
+        Self::runtime_manifest(self, session_id).await
+    }
+
+    async fn save_runtime_checkpoint(
+        &self,
+        session_id: Uuid,
+        worker_id: Uuid,
+        key: &str,
+        state: &serde_json::Value,
+    ) -> Result<RuntimeCheckpoint> {
+        Self::save_runtime_checkpoint(self, session_id, worker_id, key, state).await
+    }
+
+    async fn runtime_checkpoint(
+        &self,
+        session_id: Uuid,
+        key: Option<&str>,
+    ) -> Result<Option<RuntimeCheckpoint>> {
+        Self::runtime_checkpoint(self, session_id, key).await
+    }
+
+    async fn list_runtime_checkpoints(
+        &self,
+        session_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<RuntimeCheckpoint>> {
+        Self::list_runtime_checkpoints(self, session_id, limit).await
+    }
+
+    async fn load_harness_state(&self, session_id: Uuid) -> Result<Option<serde_json::Value>> {
+        Self::load_harness_state(self, session_id).await
+    }
+
+    async fn save_harness_state(&self, session_id: Uuid, state: &serde_json::Value) -> Result<()> {
+        Self::save_harness_state(self, session_id, state).await
+    }
+
+    async fn rollback_harness_state(
+        &self,
+        session_id: Uuid,
+        steps: usize,
+    ) -> Result<serde_json::Value> {
+        Self::rollback_harness_state(self, session_id, steps).await
+    }
+
+    async fn query_history(
+        &self,
+        session_id: Uuid,
+        query: SessionHistoryQuery,
+    ) -> Result<SessionHistoryPage> {
+        Self::query_history(self, session_id, query).await
+    }
+
+    async fn history_index_documents_after(
+        &self,
+        session_id: Uuid,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionHistoryIndexDocument>> {
+        Self::history_index_documents_after(self, session_id, sequence, limit).await
+    }
+
+    async fn ensure_workflow_action(
+        &self,
+        session_id: Uuid,
+        workflow_id: Uuid,
+        payload: &serde_json::Value,
+    ) -> Result<SessionAction> {
+        Self::ensure_workflow_action(self, session_id, workflow_id, payload).await
+    }
+
+    async fn ensure_workflow_started(
+        &self,
+        event: SessionEvent,
+        workflow_id: Uuid,
+    ) -> Result<SessionEvent> {
+        Self::ensure_workflow_started(self, event, workflow_id).await
+    }
+
+    async fn append_with_action_lease(
+        &self,
+        event: SessionEvent,
+        action_id: Uuid,
+        lease_owner: &str,
+        lease_token: Uuid,
+    ) -> Result<SessionEvent> {
+        Self::append_with_action_lease(self, event, action_id, lease_owner, lease_token).await
+    }
+
+    async fn autonomy_store(
+        &self,
+    ) -> Result<Option<std::sync::Arc<dyn crate::autonomy::AutonomyStore>>> {
+        Ok(Some(std::sync::Arc::new(
+            crate::autonomy_postgres::PostgresAutonomyStore::from_pool(self.pool().clone()),
+        )))
+    }
+
+    async fn contains_session(&self, session_id: Uuid) -> Result<bool> {
+        Self::contains_session(self, session_id).await
+    }
+
+    async fn create_session_in_workspace(
+        &self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<SessionWorkspaceBinding> {
+        Self::create_session_in_workspace(self, session_id, workspace_id).await
+    }
+
+    async fn discard_empty_session(&self, session_id: Uuid) -> Result<bool> {
+        Self::discard_empty_session(self, session_id).await
+    }
+
+    async fn load_host_launch_metadata(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<serde_json::Value>> {
+        Self::load_host_launch_metadata(self, session_id).await
+    }
+
+    async fn acknowledge_host_journal(
+        &self,
+        session_id: Uuid,
+        event_cursor: u64,
+        live_revision: u64,
+    ) -> Result<()> {
+        Self::acknowledge_host_journal(self, session_id, event_cursor, live_revision).await
+    }
+
+    async fn begin_host_bootstrap(&self, session_id: Uuid) -> Result<()> {
+        Self::begin_host_bootstrap(self, session_id).await
+    }
+
+    async fn claim_legacy_host_launch_owner(
+        &self,
+        session_id: Uuid,
+        host_id: Uuid,
+        relay_origin: &str,
+    ) -> Result<()> {
+        Self::claim_legacy_host_launch_owner(self, session_id, host_id, relay_origin).await
+    }
+
+    async fn create_session_in_workspace_as(
+        &self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        participant_id: Uuid,
+    ) -> Result<SessionWorkspaceBinding> {
+        Self::create_session_in_workspace_as(self, session_id, workspace_id, participant_id).await
+    }
+
+    async fn finish_host_bootstrap(&self, session_id: Uuid) -> Result<()> {
+        Self::finish_host_bootstrap(self, session_id).await
+    }
+
+    async fn host_launch_owner(&self, session_id: Uuid) -> Result<Option<(Uuid, String)>> {
+        Self::host_launch_owner(self, session_id).await
+    }
+
+    async fn pending_host_journals(&self, after: Option<Uuid>, limit: usize) -> Result<Vec<Uuid>> {
+        Self::pending_host_journals(self, after, limit).await
+    }
+
+    async fn pending_host_launch_metadata(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, serde_json::Value)>> {
+        Self::pending_host_launch_metadata(self, limit).await
+    }
+
+    async fn pending_host_launch_metadata_for_host(
+        &self,
+        offset: usize,
+        owner: Option<(Uuid, &str)>,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, serde_json::Value)>> {
+        Self::pending_host_launch_metadata_for_host(self, offset, owner, limit).await
+    }
+
+    async fn persist_host_launch_metadata(
+        &self,
+        session_id: Uuid,
+        metadata: &serde_json::Value,
+    ) -> Result<()> {
+        Self::persist_host_launch_metadata(self, session_id, metadata).await
+    }
+
+    async fn persist_owned_host_launch_metadata(
+        &self,
+        session_id: Uuid,
+        metadata: &serde_json::Value,
+        host_id: Uuid,
+        relay_origin: &str,
+    ) -> Result<()> {
+        Self::persist_owned_host_launch_metadata(self, session_id, metadata, host_id, relay_origin)
+            .await
+    }
+
+    async fn settle_terminal_host_session(&self, session_id: Uuid) -> Result<()> {
+        Self::settle_terminal_host_session(self, session_id).await
+    }
+
+    async fn pending_host_workspace_messages(
+        &self,
+        host_id: Uuid,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<Uuid>> {
+        Self::pending_host_workspace_messages(self, host_id, after, limit).await
+    }
+
+    async fn receipt_store(&self) -> Result<std::sync::Arc<dyn crate::receipt::ReceiptBackend>> {
+        Ok(std::sync::Arc::new(
+            crate::receipt_postgres::PostgresReceiptStore::from_pool(self.pool().clone()),
+        ))
+    }
+
+    async fn compact(&self, vacuum: bool) -> Result<SessionStoreCompaction> {
+        Self::compact(self, vacuum).await
+    }
+
+    async fn readiness(&self) -> Result<SessionStoreHealth> {
+        Self::readiness(self).await
+    }
+
+    async fn health(&self) -> Result<SessionStoreHealth> {
+        Self::health(self).await
+    }
+
+    async fn import_session_events(
+        &self,
+        session_id: Uuid,
+        events: Vec<SessionEvent>,
+    ) -> Result<bool> {
+        Self::import_session_events(self, session_id, events).await
+    }
+
+    async fn session_payload_refs(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<(Uuid, SessionPayloadRef)>> {
+        let rows = sqlx::query(
+            "select id, event_id, payload_kind, byte_len from session_payloads \
+             where session_id = $1 order by created_at, id",
+        )
+        .bind(session_id)
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("event_id")?,
+                    SessionPayloadRef {
+                        id: row.try_get("id")?,
+                        kind: serde_json::from_value(serde_json::Value::String(
+                            row.try_get("payload_kind")?,
+                        ))?,
+                        byte_len: u64::try_from(row.try_get::<i64, _>("byte_len")?)
+                            .context("negative payload length")?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    async fn import_payload(
+        &self,
+        session_id: Uuid,
+        event_id: Uuid,
+        payload: &SessionPayloadRef,
+        bytes: &[u8],
+    ) -> Result<()> {
+        sqlx::query(
+            "insert into session_payloads \
+             (id, session_id, event_id, payload_kind, payload, byte_len, created_at) \
+             values ($1, $2, $3, $4, $5, $6, $7) on conflict (id) do nothing",
+        )
+        .bind(payload.id)
+        .bind(session_id)
+        .bind(event_id)
+        .bind(
+            serde_json::to_value(payload.kind)?
+                .as_str()
+                .unwrap_or_default(),
+        )
+        .bind(bytes)
+        .bind(i64::try_from(bytes.len()).context("payload exceeds a bigint")?)
+        .bind(Utc::now())
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    async fn session_lineage_page(
+        &self,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<SessionLineage>> {
+        let rows = sqlx::query(
+            "select id, parent_session_id, parent_cut_sequence, inherited_event_count, \
+                    owner_session_id \
+             from sessions where id > $1 order by id limit $2",
+        )
+        .bind(after.unwrap_or(Uuid::nil()))
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(SessionLineage {
+                    session_id: row.try_get("id")?,
+                    parent_session_id: row.try_get("parent_session_id")?,
+                    parent_cut_sequence: row
+                        .try_get::<Option<i64>, _>("parent_cut_sequence")?
+                        .map(|value| u64::try_from(value).context("negative cut sequence"))
+                        .transpose()?,
+                    inherited_event_count: u64::try_from(
+                        row.try_get::<i64, _>("inherited_event_count")?,
+                    )
+                    .context("negative inherited event count")?,
+                    owner_session_id: row.try_get("owner_session_id")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn append_batch(&self, events: Vec<SessionEvent>) -> Result<u64> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let mut transaction = self.pool().begin().await?;
+        let mut appended = 0u64;
+        for event in events {
+            self.append_durable_in_transaction(&mut transaction, event)
+                .await?;
+            appended += 1;
+        }
+        transaction.commit().await?;
+        Ok(appended)
+    }
+
+    async fn raw_event_page(
+        &self,
+        session_id: Uuid,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<RawSessionEvent>> {
+        let rows = sqlx::query(
+            "select sequence, event_id, event_kind, event_json, event_body, dict_id, \
+                    projection_json, fork_inheritable, recovery_relevant, message_id, created_at \
+             from session_events where session_id = $1 and sequence > $2 \
+             order by sequence limit $3",
+        )
+        .bind(session_id)
+        .bind(i64::try_from(after_sequence).unwrap_or(i64::MAX))
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(self.pool())
+        .await?;
+        let mut events = Vec::with_capacity(rows.len());
+        for row in &rows {
+            // A cold row is decoded here so the caller always receives the
+            // readable body, whichever tier it happens to live in.
+            let body = match row.try_get::<Option<serde_json::Value>, _>("event_json")? {
+                Some(body) => body,
+                None => {
+                    let bytes: Option<Vec<u8>> = row.try_get("event_body")?;
+                    let dict_id: Option<i32> = row.try_get("dict_id")?;
+                    let dictionary = match dict_id {
+                        Some(dict_id) => Some(self.dictionary(dict_id).await?),
+                        None => None,
+                    };
+                    let dictionary = match dictionary {
+                        Some(dictionary) => Some((*dictionary).clone()),
+                        None => None,
+                    };
+                    serde_json::from_slice(&super::body::decompress(
+                        &bytes.unwrap_or_default(),
+                        dictionary.as_ref(),
+                    )?)?
+                }
+            };
+            events.push(RawSessionEvent {
+                sequence: u64::try_from(row.try_get::<i64, _>("sequence")?)
+                    .context("negative sequence")?,
+                event_id: row.try_get("event_id")?,
+                event_kind: row.try_get("event_kind")?,
+                body,
+                projection_json: row.try_get("projection_json")?,
+                fork_inheritable: row.try_get("fork_inheritable")?,
+                recovery_relevant: row.try_get("recovery_relevant")?,
+                message_id: row.try_get("message_id")?,
+                created_at: row.try_get("created_at")?,
+            });
+        }
+        Ok(events)
+    }
+
+    async fn import_raw_events(
+        &self,
+        session_id: Uuid,
+        events: Vec<RawSessionEvent>,
+    ) -> Result<u64> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let highest = events.iter().map(|event| event.sequence).max().unwrap_or(0);
+        let mut transaction = self.pool().begin().await?;
+        let mut imported = 0u64;
+        for event in events {
+            // Same NUL rule as the live append path: jsonb cannot hold one, so
+            // such a body goes to the byte tier verbatim rather than being
+            // altered to fit.
+            let text = serde_json::to_string(&event.body)?;
+            let nul_bearing = text.contains("\\u0000");
+            let json = (!nul_bearing).then(|| event.body.clone());
+            let bytes = nul_bearing.then(|| text.into_bytes());
+            // The predicate columns are lifted out of the body at write time
+            // because a cold body is opaque to the planner, so they are derived
+            // here too rather than carried across.
+            let decoded: Option<SessionEvent> = serde_json::from_value(event.body.clone()).ok();
+            let affected = sqlx::query(
+                "insert into session_events \
+                 (session_id, sequence, event_id, event_kind, event_json, event_body, \
+                  projection_json, fork_inheritable, recovery_relevant, message_id, created_at, \
+                  subagent_session_id, provider_event_kind) \
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                 on conflict (session_id, sequence) do nothing",
+            )
+            .bind(session_id)
+            .bind(i64::try_from(event.sequence).context("sequence exceeds a bigint")?)
+            .bind(event.event_id)
+            .bind(&event.event_kind)
+            .bind(&json)
+            .bind(bytes.as_deref())
+            .bind(&event.projection_json)
+            .bind(event.fork_inheritable)
+            .bind(event.recovery_relevant)
+            .bind(event.message_id)
+            .bind(event.created_at)
+            .bind(
+                decoded
+                    .as_ref()
+                    .and_then(|event| subagent_session_id(&event.kind)),
+            )
+            .bind(
+                decoded
+                    .as_ref()
+                    .and_then(|event| provider_event_kind(&event.kind)),
+            )
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            imported += affected;
+        }
+        sqlx::query(
+            "update sessions set next_sequence = greatest(next_sequence, $1), updated_at = $2 \
+             where id = $3",
+        )
+        .bind(i64::try_from(highest.saturating_add(1)).unwrap_or(i64::MAX))
+        .bind(Utc::now())
+        .bind(session_id)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(imported)
+    }
+
+    async fn finish_imported_session(
+        &self,
+        session_id: Uuid,
+        state: &SessionState,
+        inherited_event_count: u64,
+    ) -> Result<()> {
+        sqlx::query(
+            "update sessions set state_json = $1, inherited_event_count = $2, updated_at = $3 \
+             where id = $4",
+        )
+        .bind(serde_json::to_string(state)?)
+        .bind(i64::try_from(inherited_event_count).context("inherited count exceeds a bigint")?)
+        .bind(Utc::now())
+        .bind(session_id)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Admit a durable prompt exactly once.
+    ///
+    /// Idempotent by the prompt's message id: a retried send returns the
+    /// already-journaled event rather than adding a second one, and a DIFFERENT
+    /// prompt reusing that id is refused. The lookup and the append share one
+    /// transaction, so two clients racing the same retry cannot both admit.
+    ///
+    /// The readiness wait is not ceremony: a prompt admitted before the session
+    /// has journaled its configuration would be replayed against a session that
+    /// does not yet know what provider it is.
+    async fn admit_prompt(&self, mut event: SessionEvent) -> Result<SessionEvent> {
+        crate::session_store::ensure_prompt_admission(&event)?;
+        let message_id = crate::session_store::prompt_message_id(&event)?;
+        let ready_deadline = tokio::time::Instant::now()
+            + crate::session_store::PROMPT_ADMISSION_SESSION_READY_TIMEOUT;
+        loop {
+            let state = SessionStore::state(self, event.session_id).await?;
+            if state.started_at.is_some() && state.configuration.is_some() {
+                break;
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < ready_deadline,
+                "session {} did not establish its durable journal before prompt admission",
+                event.session_id
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let mut transaction = self.pool().begin().await?;
+        // `message_id` is a lifted column with its own partial index, because a
+        // compressed body is opaque to the planner; this is the lookup that
+        // index exists for.
+        let existing = sqlx::query(
+            "select event_json, event_body, dict_id from session_events \
+             where session_id = $1 and message_id = $2 order by sequence asc limit 1",
+        )
+        .bind(event.session_id)
+        .bind(message_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if let Some(row) = existing {
+            // Decoded from whichever tier holds it: an admitted prompt that had
+            // aged into the cold tier must still be recognised as admitted, or
+            // the retry would journal it a second time.
+            let body = match row.try_get::<Option<serde_json::Value>, _>("event_json")? {
+                Some(body) => body,
+                None => {
+                    let bytes: Option<Vec<u8>> = row.try_get("event_body")?;
+                    let dict_id: Option<i32> = row.try_get("dict_id")?;
+                    let dictionary = match dict_id {
+                        Some(dict_id) => Some(self.dictionary(dict_id).await?),
+                        None => None,
+                    };
+                    let dictionary = dictionary.map(|dictionary| (*dictionary).clone());
+                    serde_json::from_slice(&super::body::decompress(
+                        &bytes.unwrap_or_default(),
+                        dictionary.as_ref(),
+                    )?)?
+                }
+            };
+            let existing: SessionEvent = serde_json::from_value(body)?;
+            crate::session_store::ensure_same_prompt_admission(&existing, &event)?;
+            transaction.commit().await?;
+            return Ok(existing);
+        }
+        event = self
+            .append_durable_in_transaction(&mut transaction, event)
+            .await?;
+        transaction.commit().await?;
+        Ok(event)
+    }
+
+    async fn recent_messages(&self, session_id: Uuid, limit: usize) -> Result<Vec<SessionEvent>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        // A fork stores only its own events, numbered from inherited + 1, so
+        // the bound is stated rather than left to where a fork's rows happen to
+        // start -- matching the trait's contract by construction.
+        let inherited = self.session_row(session_id).await?.inherited_event_count;
+        self.recent_messages_matching(session_id, inherited, limit, |event| {
+            matches!(
+                event.kind,
+                SessionEventKind::Message {
+                    actor: crate::EventActor::User | crate::EventActor::Assistant,
+                    status: crate::MessageStatus::Complete | crate::MessageStatus::InProgress,
+                    ..
+                }
+            )
+        })
+        .await
+    }
+
+    async fn recent_user_messages(
+        &self,
+        session_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<SessionEvent>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.recent_messages_matching(session_id, 0, limit, |event| {
+            event.kind.is_recallable_user_message()
+        })
+        .await
+    }
+
+    async fn search_all_sessions(&self, query: SessionHistoryQuery) -> Result<SessionHistoryPage> {
+        anyhow::ensure!(
+            matches!(query.mode, SessionHistorySearchMode::Lexical),
+            "cross-session search is lexical only"
+        );
+        anyhow::ensure!(
+            query
+                .text
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty()),
+            "cross-session search requires search text"
+        );
+        Self::query_history_across_sessions(self, query).await
+    }
+
+    fn plugin_backend(&self) -> std::sync::Arc<dyn crate::plugin_store::PluginBackend> {
+        std::sync::Arc::new(crate::plugin_store::postgres::PostgresPluginStore::new(
+            self.pool().clone(),
+        ))
+    }
+
+    // Harness routing; forwards to the inherent methods of the same name.
+    async fn uses_native_codex_harness(&self, session_id: Uuid) -> Result<bool> {
+        Self::uses_native_codex_harness(self, session_id).await
+    }
+
+    async fn uses_native_opencode_harness(
+        &self,
+        session_id: Uuid,
+        model: Option<&str>,
+    ) -> Result<bool> {
+        Self::uses_native_opencode_harness(self, session_id, model).await
+    }
+
+    #[cfg(any(feature = "subscription-adapters", test))]
+    async fn record_model_access(
+        &self,
+        session_id: Uuid,
+        provider: CodingProvider,
+        account_identity: &str,
+    ) -> Result<()> {
+        Self::record_model_access(self, session_id, provider, account_identity).await
+    }
+
     async fn attach_workspace(
         &self,
         binding: crate::SessionWorkspaceBinding,
@@ -668,11 +1452,7 @@ impl SessionStore for PostgresSessionStore {
         self.session_workspace_binding(session_id).await
     }
 
-    async fn register_child_session(
-        &self,
-        owner_session_id: Uuid,
-        session_id: Uuid,
-    ) -> Result<()> {
+    async fn register_child_session(&self, owner_session_id: Uuid, session_id: Uuid) -> Result<()> {
         PostgresSessionStore::register_child_session(self, owner_session_id, session_id).await
     }
 
@@ -762,8 +1542,14 @@ impl SessionStore for PostgresSessionStore {
         lease_token: Uuid,
         lease_duration: Duration,
     ) -> Result<SessionAction> {
-        self.pg_heartbeat_action(session_id, action_id, lease_owner, lease_token, lease_duration)
-            .await
+        self.pg_heartbeat_action(
+            session_id,
+            action_id,
+            lease_owner,
+            lease_token,
+            lease_duration,
+        )
+        .await
     }
 
     async fn transition_claimed_action(
@@ -779,7 +1565,8 @@ impl SessionStore for PostgresSessionStore {
         now: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<SessionAction>> {
-        self.pg_recover_expired_actions(session_id, now, limit).await
+        self.pg_recover_expired_actions(session_id, now, limit)
+            .await
     }
 
     async fn action(&self, session_id: Uuid, action_id: Uuid) -> Result<Option<SessionAction>> {
@@ -860,7 +1647,7 @@ mod tests {
             return;
         };
         let scratch = ScratchDatabase::create(&url).await;
-        let store = PostgresSessionStore::connect(&scratch.url)
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
             .await
             .expect("connect");
         let session_id = Uuid::new_v4();
@@ -917,7 +1704,7 @@ mod tests {
             return;
         };
         let scratch = ScratchDatabase::create(&url).await;
-        let store = PostgresSessionStore::connect(&scratch.url)
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
             .await
             .expect("connect");
         let session_id = Uuid::new_v4();
@@ -943,7 +1730,7 @@ mod tests {
         };
         let scratch = ScratchDatabase::create(&url).await;
         let store = Arc::new(
-            PostgresSessionStore::connect(&scratch.url)
+            PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
                 .await
                 .expect("connect"),
         );
@@ -989,7 +1776,7 @@ mod tests {
         };
         let scratch = ScratchDatabase::create(&url).await;
         let store = Arc::new(
-            PostgresSessionStore::connect(&scratch.url)
+            PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
                 .await
                 .expect("connect"),
         );
@@ -1031,7 +1818,6 @@ mod tests {
         scratch.discard().await;
     }
 
-
     #[tokio::test]
     async fn live_state_coalesces_and_never_enters_the_durable_sequence() {
         let Some(url) = test_url() else {
@@ -1039,7 +1825,7 @@ mod tests {
             return;
         };
         let scratch = ScratchDatabase::create(&url).await;
-        let store = PostgresSessionStore::connect(&scratch.url)
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
             .await
             .expect("connect");
         let session_id = Uuid::new_v4();

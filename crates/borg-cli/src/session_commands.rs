@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -5,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use borg_remote::{
     CodingProvider, EventActor, MessageStatus, PermissionMode, PromptDelivery, ResponseLanguage,
     SessionConfiguration, SessionEvent, SessionEventKind, SessionStore, SessionSummary,
-    SqliteSessionStore, WorkspaceSnapshot, default_host_config_path,
+    WorkspaceSnapshot, default_host_config_path,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -61,30 +63,42 @@ pub(crate) async fn run(command: SessionCommand) -> Result<()> {
             json,
         } => restore_snapshot(input, cwd, prune, json).await,
         SessionCommand::Import { input, cwd, json } => import_session(input, cwd, json).await,
+        SessionCommand::Migrate {
+            to,
+            dry_run,
+            limit,
+            fail_fast,
+            json,
+        } => migrate_journal_command(to, dry_run, limit, fail_fast, json).await,
         command => {
             let store = open_store().await?;
             match command {
-                SessionCommand::Tree { session, json } => show_tree(&store, session, json).await,
+                SessionCommand::Tree { session, json } => {
+                    show_tree(store.as_ref(), session, json).await
+                }
                 SessionCommand::Fork {
                     session,
                     before,
                     json,
-                } => fork_session(&store, session, before, json).await,
+                } => fork_session(store.as_ref(), session, before, json).await,
                 SessionCommand::Undo {
                     session,
                     before,
                     json,
-                } => undo_session(&store, session, before, json).await,
-                SessionCommand::Redo { session, json } => redo_session(&store, session, json).await,
+                } => undo_session(store.as_ref(), session, before, json).await,
+                SessionCommand::Redo { session, json } => {
+                    redo_session(store.as_ref(), session, json).await
+                }
                 SessionCommand::Export {
                     session,
                     output,
                     json,
-                } => export_session(&store, session, output, json).await,
+                } => export_session(store.as_ref(), session, output, json).await,
                 SessionCommand::Compact { no_vacuum, json } => {
-                    compact_store(&store, !no_vacuum, json).await
+                    compact_store(store.as_ref(), !no_vacuum, json).await
                 }
                 SessionCommand::Import { .. }
+                | SessionCommand::Migrate { .. }
                 | SessionCommand::Snapshot { .. }
                 | SessionCommand::Restore { .. } => unreachable!("handled above"),
             }
@@ -92,7 +106,7 @@ pub(crate) async fn run(command: SessionCommand) -> Result<()> {
     }
 }
 
-async fn compact_store(store: &SqliteSessionStore, vacuum: bool, json: bool) -> Result<()> {
+async fn compact_store(store: &dyn SessionStore, vacuum: bool, json: bool) -> Result<()> {
     let outcome = store.compact(vacuum).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&outcome)?);
@@ -132,15 +146,114 @@ fn human_bytes(bytes: i64) -> String {
     }
 }
 
-async fn open_store() -> Result<SqliteSessionStore> {
+/// Copy the configured journal into another backend.
+///
+/// The destination is opened with the same factory as any other entry point,
+/// so it applies its own schema and proves its satellite tiers before a single
+/// event is written -- a half-configured destination fails here rather than
+/// half way through a long copy.
+async fn migrate_journal_command(
+    to: String,
+    dry_run: bool,
+    limit: Option<u64>,
+    fail_fast: bool,
+    json: bool,
+) -> Result<()> {
+    let source_path = default_host_config_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("sessions/sessions.sqlite3");
+    let source_config =
+        borg_remote::session_store::factory::SessionStoreConfig::from_env(&source_path);
+    let destination_config =
+        borg_remote::session_store::factory::SessionStoreConfig::with_url(&to, &source_path);
+    ensure!(
+        source_config.backend() != destination_config.backend()
+            || source_config.describe() != destination_config.describe(),
+        "the source and destination are the same store"
+    );
+
+    let source = Arc::clone(
+        borg_remote::session_store::factory::open(&source_config)
+            .await?
+            .session(),
+    );
+    let destination = Arc::clone(
+        borg_remote::session_store::factory::open_resolved(&destination_config)
+            .await?
+            .session(),
+    );
+
+    let options = borg_remote::session_store::migrate::MigrationOptions {
+        dry_run,
+        max_sessions: limit,
+        fail_fast,
+    };
+    let mut report = |line: &str| {
+        if !json {
+            println!("{line}");
+        }
+    };
+    let outcome = borg_remote::session_store::migrate::migrate_journal(
+        source,
+        destination,
+        &options,
+        &mut report,
+    )
+    .await?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "dry_run": dry_run,
+                "sessions_copied": outcome.sessions_copied,
+                "sessions_skipped": outcome.sessions_skipped,
+                "sessions_failed": outcome.sessions_failed,
+                "events_copied": outcome.events_copied,
+                "payloads_copied": outcome.payloads_copied,
+                "failures": outcome
+                    .failures
+                    .iter()
+                    .map(|(id, reason)| serde_json::json!({"session": id, "error": reason}))
+                    .collect::<Vec<_>>(),
+            }))?
+        );
+    } else {
+        println!(
+            "{} {} session(s), skipped {}, failed {}; {} event(s), {} payload(s)",
+            if dry_run { "Would copy" } else { "Copied" },
+            outcome.sessions_copied,
+            outcome.sessions_skipped,
+            outcome.sessions_failed,
+            outcome.events_copied,
+            outcome.payloads_copied
+        );
+        for (session, reason) in &outcome.failures {
+            println!("  failed {session}: {reason}");
+        }
+    }
+    Ok(())
+}
+
+async fn open_store() -> Result<Arc<dyn SessionStore>> {
     let path = default_host_config_path()
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("sessions/sessions.sqlite3");
-    SqliteSessionStore::open(path).await
+    // `borg session` inspects and maintains whichever backend this machine is
+    // configured for; every operation it performs is on the store trait, so it
+    // needs the journal but none of the satellite tiers.
+    Ok(Arc::clone(
+        borg_remote::session_store::factory::open(
+            &borg_remote::session_store::factory::SessionStoreConfig::from_env(path),
+        )
+        .await?
+        .session(),
+    ))
 }
 
-async fn resolve_session(store: &SqliteSessionStore, requested: Option<Uuid>) -> Result<Uuid> {
+async fn resolve_session(store: &dyn SessionStore, requested: Option<Uuid>) -> Result<Uuid> {
     if let Some(session_id) = requested {
         store
             .state(session_id)
@@ -157,7 +270,7 @@ async fn resolve_session(store: &SqliteSessionStore, requested: Option<Uuid>) ->
         .context("there are no resumable local Borg sessions")
 }
 
-async fn show_tree(store: &SqliteSessionStore, requested: Option<Uuid>, json: bool) -> Result<()> {
+async fn show_tree(store: &dyn SessionStore, requested: Option<Uuid>, json: bool) -> Result<()> {
     let summaries = store.list_sessions(10_000).await?;
     let entries = summaries.iter().map(tree_entry).collect::<Vec<_>>();
     if json {
@@ -251,7 +364,7 @@ fn tree_entry(summary: &SessionSummary) -> TreeEntry {
 }
 
 async fn fork_session(
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     parent: Uuid,
     before: u64,
     json: bool,
@@ -262,7 +375,7 @@ async fn fork_session(
 }
 
 async fn undo_session(
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     session: Uuid,
     before: Option<u64>,
     json: bool,
@@ -289,7 +402,7 @@ async fn undo_session(
     print_fork(fork, json)
 }
 
-async fn redo_session(store: &SqliteSessionStore, session: Uuid, json: bool) -> Result<()> {
+async fn redo_session(store: &dyn SessionStore, session: Uuid, json: bool) -> Result<()> {
     let summaries = store.list_sessions(10_000).await?;
     let current = summaries
         .iter()
@@ -337,7 +450,7 @@ fn fork_json(fork: &borg_remote::SessionStoreFork) -> serde_json::Value {
 }
 
 async fn export_session(
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     requested: Option<Uuid>,
     output: Option<PathBuf>,
     json: bool,

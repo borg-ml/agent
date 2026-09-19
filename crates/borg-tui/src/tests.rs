@@ -7406,12 +7406,21 @@ fn only_argument_taking_commands_are_inserted_rather_than_run() {
     assert!(slash_command_needs_argument("/queue"));
     assert!(slash_command_needs_argument("/steer"));
     assert!(slash_command_needs_argument("/team"));
+    assert!(slash_command_needs_argument("/broadcast"));
     assert_eq!(slash_matches("/copy")[0].0, "/copy");
     assert!(!slash_command_needs_argument("/copy"));
     for (command, _) in SLASH_COMMANDS.iter().filter(|(command, _)| {
         !matches!(
             *command,
-            "/ask" | "/director" | "/claude" | "/gpt" | "/peer" | "/queue" | "/steer" | "/team"
+            "/ask"
+                | "/director"
+                | "/claude"
+                | "/gpt"
+                | "/peer"
+                | "/queue"
+                | "/steer"
+                | "/team"
+                | "/broadcast"
         )
     }) {
         assert!(
@@ -13401,5 +13410,82 @@ fn image_preview_slots_group_tile_rows_and_drop_the_label_row() {
             start: 2,
             width: 24,
         }]
+    );
+}
+
+/// Submitting after a turn ends used to bounce the prompt through the pending
+/// list: the session journals `Message{Queued}` a beat before `TurnStarted`,
+/// so the message appeared as pending input and was then pulled straight back
+/// out. The queued transient for our own optimistic submission is withheld.
+#[test]
+fn optimistic_idle_submission_does_not_flicker_through_pending_input() {
+    let message_id = Uuid::new_v4();
+    let queued = SessionEventKind::Message {
+        message_id,
+        actor: EventActor::User,
+        text: "next question".to_string(),
+        attachments: Vec::new(),
+        status: MessageStatus::Queued,
+        delivery: Some(PromptDelivery::Queue),
+    };
+
+    // Without the hold the prompt lands in the pending list.
+    let mut unsuppressed = Vec::new();
+    update_queued_prompts(&mut unsuppressed, &queued, &mut None);
+    assert_eq!(unsuppressed.len(), 1);
+
+    // With it, the transient is withheld instead of projected.
+    let decision = optimistic_idle_prompt_decision(&queued, message_id);
+    let OptimisticPromptDecision::Withhold(withheld) = decision else {
+        panic!("the queued transient for our own prompt must be withheld");
+    };
+    assert_eq!(withheld.message_id, message_id);
+
+    // The matching TurnStarted settles the hold, so nothing is ever released.
+    assert_eq!(
+        optimistic_idle_prompt_decision(
+            &SessionEventKind::TurnStarted {
+                message_id,
+                provider: CodingProvider::Claude,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+            message_id,
+        ),
+        OptimisticPromptDecision::Settled,
+    );
+}
+
+/// The hold must never swallow a prompt that really is waiting: if any other
+/// prompt settles first, the withheld projection is released.
+#[test]
+fn a_genuinely_queued_prompt_is_released_when_another_turn_starts() {
+    let ours = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    assert_eq!(
+        optimistic_idle_prompt_decision(
+            &SessionEventKind::TurnStarted {
+                message_id: other,
+                provider: CodingProvider::Claude,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+            ours,
+        ),
+        OptimisticPromptDecision::Release,
+    );
+    // Unrelated traffic between the transient and TurnStarted must not
+    // release the hold, or the flicker returns.
+    assert_eq!(
+        optimistic_idle_prompt_decision(
+            &SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                detail: None,
+            },
+            ours,
+        ),
+        OptimisticPromptDecision::Ignore,
     );
 }

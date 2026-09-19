@@ -6,10 +6,10 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use super::PostgresSessionStore;
+use crate::SessionEvent;
 use crate::session_store::{
     EventPersistence, SessionState, SessionStoreCompaction, SessionWorkspaceBinding,
 };
-use crate::SessionEvent;
 
 /// Rows examined per transaction while compacting.
 const COMPACT_BATCH: i64 = 2_000;
@@ -76,13 +76,11 @@ impl PostgresSessionStore {
             }
             let mut transaction = self.pool().begin().await?;
             for (session_id, sequence) in &stale {
-                sqlx::query(
-                    "delete from session_events where session_id = $1 and sequence = $2",
-                )
-                .bind(session_id)
-                .bind(sequence)
-                .execute(&mut *transaction)
-                .await?;
+                sqlx::query("delete from session_events where session_id = $1 and sequence = $2")
+                    .bind(session_id)
+                    .bind(sequence)
+                    .execute(&mut *transaction)
+                    .await?;
             }
             transaction.commit().await?;
             deleted_events += stale.len() as u64;
@@ -143,12 +141,11 @@ impl PostgresSessionStore {
             .await?;
             let Some(session_id) = candidate else { break };
             let mut transaction = self.pool().begin().await?;
-            let events: i64 = sqlx::query_scalar(
-                "select count(*) from session_events where session_id = $1",
-            )
-            .bind(session_id)
-            .fetch_one(&mut *transaction)
-            .await?;
+            let events: i64 =
+                sqlx::query_scalar("select count(*) from session_events where session_id = $1")
+                    .bind(session_id)
+                    .fetch_one(&mut *transaction)
+                    .await?;
             sqlx::query("delete from host_launches where session_id = $1")
                 .bind(session_id)
                 .execute(&mut *transaction)
@@ -326,7 +323,7 @@ mod tests {
 
     async fn store(url: &str) -> (ScratchDatabase, PostgresSessionStore) {
         let scratch = ScratchDatabase::create(url).await;
-        let store = PostgresSessionStore::connect(&scratch.url)
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
             .await
             .expect("connect");
         (scratch, store)
@@ -367,7 +364,10 @@ mod tests {
             .append(SessionEvent::new(used, 0, SessionEventKind::SessionStarted))
             .await
             .expect("started");
-        store.append(message(used, "real work")).await.expect("message");
+        store
+            .append(message(used, "real work"))
+            .await
+            .expect("message");
         assert!(
             !store.discard_empty_session(used).await.expect("discard"),
             "a session with resumable activity must not be discarded"
@@ -378,7 +378,11 @@ mod tests {
         let parent = Uuid::new_v4();
         store.create_session(parent).await.expect("create");
         store
-            .append(SessionEvent::new(parent, 0, SessionEventKind::SessionStarted))
+            .append(SessionEvent::new(
+                parent,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
             .await
             .expect("started");
         let child = Uuid::new_v4();
@@ -403,7 +407,12 @@ mod tests {
         assert_eq!(binding.workspace_id, workspace_id);
         assert_eq!(binding.participant_id, session_id);
         assert_eq!(
-            store.workspace_binding(session_id).await.unwrap().unwrap().workspace_id,
+            store
+                .workspace_binding(session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .workspace_id,
             workspace_id
         );
 
@@ -439,7 +448,10 @@ mod tests {
         let stored = store.read(session_id).await.expect("read");
         assert_eq!(stored.len(), 3);
         assert_eq!(
-            stored.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            stored
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
             vec![1, 2, 3],
             "an import must be renumbered into one contiguous sequence space"
         );
@@ -462,7 +474,12 @@ mod tests {
                 .is_err()
         );
         assert!(!store.contains_session(other).await.unwrap());
-        assert!(store.import_session_events(other, Vec::new()).await.is_err());
+        assert!(
+            store
+                .import_session_events(other, Vec::new())
+                .await
+                .is_err()
+        );
         scratch.discard().await;
     }
 
@@ -479,12 +496,19 @@ mod tests {
             .append(SessionEvent::new(aged, 0, SessionEventKind::SessionStarted))
             .await
             .expect("started");
-        store.append(message(aged, "old news")).await.expect("message");
+        store
+            .append(message(aged, "old news"))
+            .await
+            .expect("message");
 
         let parent = Uuid::new_v4();
         store.create_session(parent).await.expect("create");
         store
-            .append(SessionEvent::new(parent, 0, SessionEventKind::SessionStarted))
+            .append(SessionEvent::new(
+                parent,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
             .await
             .expect("started");
         let child = Uuid::new_v4();
@@ -493,7 +517,11 @@ mod tests {
         let recent = Uuid::new_v4();
         store.create_session(recent).await.expect("create");
         store
-            .append(SessionEvent::new(recent, 0, SessionEventKind::SessionStarted))
+            .append(SessionEvent::new(
+                recent,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
             .await
             .expect("started");
 
@@ -579,7 +607,11 @@ mod tests {
 
         // Compaction is idempotent.
         assert_eq!(
-            store.compact(false).await.expect("compact").deleted_search_rows,
+            store
+                .compact(false)
+                .await
+                .expect("compact")
+                .deleted_search_rows,
             0
         );
         scratch.discard().await;

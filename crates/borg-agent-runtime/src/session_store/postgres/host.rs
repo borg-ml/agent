@@ -27,6 +27,54 @@ impl PostgresSessionStore {
         )
     }
 
+    /// Sessions this host relays that have workspace messages it has not yet
+    /// forwarded.
+    ///
+    /// Joins the journal tier (launches, bindings, cursors) to the workspace
+    /// tier (members, events). They share one database in both backends, which
+    /// is why this can be a single query rather than a fan-out -- the point of
+    /// keeping the satellite tiers in the journal's schema rather than a
+    /// separate store.
+    ///
+    /// `after` paginates by session id. The nil UUID stands in for "from the
+    /// beginning": every real session id sorts above it, so the first page
+    /// needs no separate query.
+    pub async fn pending_host_workspace_messages(
+        &self,
+        host_id: Uuid,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<Uuid>> {
+        Ok(sqlx::query_scalar(
+            // `e.is_message` is the stored generated column; SQLite has to
+            // re-extract it from the body per row.
+            //
+            // The `::text` casts are load-bearing. The journal tier types ids
+            // as `uuid` while the satellite tier keeps them `text`, faithful to
+            // the SQLite originals, so every join across the two must say which
+            // representation it means. Postgres refuses uuid = text outright,
+            // which is why this is a cast and not a silent coercion.
+            "select h.session_id from host_launches h \
+             join session_workspace_bindings b on b.session_id = h.session_id \
+             where b.host_id = $1 and h.session_id > $2 \
+               and exists(select 1 from workspace_members m \
+                 join workspace_events e on e.workspace_id = m.workspace_id \
+                 left join host_workspace_cursors c on c.host_id = b.host_id \
+                   and c.session_id = h.session_id \
+                   and c.workspace_id::text = e.workspace_id \
+                 where m.participant_id = b.participant_id::text \
+                   and e.author_id = b.participant_id::text \
+                   and e.is_message \
+                   and e.sequence > coalesce(c.sequence, 0)) \
+             order by h.session_id limit $3",
+        )
+        .bind(host_id)
+        .bind(after.unwrap_or(Uuid::nil()))
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(self.pool())
+        .await?)
+    }
+
     pub async fn persist_host_launch_metadata(
         &self,
         session_id: Uuid,
@@ -608,7 +656,7 @@ mod tests {
 
     async fn store(url: &str) -> (ScratchDatabase, PostgresSessionStore) {
         let scratch = ScratchDatabase::create(url).await;
-        let store = PostgresSessionStore::connect(&scratch.url)
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
             .await
             .expect("connect");
         (scratch, store)
@@ -804,8 +852,14 @@ mod tests {
             .await
             .expect("started");
 
-        let pending = store.pending_host_journals(None, 10).await.expect("pending");
-        assert!(pending.contains(&session_id), "unsent journal must be listed");
+        let pending = store
+            .pending_host_journals(None, 10)
+            .await
+            .expect("pending");
+        assert!(
+            pending.contains(&session_id),
+            "unsent journal must be listed"
+        );
 
         store
             .acknowledge_host_journal(session_id, 1, 0)
@@ -864,7 +918,10 @@ mod tests {
         );
 
         store.begin_host_bootstrap(session_id).await.expect("begin");
-        let pending = store.pending_host_launch_metadata(10).await.expect("pending");
+        let pending = store
+            .pending_host_launch_metadata(10)
+            .await
+            .expect("pending");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, session_id);
 
@@ -879,7 +936,10 @@ mod tests {
             .expect("scoped");
         assert!(scoped.is_empty());
 
-        store.finish_host_bootstrap(session_id).await.expect("finish");
+        store
+            .finish_host_bootstrap(session_id)
+            .await
+            .expect("finish");
         assert!(
             store
                 .pending_host_launch_metadata(10)
@@ -938,11 +998,18 @@ mod tests {
             crate::session_action::ActionWakePolicy::OnLowerBoundary,
             serde_json::json!({"text": "unfinished"}),
         );
-        let action_id = store.enqueue_action(action).await.expect("enqueue").action_id;
+        let action_id = store
+            .enqueue_action(action)
+            .await
+            .expect("enqueue")
+            .action_id;
 
         // Live work must not be swept away by a settle.
         assert!(
-            store.settle_terminal_host_session(session_id).await.is_err(),
+            store
+                .settle_terminal_host_session(session_id)
+                .await
+                .is_err(),
             "a running session is not settleable"
         );
 
@@ -964,9 +1031,18 @@ mod tests {
             .expect("settle");
 
         let settled = store.action(session_id, action_id).await.unwrap().unwrap();
-        assert_eq!(settled.state, crate::session_action::SessionActionState::Cancelled);
+        assert_eq!(
+            settled.state,
+            crate::session_action::SessionActionState::Cancelled
+        );
         assert_eq!(settled.error.as_deref(), Some("host session is terminal"));
-        assert!(store.pending_actions(session_id, 10).await.unwrap().is_empty());
+        assert!(
+            store
+                .pending_actions(session_id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             store
                 .pending_host_launch_metadata(10)

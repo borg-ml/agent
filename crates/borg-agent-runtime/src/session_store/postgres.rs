@@ -18,17 +18,19 @@ use sqlx::{ConnectOptions, Executor};
 
 use super::{SESSION_SCHEMA_VERSION, SessionStoreHealth};
 
-pub mod body;
 pub mod actions;
+pub mod body;
 pub mod cold;
 pub mod fork;
 pub mod harness;
 pub mod host;
 pub mod maintenance;
 pub mod recovery;
+pub mod runtime;
 pub mod search;
 pub mod store;
 pub mod sync;
+pub mod workflow;
 
 #[cfg(test)]
 pub(crate) mod testing;
@@ -46,6 +48,9 @@ const POSTGRES_SATELLITE_SCHEMA_SQL: &str = include_str!("postgres_satellite_sch
 
 /// Environment override for the journal connection string.
 pub const SESSIONS_URL_ENV: &str = "BORG_SESSIONS_URL";
+
+/// Opt-in for a journal deliberately shared between machines or OS users.
+pub const SESSIONS_SHARED_ENV: &str = "BORG_SESSIONS_SHARED";
 
 /// Connections held per process. SQLite was capped at 4 because additional
 /// connections only deepened contention on the single write lock. Postgres has
@@ -69,8 +74,20 @@ pub struct PostgresSessionStore {
 }
 
 impl PostgresSessionStore {
+    /// Connect with a caller-chosen pool size.
+    ///
+    /// Tests run one store per core against one server, so they ask for a small
+    /// pool; production uses `connect`, which is sized for a busy agent.
+    pub async fn connect_with_pool_size(url: &str, max_connections: u32) -> Result<Self> {
+        Self::connect_inner(url, max_connections).await
+    }
+
     /// Connect to `url` and bring the schema up to the current version.
     pub async fn connect(url: &str) -> Result<Self> {
+        Self::connect_inner(url, POSTGRES_MAX_CONNECTIONS).await
+    }
+
+    async fn connect_inner(url: &str, max_connections: u32) -> Result<Self> {
         let options: PgConnectOptions = url
             .parse::<PgConnectOptions>()
             .with_context(|| format!("invalid Postgres session store URL: {url}"))?
@@ -79,7 +96,7 @@ impl PostgresSessionStore {
             // process log; the journal is the authority for that content.
             .log_statements(tracing::log::LevelFilter::Debug);
         let pool = PgPoolOptions::new()
-            .max_connections(POSTGRES_MAX_CONNECTIONS)
+            .max_connections(max_connections)
             .acquire_timeout(POSTGRES_ACQUIRE_TIMEOUT)
             .connect_with(options)
             .await
@@ -168,6 +185,77 @@ impl PostgresSessionStore {
             .commit()
             .await
             .context("failed to commit the Postgres schema bootstrap")?;
+        Ok(())
+    }
+
+    /// This machine and OS user, as one stable string.
+    ///
+    /// Hostname plus username, because that pair IS the boundary in question:
+    /// workspace membership and `/broadcast` are scoped to one OS user on one
+    /// machine, and a shared journal widens them to everyone who can reach the
+    /// database.
+    fn owner_fingerprint() -> (String, String) {
+        let host = std::env::var("HOSTNAME")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                std::fs::read_to_string("/etc/hostname")
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+            .unwrap_or_else(|| "unknown-host".to_string());
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "unknown-user".to_string());
+        (format!("{user}@{host}"), format!("{user} on {host}"))
+    }
+
+    /// Record this process as an owner, and refuse a journal that silently
+    /// acquired a second one.
+    ///
+    /// NOT a policy decision about whether sharing is allowed -- it is allowed,
+    /// by setting `BORG_SESSIONS_SHARED`. What is refused is arriving at a
+    /// shared journal by ACCIDENT, because the thing being shared is a trust
+    /// boundary: every participant in that database can see and address every
+    /// other. SQLite could not be shared by accident; a connection string can.
+    pub async fn ensure_single_owner(&self) -> Result<()> {
+        let (fingerprint, display) = Self::owner_fingerprint();
+        sqlx::query(
+            "insert into borg_journal_owners (fingerprint, display) values ($1, $2) \
+             on conflict (fingerprint) do update set last_seen = now()",
+        )
+        .bind(&fingerprint)
+        .bind(&display)
+        .execute(&self.pool)
+        .await
+        .context("failed to record this journal owner")?;
+
+        if std::env::var(SESSIONS_SHARED_ENV)
+            .map(|value| !value.trim().is_empty() && value != "0")
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        let others: Vec<String> = sqlx::query_scalar(
+            "select display from borg_journal_owners where fingerprint <> $1 \
+             order by first_seen limit 8",
+        )
+        .bind(&fingerprint)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to read this journal's owners")?;
+        anyhow::ensure!(
+            others.is_empty(),
+            "this journal has already been used by {}, and this process is {display}. \
+             Sharing one journal means sharing a trust boundary: workspace membership \
+             and /broadcast are scoped per machine and OS user, so every owner of this \
+             database can see and address every other. If that is what you intend, set \
+             {SESSIONS_SHARED_ENV}=1. If it is not, point {} at a database of its own.",
+            others.join(", "),
+            display
+        );
         Ok(())
     }
 
@@ -293,7 +381,11 @@ mod tests {
         let mut bootstraps = tokio::task::JoinSet::new();
         for _ in 0..8 {
             let url = scratch_url.clone();
-            bootstraps.spawn(async move { PostgresSessionStore::connect(&url).await.map(|_| ()) });
+            bootstraps.spawn(async move {
+                PostgresSessionStore::connect_with_pool_size(&url, 2)
+                    .await
+                    .map(|_| ())
+            });
         }
         let mut failures = Vec::new();
         while let Some(joined) = bootstraps.join_next().await {
@@ -325,7 +417,7 @@ mod tests {
             eprintln!("skipping: BORG_TEST_SESSIONS_URL is not set");
             return;
         };
-        let store = PostgresSessionStore::connect(&url)
+        let store = PostgresSessionStore::connect_with_pool_size(&url, 4)
             .await
             .expect("connect and bootstrap");
         assert!(
@@ -369,7 +461,9 @@ mod tests {
             eprintln!("skipping: BORG_TEST_SESSIONS_URL is not set");
             return;
         };
-        let store = PostgresSessionStore::connect(&url).await.expect("connect");
+        let store = PostgresSessionStore::connect_with_pool_size(&url, 4)
+            .await
+            .expect("connect");
         for table in [
             "sessions",
             "session_events",

@@ -1534,8 +1534,22 @@ mod tests {
         let stale = tokio::net::UnixListener::bind(&socket_path).unwrap();
         drop(stale);
         assert!(socket_path.exists(), "the stale socket file survives");
+        // Polled rather than asserted instantly. A listener that has just been
+        // dropped can still accept from its backlog for a moment, and under
+        // load that window widens -- which is a kernel teardown artifact, not
+        // the bug this guards. The bug was that a dead session stayed live
+        // FOREVER, so the property is that unreachability arrives, promptly
+        // and on its own, without anything cleaning the file up.
+        let mut went_stale = false;
+        for _ in 0..40 {
+            if !session_control_socket_is_reachable(&socket_path).await {
+                went_stale = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
         assert!(
-            !session_control_socket_is_reachable(&socket_path).await,
+            went_stale,
             "an existing socket file with no listener must not read as live"
         );
 
@@ -1547,10 +1561,22 @@ mod tests {
         let server =
             LocalSessionControlServer::start(socket_path.clone(), session_id, &writer, owner_tx)
                 .unwrap();
-        assert!(
-            session_control_socket_is_reachable(&socket_path).await,
-            "a served socket is reachable"
-        );
+        // Retried, because the probe is bounded at 250ms so that one
+        // unresponsive peer cannot stall a whole listing. That bound is right
+        // for production and wrong as a test assertion: on a loaded machine a
+        // connect to a genuinely live socket can miss it, which says nothing
+        // about reachability and everything about the scheduler. Retrying
+        // keeps the property under test -- a served socket IS reachable --
+        // without asserting anything about how promptly this host schedules.
+        let mut reachable = false;
+        for _ in 0..20 {
+            if session_control_socket_is_reachable(&socket_path).await {
+                reachable = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(reachable, "a served socket is reachable");
         drop(server);
     }
 

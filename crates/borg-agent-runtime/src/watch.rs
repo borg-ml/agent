@@ -6,7 +6,7 @@ use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{SqliteSessionStore, native_process::ProcessManager};
+use crate::native_process::ProcessManager;
 
 const MAX_WATCHES: usize = 4;
 const MAX_EVENT_BYTES: usize = 16 * 1024;
@@ -84,7 +84,7 @@ impl Watches {
         session_id: Uuid,
         root: &Path,
         args: WatchArgs,
-        store: Option<SqliteSessionStore>,
+        store: Option<std::sync::Arc<dyn crate::SessionStore>>,
         timeout_ms: u64,
     ) -> Result<WatchInfo> {
         ensure!(

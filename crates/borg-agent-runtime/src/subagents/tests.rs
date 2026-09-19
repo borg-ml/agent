@@ -34,6 +34,7 @@ async fn mcp_disconnect_and_shutdown_reap_the_active_runtime_worker() {
             directory.path().to_path_buf(),
             None,
             None,
+            None,
             Vec::new(),
             None,
             crate::native_process::ProcessManager::default(),
@@ -142,6 +143,7 @@ async fn workspace_mutations_preserve_authorization_and_file_contents_on_failure
         root.clone(),
         None,
         None,
+        None,
         Vec::new(),
         None,
         crate::native_process::ProcessManager::default(),
@@ -247,6 +249,7 @@ async fn mcp_workspace_reads_are_bounded_and_cannot_escape_the_session_root() {
         None,
         None,
         root,
+        None,
         None,
         None,
         Vec::new(),
@@ -534,6 +537,7 @@ async fn persistent_runtime_supports_a_surf_calibration_notebook() {
         directory.path().to_path_buf(),
         None,
         None,
+        None,
         Vec::new(),
         None,
         crate::native_process::ProcessManager::default(),
@@ -589,6 +593,7 @@ async fn dispatcher_can_select_the_optional_bun_javascript_runtime() {
         None,
         None,
         directory.path().to_path_buf(),
+        None,
         None,
         None,
         Vec::new(),
@@ -648,7 +653,8 @@ async fn dispatcher_and_python_share_the_canonical_lossless_history_query() {
         ))
         .await
         .unwrap();
-    let autonomy = store.autonomy_store().await.unwrap();
+    let autonomy: Option<std::sync::Arc<dyn crate::autonomy::AutonomyStore>> =
+        Some(std::sync::Arc::new(store.autonomy_store().await.unwrap()));
     let dispatcher = AgentToolDispatcher::new(
         SessionGoalTools::disconnected(),
         SessionTodoTools::disconnected(),
@@ -661,7 +667,8 @@ async fn dispatcher_and_python_share_the_canonical_lossless_history_query() {
         None,
         directory.path().to_path_buf(),
         None,
-        Some(autonomy),
+        autonomy,
+        Some(std::sync::Arc::new(store.clone()) as std::sync::Arc<dyn crate::SessionStore>),
         Vec::new(),
         None,
         crate::native_process::ProcessManager::default(),
@@ -787,6 +794,7 @@ async fn persistent_runtime_can_call_only_the_granted_external_mcp_tools() {
         directory.path().to_path_buf(),
         None,
         None,
+        None,
         Vec::new(),
         None,
         crate::native_process::ProcessManager::default(),
@@ -885,6 +893,7 @@ async fn extension_mcp_grant_is_available_through_the_persistent_environment_bin
         directory.path().to_path_buf(),
         None,
         None,
+        None,
         Vec::new(),
         None,
         crate::native_process::ProcessManager::default(),
@@ -955,6 +964,7 @@ async fn read_only_runtime_allows_scoped_semantic_search_only() {
         None,
         None,
         directory.path().to_path_buf(),
+        None,
         None,
         None,
         Vec::new(),
@@ -1036,7 +1046,8 @@ async fn persistent_runtime_rehydrates_explicit_checkpoint_after_worker_restart(
         .unwrap();
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
-    let first_autonomy = store.autonomy_store().await.unwrap();
+    let first_autonomy: Option<std::sync::Arc<dyn crate::autonomy::AutonomyStore>> =
+        Some(std::sync::Arc::new(store.autonomy_store().await.unwrap()));
     let first = AgentToolDispatcher::new(
         SessionGoalTools::disconnected(),
         SessionTodoTools::disconnected(),
@@ -1049,7 +1060,8 @@ async fn persistent_runtime_rehydrates_explicit_checkpoint_after_worker_restart(
         None,
         directory.path().to_path_buf(),
         None,
-        Some(first_autonomy),
+        first_autonomy,
+        Some(std::sync::Arc::new(store.clone()) as std::sync::Arc<dyn crate::SessionStore>),
         Vec::new(),
         None,
         crate::native_process::ProcessManager::default(),
@@ -1068,7 +1080,8 @@ async fn persistent_runtime_rehydrates_explicit_checkpoint_after_worker_restart(
     assert_eq!(first_result["execution_count"], 1);
     drop(first);
 
-    let second_autonomy = store.autonomy_store().await.unwrap();
+    let second_autonomy: Option<std::sync::Arc<dyn crate::autonomy::AutonomyStore>> =
+        Some(std::sync::Arc::new(store.autonomy_store().await.unwrap()));
     let second = AgentToolDispatcher::new(
         SessionGoalTools::disconnected(),
         SessionTodoTools::disconnected(),
@@ -1081,7 +1094,8 @@ async fn persistent_runtime_rehydrates_explicit_checkpoint_after_worker_restart(
         None,
         directory.path().to_path_buf(),
         None,
-        Some(second_autonomy),
+        second_autonomy,
+        Some(std::sync::Arc::new(store.clone()) as std::sync::Arc<dyn crate::SessionStore>),
         Vec::new(),
         None,
         crate::native_process::ProcessManager::default(),
@@ -3273,7 +3287,7 @@ async fn shared_work_tools_are_idempotent_atomic_and_replayable() {
     let workspace_id = Uuid::new_v4();
     let human_id = Uuid::new_v4();
     let agent_id = Uuid::new_v4();
-    let store = SqliteWorkspaceStore::open(directory.path().join("sessions.sqlite3"))
+    let store = crate::SqliteWorkspaceStore::open(directory.path().join("sessions.sqlite3"))
         .await
         .unwrap();
     store
@@ -3287,7 +3301,7 @@ async fn shared_work_tools_are_idempotent_atomic_and_replayable() {
         )
         .await
         .unwrap();
-    let tools = SharedWorkToolContext::new(store, workspace_id, agent_id);
+    let tools = SharedWorkToolContext::new(std::sync::Arc::new(store), workspace_id, agent_id);
 
     let create_args = json!({
         "title": "Verify boundary delivery",
@@ -3916,6 +3930,7 @@ async fn computer_use_requires_approval_even_for_observation() {
         directory.path().to_path_buf(),
         None,
         None,
+        None,
         Vec::new(),
         None,
         crate::native_process::ProcessManager::default(),
@@ -3958,6 +3973,7 @@ async fn computer_use_live_desktop_clients() {
         None,
         None,
         directory.path().to_path_buf(),
+        None,
         None,
         None,
         Vec::new(),

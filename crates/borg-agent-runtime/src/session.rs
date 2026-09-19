@@ -21,9 +21,9 @@ use crate::{
     PlanItemStatus, PromptDelivery, SessionEvent, SessionEventKind, SessionGoal,
     SessionGoalToolRequest, SessionGoalToolResponse, SessionState, SessionStatus, SessionStore,
     SessionTodoToolRequest, SessionTodoToolResponse, SessionWriterLease, SqliteSessionStore,
-    SqliteWorkspaceStore, SubagentAction, SubagentActivity, SubagentActivityKind,
-    SubagentControlOutcome, SubagentCoordinator, TodoAction, TodoItemUpdate, WorkspaceEvent,
-    WorkspaceEventKind, WorkspaceStore,
+    SubagentAction, SubagentActivity, SubagentActivityKind, SubagentControlOutcome,
+    SubagentCoordinator, TodoAction, TodoItemUpdate, WorkspaceEvent, WorkspaceEventKind,
+    WorkspaceStore,
 };
 
 pub struct AbortTask<T = ()>(pub tokio::task::JoinHandle<T>);
@@ -321,7 +321,7 @@ struct RuntimeSessionStore {
 
 #[derive(Clone)]
 struct WorkspaceProjection {
-    store: SqliteWorkspaceStore,
+    store: Arc<dyn WorkspaceStore>,
     workspace_id: Uuid,
     agent_participant_id: Uuid,
     human_participant_id: Uuid,
@@ -331,7 +331,7 @@ struct WorkspaceProjection {
 
 impl WorkspaceProjection {
     fn new(
-        store: SqliteWorkspaceStore,
+        store: Arc<dyn WorkspaceStore>,
         workspace_id: Uuid,
         agent_participant_id: Uuid,
         human_participant_id: Uuid,
@@ -1628,6 +1628,22 @@ async fn run_agent_session_store_kernel_inner(
                 agent_display_name,
             )
             .await?;
+        // Record the launch identity discovery needs. The workspace name above
+        // is only `cwd`'s basename, so every session started in a checkout
+        // called "agent" is indistinguishable from the others; the full path
+        // and owning pid are known right here and were previously dropped.
+        if let Err(error) = workspace_store
+            .register_local_instance(
+                binding.participant_id,
+                Some(binding.workspace_id),
+                &launch.cwd,
+                std::process::id(),
+            )
+            .await
+        {
+            // Discovery metadata must never keep a session from starting.
+            tracing::warn!(%error, "failed to record the local instance launch identity");
+        }
         // Inherited events were already projected by the fork parent, and reads
         // renumber them into this session's sequence space under fresh event
         // ids, so replaying them would re-append the whole ancestry to the
@@ -1966,6 +1982,7 @@ async fn run_agent_session_store_kernel_inner(
         launch.cwd.clone(),
         Some(consultation_tools),
         autonomy_store.clone(),
+        Some(Arc::clone(&store)),
         launch.capabilities.provider_capabilities.clone(),
         workflow_snapshot,
         workflow_processes.clone(),
@@ -1981,6 +1998,7 @@ async fn run_agent_session_store_kernel_inner(
         .configure_runtime_mcp(runtime_mcp_servers.clone())
         .await?;
     let workflow_autonomy_store = autonomy_store.clone();
+    let workflow_session_store = dispatcher.session_store();
     let agent_tool_server =
         crate::AgentToolServer::start(session_root, session_id, dispatcher.clone()).await?;
     let agent_mcp_server = agent_tool_server.external_mcp_server()?;
@@ -2278,7 +2296,12 @@ async fn run_agent_session_store_kernel_inner(
                                                 )));
                                                 continue;
                                             };
-                                            let workflow_store = autonomy_store.session_store();
+                                            let Some(workflow_store) = workflow_session_store.clone() else {
+                                                let _ = dispatch.result.send(Err(anyhow::anyhow!(
+                                                    "Blu workflow jobs require durable session storage"
+                                                )));
+                                                continue;
+                                            };
                                             let runner = crate::blu_workflow::BluWorkflowRunner::new(
                                                 session_id,
                                                 workflow_store,
@@ -2734,6 +2757,20 @@ async fn run_agent_session_store_kernel_inner(
                         text,
                     }) if command_session_id == session_id => {
                         broadcast_team_message(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            subagents.as_ref(),
+                            text,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Some(HostCommand::BroadcastInstances {
+                        session_id: command_session_id,
+                        text,
+                    }) if command_session_id == session_id => {
+                        broadcast_instance_message(
                             &mut journal,
                             &events,
                             session_id,
@@ -5238,6 +5275,16 @@ async fn run_agent_session_store_kernel_inner(
                             )
                             .await?;
                         }
+                        HostCommand::BroadcastInstances { text, .. } => {
+                            broadcast_instance_message(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                subagents.as_ref(),
+                                text,
+                            )
+                            .await?;
+                        }
                         HostCommand::Interrupt { .. } => {
                             pause_active_goal(
                                 &mut journal,
@@ -7376,6 +7423,78 @@ async fn broadcast_team_message(
             },
         )
         .await?;
+    }
+    Ok(())
+}
+
+/// Fan one human `/broadcast` out to every Borg instance on this machine.
+///
+/// Reach is reported back into the transcript rather than assumed: a delivery
+/// that reached nothing looks identical to a successful one otherwise, which
+/// is precisely the failure that made discovery untrustworthy in the first
+/// place.
+async fn broadcast_instance_message(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    subagents: Option<&SubagentCoordinator>,
+    text: String,
+) -> Result<()> {
+    let outcome = match subagents {
+        Some(coordinator) => {
+            coordinator
+                .broadcast_local_instances_as(session_id, &text)
+                .await
+        }
+        None => Err(anyhow::anyhow!(
+            "multiplayer is unavailable, so there is no instance registry to broadcast to"
+        )),
+    };
+    match outcome {
+        // A silent success is correct here. Reporting reach through
+        // StatusChanged would let a broadcast issued mid-turn advertise the
+        // session as Ready, which is the same class of spurious status
+        // transition that made submissions visibly flicker.
+        Ok(reach) if reach.failed.is_empty() && !reach.delivered.is_empty() => {
+            tracing::info!(
+                delivered = reach.delivered.len(),
+                skipped = reach.skipped_unreachable,
+                "instance broadcast delivered"
+            );
+        }
+        Ok(reach) => {
+            let message = if reach.delivered.is_empty() {
+                format!(
+                    "broadcast reached no other instance on this machine ({} unreachable)",
+                    reach.skipped_unreachable
+                )
+            } else {
+                format!(
+                    "broadcast reached {} instance(s); {} failed and {} were unreachable",
+                    reach.delivered.len(),
+                    reach.failed.len(),
+                    reach.skipped_unreachable
+                )
+            };
+            record(
+                journal,
+                events,
+                session_id,
+                SessionEventKind::Error { message },
+            )
+            .await?;
+        }
+        Err(error) => {
+            record(
+                journal,
+                events,
+                session_id,
+                SessionEventKind::Error {
+                    message: format!("instance broadcast failed: {error:#}"),
+                },
+            )
+            .await?;
+        }
     }
     Ok(())
 }
@@ -9708,10 +9827,28 @@ fn push_coalesced_provider_event(batch: &mut Vec<SessionEventKind>, next: Sessio
 }
 
 tokio::task_local! {
-    /// Set for the duration of one burst of recorded events. Tracks whether the
-    /// live observer has already failed to keep up during this burst.
-    static LIVE_DELIVERY_LAGGING: std::cell::Cell<bool>;
+    /// When the live observer was last seen failing to keep up, or `None` while
+    /// it is believed healthy.
+    ///
+    /// A TIMESTAMP rather than a per-burst flag, because a flag reset every
+    /// burst means a permanently wedged observer is re-probed once per batch
+    /// forever. Measured on the stalled-observer test: 24 of 25 bursts paid the
+    /// full delivery window to re-learn something already known, and because
+    /// commands share the actor's `select!`, every one of those windows is time
+    /// an operator's interrupt spends waiting.
+    static LIVE_DELIVERY_LAGGING: std::cell::Cell<Option<std::time::Instant>>;
 }
+
+/// How long a known-lagging observer is believed to still be lagging.
+///
+/// The point of re-probing at all is that an observer which recovers must not
+/// stay penalised. The point of not re-probing constantly is that one which has
+/// not recovered must not be paid for repeatedly. This interval is the price of
+/// noticing recovery, and it is bounded rather than per-batch.
+#[cfg(not(test))]
+const LIVE_DELIVERY_REPROBE_AFTER: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const LIVE_DELIVERY_REPROBE_AFTER: Duration = Duration::from_millis(250);
 
 /// Begin a new burst of live deliveries.
 ///
@@ -9719,18 +9856,38 @@ tokio::task_local! {
 /// the operator's interrupt — share its `select!`. Any time spent blocking inside
 /// a batch is time an interrupt waits, so each batch starts with a fresh window
 /// and gives up blocking as soon as the observer misses it once.
+#[cfg(test)]
+pub(crate) static LIVE_DELIVERY_BURSTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static LIVE_DELIVERY_BLOCKED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn begin_live_delivery_burst() {
-    let _ = LIVE_DELIVERY_LAGGING.try_with(|lagging| lagging.set(false));
+    #[cfg(test)]
+    LIVE_DELIVERY_BURSTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Clears the mark only once it is stale, so a recovered observer is given
+    // another chance without every batch buying one.
+    let _ = LIVE_DELIVERY_LAGGING.try_with(|lagging| {
+        if lagging
+            .get()
+            .is_some_and(|at| at.elapsed() >= LIVE_DELIVERY_REPROBE_AFTER)
+        {
+            lagging.set(None);
+        }
+    });
 }
 
 fn live_delivery_is_lagging() -> bool {
     LIVE_DELIVERY_LAGGING
-        .try_with(std::cell::Cell::get)
+        .try_with(|lagging| lagging.get().is_some())
         .unwrap_or(false)
 }
 
 fn mark_live_delivery_lagging() {
-    let _ = LIVE_DELIVERY_LAGGING.try_with(|lagging| lagging.set(true));
+    let _ = LIVE_DELIVERY_LAGGING.try_with(|lagging| {
+        lagging.set(Some(std::time::Instant::now()));
+    });
 }
 
 /// Run the session actor with live-delivery budgeting installed.
@@ -9742,7 +9899,7 @@ pub(crate) async fn with_live_delivery_budget(
     future: std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + '_>>,
 ) -> Result<()> {
     LIVE_DELIVERY_LAGGING
-        .scope(std::cell::Cell::new(false), future)
+        .scope(std::cell::Cell::new(None), future)
         .await
 }
 
@@ -9779,6 +9936,8 @@ async fn deliver_recorded_event(
                 tracing::debug!(session_id = %session_id, sequence, "live session event receiver closed")
             }
             Err(_) => {
+                #[cfg(test)]
+                LIVE_DELIVERY_BLOCKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 mark_live_delivery_lagging();
                 tracing::warn!(
                     session_id = %session_id,

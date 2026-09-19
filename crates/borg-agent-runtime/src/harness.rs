@@ -173,7 +173,7 @@ async fn load_state(
     scope: HarnessScope,
     session_id: Uuid,
     root: &Path,
-    store: Option<&crate::SqliteSessionStore>,
+    store: Option<&dyn crate::SessionStore>,
 ) -> Result<HarnessState> {
     let value = match scope {
         HarnessScope::Local => {
@@ -201,7 +201,7 @@ async fn save_state(
     state: &HarnessState,
     session_id: Uuid,
     root: &Path,
-    store: Option<&crate::SqliteSessionStore>,
+    store: Option<&dyn crate::SessionStore>,
 ) -> Result<()> {
     let value = serde_json::to_value(state)?;
     match scope {
@@ -327,7 +327,7 @@ async fn list_entries(
     request: &HarnessRequest,
     session_id: Uuid,
     root: &Path,
-    store: Option<&crate::SqliteSessionStore>,
+    store: Option<&dyn crate::SessionStore>,
 ) -> Result<Value> {
     let scopes = request
         .scope
@@ -353,7 +353,7 @@ async fn overview(
     request: &HarnessRequest,
     session_id: Uuid,
     root: &Path,
-    store: Option<&crate::SqliteSessionStore>,
+    store: Option<&dyn crate::SessionStore>,
 ) -> Result<Value> {
     let local = load_state(HarnessScope::Local, session_id, root, store).await?;
     let global = load_state(HarnessScope::Global, session_id, root, store).await?;
@@ -385,7 +385,7 @@ async fn get_entry(
     request: &HarnessRequest,
     session_id: Uuid,
     root: &Path,
-    store: Option<&crate::SqliteSessionStore>,
+    store: Option<&dyn crate::SessionStore>,
 ) -> Result<Value> {
     let id = request
         .id
@@ -469,7 +469,7 @@ async fn mutate(
     request: &HarnessRequest,
     session_id: Uuid,
     root: &Path,
-    store: Option<&crate::SqliteSessionStore>,
+    store: Option<&dyn crate::SessionStore>,
     allow_effects: bool,
 ) -> Result<Value> {
     ensure!(
@@ -588,7 +588,7 @@ pub(crate) async fn call(
     arguments: Value,
     session_id: Uuid,
     root: &Path,
-    store: Option<&crate::SqliteSessionStore>,
+    store: Option<&dyn crate::SessionStore>,
     global_lock: &Arc<Mutex<()>>,
     allow_effects: bool,
 ) -> Result<Value> {
@@ -622,7 +622,7 @@ pub(crate) async fn call(
 pub(crate) async fn prompt_appendix(
     session_id: Uuid,
     root: &Path,
-    store: Option<&crate::SqliteSessionStore>,
+    store: Option<&dyn crate::SessionStore>,
     global_lock: &Arc<Mutex<()>>,
 ) -> Result<String> {
     let _lock = global_lock.lock().await;

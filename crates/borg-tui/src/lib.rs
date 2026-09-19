@@ -596,6 +596,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/queue", "send after the current turn finishes"),
     ("/steer", "send now and redirect the current turn"),
     ("/team", "message every agent in the team"),
+    (
+        "/broadcast",
+        "message every Borg instance running on this machine",
+    ),
     ("/interrupt", "interrupt the current turn"),
     ("/stop", "alias for /interrupt"),
     ("/login", "switch ChatGPT / API key billing"),
@@ -841,6 +845,11 @@ pub enum UiAction {
     /// `/team <message>`: queue one message to every non-terminal agent in the
     /// team (subagents plus root). Always addressed at the director session.
     Broadcast {
+        text: String,
+    },
+    /// `/broadcast <message>`: deliver one message to every Borg instance
+    /// running on this machine, beyond this session's own team.
+    BroadcastInstances {
         text: String,
     },
     Approve {
@@ -1580,6 +1589,16 @@ pub struct BorgTerminal {
     last_ctrl_c: Option<Instant>,
     ctrl_c_count: u8,
     queued_prompts: Vec<PendingPromptProjection>,
+    /// An idle submission this surface already projected as a starting turn.
+    ///
+    /// The session journals such a prompt as `Message{status: Queued}` a beat
+    /// before `TurnStarted`, so projecting that transient straight into the
+    /// pending list made every post-turn submission visibly bounce
+    /// Starting -> pending -> Running. The projection is withheld while this
+    /// is set and only materialises if something other than the matching
+    /// `TurnStarted` resolves it.
+    optimistic_idle_prompt: Option<Uuid>,
+    withheld_queued_prompt: Option<PendingPromptProjection>,
     /// Insertion point for prompts the session re-queues right after a failed
     /// turn; they precede everything queued while that turn ran.
     requeue_cursor: Option<usize>,
@@ -2692,6 +2711,8 @@ impl BorgTerminal {
             last_ctrl_c: None,
             ctrl_c_count: 0,
             queued_prompts: Vec::new(),
+            optimistic_idle_prompt: None,
+            withheld_queued_prompt: None,
             requeue_cursor: None,
             active_turn_followup: false,
             child_active_turn_followups: HashSet::new(),
@@ -3059,7 +3080,12 @@ impl BorgTerminal {
     }
 
     pub fn restore_composer(&mut self, text: String, attachments: Vec<PathBuf>) {
-        self.composer.restore(text, attachments);
+        // Never destroy a draft. A returned prompt used to overwrite the
+        // composer outright, so anything typed between submitting and the
+        // rejection arriving was silently lost. `append_recalled` degrades to
+        // a plain restore when the composer is empty, which is the usual case
+        // because submission takes it.
+        self.composer.append_recalled(text, attachments);
         self.composer_selection = None;
     }
 
@@ -3111,6 +3137,54 @@ impl BorgTerminal {
         }
     }
 
+    /// Decide whether `event` may update the pending-prompt projection.
+    ///
+    /// Returns false only for the one transient this surface already rendered
+    /// optimistically: the `Message{status: Queued}` the session writes for an
+    /// idle submission immediately before `TurnStarted`. Holding it back keeps
+    /// the prompt from appearing in the pending list for a frame and then
+    /// vanishing. The hold is resolved deterministically rather than on a
+    /// timer: the matching `TurnStarted` drops it, and anything else that
+    /// settles a prompt releases it into the pending list where it belongs, so
+    /// a genuinely queued prompt is never lost.
+    fn absorb_optimistic_idle_prompt(&mut self, event: &SessionEventKind) -> bool {
+        let Some(optimistic) = self.optimistic_idle_prompt else {
+            return true;
+        };
+        match optimistic_idle_prompt_decision(event, optimistic) {
+            OptimisticPromptDecision::Withhold(withheld) => {
+                self.withheld_queued_prompt = Some(withheld);
+                false
+            }
+            OptimisticPromptDecision::Settled => {
+                // The transient resolved exactly as projected.
+                self.optimistic_idle_prompt = None;
+                self.withheld_queued_prompt = None;
+                true
+            }
+            OptimisticPromptDecision::Release => {
+                // Something else settled first, so the prompt really is
+                // waiting. Release the withheld projection before the event is
+                // applied so ordering matches an unsuppressed run.
+                self.release_withheld_queued_prompt();
+                true
+            }
+            OptimisticPromptDecision::Ignore => true,
+        }
+    }
+
+    fn release_withheld_queued_prompt(&mut self) {
+        self.optimistic_idle_prompt = None;
+        if let Some(withheld) = self.withheld_queued_prompt.take() {
+            push_queued_prompt(
+                &mut self.queued_prompts,
+                withheld.message_id,
+                withheld.text,
+                withheld.delivery,
+            );
+        }
+    }
+
     pub fn discard_pending_prompt(&mut self, target: Option<Uuid>, message_id: Uuid) {
         if let Some(child) = target {
             self.child_queued_prompts
@@ -3146,6 +3220,8 @@ impl BorgTerminal {
             },
         );
         self.transcript.project_optimistic_message(&event);
+        self.optimistic_idle_prompt = Some(message_id);
+        self.withheld_queued_prompt = None;
         self.status = SessionStatus::Starting;
         self.interrupt_requested = false;
         self.active_since = Some(event.created_at);
@@ -3183,7 +3259,9 @@ impl BorgTerminal {
                 self.active_since = None;
             }
         }
-        self.composer.restore(text, attachments);
+        self.optimistic_idle_prompt = None;
+        self.withheld_queued_prompt = None;
+        self.composer.append_recalled(text, attachments);
         self.composer_selection = None;
         self.notice = Some("Could not send the prompt; it was returned to the composer".into());
     }
@@ -3390,11 +3468,13 @@ impl BorgTerminal {
         if event.sequence > 0 {
             self.session_state_sequence = self.session_state_sequence.max(event.sequence);
         }
-        update_queued_prompts(
-            &mut self.queued_prompts,
-            &event.kind,
-            &mut self.requeue_cursor,
-        );
+        if self.absorb_optimistic_idle_prompt(&event.kind) {
+            update_queued_prompts(
+                &mut self.queued_prompts,
+                &event.kind,
+                &mut self.requeue_cursor,
+            );
+        }
         if self.notice.as_deref() == Some("Sending pending input")
             && self.active_queued_prompts().is_empty()
         {
@@ -9428,6 +9508,19 @@ impl BorgTerminal {
                 self.notice = None;
                 return Ok(UiAction::Broadcast { text: message });
             }
+            if self.composer.attachments.is_empty()
+                && let Some(message) = self.composer.text.trim().strip_prefix("/broadcast")
+                && message.chars().next().is_none_or(char::is_whitespace)
+            {
+                let message = message.trim().to_string();
+                if message.is_empty() {
+                    self.notice = Some("Usage: /broadcast <message>".to_string());
+                    return Ok(UiAction::None);
+                }
+                self.composer.clear();
+                self.notice = Some("Broadcasting to every instance on this machine".to_string());
+                return Ok(UiAction::BroadcastInstances { text: message });
+            }
             let (text, attachments) = self.composer.take();
             if text.trim().is_empty() && attachments.is_empty() {
                 return Ok(UiAction::None);
@@ -11830,6 +11923,53 @@ fn normalize_terminal_capture_paste(value: &str) -> Cow<'_, str> {
     )
 }
 
+/// What an incoming event means for a withheld optimistic idle submission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OptimisticPromptDecision {
+    /// The pre-`TurnStarted` queued transient for our own prompt: hold it.
+    Withhold(PendingPromptProjection),
+    /// Our prompt started its turn; the hold served its purpose.
+    Settled,
+    /// Another prompt settled first, so ours is genuinely pending.
+    Release,
+    /// Unrelated event.
+    Ignore,
+}
+
+fn optimistic_idle_prompt_decision(
+    event: &SessionEventKind,
+    optimistic: Uuid,
+) -> OptimisticPromptDecision {
+    match event {
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text,
+            status: MessageStatus::Queued,
+            delivery: Some(delivery),
+            ..
+        } if *message_id == optimistic => {
+            OptimisticPromptDecision::Withhold(PendingPromptProjection {
+                message_id: *message_id,
+                text: text.clone(),
+                delivery: *delivery,
+            })
+        }
+        SessionEventKind::TurnStarted { message_id, .. } if *message_id == optimistic => {
+            OptimisticPromptDecision::Settled
+        }
+        SessionEventKind::TurnStarted { .. }
+        | SessionEventKind::TurnCompleted { .. }
+        | SessionEventKind::PromptRecalled { .. }
+        | SessionEventKind::Message {
+            actor: EventActor::User,
+            status: MessageStatus::Complete | MessageStatus::InProgress | MessageStatus::Failed,
+            ..
+        } => OptimisticPromptDecision::Release,
+        _ => OptimisticPromptDecision::Ignore,
+    }
+}
+
 fn update_queued_prompts(
     queued_prompts: &mut Vec<PendingPromptProjection>,
     event: &SessionEventKind,
@@ -13254,7 +13394,15 @@ fn next_thread_match(matches: &[usize], previous_row: Option<usize>) -> (usize, 
 fn slash_command_needs_argument(command: &str) -> bool {
     matches!(
         command,
-        "/ask" | "/director" | "/claude" | "/gpt" | "/peer" | "/queue" | "/steer" | "/team"
+        "/ask"
+            | "/director"
+            | "/claude"
+            | "/gpt"
+            | "/peer"
+            | "/queue"
+            | "/steer"
+            | "/team"
+            | "/broadcast"
     )
 }
 

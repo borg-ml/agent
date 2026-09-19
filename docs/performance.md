@@ -199,3 +199,22 @@ share, so a dominant provider wait or tool phase is immediately visible.
 This semantic profile explains where a turn spends wall time. For CPU-only
 hotspots, attach the platform profiler separately (for example perf record on
 Linux) to the profiled process and its provider children.
+
+## Interrupt latency behind a wedged live observer
+
+The session actor delivers durable events to the live observer with a bounded
+window, so a detached or far-behind observer cannot hold the actor forever. That
+window is paid at most once per batch, and the "is it lagging?" mark used to be
+cleared at the start of every batch — so a permanently wedged observer was
+re-probed once per batch indefinitely.
+
+Because operator commands share the actor's `select!`, every one of those
+windows is time an interrupt spends waiting. Measured on the stalled-observer
+test, 24 of 25 delivery bursts paid the full window to re-learn something
+already known.
+
+The mark is now a timestamp rather than a per-batch flag, and is cleared only
+once it is stale (`LIVE_DELIVERY_REPROBE_AFTER`). A recovered observer is still
+given another chance; one that has not recovered is no longer paid for on every
+batch. Measured effect on the same test: blocking windows 24 → 5, and interrupt
+latency roughly halved.

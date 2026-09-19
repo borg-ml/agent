@@ -94,7 +94,7 @@ impl PersistentRuntimeRegistry {
         &self,
         session_id: Uuid,
         root: &Path,
-        store: Option<crate::SqliteSessionStore>,
+        store: Option<std::sync::Arc<dyn crate::SessionStore>>,
     ) -> Arc<PersistentRuntimeWorker> {
         let mut runtimes = self.python.lock().await;
         runtimes
@@ -113,7 +113,7 @@ impl PersistentRuntimeRegistry {
         &self,
         session_id: Uuid,
         root: &Path,
-        store: Option<crate::SqliteSessionStore>,
+        store: Option<std::sync::Arc<dyn crate::SessionStore>>,
     ) -> Arc<PersistentRuntimeWorker> {
         let mut runtimes = self.bun.lock().await;
         runtimes
@@ -132,7 +132,7 @@ impl PersistentRuntimeRegistry {
 pub(crate) struct PersistentRuntimeWorker {
     session_id: Uuid,
     root: PathBuf,
-    store: Option<crate::SqliteSessionStore>,
+    store: Option<std::sync::Arc<dyn crate::SessionStore>>,
     worker_id: Uuid,
     runtime: &'static str,
     command: String,
@@ -183,7 +183,7 @@ impl PersistentRuntimeWorker {
     fn for_python(
         session_id: Uuid,
         root: PathBuf,
-        store: Option<crate::SqliteSessionStore>,
+        store: Option<std::sync::Arc<dyn crate::SessionStore>>,
     ) -> Self {
         Self::with_session(
             session_id,
@@ -195,7 +195,11 @@ impl PersistentRuntimeWorker {
         )
     }
 
-    fn for_bun(session_id: Uuid, root: PathBuf, store: Option<crate::SqliteSessionStore>) -> Self {
+    fn for_bun(
+        session_id: Uuid,
+        root: PathBuf,
+        store: Option<std::sync::Arc<dyn crate::SessionStore>>,
+    ) -> Self {
         Self::with_session(
             session_id,
             root,
@@ -209,7 +213,7 @@ impl PersistentRuntimeWorker {
     fn with_session(
         session_id: Uuid,
         root: PathBuf,
-        store: Option<crate::SqliteSessionStore>,
+        store: Option<std::sync::Arc<dyn crate::SessionStore>>,
         runtime: &'static str,
         command: String,
         worker_source: &'static str,
@@ -1595,7 +1599,7 @@ mod tests {
         let runtime = Arc::new(PersistentRuntimeWorker::for_python(
             session_id,
             root.path().to_path_buf(),
-            Some(store.clone()),
+            Some(std::sync::Arc::new(store.clone()) as std::sync::Arc<dyn crate::SessionStore>),
         ));
         let host = Arc::new(HoldingHost {
             entered: tokio::sync::Notify::new(),

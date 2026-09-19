@@ -177,8 +177,9 @@ impl PostgresSessionStore {
                     } else {
                         parts
                     };
-                    let mut inherited =
-                        self.composed_recovery_events(parent, Some(cut), narrowed).await?;
+                    let mut inherited = self
+                        .composed_recovery_events(parent, Some(cut), narrowed)
+                        .await?;
                     inherited.retain(|stored| stored.fork_inheritable);
                     if inherited_limit < session.inherited_event_count {
                         inherited.truncate(usize::try_from(inherited_limit).unwrap_or(usize::MAX));
@@ -262,10 +263,9 @@ impl PostgresSessionStore {
                 .await?
                 .into_iter()
                 .filter(|event| match &event.kind {
-                    SessionEventKind::Message { actor, .. } => matches!(
-                        actor,
-                        crate::EventActor::User | crate::EventActor::System
-                    ),
+                    SessionEventKind::Message { actor, .. } => {
+                        matches!(actor, crate::EventActor::User | crate::EventActor::System)
+                    }
                     SessionEventKind::PromptRecalled { .. } => true,
                     _ => false,
                 })
@@ -504,7 +504,7 @@ mod tests {
 
     async fn started_session(url: &str) -> (ScratchDatabase, PostgresSessionStore, Uuid) {
         let scratch = ScratchDatabase::create(url).await;
-        let store = PostgresSessionStore::connect(&scratch.url)
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
             .await
             .expect("connect");
         let session_id = Uuid::new_v4();

@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, bail, ensure};
+use async_trait::async_trait;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
-const RECEIPT_VERSION: u8 = 1;
+pub(crate) const RECEIPT_VERSION: u8 = 1;
 
 #[derive(Debug)]
 pub enum ReceiptState<T> {
@@ -16,28 +17,28 @@ pub enum ReceiptState<T> {
     Corrupt,
 }
 
-const RECEIPT_STATE_STARTED: &str = "started";
-const RECEIPT_STATE_TERMINAL: &str = "terminal";
+pub(crate) const RECEIPT_STATE_STARTED: &str = "started";
+pub(crate) const RECEIPT_STATE_TERMINAL: &str = "terminal";
 /// Bounds metadata and response payloads stored in one receipt row.
 pub(crate) const MAX_SQLITE_RECEIPT_JSON_BYTES: usize = 1024 * 1024;
 /// A receipt may have one intent transition and one terminal transition.
 pub(crate) const MAX_SQLITE_RECEIPT_TRANSITIONS: usize = 2;
 
 #[derive(Debug, Clone)]
-struct SqliteReceiptRecord {
-    version: i64,
-    state: String,
-    request: serde_json::Value,
-    response: Option<serde_json::Value>,
+pub(crate) struct ReceiptRecord {
+    pub(crate) version: i64,
+    pub(crate) state: String,
+    pub(crate) request: serde_json::Value,
+    pub(crate) response: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]
-struct SqliteReceiptTransition {
-    sequence: i64,
-    version: i64,
-    state: String,
-    request: serde_json::Value,
-    response: Option<serde_json::Value>,
+pub(crate) struct ReceiptTransition {
+    pub(crate) sequence: i64,
+    pub(crate) version: i64,
+    pub(crate) state: String,
+    pub(crate) request: serde_json::Value,
+    pub(crate) response: Option<serde_json::Value>,
 }
 
 /// SQLite-backed receipt persistence for hosts that need crash-safe mutation
@@ -47,6 +48,134 @@ struct SqliteReceiptTransition {
 /// current projection; `receipt_transitions` is append-only audit history.
 pub struct SqliteReceiptStore {
     pool: SqlitePool,
+}
+
+/// The durable receipt tier, independent of engine.
+///
+/// WHY THE TRAIT IS VALUE-TYPED: a receipt's whole job is to make a mutation
+/// replay-safe, so callers hand it their own request and response types. Those
+/// generics are not object-safe, and every backend converts them to JSON on the
+/// first line anyway. So the trait carries the erased `serde_json::Value` form,
+/// and the typed API callers actually use lives in `impl dyn ReceiptBackend`
+/// below -- same ergonomics, but now one call site can hold either engine.
+#[async_trait]
+pub trait ReceiptBackend: Send + Sync {
+    /// The recorded state of a request, with its response body untyped.
+    async fn load_value(
+        &self,
+        request_id: Uuid,
+        request: &serde_json::Value,
+    ) -> Result<ReceiptState<serde_json::Value>>;
+
+    /// Durably record intent before a mutation may begin.
+    async fn begin_value(&self, request_id: Uuid, request: &serde_json::Value) -> Result<()>;
+
+    /// Publish a terminal response, retaining the intent transition as evidence
+    /// that the mutation was authorised.
+    async fn finish_value(
+        &self,
+        request_id: Uuid,
+        request: &serde_json::Value,
+        response: &serde_json::Value,
+    ) -> Result<()>;
+
+    /// Queue a command for a relay host to collect.
+    async fn enqueue_host_operation(
+        &self,
+        host_id: Uuid,
+        request_id: Uuid,
+        command: &serde_json::Value,
+    ) -> Result<()>;
+
+    /// Take the next queued command for a host.
+    async fn next_host_operation(&self, host_id: Uuid)
+    -> Result<Option<(Uuid, serde_json::Value)>>;
+
+    /// Park a command that could not be executed, without losing it.
+    async fn quarantine_host_operation(&self, host_id: Uuid, request_id: Uuid) -> Result<()>;
+
+    /// Look up a still-queued command by request id.
+    async fn queued_host_operation(
+        &self,
+        host_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<Option<serde_json::Value>>;
+
+    /// Remove a command once it has been carried out.
+    async fn finish_host_operation(&self, host_id: Uuid, request_id: Uuid) -> Result<()>;
+}
+
+/// The typed receipt API.
+///
+/// Inherent methods on `dyn ReceiptBackend` rather than trait methods, because
+/// they are generic and so cannot be dispatched dynamically. Callers get the
+/// same signatures they had before the tier became engine-neutral.
+impl dyn ReceiptBackend + '_ {
+    /// The recorded state of `request_id`, decoded into `Response`.
+    ///
+    /// A stored body that will not deserialise into `Response` is reported as
+    /// `Corrupt`, not as an error: a receipt that cannot be read back is
+    /// exactly the corruption this type exists to surface, and the caller's
+    /// recovery for it is the same either way.
+    pub async fn load<Request, Response>(
+        &self,
+        request_id: Uuid,
+        request: &Request,
+    ) -> Result<ReceiptState<Response>>
+    where
+        Request: Serialize,
+        Response: DeserializeOwned,
+    {
+        let request = bounded_json_value(request, "receipt request")?;
+        Ok(match self.load_value(request_id, &request).await? {
+            ReceiptState::Terminal(response) => match serde_json::from_value(response) {
+                Ok(response) => ReceiptState::Terminal(response),
+                Err(_) => ReceiptState::Corrupt,
+            },
+            ReceiptState::Missing => ReceiptState::Missing,
+            ReceiptState::Started => ReceiptState::Started,
+            ReceiptState::Conflict => ReceiptState::Conflict,
+            ReceiptState::Corrupt => ReceiptState::Corrupt,
+        })
+    }
+
+    /// Durably record intent before a mutation may begin.
+    pub async fn begin<Request: Serialize>(
+        &self,
+        request_id: Uuid,
+        request: &Request,
+    ) -> Result<()> {
+        let request = bounded_json_value(request, "receipt request")?;
+        self.begin_value(request_id, &request).await
+    }
+
+    /// Publish a terminal response for an already-begun request.
+    pub async fn finish<Request, Response>(
+        &self,
+        request_id: Uuid,
+        request: &Request,
+        response: &Response,
+    ) -> Result<()>
+    where
+        Request: Serialize,
+        Response: Serialize,
+    {
+        let request = bounded_json_value(request, "receipt request")?;
+        let response = bounded_json_value(response, "receipt response")?;
+        self.finish_value(request_id, &request, &response).await
+    }
+
+    /// Queue a typed command for a relay host.
+    pub async fn enqueue_host_command<Command: Serialize>(
+        &self,
+        host_id: Uuid,
+        request_id: Uuid,
+        command: &Command,
+    ) -> Result<()> {
+        let command = bounded_json_value(command, "host command")?;
+        self.enqueue_host_operation(host_id, request_id, &command)
+            .await
+    }
 }
 
 impl SqliteReceiptStore {
@@ -65,15 +194,11 @@ impl SqliteReceiptStore {
         &self.pool
     }
 
-    pub async fn load<Request, Response>(
+    pub async fn load_value(
         &self,
         request_id: Uuid,
-        request: &Request,
-    ) -> Result<ReceiptState<Response>>
-    where
-        Request: Serialize,
-        Response: DeserializeOwned,
-    {
+        request: &serde_json::Value,
+    ) -> Result<ReceiptState<serde_json::Value>> {
         let request = bounded_json_value(request, "receipt request")?;
         self.ensure_schema().await?;
         let mut transaction = self.pool.begin().await?;
@@ -133,11 +258,12 @@ impl SqliteReceiptStore {
         } else {
             match record.state.as_str() {
                 RECEIPT_STATE_STARTED => ReceiptState::Started,
+                // The stored body is returned as-is; typing it is the
+                // caller's business, and a body that will not deserialise into
+                // the caller's type is reported as Corrupt by the generic
+                // wrapper rather than here.
                 RECEIPT_STATE_TERMINAL => match record.response {
-                    Some(response) => match serde_json::from_value(response) {
-                        Ok(response) => ReceiptState::Terminal(response),
-                        Err(_) => ReceiptState::Corrupt,
-                    },
+                    Some(response) => ReceiptState::Terminal(response),
                     None => ReceiptState::Corrupt,
                 },
                 _ => ReceiptState::Corrupt,
@@ -148,11 +274,7 @@ impl SqliteReceiptStore {
     }
 
     /// Durably records intent before a mutation may begin.
-    pub async fn begin<Request: Serialize>(
-        &self,
-        request_id: Uuid,
-        request: &Request,
-    ) -> Result<()> {
+    pub async fn begin_value(&self, request_id: Uuid, request: &serde_json::Value) -> Result<()> {
         let request = bounded_json_value(request, "receipt request")?;
         let request_json = serde_json::to_string(&request)?;
         self.ensure_schema().await?;
@@ -189,16 +311,12 @@ impl SqliteReceiptStore {
 
     /// Atomically publishes a terminal response while retaining the intent
     /// transition as evidence that the mutation was authorized.
-    pub async fn finish<Request, Response>(
+    pub async fn finish_value(
         &self,
         request_id: Uuid,
-        request: &Request,
-        response: &Response,
-    ) -> Result<()>
-    where
-        Request: Serialize,
-        Response: Serialize,
-    {
+        request: &serde_json::Value,
+        response: &serde_json::Value,
+    ) -> Result<()> {
         let request = bounded_json_value(request, "receipt request")?;
         let response = bounded_json_value(response, "receipt response")?;
         let request_json = serde_json::to_string(&request)?;
@@ -269,7 +387,7 @@ impl SqliteReceiptStore {
         &self,
         host_id: Uuid,
         request_id: Uuid,
-        command: &impl Serialize,
+        command: &serde_json::Value,
     ) -> Result<()> {
         let command_json = serde_json::to_string(&bounded_json_value(command, "host operation")?)?;
         self.ensure_schema().await?;
@@ -443,7 +561,7 @@ impl SqliteReceiptStore {
         &self,
         transaction: &mut Transaction<'_, Sqlite>,
         request_id: Uuid,
-    ) -> Result<Option<SqliteReceiptRecord>> {
+    ) -> Result<Option<ReceiptRecord>> {
         sqlx::query(
             "select version,state,request_json,response_json \
              from receipt_records where request_id=?",
@@ -456,7 +574,10 @@ impl SqliteReceiptStore {
     }
 }
 
-fn bounded_json_value<T: Serialize>(value: &T, label: &str) -> Result<serde_json::Value> {
+pub(crate) fn bounded_json_value<T: Serialize>(
+    value: &T,
+    label: &str,
+) -> Result<serde_json::Value> {
     let value = serde_json::to_value(value).with_context(|| format!("failed to encode {label}"))?;
     let bytes = serde_json::to_vec(&value)?.len();
     ensure!(
@@ -466,7 +587,7 @@ fn bounded_json_value<T: Serialize>(value: &T, label: &str) -> Result<serde_json
     Ok(value)
 }
 
-fn decode_receipt_record(row: &SqliteRow) -> Result<SqliteReceiptRecord> {
+fn decode_receipt_record(row: &SqliteRow) -> Result<ReceiptRecord> {
     let request_json: String = row.try_get("request_json")?;
     ensure!(
         request_json.len() <= MAX_SQLITE_RECEIPT_JSON_BYTES,
@@ -483,7 +604,7 @@ fn decode_receipt_record(row: &SqliteRow) -> Result<SqliteReceiptRecord> {
     let response = response_json
         .map(|json| serde_json::from_str(&json).context("invalid receipt response JSON"))
         .transpose()?;
-    Ok(SqliteReceiptRecord {
+    Ok(ReceiptRecord {
         version: row.try_get("version")?,
         state: row.try_get("state")?,
         request,
@@ -491,7 +612,7 @@ fn decode_receipt_record(row: &SqliteRow) -> Result<SqliteReceiptRecord> {
     })
 }
 
-fn decode_receipt_transition(row: &SqliteRow) -> Result<SqliteReceiptTransition> {
+fn decode_receipt_transition(row: &SqliteRow) -> Result<ReceiptTransition> {
     let request_json: String = row.try_get("request_json")?;
     let response_json: Option<String> = row.try_get("response_json")?;
     ensure!(
@@ -504,7 +625,7 @@ fn decode_receipt_transition(row: &SqliteRow) -> Result<SqliteReceiptTransition>
             "receipt audit response JSON exceeds bound"
         );
     }
-    Ok(SqliteReceiptTransition {
+    Ok(ReceiptTransition {
         sequence: row.try_get("sequence")?,
         version: row.try_get("version")?,
         state: row.try_get("state")?,
@@ -516,8 +637,8 @@ fn decode_receipt_transition(row: &SqliteRow) -> Result<SqliteReceiptTransition>
     })
 }
 
-fn validate_existing_request(
-    existing: &SqliteReceiptRecord,
+pub(crate) fn validate_existing_request(
+    existing: &ReceiptRecord,
     request: &serde_json::Value,
 ) -> Result<()> {
     ensure!(
@@ -531,9 +652,9 @@ fn validate_existing_request(
     Ok(())
 }
 
-fn validate_receipt_projection(
-    record: &SqliteReceiptRecord,
-    transitions: &[SqliteReceiptTransition],
+pub(crate) fn validate_receipt_projection(
+    record: &ReceiptRecord,
+    transitions: &[ReceiptTransition],
 ) -> Result<()> {
     ensure!(!transitions.is_empty(), "receipt has no audit transitions");
     ensure!(
@@ -589,7 +710,7 @@ fn validate_receipt_projection(
 async fn validate_existing_audit(
     transaction: &mut Transaction<'_, Sqlite>,
     request_id: Uuid,
-    record: &SqliteReceiptRecord,
+    record: &ReceiptRecord,
 ) -> Result<()> {
     let rows = sqlx::query(
         "select sequence,version,state,request_json,response_json \
@@ -714,7 +835,10 @@ mod tests {
         );
         assert!(
             matches!(
-                store.load::<_, Response>(first, &command).await.unwrap(),
+                (&store as &dyn ReceiptBackend)
+                    .load::<_, Response>(first, &command)
+                    .await
+                    .unwrap(),
                 ReceiptState::Missing
             ),
             "queue admission must not claim that execution has started"
@@ -817,18 +941,24 @@ mod tests {
             value: "accepted".to_string(),
         };
 
-        store.begin(request_id, &request).await.unwrap();
+        (&store as &dyn ReceiptBackend)
+            .begin(request_id, &request)
+            .await
+            .unwrap();
         let reopened = SqliteReceiptStore::new(store.pool().clone());
         assert!(matches!(
-            reopened
+            (&reopened as &dyn ReceiptBackend)
                 .load::<_, Response>(request_id, &request)
                 .await
                 .unwrap(),
             ReceiptState::Started
         ));
-        store.finish(request_id, &request, &response).await.unwrap();
+        (&store as &dyn ReceiptBackend)
+            .finish(request_id, &request, &response)
+            .await
+            .unwrap();
         assert!(matches!(
-            reopened
+            (&reopened as &dyn ReceiptBackend)
                 .load::<_, Response>(request_id, &request)
                 .await
                 .unwrap(),
@@ -854,24 +984,41 @@ mod tests {
             value: "accepted".to_string(),
         };
 
-        store.begin(request_id, &request).await.unwrap();
-        store.begin(request_id, &request).await.unwrap();
+        (&store as &dyn ReceiptBackend)
+            .begin(request_id, &request)
+            .await
+            .unwrap();
+        (&store as &dyn ReceiptBackend)
+            .begin(request_id, &request)
+            .await
+            .unwrap();
         assert!(matches!(
-            store
+            (&store as &dyn ReceiptBackend)
                 .load::<_, Response>(request_id, &different_request)
                 .await
                 .unwrap(),
             ReceiptState::Conflict
         ));
-        assert!(store.begin(request_id, &different_request).await.is_err());
+        assert!(
+            (&store as &dyn ReceiptBackend)
+                .begin(request_id, &different_request)
+                .await
+                .is_err()
+        );
 
-        store.finish(request_id, &request, &response).await.unwrap();
-        store.finish(request_id, &request, &response).await.unwrap();
+        (&store as &dyn ReceiptBackend)
+            .finish(request_id, &request, &response)
+            .await
+            .unwrap();
+        (&store as &dyn ReceiptBackend)
+            .finish(request_id, &request, &response)
+            .await
+            .unwrap();
         let different_response = Response {
             value: "different".to_string(),
         };
         assert!(
-            store
+            (&store as &dyn ReceiptBackend)
                 .finish(request_id, &request, &different_response)
                 .await
                 .is_err()
@@ -891,7 +1038,10 @@ mod tests {
         let store = sqlite_store().await;
         let request_id = Uuid::new_v4();
         let request = serde_json::json!({"operation": "write"});
-        store.begin(request_id, &request).await.unwrap();
+        (&store as &dyn ReceiptBackend)
+            .begin(request_id, &request)
+            .await
+            .unwrap();
         sqlx::query("update receipt_records set request_json=? where request_id=?")
             .bind("{")
             .bind(request_id.to_string())
@@ -900,14 +1050,14 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            store
+            (&store as &dyn ReceiptBackend)
                 .load::<_, Response>(request_id, &request)
                 .await
                 .unwrap(),
             ReceiptState::Corrupt
         ));
         assert!(matches!(
-            store
+            (&store as &dyn ReceiptBackend)
                 .load::<_, Response>(Uuid::new_v4(), &request)
                 .await
                 .unwrap(),
@@ -928,6 +1078,67 @@ mod tests {
         assert_eq!(table_count, 2);
 
         let oversized = "x".repeat(MAX_SQLITE_RECEIPT_JSON_BYTES);
-        assert!(store.begin(Uuid::new_v4(), &oversized).await.is_err());
+        assert!(
+            (&store as &dyn ReceiptBackend)
+                .begin(Uuid::new_v4(), &oversized)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[async_trait]
+impl ReceiptBackend for SqliteReceiptStore {
+    async fn load_value(
+        &self,
+        request_id: Uuid,
+        request: &serde_json::Value,
+    ) -> Result<ReceiptState<serde_json::Value>> {
+        Self::load_value(self, request_id, request).await
+    }
+
+    async fn begin_value(&self, request_id: Uuid, request: &serde_json::Value) -> Result<()> {
+        Self::begin_value(self, request_id, request).await
+    }
+
+    async fn finish_value(
+        &self,
+        request_id: Uuid,
+        request: &serde_json::Value,
+        response: &serde_json::Value,
+    ) -> Result<()> {
+        Self::finish_value(self, request_id, request, response).await
+    }
+
+    async fn enqueue_host_operation(
+        &self,
+        host_id: Uuid,
+        request_id: Uuid,
+        command: &serde_json::Value,
+    ) -> Result<()> {
+        Self::enqueue_host_operation(self, host_id, request_id, command).await
+    }
+
+    async fn next_host_operation(
+        &self,
+        host_id: Uuid,
+    ) -> Result<Option<(Uuid, serde_json::Value)>> {
+        Self::next_host_operation(self, host_id).await
+    }
+
+    async fn quarantine_host_operation(&self, host_id: Uuid, request_id: Uuid) -> Result<()> {
+        Self::quarantine_host_operation(self, host_id, request_id).await
+    }
+
+    async fn queued_host_operation(
+        &self,
+        host_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<Option<serde_json::Value>> {
+        Self::queued_host_operation(self, host_id, request_id).await
+    }
+
+    async fn finish_host_operation(&self, host_id: Uuid, request_id: Uuid) -> Result<()> {
+        Self::finish_host_operation(self, host_id, request_id).await
     }
 }

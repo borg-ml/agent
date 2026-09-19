@@ -131,7 +131,7 @@ pub(super) async fn update_action_row(
 ///
 /// `for update` is the Postgres replacement for SQLite's database-wide write
 /// lock; every caller that then writes the row depends on it.
-async fn load_action_for_update(
+pub(super) async fn load_action_for_update(
     transaction: &mut Transaction<'_, Postgres>,
     session_id: Uuid,
     action_id: Uuid,
@@ -182,7 +182,16 @@ pub(super) async fn insert_initial_action_transitions(
     action: &SessionAction,
 ) -> Result<()> {
     let queued = SessionActionState::Queued;
-    insert_action_transition(transaction, action, None, queued, None, action.created_at, 0).await?;
+    insert_action_transition(
+        transaction,
+        action,
+        None,
+        queued,
+        None,
+        action.created_at,
+        0,
+    )
+    .await?;
     if action.state != queued {
         insert_action_transition(
             transaction,
@@ -224,7 +233,7 @@ pub(super) async fn append_action_transition(
     .await
 }
 
-fn validate_live_lease(
+pub(super) fn validate_live_lease(
     action: &SessionAction,
     lease_owner: &str,
     lease_token: Uuid,
@@ -546,7 +555,7 @@ mod tests {
 
     async fn session(url: &str) -> (ScratchDatabase, PostgresSessionStore, Uuid) {
         let scratch = ScratchDatabase::create(url).await;
-        let store = PostgresSessionStore::connect(&scratch.url)
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
             .await
             .expect("connect");
         let session_id = Uuid::new_v4();
@@ -568,7 +577,10 @@ mod tests {
         // A retried enqueue must return the same durable row, not a second one.
         let again = store.enqueue_action(queued.clone()).await.expect("enqueue");
         assert_eq!(again.action_id, stored.action_id);
-        assert_eq!(store.pending_actions(session_id, 10).await.unwrap().len(), 1);
+        assert_eq!(
+            store.pending_actions(session_id, 10).await.unwrap().len(),
+            1
+        );
 
         // Reusing the id for different work would silently replace durable
         // work with other work, so it is refused.
@@ -588,18 +600,33 @@ mod tests {
             return;
         };
         let (scratch, store, session_id) = session(&url).await;
-        let queued = store.enqueue_action(action(session_id)).await.expect("enqueue");
+        let queued = store
+            .enqueue_action(action(session_id))
+            .await
+            .expect("enqueue");
         let id = queued.action_id;
 
         store
-            .transition_action(session_id, id, Some(SessionActionState::Queued), SessionActionState::Admitted, None)
+            .transition_action(
+                session_id,
+                id,
+                Some(SessionActionState::Queued),
+                SessionActionState::Admitted,
+                None,
+            )
             .await
             .expect("admit");
         // Queued -> Completed is not a legal edge; a crash must not be able to
         // complete work that never ran.
         assert!(
             store
-                .transition_action(session_id, id, Some(SessionActionState::Queued), SessionActionState::Completed, None)
+                .transition_action(
+                    session_id,
+                    id,
+                    Some(SessionActionState::Queued),
+                    SessionActionState::Completed,
+                    None
+                )
                 .await
                 .is_err(),
             "a stale expected-state must not transition the row"
@@ -608,25 +635,52 @@ mod tests {
         // delivered before it can run.
         assert!(
             store
-                .transition_action(session_id, id, Some(SessionActionState::Admitted), SessionActionState::Running, None)
+                .transition_action(
+                    session_id,
+                    id,
+                    Some(SessionActionState::Admitted),
+                    SessionActionState::Running,
+                    None
+                )
                 .await
                 .is_err()
         );
         store
-            .transition_action(session_id, id, Some(SessionActionState::Admitted), SessionActionState::Delivered, None)
+            .transition_action(
+                session_id,
+                id,
+                Some(SessionActionState::Admitted),
+                SessionActionState::Delivered,
+                None,
+            )
             .await
             .expect("deliver");
         store
-            .transition_action(session_id, id, Some(SessionActionState::Delivered), SessionActionState::Running, None)
+            .transition_action(
+                session_id,
+                id,
+                Some(SessionActionState::Delivered),
+                SessionActionState::Running,
+                None,
+            )
             .await
             .expect("run");
         let done = store
-            .transition_action(session_id, id, Some(SessionActionState::Running), SessionActionState::Completed, None)
+            .transition_action(
+                session_id,
+                id,
+                Some(SessionActionState::Running),
+                SessionActionState::Completed,
+                None,
+            )
             .await
             .expect("complete");
         assert_eq!(done.state, SessionActionState::Completed);
 
-        let transitions = store.action_transitions(session_id, id).await.expect("audit");
+        let transitions = store
+            .action_transitions(session_id, id)
+            .await
+            .expect("audit");
         let states: Vec<SessionActionState> = transitions.iter().map(|t| t.to).collect();
         assert_eq!(
             states,
@@ -643,7 +697,13 @@ mod tests {
         assert_eq!(numbers, vec![0, 1, 2, 3, 4]);
 
         // A terminal action is no longer pending work.
-        assert!(store.pending_actions(session_id, 10).await.unwrap().is_empty());
+        assert!(
+            store
+                .pending_actions(session_id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         scratch.discard().await;
     }
 
@@ -787,7 +847,11 @@ mod tests {
                 .is_some_and(|error| error.contains("lease expired")),
             "recovery must record why the work was requeued"
         );
-        let reloaded = store.action(session_id, id).await.expect("action").expect("present");
+        let reloaded = store
+            .action(session_id, id)
+            .await
+            .expect("action")
+            .expect("present");
         assert_eq!(reloaded.state, SessionActionState::Queued);
         scratch.discard().await;
     }
@@ -881,7 +945,10 @@ mod tests {
             }
         }
 
-        let transitions = store.action_transitions(session_id, id).await.expect("audit");
+        let transitions = store
+            .action_transitions(session_id, id)
+            .await
+            .expect("audit");
         // One origin record plus exactly one record per accepted transition,
         // numbered without gaps or collisions.
         assert_eq!(transitions.len(), accepted + 1);

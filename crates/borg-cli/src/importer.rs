@@ -3,7 +3,7 @@ mod formats;
 use anyhow::{Context, Result, bail, ensure};
 use borg_remote::{
     CodingProvider, EventActor, ImportedMemory, MessageStatus, PermissionMode, ResponseLanguage,
-    SessionEvent, SessionEventKind, SessionStatus, SqliteSessionStore,
+    SessionEvent, SessionEventKind, SessionStatus,
 };
 use chrono::{DateTime, Utc};
 use clap::{Args, ValueEnum};
@@ -178,12 +178,19 @@ pub(crate) async fn execute(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("sessions/sessions.sqlite3");
-    let store = SqliteSessionStore::open(database).await?;
+    // Import writes into the canonical journal, whichever backend that is.
+    let store = std::sync::Arc::clone(
+        borg_remote::session_store::factory::open(
+            &borg_remote::session_store::factory::SessionStoreConfig::from_env(database),
+        )
+        .await?
+        .session(),
+    );
     execute_into(
         plan,
         threads,
         memory,
-        &store,
+        store.as_ref(),
         &borg_remote::imported_memory_directory(),
     )
     .await
@@ -193,7 +200,7 @@ async fn execute_into(
     plan: PreparedImport,
     threads: bool,
     memory: bool,
-    store: &SqliteSessionStore,
+    store: &dyn borg_remote::SessionStore,
     memory_dir: &Path,
 ) -> Result<ImportReport> {
     ensure!(threads || memory, "select Threads, Memory, or both");
@@ -265,7 +272,7 @@ async fn execute_into(
 }
 
 async fn copy_thread(
-    store: &SqliteSessionStore,
+    store: &dyn borg_remote::SessionStore,
     memory_dir: &Path,
     source: Source,
     id: Uuid,
@@ -273,7 +280,6 @@ async fn copy_thread(
     warnings: &mut Vec<String>,
 ) -> Result<bool> {
     use base64::Engine;
-    use borg_remote::SessionStore;
     if store.state(id).await.is_ok() {
         return Ok(false);
     }
@@ -495,7 +501,7 @@ fn read_line(prompt: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use borg_remote::SessionStore;
+    use borg_remote::{SessionStore, SqliteSessionStore};
 
     #[tokio::test]
     async fn portable_import_preserves_history_copies_attachments_and_skips_duplicates() {

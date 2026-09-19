@@ -43,3 +43,4 @@ tracing.workspace = true
 ts-rs.workspace = true
 url.workspace = true
 uuid.workspace = true
+zstd.workspace = true

@@ -30,7 +30,9 @@ pub struct ScratchDatabase {
 impl ScratchDatabase {
     pub async fn create(url: &str) -> Self {
         let name = format!("borg_test_{}", Uuid::new_v4().simple());
-        let admin = PgPool::connect(url).await.expect("connect to admin database");
+        let admin = PgPool::connect(url)
+            .await
+            .expect("connect to admin database");
         // The name is a locally generated UUID, never user input.
         sqlx::query(sqlx::AssertSqlSafe(format!("create database {name}")))
             .execute(&admin)

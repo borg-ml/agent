@@ -106,8 +106,16 @@ async fn doctor(json: bool, deep: bool) -> Result<()> {
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("sessions");
-    let store =
-        borg_remote::SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?;
+    // `borg doctor` reports on whichever backend this machine is configured
+    // for, so it opens through the factory like everything else. Journal only:
+    // a health report must not create satellite schemas as a side effect.
+    let opened = borg_remote::session_store::factory::open(
+        &borg_remote::session_store::factory::SessionStoreConfig::from_env(
+            sessions_dir.join("sessions.sqlite3"),
+        ),
+    )
+    .await?;
+    let store = opened.session();
     let health = if deep {
         store.health().await?
     } else {
@@ -126,6 +134,10 @@ async fn doctor(json: bool, deep: bool) -> Result<()> {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
+                // Which engine produced the report. The health fields are
+                // SQLite-shaped and mapped onto Postgres equivalents, so
+                // without this an operator cannot tell the two apart.
+                "session_backend": opened.backend().as_str(),
                 "session_store": health,
                 "coding_plan": borg_provider::subscription::describe(),
                 "runtimes": runtimes
@@ -149,6 +161,7 @@ async fn doctor(json: bool, deep: bool) -> Result<()> {
             }))?
         );
     } else {
+        println!("Session backend: {}", opened.backend());
         println!(
             "Durable session store: {}",
             if health.is_ready() {

@@ -5,6 +5,7 @@
 
 mod agent;
 mod autonomy;
+pub mod autonomy_postgres;
 mod blu_workflow;
 mod computer_use;
 mod contract;
@@ -37,10 +38,24 @@ pub mod session;
 mod session_action;
 mod session_lock;
 pub mod session_store;
+
+#[cfg(test)]
+mod autonomy_conformance;
+pub mod receipt_postgres;
+
+#[cfg(test)]
+mod plugin_conformance;
+
+#[cfg(test)]
+mod receipt_conformance;
+pub mod workspace_postgres;
+
 mod subagents;
 mod tool_presentation;
 mod watch;
 mod workspace;
+#[cfg(test)]
+mod workspace_conformance;
 mod workspace_snapshot;
 
 pub use agent::{
@@ -78,7 +93,6 @@ pub use lsp::LspPathPolicy;
 pub use lsp::LspService;
 pub use native_process::ProcessSnapshot;
 pub use orchestration::*;
-pub(crate) use plugin_store::SqlitePluginStore;
 #[cfg(feature = "profiling")]
 pub use profiling::RuntimeProfiler;
 pub use profiling::{
@@ -101,6 +115,7 @@ pub use session_action::{
     SessionActionTransition,
 };
 pub use session_lock::SessionWriterLease;
+pub use session_store::postgres::{PostgresSessionStore, SESSIONS_URL_ENV};
 pub use session_store::{
     ClaimedActionTransition, EventPersistence, RecoveryParts, SESSION_PROJECTION_VERSION,
     SessionConfiguration, SessionHistoryHit, SessionHistoryIndexDocument, SessionHistoryPage,

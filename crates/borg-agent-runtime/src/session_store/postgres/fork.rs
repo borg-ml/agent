@@ -18,8 +18,8 @@ use uuid::Uuid;
 
 use super::PostgresSessionStore;
 use super::recovery::StoredSession;
-use crate::session_store::{SessionState, SessionStoreFork};
 use crate::SessionEvent;
+use crate::session_store::{SessionState, SessionStoreFork};
 
 /// A forked session renumbers its inherited prefix, so an inherited event needs
 /// a stable id of its own rather than reusing the parent's.
@@ -188,7 +188,7 @@ mod tests {
 
     async fn conversation(url: &str) -> (ScratchDatabase, PostgresSessionStore, Uuid) {
         let scratch = ScratchDatabase::create(url).await;
-        let store = PostgresSessionStore::connect(&scratch.url)
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
             .await
             .expect("connect");
         let session_id = Uuid::new_v4();
@@ -269,7 +269,11 @@ mod tests {
         // reuse the parent's event ids.
         assert!(inherited.iter().all(|event| event.session_id == child));
         let parent_ids: Vec<Uuid> = parent_events.iter().map(|event| event.id).collect();
-        assert!(inherited.iter().all(|event| !parent_ids.contains(&event.id)));
+        assert!(
+            inherited
+                .iter()
+                .all(|event| !parent_ids.contains(&event.id))
+        );
         assert_eq!(
             store.inherited_event_count(child).await.unwrap(),
             fork.inherited_event_count
@@ -286,7 +290,10 @@ mod tests {
         let (scratch, store, parent) = conversation(&url).await;
         let cut_at = store.read(parent).await.unwrap().last().unwrap().sequence;
         let child = Uuid::new_v4();
-        store.fork_before(parent, child, cut_at).await.expect("fork");
+        store
+            .fork_before(parent, child, cut_at)
+            .await
+            .expect("fork");
 
         store
             .append(SessionEvent::new(
@@ -326,7 +333,10 @@ mod tests {
         let (scratch, store, parent) = conversation(&url).await;
         let cut_at = store.read(parent).await.unwrap().last().unwrap().sequence;
         let child = Uuid::new_v4();
-        store.fork_before(parent, child, cut_at).await.expect("fork");
+        store
+            .fork_before(parent, child, cut_at)
+            .await
+            .expect("fork");
         store
             .append(SessionEvent::new(
                 child,

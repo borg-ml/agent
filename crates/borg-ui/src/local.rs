@@ -5,9 +5,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use borg_remote::{
     EventActor, HostCommand, MessageStatus, SessionConfigAction, SessionEvent, SessionEventKind,
-    SessionStore, SqliteSessionStore, SubagentAction, default_host_config_path,
-    local_session_owner_is_active, login_provider_with_output, send_local_session_command,
-    session_control_socket_path,
+    SessionStore, SubagentAction, default_host_config_path, local_session_owner_is_active,
+    login_provider_with_output, send_local_session_command, session_control_socket_path,
 };
 use uuid::Uuid;
 
@@ -364,7 +363,15 @@ async fn launch_new_session_owner() -> Result<(LocalSessionClient, Option<tokio:
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("sessions");
-    let store = Arc::new(SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?);
+    let store = Arc::clone(
+        borg_remote::session_store::factory::open(
+            &borg_remote::session_store::factory::SessionStoreConfig::from_env(
+                sessions_dir.join("sessions.sqlite3"),
+            ),
+        )
+        .await?
+        .session(),
+    );
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await?;
     let mut child = tokio::process::Command::new(&borg)
@@ -446,7 +453,7 @@ async fn inspect_frontend(kind: FrontendInspection, cwd: &Path) -> Result<(Strin
 }
 
 pub struct LocalSessionClient {
-    store: Arc<SqliteSessionStore>,
+    store: Arc<dyn SessionStore>,
     sessions_dir: PathBuf,
     view: SessionView,
     durable_history: Vec<borg_remote::SessionEvent>,
@@ -464,8 +471,15 @@ impl LocalSessionClient {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("sessions");
-        let store =
-            Arc::new(SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?);
+        let store = Arc::clone(
+            borg_remote::session_store::factory::open(
+                &borg_remote::session_store::factory::SessionStoreConfig::from_env(
+                    sessions_dir.join("sessions.sqlite3"),
+                ),
+            )
+            .await?
+            .session(),
+        );
         let session_id = match session_id {
             Some(session_id) => session_id,
             None => match store.list_sessions(1).await?.first() {
@@ -481,13 +495,20 @@ impl LocalSessionClient {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("sessions");
-        let store =
-            Arc::new(SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?);
+        let store = Arc::clone(
+            borg_remote::session_store::factory::open(
+                &borg_remote::session_store::factory::SessionStoreConfig::from_env(
+                    sessions_dir.join("sessions.sqlite3"),
+                ),
+            )
+            .await?
+            .session(),
+        );
         Self::open_from_store(store, sessions_dir, session_id, root_session_id).await
     }
 
     async fn open_from_store(
-        store: Arc<SqliteSessionStore>,
+        store: Arc<dyn SessionStore>,
         sessions_dir: PathBuf,
         session_id: Uuid,
         root_session_id: Uuid,

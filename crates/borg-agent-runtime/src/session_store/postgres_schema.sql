@@ -18,6 +18,25 @@
 -- primary key leads with session_id, so `partition by hash (session_id)` can
 -- be introduced later without changing any key or query.
 
+-- Who has used this journal, by machine and OS user.
+--
+-- WHY THIS EXISTS: SQLite made the trust boundary physical -- a journal was a
+-- file, owned by one OS user on one machine, and nothing else could reach it.
+-- A connection string erases that. Two machines, or two users on one machine,
+-- can point at the same database without noticing, and workspace membership
+-- and `/broadcast` are currently scoped by exactly the boundary that would
+-- silently widen.
+--
+-- Recording the owners does not decide whether sharing is allowed. It makes
+-- sharing VISIBLE, so a second owner appearing is a deliberate answer to a
+-- question rather than a discovery made later.
+create table if not exists borg_journal_owners (
+    fingerprint text        primary key,
+    display     text        not null,
+    first_seen  timestamptz not null default now(),
+    last_seen   timestamptz not null default now()
+);
+
 create table if not exists borg_session_schema (
     id      integer primary key generated always as identity check (id = 1),
     version bigint  not null
@@ -82,11 +101,29 @@ create table if not exists session_events (
     event_id         uuid        not null,
     event_kind       text        not null,
 
-    -- The event body, zstd-compressed against session_event_dicts.dict_id.
-    -- dict_id null means `event_body` is uncompressed UTF-8 JSON, which keeps
-    -- the store usable before any dictionary has been trained.
-    event_body       bytea       not null,
+    -- TWO-TIER BODY STORAGE. Exactly one of these is set per row.
+    --
+    -- HOT (event_json): readable jsonb, the default for live history. Agents
+    -- must be able to read their own and each other's journals and compose
+    -- ad-hoc SQL across the whole database, and there is no SQL-callable
+    -- zstd-with-dictionary decompressor in Postgres -- a compressed body is
+    -- opaque bytes to anything that is not Borg itself. jsonb keeps `->`,
+    -- `->>` and jsonb_path_ops indexing available, and Postgres still applies
+    -- TOAST/LZ4 underneath, so this is compressed, just not as far.
+    --
+    -- COLD (event_body + dict_id): zstd against a trained dictionary, reaching
+    -- a measured 4.41x where jsonb+TOAST measured 5,208 kB against 2,120 kB
+    -- for the same events. Reserved for aged-out history, where the 4.41x is
+    -- worth losing plain-SQL readability; nothing writes this tier yet.
+    -- dict_id null with event_body set means uncompressed UTF-8 JSON bytes.
+    --
+    -- Tiering is a per-row property, so a row can move hot -> cold later
+    -- without a schema change and without rewriting any other row.
+    event_json       jsonb,
+    event_body       bytea,
     dict_id          integer     references session_event_dicts (dict_id),
+    constraint session_events_body_present
+        check (event_json is not null or event_body is not null),
 
     -- Replayed, never searched, so plain text under ordinary TOAST rather than
     -- jsonb. Do NOT "optimise" this to jsonb: nothing queries inside it, and
@@ -148,6 +185,14 @@ create index if not exists idx_session_events_context_clear
     on session_events (session_id, sequence desc)
     where event_kind = 'context_cleared';
 
+-- Ad-hoc containment queries over readable bodies: the capability agents use
+-- to query their own and each other's history directly in SQL. jsonb_path_ops
+-- is chosen over the default opclass because it is substantially smaller and
+-- this index exists for `@>` containment, not for key-existence probes.
+create index if not exists idx_session_events_json
+    on session_events using gin (event_json jsonb_path_ops)
+    where event_json is not null;
+
 -- Checkpoint lookup: newest non-empty projection at or below a sequence.
 create index if not exists idx_session_events_projection
     on session_events (session_id, sequence desc)
@@ -191,6 +236,13 @@ create table if not exists session_event_search (
     event_kind text   not null,
     actor      text,
     body       text   not null,
+    -- `simple`, NOT `english`, and that is a compatibility requirement rather
+    -- than a default left unconsidered. The english configuration stems, so
+    -- "migration" and "migrate" collapse to one lexeme and a search for either
+    -- finds both. SQLite's FTS5 tokenizer does not stem, so adopting english
+    -- here would give the two backends different answers to the same query.
+    -- Every query in search.rs pins `simple` for the same reason; changing one
+    -- without the others silently breaks the index.
     body_tsv   tsvector generated always as (to_tsvector('simple', body)) stored,
     primary key (session_id, event_id)
 );
@@ -306,10 +358,26 @@ create table if not exists runtime_manifests (
     updated_at       timestamptz not null
 );
 
+-- `state_json` is text, NOT jsonb, and that is deliberate.
+--
+-- Every checkpoint carries `content_hash = sha256(state_json)`, verified on
+-- read, so a corrupted or truncated row is refused rather than replayed. That
+-- check is over the exact stored BYTES. jsonb does not store bytes: it parses
+-- to a normalised tree, reordering keys, dropping duplicates, discarding
+-- whitespace and renormalising numbers. Round-tripping through jsonb would
+-- therefore return text that differs from what was hashed, and the integrity
+-- check would fail on rows that are perfectly intact -- or, worse, would have
+-- to be weakened to a re-serialise-then-compare that no longer detects the
+-- corruption it exists to detect.
+--
+-- Keeping it text also makes the hash identical across both backends, which is
+-- what lets the conformance suite compare them directly. These rows are opaque
+-- runtime state fetched whole by key; nothing queries inside them, so jsonb
+-- would buy no indexing benefit to trade against this.
 create table if not exists runtime_checkpoints (
     session_id     uuid        not null references sessions (id) on delete cascade,
     checkpoint_key text        not null,
-    state_json     jsonb       not null,
+    state_json     text        not null,
     content_hash   text        not null,
     revision       bigint      not null,
     created_at     timestamptz not null,
@@ -319,3 +387,23 @@ create table if not exists runtime_checkpoints (
 
 create index if not exists idx_runtime_checkpoints_revision
     on runtime_checkpoints (session_id, revision desc);
+
+
+-- Readable history for humans and agents composing SQL by hand.
+--
+-- Hot rows expose their body directly. Cold rows surface as null bodies rather
+-- than being silently omitted, so a query cannot quietly under-report history:
+-- a null body means "compressed, ask Borg to decode it", not "no such event".
+create or replace view session_events_readable as
+select
+    e.session_id,
+    e.sequence,
+    e.event_id,
+    e.event_kind,
+    e.event_json                       as body,
+    e.event_json is null               as body_compressed,
+    e.message_id,
+    e.subagent_session_id,
+    e.provider_event_kind,
+    e.created_at
+from session_events e;

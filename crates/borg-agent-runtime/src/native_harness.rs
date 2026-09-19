@@ -1119,7 +1119,7 @@ struct NativeToolRuntimeConfig {
     external_mcp_servers: Vec<borg_provider::mcp::ExternalMcpServer>,
     extension_skill_roots: Vec<PathBuf>,
     execution_provider: Arc<dyn ExecutionProvider>,
-    session_store: Option<crate::SqliteSessionStore>,
+    session_store: Option<std::sync::Arc<dyn crate::SessionStore>>,
     harness: HarnessMode,
     command_environment: BTreeMap<String, String>,
     workflow_process_manager: crate::native_process::ProcessManager,
@@ -1133,7 +1133,7 @@ struct NativeToolRuntime {
     mcp: crate::native_mcp::NativeMcpRuntime,
     execution_provider: Arc<dyn ExecutionProvider>,
     workflow_process_manager: crate::native_process::ProcessManager,
-    session_store: Option<crate::SqliteSessionStore>,
+    session_store: Option<std::sync::Arc<dyn crate::SessionStore>>,
     context: crate::native_context::NativeContext,
     harness: HarnessMode,
     command_environment: BTreeMap<String, String>,
@@ -1348,7 +1348,10 @@ impl NativeToolRuntime {
             .session_store
             .clone()
             .context("durable session storage is unavailable to Blu workflows")?;
-        let autonomy = store.autonomy_store().await?;
+        let autonomy = store
+            .autonomy_store()
+            .await?
+            .context("durable autonomy storage is unavailable to Blu workflows")?;
         let permission = if workflow_approved {
             PermissionMode::FullAccess
         } else {
@@ -3510,6 +3513,7 @@ mod tests {
                     None,
                     None,
                     cwd.clone(),
+                    None,
                     None,
                     None,
                     Vec::new(),

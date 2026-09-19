@@ -14,14 +14,16 @@ use borg_provider::provider::{
     ClaudeAccountRateLimits, ClaudeRateLimitWindow, CodexAccountRateLimits, CodexRateLimitWindow,
     read_claude_account_rate_limits, read_codex_account_rate_limits,
 };
+#[cfg(test)]
+use borg_remote::SqliteSessionStore;
 use borg_remote::{
     AgentTurnExecutor, ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus,
     HostCommand, HostConfig, HostExecutionProfile, HostExecutorFactory, LaunchSession,
     LocalAgentSettings, LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus,
     PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, RecoveryParts, ResponseLanguage,
     SessionConfigAction, SessionEvent, SessionEventKind, SessionGoal, SessionState, SessionStatus,
-    SessionStore, SessionWriterLease, SpawnSubagent, SqliteSessionStore, SubagentAction,
-    SubagentSnapshot, SubagentStatus, TodoAction, default_host_config_path, enroll_host,
+    SessionStore, SessionWriterLease, SpawnSubagent, SubagentAction, SubagentSnapshot,
+    SubagentStatus, TodoAction, default_host_config_path, enroll_host,
     force_terminate_local_session_owner, local_session_owner_is_active,
     local_session_owner_uses_current_binary, login_provider, mirror_local_session,
     obsolete_local_session_owner_pid, probe_capabilities, probe_provider_admission_capabilities,
@@ -1345,12 +1347,24 @@ fn should_use_detached_session_host(args: &LocalAgentCliArgs) -> bool {
 // this must not take the global SQLite writer lock merely to re-verify a schema
 // that is already current: a busy journal would otherwise stall the menu behind
 // the writer wait.
-async fn open_local_session_store() -> Result<SqliteSessionStore> {
+async fn open_local_session_store() -> Result<Arc<dyn SessionStore>> {
     let sessions_dir = default_host_config_path()
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("sessions");
-    SqliteSessionStore::open_interactive(sessions_dir.join("sessions.sqlite3")).await
+    // Journal only: these callers read a single session's state to decide what
+    // the menu should show, and must not pay to build satellite tiers -- see
+    // `OpenSessionStore` for why resolving them is deferred.
+    Ok(Arc::clone(
+        borg_remote::session_store::factory::open(
+            &borg_remote::session_store::factory::SessionStoreConfig::from_env(
+                sessions_dir.join("sessions.sqlite3"),
+            )
+            .interactive(true),
+        )
+        .await?
+        .session(),
+    ))
 }
 
 async fn prepare_detached_session(args: &LocalAgentCliArgs) -> Result<Uuid> {
@@ -1360,7 +1374,7 @@ async fn prepare_detached_session(args: &LocalAgentCliArgs) -> Result<Uuid> {
         .join("sessions");
     let store = open_local_session_store().await?;
     let session_id = if let Some(session_id) = args.resume {
-        session_id_if_present(&store, session_id).await?
+        session_id_if_present(store.as_ref(), session_id).await?
     } else if args.continue_latest {
         let cwd = args
             .cwd
@@ -1368,7 +1382,7 @@ async fn prepare_detached_session(args: &LocalAgentCliArgs) -> Result<Uuid> {
             .unwrap_or_else(|| Path::new("."))
             .canonicalize()
             .context("current project directory does not exist")?;
-        latest_session_id_in_directory(&sessions_dir, &store, &cwd)
+        latest_session_id_in_directory(&sessions_dir, store.as_ref(), &cwd)
             .await?
             .context("there are no non-empty local Borg sessions to continue in this directory")?
     } else {
@@ -1676,18 +1690,23 @@ pub(crate) async fn print_local_workspaces(json: bool) -> Result<()> {
         .unwrap_or_else(|| Path::new("."))
         .join("sessions");
     let session_path = sessions_dir.join("sessions.sqlite3");
-    let workspaces = if session_path.is_file() {
-        let session_store = SqliteSessionStore::open(&session_path).await?;
-        let store = session_store
-            .workspace_store()
-            .await?
-            .context("canonical session database has no workspace projection")?;
+    let config = borg_remote::session_store::factory::SessionStoreConfig::from_env(&session_path);
+    // Listing workspaces must not CREATE a database. On SQLite that means
+    // skipping a journal that does not exist yet; a configured Postgres URL
+    // names a server that is expected to be there, so it is always consulted
+    // and a connection failure is reported rather than silently shown as "no
+    // workspaces".
+    let absent = config.backend() == borg_remote::session_store::factory::SessionBackend::Sqlite
+        && !session_path.is_file();
+    let workspaces = if absent {
+        Vec::new()
+    } else {
+        let resolved = borg_remote::session_store::factory::open_resolved(&config).await?;
         let display_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
-        store
+        resolved
+            .workspace()
             .list_workspaces_for_participant(borg_remote::local_human_participant_id(&display_name))
             .await?
-    } else {
-        Vec::new()
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&workspaces)?);
@@ -1990,11 +2009,17 @@ async fn run_local_agent_session(
         && args.session_host.is_none()
         && !BorgTerminal::fallback_requested();
     let store_open_started = std::time::Instant::now();
-    let sqlite_store = Arc::new(if interactive_store_open || args.session_host.is_some() {
-        SqliteSessionStore::open_interactive(sessions_dir.join("sessions.sqlite3")).await?
-    } else {
-        SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?
-    });
+    // The backend is chosen once, here, from BORG_SESSIONS_URL. The factory
+    // resolves every satellite tier up front and fails if one is missing, so a
+    // misconfigured backend is a startup error rather than a stall later on.
+    let opened = borg_remote::session_store::factory::open(
+        &borg_remote::session_store::factory::SessionStoreConfig::from_env(
+            sessions_dir.join("sessions.sqlite3"),
+        )
+        .interactive(interactive_store_open || args.session_host.is_some()),
+    )
+    .await?;
+    let sqlite_store = Arc::clone(opened.session());
     let store_open_ms = store_open_started.elapsed().as_millis() as u64;
     let session_id = if let Some(session_id) =
         selected_session.or(args.resume).or(args.session_host)
@@ -2044,7 +2069,12 @@ async fn run_local_agent_session(
             sqlite_store.create_session(session_id).await?;
         }
     }
-    let store: Arc<dyn SessionStore> = sqlite_store.clone();
+    // Past the ownership race: this process is running, so prove every tier is
+    // present before entering any loop that would otherwise retry a missing one
+    // forever. A host that exited above never reaches here, and so never takes
+    // the SQLite writer lock to build tiers it would not have used.
+    let resolved = opened.resolve().await?;
+    let store: Arc<dyn SessionStore> = Arc::clone(resolved.session());
     let mut session_state = store.state(session_id).await?;
     let suppress_terminal_live_tail = interactive_store_open
         && matches!(
@@ -4917,6 +4947,12 @@ async fn run_local_agent_session(
                             HostCommand::Broadcast { session_id, text },
                         );
                     }
+                    UiAction::BroadcastInstances { text } => {
+                        dispatch_ui_command(
+                            &ui_interaction_tx,
+                            HostCommand::BroadcastInstances { session_id, text },
+                        );
+                    }
                     UiAction::FlushPendingInput { target, prompt } => {
                         if let Some((message_id, text, attachments)) = prompt {
                             let command = target.map_or_else(
@@ -7766,7 +7802,7 @@ fn next_local_resume_retry_delay(delay: std::time::Duration) -> std::time::Durat
 
 async fn resolve_resume_target(
     sessions_dir: &Path,
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     current: Uuid,
     value: &str,
 ) -> Result<Uuid> {
@@ -7787,7 +7823,7 @@ async fn resolve_resume_target(
 
 async fn resolve_resume_switch(
     sessions_dir: &Path,
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     current: Uuid,
     value: &str,
     access: LocalSessionAccess,
@@ -7805,7 +7841,7 @@ async fn resolve_resume_switch(
 
 async fn latest_session_id_excluding(
     sessions_dir: &Path,
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     current: Uuid,
 ) -> Result<Option<Uuid>> {
     Ok(recent_session_ids(sessions_dir, store)
@@ -7814,7 +7850,7 @@ async fn latest_session_id_excluding(
         .find(|session| *session != current))
 }
 
-async fn recent_session_ids(sessions_dir: &Path, store: &SqliteSessionStore) -> Result<Vec<Uuid>> {
+async fn recent_session_ids(sessions_dir: &Path, store: &dyn SessionStore) -> Result<Vec<Uuid>> {
     fs::create_dir_all(sessions_dir)?;
     Ok(store
         .list_sessions(10_000)
@@ -7831,7 +7867,7 @@ fn session_has_resumable_activity(state: &borg_remote::SessionState) -> bool {
 
 async fn latest_session_id_in_directory(
     sessions_dir: &Path,
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     current_dir: &Path,
 ) -> Result<Option<Uuid>> {
     fs::create_dir_all(sessions_dir)?;
@@ -7852,7 +7888,7 @@ async fn latest_session_id_in_directory(
 
 async fn recent_session_options(
     sessions_dir: &Path,
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     current: Uuid,
     current_dir: &Path,
     limit: usize,
@@ -8541,7 +8577,7 @@ fn recent_child_history_after(inherited: u64, latest: u64) -> u64 {
 
 async fn recent_sessions_summary(
     sessions_dir: &Path,
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     current: Uuid,
     current_dir: &Path,
 ) -> Result<String> {
@@ -8563,7 +8599,7 @@ async fn recent_sessions_summary(
 
 async fn print_recent_sessions(
     sessions_dir: &Path,
-    store: &SqliteSessionStore,
+    store: &dyn SessionStore,
     current: Uuid,
     current_dir: &Path,
 ) -> Result<()> {
@@ -9091,7 +9127,7 @@ fn default_active_delivery(provider: CodingProvider, steer_active_turn: bool) ->
     }
 }
 
-async fn session_id_if_present(store: &SqliteSessionStore, session_id: Uuid) -> Result<Uuid> {
+async fn session_id_if_present(store: &dyn SessionStore, session_id: Uuid) -> Result<Uuid> {
     anyhow::ensure!(
         store.contains_session(session_id).await?,
         "local Borg session {session_id} does not exist"
@@ -9817,6 +9853,7 @@ fn remote_command_name(command: &HostCommand) -> &'static str {
         }
         HostCommand::RecallQueuedPrompt { .. } => "recall queued prompt",
         HostCommand::Broadcast { .. } => "team broadcast",
+        HostCommand::BroadcastInstances { .. } => "instance broadcast",
         HostCommand::FlushPendingInput { .. } => "flush pending input",
         HostCommand::Configure { .. } => "configure",
         HostCommand::Approve { .. } => "approval",

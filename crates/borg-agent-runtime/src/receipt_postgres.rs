@@ -8,16 +8,14 @@
 //! mutation or refuse a legitimate retry.
 
 use anyhow::{Context, Result, ensure};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::receipt::{
-    MAX_SQLITE_RECEIPT_TRANSITIONS, RECEIPT_STATE_STARTED, RECEIPT_STATE_TERMINAL,
-    RECEIPT_VERSION, ReceiptRecord, ReceiptState, ReceiptTransition, bounded_json_value,
-    validate_existing_request, validate_receipt_projection,
+    MAX_SQLITE_RECEIPT_TRANSITIONS, RECEIPT_STATE_STARTED, RECEIPT_STATE_TERMINAL, RECEIPT_VERSION,
+    ReceiptRecord, ReceiptState, ReceiptTransition, bounded_json_value, validate_existing_request,
+    validate_receipt_projection,
 };
 
 /// Receipt persistence and the host command queue, backed by PostgreSQL.
@@ -48,9 +46,7 @@ fn decode_transition(row: &PgRow) -> Result<ReceiptTransition> {
             .context("decode receipt transition request")?,
         response: row
             .try_get::<Option<String>, _>("response_json")?
-            .map(|value| {
-                serde_json::from_str(&value).context("decode receipt transition response")
-            })
+            .map(|value| serde_json::from_str(&value).context("decode receipt transition response"))
             .transpose()?,
     })
 }
@@ -157,15 +153,11 @@ impl PostgresReceiptStore {
     /// Returns a state rather than an error: "this record contradicts its own
     /// audit" is an answer the caller must act on (refuse the mutation), not a
     /// transport failure to retry.
-    pub async fn load<Request, Response>(
+    pub async fn load_value(
         &self,
         request_id: Uuid,
-        request: &Request,
-    ) -> Result<ReceiptState<Response>>
-    where
-        Request: Serialize,
-        Response: DeserializeOwned,
-    {
+        request: &serde_json::Value,
+    ) -> Result<ReceiptState<serde_json::Value>> {
         let request = bounded_json_value(request, "receipt request")?;
         let mut transaction = self.pool.begin().await?;
         let row = sqlx::query(
@@ -221,11 +213,10 @@ impl PostgresReceiptStore {
         } else {
             match record.state.as_str() {
                 RECEIPT_STATE_STARTED => ReceiptState::Started,
+                // As in the SQLite backend: hand back the stored body and let
+                // the generic wrapper decide whether it fits the caller's type.
                 RECEIPT_STATE_TERMINAL => match record.response {
-                    Some(response) => match serde_json::from_value(response) {
-                        Ok(response) => ReceiptState::Terminal(response),
-                        Err(_) => ReceiptState::Corrupt,
-                    },
+                    Some(response) => ReceiptState::Terminal(response),
                     None => ReceiptState::Corrupt,
                 },
                 _ => ReceiptState::Corrupt,
@@ -239,11 +230,7 @@ impl PostgresReceiptStore {
     ///
     /// Repeating the same intent is a no-op; repeating the id with a different
     /// request is refused, because the receipt is the mutation's identity.
-    pub async fn begin<Request: Serialize>(
-        &self,
-        request_id: Uuid,
-        request: &Request,
-    ) -> Result<()> {
+    pub async fn begin_value(&self, request_id: Uuid, request: &serde_json::Value) -> Result<()> {
         let request = bounded_json_value(request, "receipt request")?;
         let request_json = serde_json::to_string(&request)?;
         let mut transaction = self.pool.begin().await?;
@@ -277,16 +264,12 @@ impl PostgresReceiptStore {
 
     /// Publish the terminal response, keeping the intent transition as evidence
     /// that the mutation was authorised before it ran.
-    pub async fn finish<Request, Response>(
+    pub async fn finish_value(
         &self,
         request_id: Uuid,
-        request: &Request,
-        response: &Response,
-    ) -> Result<()>
-    where
-        Request: Serialize,
-        Response: Serialize,
-    {
+        request: &serde_json::Value,
+        response: &serde_json::Value,
+    ) -> Result<()> {
         let request = bounded_json_value(request, "receipt request")?;
         let response = bounded_json_value(response, "receipt response")?;
         let request_json = serde_json::to_string(&request)?;
@@ -359,7 +342,7 @@ impl PostgresReceiptStore {
         &self,
         host_id: Uuid,
         request_id: Uuid,
-        command: &impl Serialize,
+        command: &serde_json::Value,
     ) -> Result<()> {
         let command_json = serde_json::to_string(&bounded_json_value(command, "host operation")?)?;
         let command_json = command_json.as_str();
@@ -471,5 +454,61 @@ impl PostgresReceiptStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::receipt::ReceiptBackend for PostgresReceiptStore {
+    async fn load_value(
+        &self,
+        request_id: Uuid,
+        request: &serde_json::Value,
+    ) -> Result<ReceiptState<serde_json::Value>> {
+        Self::load_value(self, request_id, request).await
+    }
+
+    async fn begin_value(&self, request_id: Uuid, request: &serde_json::Value) -> Result<()> {
+        Self::begin_value(self, request_id, request).await
+    }
+
+    async fn finish_value(
+        &self,
+        request_id: Uuid,
+        request: &serde_json::Value,
+        response: &serde_json::Value,
+    ) -> Result<()> {
+        Self::finish_value(self, request_id, request, response).await
+    }
+
+    async fn enqueue_host_operation(
+        &self,
+        host_id: Uuid,
+        request_id: Uuid,
+        command: &serde_json::Value,
+    ) -> Result<()> {
+        Self::enqueue_host_operation(self, host_id, request_id, command).await
+    }
+
+    async fn next_host_operation(
+        &self,
+        host_id: Uuid,
+    ) -> Result<Option<(Uuid, serde_json::Value)>> {
+        Self::next_host_operation(self, host_id).await
+    }
+
+    async fn quarantine_host_operation(&self, host_id: Uuid, request_id: Uuid) -> Result<()> {
+        Self::quarantine_host_operation(self, host_id, request_id).await
+    }
+
+    async fn queued_host_operation(
+        &self,
+        host_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<Option<serde_json::Value>> {
+        Self::queued_host_operation(self, host_id, request_id).await
+    }
+
+    async fn finish_host_operation(&self, host_id: Uuid, request_id: Uuid) -> Result<()> {
+        Self::finish_host_operation(self, host_id, request_id).await
     }
 }

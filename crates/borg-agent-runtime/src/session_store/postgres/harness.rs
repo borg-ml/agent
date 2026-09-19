@@ -6,7 +6,7 @@
 //! owner can replay its own history. Everything here exists to make that
 //! decision once, durably, and never silently revise it.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
@@ -119,8 +119,7 @@ impl PostgresSessionStore {
                     .try_get::<Option<Uuid>, _>("parent_session_id")?
                     .is_none();
             let owner: Option<Uuid> = row.try_get("owner_session_id")?;
-            let native =
-                native_history || (empty_root && inherited.unwrap_or(owner.is_none()));
+            let native = native_history || (empty_root && inherited.unwrap_or(owner.is_none()));
             sqlx::query(
                 "insert into session_harness_routes (session_id, provider, native) \
                  values ($1, 'codex', $2) on conflict (session_id, provider) do nothing",
@@ -255,6 +254,57 @@ impl PostgresSessionStore {
         let native = Self::resolve_codex_harness(&mut transaction, session_id, None).await?;
         transaction.commit().await?;
         Ok(native)
+    }
+
+    /// Record which account last drove this session for `provider`.
+    ///
+    /// Refuses a Codex write when the session is pinned to the CLI route: the
+    /// account tag is also the signal `resolve_codex_harness` reads to decide a
+    /// route for an untagged session, so tagging a CLI-owned conversation would
+    /// later flip it to Borg's harness and strand a transcript only the CLI can
+    /// replay.
+    pub async fn record_model_access(
+        &self,
+        session_id: Uuid,
+        provider: crate::CodingProvider,
+        account_identity: &str,
+    ) -> Result<()> {
+        ensure!(
+            !account_identity.is_empty(),
+            "model account identity is empty"
+        );
+        let mut transaction = self.pool().begin().await?;
+        if provider == crate::CodingProvider::Codex {
+            let native: Option<bool> = sqlx::query_scalar(
+                "select native from session_harness_routes \
+                 where session_id = $1 and provider = 'codex'",
+            )
+            .bind(session_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            ensure!(
+                native != Some(false),
+                "this session retains its Codex compatibility route; \
+                 start a new session for Borg-owned execution"
+            );
+        }
+        let provider = serde_json::to_value(provider)?
+            .as_str()
+            .context("provider is not a string")?
+            .to_owned();
+        // This records the last selected access, not ownership of the session.
+        sqlx::query(
+            "insert into session_model_access (session_id, provider, account_identity) \
+             values ($1, $2, $3) on conflict (session_id, provider) \
+             do update set account_identity = excluded.account_identity",
+        )
+        .bind(session_id)
+        .bind(&provider)
+        .bind(account_identity)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     /// Give `session_id` the same routes as `source_session_id`.

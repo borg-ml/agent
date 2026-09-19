@@ -214,7 +214,9 @@ async fn probe() -> Result<()> {
                 .consult(ConsultationRequest {
                     access: ModelAccessContext {
                         session_id,
-                        store: Some(store.clone()),
+                        store: Some(
+                            std::sync::Arc::new(store.clone()) as std::sync::Arc<dyn SessionStore>
+                        ),
                     },
                     message_id: Uuid::new_v4(),
                     provider: CodingProvider::Codex,

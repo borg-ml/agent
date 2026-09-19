@@ -28,9 +28,9 @@ use crate::{
     HostCommand, HostResourceLimits, LaunchSession, MessageStatus, ModelGoalStatus,
     NewWorkspaceMessage, PromptDelivery, Provenance, SessionConsultationTools, SessionEvent,
     SessionEventKind, SessionGoalToolRequest, SessionGoalTools, SessionStatus, SessionStore,
-    SessionTodoToolRequest, SessionTodoTools, SharedWork, SqliteWorkspaceStore, StructuredMention,
-    TodoItemUpdate, WorkDependency, WorkReview, WorkspaceArtifact, WorkspaceDecision,
-    WorkspaceEvent, WorkspaceEventKind, WorkspaceFilesystemOperation, WorkspaceFilesystemOutcome,
+    SessionTodoToolRequest, SessionTodoTools, SharedWork, StructuredMention, TodoItemUpdate,
+    WorkDependency, WorkReview, WorkspaceArtifact, WorkspaceDecision, WorkspaceEvent,
+    WorkspaceEventKind, WorkspaceFilesystemOperation, WorkspaceFilesystemOutcome,
     WorkspaceFilesystemRequest, WorkspaceMessageReceipt, WorkspaceReference,
     WorkspaceReviewRequest, WorkspaceStore,
 };
@@ -179,8 +179,8 @@ struct BluWorkflowToolContext {
     permission: crate::PermissionMode,
     snapshot: Arc<dyn Fn() -> Vec<crate::BluWorkflowDefinition> + Send + Sync>,
     processes: crate::native_process::ProcessManager,
-    store: crate::SqliteSessionStore,
-    autonomy: crate::SqliteAutonomyStore,
+    store: Arc<dyn crate::SessionStore>,
+    autonomy: Arc<dyn crate::autonomy::AutonomyStore>,
 }
 
 /// One provider-neutral model-tool dispatcher for durable goals and child
@@ -201,7 +201,11 @@ pub struct AgentToolDispatcher {
     consultation_enabled: bool,
     team_policy: Option<crate::TeamPolicy>,
     self_service: crate::self_service::SelfServiceContext,
-    autonomy: Option<crate::SqliteAutonomyStore>,
+    autonomy: Option<Arc<dyn crate::autonomy::AutonomyStore>>,
+    /// The journal itself. Held directly rather than derived from `autonomy`:
+    /// the two tiers share a database but are separate authorities, and
+    /// reaching one through the other tied every holder to a concrete backend.
+    journal: Option<Arc<dyn crate::SessionStore>>,
     provider_capabilities: Vec<crate::ProviderCapability>,
     blu_workflows: Option<BluWorkflowToolContext>,
     extension_workflows: Arc<RwLock<Vec<crate::BluWorkflowDefinition>>>,
@@ -295,14 +299,14 @@ pub struct AgentToolServer {
 
 #[derive(Clone)]
 pub(crate) struct SharedWorkToolContext {
-    store: SqliteWorkspaceStore,
+    store: Arc<dyn WorkspaceStore>,
     workspace_id: Uuid,
     participant_id: Uuid,
 }
 
 impl SharedWorkToolContext {
     pub(crate) fn new(
-        store: SqliteWorkspaceStore,
+        store: Arc<dyn WorkspaceStore>,
         workspace_id: Uuid,
         participant_id: Uuid,
     ) -> Self {
@@ -667,7 +671,8 @@ impl AgentToolDispatcher {
         team_policy: Option<crate::TeamPolicy>,
         cwd: PathBuf,
         consultation: Option<SessionConsultationTools>,
-        autonomy: Option<crate::SqliteAutonomyStore>,
+        autonomy: Option<Arc<dyn crate::autonomy::AutonomyStore>>,
+        journal: Option<Arc<dyn crate::SessionStore>>,
         provider_capabilities: Vec<crate::ProviderCapability>,
         workflow_snapshot: Option<Arc<dyn Fn() -> Vec<crate::BluWorkflowDefinition> + Send + Sync>>,
         workflow_processes: crate::native_process::ProcessManager,
@@ -686,6 +691,7 @@ impl AgentToolDispatcher {
             cwd,
             consultation,
             autonomy,
+            journal,
             provider_capabilities,
             workflow_snapshot,
             workflow_processes,
@@ -707,7 +713,8 @@ impl AgentToolDispatcher {
         team_policy: Option<crate::TeamPolicy>,
         cwd: PathBuf,
         consultation: Option<SessionConsultationTools>,
-        autonomy: Option<crate::SqliteAutonomyStore>,
+        autonomy: Option<Arc<dyn crate::autonomy::AutonomyStore>>,
+        journal: Option<Arc<dyn crate::SessionStore>>,
         provider_capabilities: Vec<crate::ProviderCapability>,
         workflow_snapshot: Option<Arc<dyn Fn() -> Vec<crate::BluWorkflowDefinition> + Send + Sync>>,
         workflow_processes: crate::native_process::ProcessManager,
@@ -728,9 +735,13 @@ impl AgentToolDispatcher {
                 .unwrap_or_default(),
         ));
         let workflow_state = Arc::clone(&extension_workflows);
+        // A Blu workflow needs all three: a definition source, the autonomy
+        // tier to journal its job, and the session journal itself. Missing any
+        // one of them means workflows are simply unavailable, not degraded.
         let blu_workflows = workflow_snapshot
             .zip(autonomy.clone())
-            .map(|(_snapshot, autonomy)| BluWorkflowToolContext {
+            .zip(journal.clone())
+            .map(|((_snapshot, autonomy), journal)| BluWorkflowToolContext {
                 session_id: actor_session_id,
                 root: cwd.clone(),
                 permission,
@@ -741,11 +752,12 @@ impl AgentToolDispatcher {
                         .clone()
                 }),
                 processes: workflow_processes,
-                store: autonomy.session_store(),
+                store: journal,
                 autonomy,
             });
         Self {
             watches: None,
+            journal,
             goals,
             todos,
             consultation,
@@ -946,10 +958,15 @@ impl AgentToolDispatcher {
             .collect()
     }
 
-    pub(crate) fn session_store(&self) -> Option<crate::SqliteSessionStore> {
-        self.autonomy
-            .as_ref()
-            .map(crate::SqliteAutonomyStore::session_store)
+    /// The durable journal, as a trait object.
+    ///
+    /// Derived from the autonomy tier because both live on the same pool, and
+    /// the dispatcher is handed the autonomy store rather than the journal.
+    /// That coupling is incidental and due to be removed; returning `dyn
+    /// SessionStore` here is what stops it spreading a concrete backend into
+    /// every caller in the meantime.
+    pub(crate) fn session_store(&self) -> Option<Arc<dyn crate::SessionStore>> {
+        self.journal.clone()
     }
 
     pub(crate) async fn harness_prompt_appendix(&self) -> Result<String> {
@@ -957,7 +974,7 @@ impl AgentToolDispatcher {
         let mut appendix = crate::harness::prompt_appendix(
             self.actor_session_id,
             &self.runtime_root,
-            store.as_ref(),
+            store.as_deref(),
             &self.harness_lock,
         )
         .await?;
@@ -1600,7 +1617,7 @@ impl AgentToolDispatcher {
                 let store = self
                     .session_store()
                     .context("lossless session history is unavailable for this session")?;
-                history_index_response(&store, self.actor_session_id, args).await
+                history_index_response(store.as_ref(), self.actor_session_id, args).await
             }
             "get_goal" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
@@ -1768,7 +1785,7 @@ impl AgentToolDispatcher {
                     .autonomy
                     .as_ref()
                     .context("durable autonomous runtime is unavailable")?;
-                call_autonomy_tool(store, self.actor_session_id, name, arguments).await
+                call_autonomy_tool(store.as_ref(), self.actor_session_id, name, arguments).await
             }
             _ => {
                 if !self.subagents_enabled {
@@ -1973,7 +1990,7 @@ struct DispatcherRuntimeHost {
     dispatcher: AgentToolDispatcher,
     execution_provider: Arc<dyn crate::ExecutionProvider>,
     host_calls: Arc<AtomicUsize>,
-    session_store: Option<crate::SqliteSessionStore>,
+    session_store: Option<std::sync::Arc<dyn crate::SessionStore>>,
     runtime_worker_id: Uuid,
     process_cancellation: CancellationToken,
 }
@@ -2123,21 +2140,26 @@ impl RuntimeHost for DispatcherRuntimeHost {
                     .session_store
                     .as_ref()
                     .context("lossless session history is unavailable for this runtime")?;
-                history_index_response(store, self.session_id, args).await
+                history_index_response(store.as_ref(), self.session_id, args).await
             }
             "plugin_store" => {
                 let is_mutation = arguments.get("op").and_then(Value::as_str) == Some("commit");
                 if is_mutation {
                     self.ensure_effects()?;
                 }
-                let store = self
+                let backend = self
                     .session_store
                     .as_ref()
                     .context("extension storage is unavailable for this session")?
-                    .plugin_store();
-                store
-                    .call(self.session_id, &self.root, None, arguments)
-                    .await
+                    .plugin_backend();
+                crate::plugin_store::call(
+                    backend.as_ref(),
+                    self.session_id,
+                    &self.root,
+                    None,
+                    arguments,
+                )
+                .await
             }
             "retrieval_adapter" => {
                 let id = arguments
@@ -2153,7 +2175,7 @@ impl RuntimeHost for DispatcherRuntimeHost {
                     arguments,
                     self.session_id,
                     &self.root,
-                    self.session_store.as_ref(),
+                    self.session_store.as_deref(),
                     &self.dispatcher.harness_lock,
                     self.allow_effects,
                 )
@@ -2217,7 +2239,7 @@ impl RuntimeHost for DispatcherRuntimeHost {
 }
 
 pub(crate) async fn history_index_response(
-    store: &crate::SqliteSessionStore,
+    store: &dyn crate::SessionStore,
     session_id: Uuid,
     args: HistoryIndexArgs,
 ) -> Result<Value> {
@@ -2646,7 +2668,7 @@ pub struct SubagentCoordinator {
     root_launch: LaunchSession,
     executor: Arc<dyn crate::AgentTurnExecutor>,
     store: Arc<dyn SessionStore>,
-    workspace_store: Arc<OnceCell<SqliteWorkspaceStore>>,
+    workspace_store: Arc<OnceCell<Arc<dyn WorkspaceStore>>>,
     table: Arc<Mutex<SubagentTable>>,
     activity_tx: broadcast::Sender<SubagentActivity>,
     root_inbox: Arc<Mutex<Vec<TeamInboxMessage>>>,
@@ -2752,7 +2774,7 @@ impl SubagentCoordinator {
         }
     }
 
-    async fn workspace_store(&self) -> Result<&SqliteWorkspaceStore> {
+    async fn workspace_store(&self) -> Result<&Arc<dyn WorkspaceStore>> {
         self.workspace_store
             .get_or_try_init(|| async {
                 self.store.workspace_store().await?.with_context(
@@ -4435,6 +4457,87 @@ impl SubagentCoordinator {
 
     /// Send a team-attributed message. Child reports addressed to `/root` use
     /// the wake path; sibling and child messages remain next-turn queue work.
+    /// Deliver one message to every Borg instance running on this machine.
+    ///
+    /// This is the reach `/team` deliberately does not have: `/team` addresses
+    /// the in-memory team table (this session's subagents plus its root),
+    /// while this walks the durable instance registry and routes to each live
+    /// local peer independently.
+    ///
+    /// Scope is local on purpose. Remote directory entries are skipped even
+    /// when the relay knows them, because a machine-wide broadcast must not
+    /// silently become a cross-account one; that decision stays explicit.
+    pub async fn broadcast_local_instances_as(
+        &self,
+        actor_session_id: Uuid,
+        message: &str,
+    ) -> Result<BroadcastReach> {
+        let message = required_message(message)?;
+        let workspace_store = self.workspace_store().await?;
+        let mut delivered = Vec::new();
+        let mut failed = Vec::new();
+        let mut skipped = 0usize;
+        let mut reap = Vec::new();
+        for instance in workspace_store.list_instances(false).await? {
+            let participant_id = instance.participant.id;
+            if participant_id == actor_session_id {
+                continue;
+            }
+            // Local means "has a binding in this installation's store". A
+            // remote-directory row has no local session to deliver to.
+            if self
+                .store
+                .workspace_binding(participant_id)
+                .await?
+                .is_none()
+            {
+                continue;
+            }
+            let socket_path =
+                crate::session_control_socket_path(&self.journal_root, participant_id);
+            if !crate::session_control_socket_is_reachable(&socket_path).await {
+                // Unreachable peers are counted, not queued: a broadcast that
+                // silently piles up in dead inboxes is worse than one that
+                // reports its own reach. Rows whose owner is gone for good are
+                // tombstoned here as well, so repeated broadcasts converge on
+                // the live set instead of re-probing years of dead sessions.
+                if !crate::local_session_owner_is_active(&self.journal_root, participant_id)
+                    .unwrap_or(false)
+                {
+                    reap.push(participant_id);
+                }
+                skipped += 1;
+                continue;
+            }
+            let target = format!("participant:{participant_id}");
+            match self
+                .send_message_with_options_as(
+                    actor_session_id,
+                    &target,
+                    &message,
+                    TeamMessageOptions::default(),
+                )
+                .await
+            {
+                Ok(()) => delivered.push(participant_id),
+                Err(error) => {
+                    tracing::warn!(%participant_id, %error, "instance broadcast delivery failed");
+                    failed.push(participant_id);
+                }
+            }
+        }
+        if !reap.is_empty()
+            && let Err(error) = workspace_store.mark_local_instances_exited(&reap).await
+        {
+            tracing::warn!(%error, "could not reap exited local instances during broadcast");
+        }
+        Ok(BroadcastReach {
+            delivered,
+            failed,
+            skipped_unreachable: skipped,
+        })
+    }
+
     pub async fn send_message_as(
         &self,
         actor_session_id: Uuid,
@@ -5110,10 +5213,37 @@ impl SubagentCoordinator {
                     .as_deref()
                     .map(str::trim)
                     .filter(|query| !query.is_empty());
+                let cwd_filter = args
+                    .cwd
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|cwd| !cwd.is_empty());
                 let workspace_store = self.workspace_store().await?;
-                let mut instances = Vec::new();
+                let mut candidates = Vec::new();
                 let mut newest_seen = None;
-                for mut instance in workspace_store.list_instances().await? {
+                // Cheap, purely row-local filtering first. Liveness used to be
+                // probed for every row before anything was discarded, so a
+                // listing cost one binding query plus a socket connect per
+                // historical participant to return a page of results.
+                for instance in workspace_store.list_instances(args.include_exited).await? {
+                    // host_id is deliberately NOT filtered here: a local row
+                    // takes its host from the session binding resolved below,
+                    // so matching the raw column would drop every local
+                    // instance the caller asked for by host.
+                    if query.is_some_and(|query| !instance_matches_query(&instance, query)) {
+                        continue;
+                    }
+                    if cwd_filter.is_some_and(|cwd| instance.cwd.as_deref() != Some(cwd)) {
+                        continue;
+                    }
+                    if instance.exited_at.is_some() && !args.include_exited {
+                        continue;
+                    }
+                    candidates.push(instance);
+                }
+                let mut instances = Vec::new();
+                let mut reap = Vec::new();
+                for mut instance in candidates {
                     let binding = self
                         .store
                         .workspace_binding(instance.participant.id)
@@ -5127,9 +5257,6 @@ impl SubagentCoordinator {
                         .host_id
                         .is_some_and(|host_id| instance.host_id != Some(host_id))
                     {
-                        continue;
-                    }
-                    if query.is_some_and(|query| !instance_matches_query(&instance, query)) {
                         continue;
                     }
                     if !local {
@@ -5159,17 +5286,40 @@ impl SubagentCoordinator {
                             instance.participant.id,
                         )
                         .unwrap_or(false);
+                    // A local row whose owner is gone is dead for good: nothing
+                    // reanimates that participant id. Tombstone it so the table
+                    // stops growing without bound.
+                    if local
+                        && !live
+                        && !owner_running
+                        && instance.exited_at.is_none()
+                        && instance.participant.id != actor_session_id
+                    {
+                        reap.push(instance.participant.id);
+                    }
+                    if args.live && !live {
+                        continue;
+                    }
+                    if args.running && !owner_running {
+                        continue;
+                    }
                     let workspace_name = match instance.workspace_id {
                         Some(workspace_id) => workspace_store.workspace_name(workspace_id).await?,
                         None => None,
                     };
                     let seen_at = instance.seen_at;
+                    let created_at = instance.participant.created_at;
                     let mut entry = serde_json::to_value(instance)?;
                     entry["local"] = json!(local);
                     entry["live"] = json!(live);
                     entry["owner_running"] = json!(owner_running);
                     entry["workspace_name"] = json!(workspace_name);
-                    instances.push((local, seen_at, entry));
+                    instances.push((local, live, owner_running, seen_at, created_at, entry));
+                }
+                if !reap.is_empty()
+                    && let Err(error) = workspace_store.mark_local_instances_exited(&reap).await
+                {
+                    tracing::warn!(%error, "could not reap exited local instances");
                 }
                 let stale_before = newest_seen.map(|newest| newest - STALE_INSTANCE_GRACE);
                 let is_stale = |local: bool, seen_at: Option<DateTime<Utc>>| {
@@ -5181,21 +5331,36 @@ impl SubagentCoordinator {
                     0
                 } else {
                     let before = instances.len();
-                    instances.retain(|(local, seen_at, _)| !is_stale(*local, *seen_at));
+                    instances.retain(|(local, _, _, seen_at, _, _)| !is_stale(*local, *seen_at));
                     before - instances.len()
                 };
-                let mut instances = instances
+                // Rank by what the caller actually asked about. Sorting by
+                // recency alone used to bury a long-running instance under
+                // newer dead rows, so a truncated page could contain no
+                // reachable peer at all while claiming to be "newest first".
+                instances.sort_by(|left, right| {
+                    let rank = |(local, live, running, _, _, _): &(
+                        bool,
+                        bool,
+                        bool,
+                        Option<DateTime<Utc>>,
+                        DateTime<Utc>,
+                        serde_json::Value,
+                    )| { (*live, *running, *local) };
+                    rank(right)
+                        .cmp(&rank(left))
+                        .then_with(|| right.4.cmp(&left.4))
+                });
+                let total = instances.len();
+                let limit = args.limit.unwrap_or(DEFAULT_INSTANCE_LIMIT).max(1);
+                instances.truncate(limit);
+                let instances = instances
                     .into_iter()
-                    .map(|(local, seen_at, mut entry)| {
+                    .map(|(local, _, _, seen_at, _, mut entry)| {
                         entry["stale"] = json!(is_stale(local, seen_at));
                         entry
                     })
                     .collect::<Vec<_>>();
-                // Newest first so a truncated listing keeps the live instances.
-                instances.reverse();
-                let total = instances.len();
-                let limit = args.limit.unwrap_or(DEFAULT_INSTANCE_LIMIT).max(1);
-                instances.truncate(limit);
                 let participant_id = self
                     .store
                     .workspace_binding(actor_session_id)
@@ -5207,6 +5372,7 @@ impl SubagentCoordinator {
                     "total": total,
                     "truncated": total > instances.len(),
                     "hidden_stale": hidden_stale,
+                    "reaped": reap.len(),
                     "instances": instances,
                 }))
             }
@@ -5504,12 +5670,16 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "list_instances",
-            "Discover Borg agent instances across all local workspaces and the authenticated remote instance directory. Each entry reports local/live (a local session with an open control socket), seen_at (last local registration or directory sync), workspace_name and stale; stale remote entries are hidden unless include_stale is set. Returns newest first; filter with query/host_id and raise limit when needed. Use participant:<id> with send_message or followup_task. Remote entries require an enrolled host relay and may be offline; discovery does not grant project access.",
+            "Discover Borg agent instances across all local workspaces and the authenticated remote instance directory. Each entry reports local/live (a local session with an open control socket), owner_running, cwd and pid for local instances, seen_at, workspace_name and stale; stale remote entries are hidden unless include_stale is set. Results are ranked live, then running, then local, then newest, so a truncated page keeps the reachable peers rather than the most recently created rows. Prefer live:true or running:true over paging, and cwd to pick one of several sessions in the same checkout - display_name is only the workspace basename and does not distinguish them. Local rows whose owner is gone are reaped as they are observed and reported in `reaped`. Use participant:<id> with send_message or followup_task. Remote entries require an enrolled host relay and may be offline; discovery does not grant project access.",
             json!({"type":"object","properties":{
                 "query":{"type":"string","description":"Case-insensitive display-name substring or participant id prefix."},
                 "host_id":{"type":"string","description":"Only instances on this host UUID."},
-                "limit":{"type":"integer","minimum":1,"description":"Maximum entries, newest first (default 100)."},
-                "include_stale":{"type":"boolean","description":"Also list remote instances the directory stopped reporting."}
+                "limit":{"type":"integer","minimum":1,"description":"Maximum entries (default 100), ranked live/running/local first."},
+                "include_stale":{"type":"boolean","description":"Also list remote instances the directory stopped reporting."},
+                "live":{"type":"boolean","description":"Only instances answering on their control socket right now."},
+                "running":{"type":"boolean","description":"Only instances whose owning process is still alive, reachable or not."},
+                "cwd":{"type":"string","description":"Only instances launched against this exact working directory."},
+                "include_exited":{"type":"boolean","description":"Also list local instances already reaped as exited."}
             },"additionalProperties":false}),
         ),
         message_tool(
@@ -6556,6 +6726,18 @@ struct ListInstancesArgs {
     limit: Option<usize>,
     #[serde(default)]
     include_stale: bool,
+    /// Only instances reachable on their control socket right now.
+    #[serde(default)]
+    live: bool,
+    /// Only instances whose owning process is still alive, reachable or not.
+    #[serde(default)]
+    running: bool,
+    /// Only instances launched against this working directory.
+    #[serde(default)]
+    cwd: Option<String>,
+    /// Include local instances already reaped as exited.
+    #[serde(default)]
+    include_exited: bool,
 }
 
 /// Remote entries absent from the directory for this long after the newest
@@ -6989,7 +7171,7 @@ fn autonomy_tool_specs() -> Vec<Value> {
 }
 
 async fn owned_runtime_job(
-    store: &crate::SqliteAutonomyStore,
+    store: &dyn crate::autonomy::AutonomyStore,
     session_id: Uuid,
     job_id: Uuid,
 ) -> Result<crate::AutonomyJob> {
@@ -7005,7 +7187,7 @@ async fn owned_runtime_job(
 }
 
 async fn call_autonomy_tool(
-    store: &crate::SqliteAutonomyStore,
+    store: &dyn crate::autonomy::AutonomyStore,
     session_id: Uuid,
     name: &str,
     arguments: Value,
@@ -7246,6 +7428,15 @@ fn parse_remote_message_target(target: &str) -> Result<(Uuid, bool)> {
                  a local session, or participant:<UUID> from list_instances"
             )
         })
+}
+
+/// Who a machine-wide broadcast actually reached.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BroadcastReach {
+    pub delivered: Vec<Uuid>,
+    pub failed: Vec<Uuid>,
+    /// Local instances whose control socket did not answer.
+    pub skipped_unreachable: usize,
 }
 
 fn routed_message_json(routed: RoutedTeamMessage, accepted_field: &str) -> Value {

@@ -12,10 +12,7 @@ use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{
-    RuntimeProcessStatus, RuntimeProcessStream, SessionEvent, SessionEventKind, SessionStore,
-    SqliteSessionStore,
-};
+use crate::{RuntimeProcessStatus, RuntimeProcessStream, SessionEvent, SessionEventKind};
 
 const MAX_ACTIVE_PROCESSES: usize = 8;
 const CAPTURE_BYTES: usize = 512 * 1024;
@@ -140,7 +137,7 @@ impl ProcessManager {
         yield_time_ms: Option<u64>,
         max_output_tokens: Option<usize>,
         timeout_ms: u64,
-        journal: Option<SqliteSessionStore>,
+        journal: Option<std::sync::Arc<dyn crate::SessionStore>>,
     ) -> Result<ProcessSnapshot> {
         self.exec_with_environment(
             owner_session_id,
@@ -167,7 +164,7 @@ impl ProcessManager {
         yield_time_ms: Option<u64>,
         max_output_tokens: Option<usize>,
         timeout_ms: u64,
-        journal: Option<SqliteSessionStore>,
+        journal: Option<std::sync::Arc<dyn crate::SessionStore>>,
         environment: &BTreeMap<String, String>,
     ) -> Result<ProcessSnapshot> {
         self.exec_with_cancel_and_environment(
@@ -195,7 +192,7 @@ impl ProcessManager {
         yield_time_ms: Option<u64>,
         max_output_tokens: Option<usize>,
         timeout_ms: u64,
-        journal: Option<SqliteSessionStore>,
+        journal: Option<std::sync::Arc<dyn crate::SessionStore>>,
         cancel: CancellationToken,
     ) -> Result<ProcessSnapshot> {
         self.exec_with_cancel_and_environment(
@@ -223,7 +220,7 @@ impl ProcessManager {
         yield_time_ms: Option<u64>,
         max_output_tokens: Option<usize>,
         timeout_ms: u64,
-        journal: Option<SqliteSessionStore>,
+        journal: Option<std::sync::Arc<dyn crate::SessionStore>>,
         cancel: CancellationToken,
         environment: &BTreeMap<String, String>,
     ) -> Result<ProcessSnapshot> {
@@ -305,7 +302,7 @@ impl ProcessManager {
 
         if let Some(store) = journal.as_ref()
             && let Err(error) = append_runtime_event(
-                store,
+                store.as_ref(),
                 owner_session_id,
                 SessionEventKind::RuntimeProcessStarted {
                     process_id,
@@ -518,7 +515,7 @@ impl ProcessManager {
     pub(crate) async fn recover_session(
         &self,
         session_id: Uuid,
-        store: SqliteSessionStore,
+        store: std::sync::Arc<dyn crate::SessionStore>,
     ) -> Result<()> {
         {
             let mut recovered = self
@@ -545,7 +542,7 @@ impl ProcessManager {
     async fn recover_session_inner(
         &self,
         session_id: Uuid,
-        store: SqliteSessionStore,
+        store: std::sync::Arc<dyn crate::SessionStore>,
     ) -> Result<()> {
         let processes = replay_process_events(&store.read(session_id).await?);
         for process in processes.into_values().filter(|process| !process.completed) {
@@ -560,7 +557,7 @@ impl ProcessManager {
             let (stderr, stderr_omitted_bytes) =
                 process.output.stderr.render(JOURNAL_OUTPUT_TOKENS);
             append_runtime_completed(
-                &store,
+                store.as_ref(),
                 session_id,
                 process.process_id,
                 process.pid,
@@ -740,7 +737,7 @@ fn runtime_process_status(status: &ProcessStatus) -> RuntimeProcessStatus {
 }
 
 async fn append_runtime_event(
-    store: &SqliteSessionStore,
+    store: &dyn crate::SessionStore,
     session_id: Uuid,
     kind: SessionEventKind,
 ) -> Result<SessionEvent> {
@@ -749,7 +746,7 @@ async fn append_runtime_event(
 
 #[allow(clippy::too_many_arguments)]
 async fn append_runtime_completed(
-    store: &SqliteSessionStore,
+    store: &dyn crate::SessionStore,
     session_id: Uuid,
     process_id: Uuid,
     pid: u32,
@@ -870,7 +867,7 @@ async fn read_pipe<R>(
     mut reader: R,
     entry: Arc<ProcessEntry>,
     stream: OutputStream,
-    journal: Option<SqliteSessionStore>,
+    journal: Option<std::sync::Arc<dyn crate::SessionStore>>,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -920,7 +917,7 @@ async fn read_pipe<R>(
                 };
                 if let (Some(store), Some((stream, chunk))) = (journal.as_ref(), journal_chunk)
                     && let Err(error) = append_runtime_event(
-                        store,
+                        store.as_ref(),
                         entry.session_id,
                         SessionEventKind::RuntimeProcessOutput {
                             process_id: entry.process_id,
@@ -964,7 +961,7 @@ async fn supervise_process(
     timeout: Duration,
     stdout_task: tokio::task::JoinHandle<()>,
     stderr_task: tokio::task::JoinHandle<()>,
-    journal: Option<SqliteSessionStore>,
+    journal: Option<std::sync::Arc<dyn crate::SessionStore>>,
 ) {
     let complete = async {
         let result = child.wait().await;
@@ -1013,7 +1010,7 @@ async fn supervise_process(
         let (stdout, stdout_omitted_bytes) = snapshot_output(&entry, JOURNAL_OUTPUT_TOKENS, true);
         let (stderr, stderr_omitted_bytes) = snapshot_output(&entry, JOURNAL_OUTPUT_TOKENS, false);
         append_runtime_completed(
-            store,
+            store.as_ref(),
             entry.session_id,
             entry.process_id,
             entry.pid,
@@ -1185,6 +1182,8 @@ fn terminate_process_tree_now(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{SessionStore, SqliteSessionStore};
+    use std::sync::Arc;
 
     #[test]
     fn head_tail_output_preserves_the_failure_tail() {
@@ -1367,7 +1366,7 @@ mod tests {
                     Some(1),
                     Some(100),
                     60_000,
-                    Some(store.clone()),
+                    Some(Arc::new(store.clone()) as Arc<dyn SessionStore>),
                 )
                 .await
                 .unwrap();
@@ -1451,7 +1450,7 @@ mod tests {
                 Some(1),
                 Some(100),
                 60_000,
-                Some(store.clone()),
+                Some(Arc::new(store.clone()) as Arc<dyn SessionStore>),
                 cancel.clone(),
             )
             .await
@@ -1513,7 +1512,7 @@ mod tests {
                     Some(30_000),
                     Some(100),
                     60_000,
-                    Some(store),
+                    Some(Arc::new(store) as Arc<dyn SessionStore>),
                 )
                 .await
         });
@@ -1567,7 +1566,7 @@ mod tests {
                         Some(30_000),
                         Some(100),
                         60_000,
-                        Some(task_store),
+                        Some(Arc::new(task_store) as Arc<dyn SessionStore>),
                         task_cancel,
                     )
                     .await
@@ -1712,7 +1711,7 @@ mod tests {
                 Some(2_000),
                 Some(1_000),
                 10_000,
-                Some(store.clone()),
+                Some(Arc::new(store.clone()) as Arc<dyn SessionStore>),
             )
             .await
             .expect("command");
@@ -1765,7 +1764,7 @@ mod tests {
                     Some(1),
                     Some(100),
                     10_000,
-                    Some(store.clone()),
+                    Some(Arc::new(store.clone()) as Arc<dyn SessionStore>),
                 )
                 .await
                 .unwrap();
@@ -1904,11 +1903,11 @@ mod tests {
 
         let manager = ProcessManager::default();
         manager
-            .recover_session(session_id, store.clone())
+            .recover_session(session_id, Arc::new(store.clone()) as Arc<dyn SessionStore>)
             .await
             .expect("recover");
         manager
-            .recover_session(session_id, store.clone())
+            .recover_session(session_id, Arc::new(store.clone()) as Arc<dyn SessionStore>)
             .await
             .expect("repeat recovery");
 

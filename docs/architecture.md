@@ -99,12 +99,12 @@ account-scoped, not the authority for session identity.
 ```mermaid
 flowchart LR
     Events["Session events"] --> Classify["EventPersistence"]
-    Classify -->|"durable"| Journal[("Canonical SQLite WAL journal [D3]")]
+    Classify -->|"durable"| Journal[("Canonical WAL journal [D3]<br/>SQLite or PostgreSQL")]
     Classify -->|"coalesced"| Live["Latest live-state projection"]
     Classify -->|"ephemeral"| Stream["Live delivery only"]
     Journal --> Recovery["SessionState / resume / fork / retry"]
     Journal --> Context["Model context projection<br/>compaction + recent evidence"]
-    Journal --> Search["FTS5 / history index<br/>resolve hits to canonical events"]
+    Journal --> Search["FTS5 or tsvector / history index<br/>resolve hits to canonical events"]
     Journal <-->|"transactional writes"| Actions[("Action lifecycle / idempotency")]
     Related[("Related durable state<br/>goals, plans, team policy, jobs,<br/>receipts, relay cursors")] --- Actions
     Context -.-> Cache["Provider continuation<br/>optimization, not authority"]
@@ -117,8 +117,11 @@ Compaction and search are projections, not replacement journals. Streaming
 deltas and mirrored child activity are deliberately coalesced/filtered.
 Session-scoped process memory is not recovered from the event log.
 
-**Source:** `SessionEventKind::persistence` / `SqliteSessionStore` in
-[session_store.rs](../crates/borg-agent-runtime/src/session_store.rs),
+**Source:** `SessionEventKind::persistence` / the `SessionStore` trait and its
+`SqliteSessionStore` and `PostgresSessionStore` backends in
+[session_store.rs](../crates/borg-agent-runtime/src/session_store.rs)
+and [postgres/](../crates/borg-agent-runtime/src/session_store/postgres/),
+selected by [factory.rs](../crates/borg-agent-runtime/src/session_store/factory.rs),
 [action transitions](../crates/borg-agent-runtime/src/session_action.rs),
 [writer lease](../crates/borg-agent-runtime/src/session_lock.rs),
 [jobs/checkpoints](../crates/borg-agent-runtime/src/autonomy.rs),
@@ -176,7 +179,7 @@ Questions below are review prompts, not confirmed defects.
 |---|---|---|
 | **D1** | Detached single-writer host → continuity, but leases/sockets/stale-owner recovery. | Is per-session process overhead justified? |
 | **D2** | Native + upstream compatibility loops → subscription UX, but duplicated control/context paths. | Which upstream responsibilities are truly required? Preserve login, continuation, cancellation and usage when migrating. |
-| **D3** | SQLite journal + live/search projections → local recovery, but contention/migrations/projection correctness. | Which events must remain lossless? |
+| **D3** | Journal + live/search projections → local recovery, but contention/migrations/projection correctness. SQLite is the default; PostgreSQL removes the machine-wide write lock. | Which events must remain lossless? Which backend does this deployment need? [Backends](session-store-backends.md). |
 | **D4** | Full Access / Auto reviewer / Manual → permission gates, **not a sandbox**. | Is trusted-user authority appropriate for this deployment? |
 | **D5** | Durable jobs/actions + non-durable OS effects → recoverable intent, not universal exactly-once execution. | Which interrupted effects require reconciliation? |
 | **D6** | Separate child journals, potentially shared workspace → cheap collaboration, possible write conflicts. | Where are worktrees or stronger isolation needed? |

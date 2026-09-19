@@ -115,7 +115,7 @@ impl AutonomyJobState {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
 
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Claimed => "claimed",
@@ -126,7 +126,7 @@ impl AutonomyJobState {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "queued" => Ok(Self::Queued),
             "claimed" => Ok(Self::Claimed),
@@ -138,7 +138,7 @@ impl AutonomyJobState {
         }
     }
 
-    const fn can_transition_to(self, next: Self) -> bool {
+    pub(crate) const fn can_transition_to(self, next: Self) -> bool {
         match self {
             Self::Queued => matches!(next, Self::Claimed | Self::Cancelled),
             Self::Claimed => matches!(
@@ -198,6 +198,98 @@ pub struct AutonomyJob {
     pub updated_at: DateTime<Utc>,
 }
 
+/// The durable runtime-job journal, independent of engine.
+///
+/// WHY A TRAIT: admission, leases, retries and checkpoints are a state machine,
+/// and the whole point of running it on Postgres is that two supervisors can
+/// sweep for due work concurrently instead of queueing behind one file writer.
+/// Both backends implement this identically -- the conformance suite drives
+/// this trait against each -- so a caller holding `dyn AutonomyStore` cannot
+/// come to depend on either engine's incidental behaviour.
+///
+/// `lease_owner` is `&str` rather than `impl AsRef<str>` because the trait must
+/// be object-safe; that is the only signature that differs from the original
+/// inherent methods.
+#[async_trait]
+pub trait AutonomyStore: Send + Sync {
+    /// Enqueue a job, returning the existing row for a repeated idempotency
+    /// key when its immutable request fields match exactly.
+    async fn enqueue(&self, input: EnqueueAutonomyJob) -> Result<AutonomyJob>;
+
+    /// One job by id.
+    async fn get(&self, job_id: Uuid) -> Result<Option<AutonomyJob>>;
+
+    /// Claim up to `limit` due jobs for `lease_owner`.
+    async fn claim_due(
+        &self,
+        now: DateTime<Utc>,
+        lease_owner: &str,
+        lease_duration: Duration,
+        limit: u32,
+    ) -> Result<Vec<AutonomyJob>>;
+
+    /// Claim due jobs belonging to one session only.
+    async fn claim_due_for_session(
+        &self,
+        now: DateTime<Utc>,
+        lease_owner: &str,
+        lease_duration: Duration,
+        limit: u32,
+        session_id: Uuid,
+    ) -> Result<Vec<AutonomyJob>>;
+
+    /// Extend a live lease. Fails if the fence no longer matches, which is how
+    /// a superseded worker learns it has been replaced.
+    async fn heartbeat(
+        &self,
+        job_id: Uuid,
+        lease: &AutonomyLease,
+        now: DateTime<Utc>,
+        lease_duration: Duration,
+    ) -> Result<AutonomyJob>;
+
+    /// Move a job between states, refusing illegal edges.
+    async fn transition(
+        &self,
+        job_id: Uuid,
+        expected: AutonomyJobState,
+        next: AutonomyJobState,
+        lease: Option<&AutonomyLease>,
+        reason: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<AutonomyJob>;
+
+    /// Record a terminal result under a live lease.
+    async fn complete(
+        &self,
+        job_id: Uuid,
+        lease: &AutonomyLease,
+        result: Value,
+        now: DateTime<Utc>,
+    ) -> Result<AutonomyJob>;
+
+    /// Return jobs whose leases expired to the queue, so a crashed worker's
+    /// work is retried rather than stranded.
+    async fn recover_expired(&self, now: DateTime<Utc>, limit: u32) -> Result<Vec<AutonomyJob>>;
+
+    /// Recover expired leases for one session only.
+    async fn recover_expired_for_session(
+        &self,
+        now: DateTime<Utc>,
+        limit: u32,
+        session_id: Uuid,
+    ) -> Result<Vec<AutonomyJob>>;
+
+    /// Save a reproducible checkpoint for a job.
+    async fn save_checkpoint(&self, input: SaveAutonomyCheckpoint) -> Result<AutonomyCheckpoint>;
+
+    /// Every checkpoint recorded for a job, oldest first.
+    async fn list_checkpoints(&self, job_id: Uuid) -> Result<Vec<AutonomyCheckpoint>>;
+
+    /// The audited state-transition history for a job.
+    async fn list_transitions(&self, job_id: Uuid) -> Result<Vec<AutonomyJobTransition>>;
+}
+
 /// Provider- and tool-neutral execution hook for durable jobs. The handler is
 /// deliberately outside the store: SQLite owns admission, leases, retries,
 /// and results, while the session/runtime owns what a job means.
@@ -213,7 +305,7 @@ pub trait AutonomyJobHandler: Send + Sync {
 /// worker can be replaced without duplicating a completed job.
 #[derive(Clone)]
 pub struct SqliteAutonomySupervisor {
-    store: SqliteAutonomyStore,
+    store: Arc<dyn AutonomyStore>,
     handler: Arc<dyn AutonomyJobHandler>,
     owner: String,
     session_id: Option<Uuid>,
@@ -224,7 +316,7 @@ pub struct SqliteAutonomySupervisor {
 
 impl SqliteAutonomySupervisor {
     pub fn new(
-        store: SqliteAutonomyStore,
+        store: Arc<dyn AutonomyStore>,
         handler: Arc<dyn AutonomyJobHandler>,
         owner: impl Into<String>,
     ) -> Result<Self> {
@@ -444,14 +536,41 @@ impl SqliteAutonomyStore {
     /// result columns while an older owner keeps this pool open.
     pub async fn open(pool: SqlitePool) -> Result<Self> {
         let store = Self { pool };
-        store.ensure_schema().await?;
+        // Attaching to an already-current database must not take the single
+        // SQLite writer lock. `SessionStore::autonomy_store` builds one of
+        // these per call -- including from the store factory, on every process
+        // start -- so an unconditional schema transaction queues interactive
+        // callers behind whatever large session currently holds the writer.
+        // A competing host is then blocked on maintenance it does not need.
+        // Probe with reads first, exactly as the workspace tier does, and fall
+        // back to the writing path only when the database is new or stale.
+        if !store.has_current_schema().await? {
+            store.ensure_schema().await?;
+        }
         Ok(store)
     }
 
-    /// Reuse the canonical session journal on the same SQLite pool. Native
-    /// runtime records must not create a second database authority.
-    pub(crate) fn session_store(&self) -> crate::SqliteSessionStore {
-        crate::SqliteSessionStore::from_pool(self.pool.clone())
+    /// Read-only probe for an already-current autonomy schema.
+    ///
+    /// Mirrors `SqliteWorkspaceStore::has_current_schema`. Anything unexpected
+    /// -- a missing marker, a stale version -- reports false, leaving
+    /// [`Self::ensure_schema`] the single place that decides how to create or
+    /// migrate the database.
+    async fn has_current_schema(&self) -> Result<bool> {
+        let has_marker: i64 = sqlx::query_scalar(
+            "select exists(select 1 from sqlite_master \
+             where type='table' and name='borg_autonomy_schema')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if has_marker == 0 {
+            return Ok(false);
+        }
+        let version: Option<i64> =
+            sqlx::query_scalar("select version from borg_autonomy_schema where id=1")
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(version.is_some_and(|version| version >= AUTONOMY_SCHEMA_VERSION))
     }
 
     /// Enqueue a job, returning the existing row for a repeated idempotency
@@ -470,10 +589,14 @@ impl SqliteAutonomyStore {
             .await?
         {
             let existing = decode_job(&row)?;
+            // `due_at` is stored as epoch milliseconds, so a caller passing a
+            // finer-grained instant would never match its own stored row and
+            // could never retry idempotently. Compare at storage precision.
+            let due_at = from_millis(to_millis(input.due_at), "due_at_ms")?;
             ensure!(
                 existing.kind == input.kind
                     && existing.payload == input.payload
-                    && existing.due_at == input.due_at
+                    && existing.due_at == due_at
                     && existing.max_attempts == input.max_attempts
                     && existing.session_id == input.session_id
                     && existing.goal_id == input.goal_id,
@@ -536,7 +659,7 @@ impl SqliteAutonomyStore {
     pub async fn claim_due(
         &self,
         now: DateTime<Utc>,
-        lease_owner: impl AsRef<str>,
+        lease_owner: &str,
         lease_duration: Duration,
         limit: u32,
     ) -> Result<Vec<AutonomyJob>> {
@@ -548,7 +671,7 @@ impl SqliteAutonomyStore {
     pub async fn claim_due_for_session(
         &self,
         now: DateTime<Utc>,
-        lease_owner: impl AsRef<str>,
+        lease_owner: &str,
         lease_duration: Duration,
         limit: u32,
         session_id: Uuid,
@@ -560,12 +683,11 @@ impl SqliteAutonomyStore {
     async fn claim_due_filtered(
         &self,
         now: DateTime<Utc>,
-        lease_owner: impl AsRef<str>,
+        lease_owner: &str,
         lease_duration: Duration,
         limit: u32,
         session_id: Option<Uuid>,
     ) -> Result<Vec<AutonomyJob>> {
-        let lease_owner = lease_owner.as_ref();
         validate_owner(lease_owner)?;
         validate_batch_size(limit)?;
         ensure!(!lease_duration.is_zero(), "lease duration must be non-zero");
@@ -1102,14 +1224,14 @@ impl SqliteAutonomyStore {
     }
 }
 
-struct AutonomyTransition {
-    job_id: Uuid,
-    from: Option<AutonomyJobState>,
-    to: AutonomyJobState,
-    attempt: u32,
-    reason: Option<String>,
-    lease_owner: Option<String>,
-    occurred_at: DateTime<Utc>,
+pub(crate) struct AutonomyTransition {
+    pub(crate) job_id: Uuid,
+    pub(crate) from: Option<AutonomyJobState>,
+    pub(crate) to: AutonomyJobState,
+    pub(crate) attempt: u32,
+    pub(crate) reason: Option<String>,
+    pub(crate) lease_owner: Option<String>,
+    pub(crate) occurred_at: DateTime<Utc>,
 }
 
 async fn append_transition(
@@ -1238,7 +1360,7 @@ fn decode_checkpoint(row: &sqlx::sqlite::SqliteRow) -> Result<AutonomyCheckpoint
     })
 }
 
-fn validate_enqueue(input: &EnqueueAutonomyJob) -> Result<()> {
+pub(crate) fn validate_enqueue(input: &EnqueueAutonomyJob) -> Result<()> {
     validate_optional_text(
         &input.idempotency_key,
         MAX_IDEMPOTENCY_KEY_BYTES,
@@ -1257,7 +1379,7 @@ fn validate_enqueue(input: &EnqueueAutonomyJob) -> Result<()> {
     Ok(())
 }
 
-fn validate_checkpoint(input: &SaveAutonomyCheckpoint) -> Result<()> {
+pub(crate) fn validate_checkpoint(input: &SaveAutonomyCheckpoint) -> Result<()> {
     validate_optional_text(
         &input.checkpoint_key,
         MAX_CHECKPOINT_KEY_BYTES,
@@ -1272,11 +1394,11 @@ fn validate_checkpoint(input: &SaveAutonomyCheckpoint) -> Result<()> {
     Ok(())
 }
 
-fn validate_owner(owner: &str) -> Result<()> {
+pub(crate) fn validate_owner(owner: &str) -> Result<()> {
     validate_optional_text(owner, MAX_OWNER_BYTES, "lease owner")
 }
 
-fn validate_optional_text(value: &str, max_bytes: usize, label: &str) -> Result<()> {
+pub(crate) fn validate_optional_text(value: &str, max_bytes: usize, label: &str) -> Result<()> {
     ensure!(!value.trim().is_empty(), "{label} must not be empty");
     ensure!(
         value.len() <= max_bytes,
@@ -1285,7 +1407,7 @@ fn validate_optional_text(value: &str, max_bytes: usize, label: &str) -> Result<
     Ok(())
 }
 
-fn validate_batch_size(limit: u32) -> Result<()> {
+pub(crate) fn validate_batch_size(limit: u32) -> Result<()> {
     ensure!(
         limit <= MAX_BATCH_SIZE,
         "batch limit exceeds {MAX_BATCH_SIZE}"
@@ -1293,7 +1415,7 @@ fn validate_batch_size(limit: u32) -> Result<()> {
     Ok(())
 }
 
-fn validate_lease_for_transition(
+pub(crate) fn validate_lease_for_transition(
     job: &AutonomyJob,
     lease: Option<&AutonomyLease>,
     now: DateTime<Utc>,
@@ -1323,7 +1445,7 @@ fn validate_lease_for_transition(
     Ok(())
 }
 
-fn checkpoint_hash(state_json: &str, evidence_json: &str) -> String {
+pub(crate) fn checkpoint_hash(state_json: &str, evidence_json: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"borg-autonomy-checkpoint-v1\0");
     hasher.update(state_json.as_bytes());
@@ -1332,38 +1454,41 @@ fn checkpoint_hash(state_json: &str, evidence_json: &str) -> String {
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
-fn add_duration(now: DateTime<Utc>, duration: Duration) -> Result<DateTime<Utc>> {
+pub(crate) fn add_duration(now: DateTime<Utc>, duration: Duration) -> Result<DateTime<Utc>> {
     let duration = ChronoDuration::from_std(duration).context("lease duration is out of range")?;
     now.checked_add_signed(duration)
         .context("lease expiration is out of range")
 }
 
-fn to_millis(value: DateTime<Utc>) -> i64 {
+pub(crate) fn to_millis(value: DateTime<Utc>) -> i64 {
     value.timestamp_millis()
 }
 
-fn from_millis(value: i64, field: &str) -> Result<DateTime<Utc>> {
+pub(crate) fn from_millis(value: i64, field: &str) -> Result<DateTime<Utc>> {
     DateTime::from_timestamp_millis(value)
         .with_context(|| format!("invalid {field} millisecond timestamp {value}"))
 }
 
-fn from_optional_millis(value: Option<i64>, field: &str) -> Result<Option<DateTime<Utc>>> {
+pub(crate) fn from_optional_millis(
+    value: Option<i64>,
+    field: &str,
+) -> Result<Option<DateTime<Utc>>> {
     value.map(|value| from_millis(value, field)).transpose()
 }
 
-fn parse_uuid(value: String, field: &str) -> Result<Uuid> {
+pub(crate) fn parse_uuid(value: String, field: &str) -> Result<Uuid> {
     Uuid::parse_str(&value).with_context(|| format!("invalid {field} UUID {value:?}"))
 }
 
-fn parse_optional_uuid(value: Option<String>, field: &str) -> Result<Option<Uuid>> {
+pub(crate) fn parse_optional_uuid(value: Option<String>, field: &str) -> Result<Option<Uuid>> {
     value.map(|value| parse_uuid(value, field)).transpose()
 }
 
-fn to_u32(value: i64, field: &str) -> Result<u32> {
+pub(crate) fn to_u32(value: i64, field: &str) -> Result<u32> {
     u32::try_from(value).with_context(|| format!("invalid {field} value {value}"))
 }
 
-fn to_u64(value: i64, field: &str) -> Result<u64> {
+pub(crate) fn to_u64(value: i64, field: &str) -> Result<u64> {
     u64::try_from(value).with_context(|| format!("invalid {field} value {value}"))
 }
 
@@ -1841,11 +1966,14 @@ mod tests {
             .enqueue(enqueue("supervisor", at(1_700_000_000), 2))
             .await
             .expect("enqueue");
-        let supervisor =
-            SqliteAutonomySupervisor::new(store.clone(), Arc::new(EchoHandler), "test-supervisor")
-                .expect("supervisor")
-                .with_limits(Duration::from_secs(30), Duration::from_secs(1), 1)
-                .expect("limits");
+        let supervisor = SqliteAutonomySupervisor::new(
+            Arc::new(store.clone()),
+            Arc::new(EchoHandler),
+            "test-supervisor",
+        )
+        .expect("supervisor")
+        .with_limits(Duration::from_secs(30), Duration::from_secs(1), 1)
+        .expect("limits");
 
         assert_eq!(supervisor.run_once(Utc::now()).await.unwrap(), 1);
         let completed = store.get(job.job_id).await.unwrap().unwrap();
@@ -1855,5 +1983,94 @@ mod tests {
             Some(serde_json::json!({"job_id": job.job_id, "kind": "test.runtime"}))
         );
         assert_eq!(store.list_transitions(job.job_id).await.unwrap().len(), 4);
+    }
+}
+
+#[async_trait]
+impl AutonomyStore for SqliteAutonomyStore {
+    async fn enqueue(&self, input: EnqueueAutonomyJob) -> Result<AutonomyJob> {
+        Self::enqueue(self, input).await
+    }
+
+    async fn get(&self, job_id: Uuid) -> Result<Option<AutonomyJob>> {
+        Self::get(self, job_id).await
+    }
+
+    async fn claim_due(
+        &self,
+        now: DateTime<Utc>,
+        lease_owner: &str,
+        lease_duration: Duration,
+        limit: u32,
+    ) -> Result<Vec<AutonomyJob>> {
+        Self::claim_due(self, now, lease_owner, lease_duration, limit).await
+    }
+
+    async fn claim_due_for_session(
+        &self,
+        now: DateTime<Utc>,
+        lease_owner: &str,
+        lease_duration: Duration,
+        limit: u32,
+        session_id: Uuid,
+    ) -> Result<Vec<AutonomyJob>> {
+        Self::claim_due_for_session(self, now, lease_owner, lease_duration, limit, session_id).await
+    }
+
+    async fn heartbeat(
+        &self,
+        job_id: Uuid,
+        lease: &AutonomyLease,
+        now: DateTime<Utc>,
+        lease_duration: Duration,
+    ) -> Result<AutonomyJob> {
+        Self::heartbeat(self, job_id, lease, now, lease_duration).await
+    }
+
+    async fn transition(
+        &self,
+        job_id: Uuid,
+        expected: AutonomyJobState,
+        next: AutonomyJobState,
+        lease: Option<&AutonomyLease>,
+        reason: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<AutonomyJob> {
+        Self::transition(self, job_id, expected, next, lease, reason, now).await
+    }
+
+    async fn complete(
+        &self,
+        job_id: Uuid,
+        lease: &AutonomyLease,
+        result: Value,
+        now: DateTime<Utc>,
+    ) -> Result<AutonomyJob> {
+        Self::complete(self, job_id, lease, result, now).await
+    }
+
+    async fn recover_expired(&self, now: DateTime<Utc>, limit: u32) -> Result<Vec<AutonomyJob>> {
+        Self::recover_expired(self, now, limit).await
+    }
+
+    async fn recover_expired_for_session(
+        &self,
+        now: DateTime<Utc>,
+        limit: u32,
+        session_id: Uuid,
+    ) -> Result<Vec<AutonomyJob>> {
+        Self::recover_expired_for_session(self, now, limit, session_id).await
+    }
+
+    async fn save_checkpoint(&self, input: SaveAutonomyCheckpoint) -> Result<AutonomyCheckpoint> {
+        Self::save_checkpoint(self, input).await
+    }
+
+    async fn list_checkpoints(&self, job_id: Uuid) -> Result<Vec<AutonomyCheckpoint>> {
+        Self::list_checkpoints(self, job_id).await
+    }
+
+    async fn list_transitions(&self, job_id: Uuid) -> Result<Vec<AutonomyJobTransition>> {
+        Self::list_transitions(self, job_id).await
     }
 }

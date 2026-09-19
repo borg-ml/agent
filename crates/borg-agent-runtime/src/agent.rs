@@ -216,7 +216,7 @@ pub struct ConsultationRequest {
 #[derive(Clone)]
 pub struct ModelAccessContext {
     pub session_id: Uuid,
-    pub store: Option<crate::SqliteSessionStore>,
+    pub store: Option<std::sync::Arc<dyn crate::SessionStore>>,
 }
 
 impl std::fmt::Debug for ModelAccessContext {
@@ -954,11 +954,9 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         store: &dyn crate::SessionStore,
         model: Option<&str>,
     ) -> Result<Option<Arc<dyn AgentTurnExecutor>>> {
-        let autonomy = store.autonomy_store().await?;
-        let store = autonomy
-            .as_ref()
-            .context("local execution requires durable harness routing")?
-            .session_store();
+        // Harness routing lives on the journal itself; this used to detour
+        // through the autonomy tier to recover a concrete handle, which is no
+        // longer necessary now that the routes are on the store trait.
         let native = store.uses_native_codex_harness(session_id).await?;
         anyhow::ensure!(
             !self.codex_model_only || native,
@@ -1335,7 +1333,7 @@ pub async fn run_agent_turn_controlled(
     let executor = LocalAgentTurnExecutor::default();
     let bound = if let Some(store) = turn.agent_tools.session_store() {
         executor
-            .for_session(turn.session_id, &store, turn.model.as_deref())
+            .for_session(turn.session_id, store.as_ref(), turn.model.as_deref())
             .await?
     } else {
         None
@@ -2629,6 +2627,7 @@ mod tests {
                 None,
                 None,
                 cwd.to_path_buf(),
+                None,
                 None,
                 None,
                 Vec::new(),

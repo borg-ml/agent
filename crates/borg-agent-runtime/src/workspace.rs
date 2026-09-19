@@ -16,14 +16,14 @@ use uuid::Uuid;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_MMAP_SIZE_BYTES: u64 = 256 * 1024 * 1024;
 const SQLITE_CACHE_KIB: u64 = 8 * 1024;
-const WORKSPACE_SCHEMA_VERSION: i64 = 3;
+const WORKSPACE_SCHEMA_VERSION: i64 = 4;
 
 /// The canonical schema. Older databases are migrated forward by re-running
 /// this batch and adding the columns it declares that they lack.
 const WORKSPACE_SCHEMA_SQL: &str = r#"
       create table if not exists borg_workspace_schema (id integer primary key check(id=1), version integer not null);
       create table if not exists workspace_participants (id text primary key, display_name text not null, kind text not null, created_at text not null);
-      create table if not exists agent_instances (participant_id text primary key references workspace_participants(id), host_id text, workspace_id text, seen_at text);
+      create table if not exists agent_instances (participant_id text primary key references workspace_participants(id), host_id text, workspace_id text, seen_at text, cwd text, pid integer, exited_at text);
       create table if not exists workspaces (id text primary key, name text not null, next_sequence integer not null default 1, created_at text not null);
       create table if not exists workspace_members (workspace_id text not null references workspaces(id) on delete cascade, participant_id text not null references workspace_participants(id), role text not null, joined_at text not null, primary key(workspace_id,participant_id));
       create table if not exists workspace_threads (id text primary key, workspace_id text not null references workspaces(id) on delete cascade, title text not null, created_at text not null);
@@ -65,6 +65,17 @@ pub struct AgentInstance {
     /// When this installation last saw the instance in local registration or
     /// an authenticated directory sync. Not a liveness guarantee.
     pub seen_at: Option<DateTime<Utc>>,
+    /// The working directory the instance was launched against. `display_name`
+    /// is only the workspace basename, so several sessions in different
+    /// checkouts are otherwise indistinguishable; this is what tells them
+    /// apart. Recorded locally at launch and absent for remote entries.
+    pub cwd: Option<String>,
+    /// The owning OS process, recorded locally at launch. Absent for remote
+    /// entries, whose pids are meaningless on this machine.
+    pub pid: Option<i64>,
+    /// When this installation observed the local owner gone. Set by reaping so
+    /// a dead row stops being advertised without discarding its history.
+    pub exited_at: Option<DateTime<Utc>>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -404,6 +415,311 @@ pub trait WorkspaceStore: Send + Sync {
         workspace_id: Uuid,
         now: DateTime<Utc>,
     ) -> Result<Vec<PresenceLease>>;
+
+    // Reads that callers outside this module depend on. They were inherent on
+    // the SQLite store, which forced every caller to name that type; declaring
+    // them here is what lets a session hold whichever backend it was built
+    // with.
+    async fn contains_message(&self, message_id: Uuid) -> Result<bool>;
+    async fn contains_idempotent_event(
+        &self,
+        workspace_id: Uuid,
+        author_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<bool>;
+    /// Highest session sequence already projected into this workspace, so a
+    /// restart replays only above the watermark.
+    async fn latest_projected_session_sequence(
+        &self,
+        workspace_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<u64>;
+    async fn participant(&self, participant_id: Uuid) -> Result<Option<Participant>>;
+    async fn workspace_name(&self, workspace_id: Uuid) -> Result<Option<String>>;
+    async fn workspace_roster(
+        &self,
+        workspace_id: Uuid,
+        viewer_id: Uuid,
+    ) -> Result<Vec<WorkspaceRosterEntry>>;
+    async fn list_workspaces_for_participant(&self, participant_id: Uuid)
+    -> Result<Vec<Workspace>>;
+
+    /// The event a given author already admitted under this idempotency key.
+    async fn event_by_idempotency_key(
+        &self,
+        workspace_id: Uuid,
+        author_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<Option<WorkspaceEvent>>;
+
+    /// Who a delivered event was fanned out to, in recipient order.
+    async fn delivery_recipients(&self, workspace_id: Uuid, sequence: u64) -> Result<Vec<Uuid>>;
+
+    // Instance discovery. Enumeration spans workspaces -- "which instances
+    // exist on this machine" is not a question any single workspace's audience
+    // can answer -- so it belongs on the store rather than on the message path.
+    /// Agent instances known to this installation.
+    ///
+    /// `include_exited` is a storage-level filter: reaped rows accumulate and
+    /// discovery pays a binding lookup per row it materialises, so excluding
+    /// them in Rust would pay the full per-row cost before truncating.
+    async fn list_instances(&self, include_exited: bool) -> Result<Vec<AgentInstance>>;
+
+    /// Record this process as a live instance, clearing any exit tombstone.
+    async fn register_local_instance(
+        &self,
+        participant_id: Uuid,
+        workspace_id: Option<Uuid>,
+        cwd: &Path,
+        pid: u32,
+    ) -> Result<()>;
+
+    /// Create or refresh the workspace one execution session runs in.
+    ///
+    /// Idempotent by construction: the workspace is inserted on-conflict-nothing
+    /// while participants and memberships are upserted, so relaunching a session
+    /// refreshes display names and roles without duplicating anything.
+    async fn ensure_execution_workspace(
+        &self,
+        workspace_id: Uuid,
+        workspace_name: &str,
+        human_participant_id: Uuid,
+        human_display_name: &str,
+        agent_participant_id: Uuid,
+        agent_display_name: &str,
+    ) -> Result<()>;
+
+    /// The deterministic two-party workspace for a direct message.
+    ///
+    /// The id is derived from the sorted participant pair, so both directions
+    /// resolve to the same workspace instead of creating two.
+    async fn ensure_direct_workspace(
+        &self,
+        left_participant_id: Uuid,
+        right_participant_id: Uuid,
+    ) -> Result<Uuid>;
+
+    /// Undelivered messages for one recipient, oldest first.
+    async fn pending_message_events(
+        &self,
+        workspace_id: Uuid,
+        recipient_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<(WorkspaceEvent, RecipientDelivery)>>;
+
+    /// Every recipient delivery row for one message, across all workspaces.
+    async fn message_deliveries(&self, message_id: Uuid) -> Result<Vec<RecipientDelivery>>;
+
+    /// Project an authenticated relay delivery into the same inbox as local
+    /// messages.
+    ///
+    /// Thread and reply references stay cloud identities and are NOT validated
+    /// locally: the conversation they belong to may never have been
+    /// materialised on this machine, and rejecting the message for that would
+    /// drop mail that the relay already accepted.
+    async fn import_relay_message(
+        &self,
+        message: WorkspaceMessage,
+        author_name: &str,
+        recipient_id: Uuid,
+        mode: DeliveryMode,
+    ) -> Result<WorkspaceEvent>;
+
+    /// The sequence of a message event in this workspace, if it exists.
+    async fn message_sequence(&self, workspace_id: Uuid, message_id: Uuid) -> Result<Option<u64>>;
+
+    /// Cache authenticated instance discovery without granting membership.
+    async fn upsert_instance(
+        &self,
+        participant: Participant,
+        host_id: Option<Uuid>,
+        workspace_id: Option<Uuid>,
+    ) -> Result<()>;
+
+    /// Transition a delivery addressed by message id rather than sequence.
+    ///
+    /// A DEFAULT METHOD: resolving the message and checking that the recipient
+    /// was actually addressed are rules, not storage. Returns `None` rather
+    /// than erroring for an unknown message or an unaddressed participant --
+    /// a peer outside the audience simply has nothing to transition, and
+    /// treating that as fatal would kill a session over someone else's mail.
+    async fn transition_message_delivery(
+        &self,
+        workspace_id: Uuid,
+        message_id: Uuid,
+        recipient_id: Uuid,
+        state: DeliveryState,
+        attempt: Option<DeliveryAttempt>,
+    ) -> Result<Option<RecipientDelivery>> {
+        let Some(sequence) = self.message_sequence(workspace_id, message_id).await? else {
+            return Ok(None);
+        };
+        let addressed = self
+            .delivery_recipients(workspace_id, sequence)
+            .await?
+            .contains(&recipient_id);
+        if !addressed {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.transition_delivery(workspace_id, sequence, recipient_id, state, attempt)
+                .await?,
+        ))
+    }
+
+    /// Apply one authenticated relay roster projection idempotently.
+    ///
+    /// A cache of cloud membership, not a local authority grant: the workspace
+    /// must already exist locally or there is nothing to project onto.
+    async fn upsert_relay_roster_entry(
+        &self,
+        workspace_id: Uuid,
+        participant: Participant,
+        role: WorkspaceRole,
+    ) -> Result<()>;
+
+    /// Tombstone instances whose owner is gone, returning how many moved.
+    ///
+    /// Tombstoned rather than deleted: `workspace_events.author_id` and the
+    /// delivery rows reference the participant, so removing it would break
+    /// history that is still being replayed.
+    async fn mark_local_instances_exited(&self, participant_ids: &[Uuid]) -> Result<u64>;
+
+    /// Admit one authored message and return its delivery receipt.
+    ///
+    /// A DEFAULT METHOD ON PURPOSE. Everything it decides -- that the audience
+    /// resolves to someone other than the author, that a repeated idempotency
+    /// key carries identical content, that a lost race is resolved semantically
+    /// rather than reported as a conflict -- is a rule, not a storage detail.
+    /// Written once, both backends obey it; written twice, they eventually
+    /// disagree about whether a message was already sent.
+    async fn append_message(&self, input: NewWorkspaceMessage) -> Result<WorkspaceMessageReceipt> {
+        ensure!(!input.text.trim().is_empty(), "workspace message is empty");
+        ensure!(
+            !input.idempotency_key.trim().is_empty(),
+            "workspace message idempotency key is empty"
+        );
+        let roster = self
+            .workspace_roster(input.workspace_id, input.author_id)
+            .await?;
+        let members = roster
+            .iter()
+            .map(|entry| (entry.participant.id, entry.role))
+            .collect::<Vec<_>>();
+        let mut expected_recipients = resolve_recipients(&input.audience, &members)?;
+        expected_recipients.retain(|recipient| *recipient != input.author_id);
+        ensure!(
+            !expected_recipients.is_empty(),
+            "message audience resolves only to its author"
+        );
+
+        if let Some(event) = self.admitted_message_event(&input).await? {
+            return self.message_receipt(&event, &expected_recipients).await;
+        }
+
+        let message_id = Uuid::new_v4();
+        let created_at = Utc::now();
+        let mode = input.mode;
+        let candidate = WorkspaceEvent {
+            id: message_id,
+            workspace_id: input.workspace_id,
+            sequence: 0,
+            author_id: input.author_id,
+            idempotency_key: input.idempotency_key.clone(),
+            created_at,
+            kind: WorkspaceEventKind::Message {
+                message: WorkspaceMessage {
+                    id: message_id,
+                    workspace_id: input.workspace_id,
+                    thread_id: input.thread_id,
+                    reply_to_message_id: input.reply_to_message_id,
+                    author_id: input.author_id,
+                    body: WorkspaceMessageBody {
+                        text: input.text.clone(),
+                        mentions: input.mentions.clone(),
+                    },
+                    audience: input.audience.clone(),
+                    created_at,
+                },
+                mode,
+            },
+        };
+        let event = match self.append(candidate).await {
+            Ok(event) => event,
+            Err(error) => {
+                // Two exact retries can race between the optimistic lookup
+                // above and the unique idempotency constraint. Resolve the
+                // winner semantically before reporting a conflict.
+                if let Some(event) = self.admitted_message_event(&input).await? {
+                    return self.message_receipt(&event, &expected_recipients).await;
+                }
+                return Err(error);
+            }
+        };
+        self.message_receipt(&event, &expected_recipients).await
+    }
+
+    /// The already-admitted event for this key, proven to carry identical
+    /// content. A matching key with different content is a caller bug.
+    async fn admitted_message_event(
+        &self,
+        input: &NewWorkspaceMessage,
+    ) -> Result<Option<WorkspaceEvent>> {
+        let Some(event) = self
+            .event_by_idempotency_key(input.workspace_id, input.author_id, &input.idempotency_key)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let matches = matches!(
+            &event.kind,
+            WorkspaceEventKind::Message { message, mode }
+                if event.workspace_id == input.workspace_id
+                    && event.author_id == input.author_id
+                    && message.workspace_id == input.workspace_id
+                    && message.author_id == input.author_id
+                    && message.thread_id == input.thread_id
+                    && message.reply_to_message_id == input.reply_to_message_id
+                    && message.body.text == input.text
+                    && message.body.mentions == input.mentions
+                    && message.audience == input.audience
+                    && *mode == input.mode
+        );
+        ensure!(
+            matches,
+            "idempotency conflict: key was used with a different payload"
+        );
+        Ok(Some(event))
+    }
+
+    /// The receipt for an admitted message, checked against the audience the
+    /// caller was authorised for.
+    async fn message_receipt(
+        &self,
+        event: &WorkspaceEvent,
+        expected_recipients: &[Uuid],
+    ) -> Result<WorkspaceMessageReceipt> {
+        let WorkspaceEventKind::Message { message, mode } = &event.kind else {
+            bail!("workspace message receipt references a non-message event");
+        };
+        let recipient_ids = self
+            .delivery_recipients(event.workspace_id, event.sequence)
+            .await?;
+        // Delivery rows are the ground truth for who was reached; if they
+        // disagree with the authorised audience the receipt is not safe to
+        // hand back.
+        ensure!(
+            recipient_ids == expected_recipients,
+            "workspace delivery receipt does not match the authorized audience"
+        );
+        Ok(WorkspaceMessageReceipt {
+            message_id: message.id,
+            workspace_id: event.workspace_id,
+            sequence: event.sequence,
+            recipient_ids,
+            mode: *mode,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -610,13 +926,84 @@ impl SqliteWorkspaceStore {
         Ok(())
     }
 
-    pub async fn list_instances(&self) -> Result<Vec<AgentInstance>> {
+    /// Record a locally launched instance, including the working directory and
+    /// owning pid.
+    ///
+    /// `ensure_execution_workspace` only stores the workspace basename as a
+    /// display name, so several sessions launched in different checkouts all
+    /// render identically and cannot be told apart by discovery. The launch
+    /// already knows its `cwd`; this is where that survives. Re-registering
+    /// clears `exited_at` so a reaped participant id that is launched again is
+    /// advertised normally.
+    pub async fn register_local_instance(
+        &self,
+        participant_id: Uuid,
+        workspace_id: Option<Uuid>,
+        cwd: &Path,
+        pid: u32,
+    ) -> Result<()> {
+        let mut transaction = self.write().await?;
+        sqlx::query(
+            "insert into agent_instances(participant_id,host_id,workspace_id,seen_at,cwd,pid,exited_at) \
+             values(?,null,?,?,?,?,null) on conflict(participant_id) do update set \
+             workspace_id=coalesce(excluded.workspace_id,agent_instances.workspace_id), \
+             seen_at=excluded.seen_at,cwd=excluded.cwd,pid=excluded.pid,exited_at=null",
+        )
+        .bind(participant_id.to_string())
+        .bind(workspace_id.map(|id| id.to_string()))
+        .bind(Utc::now().to_rfc3339())
+        .bind(cwd.to_string_lossy().to_string())
+        .bind(i64::from(pid))
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Mark local instances whose owner is gone as exited.
+    ///
+    /// Nothing previously pruned this table: the stale filter in discovery
+    /// short-circuits on `!local`, so a local row stayed advertised forever and
+    /// the participant list grew without bound. Rows are tombstoned rather than
+    /// deleted because `workspace_events.author_id` and delivery rows reference
+    /// the participant; deleting it would break that history.
+    pub async fn mark_local_instances_exited(&self, participant_ids: &[Uuid]) -> Result<u64> {
+        if participant_ids.is_empty() {
+            return Ok(0);
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut transaction = self.write().await?;
+        let mut affected = 0;
+        for participant_id in participant_ids {
+            affected += sqlx::query(
+                "update agent_instances set exited_at=? \
+                 where participant_id=? and exited_at is null",
+            )
+            .bind(&now)
+            .bind(participant_id.to_string())
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+        }
+        transaction.commit().await?;
+        Ok(affected)
+    }
+
+    /// Every agent participant this installation knows about.
+    ///
+    /// `include_exited` is a SQL-level filter on purpose. Reaped rows are the
+    /// bulk of a long-lived database, and discovery does a binding lookup and
+    /// a socket probe per row it materialises, so excluding them in Rust still
+    /// paid the full per-row cost before anything was truncated.
+    pub async fn list_instances(&self, include_exited: bool) -> Result<Vec<AgentInstance>> {
         let rows = sqlx::query(
-            "select p.id,p.display_name,p.kind,p.created_at,i.host_id,i.workspace_id,i.seen_at \
+            "select p.id,p.display_name,p.kind,p.created_at,i.host_id,i.workspace_id,i.seen_at,\
+             i.cwd,i.pid,i.exited_at \
              from workspace_participants p left join agent_instances i on i.participant_id=p.id \
-             where p.kind=? order by p.created_at,p.id",
+             where p.kind=? and (? or i.exited_at is null) order by p.created_at,p.id",
         )
         .bind(serde_json::to_string(&ParticipantKind::Agent)?)
+        .bind(include_exited)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -639,6 +1026,14 @@ impl SqliteWorkspaceStore {
                         .transpose()?,
                     seen_at: row
                         .try_get::<Option<&str>, _>("seen_at")?
+                        .map(|value| {
+                            DateTime::parse_from_rfc3339(value).map(|t| t.with_timezone(&Utc))
+                        })
+                        .transpose()?,
+                    cwd: row.try_get::<Option<String>, _>("cwd")?,
+                    pid: row.try_get::<Option<i64>, _>("pid")?,
+                    exited_at: row
+                        .try_get::<Option<&str>, _>("exited_at")?
                         .map(|value| {
                             DateTime::parse_from_rfc3339(value).map(|t| t.with_timezone(&Utc))
                         })
@@ -761,144 +1156,14 @@ impl SqliteWorkspaceStore {
 
     /// Route one message through the canonical workspace event and delivery
     /// tables and report the exact durable recipients.
+    /// Admit one authored message. The rules live on the `WorkspaceStore`
+    /// default method so both backends share them; this keeps the inherent
+    /// name its callers already use.
     pub async fn append_message(
         &self,
         input: NewWorkspaceMessage,
     ) -> Result<WorkspaceMessageReceipt> {
-        ensure!(!input.text.trim().is_empty(), "workspace message is empty");
-        ensure!(
-            !input.idempotency_key.trim().is_empty(),
-            "workspace message idempotency key is empty"
-        );
-        let roster = self
-            .workspace_roster(input.workspace_id, input.author_id)
-            .await?;
-        let members = roster
-            .iter()
-            .map(|entry| (entry.participant.id, entry.role))
-            .collect::<Vec<_>>();
-        let mut expected_recipients = Self::recipients(&input.audience, &members)?;
-        expected_recipients.retain(|recipient| *recipient != input.author_id);
-        ensure!(
-            !expected_recipients.is_empty(),
-            "message audience resolves only to its author"
-        );
-
-        if let Some(event) = self.existing_message_event(&input).await? {
-            return self.message_receipt(&event, &expected_recipients).await;
-        }
-
-        let message_id = Uuid::new_v4();
-        let created_at = Utc::now();
-        let mode = input.mode;
-        let candidate = WorkspaceEvent {
-            id: message_id,
-            workspace_id: input.workspace_id,
-            sequence: 0,
-            author_id: input.author_id,
-            idempotency_key: input.idempotency_key.clone(),
-            created_at,
-            kind: WorkspaceEventKind::Message {
-                message: WorkspaceMessage {
-                    id: message_id,
-                    workspace_id: input.workspace_id,
-                    thread_id: input.thread_id,
-                    reply_to_message_id: input.reply_to_message_id,
-                    author_id: input.author_id,
-                    body: WorkspaceMessageBody {
-                        text: input.text.clone(),
-                        mentions: input.mentions.clone(),
-                    },
-                    audience: input.audience.clone(),
-                    created_at,
-                },
-                mode,
-            },
-        };
-        let event = match self.append(candidate).await {
-            Ok(event) => event,
-            Err(error) => {
-                // Two exact retries can race between the optimistic lookup
-                // above and SQLite's unique idempotency constraint. Resolve
-                // the winner semantically before reporting a conflict.
-                if let Some(event) = self.existing_message_event(&input).await? {
-                    return self.message_receipt(&event, &expected_recipients).await;
-                }
-                return Err(error);
-            }
-        };
-        self.message_receipt(&event, &expected_recipients).await
-    }
-
-    async fn existing_message_event(
-        &self,
-        input: &NewWorkspaceMessage,
-    ) -> Result<Option<WorkspaceEvent>> {
-        let row = sqlx::query(
-            "select event_json from workspace_events \
-             where workspace_id=? and author_id=? and idempotency_key=?",
-        )
-        .bind(input.workspace_id.to_string())
-        .bind(input.author_id.to_string())
-        .bind(&input.idempotency_key)
-        .fetch_optional(&self.pool)
-        .await?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
-        let event: WorkspaceEvent = serde_json::from_str(row.try_get("event_json")?)?;
-        let matches = matches!(
-            &event.kind,
-            WorkspaceEventKind::Message { message, mode }
-                if event.workspace_id == input.workspace_id
-                    && event.author_id == input.author_id
-                    && message.workspace_id == input.workspace_id
-                    && message.author_id == input.author_id
-                    && message.thread_id == input.thread_id
-                    && message.reply_to_message_id == input.reply_to_message_id
-                    && message.body.text == input.text
-                    && message.body.mentions == input.mentions
-                    && message.audience == input.audience
-                    && *mode == input.mode
-        );
-        ensure!(
-            matches,
-            "idempotency conflict: key was used with a different payload"
-        );
-        Ok(Some(event))
-    }
-
-    async fn message_receipt(
-        &self,
-        event: &WorkspaceEvent,
-        expected_recipients: &[Uuid],
-    ) -> Result<WorkspaceMessageReceipt> {
-        let WorkspaceEventKind::Message { message, mode } = &event.kind else {
-            bail!("workspace message receipt references a non-message event");
-        };
-        let rows = sqlx::query(
-            "select recipient_id from workspace_deliveries \
-             where workspace_id=? and sequence=? order by recipient_id",
-        )
-        .bind(event.workspace_id.to_string())
-        .bind(i64::try_from(event.sequence)?)
-        .fetch_all(&self.pool)
-        .await?;
-        let recipient_ids = rows
-            .into_iter()
-            .map(|row| Uuid::parse_str(row.get("recipient_id")))
-            .collect::<Result<Vec<_>, _>>()?;
-        ensure!(
-            recipient_ids == expected_recipients,
-            "workspace delivery receipt does not match the authorized audience"
-        );
-        Ok(WorkspaceMessageReceipt {
-            message_id: message.id,
-            workspace_id: event.workspace_id,
-            sequence: event.sequence,
-            recipient_ids,
-            mode: *mode,
-        })
+        WorkspaceStore::append_message(self, input).await
     }
 
     pub async fn workspace_threads(
@@ -1276,23 +1541,7 @@ impl SqliteWorkspaceStore {
             .collect()
     }
     fn recipients(a: &Audience, members: &[(Uuid, WorkspaceRole)]) -> Result<Vec<Uuid>> {
-        let mut ids = match a {
-            Audience::Workspace => members.iter().map(|(id, _)| *id).collect(),
-            Audience::Participants { participants } => participants.clone(),
-            Audience::Role { role } => members
-                .iter()
-                .filter_map(|(id, r)| (r == role).then_some(*id))
-                .collect(),
-            Audience::Direct { participant } => vec![*participant],
-        };
-        ids.sort_unstable();
-        ids.dedup();
-        ensure!(!ids.is_empty(), "audience resolves to no members");
-        ensure!(
-            ids.iter().all(|p| members.iter().any(|(id, _)| id == p)),
-            "audience contains a non-member"
-        );
-        Ok(ids)
+        resolve_recipients(a, members)
     }
 
     async fn work_exists(
@@ -1324,17 +1573,53 @@ impl SqliteWorkspaceStore {
         Ok(())
     }
 
-    fn canonical_event(mut event: WorkspaceEvent) -> Result<String> {
-        let epoch = DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch is valid");
-        event.id = Uuid::nil();
-        event.sequence = 0;
-        event.created_at = epoch;
-        if let WorkspaceEventKind::Message { message, .. } = &mut event.kind {
-            message.id = Uuid::nil();
-            message.created_at = epoch;
-        }
-        Ok(serde_json::to_string(&event)?)
+    fn canonical_event(event: WorkspaceEvent) -> Result<String> {
+        canonical_event(event)
     }
+}
+
+/// The canonical form an idempotency key is checked against.
+///
+/// Identity and timestamps are zeroed so a retry of the same logical event
+/// canonicalises identically. Shared by every backend on purpose: two stores
+/// that disagreed here would accept the same message twice.
+pub(crate) fn canonical_event(mut event: WorkspaceEvent) -> Result<String> {
+    let epoch = DateTime::<Utc>::from_timestamp(0, 0).expect("Unix epoch is valid");
+    event.id = Uuid::nil();
+    event.sequence = 0;
+    event.created_at = epoch;
+    if let WorkspaceEventKind::Message { message, .. } = &mut event.kind {
+        message.id = Uuid::nil();
+        message.created_at = epoch;
+    }
+    Ok(serde_json::to_string(&event)?)
+}
+
+/// Resolve an audience to the participants who must receive the event.
+///
+/// Also shared: a backend that resolved an audience differently would deliver
+/// one workspace's message to a different set of people.
+pub(crate) fn resolve_recipients(
+    audience: &Audience,
+    members: &[(Uuid, WorkspaceRole)],
+) -> Result<Vec<Uuid>> {
+    let mut ids = match audience {
+        Audience::Workspace => members.iter().map(|(id, _)| *id).collect(),
+        Audience::Participants { participants } => participants.clone(),
+        Audience::Role { role } => members
+            .iter()
+            .filter_map(|(id, r)| (r == role).then_some(*id))
+            .collect(),
+        Audience::Direct { participant } => vec![*participant],
+    };
+    ids.sort_unstable();
+    ids.dedup();
+    ensure!(!ids.is_empty(), "audience resolves to no members");
+    ensure!(
+        ids.iter().all(|p| members.iter().any(|(id, _)| id == p)),
+        "audience contains a non-member"
+    );
+    Ok(ids)
 }
 
 impl SqliteWorkspaceStore {
@@ -1948,6 +2233,180 @@ impl WorkspaceStore for SqliteWorkspaceStore {
         transaction.commit().await?;
         Ok(())
     }
+    async fn ensure_execution_workspace(
+        &self,
+        workspace_id: Uuid,
+        workspace_name: &str,
+        human_participant_id: Uuid,
+        human_display_name: &str,
+        agent_participant_id: Uuid,
+        agent_display_name: &str,
+    ) -> Result<()> {
+        SqliteWorkspaceStore::ensure_execution_workspace(
+            self,
+            workspace_id,
+            workspace_name,
+            human_participant_id,
+            human_display_name,
+            agent_participant_id,
+            agent_display_name,
+        )
+        .await
+    }
+    async fn ensure_direct_workspace(
+        &self,
+        left_participant_id: Uuid,
+        right_participant_id: Uuid,
+    ) -> Result<Uuid> {
+        SqliteWorkspaceStore::ensure_direct_workspace(
+            self,
+            left_participant_id,
+            right_participant_id,
+        )
+        .await
+    }
+    async fn pending_message_events(
+        &self,
+        workspace_id: Uuid,
+        recipient_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<(WorkspaceEvent, RecipientDelivery)>> {
+        SqliteWorkspaceStore::pending_message_events(self, workspace_id, recipient_id, limit).await
+    }
+    async fn message_deliveries(&self, message_id: Uuid) -> Result<Vec<RecipientDelivery>> {
+        SqliteWorkspaceStore::message_deliveries(self, message_id).await
+    }
+    async fn message_sequence(&self, workspace_id: Uuid, message_id: Uuid) -> Result<Option<u64>> {
+        let sequence: Option<i64> = sqlx::query_scalar(
+            "select sequence from workspace_events \
+             where workspace_id=? and id=? \
+               and json_extract(event_json, '$.kind.type')='message'",
+        )
+        .bind(workspace_id.to_string())
+        .bind(message_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        sequence
+            .map(|sequence| Ok(u64::try_from(sequence)?))
+            .transpose()
+    }
+    async fn upsert_instance(
+        &self,
+        participant: Participant,
+        host_id: Option<Uuid>,
+        workspace_id: Option<Uuid>,
+    ) -> Result<()> {
+        SqliteWorkspaceStore::upsert_instance(self, participant, host_id, workspace_id).await
+    }
+    async fn import_relay_message(
+        &self,
+        message: WorkspaceMessage,
+        author_name: &str,
+        recipient_id: Uuid,
+        mode: DeliveryMode,
+    ) -> Result<WorkspaceEvent> {
+        SqliteWorkspaceStore::import_relay_message(self, message, author_name, recipient_id, mode)
+            .await
+    }
+    async fn upsert_relay_roster_entry(
+        &self,
+        workspace_id: Uuid,
+        participant: Participant,
+        role: WorkspaceRole,
+    ) -> Result<()> {
+        SqliteWorkspaceStore::upsert_relay_roster_entry(self, workspace_id, participant, role).await
+    }
+    async fn list_instances(&self, include_exited: bool) -> Result<Vec<AgentInstance>> {
+        SqliteWorkspaceStore::list_instances(self, include_exited).await
+    }
+    async fn register_local_instance(
+        &self,
+        participant_id: Uuid,
+        workspace_id: Option<Uuid>,
+        cwd: &Path,
+        pid: u32,
+    ) -> Result<()> {
+        SqliteWorkspaceStore::register_local_instance(self, participant_id, workspace_id, cwd, pid)
+            .await
+    }
+    async fn mark_local_instances_exited(&self, participant_ids: &[Uuid]) -> Result<u64> {
+        SqliteWorkspaceStore::mark_local_instances_exited(self, participant_ids).await
+    }
+    async fn contains_message(&self, message_id: Uuid) -> Result<bool> {
+        SqliteWorkspaceStore::contains_message(self, message_id).await
+    }
+    async fn contains_idempotent_event(
+        &self,
+        workspace_id: Uuid,
+        author_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<bool> {
+        SqliteWorkspaceStore::contains_idempotent_event(
+            self,
+            workspace_id,
+            author_id,
+            idempotency_key,
+        )
+        .await
+    }
+    async fn latest_projected_session_sequence(
+        &self,
+        workspace_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<u64> {
+        SqliteWorkspaceStore::latest_projected_session_sequence(self, workspace_id, session_id)
+            .await
+    }
+    async fn participant(&self, participant_id: Uuid) -> Result<Option<Participant>> {
+        SqliteWorkspaceStore::participant(self, participant_id).await
+    }
+    async fn workspace_name(&self, workspace_id: Uuid) -> Result<Option<String>> {
+        SqliteWorkspaceStore::workspace_name(self, workspace_id).await
+    }
+    async fn workspace_roster(
+        &self,
+        workspace_id: Uuid,
+        viewer_id: Uuid,
+    ) -> Result<Vec<WorkspaceRosterEntry>> {
+        SqliteWorkspaceStore::workspace_roster(self, workspace_id, viewer_id).await
+    }
+    async fn list_workspaces_for_participant(
+        &self,
+        participant_id: Uuid,
+    ) -> Result<Vec<Workspace>> {
+        SqliteWorkspaceStore::list_workspaces_for_participant(self, participant_id).await
+    }
+    async fn event_by_idempotency_key(
+        &self,
+        workspace_id: Uuid,
+        author_id: Uuid,
+        idempotency_key: &str,
+    ) -> Result<Option<WorkspaceEvent>> {
+        let row = sqlx::query(
+            "select event_json from workspace_events \
+             where workspace_id=? and author_id=? and idempotency_key=?",
+        )
+        .bind(workspace_id.to_string())
+        .bind(author_id.to_string())
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| Ok(serde_json::from_str(row.try_get("event_json")?)?))
+            .transpose()
+    }
+    async fn delivery_recipients(&self, workspace_id: Uuid, sequence: u64) -> Result<Vec<Uuid>> {
+        let rows = sqlx::query(
+            "select recipient_id from workspace_deliveries \
+             where workspace_id=? and sequence=? order by recipient_id",
+        )
+        .bind(workspace_id.to_string())
+        .bind(i64::try_from(sequence)?)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| Ok(Uuid::parse_str(row.get("recipient_id"))?))
+            .collect()
+    }
     async fn active_presence(&self, w: Uuid, now: DateTime<Utc>) -> Result<Vec<PresenceLease>> {
         sqlx::query("delete from workspace_presence_leases where expires_at<=?")
             .bind(now.to_rfc3339())
@@ -1986,6 +2445,146 @@ mod tests {
         assert_ne!(
             local_human_participant_id("shulgin"),
             local_human_participant_id("teammate")
+        );
+    }
+
+    /// Launch identity must survive so discovery can tell two sessions in
+    /// different checkouts apart, and a dead local row must become reapable.
+    /// Neither was previously possible: only the workspace basename was
+    /// stored, and nothing ever pruned the table.
+    #[tokio::test]
+    async fn local_instances_record_launch_identity_and_can_be_reaped() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteWorkspaceStore::open(file.path()).await.unwrap();
+        let workspace_id = Uuid::new_v4();
+        let human = local_human_participant_id("tester");
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        store
+            .ensure_execution_workspace(workspace_id, "agent", human, "tester", first, "Borg")
+            .await
+            .unwrap();
+        store
+            .ensure_execution_workspace(workspace_id, "agent", human, "tester", second, "Borg")
+            .await
+            .unwrap();
+        store
+            .register_local_instance(first, Some(workspace_id), Path::new("/home/u/agent"), 4242)
+            .await
+            .unwrap();
+        store
+            .register_local_instance(
+                second,
+                Some(workspace_id),
+                Path::new("/home/u/other-agent"),
+                4243,
+            )
+            .await
+            .unwrap();
+
+        let instances = store.list_instances(true).await.unwrap();
+        let find = |id: Uuid| {
+            instances
+                .iter()
+                .find(|instance| instance.participant.id == id)
+                .cloned()
+                .expect("registered instance is listed")
+        };
+        // Same display name, different launch directory: previously
+        // indistinguishable.
+        assert_eq!(find(first).participant.display_name, "Borg");
+        assert_eq!(find(second).participant.display_name, "Borg");
+        assert_eq!(find(first).cwd.as_deref(), Some("/home/u/agent"));
+        assert_eq!(find(second).cwd.as_deref(), Some("/home/u/other-agent"));
+        assert_eq!(find(first).pid, Some(4242));
+        assert!(find(first).exited_at.is_none());
+
+        assert_eq!(
+            store.mark_local_instances_exited(&[first]).await.unwrap(),
+            1
+        );
+        let instances = store.list_instances(true).await.unwrap();
+        let reaped = instances
+            .iter()
+            .find(|instance| instance.participant.id == first)
+            .unwrap();
+        assert!(reaped.exited_at.is_some(), "a reaped row is tombstoned");
+        // Reaping is idempotent, and relaunching the same participant clears
+        // the tombstone rather than leaving it permanently hidden.
+        assert_eq!(
+            store.mark_local_instances_exited(&[first]).await.unwrap(),
+            0
+        );
+        store
+            .register_local_instance(first, Some(workspace_id), Path::new("/home/u/agent"), 5555)
+            .await
+            .unwrap();
+        let instances = store.list_instances(true).await.unwrap();
+        let revived = instances
+            .iter()
+            .find(|instance| instance.participant.id == first)
+            .unwrap();
+        assert!(revived.exited_at.is_none());
+        assert_eq!(revived.pid, Some(5555));
+    }
+
+    /// Reaped rows must be excluded by the query itself. Discovery pays a
+    /// binding lookup and a socket probe for every row it materialises, so
+    /// filtering tombstones in Rust still paid the full per-row cost for the
+    /// bulk of a long-lived database before anything was truncated.
+    #[tokio::test]
+    async fn reaped_instances_are_excluded_by_the_query_not_after_it() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let store = SqliteWorkspaceStore::open(file.path()).await.unwrap();
+        let workspace_id = Uuid::new_v4();
+        let human = local_human_participant_id("tester");
+        let live = Uuid::new_v4();
+        let dead = Uuid::new_v4();
+        for participant_id in [live, dead] {
+            store
+                .ensure_execution_workspace(
+                    workspace_id,
+                    "agent",
+                    human,
+                    "tester",
+                    participant_id,
+                    "Borg",
+                )
+                .await
+                .unwrap();
+            store
+                .register_local_instance(
+                    participant_id,
+                    Some(workspace_id),
+                    Path::new("/home/u/agent"),
+                    7000,
+                )
+                .await
+                .unwrap();
+        }
+        store.mark_local_instances_exited(&[dead]).await.unwrap();
+
+        let advertised = store.list_instances(false).await.unwrap();
+        assert!(
+            advertised
+                .iter()
+                .all(|instance| instance.participant.id != dead),
+            "a reaped instance must not be materialised at all"
+        );
+        assert!(
+            advertised
+                .iter()
+                .any(|instance| instance.participant.id == live)
+        );
+        // It is still reachable when explicitly requested, so reaping hides a
+        // row from discovery without destroying its history.
+        assert!(
+            store
+                .list_instances(true)
+                .await
+                .unwrap()
+                .iter()
+                .any(|instance| instance.participant.id == dead)
         );
     }
 
@@ -2058,7 +2657,7 @@ mod tests {
             .upsert_instance(remote.clone(), Some(host_id), Some(remote_project))
             .await
             .unwrap();
-        let instances = store.list_instances().await.unwrap();
+        let instances = store.list_instances(true).await.unwrap();
         let found = instances
             .iter()
             .filter(|entry| entry.participant.id == remote.id)

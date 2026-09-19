@@ -5826,3 +5826,303 @@ fn dropping_live_only_child_rows_does_not_change_the_reconstructed_roster() {
     assert_eq!(from_journal.status, from_everything.status);
     assert_eq!(from_journal.session_id, from_everything.session_id);
 }
+
+/// What the two backends actually cost on disk for the same history.
+///
+/// The migration's storage claim is not "Postgres is smaller" -- a row store
+/// with per-row headers, a uuid primary key and several indexes starts out
+/// LARGER than SQLite for the same events. The claim is that the cold tier pays
+/// that back: once a thread has gone quiet, its bodies are dictionary-compressed
+/// and the footprint drops below the SQLite baseline. Reporting only the hot
+/// number, or only the cold one, would each be a half-truth, so this prints all
+/// three and the ratios between them.
+///
+/// Both backends are written through `append`, not raw inserts, so each pays
+/// its real per-event cost including projections and indexes.
+#[tokio::test]
+#[ignore = "explicit storage footprint comparison against the SQLite baseline"]
+async fn storage_footprint_profile() {
+    const SESSIONS: usize = 12;
+    const EVENTS_PER_SESSION: u64 = 150;
+
+    let Some(url) = crate::session_store::postgres::testing::test_url() else {
+        eprintln!("storage footprint: skipping, BORG_TEST_SESSIONS_URL is not set");
+        return;
+    };
+
+    // Bodies shaped like real agent traffic: repeated structure with varying
+    // detail. Uniform filler would flatter the dictionary; wholly random text
+    // would defeat it. Neither would say anything about production.
+    fn event_for(session_id: Uuid, sequence: u64) -> SessionEvent {
+        let kind = match sequence % 5 {
+            1 => SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: format!(
+                    "run the failing integration test for module {} and report the first error",
+                    sequence
+                ),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Queue),
+            },
+            2 => SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: format!(
+                    "I ran the suite for module {sequence}. 3 tests failed, all in the \
+                     serialisation path; the first is `decode_rejects_truncated_body`, which \
+                     expects an error and receives Ok(()). I will look at the decoder next."
+                ),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+            _ => SessionEventKind::Error {
+                message: format!(
+                    "tool `cargo test -p module-{sequence}` exited with status 101: \
+                     thread 'decode_rejects_truncated_body' panicked at src/decode.rs:214: \
+                     assertion failed: result.is_err()"
+                ),
+            },
+        };
+        SessionEvent::new(session_id, sequence, kind)
+    }
+
+    async fn fill(store: &dyn SessionStore) {
+        for _ in 0..SESSIONS {
+            let session_id = Uuid::new_v4();
+            store.create_session(session_id).await.expect("create");
+            store
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    SessionEventKind::SessionStarted,
+                ))
+                .await
+                .expect("started");
+            for sequence in 2..=EVENTS_PER_SESSION {
+                store
+                    .append(event_for(session_id, sequence))
+                    .await
+                    .expect("append");
+            }
+        }
+    }
+
+    let total_events = SESSIONS as u64 * EVENTS_PER_SESSION;
+
+    let directory = tempdir().expect("temp dir");
+    let path = directory.path().join("sessions.sqlite3");
+    let sqlite = SqliteSessionStore::open(&path).await.expect("sqlite");
+    fill(&sqlite).await;
+    // Vacuum both engines before measuring. Comparing a compacted database to
+    // an uncompacted one measures when each was last tidied, not what the data
+    // costs -- an earlier version of this benchmark did exactly that and
+    // reported a negative footprint.
+    sqlite.compact(true).await.expect("sqlite vacuum");
+    let sqlite_bytes = std::fs::metadata(&path).expect("sqlite metadata").len() as i64;
+
+    let scratch = crate::session_store::postgres::testing::ScratchDatabase::create(&url).await;
+    let postgres = crate::session_store::postgres::PostgresSessionStore::connect_with_pool_size(
+        &scratch.url,
+        4,
+    )
+    .await
+    .expect("postgres");
+    fill(&postgres).await;
+
+    /// Bytes held by the session tables and their indexes.
+    ///
+    /// Summed per relation rather than taken from `pg_database_size`, which
+    /// also counts the system catalogs every database carries whether or not it
+    /// holds a single event.
+    async fn session_bytes(store: &crate::session_store::postgres::PostgresSessionStore) -> i64 {
+        sqlx::query_scalar(
+            "select coalesce(sum(pg_total_relation_size(c.oid)), 0)::bigint \
+             from pg_class c join pg_namespace n on n.oid = c.relnamespace \
+             where n.nspname = 'public' and c.relkind = 'r' \
+               and c.relname in ('sessions', 'session_events', 'session_payloads', \
+                                 'session_actions', 'session_action_transitions', \
+                                 'session_event_dicts')",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("session bytes")
+    }
+
+    sqlx::query("vacuum full")
+        .execute(postgres.pool())
+        .await
+        .ok();
+    let hot = session_bytes(&postgres).await;
+
+    // Force the cold tier: a cutoff in the future ages every session, which is
+    // what a real journal reaches seven days after a thread goes quiet.
+    let aged = postgres
+        .age_cold_sessions(Utc::now() + chrono::Duration::days(1), SESSIONS * 2)
+        .await
+        .expect("age");
+    sqlx::query("vacuum full")
+        .execute(postgres.pool())
+        .await
+        .ok();
+    let cold = session_bytes(&postgres).await;
+
+    let per_event = |bytes: i64| bytes as f64 / total_events as f64;
+    eprintln!("storage footprint over {total_events} events across {SESSIONS} sessions");
+    eprintln!(
+        "  sqlite         {sqlite_bytes:>10} bytes  ({:6.1} B/event)",
+        per_event(sqlite_bytes)
+    );
+    eprintln!(
+        "  postgres hot   {hot:>10} bytes  ({:6.1} B/event)  {:.2}x sqlite",
+        per_event(hot),
+        hot as f64 / sqlite_bytes as f64
+    );
+    eprintln!(
+        "  postgres cold  {cold:>10} bytes  ({:6.1} B/event)  {:.2}x sqlite, {:.2}x hot",
+        per_event(cold),
+        cold as f64 / sqlite_bytes as f64,
+        cold as f64 / hot as f64
+    );
+    eprintln!(
+        "  bodies: {} -> {} bytes ({:.2}x) over {} events in {} sessions",
+        aged.bytes_before,
+        aged.bytes_after,
+        aged.bytes_before as f64 / aged.bytes_after.max(1) as f64,
+        aged.events_compressed,
+        aged.sessions_aged
+    );
+
+    assert!(
+        cold < hot,
+        "the cold tier must shrink the footprint: hot {hot}, cold {cold}"
+    );
+
+    scratch.discard().await;
+}
+
+/// Does adding writers add throughput? This is the migration's central claim.
+///
+/// SQLite permits one writer per FILE, so concurrent agents appending to
+/// DIFFERENT sessions still queue behind each other -- throughput is flat no
+/// matter how many are added. Postgres serialises per session ROW, via
+/// `select ... for update` in the sequence allocator, so those same writers
+/// proceed in parallel.
+///
+/// Each writer owns its own session on purpose. Writers sharing one session
+/// SHOULD serialise on both backends; that is the sequence contract working,
+/// not contention, and measuring it would prove nothing about the file lock.
+#[tokio::test]
+#[ignore = "explicit concurrent-writer scaling comparison"]
+async fn concurrent_writer_scaling_profile() {
+    const APPENDS_PER_WRITER: u64 = 60;
+    const WRITER_COUNTS: [usize; 5] = [1, 4, 8, 16, 32];
+
+    async fn throughput(store: Arc<dyn SessionStore>, writers: usize) -> f64 {
+        let mut sessions = Vec::with_capacity(writers);
+        for _ in 0..writers {
+            let session_id = Uuid::new_v4();
+            store.create_session(session_id).await.expect("create");
+            store
+                .append(SessionEvent::new(
+                    session_id,
+                    0,
+                    SessionEventKind::SessionStarted,
+                ))
+                .await
+                .expect("started");
+            sessions.push(session_id);
+        }
+
+        let started = Instant::now();
+        let mut tasks = Vec::with_capacity(writers);
+        for session_id in sessions {
+            let store = Arc::clone(&store);
+            tasks.push(tokio::spawn(async move {
+                for sequence in 2..=(APPENDS_PER_WRITER + 1) {
+                    store
+                        .append(SessionEvent::new(
+                            session_id,
+                            sequence,
+                            SessionEventKind::Error {
+                                message: "concurrent writer fixture".to_string(),
+                            },
+                        ))
+                        .await
+                        .expect("append");
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.expect("writer");
+        }
+        let elapsed = started.elapsed();
+        (writers as u64 * APPENDS_PER_WRITER) as f64 / elapsed.as_secs_f64()
+    }
+
+    let mut report: Vec<(&str, Vec<f64>)> = Vec::new();
+
+    let directory = tempdir().expect("temp dir");
+    let sqlite: Arc<dyn SessionStore> = Arc::new(
+        SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .expect("sqlite"),
+    );
+    let mut sqlite_rates = Vec::new();
+    for writers in WRITER_COUNTS {
+        sqlite_rates.push(throughput(Arc::clone(&sqlite), writers).await);
+    }
+    report.push(("sqlite", sqlite_rates));
+
+    let scratch = match crate::session_store::postgres::testing::test_url() {
+        Some(url) => {
+            Some(crate::session_store::postgres::testing::ScratchDatabase::create(&url).await)
+        }
+        None => {
+            eprintln!("concurrent writers: skipping postgres, BORG_TEST_SESSIONS_URL is not set");
+            None
+        }
+    };
+    if let Some(scratch) = &scratch {
+        // One connection per writer, or the pool becomes the bottleneck being
+        // measured instead of the lock.
+        let postgres: Arc<dyn SessionStore> = Arc::new(
+            crate::session_store::postgres::PostgresSessionStore::connect_with_pool_size(
+                &scratch.url,
+                40,
+            )
+            .await
+            .expect("postgres"),
+        );
+        let mut rates = Vec::new();
+        for writers in WRITER_COUNTS {
+            rates.push(throughput(Arc::clone(&postgres), writers).await);
+        }
+        report.push(("postgres", rates));
+    }
+
+    eprintln!("concurrent writer scaling, {APPENDS_PER_WRITER} appends per writer:");
+    for (name, rates) in &report {
+        let baseline = rates[0];
+        let cells: Vec<String> = WRITER_COUNTS
+            .iter()
+            .zip(rates)
+            .map(|(writers, rate)| format!("{writers}w {rate:8.1}/s ({:.2}x)", rate / baseline))
+            .collect();
+        eprintln!("  {name:<9} {}", cells.join("   "));
+    }
+
+    if let Some(scratch) = scratch {
+        let postgres_rates = &report[1].1;
+        let scaling = postgres_rates[postgres_rates.len() - 1] / postgres_rates[0];
+        assert!(
+            scaling > 1.5,
+            "postgres must gain throughput from concurrent writers on distinct \
+             sessions, got {scaling:.2}x at {} writers",
+            WRITER_COUNTS[WRITER_COUNTS.len() - 1]
+        );
+        scratch.discard().await;
+    }
+}

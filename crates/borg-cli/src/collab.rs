@@ -24,8 +24,8 @@ use uuid::Uuid;
 
 use borg_remote::{
     ApprovalDecision, EventActor, HostCommand, MessageStatus, PromptDelivery, SessionEvent,
-    SessionEventKind, SessionStore, SqliteSessionStore, default_host_config_path,
-    send_local_session_command, session_control_socket_path,
+    SessionEventKind, default_host_config_path, send_local_session_command,
+    session_control_socket_path,
 };
 use futures_util::{SinkExt, StreamExt};
 
@@ -425,7 +425,15 @@ async fn host(session_id: Uuid, relay: &str) -> Result<()> {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("sessions");
-    let store = Arc::new(SqliteSessionStore::open(sessions_dir.join("sessions.sqlite3")).await?);
+    let store = Arc::clone(
+        borg_remote::session_store::factory::open(
+            &borg_remote::session_store::factory::SessionStoreConfig::from_env(
+                sessions_dir.join("sessions.sqlite3"),
+            ),
+        )
+        .await?
+        .session(),
+    );
     anyhow::ensure!(
         store.contains_session(session_id).await?,
         "local session {session_id} does not exist"

@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::receipt::{ReceiptState, SqliteReceiptStore};
+use crate::receipt::{ReceiptBackend, ReceiptState, SqliteReceiptStore};
 use crate::receipt_postgres::PostgresReceiptStore;
 use crate::session_store::postgres::PostgresSessionStore;
 use crate::session_store::postgres::testing::{ScratchDatabase, test_url};
@@ -23,29 +23,14 @@ struct Response {
     ok: bool,
 }
 
-enum Store {
-    Sqlite(SqliteReceiptStore),
-    Postgres(PostgresReceiptStore),
-}
-
-macro_rules! dispatch {
-    ($store:expr, $method:ident ( $($arg:expr),* $(,)? )) => {
-        match $store {
-            Store::Sqlite(store) => store.$method($($arg),*).await,
-            Store::Postgres(store) => store.$method($($arg),*).await,
-        }
-    };
-    ($store:expr, $method:ident :: <$($ty:ty),+> ( $($arg:expr),* $(,)? )) => {
-        match $store {
-            Store::Sqlite(store) => store.$method::<$($ty),+>($($arg),*).await,
-            Store::Postgres(store) => store.$method::<$($ty),+>($($arg),*).await,
-        }
-    };
-}
-
+/// Both backends are driven through `dyn ReceiptBackend`, the same dispatch
+/// production uses. This suite previously matched on an enum because no shared
+/// trait existed; testing through the trait also covers the typed `load`/
+/// `begin`/`finish` wrappers, which are where the request and response types
+/// are erased and restored -- the part most likely to differ between engines.
 struct Harness {
     name: &'static str,
-    store: Store,
+    store: Box<dyn ReceiptBackend>,
     _directory: Option<tempfile::TempDir>,
     scratch: Option<ScratchDatabase>,
 }
@@ -69,19 +54,19 @@ async fn harnesses() -> Vec<Harness> {
         .expect("open sqlite receipt store");
     harnesses.push(Harness {
         name: "sqlite",
-        store: Store::Sqlite(sqlite),
+        store: Box::new(sqlite),
         _directory: Some(directory),
         scratch: None,
     });
 
     if let Some(url) = test_url() {
         let scratch = ScratchDatabase::create(&url).await;
-        let session = PostgresSessionStore::connect(&scratch.url)
+        let session = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
             .await
             .expect("bootstrap postgres schema");
         harnesses.push(Harness {
             name: "postgres",
-            store: Store::Postgres(PostgresReceiptStore::from_pool(session.pool().clone())),
+            store: Box::new(PostgresReceiptStore::from_pool(session.pool().clone())),
             _directory: None,
             scratch: Some(scratch),
         });
@@ -107,17 +92,27 @@ async fn a_mutation_is_recorded_once_and_replays_its_response() {
 
         assert!(
             matches!(
-                dispatch!(&harness.store, load::<Request, Response>(request_id, &request))
+                harness
+                    .store
+                    .load::<Request, Response>(request_id, &request)
+                    .await
                     .expect("load"),
                 ReceiptState::Missing
             ),
             "[{name}] an unknown receipt is absent, not an error"
         );
 
-        dispatch!(&harness.store, begin(request_id, &request)).expect("begin");
+        harness
+            .store
+            .begin(request_id, &request)
+            .await
+            .expect("begin");
         assert!(
             matches!(
-                dispatch!(&harness.store, load::<Request, Response>(request_id, &request))
+                harness
+                    .store
+                    .load::<Request, Response>(request_id, &request)
+                    .await
                     .expect("load"),
                 ReceiptState::Started
             ),
@@ -126,13 +121,21 @@ async fn a_mutation_is_recorded_once_and_replays_its_response() {
 
         // Repeating the intent is a no-op, so a crash between begin and finish
         // is recoverable rather than fatal.
-        dispatch!(&harness.store, begin(request_id, &request)).expect("re-begin");
+        harness
+            .store
+            .begin(request_id, &request)
+            .await
+            .expect("re-begin");
 
         let response = Response { ok: true };
-        dispatch!(&harness.store, finish(request_id, &request, &response)).expect("finish");
+        harness
+            .store
+            .finish(request_id, &request, &response)
+            .await
+            .expect("finish");
         assert!(
             matches!(
-                dispatch!(&harness.store, load::<Request, Response>(request_id, &request))
+                harness.store.load::<Request, Response>(request_id, &request).await
                     .expect("load"),
                 ReceiptState::Terminal(ref stored) if *stored == response
             ),
@@ -143,18 +146,22 @@ async fn a_mutation_is_recorded_once_and_replays_its_response() {
         let different = request_for("/tmp/other");
         assert!(
             matches!(
-                dispatch!(
-                    &harness.store,
-                    load::<Request, Response>(request_id, &different)
-                )
-                .expect("load"),
+                harness
+                    .store
+                    .load::<Request, Response>(request_id, &different)
+                    .await
+                    .expect("load"),
                 ReceiptState::Conflict
             ),
             "[{name}]"
         );
 
         // Re-finishing identically is a replay, not a second mutation.
-        dispatch!(&harness.store, finish(request_id, &request, &response)).expect("re-finish");
+        harness
+            .store
+            .finish(request_id, &request, &response)
+            .await
+            .expect("re-finish");
         harness.discard().await;
     }
 }
@@ -165,26 +172,34 @@ async fn a_receipt_id_cannot_be_reused_for_different_work() {
         let name = harness.name;
         let request_id = Uuid::new_v4();
         let request = request_for("/tmp/original");
-        dispatch!(&harness.store, begin(request_id, &request)).expect("begin");
+        harness
+            .store
+            .begin(request_id, &request)
+            .await
+            .expect("begin");
 
         // The receipt IS the mutation's identity, so the same id describing a
         // different action must be refused rather than silently accepted.
         let other = request_for("/tmp/something-else");
         assert!(
-            dispatch!(&harness.store, begin(request_id, &other)).is_err(),
+            harness.store.begin(request_id, &other).await.is_err(),
             "[{name}] a reused receipt id with a different request must be refused"
         );
 
         let response = Response { ok: true };
-        dispatch!(&harness.store, finish(request_id, &request, &response)).expect("finish");
+        harness
+            .store
+            .finish(request_id, &request, &response)
+            .await
+            .expect("finish");
         // And a published outcome must not be rewritten: a caller may already
         // have acted on it.
         assert!(
-            dispatch!(
-                &harness.store,
-                finish(request_id, &request, &Response { ok: false })
-            )
-            .is_err(),
+            harness
+                .store
+                .finish(request_id, &request, &Response { ok: false })
+                .await
+                .is_err(),
             "[{name}] a completed receipt must not be re-published with a new response"
         );
         harness.discard().await;
@@ -198,11 +213,15 @@ async fn finishing_without_a_recorded_intent_still_leaves_a_complete_audit() {
         let request_id = Uuid::new_v4();
         let request = request_for("/tmp/direct");
         let response = Response { ok: true };
-        dispatch!(&harness.store, finish(request_id, &request, &response)).expect("finish");
+        harness
+            .store
+            .finish(request_id, &request, &response)
+            .await
+            .expect("finish");
 
         assert!(
             matches!(
-                dispatch!(&harness.store, load::<Request, Response>(request_id, &request))
+                harness.store.load::<Request, Response>(request_id, &request).await
                     .expect("load"),
                 ReceiptState::Terminal(ref stored) if *stored == response
             ),
@@ -221,35 +240,38 @@ async fn the_host_queue_is_ordered_idempotent_and_quarantinable() {
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
 
-        dispatch!(
-            &harness.store,
-            enqueue_host_operation(host, first, &serde_json::json!({"cmd": "one"}))
-        )
-        .expect("enqueue");
-        dispatch!(
-            &harness.store,
-            enqueue_host_operation(host, second, &serde_json::json!({"cmd": "two"}))
-        )
-        .expect("enqueue");
+        harness
+            .store
+            .enqueue_host_operation(host, first, &serde_json::json!({"cmd": "one"}))
+            .await
+            .expect("enqueue");
+        harness
+            .store
+            .enqueue_host_operation(host, second, &serde_json::json!({"cmd": "two"}))
+            .await
+            .expect("enqueue");
 
         // Re-enqueueing the same command is a retry; the same id naming
         // different work is a bug.
-        dispatch!(
-            &harness.store,
-            enqueue_host_operation(host, first, &serde_json::json!({"cmd": "one"}))
-        )
-        .expect("re-enqueue");
+        harness
+            .store
+            .enqueue_host_operation(host, first, &serde_json::json!({"cmd": "one"}))
+            .await
+            .expect("re-enqueue");
         assert!(
-            dispatch!(
-                &harness.store,
-                enqueue_host_operation(host, first, &serde_json::json!({"cmd": "different"}))
-            )
-            .is_err(),
+            harness
+                .store
+                .enqueue_host_operation(host, first, &serde_json::json!({"cmd": "different"}))
+                .await
+                .is_err(),
             "[{name}]"
         );
 
         // FIFO: the oldest live command comes first.
-        let (next_id, command) = dispatch!(&harness.store, next_host_operation(host))
+        let (next_id, command) = harness
+            .store
+            .next_host_operation(host)
+            .await
             .expect("next")
             .expect("queued command");
         assert_eq!(next_id, first, "[{name}] the queue is ordered");
@@ -257,34 +279,57 @@ async fn the_host_queue_is_ordered_idempotent_and_quarantinable() {
 
         // Another host sees none of it.
         assert!(
-            dispatch!(&harness.store, next_host_operation(other_host))
+            harness
+                .store
+                .next_host_operation(other_host)
+                .await
                 .expect("next")
                 .is_none(),
             "[{name}] a queue is scoped to its host"
         );
         assert!(
-            dispatch!(&harness.store, queued_host_operation(other_host, first))
+            harness
+                .store
+                .queued_host_operation(other_host, first)
+                .await
                 .expect("queued")
                 .is_none(),
             "[{name}]"
         );
 
-        dispatch!(&harness.store, finish_host_operation(host, first)).expect("finish");
-        let (next_id, _) = dispatch!(&harness.store, next_host_operation(host))
+        harness
+            .store
+            .finish_host_operation(host, first)
+            .await
+            .expect("finish");
+        let (next_id, _) = harness
+            .store
+            .next_host_operation(host)
+            .await
             .expect("next")
             .expect("queued command");
         assert_eq!(next_id, second, "[{name}] finishing advances the queue");
 
         // A quarantined command stops blocking the head without being lost.
-        dispatch!(&harness.store, quarantine_host_operation(host, second)).expect("quarantine");
+        harness
+            .store
+            .quarantine_host_operation(host, second)
+            .await
+            .expect("quarantine");
         assert!(
-            dispatch!(&harness.store, next_host_operation(host))
+            harness
+                .store
+                .next_host_operation(host)
+                .await
                 .expect("next")
                 .is_none(),
             "[{name}] a quarantined command is not served"
         );
         assert!(
-            dispatch!(&harness.store, queued_host_operation(host, second))
+            harness
+                .store
+                .queued_host_operation(host, second)
+                .await
                 .expect("queued")
                 .is_none(),
             "[{name}]"

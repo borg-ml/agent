@@ -14,7 +14,7 @@
 //! cold tier yet; the codec exists so ageing history into it later is a
 //! per-row operation that needs no schema change and no rewrite of hot rows.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 /// Compression level for the cold tier. 19 is near the top of zstd's normal
 /// range: cold rows are written once by a background ager and then read rarely,
@@ -97,6 +97,10 @@ pub fn compress(json: &[u8], dictionary: Option<&EventDictionary>) -> Result<Sto
     })
 }
 
+/// zstd frame magic, little endian. Bytes not starting with this were stored
+/// verbatim rather than compressed.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
 /// Decode a cold-tier body.
 ///
 /// The dictionary must be the one named by the row's `dict_id`; zstd rejects a
@@ -104,6 +108,24 @@ pub fn compress(json: &[u8], dictionary: Option<&EventDictionary>) -> Result<Sto
 /// rather than papered over, because a body that cannot be decoded is a
 /// corrupted journal entry and must not read as an empty event.
 pub fn decompress(bytes: &[u8], dictionary: Option<&EventDictionary>) -> Result<Vec<u8>> {
+    // A body that is not a zstd frame is stored verbatim, which the schema has
+    // always documented as the meaning of `dict_id is null`. The hot tier uses
+    // it for an event whose body contains a NUL: `jsonb` cannot hold one, so
+    // the row falls back to raw UTF-8 JSON bytes rather than losing the byte.
+    //
+    // Discriminated by content rather than by a flag column, so the
+    // representation stays self-describing -- but NOT by "anything that is not
+    // a frame", which would turn corrupt bytes into a body and defer the
+    // failure to some later parse. An event body is always a JSON object, so
+    // requiring that shape keeps garbage rejected here, where the error can
+    // still say what was wrong.
+    if !bytes.starts_with(&ZSTD_MAGIC) {
+        ensure!(
+            bytes.first().is_some_and(|byte| *byte == b'{'),
+            "event body is neither a zstd frame nor a JSON object"
+        );
+        return Ok(bytes.to_vec());
+    }
     let capacity = decompressed_capacity(bytes)?;
     match dictionary {
         Some(dictionary) => {
@@ -113,7 +135,9 @@ pub fn decompress(bytes: &[u8], dictionary: Option<&EventDictionary>) -> Result<
                 .decompress(bytes, capacity)
                 .context("failed to decompress an event body with its dictionary")
         }
-        None => zstd::bulk::decompress(bytes, capacity).context("failed to decompress an event body"),
+        None => {
+            zstd::bulk::decompress(bytes, capacity).context("failed to decompress an event body")
+        }
     }
 }
 
@@ -129,7 +153,8 @@ fn decompressed_capacity(bytes: &[u8]) -> Result<usize> {
     else {
         bail!("compressed event body has no recorded content size");
     };
-    let size = usize::try_from(size).context("compressed event body is larger than this machine")?;
+    let size =
+        usize::try_from(size).context("compressed event body is larger than this machine")?;
     if size > MAX_DECOMPRESSED_BYTES {
         bail!("compressed event body claims an implausible size of {size} bytes");
     }
@@ -178,8 +203,8 @@ mod tests {
     #[test]
     fn a_body_round_trips_without_a_dictionary() {
         let body = corpus(1).remove(0);
-        let StoredBody::Compressed { bytes, dict_id } =
-            compress(&body, None).expect("compress") else {
+        let StoredBody::Compressed { bytes, dict_id } = compress(&body, None).expect("compress")
+        else {
             panic!("compress must produce a cold body");
         };
         assert_eq!(dict_id, None, "no dictionary means no dict_id to record");
@@ -195,7 +220,8 @@ mod tests {
         };
         let body = corpus(1).remove(0);
         let StoredBody::Compressed { bytes, dict_id } =
-            compress(&body, Some(&dictionary)).expect("compress") else {
+            compress(&body, Some(&dictionary)).expect("compress")
+        else {
             panic!("compress must produce a cold body");
         };
         assert_eq!(
@@ -228,7 +254,8 @@ mod tests {
             };
             plain += bytes.len();
             let StoredBody::Compressed { bytes, .. } =
-                compress(body, Some(&dictionary)).expect("compress") else {
+                compress(body, Some(&dictionary)).expect("compress")
+            else {
                 panic!("cold body expected");
             };
             with_dictionary += bytes.len();
@@ -257,7 +284,8 @@ mod tests {
         };
         let body = corpus(1).remove(0);
         let StoredBody::Compressed { bytes, .. } =
-            compress(&body, Some(&dictionary)).expect("compress") else {
+            compress(&body, Some(&dictionary)).expect("compress")
+        else {
             panic!("cold body expected");
         };
         // A silently wrong body would be worse than a loud failure: it would
@@ -277,14 +305,32 @@ mod tests {
         assert!(cold.is_compressed());
     }
 
-
     #[test]
     fn training_refuses_an_empty_corpus() {
         assert!(train_dictionary(&[], DICTIONARY_TARGET_BYTES).is_err());
     }
 
+    /// Garbage is still refused, but a verbatim JSON body is not garbage.
+    ///
+    /// The hot tier stores an event whose body contains a NUL as raw JSON
+    /// bytes, because `jsonb` cannot hold a NUL. So "not a zstd frame" can no
+    /// longer mean "corrupt" on its own; the discriminator is whether the
+    /// bytes are a JSON object.
     #[test]
-    fn a_body_that_is_not_a_zstd_frame_is_rejected() {
-        assert!(decompress(b"not a zstd frame at all", None).is_err());
+    fn a_body_is_either_a_zstd_frame_or_verbatim_json() {
+        assert!(
+            decompress(b"not a zstd frame at all", None).is_err(),
+            "arbitrary bytes are still refused"
+        );
+        assert!(
+            decompress(b"", None).is_err(),
+            "an empty body is refused rather than read as nothing"
+        );
+        let verbatim = br#"{"kind":"probe"}"#;
+        assert_eq!(
+            decompress(verbatim, None).expect("verbatim json"),
+            verbatim.to_vec(),
+            "a JSON object stored verbatim reads back unchanged"
+        );
     }
 }

@@ -35,7 +35,7 @@ pub(crate) const SESSION_PAYLOAD_PREVIEW_BYTES: usize = 4 * 1024;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) const SQLITE_SCHEMA_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_WRITE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
-const PROMPT_ADMISSION_SESSION_READY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const PROMPT_ADMISSION_SESSION_READY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_WRITE_TRANSACTION: &str = "BEGIN IMMEDIATE";
 const SQLITE_JOURNAL_SIZE_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -320,8 +320,8 @@ pub(crate) const MAX_HISTORY_SCAN_LIMIT: usize = 100_000;
 pub(crate) const DEFAULT_HISTORY_PAYLOAD_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_HISTORY_PAYLOAD_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_HISTORY_QUERY_BYTES: usize = 8 * 1024;
-pub(crate) const MAX_RUNTIME_CHECKPOINT_BYTES: usize = 512 * 1024;
-pub(crate) const HARNESS_CHECKPOINT_PREFIX: &str = "__borg_harness__";
+pub const MAX_RUNTIME_CHECKPOINT_BYTES: usize = 512 * 1024;
+pub const HARNESS_CHECKPOINT_PREFIX: &str = "__borg_harness__";
 
 fn historical_projection_json(
     sequence: u64,
@@ -339,18 +339,18 @@ fn historical_projection_json(
 /// Version of the durable runtime namespace manifest. The manifest describes
 /// how to reconnect to a trusted runtime; it is not a second semantic-memory
 /// store and never makes arbitrary code replay implicit.
-pub(crate) const RUNTIME_MANIFEST_VERSION: u32 = 1;
+pub const RUNTIME_MANIFEST_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum RuntimeManifestStatus {
+pub enum RuntimeManifestStatus {
     Running,
     Stopped,
     Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RuntimeManifest {
+pub struct RuntimeManifest {
     pub manifest_version: u32,
     pub session_id: Uuid,
     pub runtime: String,
@@ -366,7 +366,7 @@ pub(crate) struct RuntimeManifest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct RuntimeCheckpoint {
+pub struct RuntimeCheckpoint {
     pub session_id: Uuid,
     pub key: String,
     pub state: serde_json::Value,
@@ -376,7 +376,7 @@ pub(crate) struct RuntimeCheckpoint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RuntimeManifestActivation {
+pub struct RuntimeManifestActivation {
     pub manifest: RuntimeManifest,
     pub recovered_from_previous_worker: bool,
 }
@@ -1336,6 +1336,42 @@ impl SessionState {
     }
 }
 
+/// One event row exactly as stored, for verbatim copying between backends.
+///
+/// Distinct from `SessionEvent`, which is the DECODED event. A migration that
+/// re-encodes an event necessarily re-applies today's rules to history written
+/// under older ones; this carries the stored row instead, including the
+/// projection checkpoint and the flags that were computed when it was written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawSessionEvent {
+    pub sequence: u64,
+    pub event_id: Uuid,
+    pub event_kind: String,
+    /// The stored body, decoded from whichever tier holds it.
+    pub body: serde_json::Value,
+    /// Empty for non-checkpoint rows, exactly as stored.
+    pub projection_json: String,
+    pub fork_inheritable: bool,
+    pub recovery_relevant: bool,
+    pub message_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// One session's identity and lineage, for a full resumable scan.
+///
+/// Distinct from `SessionSummary`, which omits `owner_session_id` and lists
+/// only top-level sessions. Migration must see every row -- in the journal this
+/// was built against, 548 of 1,144 sessions are subagent-owned, so listing only
+/// top-level ones would silently drop nearly half the history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionLineage {
+    pub session_id: Uuid,
+    pub parent_session_id: Option<Uuid>,
+    pub parent_cut_sequence: Option<u64>,
+    pub inherited_event_count: u64,
+    pub owner_session_id: Option<Uuid>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionStoreFork {
     pub session_id: Uuid,
@@ -1709,18 +1745,349 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<Option<SessionWorkspaceBinding>> {
         Ok(None)
     }
-    /// Return the durable autonomous runtime journal when this session store
-    /// is backed by SQLite. Other implementations may leave it unavailable.
-    async fn autonomy_store(&self) -> Result<Option<crate::SqliteAutonomyStore>> {
+    /// Return the durable autonomous runtime journal on the same authority as
+    /// this store, when it has one. Optional so the trait keeps a small
+    /// in-memory test seam; the store factory refuses a production backend that
+    /// answers `None`, because a missing tier is retried forever rather than
+    /// reported.
+    async fn autonomy_store(
+        &self,
+    ) -> Result<Option<std::sync::Arc<dyn crate::autonomy::AutonomyStore>>> {
         Ok(None)
     }
     /// Return the workspace projection on the same durable authority when the
     /// store supports it. Keeping this optional preserves the trait's small
     /// in-memory test seam without allowing production sessions to silently
     /// create a second workspace database.
-    async fn workspace_store(&self) -> Result<Option<crate::SqliteWorkspaceStore>> {
+    async fn workspace_store(&self) -> Result<Option<std::sync::Arc<dyn crate::WorkspaceStore>>> {
         Ok(None)
     }
+
+    // The persistent-runtime tier: manifests, checkpoints and harness state.
+    //
+    // These are REQUIRED rather than defaulted on purpose. A default that
+    // returned "unavailable" would let a half-ported backend compile and start,
+    // and the failure would surface much later as a session that silently
+    // forgets its harness state between turns -- the hardest class of bug this
+    // migration can produce. Making them required means the compiler, not
+    // production, tells you a backend is incomplete.
+    /// Claim this session's runtime manifest for `worker_id`, reporting whether
+    /// it was taken over from a worker that died without stopping cleanly.
+    async fn activate_runtime_manifest(
+        &self,
+        session_id: Uuid,
+        runtime: &str,
+        root: &str,
+        command: &str,
+        worker_id: Uuid,
+    ) -> Result<RuntimeManifestActivation>;
+    /// Record one execution against a manifest this worker still owns. Fails
+    /// when the manifest has since been claimed by another worker.
+    async fn record_runtime_execution(
+        &self,
+        session_id: Uuid,
+        worker_id: Uuid,
+        code_hash: &str,
+        worker_failed: bool,
+        error: Option<&str>,
+    ) -> Result<()>;
+    /// Mark this worker's manifest stopped; fenced on `worker_id`.
+    async fn stop_runtime_manifest(&self, session_id: Uuid, worker_id: Uuid) -> Result<()>;
+    /// This session's runtime manifest, if it was ever activated.
+    async fn runtime_manifest(&self, session_id: Uuid) -> Result<Option<RuntimeManifest>>;
+    /// Save a named checkpoint. Idempotent for identical content, an error for
+    /// a differing body under a key that already exists.
+    async fn save_runtime_checkpoint(
+        &self,
+        session_id: Uuid,
+        worker_id: Uuid,
+        key: &str,
+        state: &serde_json::Value,
+    ) -> Result<RuntimeCheckpoint>;
+    /// One checkpoint by key, or the newest non-harness one when `key` is None.
+    async fn runtime_checkpoint(
+        &self,
+        session_id: Uuid,
+        key: Option<&str>,
+    ) -> Result<Option<RuntimeCheckpoint>>;
+    /// The most recent checkpoints for a session, newest first.
+    async fn list_runtime_checkpoints(
+        &self,
+        session_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<RuntimeCheckpoint>>;
+    /// The newest harness state for this session.
+    async fn load_harness_state(&self, session_id: Uuid) -> Result<Option<serde_json::Value>>;
+    /// Append a new harness state revision, pruning all but the last twelve.
+    async fn save_harness_state(&self, session_id: Uuid, state: &serde_json::Value) -> Result<()>;
+    /// Rewind harness state by `steps` revisions and re-save it as the newest.
+    async fn rollback_harness_state(
+        &self,
+        session_id: Uuid,
+        steps: usize,
+    ) -> Result<serde_json::Value>;
+
+    // Harness routing. A transcript has exactly one owner -- Borg's harness or
+    // the provider's CLI -- and only the owner can replay it, so these pin a
+    // route durably rather than recomputing it per turn.
+    /// Index documents after `sequence`, for the agent-facing history index.
+    async fn history_index_documents_after(
+        &self,
+        session_id: Uuid,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionHistoryIndexDocument>>;
+    // The workflow tier. A workflow id admits exactly once, its durable action
+    // is created already running, and terminal events are fenced on the lease.
+    /// Return this workflow's durable action, creating it if it is new.
+    async fn ensure_workflow_action(
+        &self,
+        session_id: Uuid,
+        workflow_id: Uuid,
+        payload: &serde_json::Value,
+    ) -> Result<SessionAction>;
+    /// Admit a workflow start exactly once, returning the existing Started
+    /// event when this workflow id was already journaled.
+    async fn ensure_workflow_started(
+        &self,
+        event: SessionEvent,
+        workflow_id: Uuid,
+    ) -> Result<SessionEvent>;
+    /// Append a durable event only while the caller still owns `action_id`'s
+    /// lease; the check and the append share one transaction.
+    async fn append_with_action_lease(
+        &self,
+        event: SessionEvent,
+        action_id: Uuid,
+        lease_owner: &str,
+        lease_token: Uuid,
+    ) -> Result<SessionEvent>;
+    /// Does this session exist?
+    async fn contains_session(&self, session_id: Uuid) -> Result<bool>;
+    /// Create a session already bound to a workspace.
+    async fn create_session_in_workspace(
+        &self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<SessionWorkspaceBinding>;
+    /// Drop a session that was created but never used, so an abandoned launch
+    /// does not leave a permanent empty row in the session list.
+    async fn discard_empty_session(&self, session_id: Uuid) -> Result<bool>;
+    /// Finish work an interactive open deliberately deferred.
+    ///
+    /// PROVIDED, not required -- unlike the satellite tiers. This is a
+    /// lock-avoidance hook, not data: SQLite skips stale-live cleanup during an
+    /// interactive open so the first frame is not stuck behind the global
+    /// writer lock, then completes it here. A backend with no machine-wide
+    /// writer lock has genuinely nothing deferred, so doing nothing is the
+    /// correct implementation rather than a missing one.
+    async fn finish_interactive_open(&self, _session_id: Uuid) -> Result<()> {
+        Ok(())
+    }
+    /// The durable launch metadata a relay host recorded for this session.
+    async fn load_host_launch_metadata(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<serde_json::Value>>;
+    // The relay host tier: which host owns a launch, how much of a session
+    // it has seen, and what it still owes forward. These decide whether a
+    // session can be driven at all, so a backend missing them is not a
+    // degraded relay -- it is one that silently relays nothing.
+    async fn acknowledge_host_journal(
+        &self,
+        session_id: Uuid,
+        event_cursor: u64,
+        live_revision: u64,
+    ) -> Result<()>;
+    async fn begin_host_bootstrap(&self, session_id: Uuid) -> Result<()>;
+    async fn claim_legacy_host_launch_owner(
+        &self,
+        session_id: Uuid,
+        host_id: Uuid,
+        relay_origin: &str,
+    ) -> Result<()>;
+    async fn create_session_in_workspace_as(
+        &self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        participant_id: Uuid,
+    ) -> Result<SessionWorkspaceBinding>;
+    async fn finish_host_bootstrap(&self, session_id: Uuid) -> Result<()>;
+    async fn host_launch_owner(&self, session_id: Uuid) -> Result<Option<(Uuid, String)>>;
+    async fn pending_host_journals(&self, after: Option<Uuid>, limit: usize) -> Result<Vec<Uuid>>;
+    async fn pending_host_launch_metadata(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, serde_json::Value)>>;
+    async fn pending_host_launch_metadata_for_host(
+        &self,
+        offset: usize,
+        owner: Option<(Uuid, &str)>,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, serde_json::Value)>>;
+    async fn persist_host_launch_metadata(
+        &self,
+        session_id: Uuid,
+        metadata: &serde_json::Value,
+    ) -> Result<()>;
+    async fn persist_owned_host_launch_metadata(
+        &self,
+        session_id: Uuid,
+        metadata: &serde_json::Value,
+        host_id: Uuid,
+        relay_origin: &str,
+    ) -> Result<()>;
+    async fn settle_terminal_host_session(&self, session_id: Uuid) -> Result<()>;
+    async fn pending_host_workspace_messages(
+        &self,
+        host_id: Uuid,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<Uuid>>;
+    /// The durable receipt tier on the same authority as the journal.
+    ///
+    /// Required, like `plugin_backend`: receipts are what make a relayed
+    /// mutation replay-safe, so a backend that could not provide them would
+    /// let the relay repeat work it had already done.
+    async fn receipt_store(&self) -> Result<std::sync::Arc<dyn crate::receipt::ReceiptBackend>>;
+    /// Reclaim space and prune derived rows.
+    ///
+    /// `vacuum` asks for the engine's heavyweight rewrite: SQLite's `VACUUM`,
+    /// or the Postgres equivalent. Both report the same summary so an operator
+    /// sees one shape regardless of backend.
+    async fn compact(&self, vacuum: bool) -> Result<SessionStoreCompaction>;
+    /// A cheap readiness probe for startup and `borg doctor`.
+    async fn readiness(&self) -> Result<SessionStoreHealth>;
+    /// A deeper health check, including an integrity pass.
+    async fn health(&self) -> Result<SessionStoreHealth>;
+    /// Import a session's events wholesale, for migration and import tooling.
+    async fn import_session_events(
+        &self,
+        session_id: Uuid,
+        events: Vec<SessionEvent>,
+    ) -> Result<bool>;
+    // Migration primitives. A journal is copied between backends by replaying
+    // its events through `append`, which recomputes projections for the
+    // destination engine; these two carry the one thing replay cannot, namely
+    // the oversized bodies that were moved out of the event into a side table.
+    /// Every stored payload for a session, as (event id, reference) pairs.
+    async fn session_payload_refs(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<(Uuid, SessionPayloadRef)>>;
+    /// Store one payload verbatim, keeping its existing id.
+    ///
+    /// Idempotent by id, so a resumed migration re-copying a session it had
+    /// already reached writes nothing. The id is not regenerated because the
+    /// event body already references it: minting a new one would leave the
+    /// event pointing at a payload that does not exist.
+    async fn import_payload(
+        &self,
+        session_id: Uuid,
+        event_id: Uuid,
+        payload: &SessionPayloadRef,
+        bytes: &[u8],
+    ) -> Result<()>;
+    /// A page of sessions ordered by id, for a full resumable scan.
+    ///
+    /// Ordered by id rather than by activity so the sequence is stable while
+    /// the source is still being written: a migration paging by `updated_at`
+    /// would revisit sessions touched mid-run and could skip others entirely.
+    async fn session_lineage_page(
+        &self,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<SessionLineage>>;
+    /// Append many events to one session in a SINGLE transaction.
+    ///
+    /// For bulk import only. Ordinary appends are one transaction each because
+    /// each one must be durable before the agent acts on it; a migration has no
+    /// such reader, and paying a commit per event made copying a 2.5M-event
+    /// journal take about fifteen hours at a measured 46 events/second. The
+    /// batch holds the session's row lock once instead of re-taking it per
+    /// event, and fsyncs once instead of per event.
+    ///
+    /// All-or-nothing: a failure rolls the whole batch back, so a resumed
+    /// migration re-copies the batch rather than finding it half applied.
+    async fn append_batch(&self, events: Vec<SessionEvent>) -> Result<u64>;
+    // Verbatim copy, for migrating a journal between backends. See
+    // `RawSessionEvent` for why replay is not sufficient.
+    /// A page of stored event rows after `after_sequence`, in sequence order.
+    async fn raw_event_page(
+        &self,
+        session_id: Uuid,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<RawSessionEvent>>;
+    /// Insert stored rows verbatim and advance the session's allocator.
+    ///
+    /// Bypasses classification entirely: whatever the source journaled is
+    /// journaled here, at the same sequence, with the same flags. Idempotent by
+    /// (session, sequence), so a resumed migration re-running a batch writes
+    /// nothing.
+    async fn import_raw_events(
+        &self,
+        session_id: Uuid,
+        events: Vec<RawSessionEvent>,
+    ) -> Result<u64>;
+    /// Set a migrated session's projected state to the source's.
+    ///
+    /// The row-level copy carries projection CHECKPOINTS but not the session's
+    /// current state, which is a running fold the source already computed.
+    /// Recomputing it here would mean replaying every event through today's
+    /// rules -- the exact thing verbatim copying exists to avoid.
+    ///
+    /// `inherited_event_count` is written from the SOURCE rather than left as
+    /// the destination computed it. `fork_before` derives it by counting the
+    /// parent's inheritable events, and a real journal can carry a value that
+    /// no longer matches its own data -- one fork measured here records 15,245
+    /// where recounting gives 15,169. The fork's own events start immediately
+    /// after the RECORDED value, so recomputing it opens a 76-sequence hole in
+    /// the composed history.
+    async fn finish_imported_session(
+        &self,
+        session_id: Uuid,
+        state: &SessionState,
+        inherited_event_count: u64,
+    ) -> Result<()>;
+    /// Search EVERY session's history at once.
+    ///
+    /// The cross-session half of the search tier: an agent asking "have I seen
+    /// this error before?" is asking about its whole history, not one thread.
+    /// Only the lexical mode is served globally -- a regex would have to scan
+    /// every body in the journal, which is a different and much more expensive
+    /// promise than this makes.
+    async fn search_all_sessions(&self, query: SessionHistoryQuery) -> Result<SessionHistoryPage>;
+    /// The extension state tier on the same durable authority as the journal.
+    ///
+    /// Required, not optional: a store that answered `None` would send plugin
+    /// state to a second database, and the whole point of this tier living in
+    /// the journal's schema is that it does not.
+    fn plugin_backend(&self) -> std::sync::Arc<dyn crate::plugin_store::PluginBackend>;
+    /// Search this session's history, composing a fork's inherited range with
+    /// its own so callers see one renumbered timeline.
+    async fn query_history(
+        &self,
+        session_id: Uuid,
+        query: SessionHistoryQuery,
+    ) -> Result<SessionHistoryPage>;
+    /// Resolve, and durably pin, this session's Codex route.
+    async fn uses_native_codex_harness(&self, session_id: Uuid) -> Result<bool>;
+    /// Resolve, and durably pin, this session's OpenCode route. The route is
+    /// model-aware, so the launch model is passed for a fresh session.
+    async fn uses_native_opencode_harness(
+        &self,
+        session_id: Uuid,
+        model: Option<&str>,
+    ) -> Result<bool>;
+    /// Record which account last drove this session for `provider`.
+    #[cfg(any(feature = "subscription-adapters", test))]
+    async fn record_model_access(
+        &self,
+        session_id: Uuid,
+        provider: CodingProvider,
+        account_identity: &str,
+    ) -> Result<()>;
 }
 
 #[derive(Clone)]
@@ -1774,10 +2141,6 @@ impl SessionStoreHealth {
 }
 
 impl SqliteSessionStore {
-    pub(crate) fn from_pool(pool: SqlitePool) -> Self {
-        Self { pool }
-    }
-
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_path(path.as_ref().to_path_buf(), true, false).await
     }
@@ -2160,10 +2523,6 @@ impl SqliteSessionStore {
         &self.pool
     }
 
-    pub(crate) fn plugin_store(&self) -> crate::SqlitePluginStore {
-        crate::SqlitePluginStore::new(self.pool.clone())
-    }
-
     /// Query the lossless session journal through exact/range, FTS5, or
     /// bounded-regex retrieval. Search rows contain only a rebuildable
     /// projection; every hit is resolved back to `session_events` before it is
@@ -2226,7 +2585,8 @@ impl SqliteSessionStore {
         match (text, query.mode) {
             (None, _) => self.query_history_exact(session_id, &query).await,
             (Some(text), SessionHistorySearchMode::Lexical) => {
-                self.query_history_lexical(session_id, &query, text).await
+                self.query_history_lexical(Some(session_id), &query, text)
+                    .await
             }
             (Some(text), SessionHistorySearchMode::Regex) => {
                 self.query_history_regex(session_id, &query, text).await
@@ -2402,9 +2762,14 @@ impl SqliteSessionStore {
         })
     }
 
+    /// `session_id` of `None` searches EVERY session.
+    ///
+    /// The FTS index is global -- `session_event_search` carries a session_id
+    /// column rather than being partitioned -- so dropping the scope clause is
+    /// the whole difference between one session and all of them.
     async fn query_history_lexical(
         &self,
-        session_id: Uuid,
+        session_id: Option<Uuid>,
         query: &SessionHistoryQuery,
         text: &str,
     ) -> Result<SessionHistoryPage> {
@@ -2419,8 +2784,10 @@ impl SqliteSessionStore {
              where session_event_fts match ",
         );
         sql.push_bind(history_fts_query(text)?);
-        sql.push(" and s.session_id = ")
-            .push_bind(session_id.to_string());
+        if let Some(session_id) = session_id {
+            sql.push(" and s.session_id = ")
+                .push_bind(session_id.to_string());
+        }
         push_history_sql_filters(&mut sql, query, "s");
         if query.newest_first {
             sql.push(" order by s.sequence desc");
@@ -6440,7 +6807,7 @@ fn same_prompt_payload_ignoring_delivery(
         && left.get("attachments") == right.get("attachments")
 }
 
-fn ensure_prompt_admission(event: &SessionEvent) -> Result<()> {
+pub(crate) fn ensure_prompt_admission(event: &SessionEvent) -> Result<()> {
     ensure!(
         matches!(
             event.kind,
@@ -6459,14 +6826,17 @@ fn ensure_prompt_admission(event: &SessionEvent) -> Result<()> {
     Ok(())
 }
 
-fn prompt_message_id(event: &SessionEvent) -> Result<Uuid> {
+pub(crate) fn prompt_message_id(event: &SessionEvent) -> Result<Uuid> {
     match event.kind {
         SessionEventKind::Message { message_id, .. } => Ok(message_id),
         _ => bail!("prompt admission is not a message"),
     }
 }
 
-fn ensure_same_prompt_admission(existing: &SessionEvent, requested: &SessionEvent) -> Result<()> {
+pub(crate) fn ensure_same_prompt_admission(
+    existing: &SessionEvent,
+    requested: &SessionEvent,
+) -> Result<()> {
     let (
         SessionEventKind::Message {
             message_id: existing_id,
@@ -6661,16 +7031,557 @@ impl SessionStore for SqliteSessionStore {
         self.sqlite_acknowledge_host_workspaces(host_id, session_id, cursors)
             .await
     }
-    async fn autonomy_store(&self) -> Result<Option<crate::SqliteAutonomyStore>> {
-        Ok(Some(
+    async fn autonomy_store(
+        &self,
+    ) -> Result<Option<std::sync::Arc<dyn crate::autonomy::AutonomyStore>>> {
+        Ok(Some(std::sync::Arc::new(
             crate::SqliteAutonomyStore::open(self.pool.clone()).await?,
+        )))
+    }
+
+    async fn workspace_store(&self) -> Result<Option<std::sync::Arc<dyn crate::WorkspaceStore>>> {
+        Ok(Some(std::sync::Arc::new(
+            crate::SqliteWorkspaceStore::from_pool(self.pool.clone()).await?,
+        )))
+    }
+
+    // The persistent-runtime tier. These forward to the inherent methods of the
+    // same name: the inherent versions predate the trait and are still called
+    // directly through concrete handles, so the trait adopts them rather than
+    // duplicating their bodies.
+
+    async fn activate_runtime_manifest(
+        &self,
+        session_id: Uuid,
+        runtime: &str,
+        root: &str,
+        command: &str,
+        worker_id: Uuid,
+    ) -> Result<RuntimeManifestActivation> {
+        Self::activate_runtime_manifest(self, session_id, runtime, root, command, worker_id).await
+    }
+
+    async fn record_runtime_execution(
+        &self,
+        session_id: Uuid,
+        worker_id: Uuid,
+        code_hash: &str,
+        worker_failed: bool,
+        error: Option<&str>,
+    ) -> Result<()> {
+        Self::record_runtime_execution(self, session_id, worker_id, code_hash, worker_failed, error)
+            .await
+    }
+
+    async fn stop_runtime_manifest(&self, session_id: Uuid, worker_id: Uuid) -> Result<()> {
+        Self::stop_runtime_manifest(self, session_id, worker_id).await
+    }
+
+    async fn runtime_manifest(&self, session_id: Uuid) -> Result<Option<RuntimeManifest>> {
+        Self::runtime_manifest(self, session_id).await
+    }
+
+    async fn save_runtime_checkpoint(
+        &self,
+        session_id: Uuid,
+        worker_id: Uuid,
+        key: &str,
+        state: &serde_json::Value,
+    ) -> Result<RuntimeCheckpoint> {
+        Self::save_runtime_checkpoint(self, session_id, worker_id, key, state).await
+    }
+
+    async fn runtime_checkpoint(
+        &self,
+        session_id: Uuid,
+        key: Option<&str>,
+    ) -> Result<Option<RuntimeCheckpoint>> {
+        Self::runtime_checkpoint(self, session_id, key).await
+    }
+
+    async fn list_runtime_checkpoints(
+        &self,
+        session_id: Uuid,
+        limit: usize,
+    ) -> Result<Vec<RuntimeCheckpoint>> {
+        Self::list_runtime_checkpoints(self, session_id, limit).await
+    }
+
+    async fn load_harness_state(&self, session_id: Uuid) -> Result<Option<serde_json::Value>> {
+        Self::load_harness_state(self, session_id).await
+    }
+
+    async fn save_harness_state(&self, session_id: Uuid, state: &serde_json::Value) -> Result<()> {
+        Self::save_harness_state(self, session_id, state).await
+    }
+
+    async fn rollback_harness_state(
+        &self,
+        session_id: Uuid,
+        steps: usize,
+    ) -> Result<serde_json::Value> {
+        Self::rollback_harness_state(self, session_id, steps).await
+    }
+
+    async fn query_history(
+        &self,
+        session_id: Uuid,
+        query: SessionHistoryQuery,
+    ) -> Result<SessionHistoryPage> {
+        Self::query_history(self, session_id, query).await
+    }
+
+    async fn history_index_documents_after(
+        &self,
+        session_id: Uuid,
+        sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<SessionHistoryIndexDocument>> {
+        Self::history_index_documents_after(self, session_id, sequence, limit).await
+    }
+
+    async fn ensure_workflow_action(
+        &self,
+        session_id: Uuid,
+        workflow_id: Uuid,
+        payload: &serde_json::Value,
+    ) -> Result<SessionAction> {
+        Self::ensure_workflow_action(self, session_id, workflow_id, payload).await
+    }
+
+    async fn ensure_workflow_started(
+        &self,
+        event: SessionEvent,
+        workflow_id: Uuid,
+    ) -> Result<SessionEvent> {
+        Self::ensure_workflow_started(self, event, workflow_id).await
+    }
+
+    async fn append_with_action_lease(
+        &self,
+        event: SessionEvent,
+        action_id: Uuid,
+        lease_owner: &str,
+        lease_token: Uuid,
+    ) -> Result<SessionEvent> {
+        Self::append_with_action_lease(self, event, action_id, lease_owner, lease_token).await
+    }
+
+    async fn contains_session(&self, session_id: Uuid) -> Result<bool> {
+        Self::contains_session(self, session_id).await
+    }
+
+    async fn create_session_in_workspace(
+        &self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<SessionWorkspaceBinding> {
+        Self::create_session_in_workspace(self, session_id, workspace_id).await
+    }
+
+    async fn discard_empty_session(&self, session_id: Uuid) -> Result<bool> {
+        Self::discard_empty_session(self, session_id).await
+    }
+
+    async fn finish_interactive_open(&self, session_id: Uuid) -> Result<()> {
+        Self::finish_interactive_open(self, session_id).await
+    }
+
+    async fn load_host_launch_metadata(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Option<serde_json::Value>> {
+        Self::load_host_launch_metadata(self, session_id).await
+    }
+
+    async fn acknowledge_host_journal(
+        &self,
+        session_id: Uuid,
+        event_cursor: u64,
+        live_revision: u64,
+    ) -> Result<()> {
+        Self::acknowledge_host_journal(self, session_id, event_cursor, live_revision).await
+    }
+
+    async fn begin_host_bootstrap(&self, session_id: Uuid) -> Result<()> {
+        Self::begin_host_bootstrap(self, session_id).await
+    }
+
+    async fn claim_legacy_host_launch_owner(
+        &self,
+        session_id: Uuid,
+        host_id: Uuid,
+        relay_origin: &str,
+    ) -> Result<()> {
+        Self::claim_legacy_host_launch_owner(self, session_id, host_id, relay_origin).await
+    }
+
+    async fn create_session_in_workspace_as(
+        &self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        participant_id: Uuid,
+    ) -> Result<SessionWorkspaceBinding> {
+        Self::create_session_in_workspace_as(self, session_id, workspace_id, participant_id).await
+    }
+
+    async fn finish_host_bootstrap(&self, session_id: Uuid) -> Result<()> {
+        Self::finish_host_bootstrap(self, session_id).await
+    }
+
+    async fn host_launch_owner(&self, session_id: Uuid) -> Result<Option<(Uuid, String)>> {
+        Self::host_launch_owner(self, session_id).await
+    }
+
+    async fn pending_host_journals(&self, after: Option<Uuid>, limit: usize) -> Result<Vec<Uuid>> {
+        Self::pending_host_journals(self, after, limit).await
+    }
+
+    async fn pending_host_launch_metadata(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, serde_json::Value)>> {
+        Self::pending_host_launch_metadata(self, limit).await
+    }
+
+    async fn pending_host_launch_metadata_for_host(
+        &self,
+        offset: usize,
+        owner: Option<(Uuid, &str)>,
+        limit: usize,
+    ) -> Result<Vec<(Uuid, serde_json::Value)>> {
+        Self::pending_host_launch_metadata_for_host(self, offset, owner, limit).await
+    }
+
+    async fn persist_host_launch_metadata(
+        &self,
+        session_id: Uuid,
+        metadata: &serde_json::Value,
+    ) -> Result<()> {
+        Self::persist_host_launch_metadata(self, session_id, metadata).await
+    }
+
+    async fn persist_owned_host_launch_metadata(
+        &self,
+        session_id: Uuid,
+        metadata: &serde_json::Value,
+        host_id: Uuid,
+        relay_origin: &str,
+    ) -> Result<()> {
+        Self::persist_owned_host_launch_metadata(self, session_id, metadata, host_id, relay_origin)
+            .await
+    }
+
+    async fn settle_terminal_host_session(&self, session_id: Uuid) -> Result<()> {
+        Self::settle_terminal_host_session(self, session_id).await
+    }
+
+    async fn pending_host_workspace_messages(
+        &self,
+        host_id: Uuid,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<Uuid>> {
+        Self::pending_host_workspace_messages(self, host_id, after, limit).await
+    }
+
+    async fn receipt_store(&self) -> Result<std::sync::Arc<dyn crate::receipt::ReceiptBackend>> {
+        Ok(std::sync::Arc::new(
+            crate::receipt::SqliteReceiptStore::open(self.pool.clone()).await?,
         ))
     }
 
-    async fn workspace_store(&self) -> Result<Option<crate::SqliteWorkspaceStore>> {
-        Ok(Some(
-            crate::SqliteWorkspaceStore::from_pool(self.pool.clone()).await?,
+    async fn compact(&self, vacuum: bool) -> Result<SessionStoreCompaction> {
+        Self::compact(self, vacuum).await
+    }
+
+    async fn readiness(&self) -> Result<SessionStoreHealth> {
+        Self::readiness(self).await
+    }
+
+    async fn health(&self) -> Result<SessionStoreHealth> {
+        Self::health(self).await
+    }
+
+    async fn import_session_events(
+        &self,
+        session_id: Uuid,
+        events: Vec<SessionEvent>,
+    ) -> Result<bool> {
+        Self::import_session_events(self, session_id, events).await
+    }
+
+    async fn session_payload_refs(
+        &self,
+        session_id: Uuid,
+    ) -> Result<Vec<(Uuid, SessionPayloadRef)>> {
+        let rows = sqlx::query(
+            "select id, event_id, payload_kind, byte_len from session_payloads \
+             where session_id = ? order by created_at, id",
+        )
+        .bind(session_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok((
+                    parse_uuid(row.try_get("event_id")?)?,
+                    SessionPayloadRef {
+                        id: parse_uuid(row.try_get("id")?)?,
+                        kind: parse_enum(row.try_get("payload_kind")?)?,
+                        byte_len: u64::try_from(row.try_get::<i64, _>("byte_len")?)
+                            .context("negative payload length")?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    async fn import_payload(
+        &self,
+        session_id: Uuid,
+        event_id: Uuid,
+        payload: &SessionPayloadRef,
+        bytes: &[u8],
+    ) -> Result<()> {
+        sqlx::query(
+            "insert into session_payloads \
+             (id, session_id, event_id, payload_kind, payload, byte_len, created_at) \
+             values (?, ?, ?, ?, ?, ?, ?) on conflict(id) do nothing",
+        )
+        .bind(payload.id.to_string())
+        .bind(session_id.to_string())
+        .bind(event_id.to_string())
+        .bind(
+            serde_json::to_value(payload.kind)?
+                .as_str()
+                .unwrap_or_default(),
+        )
+        .bind(bytes)
+        .bind(i64::try_from(bytes.len()).context("payload exceeds a bigint")?)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn session_lineage_page(
+        &self,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<SessionLineage>> {
+        let rows = sqlx::query(
+            "select id, parent_session_id, parent_cut_sequence, inherited_event_count, \
+                    owner_session_id \
+             from sessions where id > ? order by id limit ?",
+        )
+        .bind(after.map(|id| id.to_string()).unwrap_or_default())
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(SessionLineage {
+                    session_id: parse_uuid(row.try_get("id")?)?,
+                    parent_session_id: row
+                        .try_get::<Option<String>, _>("parent_session_id")?
+                        .map(|id| parse_uuid(&id))
+                        .transpose()?,
+                    parent_cut_sequence: row
+                        .try_get::<Option<i64>, _>("parent_cut_sequence")?
+                        .map(|value| u64::try_from(value).context("negative cut sequence"))
+                        .transpose()?,
+                    inherited_event_count: u64::try_from(
+                        row.try_get::<i64, _>("inherited_event_count")?,
+                    )
+                    .context("negative inherited event count")?,
+                    owner_session_id: row
+                        .try_get::<Option<String>, _>("owner_session_id")?
+                        .map(|id| parse_uuid(&id))
+                        .transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    async fn append_batch(&self, events: Vec<SessionEvent>) -> Result<u64> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let mut transaction = self.begin_write().await?;
+        let mut appended = 0u64;
+        for event in events {
+            self.append_durable_in_transaction(&mut transaction, event)
+                .await?;
+            appended += 1;
+        }
+        transaction.commit().await?;
+        Ok(appended)
+    }
+
+    async fn raw_event_page(
+        &self,
+        session_id: Uuid,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<RawSessionEvent>> {
+        let rows = sqlx::query(
+            "select sequence, event_id, event_kind, event_json, projection_json, \
+                    fork_inheritable, recovery_relevant, message_id, created_at \
+             from session_events where session_id = ? and sequence > ? \
+             order by sequence limit ?",
+        )
+        .bind(session_id.to_string())
+        .bind(i64::try_from(after_sequence).unwrap_or(i64::MAX))
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                Ok(RawSessionEvent {
+                    sequence: u64::try_from(row.try_get::<i64, _>("sequence")?)
+                        .context("negative sequence")?,
+                    event_id: parse_uuid(row.try_get("event_id")?)?,
+                    event_kind: row.try_get("event_kind")?,
+                    body: serde_json::from_str(row.try_get("event_json")?)?,
+                    projection_json: row.try_get("projection_json")?,
+                    fork_inheritable: row.try_get::<i64, _>("fork_inheritable")? != 0,
+                    recovery_relevant: row.try_get::<i64, _>("recovery_relevant")? != 0,
+                    message_id: row
+                        .try_get::<Option<String>, _>("message_id")?
+                        .map(|id| parse_uuid(&id))
+                        .transpose()?,
+                    created_at: parse_timestamp(Some(row.try_get("created_at")?))?
+                        .context("missing event created_at")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn import_raw_events(
+        &self,
+        session_id: Uuid,
+        events: Vec<RawSessionEvent>,
+    ) -> Result<u64> {
+        if events.is_empty() {
+            return Ok(0);
+        }
+        let highest = events.iter().map(|event| event.sequence).max().unwrap_or(0);
+        let mut transaction = self.begin_write().await?;
+        let mut imported = 0u64;
+        for event in events {
+            let affected = sqlx::query(
+                "insert into session_events \
+                 (session_id, sequence, event_id, event_kind, event_json, projection_json, \
+                  fork_inheritable, recovery_relevant, message_id, created_at) \
+                 values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 on conflict(session_id, sequence) do nothing",
+            )
+            .bind(session_id.to_string())
+            .bind(i64::try_from(event.sequence).context("sequence exceeds an integer")?)
+            .bind(event.event_id.to_string())
+            .bind(&event.event_kind)
+            .bind(serde_json::to_string(&event.body)?)
+            .bind(&event.projection_json)
+            .bind(i64::from(event.fork_inheritable))
+            .bind(i64::from(event.recovery_relevant))
+            .bind(event.message_id.map(|id| id.to_string()))
+            .bind(event.created_at.to_rfc3339())
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            imported += affected;
+        }
+        sqlx::query(
+            "update sessions set next_sequence = max(next_sequence, ?), updated_at = ? \
+             where id = ?",
+        )
+        .bind(i64::try_from(highest.saturating_add(1)).unwrap_or(i64::MAX))
+        .bind(Utc::now().to_rfc3339())
+        .bind(session_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(imported)
+    }
+
+    async fn finish_imported_session(
+        &self,
+        session_id: Uuid,
+        state: &SessionState,
+        inherited_event_count: u64,
+    ) -> Result<()> {
+        sqlx::query(
+            "update sessions set state_json = ?, inherited_event_count = ?, updated_at = ? \
+             where id = ?",
+        )
+        .bind(serde_json::to_string(state)?)
+        .bind(i64::try_from(inherited_event_count).context("inherited count exceeds an integer")?)
+        .bind(Utc::now().to_rfc3339())
+        .bind(session_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn search_all_sessions(&self, query: SessionHistoryQuery) -> Result<SessionHistoryPage> {
+        let text = query
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned);
+        anyhow::ensure!(
+            matches!(query.mode, SessionHistorySearchMode::Lexical),
+            "cross-session search is lexical only"
+        );
+        let Some(text) = text else {
+            anyhow::bail!("cross-session search requires search text");
+        };
+        // Every session must be projected first. The projection is built
+        // lazily per session, so an unvisited one would contribute nothing and
+        // the search would quietly under-report rather than fail.
+        let sessions: Vec<(String, i64)> = sqlx::query_as(
+            "select id, (select count(*) from session_events e where e.session_id = s.id) \
+             from sessions s",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        for (session_id, events) in sessions {
+            let session_id = parse_uuid(&session_id)?;
+            let expected = u64::try_from(events).context("negative event count")?;
+            self.ensure_history_projection(session_id, expected).await?;
+        }
+        self.query_history_lexical(None, &query, &text).await
+    }
+
+    fn plugin_backend(&self) -> std::sync::Arc<dyn crate::plugin_store::PluginBackend> {
+        std::sync::Arc::new(crate::plugin_store::SqlitePluginStore::new(
+            self.pool.clone(),
         ))
+    }
+
+    // Harness routing; forwards to the inherent methods of the same name.
+    async fn uses_native_codex_harness(&self, session_id: Uuid) -> Result<bool> {
+        Self::uses_native_codex_harness(self, session_id).await
+    }
+
+    async fn uses_native_opencode_harness(
+        &self,
+        session_id: Uuid,
+        model: Option<&str>,
+    ) -> Result<bool> {
+        Self::uses_native_opencode_harness(self, session_id, model).await
+    }
+
+    #[cfg(any(feature = "subscription-adapters", test))]
+    async fn record_model_access(
+        &self,
+        session_id: Uuid,
+        provider: CodingProvider,
+        account_identity: &str,
+    ) -> Result<()> {
+        Self::record_model_access(self, session_id, provider, account_identity).await
     }
 
     async fn create_session(&self, session_id: Uuid) -> Result<()> {
@@ -7722,6 +8633,16 @@ fn workflow_event_id(kind: &SessionEventKind) -> Option<Uuid> {
         _ => None,
     }
 }
+
+pub mod factory;
+pub mod migrate;
+pub mod postgres;
+
+#[cfg(test)]
+mod backend_symmetry;
+
+#[cfg(test)]
+mod conformance;
 
 #[cfg(test)]
 mod tests;

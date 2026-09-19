@@ -27,7 +27,7 @@ use uuid::Uuid;
 use crate::native_process::ProcessManager;
 use crate::{
     AgentToolDispatcher, EnqueueAutonomyJob, PermissionMode, SessionEvent, SessionEventKind,
-    SessionStore, SqliteAutonomyStore, SqliteSessionStore, WorkflowRuntime,
+    SessionStore, WorkflowRuntime,
 };
 
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
@@ -86,8 +86,8 @@ pub(crate) struct RuntimeWorkflowResult {
 pub(crate) struct BluWorkflowRunner {
     session_id: Uuid,
     extension_id: Option<String>,
-    store: SqliteSessionStore,
-    autonomy: SqliteAutonomyStore,
+    store: Arc<dyn SessionStore>,
+    autonomy: Arc<dyn crate::autonomy::AutonomyStore>,
     dispatcher: Option<AgentToolDispatcher>,
     processes: ProcessManager,
     root: PathBuf,
@@ -96,11 +96,35 @@ pub(crate) struct BluWorkflowRunner {
 }
 
 impl BluWorkflowRunner {
+    /// Run one plugin-storage call against this runner's journal.
+    ///
+    /// Test-only: it exists so assertions read the state a workflow wrote
+    /// through the same backend-neutral entry point the workflow itself uses,
+    /// rather than reaching past it into a concrete store.
+    #[cfg(test)]
+    pub(crate) async fn store_plugin_call(
+        &self,
+        session_id: Uuid,
+        root: &std::path::Path,
+        default_extension_id: Option<&str>,
+        arguments: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let backend = self.store.plugin_backend();
+        crate::plugin_store::call(
+            backend.as_ref(),
+            session_id,
+            root,
+            default_extension_id,
+            arguments,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         session_id: Uuid,
-        store: SqliteSessionStore,
-        autonomy: SqliteAutonomyStore,
+        store: Arc<dyn SessionStore>,
+        autonomy: Arc<dyn crate::autonomy::AutonomyStore>,
         dispatcher: Option<AgentToolDispatcher>,
         processes: ProcessManager,
         root: PathBuf,
@@ -540,7 +564,7 @@ impl BluWorkflowRunner {
                 Some(30_000),
                 Some(MAX_PROCESS_OUTPUT_TOKENS),
                 MAX_PROCESS_TIMEOUT_MS,
-                Some(self.store.clone()),
+                Some(Arc::clone(&self.store)),
                 cancel.clone(),
             )
             .await;
@@ -813,7 +837,7 @@ struct ReplayCall {
 struct WorkflowCallJournal {
     session_id: Uuid,
     workflow_id: Uuid,
-    store: SqliteSessionStore,
+    store: Arc<dyn SessionStore>,
     handle: Handle,
     replay: Arc<Mutex<HashMap<u64, ReplayCall>>>,
 }
@@ -822,7 +846,7 @@ impl WorkflowCallJournal {
     fn from_events(
         session_id: Uuid,
         workflow_id: Uuid,
-        store: SqliteSessionStore,
+        store: Arc<dyn SessionStore>,
         handle: Handle,
         events: &[SessionEvent],
     ) -> Result<Self> {
@@ -968,7 +992,7 @@ struct HostBridge {
     permission: PermissionMode,
     cancel: CancellationToken,
     journal: WorkflowCallJournal,
-    autonomy: SqliteAutonomyStore,
+    autonomy: Arc<dyn crate::autonomy::AutonomyStore>,
     dispatcher: Option<AgentToolDispatcher>,
     processes: ProcessManager,
     invocation_arguments: Value,
@@ -1027,7 +1051,7 @@ impl HostBridge {
                 let store = self.journal.store.clone();
                 self.journal.call(call_id, operation, query, || {
                     self.block_on(crate::subagents::history_index_response(
-                        &store,
+                        store.as_ref(),
                         self.session_id,
                         index_args,
                     ))
@@ -1151,11 +1175,17 @@ impl HostBridge {
             "plugin_store" => {
                 self.require_full_access(operation)?;
                 let request = guest_json(args, 1, "plugin_store_request_json")?;
-                let store = self.journal.store.plugin_store();
+                let backend = self.journal.store.plugin_backend();
                 let extension_id = self.extension_id.as_deref();
                 let root = self.root.clone();
                 self.journal.call(call_id, operation, request.clone(), || {
-                    self.block_on(store.call(self.session_id, &root, extension_id, request))
+                    self.block_on(crate::plugin_store::call(
+                        backend.as_ref(),
+                        self.session_id,
+                        &root,
+                        extension_id,
+                        request,
+                    ))
                 })?
             }
             "assert_exec_success" => {
@@ -1205,7 +1235,7 @@ impl HostBridge {
                         yield_time_ms,
                         Some(output_tokens),
                         timeout_ms,
-                        Some(self.journal.store.clone()),
+                        Some(Arc::clone(&self.journal.store)),
                         self.cancel.clone(),
                     ))?;
                     ensure!(!self.cancel.is_cancelled(), "Blu workflow was cancelled");
@@ -1420,14 +1450,17 @@ mod tests {
         // The runner owns only the SQLite pool; keep the test database alive
         // across the extra connections used by workflow leases/heartbeats.
         let directory = tempdir().expect("tempdir").keep();
-        let store = SqliteSessionStore::open(directory.join("sessions.sqlite3"))
+        let sqlite = crate::SqliteSessionStore::open(directory.join("sessions.sqlite3"))
             .await
             .expect("store");
         let session_id = Uuid::new_v4();
+        let autonomy: Arc<dyn crate::autonomy::AutonomyStore> = Arc::new(
+            crate::SqliteAutonomyStore::open(sqlite.pool().clone())
+                .await
+                .expect("autonomy"),
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(sqlite);
         store.create_session(session_id).await.expect("session");
-        let autonomy = SqliteAutonomyStore::open(store.pool().clone())
-            .await
-            .expect("autonomy");
         BluWorkflowRunner::new(
             session_id,
             store,
@@ -1441,14 +1474,17 @@ mod tests {
 
     async fn external_runner(permission: PermissionMode) -> (BluWorkflowRunner, PathBuf) {
         let directory = tempdir().expect("tempdir").keep();
-        let store = SqliteSessionStore::open(directory.join("sessions.sqlite3"))
+        let sqlite = crate::SqliteSessionStore::open(directory.join("sessions.sqlite3"))
             .await
             .expect("store");
         let session_id = Uuid::new_v4();
+        let autonomy: Arc<dyn crate::autonomy::AutonomyStore> = Arc::new(
+            crate::SqliteAutonomyStore::open(sqlite.pool().clone())
+                .await
+                .expect("autonomy"),
+        );
+        let store: Arc<dyn SessionStore> = Arc::new(sqlite);
         store.create_session(session_id).await.expect("session");
-        let autonomy = SqliteAutonomyStore::open(store.pool().clone())
-            .await
-            .expect("autonomy");
         (
             BluWorkflowRunner::new(
                 session_id,
@@ -1753,9 +1789,7 @@ return borg_plugin_store(2, "{\"op\":\"commit\",\"scope\":\"session\",\"idempote
         assert_eq!(first, runner.run(request).await.expect("workflow replay"));
 
         let entry = runner
-            .store
-            .plugin_store()
-            .call(
+            .store_plugin_call(
                 runner.session_id,
                 &root,
                 Some("harvey-lab"),
@@ -1765,9 +1799,7 @@ return borg_plugin_store(2, "{\"op\":\"commit\",\"scope\":\"session\",\"idempote
             .expect("stored entry");
         assert_eq!(entry["entry"]["value"]["state"], "recorded");
         let verified = runner
-            .store
-            .plugin_store()
-            .call(
+            .store_plugin_call(
                 runner.session_id,
                 &root,
                 Some("harvey-lab"),
@@ -1780,9 +1812,7 @@ return borg_plugin_store(2, "{\"op\":\"commit\",\"scope\":\"session\",\"idempote
             .await
             .expect("change artifact");
         let changed = runner
-            .store
-            .plugin_store()
-            .call(
+            .store_plugin_call(
                 runner.session_id,
                 &root,
                 Some("harvey-lab"),
@@ -1838,9 +1868,7 @@ return receipt
             "{result:?}"
         );
         let entry = runner
-            .store
-            .plugin_store()
-            .call(
+            .store_plugin_call(
                 runner.session_id,
                 &root,
                 Some("harvey-lab"),
