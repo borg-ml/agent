@@ -98,20 +98,7 @@ async fn access_at(
     let path = path
         .canonicalize()
         .context("cannot locate saved ChatGPT subscription; reconnect with borg login codex")?;
-    let lock_path = path.with_extension("borg-lock");
-    let _lock = tokio::task::spawn_blocking(move || -> Result<fs::File> {
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_path)
-            .context("open ChatGPT credential lock")?;
-        file.lock().context("lock ChatGPT credentials")?;
-        Ok(file)
-    })
-    .await
-    .context("ChatGPT credential lock task failed")??;
+    let _lock = credential_lock(&path).await?;
     let mut document = load(&path)?;
     let account = account_from_document(&document)?;
     let token = document["tokens"]["access_token"]
@@ -183,6 +170,23 @@ async fn access_at(
     })
 }
 
+async fn credential_lock(path: &Path) -> Result<fs::File> {
+    let lock_path = path.with_extension("borg-lock");
+    tokio::task::spawn_blocking(move || -> Result<fs::File> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .context("open ChatGPT credential lock")?;
+        file.lock().context("lock ChatGPT credentials")?;
+        Ok(file)
+    })
+    .await
+    .context("ChatGPT credential lock task failed")?
+}
+
 fn account_from_document(document: &Value) -> Result<SubscriptionAccount> {
     ensure!(
         document["auth_mode"] != "apikey",
@@ -243,7 +247,7 @@ fn save(path: &Path, document: &Value) -> Result<()> {
     let parent = path
         .parent()
         .context("ChatGPT credential path has no parent")?;
-    fs::create_dir_all(parent).context("create ChatGPT credential directory")?;
+    private_directory(parent)?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)
         .context("create private ChatGPT credential file")?;
     #[cfg(unix)]
@@ -286,6 +290,141 @@ async fn response_json(response: reqwest::Response) -> Result<Value> {
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).context("invalid ChatGPT authentication response")
+}
+
+/// Device approval details are displayed only by the login UI, never journaled as credentials.
+pub struct DeviceLogin {
+    pub user_code: String,
+    pub verification_url: String,
+    device_auth_id: String,
+    interval: Duration,
+    deadline: tokio::time::Instant,
+    path: PathBuf,
+}
+
+pub async fn begin_device_login() -> Result<DeviceLogin> {
+    let path = auth_path()?;
+    let path = if path.exists() {
+        path.canonicalize()?
+    } else {
+        path
+    };
+    let response = client()?
+        .post("https://auth.openai.com/api/accounts/deviceauth/usercode")
+        .json(&json!({"client_id": CLIENT_ID}))
+        .send()
+        .await
+        .context("ChatGPT device login connection failed")?;
+    ensure!(
+        response.status().is_success(),
+        "ChatGPT device login unavailable (HTTP {})",
+        response.status()
+    );
+    let body = response_json(response).await?;
+    let code = body["user_code"]
+        .as_str()
+        .or_else(|| body["usercode"].as_str())
+        .context("ChatGPT device login omitted the approval code")?;
+    ensure!(
+        !code.is_empty()
+            && code.len() <= 128
+            && code
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b"-"[0]),
+        "ChatGPT device login returned an invalid approval code"
+    );
+    let device_auth_id = body["device_auth_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .context("ChatGPT device login omitted its identifier")?
+        .to_owned();
+    let interval = body["interval"]
+        .as_u64()
+        .or_else(|| {
+            body["interval"]
+                .as_str()
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(5)
+        .clamp(1, 60);
+    Ok(DeviceLogin {
+        user_code: code.to_owned(),
+        verification_url: "https://auth.openai.com/codex/device".into(),
+        device_auth_id,
+        interval: Duration::from_secs(interval),
+        deadline: tokio::time::Instant::now() + Duration::from_secs(15 * 60),
+        path,
+    })
+}
+
+pub async fn complete_device_login(login: DeviceLogin) -> Result<SubscriptionAccount> {
+    let client = client()?;
+    let code = tokio::time::timeout_at(login.deadline, async {
+        loop {
+            let response = client
+                .post("https://auth.openai.com/api/accounts/deviceauth/token")
+                .json(
+                    &json!({"device_auth_id": login.device_auth_id, "user_code": login.user_code}),
+                )
+                .send()
+                .await
+                .context("ChatGPT device approval check failed")?;
+            let status = response.status();
+            if status.is_success() {
+                return response_json(response).await;
+            }
+            ensure!(
+                status == reqwest::StatusCode::FORBIDDEN
+                    || status == reqwest::StatusCode::NOT_FOUND,
+                "ChatGPT device approval failed (HTTP {status})"
+            );
+            tokio::time::sleep(login.interval).await;
+        }
+    })
+    .await
+    .context("ChatGPT device approval expired; start login again")??;
+    // Once the authorization code is exchanged, finish persistence even if the UI closes.
+    tokio::spawn(async move {
+        let authorization_code = code["authorization_code"].as_str().filter(|s| !s.is_empty())
+            .context("ChatGPT device approval omitted its authorization code")?;
+        let verifier = code["code_verifier"].as_str().filter(|s| !s.is_empty())
+            .context("ChatGPT device approval omitted its PKCE verifier")?;
+        let response = client.post(TOKEN_ENDPOINT).form(&[
+            ("grant_type", "authorization_code"), ("client_id", CLIENT_ID),
+            ("code", authorization_code), ("code_verifier", verifier),
+            ("redirect_uri", "https://auth.openai.com/deviceauth/callback"),
+        ]).send().await.context("ChatGPT authorization exchange failed")?;
+        ensure!(response.status().is_success(), "ChatGPT authorization exchange rejected (HTTP {})", response.status());
+        let tokens = response_json(response).await?;
+        for field in ["access_token", "refresh_token", "id_token"] {
+            ensure!(tokens[field].as_str().is_some_and(|token| !token.is_empty()), "ChatGPT login omitted a required token");
+        }
+        let mut document = json!({"auth_mode": "chatgpt", "tokens": {
+            "access_token": tokens["access_token"], "refresh_token": tokens["refresh_token"], "id_token": tokens["id_token"]
+        }, "last_refresh": Utc::now().to_rfc3339()});
+        let account = account_from_document(&document)?;
+        document["tokens"]["account_id"] = json!(account.account_id);
+        let current = auth_path()?;
+        let current = if current.exists() { current.canonicalize()? } else { current };
+        ensure!(current == login.path, "ChatGPT credential selection changed during login; saved credentials were kept");
+        private_directory(login.path.parent().context("ChatGPT credential path has no parent")?)?;
+        let _lock = credential_lock(&login.path).await?;
+        save(&login.path, &document)?;
+        Ok(account)
+    }).await.context("ChatGPT login persistence task failed")?
+}
+
+fn private_directory(path: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(path)
+        .context("create private ChatGPT credential directory")
 }
 
 #[cfg(test)]
@@ -352,6 +491,14 @@ mod tests {
         let old = token("account-a", Utc::now().timestamp() + 3600);
         let next = token("account-a", Utc::now().timestamp() + 7200);
         save(&path, &document(&old)).unwrap();
+        #[cfg(not(unix))]
+        let second_path = path.clone();
+        #[cfg(unix)]
+        let second_path = {
+            let alias = directory.path().join("auth-alias.json");
+            std::os::unix::fs::symlink(&path, &alias).unwrap();
+            alias
+        };
         let (endpoint, server) = response_server(
             200,
             json!({
@@ -362,7 +509,7 @@ mod tests {
         let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(
                 access_at(path.clone(), Some(old.clone()), &endpoint),
-                access_at(path.clone(), Some(old.clone()), &endpoint)
+                access_at(second_path.clone(), Some(old.clone()), &endpoint)
             )
         })
         .await
