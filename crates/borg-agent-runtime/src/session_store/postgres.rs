@@ -33,8 +33,8 @@ pub mod store;
 pub mod sync;
 pub mod workflow;
 
-#[cfg(test)]
-pub(crate) mod testing;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 
 /// The journal schema. Its fingerprint prevents replaying DDL on ordinary opens.
 const POSTGRES_SCHEMA_SQL: &str = include_str!("postgres_schema.sql");

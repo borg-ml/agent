@@ -1,19 +1,17 @@
 //! Borg's own PostgreSQL cluster, provisioned and supervised on this machine.
 //!
 //! WHY THIS EXISTS: Borg's default posture is several agents running at once on
-//! one machine. SQLite permits exactly one writer per FILE, and every process
-//! here shares one journal file, so that default put every agent behind a
-//! single machine-wide lock whose throughput does not improve no matter how
-//! many writers are added. Postgres serialises per session row instead. Making
-//! it the default is therefore only useful if it needs no setup, so this module
-//! does the setup.
+//! one machine, and Postgres serialises writers per session row rather than
+//! machine-wide. Serving that as the default is only useful if it needs no
+//! setup, so this module does the setup.
 //!
 //! WHAT IT DOES NOT DO: it never installs PostgreSQL. It locates the `initdb`
 //! and `pg_ctl` that a PostgreSQL installation already provides, and creates a
 //! cluster under Borg's own home directory. When those binaries are absent it
 //! fails with the install command for this platform rather than silently
-//! dropping to SQLite -- a silent drop would split one machine's history across
-//! two databases, which is the failure the store factory exists to prevent.
+//! journalling somewhere else -- a silent fallback would split one machine's
+//! history across two databases, which is the failure the store factory exists
+//! to prevent.
 //!
 //! CONCURRENCY: several Borg processes routinely start at the same moment, and
 //! all of them run this. Rather than take a lock, each step is written so that
@@ -343,9 +341,8 @@ fn locate_binary(name: &str) -> Result<PathBuf> {
         "Borg defaults to PostgreSQL so several agents can write at once, but `{name}` \
          was not found on this machine.\n\n\
          Install PostgreSQL:\n{}\n\n\
-         Or choose a different journal explicitly:\n  \
-         BORG_SESSIONS_URL=postgres://user@host/db   use an existing server\n  \
-         BORG_SESSIONS_BACKEND=sqlite                single-writer SQLite, for one agent at a time",
+         Or point Borg at a server you already run:\n  \
+         BORG_SESSIONS_URL=postgres://user@host/db",
         install_hint()
     )
 }
@@ -441,7 +438,10 @@ mod tests {
             .expect_err("a missing binary must not resolve");
         let message = format!("{error:#}");
         assert!(message.contains("BORG_SESSIONS_URL"));
-        assert!(message.contains("BORG_SESSIONS_BACKEND=sqlite"));
+        assert!(
+            message.contains("Install PostgreSQL"),
+            "the error must say how to get a server, got: {message}"
+        );
     }
 
     #[test]

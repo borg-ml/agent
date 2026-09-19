@@ -8,8 +8,7 @@
 -- connection limits, and makes a stray `drop schema` or an accidental
 -- cross-tier join impossible rather than merely discouraged. The cost is that
 -- the journal cannot be joined to the relay tier in SQL -- which costs nothing
--- today, because the journal currently lives in a SQLite file and no such join
--- exists.
+-- today, because no such join exists.
 --
 -- NOT PARTITIONED, deliberately. session_events holds 2,497,802 rows
 -- (measured, not extrapolated). Partitioning at this size buys nothing and

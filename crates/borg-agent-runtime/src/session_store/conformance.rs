@@ -1,23 +1,22 @@
-//! One suite, both backends.
+//! The suite written against the `SessionStore` trait rather than a store.
 //!
-//! These tests are written against the `SessionStore` trait and run twice: once
-//! on SQLite and once on PostgreSQL. Anywhere the two backends disagree, a test
-//! here fails -- which is the only real proof that swapping the journal engine
-//! does not quietly change behaviour.
+//! These tests exercise the trait's contract, not one implementation's
+//! internals, so they stay honest about what a store must do rather than what
+//! the current one happens to do. They are kept in the looping shape they were
+//! written in: adding a second store means adding it to `harnesses`, and every
+//! test then covers it without being rewritten.
 //!
-//! The Postgres half is skipped when `BORG_TEST_SESSIONS_URL` is unset, so the
-//! suite still runs on a machine with no database; the SQLite half always runs.
+//! A server is required. See `postgres::testing` for why these do not skip.
 
 use std::sync::Arc;
 
 use uuid::Uuid;
 
-use super::postgres::PostgresSessionStore;
-use super::postgres::testing::{ScratchDatabase, test_url};
+use super::postgres::testing::{self, ScratchDatabase};
 use crate::session_action::{
     ActionDeliveryPolicy, ActionWakePolicy, SessionAction, SessionActionKind, SessionActionState,
 };
-use crate::session_store::{RecoveryParts, SessionStore, SqliteSessionStore};
+use crate::session_store::{RecoveryParts, SessionStore};
 use crate::{
     EventActor, MessageStatus, PromptDelivery, SessionEvent, SessionEventKind, SessionStatus,
 };
@@ -26,47 +25,23 @@ use crate::{
 struct Harness {
     name: &'static str,
     store: Arc<dyn SessionStore>,
-    _directory: Option<tempfile::TempDir>,
-    scratch: Option<ScratchDatabase>,
+    scratch: ScratchDatabase,
 }
 
 impl Harness {
     async fn discard(self) {
-        if let Some(scratch) = self.scratch {
-            scratch.discard().await;
-        }
+        self.scratch.discard().await;
     }
 }
 
-/// Every backend available on this machine.
+/// Every backend under test.
 async fn harnesses() -> Vec<Harness> {
-    let mut harnesses = Vec::new();
-    let directory = tempfile::tempdir().expect("temp dir");
-    let sqlite = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-        .await
-        .expect("open sqlite store");
-    harnesses.push(Harness {
-        name: "sqlite",
-        store: Arc::new(sqlite),
-        _directory: Some(directory),
-        scratch: None,
-    });
-
-    if let Some(url) = test_url() {
-        let scratch = ScratchDatabase::create(&url).await;
-        let postgres = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
-            .await
-            .expect("connect postgres store");
-        harnesses.push(Harness {
-            name: "postgres",
-            store: Arc::new(postgres),
-            _directory: None,
-            scratch: Some(scratch),
-        });
-    } else {
-        eprintln!("conformance: skipping postgres, BORG_TEST_SESSIONS_URL is not set");
-    }
-    harnesses
+    let (scratch, postgres) = testing::session_store().await;
+    vec![Harness {
+        name: "postgres",
+        store: Arc::new(postgres),
+        scratch,
+    }]
 }
 
 async fn started_session(store: &dyn SessionStore) -> Uuid {
@@ -1393,13 +1368,12 @@ fn lexical(text: &str) -> crate::session_store::SessionHistoryQuery {
     }
 }
 
-/// Lexical search selects the same EVENTS on both engines.
+/// Lexical search selects events by what they contain, not by how they rank.
 ///
-/// WHAT IS AND IS NOT COMPARED: the two backends use different search engines
-/// -- SQLite FTS5 and Postgres `tsvector`/`ts_rank_cd` -- so their relevance
-/// scores and snippet boundaries are different algorithms and are deliberately
-/// not asserted equal. What MUST agree is which events a query selects; a
-/// caller that gets different evidence from the two backends is being told a
+/// WHAT IS AND IS NOT COMPARED: relevance scores and snippet boundaries belong
+/// to the search engine and are deliberately not asserted here, because pinning
+/// them would freeze an implementation detail. What MUST hold is which events a
+/// query selects; a caller that gets different evidence from a store is told a
 /// different history, which is the failure this whole suite exists to catch.
 #[tokio::test]
 async fn lexical_search_selects_the_same_events_on_both_backends() {
@@ -1657,12 +1631,12 @@ async fn event_lookup_and_untexted_reads_agree() {
 
 /// Neither engine stems, so a word variant matches on both or on neither.
 ///
-/// This is the parity trap in the search tier. Postgres would stem by default:
-/// `to_tsvector('english', ...)` maps "migration" and "migrate" to one lexeme,
-/// so a search for either would find both. SQLite's FTS5 tokenizer does not.
-/// The Postgres schema therefore pins the `'simple'` configuration, which does
-/// not stem, and this test is what keeps that pinned -- switching to
-/// `'english'` for "better" search would silently give the two backends
+/// Postgres would stem by default: `to_tsvector('english', ...)` maps
+/// "migration" and "migrate" to one lexeme, so a search for either would find
+/// both, and a search for an exact term would return events that never contain
+/// it. The schema therefore pins the `'simple'` configuration, which does not
+/// stem, and this test is what keeps it pinned -- switching to `'english'` for
+/// "better" search would silently give callers
 /// different answers to the same question.
 #[tokio::test]
 async fn neither_backend_stems_word_variants() {
@@ -1717,7 +1691,7 @@ async fn neither_backend_stems_word_variants() {
 /// throughput half is measured by `concurrent_writer_scaling_profile`; scaling
 /// would be worthless if the allocator raced. Postgres serialises these writers
 /// on the session's own row (`select ... for update` in the sequence
-/// allocator); SQLite serialises them on the file. Both must produce exactly
+/// allocator). The result must be exactly
 /// one event per append, numbered contiguously from 1, because replay walks
 /// that sequence and a gap or a repeat silently truncates or duplicates
 /// history.
@@ -1790,220 +1764,15 @@ async fn concurrent_appends_to_one_session_stay_gapless() {
     }
 }
 
-/// A journal migrates between backends with its structure intact.
-///
-/// This is the goal's migration path, exercised in both directions so neither
-/// backend is only ever a source or only ever a destination. The fixture is
-/// built to contain the three things a naive copy loses:
-///
-/// * an OVERSIZED body, which lives in `session_payloads` rather than in its
-///   event, so replay alone would leave the event pointing at nothing;
-/// * a FORK, whose own events are numbered after its parent's cut, so the
-///   destination must know it is a fork before the first append;
-/// * a SUBAGENT-OWNED session, which `list_sessions` does not return at all --
-///   enumerating with that would silently drop it.
-#[tokio::test]
-async fn a_journal_migrates_between_backends_with_its_structure_intact() {
-    use crate::session_store::migrate::{MigrationOptions, migrate_journal};
-
-    let mut pairs: Vec<(Harness, Harness)> = Vec::new();
-    let backends = harnesses().await;
-    if backends.len() < 2 {
-        eprintln!("migration: skipping, needs both backends");
-        for harness in backends {
-            harness.discard().await;
-        }
-        return;
-    }
-    // Both directions: sqlite -> postgres and postgres -> sqlite.
-    let mut forward = harnesses().await;
-    let forward_dest = forward.pop().expect("destination");
-    let forward_src = forward.remove(0);
-    pairs.push((forward_src, forward_dest));
-    let mut backward = harnesses().await;
-    let backward_src = backward.pop().expect("source");
-    let backward_dest = backward.remove(0);
-    pairs.push((backward_src, backward_dest));
-    for harness in backends {
-        harness.discard().await;
-    }
-
-    for (source_harness, destination_harness) in pairs {
-        let source = Arc::clone(&source_harness.store);
-        let destination = Arc::clone(&destination_harness.store);
-        let route = format!("{} -> {}", source_harness.name, destination_harness.name);
-
-        // A root session with an oversized tool output.
-        let root = started_session(source.as_ref()).await;
-        let output = "y".repeat(super::INLINE_SESSION_PAYLOAD_BYTES + 2_048);
-        source
-            .append(SessionEvent::new(
-                root,
-                0,
-                SessionEventKind::ToolCompleted {
-                    tool_call_id: "migrated-call".to_string(),
-                    output: output.clone(),
-                    output_ref: None,
-                    is_error: false,
-                    input: None,
-                    input_ref: None,
-                },
-            ))
-            .await
-            .unwrap_or_else(|error| panic!("{route}: oversized append: {error:#}"));
-        source
-            .append(user_prompt(root, Uuid::new_v4(), "after the big output"))
-            .await
-            .unwrap_or_else(|error| panic!("{route}: prompt: {error:#}"));
-        let root_events = source.read(root).await.expect("root events");
-
-        // A fork of it, with its own divergent history.
-        let forked = Uuid::new_v4();
-        source
-            .fork_before(root, forked, 2)
-            .await
-            .unwrap_or_else(|error| panic!("{route}: fork: {error:#}"));
-        source
-            .append(user_prompt(forked, Uuid::new_v4(), "only on the fork"))
-            .await
-            .unwrap_or_else(|error| panic!("{route}: fork append: {error:#}"));
-
-        // A subagent-owned child, which top-level listing would not return.
-        let child = started_session(source.as_ref()).await;
-        source
-            .register_child_session(root, child)
-            .await
-            .unwrap_or_else(|error| panic!("{route}: register child: {error:#}"));
-
-        // `fork_before(.., 2)` records `parent_cut_sequence = 1`: the argument
-        // is the first sequence NOT inherited, the column is the last one that
-        // is. The migration has to convert between them, so the fixture pins
-        // the recorded value rather than the argument.
-        let mut log = Vec::new();
-        let outcome = migrate_journal(
-            Arc::clone(&source),
-            Arc::clone(&destination),
-            &MigrationOptions::default(),
-            &mut |line| log.push(line.to_string()),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("{route}: migrate: {error:#}"));
-
-        assert_eq!(
-            outcome.sessions_failed, 0,
-            "{route}: {:?}",
-            outcome.failures
-        );
-        assert!(
-            outcome.sessions_copied >= 3,
-            "{route}: root, fork and child must all be copied, got {}",
-            outcome.sessions_copied
-        );
-        assert!(
-            outcome.payloads_copied >= 1,
-            "{route}: the oversized body must be carried across"
-        );
-
-        // The root's events arrive intact, and the deferred body reloads.
-        let copied_events = destination.read(root).await.expect("copied root");
-        assert_eq!(
-            copied_events.len(),
-            root_events.len(),
-            "{route}: every root event is present"
-        );
-        let reference = copied_events
-            .iter()
-            .find_map(|event| match &event.kind {
-                SessionEventKind::ToolCompleted { output_ref, .. } => output_ref.clone(),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("{route}: the migrated event keeps its payload reference"));
-        let loaded = destination
-            .load_payload(&reference)
-            .await
-            .unwrap_or_else(|error| panic!("{route}: load migrated payload: {error:#}"));
-        assert_eq!(
-            String::from_utf8(loaded).expect("utf8"),
-            output,
-            "{route}: a migrated payload reloads byte for byte"
-        );
-
-        // The fork keeps its lineage rather than becoming a root.
-        let lineage = destination
-            .session_lineage_page(None, 64)
-            .await
-            .expect("destination lineage");
-        let forked_lineage = lineage
-            .iter()
-            .find(|entry| entry.session_id == forked)
-            .unwrap_or_else(|| panic!("{route}: the fork must exist"));
-        assert_eq!(
-            forked_lineage.parent_session_id,
-            Some(root),
-            "{route}: a migrated fork keeps its parent"
-        );
-        assert_eq!(
-            forked_lineage.parent_cut_sequence,
-            Some(1),
-            "{route}: a migrated fork keeps its cut"
-        );
-        // The RECORDED inherited count, not one recomputed at the destination.
-        // A fork's own events are numbered immediately after it, so a
-        // destination that recounts can open a hole in the composed history --
-        // which is exactly what a real journal did.
-        let source_lineage = source
-            .session_lineage_page(None, 64)
-            .await
-            .expect("source lineage");
-        let source_fork = source_lineage
-            .iter()
-            .find(|entry| entry.session_id == forked)
-            .unwrap_or_else(|| panic!("{route}: the source fork must exist"));
-        assert_eq!(
-            forked_lineage.inherited_event_count, source_fork.inherited_event_count,
-            "{route}: a migrated fork keeps the inherited count the SOURCE recorded"
-        );
-        let child_lineage = lineage
-            .iter()
-            .find(|entry| entry.session_id == child)
-            .unwrap_or_else(|| panic!("{route}: the subagent session must exist"));
-        assert_eq!(
-            child_lineage.owner_session_id,
-            Some(root),
-            "{route}: a migrated subagent session keeps its owner"
-        );
-
-        // Running it again copies nothing and breaks nothing.
-        let second = migrate_journal(
-            Arc::clone(&source),
-            Arc::clone(&destination),
-            &MigrationOptions::default(),
-            &mut |_| {},
-        )
-        .await
-        .unwrap_or_else(|error| panic!("{route}: re-migrate: {error:#}"));
-        assert_eq!(
-            second.sessions_copied, 0,
-            "{route}: a repeated migration is a no-op"
-        );
-        assert!(
-            second.sessions_skipped >= outcome.sessions_copied,
-            "{route}: every already-copied session is skipped"
-        );
-
-        source_harness.discard().await;
-        destination_harness.discard().await;
-    }
-}
-
 /// An event body containing a NUL survives on both backends.
 ///
 /// Found by replaying a real journal, not by construction. Postgres `jsonb`
 /// parses to a tree whose strings are `text`, and `text` cannot hold a NUL, so
 /// the server rejects the entire insert with "unsupported Unicode escape
-/// sequence". SQLite's JSON is text and accepts it without comment. 246 events
-/// of 2.5 million in the journal this was measured against carry one, nearly
-/// all of them tool output that captured a binary byte.
+/// sequence", so an event carrying one would fail the whole append rather than
+/// be stored lossily. 246 events of 2.5 million in the journal this was
+/// measured against carry one, nearly all of them tool output that captured a
+/// binary byte.
 ///
 /// This is not a migration concern: the same append path runs live, so before
 /// the fix a single NUL in a tool's output would have failed the turn.
@@ -2062,118 +1831,6 @@ async fn an_event_body_containing_a_nul_round_trips_on_both_backends() {
 
         harness.discard().await;
     }
-}
-
-/// An interrupted migration RESUMES a half-copied session rather than skipping it.
-///
-/// Events stream in batches, each its own transaction, so a run killed
-/// mid-session leaves that session present but short. If "present" meant
-/// "done", the resume would step over it and the truncation would be
-/// permanent and silent -- every later read seeing a history that simply
-/// stops. The fixture below is that exact state: a session copied with a
-/// session budget too small to finish the journal, then finished by a second
-/// run.
-#[tokio::test]
-async fn an_interrupted_migration_resumes_a_partial_session() {
-    use crate::session_store::migrate::{MigrationOptions, migrate_journal};
-
-    let mut backends = harnesses().await;
-    if backends.len() < 2 {
-        eprintln!("resume: skipping, needs both backends");
-        for harness in backends {
-            harness.discard().await;
-        }
-        return;
-    }
-    let destination_harness = backends.pop().expect("destination");
-    let source_harness = backends.remove(0);
-    let source = Arc::clone(&source_harness.store);
-    let destination = Arc::clone(&destination_harness.store);
-
-    let session_id = started_session(source.as_ref()).await;
-    for index in 0..12 {
-        source
-            .append(user_prompt(
-                session_id,
-                Uuid::new_v4(),
-                &format!("message {index}"),
-            ))
-            .await
-            .expect("append");
-    }
-    let complete = source.state(session_id).await.expect("source state");
-
-    // Simulate the interrupted run: copy the lineage and only part of the
-    // events, exactly as a killed process would leave them.
-    destination
-        .create_session(session_id)
-        .await
-        .expect("create destination session");
-    let partial = source
-        .events_after(session_id, 0, 5)
-        .await
-        .expect("partial batch");
-    destination
-        .append_batch(partial)
-        .await
-        .expect("partial append");
-    let before = destination.state(session_id).await.expect("partial state");
-    assert!(
-        before.latest_sequence < complete.latest_sequence,
-        "the fixture must be genuinely short: {} vs {}",
-        before.latest_sequence,
-        complete.latest_sequence
-    );
-
-    let outcome = migrate_journal(
-        Arc::clone(&source),
-        Arc::clone(&destination),
-        &MigrationOptions::default(),
-        &mut |_| {},
-    )
-    .await
-    .expect("resume");
-
-    assert_eq!(
-        outcome.sessions_skipped, 0,
-        "a short session must not be mistaken for a finished one"
-    );
-    let after = destination.state(session_id).await.expect("resumed state");
-    assert_eq!(
-        after.latest_sequence, complete.latest_sequence,
-        "the resume must carry the session all the way to the source's end"
-    );
-    let events = destination.read(session_id).await.expect("resumed events");
-    let texts: Vec<String> = events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            SessionEventKind::Message { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        texts.len(),
-        12,
-        "every message survives exactly once: {texts:?}"
-    );
-
-    // And a third run, now that it is genuinely complete, does skip it.
-    let third = migrate_journal(
-        Arc::clone(&source),
-        Arc::clone(&destination),
-        &MigrationOptions::default(),
-        &mut |_| {},
-    )
-    .await
-    .expect("third run");
-    assert_eq!(
-        third.sessions_copied, 0,
-        "a finished session is not recopied"
-    );
-    assert!(third.sessions_skipped >= 1, "a finished session is skipped");
-
-    source_harness.discard().await;
-    destination_harness.discard().await;
 }
 
 /// Prompt admission is idempotent by message id on both backends.
@@ -2350,12 +2007,11 @@ async fn recent_message_recall_agrees_on_both_backends() {
 
 /// Cross-session search spans sessions on both backends.
 ///
-/// Named in the migration's objective and, until this test, unreachable: the
-/// Postgres implementation existed but was on no trait and had no caller, so
-/// nothing in the runtime could invoke it and SQLite had no equivalent at all.
-/// A capability nothing can call is not delivered.
+/// Until this test it was unreachable: the implementation existed but was on no
+/// trait and had no caller, so nothing in the runtime could invoke it. A
+/// capability nothing can call is not delivered.
 #[tokio::test]
-async fn cross_session_search_spans_sessions_on_both_backends() {
+async fn cross_session_search_spans_sessions() {
     for harness in harnesses().await {
         let store = Arc::clone(&harness.store);
         let name = harness.name;
@@ -2423,28 +2079,6 @@ async fn cross_session_search_spans_sessions_on_both_backends() {
             "{name}: cross-session regex must be refused, not attempted"
         );
 
-        harness.discard().await;
-    }
-}
-
-/// Guard against the suite quietly becoming single-backend.
-///
-/// Every test above loops over whatever `harnesses()` returns, so a
-/// misconfigured URL or a broken connection would turn the whole conformance
-/// suite green while only exercising SQLite. This asserts the loop really did
-/// cover Postgres whenever the environment says it should.
-#[tokio::test]
-async fn both_backends_are_exercised_when_postgres_is_configured() {
-    let configured = test_url().is_some();
-    let harnesses = harnesses().await;
-    let names: Vec<&str> = harnesses.iter().map(|harness| harness.name).collect();
-    assert!(names.contains(&"sqlite"), "sqlite must always be covered");
-    assert_eq!(
-        names.contains(&"postgres"),
-        configured,
-        "postgres coverage must follow BORG_TEST_SESSIONS_URL, got {names:?}"
-    );
-    for harness in harnesses {
         harness.discard().await;
     }
 }

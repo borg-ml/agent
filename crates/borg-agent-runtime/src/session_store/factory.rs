@@ -1,10 +1,9 @@
-//! Chooses this process's durable backend, and refuses to start on a partial one.
+//! Opens this process's durable journal, and refuses to start on a partial one.
 //!
-//! WHY THIS EXISTS: Borg now has two session-store implementations, and every
-//! process must pick exactly one. That choice cannot be made lazily per call
-//! site, because the two backends are not interchangeable at runtime -- they
-//! are different databases holding different data. One decision, made once at
-//! startup, from one environment variable.
+//! WHY THIS EXISTS: a process journals either to the managed cluster this
+//! installation provisions or to a server named by `BORG_SESSIONS_URL`. Those
+//! are different databases holding different data, so the choice cannot be made
+//! lazily per call site. One decision, made once at startup.
 //!
 //! THE FAIL-FAST RULE IS THE POINT. A `SessionStore` exposes its satellite
 //! tiers as `Result<Option<_>>`, and `None` means "this backend does not offer
@@ -16,11 +15,11 @@
 //! nothing but a repeating warning to show for it.
 //!
 //! So this module resolves the tiers eagerly and returns an error naming the
-//! backend and the missing tier. A process that cannot serve every tier must
-//! die at startup, where the operator is watching, rather than degrade into a
-//! silent retry loop hours later. `open` is the only supported way to obtain a
-//! store from configuration; constructing a backend directly is for tests and
-//! for tools that deliberately want one specific backend.
+//! missing tier. A process that cannot serve every tier must die at startup,
+//! where the operator is watching, rather than degrade into a silent retry loop
+//! hours later. `open` is the only supported way to obtain a store from
+//! configuration; constructing a store directly is for tests and for tools that
+//! deliberately want one specific database.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,40 +27,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use super::postgres::{PostgresSessionStore, SESSIONS_URL_ENV};
-use super::{SessionStore, SqliteSessionStore};
-
-/// Which durable backend a process resolved to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionBackend {
-    /// The historical single-file journal. One writer per file, machine-wide.
-    Sqlite,
-    /// The contention-free journal: writers serialise per session row.
-    Postgres,
-}
-
-impl SessionBackend {
-    /// The name used in diagnostics and startup errors.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Sqlite => "sqlite",
-            Self::Postgres => "postgres",
-        }
-    }
-}
-
-impl std::fmt::Display for SessionBackend {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
+use super::SessionStore;
 
 /// Which journal a process was told to use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Selection {
     /// An explicit `BORG_SESSIONS_URL`, or a URL pinned in code.
     Url(String),
-    /// An explicit opt-out to the single-writer journal.
-    Sqlite,
     /// The default: Borg's own PostgreSQL cluster on this machine.
     Managed,
 }
@@ -76,18 +48,9 @@ enum Selection {
 pub struct SessionStoreConfig {
     /// What the environment or the caller asked for.
     selection: Selection,
-    /// Where the SQLite journal lives when SQLite was selected.
-    sqlite_path: PathBuf,
     /// The Borg home directory that hosts the managed cluster.
     home: PathBuf,
-    /// Interactive processes wait longer for the SQLite write lock instead of
-    /// failing a user-visible command. Ignored by Postgres, which has no
-    /// machine-wide write lock to wait on.
-    interactive: bool,
 }
-
-/// Opt out of the managed cluster and use the single-writer journal.
-pub const SESSIONS_BACKEND_ENV: &str = "BORG_SESSIONS_BACKEND";
 
 /// The Borg home that hosts the managed cluster.
 ///
@@ -109,61 +72,30 @@ fn default_home() -> PathBuf {
 impl SessionStoreConfig {
     /// Resolve from the environment.
     ///
-    /// The default is the managed PostgreSQL cluster. Borg's normal posture is
-    /// several agents running at once, and SQLite admits one writer per file
-    /// machine-wide, so a SQLite default silently serialises every agent behind
-    /// one lock. SQLite remains available, but only when asked for.
-    pub fn from_env(sqlite_path: impl Into<PathBuf>) -> Self {
-        let sqlite_path = sqlite_path.into();
-        let selection = select(
-            PostgresSessionStore::url_from_env(),
-            std::env::var(SESSIONS_BACKEND_ENV).ok().as_deref(),
-            journal_is_the_default_one(&sqlite_path),
-        );
+    /// The default is Borg's own managed PostgreSQL cluster. An explicit
+    /// `BORG_SESSIONS_URL` points somewhere else, and is the only thing that
+    /// does: there is one backend, so there is nothing to select between.
+    pub fn from_env() -> Self {
         Self {
-            selection,
+            selection: select(PostgresSessionStore::url_from_env()),
             home: default_home(),
-            sqlite_path,
-            interactive: false,
         }
     }
 
     /// Pin a specific Postgres URL, ignoring the environment.
-    pub fn with_url(url: impl Into<String>, sqlite_path: impl Into<PathBuf>) -> Self {
-        let sqlite_path = sqlite_path.into();
+    pub fn with_url(url: impl Into<String>) -> Self {
         Self {
             selection: Selection::Url(url.into()),
             home: default_home(),
-            sqlite_path,
-            interactive: false,
-        }
-    }
-
-    /// Pin SQLite, ignoring the environment.
-    pub fn sqlite(sqlite_path: impl Into<PathBuf>) -> Self {
-        let sqlite_path = sqlite_path.into();
-        Self {
-            selection: Selection::Sqlite,
-            home: default_home(),
-            sqlite_path,
-            interactive: false,
         }
     }
 
     /// Pin the managed cluster under a specific home, ignoring the environment.
-    pub fn managed(home: impl Into<PathBuf>, sqlite_path: impl Into<PathBuf>) -> Self {
+    pub fn managed(home: impl Into<PathBuf>) -> Self {
         Self {
             selection: Selection::Managed,
             home: home.into(),
-            sqlite_path: sqlite_path.into(),
-            interactive: false,
         }
-    }
-
-    /// Wait longer for the SQLite write lock; see the field comment.
-    pub fn interactive(mut self, interactive: bool) -> Self {
-        self.interactive = interactive;
-        self
     }
 
     /// Where this configuration points, for diagnostics and for telling two
@@ -175,22 +107,7 @@ impl SessionStoreConfig {
     pub fn describe(&self) -> String {
         match &self.selection {
             Selection::Url(url) => url.clone(),
-            Selection::Sqlite => self.sqlite_path.display().to_string(),
             Selection::Managed => self.cluster().data_dir().display().to_string(),
-        }
-    }
-
-    /// Which backend this configuration selects, without connecting.
-    ///
-    /// There is no auto-detection and no fallback in either direction: an
-    /// unreachable Postgres does not quietly become SQLite, because that would
-    /// split one machine's history across two databases, and the split stays
-    /// invisible until someone goes looking for a session that was written
-    /// somewhere else.
-    pub fn backend(&self) -> SessionBackend {
-        match self.selection {
-            Selection::Url(_) | Selection::Managed => SessionBackend::Postgres,
-            Selection::Sqlite => SessionBackend::Sqlite,
         }
     }
 
@@ -204,33 +121,13 @@ impl SessionStoreConfig {
 ///
 /// Pure so the precedence rule can be tested directly: `std::env::set_var` is
 /// not sound to call while other threads run, and this suite is threaded.
-fn select(url: Option<String>, backend: Option<&str>, default_journal: bool) -> Selection {
-    // An explicit URL wins over everything, including an explicit backend
-    // name, because it is the more specific instruction.
-    if let Some(url) = url {
-        return Selection::Url(url);
+fn select(url: Option<String>) -> Selection {
+    // A configured URL is the more specific instruction, so it outranks the
+    // installation's own cluster.
+    match url {
+        Some(url) => Selection::Url(url),
+        None => Selection::Managed,
     }
-    if backend
-        .map(str::trim)
-        .is_some_and(|name| name.eq_ignore_ascii_case("sqlite"))
-    {
-        return Selection::Sqlite;
-    }
-    // The managed cluster serves the installation's own journal. A caller that
-    // pointed somewhere else -- a scratch directory, a second journal being
-    // read for migration -- has deliberately left that installation, and there
-    // is no cluster there to reach for. Provisioning one beside every scratch
-    // path would turn a temp directory into a database server.
-    if default_journal {
-        Selection::Managed
-    } else {
-        Selection::Sqlite
-    }
-}
-
-/// Whether this journal path is the one the local Borg installation owns.
-fn journal_is_the_default_one(sqlite_path: &Path) -> bool {
-    sqlite_path.starts_with(default_home())
 }
 
 /// A session store whose satellite tiers are known to be present.
@@ -240,7 +137,6 @@ fn journal_is_the_default_one(sqlite_path: &Path) -> bool {
 /// be weakened by a later caller that forgets to check.
 #[derive(Clone)]
 pub struct ResolvedSessionStore {
-    backend: SessionBackend,
     session: Arc<dyn SessionStore>,
     workspace: Arc<dyn crate::WorkspaceStore>,
     autonomy: Arc<dyn crate::autonomy::AutonomyStore>,
@@ -248,11 +144,6 @@ pub struct ResolvedSessionStore {
 }
 
 impl ResolvedSessionStore {
-    /// The backend this process resolved to.
-    pub fn backend(&self) -> SessionBackend {
-        self.backend
-    }
-
     /// The session journal.
     pub fn session(&self) -> &Arc<dyn SessionStore> {
         &self.session
@@ -278,7 +169,6 @@ impl std::fmt::Debug for ResolvedSessionStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ResolvedSessionStore")
-            .field("backend", &self.backend)
             .finish_non_exhaustive()
     }
 }
@@ -286,19 +176,15 @@ impl std::fmt::Debug for ResolvedSessionStore {
 /// A journal that has been opened but whose tiers are not yet proven.
 ///
 /// Separate from `ResolvedSessionStore` so the type says which guarantee you
-/// hold. Resolving a tier CONSTRUCTS it, and on a new database that means
-/// creating its schema -- real work that takes SQLite's single writer lock. A
-/// process that is about to discover it lost an ownership race and exit must
-/// not pay for tiers it will never use, or it blocks behind whatever large
-/// session currently holds the writer.
+/// hold: an open journal is reachable, a resolved one is known to serve every
+/// tier.
 ///
-/// So the journal opens first, the caller makes its ownership decision, and
-/// only a process that commits to running calls [`OpenSessionStore::resolve`].
-/// Every long-running path does, which is what keeps the all-or-nothing
-/// guarantee where it matters: before any loop that would otherwise retry a
-/// missing tier forever.
+/// The journal opens first, the caller makes its ownership decision, and only a
+/// process that commits to running calls [`OpenSessionStore::resolve`]. Every
+/// long-running path does, which is what keeps the all-or-nothing guarantee
+/// where it matters: before any loop that would otherwise retry a missing tier
+/// forever.
 pub struct OpenSessionStore {
-    backend: SessionBackend,
     session: Arc<dyn SessionStore>,
 }
 
@@ -306,17 +192,11 @@ impl std::fmt::Debug for OpenSessionStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("OpenSessionStore")
-            .field("backend", &self.backend)
             .finish_non_exhaustive()
     }
 }
 
 impl OpenSessionStore {
-    /// The backend this process resolved to.
-    pub fn backend(&self) -> SessionBackend {
-        self.backend
-    }
-
     /// The journal, before its satellite tiers have been proven present.
     pub fn session(&self) -> &Arc<dyn SessionStore> {
         &self.session
@@ -324,7 +204,7 @@ impl OpenSessionStore {
 
     /// Prove every satellite tier is present, or fail.
     pub async fn resolve(self) -> Result<ResolvedSessionStore> {
-        resolve_tiers(self.backend, self.session).await
+        resolve_tiers(self.session).await
     }
 }
 
@@ -334,16 +214,15 @@ impl OpenSessionStore {
 /// process has committed to running. See that type for why the two steps are
 /// separate.
 pub async fn open(config: &SessionStoreConfig) -> Result<OpenSessionStore> {
-    let backend = config.backend();
     let session: Arc<dyn SessionStore> = match &config.selection {
         Selection::Url(url) => {
             let store = PostgresSessionStore::connect(url).await.with_context(|| {
                 format!("{SESSIONS_URL_ENV} is set, so Borg requires PostgreSQL")
             })?;
             // Before anything reads or writes. A journal reached by
-            // connection string can be shared by accident in a way a SQLite
-            // file could not, and what would be shared is a trust boundary.
-            // Sharing stays possible, but only deliberately.
+            // connection string can be pointed at by a second machine or OS
+            // user without anyone noticing, and what would be shared is a
+            // trust boundary. Sharing stays possible, but only deliberately.
             store.ensure_single_owner().await?;
             Arc::new(store)
         }
@@ -363,16 +242,8 @@ pub async fn open(config: &SessionStoreConfig) -> Result<OpenSessionStore> {
             store.ensure_single_owner().await?;
             Arc::new(store)
         }
-        Selection::Sqlite => {
-            let path = config.sqlite_path.clone();
-            if config.interactive {
-                Arc::new(SqliteSessionStore::open_interactive(path).await?)
-            } else {
-                Arc::new(SqliteSessionStore::open(path).await?)
-            }
-        }
     };
-    Ok(OpenSessionStore { backend, session })
+    Ok(OpenSessionStore { session })
 }
 
 /// Open the configured backend and prove every tier in one step.
@@ -388,26 +259,22 @@ pub async fn open_resolved(config: &SessionStoreConfig) -> Result<ResolvedSessio
 /// Split out so a caller that built a backend itself -- a test, or a tool that
 /// deliberately wants one specific backend -- still gets the same all-or-
 /// nothing guarantee as a configured startup.
-pub async fn resolve_tiers(
-    backend: SessionBackend,
-    session: Arc<dyn SessionStore>,
-) -> Result<ResolvedSessionStore> {
+pub async fn resolve_tiers(session: Arc<dyn SessionStore>) -> Result<ResolvedSessionStore> {
     let workspace = session
         .workspace_store()
         .await
-        .with_context(|| missing_tier_context(backend, "workspace"))?
-        .ok_or_else(|| anyhow::anyhow!(missing_tier_context(backend, "workspace")))?;
+        .with_context(|| missing_tier_context("workspace"))?
+        .ok_or_else(|| anyhow::anyhow!(missing_tier_context("workspace")))?;
     let autonomy = session
         .autonomy_store()
         .await
-        .with_context(|| missing_tier_context(backend, "autonomy"))?
-        .ok_or_else(|| anyhow::anyhow!(missing_tier_context(backend, "autonomy")))?;
+        .with_context(|| missing_tier_context("autonomy"))?
+        .ok_or_else(|| anyhow::anyhow!(missing_tier_context("autonomy")))?;
     let receipts = session
         .receipt_store()
         .await
-        .with_context(|| missing_tier_context(backend, "receipt"))?;
+        .with_context(|| missing_tier_context("receipt"))?;
     Ok(ResolvedSessionStore {
-        backend,
         session,
         workspace,
         autonomy,
@@ -421,12 +288,12 @@ pub async fn resolve_tiers(
 /// retry loop that never terminated, so the message has to make clear that
 /// refusing to start is the intended behaviour and not a transient fault worth
 /// restarting into.
-fn missing_tier_context(backend: SessionBackend, tier: &str) -> String {
+fn missing_tier_context(tier: &str) -> String {
     format!(
-        "the {backend} session store does not provide the {tier} tier, so this process \
+        "the Postgres session store does not provide the {tier} tier, so this process \
          refuses to start; a partially wired backend does not fail at the point of use, \
-         it retries forever (see run_host_workspace_recovery_loop). Either finish porting \
-         the {tier} tier to {backend}, or unset {SESSIONS_URL_ENV} to use SQLite."
+         it retries forever (see run_host_workspace_recovery_loop). The {tier} tier has \
+         to be finished before this journal can serve a running agent."
     )
 }
 
@@ -435,61 +302,37 @@ mod tests {
     use super::*;
     use crate::CodingProvider;
 
-    /// Borg's default posture is several agents at once, and SQLite admits one
-    /// writer per file machine-wide. So the default must be Postgres, and
-    /// SQLite must still be reachable for anyone who wants it.
+    /// Without a configured URL a process serves the installation's own
+    /// cluster. Nothing else can be selected, so nothing else may be inferred:
+    /// an absent URL must not become some other journal by accident.
     #[test]
-    fn postgres_is_the_default_and_sqlite_is_opt_in() {
-        assert_eq!(select(None, None, true), Selection::Managed);
-        assert_eq!(select(None, Some("sqlite"), true), Selection::Sqlite);
-        assert_eq!(select(None, Some("  SQLite  "), true), Selection::Sqlite);
-        // An unrecognised name must not silently become SQLite.
-        assert_eq!(select(None, Some("postgres"), true), Selection::Managed);
-        assert_eq!(select(None, Some(""), true), Selection::Managed);
+    fn the_managed_cluster_is_the_default() {
+        assert_eq!(select(None), Selection::Managed);
     }
 
-    /// The managed cluster belongs to the installation's own journal. A caller
-    /// pointing at a scratch path has left that installation, and must not
-    /// have a database server provisioned beside it.
+    /// A configured URL is the more specific instruction, so it outranks the
+    /// installation's own cluster rather than being merged with it.
     #[test]
-    fn a_journal_outside_the_borg_home_does_not_get_a_cluster() {
-        assert_eq!(select(None, None, false), Selection::Sqlite);
-        // An explicit URL still reaches whatever it names.
-        assert_eq!(
-            select(Some("postgres://x@y/z".to_string()), None, false),
-            Selection::Url("postgres://x@y/z".to_string())
-        );
-    }
-
-    /// A configured URL is the more specific instruction, so it outranks a
-    /// backend name rather than being contradicted by one.
-    #[test]
-    fn an_explicit_url_outranks_every_other_selection() {
+    fn an_explicit_url_outranks_the_managed_cluster() {
         let url = "postgres://borg@localhost:5433/borg_sessions";
-        assert_eq!(
-            select(Some(url.to_string()), None, true),
-            Selection::Url(url.to_string())
-        );
-        assert_eq!(
-            select(Some(url.to_string()), Some("sqlite"), true),
-            Selection::Url(url.to_string())
-        );
+        assert_eq!(select(Some(url.to_string())), Selection::Url(url.to_string()));
     }
 
+    /// `describe` is what an operator reads in a startup error, so each
+    /// selection has to name the place it will actually open.
     #[test]
-    fn each_selection_reports_the_backend_it_will_open() {
+    fn each_selection_describes_where_it_points() {
         assert_eq!(
-            SessionStoreConfig::sqlite("/tmp/borg/sessions.sqlite3").backend(),
-            SessionBackend::Sqlite
+            SessionStoreConfig::with_url("postgres://x@y/z").describe(),
+            "postgres://x@y/z"
         );
         assert_eq!(
-            SessionStoreConfig::managed("/tmp/borg", "/tmp/borg/sessions.sqlite3").backend(),
-            SessionBackend::Postgres
-        );
-        assert_eq!(
-            SessionStoreConfig::with_url("postgres://x@y/z", "/tmp/borg/sessions.sqlite3")
-                .backend(),
-            SessionBackend::Postgres
+            SessionStoreConfig::managed("/tmp/borg").describe(),
+            SessionStoreConfig::managed("/tmp/borg")
+                .cluster()
+                .data_dir()
+                .display()
+                .to_string()
         );
     }
 
@@ -961,12 +804,12 @@ mod tests {
     /// rather than at the point of use, silently and forever.
     #[tokio::test]
     async fn a_backend_without_a_workspace_tier_is_refused_at_startup() {
-        let error = resolve_tiers(SessionBackend::Postgres, Arc::new(TierlessStore::default()))
+        let error = resolve_tiers(Arc::new(TierlessStore::default()))
             .await
             .expect_err("a store with no workspace tier must not resolve");
         let message = format!("{error:#}");
         assert!(
-            message.contains("workspace") && message.contains("postgres"),
+            message.contains("workspace") && message.contains("Postgres"),
             "the error must name the backend and the missing tier, got: {message}"
         );
         assert!(
@@ -975,23 +818,18 @@ mod tests {
         );
     }
 
-    /// The migration's actual claim: Postgres serves every tier too, so a
-    /// process pointed at `BORG_SESSIONS_URL` starts rather than refusing.
-    /// Without this, `a_backend_without_a_workspace_tier_is_refused_at_startup`
-    /// would be satisfied by a factory that rejects Postgres unconditionally.
+    /// The shipped claim: the journal serves every tier, so a configured
+    /// process starts rather than refusing. Without this,
+    /// `a_backend_without_a_workspace_tier_is_refused_at_startup` would be
+    /// satisfied by a factory that rejects every store unconditionally.
     #[tokio::test]
     async fn postgres_resolves_every_tier() {
-        let Some(url) = crate::session_store::postgres::testing::test_url() else {
-            eprintln!("factory: skipping postgres, BORG_TEST_SESSIONS_URL is not set");
-            return;
-        };
+        let url = crate::session_store::postgres::testing::required_test_url();
         let scratch = crate::session_store::postgres::testing::ScratchDatabase::create(&url).await;
-        let config = SessionStoreConfig::with_url(&scratch.url, "/unused/sessions.sqlite3");
-        assert_eq!(config.backend(), SessionBackend::Postgres);
+        let config = SessionStoreConfig::with_url(&scratch.url);
         let resolved = open_resolved(&config)
             .await
             .expect("postgres must serve every tier");
-        assert_eq!(resolved.backend(), SessionBackend::Postgres);
         resolved
             .workspace()
             .create_workspace(crate::Workspace {
@@ -1010,107 +848,22 @@ mod tests {
                 .is_none(),
             "an unknown job id has no row"
         );
-    }
-
-    /// SQLite serves every tier today, so it must resolve -- otherwise the
-    /// check above would be vacuously true and would pass on any input.
-    #[tokio::test]
-    async fn sqlite_resolves_every_tier() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let config = SessionStoreConfig::sqlite(directory.path().join("sessions.sqlite3"));
-        let resolved = open_resolved(&config)
-            .await
-            .expect("sqlite must serve every tier");
-        assert_eq!(resolved.backend(), SessionBackend::Sqlite);
-        // Prove the handle is usable, not merely non-null.
-        resolved
-            .workspace()
-            .create_workspace(crate::Workspace {
-                id: Uuid::new_v4(),
-                name: "factory-tier-check".to_string(),
-                created_at: Utc::now(),
-            })
-            .await
-            .expect("the resolved workspace tier must be usable");
-        assert!(
-            resolved
-                .autonomy()
-                .get(Uuid::new_v4())
-                .await
-                .expect("the resolved autonomy tier must be usable")
-                .is_none(),
-            "an unknown job id has no row"
-        );
-    }
-
-    /// Opening the journal must not construct the satellite tiers.
-    ///
-    /// This is the ordering that a competing host depends on: resolving a tier
-    /// creates its schema, which takes SQLite's single writer lock, so doing it
-    /// during `open` makes a process that is about to lose an ownership race
-    /// block behind whatever session currently holds the writer. The tables
-    /// below are the proof -- they exist only after `resolve`.
-    #[tokio::test]
-    async fn opening_the_journal_does_not_build_the_satellite_tiers() {
-        use sqlx::Row;
-
-        let directory = tempfile::tempdir().expect("tempdir");
-        let path = directory.path().join("sessions.sqlite3");
-        let config = SessionStoreConfig::sqlite(&path);
-
-        let opened = open(&config).await.expect("open the journal");
-        let probe = SqliteSessionStore::open(&path).await.expect("probe");
-        let tier_tables = |pool: &sqlx::SqlitePool| {
-            let pool = pool.clone();
-            async move {
-                sqlx::query(
-                    "select name from sqlite_master where type='table' \
-                     and name in ('borg_autonomy_schema', 'borg_workspace_schema')",
-                )
-                .fetch_all(&pool)
-                .await
-                .expect("probe tier tables")
-                .iter()
-                .map(|row| row.get::<String, _>("name"))
-                .collect::<Vec<_>>()
-            }
-        };
-        assert!(
-            tier_tables(probe.pool()).await.is_empty(),
-            "opening the journal must not create tier schemas"
-        );
-
-        let resolved = opened.resolve().await.expect("resolve tiers");
-        let mut after = tier_tables(probe.pool()).await;
-        after.sort();
-        assert_eq!(
-            after,
-            vec![
-                "borg_autonomy_schema".to_string(),
-                "borg_workspace_schema".to_string()
-            ],
-            "resolving is what builds the tiers"
-        );
-        assert_eq!(resolved.backend(), SessionBackend::Sqlite);
     }
 
     /// A journal that acquires a SECOND owner is refused unless sharing was
     /// asked for.
     ///
     /// The owner is this machine and OS user, which is exactly the boundary
-    /// workspace membership and `/broadcast` are scoped to. A SQLite journal
-    /// could not be shared by accident because it was a file; a connection
-    /// string can be, and the sharing would be invisible until someone noticed
-    /// a stranger in their workspace. Simulated here by writing a second owner
-    /// row directly, because a test cannot become a different OS user.
+    /// workspace membership and `/broadcast` are scoped to. A connection string
+    /// can be handed to a second machine or OS user by accident, and the
+    /// sharing would be invisible until someone noticed a stranger in their
+    /// workspace. Simulated here by writing a second owner row directly,
+    /// because a test cannot become a different OS user.
     #[tokio::test]
     async fn a_second_owner_is_refused_unless_sharing_is_explicit() {
-        let Some(url) = crate::session_store::postgres::testing::test_url() else {
-            eprintln!("factory: skipping postgres, BORG_TEST_SESSIONS_URL is not set");
-            return;
-        };
+        let url = crate::session_store::postgres::testing::required_test_url();
         let scratch = crate::session_store::postgres::testing::ScratchDatabase::create(&url).await;
-        let config = SessionStoreConfig::with_url(&scratch.url, "/unused/sessions.sqlite3");
+        let config = SessionStoreConfig::with_url(&scratch.url);
 
         // First owner: this process. Opening records it and succeeds.
         let opened = open(&config).await.expect("a fresh journal has one owner");
@@ -1151,22 +904,16 @@ mod tests {
     /// autonomy would otherwise slip through the guard above.
     #[tokio::test]
     async fn a_backend_missing_only_the_autonomy_tier_is_also_refused() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let sqlite = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .expect("sqlite");
-        let workspace = sqlite
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let workspace = store
             .workspace_store()
             .await
             .expect("workspace tier")
             .expect("workspace tier");
 
-        let error = resolve_tiers(
-            SessionBackend::Postgres,
-            Arc::new(TierlessStore {
-                workspace: Some(workspace),
-            }),
-        )
+        let error = resolve_tiers(Arc::new(TierlessStore {
+            workspace: Some(workspace),
+        }))
         .await
         .expect_err("a store with no autonomy tier must not resolve");
         let message = format!("{error:#}");
@@ -1174,5 +921,7 @@ mod tests {
             message.contains("autonomy"),
             "the error must name the autonomy tier, got: {message}"
         );
+
+        scratch.discard().await;
     }
 }
