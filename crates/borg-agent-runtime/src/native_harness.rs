@@ -1434,6 +1434,7 @@ async fn call_model_streaming(
     // progress sender for provider-owned background work. Do not let the
     // foreground result become a Ready status until that event stream closes.
     let mut completed = None;
+    let mut control_applied = false;
     loop {
         // Live assistant text is rate limited, so the tail of a burst is often
         // still unpublished when the model moves on. Give that tail its own
@@ -1574,8 +1575,12 @@ async fn call_model_streaming(
                 None => progress_open = false,
                 }
             },
-            control = next_control(context.controls) => match control {
-                Some(AgentTurnControl::Interrupt) => bail!("native provider turn interrupted"),
+            control = next_control(context.controls), if !control_applied => match control {
+                Some(AgentTurnControl::Interrupt) => {
+                    completed = Some(Err(anyhow::anyhow!("native provider turn interrupted")));
+                    control_applied = true;
+                    progress_rx.close();
+                }
                 Some(AgentTurnControl::Steer {
                     text,
                     attachments,
@@ -1588,10 +1593,13 @@ async fn call_model_streaming(
                         continue;
                     }
                     let _ = ack.send(Ok(()));
-                    return Ok(NativeModelOutcome::Steered(NativeSteer {
+                    completed = Some(Ok(NativeModelOutcome::Steered(NativeSteer {
                         text,
                         attachments,
-                    }));
+                    })));
+                    // Stop generation, but drain already received deltas before returning.
+                    control_applied = true;
+                    progress_rx.close();
                 }
                 Some(AgentTurnControl::Approval { .. })
                 | Some(AgentTurnControl::ProviderInteractionResponse { .. }) => {}
@@ -3819,6 +3827,65 @@ mod tests {
                 result.expect("commentary must reach the stream while the turn continues");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn steering_drains_received_commentary_before_returning() {
+        let client = CommentaryTailClient { follow_up: None };
+        let (events_tx, mut events_rx) = mpsc::channel(1);
+        let (controls_tx, controls_rx) = mpsc::channel(1);
+        let message_id = Uuid::new_v4();
+        let mut controls = Some(controls_rx);
+        let call = call_model_streaming(
+            &client,
+            crate::CodingProvider::Codex,
+            "test-model",
+            None,
+            ModelTurnRequest {
+                fast: false,
+                request_id: None,
+                session_id: None,
+                prompt_cache_key: None,
+                messages: vec![ModelMessage::user("hello")],
+                tools: Vec::new(),
+                output_schema: None,
+            },
+            ModelStreamContext {
+                coding_provider: crate::CodingProvider::Codex,
+                assistant_message_id: message_id,
+                events: &events_tx,
+                controls: &mut controls,
+            },
+        );
+        let observe = async {
+            assert_eq!(
+                next_live_commentary(&mut events_rx, message_id).await,
+                "The"
+            );
+            let (ack, received) = tokio::sync::oneshot::channel();
+            controls_tx
+                .send(AgentTurnControl::Steer {
+                    message_id: Uuid::new_v4(),
+                    text: "new direction".into(),
+                    attachments: Vec::new(),
+                    admission: borg_provider::provider::SteerAdmission::pending(),
+                    preempt: true,
+                    ack,
+                })
+                .await
+                .unwrap();
+            received.await.unwrap().unwrap();
+            assert_eq!(
+                next_live_commentary(&mut events_rx, message_id).await,
+                "The lifecycle regression passed."
+            );
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(call, observe)
+        })
+        .await
+        .expect("steering must finish without dropping text");
+        assert!(matches!(result.unwrap(), NativeModelOutcome::Steered(_)));
     }
 
     #[tokio::test]

@@ -8296,6 +8296,41 @@ fn running_tool_suppresses_stale_response_spinner() {
 }
 
 #[test]
+fn redirected_reply_is_visibly_interrupted_not_a_finished_answer() {
+    let mut transcript = Transcript::default();
+    let session_id = Uuid::new_v4();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "I can see".into(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "native_steer_applied".into(),
+            payload: serde_json::json!({}),
+        },
+    ));
+    let rendered = transcript
+        .lines(100)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("I can see"), "{rendered}");
+    assert!(rendered.contains("interrupted"), "{rendered}");
+}
+
+#[test]
 fn terminal_boundary_settles_a_late_assistant_live_snapshot() {
     let session_id = Uuid::new_v4();
     let prompt_id = Uuid::new_v4();

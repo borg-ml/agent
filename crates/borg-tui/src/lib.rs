@@ -1539,7 +1539,7 @@ pub struct BorgTerminal {
     /// `None` keeps the half-block fallback drawn by the transcript.
     image_picker: Option<ImagePicker>,
     /// Encoded previews keyed by source path and tile size in cells.
-    image_protocols: HashMap<(PathBuf, u16, u16), StatefulProtocol>,
+    image_protocols: HashMap<(PathBuf, u16, u16, usize, u16), StatefulProtocol>,
     picker_hit_areas: Vec<(Rect, usize)>,
     hovered_tool: Option<usize>,
     hovered_tool_run: Option<(usize, usize)>,
@@ -7707,16 +7707,14 @@ impl BorgTerminal {
                 }
                 frame.render_widget(Paragraph::new(visible_transcript), content_area);
                 if let Some(picker) = self.image_picker.as_ref() {
-                    // Replace fully visible half-block tiles with real
-                    // terminal graphics; partially scrolled tiles keep the
-                    // glyph fallback so nothing is drawn outside the viewport.
                     for slot in image_preview_slots(link_rows) {
-                        if slot.first_row < scroll_start
-                            || slot.first_row + slot.rows
-                                > scroll_start.saturating_add(visible_height)
-                        {
+                        let first = slot.first_row.max(scroll_start);
+                        let end = (slot.first_row + slot.rows)
+                            .min(scroll_start.saturating_add(visible_height));
+                        if first >= end {
                             continue;
                         }
+                        let skipped_rows = first - slot.first_row;
                         let x = content_area.x.saturating_add(slot.start as u16);
                         let width = (slot.width as u16).min(content_area.right().saturating_sub(x));
                         if width == 0 {
@@ -7724,11 +7722,17 @@ impl BorgTerminal {
                         }
                         let area = Rect {
                             x,
-                            y: content_area.y + (slot.first_row - scroll_start) as u16,
+                            y: content_area.y + (first - scroll_start) as u16,
                             width,
-                            height: slot.rows as u16,
+                            height: (end - first) as u16,
                         };
-                        let key = (slot.path.clone(), area.width, area.height);
+                        let key = (
+                            slot.path.clone(),
+                            area.width,
+                            slot.rows as u16,
+                            skipped_rows,
+                            area.height,
+                        );
                         if !self.image_protocols.contains_key(&key) {
                             if self.image_protocols.len() >= 64 {
                                 self.image_protocols.clear();
@@ -7736,8 +7740,22 @@ impl BorgTerminal {
                             let Some(image) = attachments::load_preview_image(&slot.path) else {
                                 continue;
                             };
+                            let font = picker.font_size();
+                            // Keep the full preview scale when only part of it is visible.
+                            let fitted = Resize::Fit(None).resize(
+                                &image,
+                                font,
+                                ratatui::layout::Size::new(width, slot.rows as u16),
+                                None,
+                            );
+                            let visible = fitted.crop_imm(
+                                0,
+                                skipped_rows as u32 * u32::from(font.height),
+                                fitted.width(),
+                                u32::from(area.height) * u32::from(font.height),
+                            );
                             self.image_protocols
-                                .insert(key.clone(), picker.new_resize_protocol(image));
+                                .insert(key.clone(), picker.new_resize_protocol(visible));
                         }
                         if let Some(protocol) = self.image_protocols.get_mut(&key) {
                             frame.render_stateful_widget(

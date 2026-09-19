@@ -1119,6 +1119,9 @@ impl Transcript {
                         .is_some_and(|detail| detail.eq_ignore_ascii_case("interrupted")),
                 );
             }
+            SessionEventKind::ProviderEvent { kind, .. } if kind == "native_steer_applied" => {
+                self.finish_live_assistant_messages(event.created_at, true);
+            }
             SessionEventKind::TurnCompleted { error, .. } => {
                 self.live_turn_closed = true;
                 self.finish_live_assistant_messages(
