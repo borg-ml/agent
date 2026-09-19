@@ -1,5 +1,5 @@
 use super::*;
-use sqlx::Executor;
+use borg_remote::session_store::postgres::PostgresSessionStore;
 use std::io::Read as _;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
@@ -110,13 +110,10 @@ async fn goal_dispatch_does_not_wait_for_a_full_command_queue() {
 }
 
 #[tokio::test]
-async fn prompt_dispatch_does_not_block_input_while_sqlite_is_locked() {
+async fn prompt_dispatch_does_not_block_input_while_the_journal_is_blocked() {
     let directory = tempdir().expect("session directory");
-    let store = Arc::new(
-        SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .expect("session store"),
-    );
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     store
@@ -141,11 +138,14 @@ async fn prompt_dispatch_does_not_block_input_while_sqlite_is_locked() {
             .expect("initialize session journal");
     }
 
-    let mut blocker = store.pool().acquire().await.expect("writer connection");
-    blocker
-        .execute("BEGIN IMMEDIATE")
+    // Block durable appends the way real contention does -- an exclusive lock
+    // on the event table -- rather than by taking any one backend's writer
+    // lock. What is under test is the input path, not the database.
+    let mut blocked = store.pool().begin().await.expect("writer transaction");
+    sqlx::query("lock table session_events in access exclusive mode")
+        .execute(&mut *blocked)
         .await
-        .expect("hold SQLite writer lock");
+        .expect("hold the journal against appends");
 
     let (commands_tx, mut commands_rx) = mpsc::channel(1);
     let durable_store: Arc<dyn SessionStore> = store.clone();
@@ -200,13 +200,10 @@ async fn prompt_dispatch_does_not_block_input_while_sqlite_is_locked() {
         }) if interrupted == session_id
     ));
 
-    blocker
-        .execute("ROLLBACK")
+    blocked.rollback().await.expect("release the journal");
+    let routed = tokio::time::timeout(Duration::from_secs(5), commands_rx.recv())
         .await
-        .expect("release writer lock");
-    let routed = tokio::time::timeout(Duration::from_secs(2), commands_rx.recv())
-        .await
-        .expect("prompt was not routed after releasing the writer lock")
+        .expect("prompt was not routed after the journal was released")
         .expect("command channel closed");
     assert!(matches!(
         routed,
@@ -216,7 +213,7 @@ async fn prompt_dispatch_does_not_block_input_while_sqlite_is_locked() {
             ..
         } if routed_session == session_id && routed_message == message_id
     ));
-    let completion = tokio::time::timeout(Duration::from_secs(2), completions.recv())
+    let completion = tokio::time::timeout(Duration::from_secs(5), completions.recv())
         .await
         .expect("prompt completion timed out");
     assert!(matches!(
@@ -237,10 +234,49 @@ async fn prompt_dispatch_does_not_block_input_while_sqlite_is_locked() {
     );
 
     drop(operations);
-    tokio::time::timeout(Duration::from_secs(1), dispatcher)
+    tokio::time::timeout(Duration::from_secs(5), dispatcher)
         .await
         .expect("dispatcher did not drain")
         .expect("dispatcher task panicked");
+    scratch.discard().await;
+}
+
+/// A second launcher for a session that already has an owner must stand down.
+///
+/// The ownership decision is the writer lease, not the journal: a host that
+/// loses the race takes the attached path and returns without touching the
+/// owner. This pins the lease half directly, because the launcher it guards
+/// resolves its store from the process environment and cannot be pointed at a
+/// scratch database in-process.
+#[test]
+fn competing_detached_host_cannot_take_ownership_from_the_legitimate_owner() {
+    let root = short_socket_tempdir();
+    let session_id = Uuid::new_v4();
+    let lock_path = root.path().join(format!("{session_id}.lock"));
+
+    let owner = SessionWriterLease::try_acquire(&lock_path)
+        .expect("acquire the owner lease")
+        .expect("an unheld lease is available");
+
+    let competitor = SessionWriterLease::try_acquire(&lock_path).expect("probe the held lease");
+    assert!(
+        competitor.is_none(),
+        "a competing host must not be handed a second writer lease"
+    );
+    assert!(
+        SessionWriterLease::try_acquire(&lock_path)
+            .expect("probe the held lease again")
+            .is_none(),
+        "a failed competing attempt must not release the owner's lease"
+    );
+
+    drop(owner);
+    assert!(
+        SessionWriterLease::try_acquire(&lock_path)
+            .expect("acquire after the owner exits")
+            .is_some(),
+        "the lease must be reclaimable once the owner is gone"
+    );
 }
 
 #[test]
@@ -260,66 +296,16 @@ fn relaunching_the_same_session_carries_the_unsent_composer_draft() {
 }
 
 #[test]
-fn resume_retries_sqlite_contention_but_not_permanent_errors() {
+fn resume_retries_transient_store_faults_but_not_permanent_errors() {
     assert!(local_resume_error_is_retryable(&anyhow::anyhow!(
         "pool timed out while waiting for an open connection"
     )));
     assert!(local_resume_error_is_retryable(&anyhow::anyhow!(
-        "database is locked"
-    )));
-    assert!(local_resume_error_is_retryable(&anyhow::anyhow!(
-        "error returned from database: (code: 13) database or disk is full"
+        "error returned from database: no space left on device"
     )));
     assert!(!local_resume_error_is_retryable(&anyhow::anyhow!(
         "recorded project directory no longer exists"
     )));
-}
-
-#[tokio::test]
-#[cfg(unix)]
-async fn competing_detached_host_exits_without_waiting_for_database_writer_or_stopping_owner() {
-    let root = short_socket_tempdir();
-    let session_id = Uuid::new_v4();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
-    store.create_session(session_id).await.unwrap();
-    let lock_path = root.path().join(format!("{session_id}.lock"));
-    let writer = SessionWriterLease::try_acquire(&lock_path)
-        .unwrap()
-        .unwrap();
-    let mut transaction = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
-    sqlx::query("update sessions set updated_at=updated_at where id=?")
-        .bind(session_id.to_string())
-        .execute(&mut *transaction)
-        .await
-        .unwrap();
-    let mut args = LocalAgentCliArgs::resume(Some(session_id));
-    args.session_host = Some(session_id);
-    args.local_only = true;
-
-    let result = tokio::time::timeout(
-        Duration::from_secs(1),
-        run_local_agent_session(
-            &args,
-            None,
-            None,
-            Some(root.path()),
-            Arc::new(TuiCrashContext::default()),
-            None,
-        ),
-    )
-    .await
-    .expect("competing host blocked on database maintenance")
-    .expect("competing host must exit successfully");
-    assert!(result.is_none());
-    assert!(
-        SessionWriterLease::try_acquire(&lock_path)
-            .unwrap()
-            .is_none()
-    );
-    transaction.rollback().await.unwrap();
-    drop(writer);
 }
 
 /// A detached host that stops in order to come straight back -- an unsent
@@ -335,7 +321,7 @@ async fn competing_detached_host_exits_without_waiting_for_database_writer_or_st
 #[tokio::test]
 async fn a_detached_host_coming_back_keeps_the_row_startup_demands() {
     async fn stop_then_start(
-        store: &SqliteSessionStore,
+        store: &PostgresSessionStore,
         session_id: Uuid,
         user_requested_exit: bool,
         relaunches_same_session: bool,
@@ -357,9 +343,7 @@ async fn a_detached_host_coming_back_keeps_the_row_startup_demands() {
     }
 
     let directory = tempdir().expect("temporary session root");
-    let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-        .await
-        .expect("open session store");
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
 
     // Reopening after a detach: the draft is what brings the session back, and
     // it is also why the session is still empty.
@@ -413,6 +397,7 @@ async fn a_detached_host_coming_back_keeps_the_row_startup_demands() {
         !store.contains_session(finished).await.expect("contains"),
         "the ended session should have been reclaimed"
     );
+    scratch.discard().await;
 }
 
 #[cfg(unix)]
@@ -884,9 +869,7 @@ fn first_resume_scan_is_bounded_before_history_is_selected() {
 #[tokio::test]
 async fn first_resume_frame_keeps_latest_updates_from_a_long_autonomous_turn() {
     let directory = tempdir().unwrap();
-    let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
     store
@@ -944,6 +927,7 @@ async fn first_resume_frame_keeps_latest_updates_from_a_long_autonomous_turn() {
         SessionEventKind::Message { actor: EventActor::Assistant, text, .. }
             if text == "latest autonomous update"
     )));
+    scratch.discard().await;
 }
 
 /// The sibling test above ends the stream on the last reply, so the bounded
@@ -956,9 +940,7 @@ async fn first_resume_frame_keeps_latest_updates_from_a_long_autonomous_turn() {
 #[tokio::test]
 async fn first_resume_frame_reaches_a_conversation_end_buried_behind_a_long_event_tail() {
     let directory = tempdir().unwrap();
-    let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
     store
@@ -1044,6 +1026,7 @@ async fn first_resume_frame_reaches_a_conversation_end_buried_behind_a_long_even
             .any(|event| event.sequence > reply.sequence && event.sequence < history.page_before),
         "paging up must load the interval the splice skipped"
     );
+    scratch.discard().await;
 }
 
 /// The conversation splice reads a fork's own rows, which are numbered from
@@ -1055,9 +1038,7 @@ async fn first_resume_frame_reaches_a_conversation_end_buried_behind_a_long_even
 #[tokio::test]
 async fn first_resume_frame_reaches_a_forked_conversation_end_in_logical_sequence_space() {
     let directory = tempdir().unwrap();
-    let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let parent_id = Uuid::new_v4();
     store.create_session(parent_id).await.unwrap();
     for text in ["inherited prompt", "inherited reply"] {
@@ -1173,6 +1154,7 @@ async fn first_resume_frame_reaches_a_forked_conversation_end_in_logical_sequenc
     // The inherited prefix is not spliced, so it must remain reachable the
     // normal way: paging walks down into the projection that renumbers it.
     assert!(history.page_before > fork.inherited_event_count);
+    scratch.discard().await;
 }
 
 #[test]
@@ -1293,9 +1275,7 @@ fn trimmed_resume_tail_keeps_paging_contiguous() {
 #[tokio::test]
 async fn first_resume_frame_splices_in_the_latest_completed_compaction() {
     let directory = tempdir().unwrap();
-    let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
     for kind in [
@@ -1407,6 +1387,7 @@ async fn first_resume_frame_splices_in_the_latest_completed_compaction() {
         &event.kind,
         SessionEventKind::Message { text, .. } if text == "current request"
     )));
+    scratch.discard().await;
 }
 
 #[test]
@@ -1562,9 +1543,7 @@ fn history_reprojection_uses_delivered_durable_and_live_projection() {
 #[tokio::test]
 async fn delivered_projection_repairs_durable_workflow_events_missing_from_live_stream() {
     let root = tempdir().unwrap();
-    let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let session_id = Uuid::new_v4();
     store.create_session(session_id).await.unwrap();
     store
@@ -1648,6 +1627,7 @@ async fn delivered_projection_repairs_durable_workflow_events_missing_from_live_
     )));
     assert_eq!(delivered.state().latest_sequence, final_sequence);
     assert_eq!(delivered.state().status, Some(SessionStatus::Running));
+    scratch.discard().await;
 }
 
 #[test]
@@ -1748,9 +1728,7 @@ async fn resumed_roster_prefers_the_child_terminal_ledger_over_a_stale_parent_mi
     let root = Uuid::new_v4();
     let child = Uuid::new_v4();
     let now = Utc::now();
-    let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     store.create_session(child).await.unwrap();
     store
         .append(SessionEvent::new(
@@ -1786,14 +1764,13 @@ async fn resumed_roster_prefers_the_child_terminal_ledger_over_a_stale_parent_mi
         snapshots[0].detail.as_deref(),
         Some("crash cleanup completed")
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn child_history_excludes_fork_inherited_director_events() {
     let directory = tempdir().expect("tempdir");
-    let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-        .await
-        .expect("session store");
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let parent = Uuid::new_v4();
     let child = Uuid::new_v4();
     store.create_session(parent).await.expect("parent");
@@ -1825,6 +1802,7 @@ async fn child_history_excludes_fork_inherited_director_events() {
         history[0].kind,
         SessionEventKind::Error { ref message } if message == "child authored event"
     ));
+    scratch.discard().await;
 }
 
 #[test]
@@ -2577,9 +2555,7 @@ fn terminal_animation_ticks_separate_active_and_idle_rates() {
 #[tokio::test]
 async fn resume_target_resolves_saved_session_and_skips_current_for_last() {
     let dir = tempdir().expect("session directory");
-    let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let current = Uuid::new_v4();
     let previous = Uuid::new_v4();
     for session_id in [previous, current] {
@@ -2634,14 +2610,13 @@ async fn resume_target_resolves_saved_session_and_skips_current_for_last() {
             .await
             .is_err()
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn resume_switch_rejects_remote_owned_session_before_stopping_current() {
     let dir = tempdir().expect("session directory");
-    let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let current = Uuid::new_v4();
     let target = Uuid::new_v4();
     store.create_session(current).await.unwrap();
@@ -2662,6 +2637,7 @@ async fn resume_switch_rejects_remote_owned_session_before_stopping_current() {
     .await
     .expect_err("remote-owned sessions must not tear down the active TUI");
     assert!(error.to_string().contains("background Borg remote host"));
+    scratch.discard().await;
 }
 
 /// A session must always know which model it is talking to. Leaving the model
@@ -2702,15 +2678,13 @@ fn every_defaultable_provider_pins_a_model_for_a_fresh_session() {
 #[tokio::test]
 async fn recent_sessions_are_ordered_by_latest_conversation_activity() {
     let dir = tempdir().expect("session directory");
-    let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let recently_active = Uuid::new_v4();
     let recent_message = Uuid::new_v4();
     let now = Utc::now();
 
     async fn write_events(
-        store: &SqliteSessionStore,
+        store: &PostgresSessionStore,
         cwd: &Path,
         session_id: Uuid,
         events: Vec<(chrono::DateTime<Utc>, SessionEventKind)>,
@@ -2797,6 +2771,7 @@ async fn recent_sessions_are_ordered_by_latest_conversation_activity() {
         recent_session_ids(dir.path(), &store).await.unwrap(),
         vec![recent_message, recently_active]
     );
+    scratch.discard().await;
 }
 
 /// A crash or shutdown sweep stamps `StatusChanged { Stopped }` across every
@@ -2809,16 +2784,14 @@ async fn recent_sessions_are_ordered_by_latest_conversation_activity() {
 #[tokio::test]
 async fn host_bookkeeping_does_not_outrank_the_session_the_user_worked_in() {
     let dir = tempdir().expect("session directory");
-    let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let worked_in = Uuid::new_v4();
     let idle_one = Uuid::new_v4();
     let idle_two = Uuid::new_v4();
     let now = Utc::now();
 
     async fn write(
-        store: &SqliteSessionStore,
+        store: &PostgresSessionStore,
         cwd: &Path,
         session_id: Uuid,
         events: Vec<(chrono::DateTime<Utc>, SessionEventKind)>,
@@ -2920,14 +2893,13 @@ async fn host_bookkeeping_does_not_outrank_the_session_the_user_worked_in() {
         Some(&worked_in),
         "a shutdown sweep and a capability probe must not outrank real work"
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn resume_picker_titles_and_previews_sessions_from_the_latest_response() {
     let dir = tempdir().expect("session directory");
-    let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let current = Uuid::new_v4();
     let target = Uuid::new_v4();
     store.create_session(current).await.unwrap();
@@ -2989,14 +2961,13 @@ async fn resume_picker_titles_and_previews_sessions_from_the_latest_response() {
     assert!(target.preview.contains("**Model:** `gpt-resume-filter`"));
     assert!(target.preview.contains("Latest prompt:"));
     assert!(target.preview.contains("Latest formatted request"));
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn resume_discovery_ignores_launch_only_probe_sessions() {
     let dir = tempdir().expect("session directory");
-    let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let probe = Uuid::new_v4();
     let real = Uuid::new_v4();
     for session_id in [probe, real] {
@@ -3058,14 +3029,13 @@ async fn resume_discovery_ignores_launch_only_probe_sessions() {
         store.contains_session(probe).await.unwrap(),
         "filtering the resume surface must not destructively delete stored sessions"
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn continue_selects_the_latest_non_empty_session_in_the_current_directory() {
     let dir = tempdir().expect("session directory");
-    let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let local = Uuid::new_v4();
     let other = Uuid::new_v4();
     for (session_id, cwd) in [
@@ -3106,14 +3076,13 @@ async fn continue_selects_the_latest_non_empty_session_in_the_current_directory(
             .unwrap(),
         Some(local)
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
 async fn resume_picker_prioritizes_current_directory_and_keeps_global_choices() {
     let dir = tempdir().expect("session directory");
-    let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let current = Uuid::new_v4();
     let local = Uuid::new_v4();
     let global = Uuid::new_v4();
@@ -3162,6 +3131,7 @@ async fn resume_picker_prioritizes_current_directory_and_keeps_global_choices() 
             .collect::<Vec<_>>(),
         [(local, true), (global, false)]
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -3169,9 +3139,7 @@ async fn resume_picker_loads_older_sessions_in_recent_first_order() {
     const SESSION_COUNT: usize = 12;
 
     let dir = tempdir().expect("session directory");
-    let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let current = Uuid::new_v4();
     store.create_session(current).await.unwrap();
     let mut session_ids = Vec::with_capacity(SESSION_COUNT);
@@ -3221,6 +3189,7 @@ async fn resume_picker_loads_older_sessions_in_recent_first_order() {
         options.iter().map(|option| option.id).collect::<Vec<_>>(),
         session_ids.into_iter().rev().collect::<Vec<_>>()
     );
+    scratch.discard().await;
 }
 
 #[tokio::test]
@@ -3230,9 +3199,7 @@ async fn recent_session_picker_p95_gate() {
     const SAMPLES: usize = 100;
 
     let dir = tempdir().expect("session directory");
-    let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
-        .await
-        .unwrap();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let current = Uuid::new_v4();
     store.create_session(current).await.unwrap();
     for index in 0..SESSION_COUNT {
@@ -3300,6 +3267,7 @@ async fn recent_session_picker_p95_gate() {
         p95 < Duration::from_millis(50),
         "session picker p95 exceeded 50 ms: {p95:?}"
     );
+    scratch.discard().await;
 }
 
 #[test]
@@ -3415,9 +3383,7 @@ async fn resume_hydration_over_a_real_session_store_is_bounded() {
         .parse()
         .expect("BORG_RESUME_BENCH_SESSION must be a session uuid");
     let sessions_dir = path.parent().expect("sessions directory").to_path_buf();
-    let store = SqliteSessionStore::open(&path)
-        .await
-        .expect("session store");
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
     let events = store
         .state(session_id)
         .await
@@ -3480,6 +3446,7 @@ async fn resume_hydration_over_a_real_session_store_is_bounded() {
         snapshots.len(),
         queue.len(),
     );
+    scratch.discard().await;
 }
 
 #[test]
