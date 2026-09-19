@@ -1227,39 +1227,6 @@ impl SessionRecovery {
     }
 }
 
-/// SQL predicate restricting a recovery scan to the requested slices.
-///
-/// The context slice spans many event kinds with no cheap column expression,
-/// so it keeps using the `recovery_relevant` partial index unchanged. Queue-
-/// and subagent-only callers add an `event_kind` narrowing on top of that same
-/// index, which is what keeps the multi-hundred-megabyte tool payloads out of
-/// the result set.
-fn recovery_scan_predicate(parts: RecoveryParts, alias: &str) -> String {
-    if parts.context {
-        return format!("{alias}recovery_relevant = 1");
-    }
-    let mut kinds: Vec<&str> = Vec::new();
-    if parts.queue {
-        kinds.push("'message'");
-        kinds.push("'prompt_recalled'");
-    }
-    if parts.subagents {
-        kinds.push("'subagent_activity'");
-    }
-    match kinds.as_slice() {
-        [] => "0 = 1".to_string(),
-        // Every `subagent_activity` row is recovery-relevant by construction,
-        // so dropping the redundant flag lets the planner take the roster read
-        // through `idx_session_events_subagent_recovery` instead of walking
-        // the whole recovery index.
-        ["'subagent_activity'"] => format!("{alias}event_kind = 'subagent_activity'"),
-        kinds => format!(
-            "{alias}recovery_relevant = 1 and {alias}event_kind in ({})",
-            kinds.join(", ")
-        ),
-    }
-}
-
 /// Inputs for a lease-fenced action transition.
 ///
 /// Keeping the fence and lifecycle fields together makes the store boundary
@@ -1904,31 +1871,6 @@ pub(crate) fn ensure_same_prompt_admission(
     Ok(())
 }
 
-fn validate_live_lease(
-    action: &SessionAction,
-    lease_owner: &str,
-    lease_token: Uuid,
-    now: DateTime<Utc>,
-) -> Result<()> {
-    anyhow::ensure!(
-        action.lease_owner.as_deref() == Some(lease_owner)
-            && action.lease_token == Some(lease_token),
-        "action {} lease is not owned by {lease_owner}",
-        action.action_id
-    );
-    anyhow::ensure!(
-        !action.lease_expired_at(now),
-        "action {} lease has expired",
-        action.action_id
-    );
-    anyhow::ensure!(
-        !action.state.is_terminal(),
-        "action {} is already terminal",
-        action.action_id
-    );
-    Ok(())
-}
-
 pub fn deferred_json_payload(payload: &SessionPayloadRef) -> serde_json::Value {
     serde_json::json!({
         "borg_payload_deferred": true,
@@ -1947,19 +1889,6 @@ pub fn deferred_text_payload(value: &str, payload: &SessionPayloadRef) -> String
         &value[..end],
         payload.byte_len
     )
-}
-
-struct StoredEvent {
-    event: SessionEvent,
-    fork_inheritable: bool,
-}
-
-fn inherited_event_id(session_id: Uuid, source_event_id: Uuid) -> Uuid {
-    Uuid::new_v5(&session_id, source_event_id.as_bytes())
-}
-
-fn parse_uuid(value: &str) -> Result<Uuid> {
-    Uuid::parse_str(value).with_context(|| format!("invalid stored UUID {value}"))
 }
 
 fn event_kind(kind: &SessionEventKind) -> Result<String> {
