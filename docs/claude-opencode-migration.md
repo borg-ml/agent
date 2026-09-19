@@ -125,27 +125,72 @@ produce an incidental denial event; the guard evidence is the filter itself.
 (`opencode serve`, v1.18.31) over its HTTP route with the same 512-row fixture
 prefix and the same two prompts, on `opencode-go/glm-5.3-flash`.
 
-Provenance, stated plainly: unlike the native figures above, these numbers were
-**not** produced first-hand this round. They come from an earlier session's run;
-what was done here is re-reading them against the recorded log and the script
-that produced them. The run was not repeated because doing so starts a local
-`opencode serve` process, and that was left pending an explicit decision after
-the operator objected to local processes. It is a proxy harness rather than a
-model or inference server, but it was not worth assuming.
+Provenance: these particular figures came from an earlier session's run and
+covered `glm-5.3-flash` only. They are retained below as history. The run was
+originally deferred because it starts a local `opencode serve` process, which
+was left pending an explicit decision. That decision has since been made — the
+prohibition is on local *models*, and `opencode serve` is a localhost HTTP proxy
+in front of the same hosted Go subscription, not an inference server — so the
+baseline was approved and has now been collected first-hand for both models.
 
-Figures:
+Earlier round, `glm-5.3-flash` only:
 
 - round 1: total 10492, input 10379, output 113, cache read 0, cache write 0
 - round 2: total 10575, input 10518, output 57, cache read 0, cache write 0
 
-This is a *matched workload*, constructed from the same prefix and prompts. It is
-not a byte-identical request body, so the two lanes are not a controlled
-comparison. Critically, **cache read 0 is not proof that no server-side caching
-occurred** — it only shows that this route reported no cache tokens in its own
-accounting. The contrast with the native lane (second turn: 146 input against 10496 cached
-originally, 122 against the same 10496 on the first-hand re-run) is therefore
-suggestive of native prefix reuse, not a measured parity or savings claim
-against OpenCode.
+### First-hand run, both approved models
+
+Run by `/tmp/borg-go-server-baseline-owned.py`, an owned adaptation of the
+original script (the original and its receipt are left untouched). Each model
+got its own `opencode serve` child bound to `127.0.0.1` on a random port with an
+ephemeral unprinted password, startup bounded at 20 s and every request at 45 s.
+Exact process count: **two** server children, one per model, each stopped by
+terminating that one process handle; **four** hosted requests, two per model.
+The receipt records a disposition on all four rows, which is per-request, not
+per-process. Every round returned the run's marker and no round attempted a tool
+call. Receipt: `/tmp/borg-go-server-baseline-owned.log`.
+
+On the sandbox, claiming only what was actually checked: the global OpenCode
+config declares no MCP servers at all — `~/.config/opencode/opencode.jsonc` is a
+single `$schema` line and no `mcp` key appears in any opencode config — so there
+was nothing for the child to launch. Each child was additionally passed
+`OPENCODE_CONFIG_CONTENT={"permission":{"*":"deny"}}` and ran in a fresh
+`mkdtemp`. Whether that variable replaces the global config or merges into it
+was not verified, so no wholesale-takeover claim is made here; the absence of
+any configured MCP server is what the no-other-apps assurance rests on.
+
+| Model | Round | total | input | output | reasoning | cache read | cache write |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `glm-5.3-flash` | 1 | 10505 | 10383 | 122 | 0 | 0 | 0 |
+| `glm-5.3-flash` | 2 | 10623 | 10530 | 93 | 0 | **0** | 0 |
+| `deepseek-v4.1-flash` | 1 | 10301 | 10180 | 27 | 94 | 0 | 0 |
+| `deepseek-v4.1-flash` | 2 | 10262 | 251 | 27 | 0 | **9984** | 0 |
+
+**This corrects an inference in the earlier draft.** That draft had only GLM
+external figures, saw `cache read 0` on both rounds, and read the contrast with
+the native lane as suggestive of native prefix reuse. Adding DeepSeek shows the
+behaviour is *model-dependent, not lane-wide*: on the external route DeepSeek
+reported 9984 cache-read tokens on its second turn and its input collapsed from
+10180 to 251, which is the same shape as the native lane. Second turns side by
+side, native figures from the first-hand re-run above:
+
+| Model | Native input / cached | External input / cached |
+| --- | --- | --- |
+| `glm-5.3-flash` | 122 / 10496 | 10530 / 0 |
+| `deepseek-v4.1-flash` | 202 / 10368 | 251 / 9984 |
+
+So the honest reading is narrower than before: for DeepSeek the two lanes are
+comparable on this workload, and only GLM shows reuse on the native lane that
+the external route did not report.
+
+What this still does not establish. It is a *matched workload* — same prefix,
+same prompts, same model, same hosted route — not a byte-identical request body,
+because the two loops necessarily wrap the fixture differently; the lanes are
+therefore not a controlled comparison. **`cache read 0` remains no proof that no
+server-side caching occurred**: it shows only that the route reported no cache
+tokens in its own accounting, which is exactly why the GLM row should not be
+read as an absolute. `cost_basis` is `unavailable` throughout, so no dollar
+figure follows. Nothing here is a parity or savings claim.
 
 ## Borg-owned tool execution, approval and cancellation
 
@@ -195,7 +240,8 @@ the session in one process (`should_use_detached_session_host` requires
 All three were pre-existing in committed `HEAD`, not working-tree edits. They
 were reported first and then, on the parent's decision, repaired. Each is
 described below as originally diagnosed; the repairs and their receipts follow
-in the next section. Nothing is committed.
+in the next section. All three repairs have since been committed in `86ed7db`
+("Add watcher yields and harden agent integrations").
 
 **1. Compaction cannot run on the OpenCode Go native lane.** `/compact` failed
 immediately with `Error: OpenCode native sessions require an explicit model`,
@@ -349,19 +395,62 @@ The provider figure differs from the 127/3 recorded earlier in this document.
 That baseline was taken at an older tree state and other agents have since
 changed provider code; none of the three repairs here touch `borg-provider`.
 
-Two follow-ups left for their owners rather than taken unilaterally. Converting
-both call sites leaves `native_harness::with_model_access` unused, which now
-raises a `dead_code` warning — removing that footgun wrapper belongs to whoever
-owns `native_harness.rs`, since it is adjacent to the cache worker's area. And
-the external byte-identical baseline is still deferred, because it would start a
-local `opencode serve`.
+### Regression coverage
+
+The three repairs were committed without tests guarding them, which is worth
+naming because defect 2 was itself a silent drift between two sides that no test
+compared. Coverage is now uneven, deliberately so:
+
+- **Defect 2 has a regression test.**
+  `subagents::tests::agent_tool_provider_environment_parses_back_for_every_provider`
+  starts a real `AgentToolServer` for each of the seven `CodingProvider`
+  variants, reads `BORG_AGENT_TOOL_PROVIDER` back out of
+  `external_mcp_server().env`, and parses it exactly the way `borg-cli`'s
+  `agent_tool_provider()` does. It compares the two sides at the boundary where
+  they actually disagreed, rather than asserting a spelling.
+- **Defect 1 has no unit test, and is instead prevented structurally.** With
+  `with_model_access` deleted there is no model-less wrapper to reach for, so a
+  call site can only forward `None` by writing it explicitly. An earlier draft
+  of this section proposed a test pinning the `require an explicit model` error
+  string; it was dropped on review because it exercised the helper's own error
+  text rather than what actually broke — that `compact_native` and `consult`
+  pass the model they already resolved. The empirical receipts are the
+  compaction probe runs above.
+- **Defect 3 has no unit test.** Its evidence is the ACP probe receipts above
+  (`/tmp/borg-go-acp-blocking.py`, `/tmp/borg-go-acp-tools.py`).
+
+Both follow-ups originally left to their owners are now closed.
+
+*Closed.* Converting both call sites left `native_harness::with_model_access`
+unused and raising a `dead_code` warning. The owner removed that footgun wrapper
+in `f15af98` ("Remove obsolete model-less native access wrapper"), which is what
+turned defect 1 into the structural prevention described above.
+
+*Also closed.* The external baseline has now been collected first-hand for both
+approved models — see *First-hand run, both approved models*. The blocker had
+been recorded as "it would start a local `opencode serve`"; that framing was
+narrowed (the prohibition is on local *models*, and `opencode serve` is a
+localhost proxy to the same hosted subscription), the bounded run was approved,
+and it executed in four hosted calls. It corrected an inference rather than
+confirming one: external caching turned out to be model-dependent. Nothing in
+this document asserts parity.
 
 ## Scope limits on this round
 
-All model calls used the hosted OpenCode Go subscription through Borg's native
-adapter. The Go key was read in place from `~/.local/share/opencode/auth.json`;
-nothing was copied, no sign-in was started, and no API-billing route was used.
-No local model or inference server was started for any of this work.
+All model calls used the hosted OpenCode Go subscription. The Go key was read
+in place from `~/.local/share/opencode/auth.json`; nothing was copied or
+printed, no sign-in was started, and no API-billing route was used. Models were
+restricted to `opencode-go/glm-5.3-flash` and `opencode-go/deepseek-v4.1-flash`.
+
+No local model or inference server was started for any of this work. One
+qualification, since an earlier version of this line was written before the
+external baseline ran: that baseline does start a local `opencode serve`
+process. It is a localhost HTTP proxy that forwards to the same hosted
+subscription — it performs no inference — and each run spawns exactly one such
+child, bound to `127.0.0.1` on a random port, stopped by terminating that one
+process handle. Every call in this document therefore still resolves to the
+hosted service; the native figures reach it through Borg's own adapter and the
+baseline figures reach it through that proxy.
 
 Receipts come from the existing `target/debug/borg` build, which predates other
 agents' in-flight uncommitted edits to the CLI and provider crates. It was reused
@@ -393,13 +482,24 @@ defect 2 expects and `catalog_backend()` failed to supply.
 
 ## Remaining verification
 
-Capture matched external Go model/cache/tool baselines under byte-identical
-request bodies before making any parity or savings claim; check mixed-protocol
-models and preserve route-specific semantics before claiming full coverage.
-Compaction and ACP approval/cancellation now have passing receipts (see
-*Repairs and verification*). What remains unverified is the byte-identical
-external comparison, deliberately deferred rather than allowed to block the
-repairs. Do not remove the generic OpenCode compatibility path while
+A matched external cache baseline now exists for both approved models (see
+*First-hand run, both approved models*), and compaction and ACP
+approval/cancellation have passing receipts (see *Repairs and verification*).
+
+What remains unverified:
+
+- **A byte-identical request-body comparison.** The collected baseline is a
+  matched workload, not a controlled one: the native and server loops
+  necessarily wrap the same fixture differently. No parity or savings claim
+  should rest on it, and none is made here.
+- **A cost basis.** `cost_basis` is `unavailable` on every native row, so no
+  dollar comparison is derivable on either lane.
+- **External tool-path behaviour.** Only model/cache accounting was measured
+  externally; the tool, approval and cancellation receipts are native-lane only.
+- **Mixed-protocol models**, below — check these and preserve route-specific
+  semantics before claiming full coverage.
+
+Do not remove the generic OpenCode compatibility path while
 other routes still use it. Claude direct subscription migration requires a
 supported access change or explicit provider authorization, not an API billing
 substitution.

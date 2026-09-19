@@ -4126,3 +4126,65 @@ async fn acknowledging_an_already_admitted_team_message_is_idempotent() {
         .await
         .expect("acknowledgement must be idempotent");
 }
+
+/// Failure mode: the sender wrote `BORG_AGENT_TOOL_PROVIDER` in kebab-case while
+/// `borg __agent-mcp` parses snake_case, so the tool server exited at startup and
+/// the session silently lost every `mcp__borg_agent__*` tool.
+#[tokio::test]
+async fn agent_tool_provider_environment_parses_back_for_every_provider() {
+    for provider in [
+        CodingProvider::Codex,
+        CodingProvider::Claude,
+        CodingProvider::OpenCode,
+        CodingProvider::Kimi,
+        CodingProvider::Glm,
+        CodingProvider::OpenRouter,
+        CodingProvider::OpenAiCompatible,
+    ] {
+        let directory = tempdir().unwrap();
+        let dispatcher = AgentToolDispatcher::new(
+            SessionGoalTools::disconnected(),
+            SessionTodoTools::disconnected(),
+            None,
+            crate::LspService::new(directory.path()),
+            provider,
+            Uuid::new_v4(),
+            false,
+            None,
+            None,
+            directory.path().to_path_buf(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::native_process::ProcessManager::default(),
+            PermissionMode::FullAccess,
+        );
+        let server = AgentToolServer::start(directory.path(), Uuid::new_v4(), dispatcher)
+            .await
+            .expect("the agent tool server starts");
+        let external = server
+            .external_mcp_server()
+            .expect("the MCP server description is produced");
+        let sent = external
+            .env
+            .get("BORG_AGENT_TOOL_PROVIDER")
+            .expect("the provider is always passed to the tool server")
+            .clone();
+
+        let parsed: CodingProvider =
+            serde_json::from_value(serde_json::Value::String(sent.clone())).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "{provider:?} sends BORG_AGENT_TOOL_PROVIDER={sent:?}, which \
+                         `borg __agent-mcp` rejects: {error}"
+                    )
+                },
+            );
+        assert_eq!(
+            parsed, provider,
+            "{sent:?} must round trip back to the provider that sent it"
+        );
+    }
+}
