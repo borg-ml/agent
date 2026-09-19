@@ -141,6 +141,10 @@ async fn probe() -> Result<()> {
         "model did not return Borg's probe result"
     );
     println!(
+        "Uncached input tokens by round: {} + {}",
+        first.usage.input_tokens, second.usage.input_tokens
+    );
+    println!(
         "PASS: {}/{}; two subscription model rounds, Borg-owned tool result, durable replay; tokens: {} + {}, cached input: {} + {}",
         provider.model,
         provider.effort,

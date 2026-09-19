@@ -472,3 +472,45 @@ and `execveat`, it passed with total tokens 8,293 + 8,361 and cached input token
 0 + 8,192. This verifies a native cache hit and replay without executable
 launches. It is **not cache parity**: a comparable Codex baseline and the final
 application/restart verification remain required.
+
+### Paired workload and session verification
+
+The rebuilt `codex_native_probe` passed with a restricted launch PATH containing
+only `cat`, `sh`, `bash`, and `sleep`, `BORG_CODEX_BIN=/nonexistent/codex`, and
+`BORG_AUTO_INSTALL=0`. It exercised manual approval of `cat probe.txt`, durable
+opaque model-state persistence, native account-bound compaction preserving an
+exact random value, actor restart, and isolated account-bound consultation.
+The resumed turn reported 1,664 cached input tokens. This is actor/session
+restart verification, not yet an installed TUI/process-restart test.
+
+A separate baseline used Codex CLI 0.154.0 with the same Pro token authority
+in place (no credential copies), model `gpt-6-astra`, effort `medium`, fixed
+512-row prefix, instruction text, and one `borg_probe` tool roundtrip. The
+baseline is reproducible with `python3 scripts/codex-cache-baseline.py
+--codex-home /path/to/existing/authority`; it is a verification-only external
+client, not a Borg runtime dependency. Native requests used the seccomp guard
+that denies both exec syscalls and an empty PATH.
+
+| Measurement | Borg native | Codex baseline |
+| --- | ---: | ---: |
+| First-round input, including cached | 8,278 | 17,409 |
+| First-round cached input | 0 | 0 |
+| Second-round input, including cached | 8,330 | 17,473 |
+| Second-round cached input | 8,192 | 17,280 |
+| Second-round uncached input | 138 | 193 |
+| Second-round cached fraction | 98.34% | 98.90% |
+| Cached second-round / first-round input | 98.96% | 99.26% |
+
+Borg usage reports uncached input separately; its 138 input tokens must be
+added to 8,192 cached tokens before comparing with Codex inputTokens. Both
+clients reused nearly all prior input on this workflow. The native uncached
+tail was smaller, while its cached fraction was 0.55 percentage points lower.
+The requests are workload-matched, not byte-identical: Codex retains additional
+prompt/tool context. These single-sample measurements demonstrate comparable
+warm-prefix caching, not universal equality, a latency guarantee, or cache
+reuse across arbitrary compaction rewrites. Fresh device approval remains
+unverified. No authentication token contents are included in these receipts.
+
+The retained baseline script also passed a second live run: first-round input
+17,415 (0 cached), second-round input 17,476 (17,280 cached, 196 uncached;
+98.88% cached). This reproduces the baseline workflow, not a second native sample.
