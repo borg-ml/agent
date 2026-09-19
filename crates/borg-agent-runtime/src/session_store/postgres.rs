@@ -114,7 +114,52 @@ impl PostgresSessionStore {
             dictionaries: cold::DictionaryCache::default(),
         };
         store.ensure_schema().await?;
+        store.clear_stranded_turn_live_state().await?;
         Ok(store)
+    }
+
+    /// Erase turn live state belonging to sessions that are not running.
+    ///
+    /// WHY THIS EXISTS: live state is the one part of the journal that is not
+    /// written as events, so nothing replays it back into a correct shape. A
+    /// process that dies mid-turn leaves its last streamed frames behind, and
+    /// the session they describe is terminal by the time anyone looks. Without
+    /// this, reopening serves those frames to a client as though a turn were
+    /// still in flight -- a finished session that appears to be responding, and
+    /// stays that way until someone runs another turn on it.
+    ///
+    /// `append_live` already refuses to write turn live state unless the status
+    /// is `running` or `waiting_for_approval`. This restores that same
+    /// invariant for rows that predate a crash rather than inventing a second
+    /// rule, which is why the predicate is the writer's, negated, rather than a
+    /// list of terminal names that could drift away from it.
+    ///
+    /// CONCURRENCY: this must not delete the live state of a session someone
+    /// has just resumed. It takes `for update` on the canonical `sessions` row
+    /// -- the same lock `append_live` takes before it decides whether writing
+    /// is allowed -- so a live writer and this repair cannot interleave. Rows
+    /// already locked are SKIPPED rather than waited on: a held session row
+    /// means another process is mid-write on that session, which is precisely
+    /// the case this must not touch. Anything skipped is repaired by whichever
+    /// process opens next, because the condition is durable.
+    ///
+    /// The context-window snapshot is kept. It describes the session's capacity
+    /// rather than a turn in progress, and remains true while idle.
+    async fn clear_stranded_turn_live_state(&self) -> Result<u64> {
+        let deleted = sqlx::query(
+            "with stranded as (                  select s.id from sessions s                  where s.id in (                      select session_id from session_live_state                      where live_key <> 'context_window'                  )                  and coalesce(s.state_json::jsonb ->> 'status', '')                      not in ('running', 'waiting_for_approval')                  for update skip locked              )              delete from session_live_state              where live_key <> 'context_window'                and session_id in (select id from stranded)",
+        )
+        .execute(&self.pool)
+        .await
+        .context("failed to clear stranded turn live state")?;
+        let deleted = deleted.rows_affected();
+        if deleted > 0 {
+            tracing::info!(
+                rows = deleted,
+                "cleared turn live state left behind by an interrupted turn"
+            );
+        }
+        Ok(deleted)
     }
 
     /// The connection string this process should use, from the environment.

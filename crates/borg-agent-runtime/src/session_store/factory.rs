@@ -450,9 +450,6 @@ mod tests {
             // The tier this fixture deliberately withholds.
             Ok(None)
         }
-        async fn finish_interactive_open(&self, _session_id: Uuid) -> Result<()> {
-            unimplemented!("journal access is not part of this test")
-        }
         async fn create_session(&self, _session_id: Uuid) -> Result<()> {
             unimplemented!("journal access is not part of this test")
         }

@@ -1567,17 +1567,6 @@ pub trait SessionStore: Send + Sync {
     /// Drop a session that was created but never used, so an abandoned launch
     /// does not leave a permanent empty row in the session list.
     async fn discard_empty_session(&self, session_id: Uuid) -> Result<bool>;
-    /// Finish work an interactive open deliberately deferred.
-    ///
-    /// PROVIDED, not required -- unlike the satellite tiers. This is a
-    /// lock-avoidance hook, not data: a store whose open path defers cleanup to
-    /// keep the first frame responsive completes that work here. A store with
-    /// no machine-wide writer lock to avoid has genuinely nothing deferred, so
-    /// doing nothing is the correct implementation rather than a missing one.
-    ///
-    /// Postgres serialises writers per session row, so it defers nothing and
-    /// this is a no-op for the only shipped backend.
-    async fn finish_interactive_open(&self, session_id: Uuid) -> Result<()>;
     /// The durable launch metadata a relay host recorded for this session.
     async fn load_host_launch_metadata(
         &self,

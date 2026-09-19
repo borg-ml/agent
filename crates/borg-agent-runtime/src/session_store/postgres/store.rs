@@ -544,18 +544,6 @@ fn provider_event_kind(kind: &SessionEventKind) -> Option<String> {
 
 #[async_trait]
 impl SessionStore for PostgresSessionStore {
-    /// Nothing is deferred, so nothing is finished here.
-    ///
-    /// The hook exists for a store whose open path skips work to keep the first
-    /// frame responsive and completes it once the caller is ready. That was a
-    /// way to avoid a machine-wide writer lock. Postgres serialises writers per
-    /// session row, so an open does no work worth deferring and this is
-    /// genuinely empty -- implemented explicitly rather than inherited, so the
-    /// emptiness is a stated decision instead of a silent default.
-    async fn finish_interactive_open(&self, _session_id: Uuid) -> Result<()> {
-        Ok(())
-    }
-
     async fn create_session(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now();
         let mut transaction = self.pool().begin().await?;

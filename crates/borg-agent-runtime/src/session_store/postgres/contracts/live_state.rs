@@ -435,3 +435,158 @@ async fn terminal_boundaries_clear_all_turn_live_state_but_keep_context_window()
     ));
     scratch.discard().await;
 }
+
+/// Stranded turn live state is erased when the store is opened again.
+///
+/// This is the crash case, and it is the reason the repair exists at all. Live
+/// state is not written as events, so nothing replays it into a correct shape:
+/// a process that dies mid-turn simply leaves its last frames behind. The
+/// session is terminal by the time anyone looks, and serving those frames makes
+/// a finished session look like it is still answering.
+///
+/// The row is inserted directly rather than through `append`, because
+/// `append_live` refuses to write turn live state to a session that is not
+/// running -- which is exactly the invariant the repair restores. Reaching
+/// around the writer is the only way to produce the state a crash produces.
+#[tokio::test]
+async fn reopening_repairs_turn_live_state_left_on_a_terminal_session() {
+    let (scratch, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::SessionStarted,
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let message_id = Uuid::new_v4();
+    let event = SessionEvent::new(
+        session_id,
+        0,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::Assistant,
+            text: "stale response".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    );
+    sqlx::query(
+        "insert into session_live_state \
+         (session_id, live_key, revision, event_json, updated_at) \
+         values ($1, $2, $3, $4, $5)",
+    )
+    .bind(session_id)
+    .bind(format!("message:{message_id}"))
+    .bind(99_i64)
+    .bind(serde_json::to_value(&event).unwrap())
+    .bind(event.created_at)
+    .execute(store.pool())
+    .await
+    .unwrap();
+    assert!(
+        !store
+            .live_events_after(session_id, 0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the fixture must actually strand a row, or this proves nothing"
+    );
+
+    let reopened =
+        crate::session_store::postgres::PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+            .await
+            .unwrap();
+    assert!(
+        reopened
+            .live_events_after(session_id, 0)
+            .await
+            .unwrap()
+            .is_empty(),
+        "reopening must not serve the frames of a turn that died"
+    );
+
+    scratch.discard().await;
+}
+
+/// The repair must not touch a session that is actually running.
+///
+/// Without this the test above is satisfied by a repair that deletes every live
+/// row on open, which would erase the in-flight turn of a second process that
+/// happens to be mid-stream while this one starts. The whole difficulty of the
+/// repair is telling those two cases apart, so both halves have to be pinned.
+#[tokio::test]
+async fn reopening_leaves_the_live_state_of_a_running_session_alone() {
+    let (scratch, store) = store().await;
+    let session_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::SessionStarted,
+        ))
+        .await
+        .unwrap();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                detail: None,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let message_id = Uuid::new_v4();
+    store
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::Assistant,
+                text: "still streaming".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: None,
+            },
+        ))
+        .await
+        .unwrap();
+    let before = store.live_events_after(session_id, 0).await.unwrap();
+    assert!(
+        !before.is_empty(),
+        "a running turn must publish live state for this to mean anything"
+    );
+
+    let reopened =
+        crate::session_store::postgres::PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+            .await
+            .unwrap();
+    let after = reopened.live_events_after(session_id, 0).await.unwrap();
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "opening a second store must not disturb a turn that is still running"
+    );
+
+    scratch.discard().await;
+}
