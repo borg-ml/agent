@@ -7272,10 +7272,23 @@ async fn run_local_agent_session(
             Some(anyhow::anyhow!("agent session task failed: {join_error}"))
         }
     };
-    let discarded_empty_session = if session_access == LocalSessionAccess::Owned
-        && !args.ephemeral
-        && !(args.session_host.is_some() && actor_error.is_some())
-    {
+    // Reopening this session means its row has to survive. Both relaunches
+    // below hand an id back to the outer loop, which re-enters startup, and
+    // startup refuses an id whose row is gone -- so reclaiming a row this
+    // process is about to walk back into strands it, and the host dies with
+    // `does not exist`. The error path already refuses to relaunch a session it
+    // discarded; this is that same rule for the clean path.
+    let reopen_after_detach =
+        detached_prompt.is_some() && !user_requested_exit && resume_session.is_none();
+    let relaunches_same_session = reopen_after_detach || resume_session == Some(session_id);
+    let discarded_empty_session = if should_discard_empty_session(
+        session_access,
+        args.ephemeral,
+        args.session_host.is_some(),
+        actor_error.is_some(),
+        user_requested_exit,
+        relaunches_same_session,
+    ) {
         match sqlite_store.discard_empty_session(session_id).await {
             Ok(discarded) => discarded,
             Err(error) => {
@@ -7355,8 +7368,6 @@ async fn run_local_agent_session(
         }
         println!("\n{}", resume_instructions(session_id, false));
     }
-    let reopen_after_detach =
-        detached_prompt.is_some() && !user_requested_exit && resume_session.is_none();
     let next_prompt = relaunch_prompt(
         detached_prompt.or(rewind_prompt),
         composer_draft,
@@ -9200,6 +9211,45 @@ fn default_active_delivery(provider: CodingProvider, steer_active_turn: bool) ->
     } else {
         PromptDelivery::Queue
     }
+}
+
+/// Whether a session's row may be reclaimed as an empty one when this process
+/// stops driving it.
+///
+/// Reclaiming is for rows nothing will ask for again, so every clause here
+/// names something that still wants this row.
+///
+/// `relaunches_same_session` is the one that bites. The clean exit path hands
+/// an id straight back to the outer loop, which re-enters startup, and startup
+/// refuses an id whose row has gone -- so a session discarded on its way back
+/// in is stranded, and the error is the misleading `does not exist` rather
+/// than anything naming the discard. An unsent composer draft reaches that
+/// combination on its own: the draft is what triggers the relaunch, while
+/// leaving the session with no resumable activity, which is what makes the row
+/// look disposable in the first place.
+///
+/// A detached host is held to the stricter rule that only the user ending the
+/// session counts as finished. Its other stops are handoffs and retries that
+/// come back to this same id, and it cannot see from here which one it is
+/// taking -- the decision is made further down. Keeping an empty row costs a
+/// disposable row; reclaiming one that is about to be resumed costs the
+/// session. That asymmetry is why this errs toward keeping.
+fn should_discard_empty_session(
+    session_access: LocalSessionAccess,
+    ephemeral: bool,
+    is_session_host: bool,
+    actor_failed: bool,
+    user_requested_exit: bool,
+    relaunches_same_session: bool,
+) -> bool {
+    session_access == LocalSessionAccess::Owned
+        && !ephemeral
+        && !relaunches_same_session
+        && if is_session_host {
+            user_requested_exit && !actor_failed
+        } else {
+            true
+        }
 }
 
 async fn session_id_if_present(store: &dyn SessionStore, session_id: Uuid) -> Result<Uuid> {

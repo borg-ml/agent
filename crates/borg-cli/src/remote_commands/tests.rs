@@ -322,6 +322,99 @@ async fn competing_detached_host_exits_without_waiting_for_database_writer_or_st
     drop(writer);
 }
 
+/// A detached host that stops in order to come straight back -- an unsent
+/// composer draft reopening the session, or a resume landing on the id it is
+/// already driving -- used to reclaim the row on the way out and then fail
+/// startup on the way back in, reporting `does not exist` for a session it had
+/// deleted itself moments earlier.
+///
+/// Drives the real sequence rather than the predicate: shut down, apply
+/// whatever the policy says, then ask the startup gate the question a relaunch
+/// asks. A true exit must still reclaim the row, so this pins the fix without
+/// turning the discard off.
+#[tokio::test]
+async fn a_detached_host_coming_back_keeps_the_row_startup_demands() {
+    async fn stop_then_start(
+        store: &SqliteSessionStore,
+        session_id: Uuid,
+        user_requested_exit: bool,
+        relaunches_same_session: bool,
+    ) -> Result<Uuid> {
+        if should_discard_empty_session(
+            LocalSessionAccess::Owned,
+            false,
+            true,
+            false,
+            user_requested_exit,
+            relaunches_same_session,
+        ) {
+            store
+                .discard_empty_session(session_id)
+                .await
+                .expect("discard empty session");
+        }
+        session_id_if_present(store, session_id).await
+    }
+
+    let directory = tempdir().expect("temporary session root");
+    let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+        .await
+        .expect("open session store");
+
+    // Reopening after a detach: the draft is what brings the session back, and
+    // it is also why the session is still empty.
+    let reopened = Uuid::new_v4();
+    store.create_session(reopened).await.expect("create");
+    assert_eq!(
+        stop_then_start(&store, reopened, false, true)
+            .await
+            .expect("a reopened session must survive its own shutdown"),
+        reopened,
+    );
+
+    // A resume that lands on the session already being driven takes a
+    // different branch to the same relaunch, so it must be held to the same
+    // rule.
+    let resumed_in_place = Uuid::new_v4();
+    store
+        .create_session(resumed_in_place)
+        .await
+        .expect("create");
+    assert_eq!(
+        stop_then_start(&store, resumed_in_place, false, true)
+            .await
+            .expect("resuming the current session must survive its own shutdown"),
+        resumed_in_place,
+    );
+
+    // Stopping without the user ending it is a handoff or a retry, and both
+    // come back to this id.
+    let handed_off = Uuid::new_v4();
+    store.create_session(handed_off).await.expect("create");
+    assert_eq!(
+        stop_then_start(&store, handed_off, false, false)
+            .await
+            .expect("a host that did not exit must leave the row alone"),
+        handed_off,
+    );
+
+    // The user actually ending an empty session still reclaims the row: this
+    // fix must not turn the discard into a leak.
+    let finished = Uuid::new_v4();
+    store.create_session(finished).await.expect("create");
+    let error = stop_then_start(&store, finished, true, false)
+        .await
+        .expect_err("an ended empty session is still disposable");
+    assert!(
+        error.to_string().contains("does not exist"),
+        "unexpected error: {error:#}"
+    );
+    assert!(
+        !store.contains_session(finished).await.expect("contains"),
+        "the ended session should have been reclaimed"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn detached_host_waits_past_notice_interval_without_replacing_live_child() {
