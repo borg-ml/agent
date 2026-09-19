@@ -1418,7 +1418,7 @@ fn terminate_process_tree_now(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SessionStore, SqliteSessionStore};
+    use crate::SessionStore;
     use std::sync::Arc;
 
     #[test]
@@ -1587,9 +1587,7 @@ mod tests {
     async fn session_cleanup_waits_for_journaling_and_propagates_failure() {
         for fail_journal in [false, true] {
             let root = tempfile::tempdir().unwrap();
-            let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-                .await
-                .unwrap();
+            let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
             let owner = Uuid::new_v4();
             store.create_session(owner).await.unwrap();
             let manager = ProcessManager::default();
@@ -1611,7 +1609,14 @@ mod tests {
                 store.pool().close().await;
                 None
             } else {
-                Some(store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap())
+                Some({
+                    let mut transaction = store.pool().begin().await.unwrap();
+                    sqlx::query("lock table session_events in access exclusive mode")
+                        .execute(&mut *transaction)
+                        .await
+                        .unwrap();
+                    transaction
+                })
             };
             let stop_manager = manager.clone();
             let first = tokio::spawn(async move { stop_manager.terminate_session(owner).await });
@@ -1663,6 +1668,7 @@ mod tests {
                         ))
                 );
             }
+            scratch.discard().await;
         }
     }
 
@@ -1670,9 +1676,7 @@ mod tests {
     #[cfg(unix)]
     async fn background_cancellation_is_scoped_and_journaled() {
         let root = tempfile::tempdir().unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let owner = Uuid::new_v4();
         store.create_session(owner).await.unwrap();
         let manager = ProcessManager::default();
@@ -1723,18 +1727,24 @@ mod tests {
                 .running
         );
         manager.terminate_session(owner).await.unwrap();
+        scratch.discard().await;
     }
 
     #[tokio::test]
     #[cfg(unix)]
     async fn dropping_command_startup_kills_the_unjournaled_process() {
         let root = tempfile::tempdir().unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let owner = Uuid::new_v4();
         store.create_session(owner).await.unwrap();
-        let transaction = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let transaction = {
+            let mut transaction = store.pool().begin().await.unwrap();
+            sqlx::query("lock table session_events in access exclusive mode")
+                .execute(&mut *transaction)
+                .await
+                .unwrap();
+            transaction
+        };
         let manager = ProcessManager::default();
         let task_manager = manager.clone();
         let cwd = root.path().to_path_buf();
@@ -1775,6 +1785,7 @@ mod tests {
         .await
         .expect("aborted startup must reap its child");
         assert!(manager.inner.processes.lock().unwrap().is_empty());
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -1782,9 +1793,7 @@ mod tests {
     async fn cancellable_process_execution_reaps_the_workflow_child() {
         for fail_journal in [false, true] {
             let root = tempfile::tempdir().expect("workspace");
-            let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-                .await
-                .unwrap();
+            let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
             let manager = ProcessManager::default();
             let owner = Uuid::new_v4();
             store.create_session(owner).await.unwrap();
@@ -1840,6 +1849,7 @@ mod tests {
                     .values()
                     .all(|entry| entry.session_id != owner)
             );
+            scratch.discard().await;
         }
     }
 
@@ -1932,9 +1942,7 @@ mod tests {
     #[cfg(unix)]
     async fn completed_processes_are_durably_journaled_before_poll_returns() {
         let directory = tempfile::tempdir().expect("database directory");
-        let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .expect("session store");
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let session_id = Uuid::new_v4();
         store.create_session(session_id).await.expect("session");
         let manager = ProcessManager::default();
@@ -1978,6 +1986,7 @@ mod tests {
                 ..
             }
         )));
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -1985,9 +1994,7 @@ mod tests {
     async fn completion_poll_waits_for_journal_or_reports_its_failure() {
         for fail_journal in [false, true] {
             let directory = tempfile::tempdir().unwrap();
-            let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-                .await
-                .unwrap();
+            let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
             let owner = Uuid::new_v4();
             store.create_session(owner).await.unwrap();
             let manager = ProcessManager::default();
@@ -2010,7 +2017,14 @@ mod tests {
                 store.pool().close().await;
                 None
             } else {
-                Some(store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap())
+                Some({
+                    let mut transaction = store.pool().begin().await.unwrap();
+                    sqlx::query("lock table session_events in access exclusive mode")
+                        .execute(&mut *transaction)
+                        .await
+                        .unwrap();
+                    transaction
+                })
             };
             manager
                 .write_stdin(
@@ -2074,6 +2088,7 @@ mod tests {
                         ))
                 );
             }
+            scratch.discard().await;
         }
     }
 
@@ -2115,11 +2130,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_recovery_is_idempotent_for_an_orphaned_process() {
+    async fn postgres_recovery_is_idempotent_for_an_orphaned_process() {
         let directory = tempfile::tempdir().expect("database directory");
-        let store = SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .expect("session store");
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let session_id = Uuid::new_v4();
         let process_id = Uuid::new_v4();
         store.create_session(session_id).await.expect("session");
@@ -2164,6 +2177,7 @@ mod tests {
             })
             .count();
         assert_eq!(completions, 1);
+        scratch.discard().await;
     }
 
     /// A real PNG, built here rather than checked in so the test carries its
