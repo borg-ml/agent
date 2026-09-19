@@ -13,6 +13,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions};
 use sqlx::{ConnectOptions, Executor};
 
@@ -35,9 +36,7 @@ pub mod workflow;
 #[cfg(test)]
 pub(crate) mod testing;
 
-/// The journal schema, applied verbatim and idempotently. Every statement in
-/// the file is `create ... if not exists`, so bootstrap is safe to run from
-/// every process on every open and needs no migration runner yet.
+/// The journal schema. Its fingerprint prevents replaying DDL on ordinary opens.
 const POSTGRES_SCHEMA_SQL: &str = include_str!("postgres_schema.sql");
 
 /// The satellite tiers -- workspaces, autonomy, plugin state, receipts and the
@@ -127,29 +126,76 @@ impl PostgresSessionStore {
         &self.pool
     }
 
-    /// Apply the schema and record its version.
-    ///
-    /// Every borg process bootstraps on open, so concurrent first boots are the
-    /// normal case, not an edge case. `create ... if not exists` is NOT safe
-    /// under that concurrency: the existence check and the creation are not
-    /// atomic, so two sessions both observing "absent" both proceed and the
-    /// loser fails with a duplicate key on `pg_class`. Observed, not theorised
-    /// -- two tests bootstrapping in parallel reproduced it immediately.
-    ///
-    /// A transaction-scoped advisory lock serialises the whole bootstrap across
-    /// processes and releases automatically on commit, rollback, or a crashed
-    /// connection, so a process that dies mid-bootstrap cannot wedge the rest.
+    /// Serialize real migrations, but never repeat unchanged DDL against live writers.
     pub async fn ensure_schema(&self) -> Result<()> {
+        let mut hash = Sha256::new();
+        hash.update(SESSION_SCHEMA_VERSION.to_le_bytes());
+        hash.update(POSTGRES_SCHEMA_SQL);
+        hash.update(POSTGRES_SATELLITE_SCHEMA_SQL);
+        let fingerprint = hex::encode(hash.finalize());
+        for attempt in 0..6 {
+            match self.ensure_schema_once(&fingerprint).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    let transient = error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<sqlx::Error>()
+                            .and_then(sqlx::Error::as_database_error)
+                            .and_then(|error| error.code())
+                            .is_some_and(|code| {
+                                matches!(code.as_ref(), "40P01" | "55P03" | "40001")
+                            })
+                    });
+                    if !transient || attempt == 5 {
+                        return Err(error);
+                    }
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        "retrying contended Postgres schema bootstrap"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100 << attempt)).await;
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    async fn ensure_schema_once(&self, fingerprint: &str) -> Result<()> {
         let mut transaction = self
             .pool
             .begin()
             .await
             .context("failed to begin the Postgres schema bootstrap")?;
+        sqlx::query("set local lock_timeout = 5000")
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query("select pg_advisory_xact_lock($1)")
             .bind(SCHEMA_BOOTSTRAP_LOCK)
             .execute(&mut *transaction)
             .await
             .context("failed to take the Postgres schema bootstrap lock")?;
+        let metadata_exists: bool = sqlx::query_scalar("select to_regclass($1) is not null")
+            .bind("borg_session_schema")
+            .fetch_one(&mut *transaction)
+            .await?;
+        if metadata_exists {
+            let stored: Option<(i64, Option<String>)> = sqlx::query_as(
+                "select version, to_jsonb(s) ->> $1 from borg_session_schema s where id = 1",
+            )
+            .bind("definition_hash")
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if let Some((version, applied)) = stored {
+                anyhow::ensure!(
+                    version <= SESSION_SCHEMA_VERSION,
+                    "unsupported future Borg session schema version {version}; current is {SESSION_SCHEMA_VERSION}"
+                );
+                if version == SESSION_SCHEMA_VERSION && applied.as_deref() == Some(fingerprint) {
+                    transaction.commit().await?;
+                    return Ok(());
+                }
+            }
+        }
         // gin_trgm_ops in the schema requires pg_trgm. Attempted here rather
         // than in the .sql file because it needs privileges the journal role
         // may not hold in a managed deployment, where an operator installs it
@@ -169,15 +215,21 @@ impl PostgresSessionStore {
             .execute(&mut *transaction)
             .await
             .context("failed to apply the Postgres satellite schema")?;
+        sqlx::query(
+            "alter table borg_session_schema add column if not exists definition_hash text",
+        )
+        .execute(&mut *transaction)
+        .await?;
         // `id` is `generated always as identity` with `check (id = 1)`, so the
         // single row must be written with an explicit id and OVERRIDING SYSTEM
         // VALUE; a plain insert would allocate id=2 and trip the check.
         sqlx::query(
-            "insert into borg_session_schema (id, version) overriding system value \
-             values (1, $1) \
-             on conflict (id) do update set version = excluded.version",
+            "insert into borg_session_schema (id, version, definition_hash) overriding system value \
+             values (1, $1, $2) \
+             on conflict (id) do update set version = excluded.version, definition_hash = excluded.definition_hash",
         )
         .bind(SESSION_SCHEMA_VERSION)
+        .bind(fingerprint)
         .execute(&mut *transaction)
         .await
         .context("failed to record the Postgres session schema version")?;
@@ -408,6 +460,68 @@ mod tests {
         assert_eq!(rows, 1);
         drop(store);
 
+        scratch.discard().await;
+    }
+
+    #[tokio::test]
+    async fn current_schema_opens_without_blocking_live_journal_writers() {
+        let Some(url) = test_url() else {
+            return;
+        };
+        let scratch = ScratchDatabase::create(&url).await;
+        let store = PostgresSessionStore::connect(&scratch.url).await.unwrap();
+        let mut writer = store.pool.begin().await.unwrap();
+        sqlx::query("lock table sessions in row exclusive mode")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        let opened = tokio::time::timeout(
+            Duration::from_secs(2),
+            PostgresSessionStore::connect(&scratch.url),
+        )
+        .await;
+        writer.rollback().await.unwrap();
+        let opened = opened
+            .expect("opening a current schema must not request DDL locks")
+            .expect("open alongside journal writer");
+        drop(opened);
+        drop(store);
+        scratch.discard().await;
+    }
+
+    #[tokio::test]
+    async fn schema_bootstrap_retries_a_transient_migration_lock_timeout() {
+        let Some(url) = test_url() else {
+            return;
+        };
+        let scratch = ScratchDatabase::create(&url).await;
+        let store = PostgresSessionStore::connect(&scratch.url).await.unwrap();
+        sqlx::query("update borg_session_schema set definition_hash = null")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let mut blocker = store.pool.begin().await.unwrap();
+        sqlx::query("select pg_advisory_xact_lock($1)")
+            .bind(SCHEMA_BOOTSTRAP_LOCK)
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let retrying = store.clone();
+        let opening = tokio::spawn(async move { retrying.ensure_schema().await });
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        blocker.rollback().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), opening)
+            .await
+            .expect("bootstrap retry is bounded")
+            .unwrap()
+            .expect("transient migration contention must recover");
+        let applied: Option<String> =
+            sqlx::query_scalar("select definition_hash from borg_session_schema where id = 1")
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert!(applied.is_some());
+        drop(store);
         scratch.discard().await;
     }
 

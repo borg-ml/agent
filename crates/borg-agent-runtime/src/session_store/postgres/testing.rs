@@ -5,6 +5,7 @@
 //! round-tripping -- are exactly what a mock would get wrong, and are what the
 //! store depends on.
 
+use sqlx::ConnectOptions;
 use sqlx::postgres::{PgConnectOptions, PgPool};
 use uuid::Uuid;
 
@@ -39,13 +40,7 @@ impl ScratchDatabase {
             .await
             .expect("create scratch database");
         let options: PgConnectOptions = url.parse().expect("parse url");
-        let url = format!(
-            "postgres://{}@{}:{}/{}",
-            options.get_username(),
-            options.get_host(),
-            options.get_port(),
-            name
-        );
+        let url = options.database(&name).to_url_lossy().to_string();
         Self { url, name, admin }
     }
 
