@@ -4025,3 +4025,104 @@ async fn computer_use_live_desktop_clients() {
         .stop_session(session_id)
         .await;
 }
+
+/// Settling a delivery at the session projection must not turn a worker's own
+/// `acknowledge_team_message` into an error.
+///
+/// The projection now admits a team message as soon as the child journals it
+/// as complete, so by the time the worker acknowledges, the delivery is no
+/// longer pending. The ack lookup searches only the pending set, so an
+/// already-admitted message reports "unread team message not found" -- a
+/// worker that did exactly what it was told is told it imagined the message.
+#[tokio::test]
+async fn acknowledging_an_already_admitted_team_message_is_idempotent() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let store = Arc::new(
+        crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
+            .await
+            .unwrap(),
+    );
+    store.create_session(root).await.unwrap();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        3,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+    let worker = coordinator
+        .table
+        .lock()
+        .await
+        .reserve("worker", &launch())
+        .unwrap();
+    bind_test_team(directory.path(), store.as_ref(), root, &[worker.session_id]).await;
+
+    let workspace_store = coordinator.workspace_store().await.unwrap();
+    let binding = store
+        .workspace_binding(worker.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let director = store
+        .workspace_binding(root)
+        .await
+        .unwrap()
+        .unwrap()
+        .participant_id;
+    let receipt = workspace_store
+        .append_message(crate::NewWorkspaceMessage {
+            workspace_id: binding.workspace_id,
+            author_id: director,
+            text: "freeze the build".to_string(),
+            mentions: Vec::new(),
+            audience: crate::Audience::Direct {
+                participant: binding.participant_id,
+            },
+            mode: crate::DeliveryMode::Boundary,
+            thread_id: None,
+            reply_to_message_id: None,
+            idempotency_key: "test-freeze".to_string(),
+        })
+        .await
+        .unwrap();
+    let message_id = receipt.message_id;
+
+    // What the session projection now does once the child journals the
+    // prompt as complete.
+    workspace_store
+        .transition_message_delivery(
+            binding.workspace_id,
+            message_id,
+            binding.participant_id,
+            crate::DeliveryState::Admitted,
+            None,
+        )
+        .await
+        .unwrap();
+
+    coordinator
+        .acknowledge_message_for_session(worker.session_id, message_id)
+        .await
+        .expect("acknowledging an admitted team message must succeed");
+    assert_eq!(
+        workspace_store
+            .message_deliveries(message_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|delivery| delivery.recipient_id == binding.participant_id)
+            .unwrap()
+            .state,
+        crate::DeliveryState::Acknowledged
+    );
+
+    // A second ack is a no-op, not a failure.
+    coordinator
+        .acknowledge_message_for_session(worker.session_id, message_id)
+        .await
+        .expect("acknowledgement must be idempotent");
+}

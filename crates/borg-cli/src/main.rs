@@ -11,8 +11,8 @@ mod editor_preferences {
     pub(crate) use borg_ui::preferences::*;
 }
 mod extensions;
-mod importer;
 mod image_delivery;
+mod importer;
 mod inspect;
 mod limits;
 mod protection;

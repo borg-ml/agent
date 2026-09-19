@@ -44,6 +44,18 @@ impl From<WatchInfo> for crate::WatchSummary {
     }
 }
 
+/// An explicit wait: the agent has no other actionable work and is blocked on
+/// these watchers. Held in memory only and never journalled back into a
+/// restarted session, so a restart always comes back working rather than
+/// blocked. It does not touch goal status -- only automatic continuation.
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct GoalYield {
+    pub watch_ids: Vec<Uuid>,
+    pub reason: String,
+    #[serde(skip)]
+    pub since: chrono::DateTime<chrono::Utc>,
+}
+
 struct WatchEntry {
     info: WatchInfo,
     cancel: CancellationToken,
@@ -60,6 +72,10 @@ pub(crate) struct Watches {
     /// Signalled whenever the watch set or a watch's counters change, so
     /// the session can publish a fresh `WatchesChanged` to its frontends.
     pub changed: Arc<tokio::sync::Notify>,
+    /// Explicit goal yield, if the agent declared itself blocked on watchers.
+    /// A plain mutex, not a notifier: the session loop already wakes on real
+    /// input, so this only has to be re-read, never waited on.
+    yielded: Arc<std::sync::Mutex<Option<GoalYield>>>,
 }
 
 impl Watches {
@@ -71,7 +87,43 @@ impl Watches {
             events,
             cancel: CancellationToken::new(),
             changed: Arc::new(tokio::sync::Notify::new()),
+            yielded: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Record an explicit wait on `watch_ids`. Returns `None` when none of them
+    /// is still running, which is an actionable "there is nothing to wait for,
+    /// keep working" answer rather than a stall.
+    pub async fn begin_yield(&self, watch_ids: &[Uuid], reason: &str) -> Option<GoalYield> {
+        let entries = self.entries.lock().await;
+        let waiting: Vec<Uuid> = watch_ids
+            .iter()
+            .copied()
+            .filter(|id| entries.get(id).is_some_and(|entry| entry.info.running))
+            .collect();
+        drop(entries);
+        if waiting.is_empty() {
+            return None;
+        }
+        let yielded = GoalYield {
+            watch_ids: waiting,
+            reason: reason.to_string(),
+            since: chrono::Utc::now(),
+        };
+        *self.yielded.lock().unwrap() = Some(yielded.clone());
+        Some(yielded)
+    }
+
+    /// The active wait, if any. The session loop reads this to decide whether
+    /// to skip automatic goal continuation.
+    pub fn yielded(&self) -> Option<GoalYield> {
+        self.yielded.lock().unwrap().clone()
+    }
+
+    /// End the wait. Any real input resumes, including an event from a watcher
+    /// that was never named: unrelated output can still unblock the goal.
+    pub fn resume(&self) -> Option<GoalYield> {
+        self.yielded.lock().unwrap().take()
     }
 
     /// Frontend-facing view of every watch this session has armed.
@@ -374,6 +426,76 @@ mod tests {
         .unwrap();
         assert!(output.contains("first\n"), "{output}");
         assert!(output.contains("final"), "{output}");
+        watches.cancel.cancel();
+    }
+
+    /// The wait is only valid against a watcher that can still report. A
+    /// watcher that finished or was pruned between the decision and the call
+    /// must leave the session working, not stranded on something that will
+    /// never fire again.
+    #[tokio::test]
+    async fn a_wait_needs_a_live_watcher_and_never_strands_on_a_finished_one() {
+        let root = tempfile::tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(8);
+        let watches = Watches::new(ProcessManager::default(), tx, session_id);
+
+        // Nothing is running yet, so there is nothing to wait for.
+        assert!(
+            watches
+                .begin_yield(&[Uuid::new_v4()], "blocked on the sweep")
+                .await
+                .is_none()
+        );
+        assert!(watches.yielded().is_none(), "no wait may be recorded");
+
+        let info = watches
+            .start(
+                session_id,
+                root.path(),
+                WatchArgs {
+                    command: "printf 'ready\\n'; sleep 30".into(),
+                    label: "Sweep".into(),
+                    workdir: None,
+                },
+                None,
+                60_000,
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A live watcher, plus an unknown id, still yields on the live one.
+        let waiting = watches
+            .begin_yield(
+                &[Uuid::new_v4(), info.watch_id],
+                "every remaining step needs the sweep",
+            )
+            .await
+            .expect("a running watcher is a valid dependency");
+        assert_eq!(waiting.watch_ids, vec![info.watch_id]);
+        assert_eq!(waiting.reason, "every remaining step needs the sweep");
+        assert!(watches.yielded().is_some());
+
+        // Resuming is idempotent and hands back the wait exactly once, so the
+        // session journals one resume rather than one per pass.
+        let resumed = watches.resume().expect("the wait is returned once");
+        assert_eq!(resumed.watch_ids, vec![info.watch_id]);
+        assert!(watches.yielded().is_none());
+        assert!(watches.resume().is_none());
+
+        // A stopped watcher is no longer a thing to wait for.
+        watches.stop(info.watch_id).await.unwrap();
+        assert!(
+            watches
+                .begin_yield(&[info.watch_id], "still blocked")
+                .await
+                .is_none()
+        );
+        assert!(watches.yielded().is_none());
         watches.cancel.cancel();
     }
 }

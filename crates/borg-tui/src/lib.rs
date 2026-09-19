@@ -2294,6 +2294,58 @@ fn ordered_plan_items(items: &[PlanItem]) -> Vec<&PlanItem> {
     .collect()
 }
 
+/// The items an update actually changed: added, reworded, or moved to a new
+/// status, matched by durable item id. An update with nothing to compare
+/// against — a session's first plan or a replayed one — and an update that
+/// only removed items both return nothing, and the card falls back to the
+/// ordinary ordered list.
+fn changed_plan_items<'a>(items: &'a [PlanItem], previous: &[PlanItem]) -> Vec<&'a PlanItem> {
+    if previous.is_empty() {
+        return Vec::new();
+    }
+    ordered_plan_items(items)
+        .into_iter()
+        .filter(|item| {
+            previous
+                .iter()
+                .find(|superseded| superseded.id == item.id)
+                .is_none_or(|superseded| {
+                    superseded.status != item.status || superseded.content != item.content
+                })
+        })
+        .collect()
+}
+
+/// The rows a plan card shows and the number of plan items it leaves hidden.
+///
+/// A collapsed card is a change log for the update that produced it, so the
+/// newest or newly finished step is always visible instead of buried under
+/// unchanged leading steps. Expanding shows the whole plan.
+fn plan_card_rows<'a>(
+    items: &'a [PlanItem],
+    previous: &[PlanItem],
+    collapsed: bool,
+) -> (Vec<&'a PlanItem>, usize) {
+    let changed = changed_plan_items(items, previous);
+    let mut rows = if collapsed && !changed.is_empty() {
+        changed
+    } else {
+        ordered_plan_items(items)
+    };
+    if collapsed {
+        rows.truncate(MAX_COLLAPSED_PLAN_ITEMS);
+    }
+    let hidden = items.len().saturating_sub(rows.len());
+    (rows, hidden)
+}
+
+fn removed_plan_items(items: &[PlanItem], previous: &[PlanItem]) -> usize {
+    previous
+        .iter()
+        .filter(|superseded| !items.iter().any(|item| item.id == superseded.id))
+        .count()
+}
+
 fn pad_display(value: &str, width: usize) -> String {
     let used = UnicodeWidthStr::width(value);
     format!("{value}{}", " ".repeat(width.saturating_sub(used)))
@@ -15319,6 +15371,10 @@ fn detect_image_picker() -> Option<ImagePicker> {
     {
         return None;
     }
-    let picker = ImagePicker::from_query_stdio().ok()?;
+    let mut picker = ImagePicker::from_query_stdio().ok()?;
+    // Opaque padding hides stale half-block glyphs beneath terminal graphics.
+    if let Color::Rgb(red, green, blue) = MESSAGE_BG {
+        picker.set_background_color(Some(image::Rgba([red, green, blue, 255])));
+    }
     (picker.protocol_type() != ProtocolType::Halfblocks).then_some(picker)
 }

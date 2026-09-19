@@ -1013,8 +1013,8 @@ async fn compilation_context_status(
             "status": "missing",
             "searchedFrom": search_start,
             "warning": "no compile_commands.json or compile_flags.txt was found; \
-clangd is using fallback flags, so missing-include and unknown-type diagnostics \
-likely describe absent build configuration rather than defects in the code"
+        clangd is using fallback flags, so missing-include and unknown-type diagnostics \
+        likely describe absent build configuration rather than defects in the code"
         }));
     };
     let mut status = json!({
@@ -1076,7 +1076,10 @@ async fn find_compilation_database(start: &Path, root: &Path) -> Option<Compilat
     let mut reached_root = false;
     while let Some(directory) = current {
         for (relative, kind) in [
-            (PathBuf::from("compile_commands.json"), "compile_commands.json"),
+            (
+                PathBuf::from("compile_commands.json"),
+                "compile_commands.json",
+            ),
             (
                 PathBuf::from("build").join("compile_commands.json"),
                 "compile_commands.json",
@@ -1849,4 +1852,3 @@ mod tests {
         );
     }
 }
-

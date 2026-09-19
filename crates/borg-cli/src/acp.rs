@@ -106,9 +106,26 @@ pub(crate) async fn run(args: AcpArgs) -> Result<()> {
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            move |request: PromptRequest, responder, connection| {
+            move |request: PromptRequest,
+                  responder,
+                  connection: ConnectionTo<agent_client_protocol::Client>| {
                 let runtime = prompt_runtime.clone();
-                async move { respond_prompt(runtime, request, responder, connection).await }
+                async move {
+                    // A prompt drives an entire turn, and an approval-gated tool
+                    // call parks on `block_task()` waiting for the client's
+                    // `session/request_permission` reply. Handler callbacks all
+                    // run on the connection's single event-loop task, so doing
+                    // that work inline stops the server from reading any further
+                    // client message -- including the very permission response it
+                    // is blocked on, and any `session/cancel`. Hand the turn to a
+                    // spawned task, the library's prescribed shape for work that
+                    // outlives one dispatch tick, so the loop stays free to read.
+                    let turn_connection = connection.clone();
+                    connection.spawn(async move {
+                        respond_prompt(runtime, request, responder, turn_connection).await
+                    })?;
+                    Ok(())
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )

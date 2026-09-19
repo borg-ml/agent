@@ -456,9 +456,19 @@ impl AgentToolServer {
 
     pub fn external_mcp_server(&self) -> Result<borg_provider::mcp::ExternalMcpServer> {
         let mut env = BTreeMap::new();
+        // This value is read back by `borg __agent-mcp`, which parses it with
+        // the `CodingProvider` serde impl (snake_case). `catalog_backend()` is a
+        // different vocabulary -- kebab-case, for model-catalog lookups -- and
+        // its `open-code` / `openrouter` / `openai-compatible` spellings do not
+        // deserialize. Sending those made the tool server exit at startup and
+        // silently dropped every `mcp__borg_agent__*` tool from the session.
+        // Serialize through serde so the two sides cannot drift again.
         env.insert(
             "BORG_AGENT_TOOL_PROVIDER".to_string(),
-            self.provider.catalog_backend().to_string(),
+            serde_json::to_value(self.provider)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .context("provider does not serialize to a string")?,
         );
         if let Some(policy) = &self.team_policy
             && let Ok(policy) = serde_json::to_string(policy)
@@ -1484,6 +1494,44 @@ impl AgentToolDispatcher {
                         )
                         .await?,
                 )?)
+            }
+            "await_watchers" | "await_watches" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Args {
+                    watch_ids: Vec<Uuid>,
+                    reason: String,
+                }
+                let args: Args = serde_json::from_value(arguments)?;
+                ensure!(
+                    !args.watch_ids.is_empty(),
+                    "name the watchers the remaining work is blocked on"
+                );
+                ensure!(
+                    !args.reason.trim().is_empty(),
+                    "state why no other work is actionable"
+                );
+                let watches = self
+                    .watches
+                    .as_ref()
+                    .context("watchers are unavailable for this session")?;
+                // A watcher that finished or was pruned between the decision and
+                // this call is not an error: report it so the model keeps working
+                // instead of stranding on something that will never fire again.
+                Ok(
+                    match watches.begin_yield(&args.watch_ids, &args.reason).await {
+                        Some(yielded) => json!({
+                            "status": "waiting",
+                            "watch_ids": yielded.watch_ids,
+                            "reason": yielded.reason,
+                        }),
+                        None => json!({
+                            "status": "not_waiting",
+                            "detail": "None of those watchers is still running, so there is nothing to wait for. Re-check their output and continue with the remaining work.",
+                            "watchers": watches.list().await,
+                        }),
+                    },
+                )
             }
             "list_watchers" | "list_watches" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
@@ -3078,16 +3126,37 @@ impl SubagentCoordinator {
                 break;
             }
         }
-        let workspace_id = addressed_workspace_id.context("unread team message not found")?;
-        store
-            .transition_message_delivery(
-                workspace_id,
-                message_id,
-                binding.participant_id,
-                crate::DeliveryState::Admitted,
-                None,
-            )
-            .await?;
+        // The session projection admits a team message as soon as the child
+        // journals it complete, so a worker acknowledging work it really did
+        // usually finds its delivery already out of the pending set. Resolve
+        // the addressed workspace from the delivery itself before deciding
+        // the message does not exist: acknowledging twice is ordinary, and
+        // reporting "not found" to a worker that followed instructions turns
+        // a settled message into a phantom.
+        let delivery = store
+            .message_deliveries(message_id)
+            .await?
+            .into_iter()
+            .find(|delivery| delivery.recipient_id == binding.participant_id);
+        let workspace_id = match (addressed_workspace_id, &delivery) {
+            (Some(workspace_id), _) => workspace_id,
+            (None, Some(delivery)) => delivery.workspace_id,
+            (None, None) => bail!("unread team message not found"),
+        };
+        // Walk only the edges the store allows. `Admitted` is skipped when the
+        // projection already recorded it, and an acknowledged delivery is left
+        // exactly as it is rather than being pushed backwards.
+        if delivery.is_none_or(|delivery| delivery.state == crate::DeliveryState::Pending) {
+            store
+                .transition_message_delivery(
+                    workspace_id,
+                    message_id,
+                    binding.participant_id,
+                    crate::DeliveryState::Admitted,
+                    None,
+                )
+                .await?;
+        }
         store
             .transition_message_delivery(
                 workspace_id,
@@ -6052,6 +6121,26 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
             "List this session's background watchers and whether they are running.",
             json!({
                 "type": "object", "properties": {}, "additionalProperties": false
+            }),
+        ),
+        tool(
+            "await_watchers",
+            "Yield the active goal until a watcher reports progress, when every remaining step is blocked on watchers you already started. Only call this after finishing all other actionable work: name the watchers you are blocked on and say why nothing else can proceed. It does not pause, complete, or otherwise change the goal, and it does not stop any watcher. The next watcher update, message, or instruction resumes you automatically. If none of the named watchers is still running you get `not_waiting` back and should keep working.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "watch_ids": {
+                        "type": "array",
+                        "items": {"type": "string", "format": "uuid"},
+                        "minItems": 1,
+                        "description": "Watchers the remaining work depends on."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why no other work is actionable right now."
+                    }
+                },
+                "required": ["watch_ids", "reason"], "additionalProperties": false
             }),
         ),
         tool(

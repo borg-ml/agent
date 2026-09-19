@@ -1015,7 +1015,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 .context("native consultation requires an explicit model")?;
             let (final_text, usage) = self
                 .native_harness
-                .with_model_access(request.provider, &request.access)
+                .with_model_access_for(request.provider, Some(model), &request.access)
                 .await?
                 .consult(
                     request.provider,
@@ -1053,7 +1053,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         );
         let (summary, usage) = self
             .native_harness
-            .with_model_access(provider, &access)
+            .with_model_access_for(provider, Some(model), &access)
             .await?
             .compact(provider, model, effort, fast, conversation)
             .await?;

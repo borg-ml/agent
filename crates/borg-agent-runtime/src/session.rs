@@ -1945,6 +1945,9 @@ async fn run_agent_session_store_kernel_inner(
     let mut at_turn_boundary = !pending.is_empty();
     let mut projection_repair_started = false;
     let mut next_ready_detail = (!fresh).then(|| "Resumed".to_string());
+    // Whether the current watcher wait has already been journalled, so a wait
+    // is recorded once rather than on every pass through the idle select.
+    let mut yield_journalled = false;
     let (goal_tool_tx, mut goal_tool_rx) = mpsc::channel(8);
     let goal_tools = SessionGoalTools {
         requests: goal_tool_tx,
@@ -2201,6 +2204,7 @@ async fn run_agent_session_store_kernel_inner(
             Some(watch_prompt(text, &mut watch_events_rx))
         } else if !usage_limit_retry_waiting
             && !user_stop
+            && watches.yielded().is_none()
             && let Some(active_goal) = goal
                 .as_ref()
                 .filter(|goal| goal_allows_automatic_continuation(goal))
@@ -2217,6 +2221,29 @@ async fn run_agent_session_store_kernel_inner(
                 batch: Vec::new(),
             })
         } else {
+            if let Some(waiting) = watches.yielded()
+                && !std::mem::replace(&mut yield_journalled, true)
+            {
+                // Visible, never silent: the goal stays active and the session
+                // is plainly waiting rather than appearing stalled.
+                next_ready_detail.get_or_insert_with(|| {
+                    format!("Waiting on {} watcher(s)", waiting.watch_ids.len())
+                });
+                record(
+                    &mut journal,
+                    &events,
+                    session_id,
+                    SessionEventKind::ProviderEvent {
+                        provider: launch.provider,
+                        kind: "goal_yielded".to_string(),
+                        payload: serde_json::json!({
+                            "reason": waiting.reason,
+                            "watch_ids": waiting.watch_ids,
+                        }),
+                    },
+                )
+                .await?;
+            }
             record(
                 &mut journal,
                 &events,
@@ -2245,7 +2272,7 @@ async fn run_agent_session_store_kernel_inner(
                                         retry_not_before = None;
                                         let goal_is_active = goal.as_ref().is_some_and(|goal| goal.status == GoalStatus::Active);
                                         break pop_next_pending_prompt(&mut pending, goal_is_active || network_retry_message_id.is_some() || usage_limit_continuation_id.is_some()).or_else(|| {
-                                            (!user_stop).then_some(()).and_then(|()| goal.as_ref()
+                                            (!user_stop && watches.yielded().is_none()).then_some(()).and_then(|()| goal.as_ref()
                                                 .filter(|goal| goal_allows_automatic_continuation(goal)))
                                                 .map(|active_goal| QueuedPrompt {
                                                     message_id: Uuid::new_v4(),
@@ -3150,6 +3177,31 @@ async fn run_agent_session_store_kernel_inner(
                 }
             }
         };
+        if next.is_some()
+            && let Some(resumed) = watches.resume()
+        {
+            yield_journalled = false;
+            // Any real input ends the wait -- including an event from a watcher
+            // that was never named, because unrelated output can still unblock
+            // the goal. The goal was never paused, so nothing is un-paused here.
+            record(
+                &mut journal,
+                &events,
+                session_id,
+                SessionEventKind::ProviderEvent {
+                    provider: launch.provider,
+                    kind: "goal_resumed".to_string(),
+                    payload: serde_json::json!({
+                        "reason": resumed.reason,
+                        "watch_ids": resumed.watch_ids,
+                        "waited_ms": (chrono::Utc::now() - resumed.since)
+                            .num_milliseconds()
+                            .max(0),
+                    }),
+                },
+            )
+            .await?;
+        }
         if let Some(prompt) = next.as_ref() {
             reconcile_usage_limit_continuation(
                 &mut pending,

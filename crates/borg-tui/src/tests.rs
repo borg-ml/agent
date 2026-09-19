@@ -678,6 +678,112 @@ fn child_transcript_starts_with_a_director_context_boundary() {
 }
 
 #[test]
+fn a_child_badges_its_director_assignment_and_leaves_later_prompts_alone() {
+    let session = Uuid::new_v4();
+    let assignment = Uuid::new_v4();
+    let followup = Uuid::new_v4();
+    let prompt = |message_id, sequence, text: &str| {
+        SessionEvent::new(
+            session,
+            sequence,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        )
+    };
+    let row_color = |transcript: &Transcript, text: &str| {
+        let rendered = transcript.render(100, None, None, None).0;
+        let row = rendered
+            .iter()
+            .position(|line| line.to_string().contains(text))
+            .unwrap_or_else(|| panic!("{text} is missing from the transcript"));
+        rendered[row]
+            .spans
+            .iter()
+            .filter_map(|span| span.style.fg)
+            .collect::<Vec<_>>()
+    };
+    let replay = |events: &[SessionEvent]| {
+        let mut transcript = Transcript::default();
+        transcript.show_director_context_boundary();
+        for event in events {
+            transcript.apply_history(event);
+        }
+        transcript
+    };
+
+    let mut transcript = Transcript::default();
+    transcript.show_director_context_boundary();
+    // A prompt the operator queues before the assignment lands never becomes
+    // a transcript row, so it must not reserve the director identity.
+    transcript.apply(&SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::User,
+            text: "queued while starting".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: None,
+        },
+    ));
+    assert_eq!(transcript.director_prompt, None);
+    transcript.apply(&prompt(assignment, 2, "director assignment"));
+
+    // The prompt that opens the child came from the director agent, so it
+    // carries the team identity rather than the operator's.
+    let header = row_color(&transcript, "▌ director ▐");
+    assert!(header.contains(&SUBAGENT_PINK), "{header:?}");
+    assert!(!header.contains(&transcript.user_label_color), "{header:?}");
+    assert!(
+        row_color(&transcript, "director assignment").contains(&SUBAGENT_PINK),
+        "the assignment body shares the director identity"
+    );
+
+    // A human following up in the same child is still the human.
+    transcript.apply(&prompt(followup, 2, "human follow-up"));
+    let followup_body = row_color(&transcript, "human follow-up");
+    assert!(
+        followup_body.contains(&transcript.user_message_color),
+        "{followup_body:?}"
+    );
+    assert!(!followup_body.contains(&SUBAGENT_PINK), "{followup_body:?}");
+    assert!(
+        row_color(&transcript, "director assignment").contains(&SUBAGENT_PINK),
+        "the earlier assignment keeps its badge"
+    );
+
+    // Replaying the same history, and redelivering the assignment, must land
+    // on the same row rather than moving the badge.
+    let replayed = replay(&[
+        prompt(assignment, 1, "director assignment"),
+        prompt(followup, 2, "human follow-up"),
+    ]);
+    assert_eq!(replayed.director_prompt, Some(assignment));
+    assert!(row_color(&replayed, "director assignment").contains(&SUBAGENT_PINK));
+    assert!(!row_color(&replayed, "human follow-up").contains(&SUBAGENT_PINK));
+    transcript.apply(&prompt(assignment, 3, "director assignment"));
+    assert_eq!(transcript.director_prompt, Some(assignment));
+
+    // A root transcript has no director context, so nothing is badged.
+    let mut root = Transcript::default();
+    root.apply(&prompt(assignment, 1, "root prompt"));
+    assert_eq!(root.director_prompt, None);
+    let root_prompt = row_color(&root, "root prompt");
+    assert!(
+        root_prompt.contains(&root.user_message_color),
+        "{root_prompt:?}"
+    );
+    assert!(!root_prompt.contains(&SUBAGENT_PINK), "{root_prompt:?}");
+}
+
+#[test]
 fn focused_transcript_can_switch_directly_between_children() {
     let first_id = Uuid::new_v4();
     let second_id = Uuid::new_v4();
@@ -9668,6 +9774,7 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
             content: "Verify the result".to_string(),
             status: PlanItemStatus::InProgress,
         }],
+        previous: Vec::new(),
         time: "12:04".to_string(),
         expanded: false,
     });
@@ -11212,6 +11319,7 @@ fn rich_plan_orders_active_work_first_and_mutes_completed_work() {
                 status: PlanItemStatus::InProgress,
             },
         ],
+        previous: Vec::new(),
         time: "12:00".to_string(),
         expanded: false,
     });
@@ -11285,6 +11393,7 @@ fn plan_cards_copy_the_complete_readable_todo_list() {
                 status: PlanItemStatus::InProgress,
             },
         ],
+        previous: Vec::new(),
         time: "12:00".to_string(),
         expanded: false,
     };
@@ -11306,6 +11415,7 @@ fn long_plans_clip_with_a_hint_and_expand_on_toggle() {
                 status: PlanItemStatus::Pending,
             })
             .collect(),
+        previous: Vec::new(),
         time: "12:00".to_string(),
         expanded: false,
     });
@@ -11334,6 +11444,82 @@ fn long_plans_clip_with_a_hint_and_expand_on_toggle() {
     transcript.toggle_plan_expansion(0);
     let reclipped = render(&transcript);
     assert!(!reclipped.contains("Step 5"), "{reclipped}");
+}
+
+#[test]
+fn a_collapsed_plan_card_shows_the_update_not_the_first_rows() {
+    let mut transcript = Transcript::default();
+    let mut items = (0..24)
+        .map(|index| PlanItem {
+            id: Uuid::new_v4(),
+            content: format!("Step {index}"),
+            status: PlanItemStatus::Completed,
+        })
+        .collect::<Vec<_>>();
+    let render = |transcript: &Transcript| {
+        transcript
+            .lines(80)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    transcript.upsert_plan(items.clone(), "12:00".to_string());
+
+    // The first plan has nothing to compare against, so it still reads as a
+    // plan: the leading steps, clipped.
+    let initial = render(&transcript);
+    assert!(initial.contains("Step 0"), "{initial}");
+    assert!(initial.contains("+ 19 more · click to expand"), "{initial}");
+
+    // Appending the release step is the whole point of the update, so the
+    // collapsed card must show it instead of 23 unchanged rows.
+    items.push(PlanItem {
+        id: Uuid::new_v4(),
+        content: "FINAL release".to_string(),
+        status: PlanItemStatus::InProgress,
+    });
+    transcript.upsert_plan(items.clone(), "12:05".to_string());
+    let appended = render(&transcript);
+    assert!(appended.contains("FINAL release"), "{appended}");
+    assert!(!appended.contains("Step 0"), "{appended}");
+    assert!(appended.contains("24/25 completed"), "{appended}");
+    assert!(
+        appended.contains("+ 24 more · click to expand"),
+        "{appended}"
+    );
+
+    // Expanding still shows the entire plan.
+    let index = transcript.order.len() - 1;
+    assert!(transcript.plan_is_clippable(index));
+    transcript.toggle_plan_expansion(index);
+    let expanded = render(&transcript);
+    assert!(expanded.contains("Step 0"), "{expanded}");
+    assert!(expanded.contains("FINAL release"), "{expanded}");
+    assert!(expanded.contains("− show less"), "{expanded}");
+
+    // A status change is an update too, and removals are reported even
+    // though the removed rows themselves are gone.
+    transcript.toggle_plan_expansion(index);
+    items.retain(|item| item.content != "Step 1");
+    items.last_mut().expect("the release step").status = PlanItemStatus::Completed;
+    transcript.upsert_plan(items.clone(), "12:09".to_string());
+    let finished = render(&transcript);
+    assert!(finished.contains("FINAL release"), "{finished}");
+    assert!(!finished.contains("Step 2"), "{finished}");
+    assert!(
+        finished.contains("24/24 completed · 1 removed"),
+        "{finished}"
+    );
+
+    // A replayed update changes nothing, so the card falls back to the plan.
+    transcript.upsert_plan(items, "12:10".to_string());
+    let replayed = render(&transcript);
+    assert!(replayed.contains("Step 2"), "{replayed}");
+    assert!(
+        replayed.contains("+ 19 more · click to expand"),
+        "{replayed}"
+    );
 }
 
 #[test]
@@ -12786,6 +12972,7 @@ fn fullscreen_non_tool_details_expand_without_mutating_inline_state() {
                 status: PlanItemStatus::Pending,
             })
             .collect(),
+        previous: Vec::new(),
         time: "12:00".into(),
         expanded: false,
     });
@@ -12893,6 +13080,7 @@ async fn timeline_detail_click_policy_applies_to_every_expandable_entry() {
                 status: PlanItemStatus::Pending,
             })
             .collect(),
+        previous: Vec::new(),
         time: "12:00".into(),
         expanded: false,
     });

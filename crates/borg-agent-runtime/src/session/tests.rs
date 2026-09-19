@@ -14524,3 +14524,286 @@ async fn steer_in_flight_when_the_turn_ends_starts_a_new_turn() {
         .unwrap();
     actor.await.unwrap().unwrap();
 }
+
+/// Build a workspace directed at `recipient` and return its stores plus a
+/// projection standing in for one long-running child session.
+async fn team_delivery_fixture(
+    root: &std::path::Path,
+) -> (
+    Uuid,
+    Arc<SqliteSessionStore>,
+    Arc<dyn WorkspaceStore>,
+    crate::SessionWorkspaceBinding,
+    WorkspaceProjection,
+) {
+    let session_id = Uuid::new_v4();
+    let session_store = Arc::new(
+        SqliteSessionStore::open(root.join("sessions.sqlite3"))
+            .await
+            .unwrap(),
+    );
+    session_store.create_session(session_id).await.unwrap();
+    let binding = session_store
+        .workspace_binding(session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let workspace_store = session_store.workspace_store().await.unwrap().unwrap();
+    let human_id = crate::local_human_participant_id("Human");
+    workspace_store
+        .ensure_execution_workspace(
+            binding.workspace_id,
+            "test workspace",
+            human_id,
+            "Human",
+            binding.participant_id,
+            "Worker",
+        )
+        .await
+        .unwrap();
+    let projection = WorkspaceProjection::new(
+        workspace_store.clone(),
+        binding.workspace_id,
+        binding.participant_id,
+        human_id,
+        0,
+        0,
+    );
+    (
+        session_id,
+        session_store,
+        workspace_store,
+        binding,
+        projection,
+    )
+}
+
+/// Route one directed team message and return its id.
+async fn append_team_message(
+    workspace_store: &Arc<dyn WorkspaceStore>,
+    binding: &crate::SessionWorkspaceBinding,
+    text: &str,
+    mode: crate::DeliveryMode,
+) -> Uuid {
+    let author = crate::local_human_participant_id("Human");
+    let message_id = Uuid::new_v4();
+    workspace_store
+        .append(WorkspaceEvent {
+            id: message_id,
+            workspace_id: binding.workspace_id,
+            sequence: 0,
+            author_id: author,
+            idempotency_key: format!("test-team-message:{message_id}"),
+            created_at: chrono::Utc::now(),
+            kind: WorkspaceEventKind::Message {
+                message: crate::WorkspaceMessage {
+                    id: message_id,
+                    workspace_id: binding.workspace_id,
+                    thread_id: None,
+                    reply_to_message_id: None,
+                    author_id: author,
+                    body: crate::WorkspaceMessageBody {
+                        text: text.to_string(),
+                        mentions: Vec::new(),
+                    },
+                    audience: crate::Audience::Direct {
+                        participant: binding.participant_id,
+                    },
+                    created_at: chrono::Utc::now(),
+                },
+                mode,
+            },
+        })
+        .await
+        .unwrap();
+    message_id
+}
+
+async fn unread_ids(
+    workspace_store: &Arc<dyn WorkspaceStore>,
+    binding: &crate::SessionWorkspaceBinding,
+) -> Vec<Uuid> {
+    workspace_store
+        .pending_message_events(binding.workspace_id, binding.participant_id, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|(event, _)| match event.kind {
+            WorkspaceEventKind::Message { message, .. } => Some(message.id),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn delivery_state(
+    workspace_store: &Arc<dyn WorkspaceStore>,
+    binding: &crate::SessionWorkspaceBinding,
+    message_id: Uuid,
+) -> crate::DeliveryState {
+    workspace_store
+        .message_deliveries(message_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|delivery| delivery.recipient_id == binding.participant_id)
+        .expect("recipient delivery exists")
+        .state
+}
+
+/// A busy child is steered mid-turn, so no `TurnCompleted` ever names the
+/// team message. Team prompts are journaled as `System`, so gating admission
+/// on `User` left the delivery pending forever and every later inbox read
+/// replayed a build/freeze/lease instruction the worker had already carried
+/// out. Only a coordinator restart used to clear it, so a long-running child
+/// accumulated its whole history as unread.
+#[tokio::test]
+async fn an_accepted_steer_settles_a_long_running_child_team_delivery() {
+    let root = tempdir().unwrap();
+    let (session_id, session_store, workspace_store, binding, projection) =
+        team_delivery_fixture(root.path()).await;
+    let message_id = append_team_message(
+        &workspace_store,
+        &binding,
+        "freeze the build",
+        crate::DeliveryMode::Boundary,
+    )
+    .await;
+    let store: Arc<dyn SessionStore> = session_store.clone();
+    let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new(), true)
+        .with_workspace_projection(projection);
+
+    assert_eq!(
+        unread_ids(&workspace_store, &binding).await,
+        vec![message_id]
+    );
+
+    // The provider accepted the steer but the model has not consumed it yet.
+    // An unconsumed steer is not an admission.
+    runtime
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::System,
+                text: "freeze the build".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        delivery_state(&workspace_store, &binding, message_id).await,
+        crate::DeliveryState::Pending,
+        "an unconsumed steer must not settle its delivery"
+    );
+
+    runtime
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::System,
+                text: "freeze the build".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Steer),
+            },
+        ))
+        .await
+        .unwrap();
+
+    // Consumed: admitted, and gone from the unread inbox. Not acknowledged --
+    // no turn boundary ever answered for it, and claiming otherwise would
+    // overstate what happened.
+    assert_eq!(
+        delivery_state(&workspace_store, &binding, message_id).await,
+        crate::DeliveryState::Admitted
+    );
+    assert!(
+        unread_ids(&workspace_store, &binding).await.is_empty(),
+        "a consumed steer must not replay as unread on a still-running child"
+    );
+}
+
+/// The queued path reached `TurnCompleted`, but `Pending -> Acknowledged` is
+/// rejected by the store's monotonic transition table, and the rejection only
+/// surfaced as a warn-level projection diagnostic. The delivery stayed pending.
+#[tokio::test]
+async fn a_completed_queued_team_turn_acknowledges_its_delivery() {
+    let root = tempdir().unwrap();
+    let (session_id, session_store, workspace_store, binding, projection) =
+        team_delivery_fixture(root.path()).await;
+    let message_id = append_team_message(
+        &workspace_store,
+        &binding,
+        "take the deploy lease",
+        crate::DeliveryMode::NextTurn,
+    )
+    .await;
+    let store: Arc<dyn SessionStore> = session_store.clone();
+    let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new(), true)
+        .with_workspace_projection(projection.clone());
+
+    runtime
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::System,
+                text: "take the deploy lease".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        delivery_state(&workspace_store, &binding, message_id).await,
+        crate::DeliveryState::Admitted
+    );
+
+    runtime
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::TurnCompleted {
+                message_id,
+                provider_session_id: Some("provider-session".to_string()),
+                final_text: "leased".to_string(),
+                error: None,
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        delivery_state(&workspace_store, &binding, message_id).await,
+        crate::DeliveryState::Acknowledged
+    );
+    assert!(unread_ids(&workspace_store, &binding).await.is_empty());
+
+    // The rejected shortcut used to be swallowed into a diagnostic rather
+    // than settling anything.
+    assert!(!store.read(session_id).await.unwrap().iter().any(|event| {
+        matches!(
+            &event.kind,
+            SessionEventKind::Error { message }
+                if message.contains("invalid non-monotonic delivery transition")
+        )
+    }));
+
+    // Replaying the whole transcript is how repair catches up; it must not
+    // drag an acknowledged delivery back to admitted.
+    for event in store.read(session_id).await.unwrap() {
+        projection.project(&event).await.unwrap();
+    }
+    assert_eq!(
+        delivery_state(&workspace_store, &binding, message_id).await,
+        crate::DeliveryState::Acknowledged
+    );
+}

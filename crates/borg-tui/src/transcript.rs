@@ -113,6 +113,8 @@ fn extend_tool_lifecycle_spans(
 struct Transcript {
     order: Vec<TranscriptEntry>,
     messages: HashMap<Uuid, usize>,
+    director_context: bool,
+    director_prompt: Option<Uuid>,
     tools: HashMap<String, usize>,
     foreground_tool: Option<String>,
     preparing_tools: HashMap<String, String>,
@@ -221,6 +223,8 @@ impl Default for Transcript {
         Self {
             order: Vec::new(),
             messages: HashMap::new(),
+            director_context: false,
+            director_prompt: None,
             tools: HashMap::new(),
             foreground_tool: None,
             preparing_tools: HashMap::new(),
@@ -370,6 +374,9 @@ enum TranscriptEntry {
     },
     Plan {
         items: Vec<PlanItem>,
+        /// The plan this update replaced, kept so the collapsed card can show
+        /// what the update actually changed instead of the first few rows.
+        previous: Vec<PlanItem>,
         time: String,
         expanded: bool,
     },
@@ -657,6 +664,7 @@ impl Transcript {
     }
 
     fn show_director_context_boundary(&mut self) {
+        self.director_context = true;
         self.order.push(TranscriptEntry::Activity {
             text: DIRECTOR_CONTEXT_BOUNDARY.to_string(),
             time: canonical_local_time(Local::now()),
@@ -683,22 +691,27 @@ impl Transcript {
 
     fn upsert_plan(&mut self, items: Vec<PlanItem>, time: String) -> Option<usize> {
         let mut expanded = false;
+        let mut previous = Vec::new();
         let removed = self
             .order
             .iter()
             .rposition(|entry| matches!(entry, TranscriptEntry::Plan { .. }));
         if let Some(index) = removed {
             if let Some(TranscriptEntry::Plan {
-                expanded: previous, ..
+                items: superseded,
+                expanded: was_expanded,
+                ..
             }) = self.order.get(index)
             {
-                expanded = *previous;
+                expanded = *was_expanded;
+                previous.clone_from(superseded);
             }
             self.order.remove(index);
             self.reindex_after_removal(index);
         }
         self.order.push(TranscriptEntry::Plan {
             items,
+            previous,
             time,
             expanded,
         });
@@ -787,7 +800,8 @@ impl Transcript {
     fn plan_is_clippable(&self, index: usize) -> bool {
         matches!(
             self.order.get(index),
-            Some(TranscriptEntry::Plan { items, .. }) if items.len() > MAX_COLLAPSED_PLAN_ITEMS
+            Some(TranscriptEntry::Plan { items, previous, .. })
+                if plan_card_rows(items, previous, true).1 > 0
         )
     }
 
@@ -1436,6 +1450,19 @@ impl Transcript {
                     };
                     if insertion_index < self.order.len() {
                         self.reindex_after_insertion(insertion_index);
+                    }
+                    // The prompt that opens a child session is the
+                    // director's assignment, not the operator's. Claim the
+                    // badge for the first user row this transcript actually
+                    // materializes after the context boundary: queued,
+                    // withdrawn and provider-input messages never reach here,
+                    // so a genuine later human follow-up keeps its own
+                    // identity.
+                    if self.director_context
+                        && *actor == EventActor::User
+                        && self.director_prompt.is_none()
+                    {
+                        self.director_prompt = Some(*message_id);
                     }
                     self.messages.insert(*message_id, insertion_index);
                     self.order.insert(
@@ -2197,6 +2224,11 @@ impl Transcript {
 
     fn remove_message(&mut self, message_id: Uuid) -> Option<usize> {
         let index = self.messages.remove(&message_id)?;
+        if self.director_prompt == Some(message_id) {
+            // A withdrawn row must not keep the badge reserved for an entry
+            // that no longer exists.
+            self.director_prompt = None;
+        }
         self.order.remove(index);
         self.reindex_after_removal(index);
         Some(index)
@@ -3656,6 +3688,9 @@ impl Transcript {
             ));
             lines.push(Line::default());
         }
+        let director_prompt_row = self
+            .director_prompt
+            .and_then(|prompt| self.messages.get(&prompt).copied());
         for (index, entry) in self.order.iter().enumerate() {
             if focused_tool.is_some_and(|focused| focused != index) {
                 continue;
@@ -3730,7 +3765,9 @@ impl Transcript {
                     if *status == MessageStatus::Queued {
                         continue;
                     }
+                    let from_director = director_prompt_row == Some(index);
                     let (label, color) = match actor {
+                        EventActor::User if from_director => ("director".to_string(), SUBAGENT_PINK),
                         EventActor::User => (self.user_label.clone(), self.user_label_color),
                         EventActor::Assistant => {
                             (self.assistant_label.clone(), self.assistant_label_color)
@@ -3785,6 +3822,7 @@ impl Transcript {
                     ));
                     lines.push(Line::from(header));
                     let text_color = match actor {
+                        EventActor::User if from_director => Some(SUBAGENT_PINK),
                         EventActor::User => Some(self.user_message_color),
                         EventActor::Assistant => Some(self.assistant_message_color),
                         _ => None,
@@ -4035,6 +4073,7 @@ impl Transcript {
                 }
                 TranscriptEntry::Plan {
                     items,
+                    previous,
                     time,
                     expanded,
                 } => {
@@ -4043,6 +4082,12 @@ impl Transcript {
                         .iter()
                         .filter(|item| item.status == PlanItemStatus::Completed)
                         .count();
+                    let dropped = removed_plan_items(items, previous);
+                    let dropped = if dropped == 0 {
+                        String::new()
+                    } else {
+                        format!(" · {dropped} removed")
+                    };
                     lines.push(Line::from(vec![
                         Span::styled(
                             "▌ Plan",
@@ -4051,20 +4096,16 @@ impl Transcript {
                                 .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(
-                            format!("  {time}  {done}/{} completed", items.len()),
+                            format!("  {time}  {done}/{} completed{dropped}", items.len()),
                             Style::default().fg(Color::DarkGray),
                         ),
                     ]));
-                    let display_items = ordered_plan_items(items);
-                    let clipped = !*expanded
-                        && focused_tool != Some(index)
-                        && items.len() > MAX_COLLAPSED_PLAN_ITEMS;
-                    let display_limit = if clipped {
-                        MAX_COLLAPSED_PLAN_ITEMS
-                    } else {
-                        usize::MAX
-                    };
-                    for item in display_items.into_iter().take(display_limit) {
+                    // Collapsed, the card is a change log: a long plan whose
+                    // newest row is its most important one must not hide that
+                    // row behind unchanged leading steps.
+                    let collapsed = !*expanded && focused_tool != Some(index);
+                    let (display_items, hidden) = plan_card_rows(items, previous, collapsed);
+                    for item in display_items {
                         let (glyph, marker_style, text_style) = match item.status {
                             PlanItemStatus::Completed => (
                                 "✓",
@@ -4104,12 +4145,9 @@ impl Transcript {
                             ]));
                         }
                     }
-                    if clipped {
+                    if collapsed && hidden > 0 {
                         lines.push(Line::from(Span::styled(
-                            format!(
-                                "    + {} more · click to expand",
-                                items.len() - MAX_COLLAPSED_PLAN_ITEMS
-                            ),
+                            format!("    + {hidden} more · click to expand"),
                             Style::default().fg(Color::DarkGray),
                         )));
                     } else if *expanded && items.len() > MAX_COLLAPSED_PLAN_ITEMS {

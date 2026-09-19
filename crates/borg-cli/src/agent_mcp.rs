@@ -64,7 +64,25 @@ pub(crate) async fn call_tool(name: &str, arguments: Option<&str>) -> Result<()>
     let output = forward(&endpoint, name, arguments, None).await?;
     let output = spool_result_attachments(output);
     println!("{}", serde_json::to_string(&output)?);
+    // Printed first so non-image output is never lost, then failed: an image
+    // that did not reach the model must not look like a success.
+    if let Some(error) = first_spool_error(&output, 0) {
+        bail!("{error}");
+    }
     Ok(())
+}
+
+fn first_spool_error(value: &Value, depth: usize) -> Option<&str> {
+    if depth > MAX_ATTACHMENT_SEARCH_DEPTH {
+        return None;
+    }
+    let object = value.as_object()?;
+    if let Some(error) = object.get(SPOOL_ERROR_KEY).and_then(Value::as_str) {
+        return Some(error);
+    }
+    object
+        .values()
+        .find_map(|nested| first_spool_error(nested, depth + 1))
 }
 
 /// Number of images spooled, left in stdout in place of the base64 so the
@@ -126,13 +144,15 @@ fn spool_attachments_in(value: &mut Value, dir: &std::path::Path, depth: usize) 
                 object.insert(SPOOLED_IMAGES_KEY.to_string(), json!(written.len()));
             }
             Some(error) => {
-                // Put the whole set back inline rather than dropping images.
-                // The already-written files must go first: leaving them would
-                // deliver those images twice, once as files and once as text.
+                // Never fall back to inline base64 once a spool is configured.
+                // Reinlining puts the image back into stdout, where it is
+                // truncated into unusable text and exposed in the transcript,
+                // while the command still exits 0 and looks like it worked.
+                // Partial writes are removed so nothing arrives twice, and the
+                // caller turns this key into a non-zero exit.
                 for path in &written {
                     let _ = std::fs::remove_file(path);
                 }
-                object.insert(ATTACHMENTS_KEY.to_string(), Value::Array(attachments));
                 object.insert(SPOOL_ERROR_KEY.to_string(), json!(error));
             }
         }
@@ -861,12 +881,19 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(spool.path()).unwrap().count(),
             0,
-            "a spooled file survived the fallback"
+            "a spooled file survived the failure"
         );
-        assert_eq!(result["borg_attachments"].as_array().map(Vec::len), Some(2));
+        assert!(
+            result.get("borg_attachments").is_none(),
+            "base64 was put back into stdout: {result}"
+        );
         assert!(
             result[SPOOL_ERROR_KEY].is_string(),
             "the failure was not reported: {result}"
+        );
+        assert!(
+            first_spool_error(&result, 0).is_some(),
+            "the caller cannot detect the failure and would exit 0"
         );
     }
 

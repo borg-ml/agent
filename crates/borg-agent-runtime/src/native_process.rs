@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
+use base64::Engine as _;
 use borg_provider::provider::ModelInputAttachment;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -23,36 +24,29 @@ const DEFAULT_OUTPUT_TOKENS: usize = 10_000;
 const MAX_OUTPUT_TOKENS: usize = 64_000;
 const JOURNAL_OUTPUT_TOKENS: usize = 16_384;
 
-/// Absolute path of a private directory where a child process can hand images
-/// back to the model out of band.
+/// Private directory where a child process hands images back out of band.
 ///
-/// Images cannot travel in stdout. `exec` captures a child's stdout into
-/// [`HeadTailBuffer`], which keeps at most [`CAPTURE_BYTES`] and is rendered
-/// down to a token budget on every snapshot, so a screenshot's base64 is cut
-/// in half by `… bytes omitted …` long before any caller could parse it back
-/// out. Raising those limits is not an option either: shell output is meant to
-/// stay small, and megabytes of base64 would flow through the secret scrubber,
-/// the journal, and the tool-result bound on every single read.
-///
-/// So the bytes take a different road. A child writes each image as its own
-/// file here, the snapshot drains them, and only a short descriptor is left in
-/// stdout. Because this rides on an inherited environment variable instead of
-/// the stdout text, it survives pipes, redirection, subshells, and nested
-/// scripts — anything that inherits the environment can deliver an image.
+/// Images cannot travel in stdout: `exec` captures it into [`HeadTailBuffer`]
+/// and renders it down to a token budget, so a screenshot's base64 is cut by
+/// `… bytes omitted …` before anything can parse it. Raising those limits
+/// would push megabytes of base64 through the scrubber, journal, and
+/// tool-result bound on every read. Instead each image is written here and
+/// drained into the snapshot, leaving a short descriptor in stdout. Riding an
+/// inherited variable rather than stdout, it survives pipes, redirection, and
+/// subshells.
 pub(crate) const ATTACHMENT_SPOOL_ENV: &str = "BORG_ATTACHMENT_SPOOL";
-/// Safety bound only. The canonical per-result image policy (how many images,
-/// how large, and the `dropped_attachments` diagnostics) lives in
-/// `native_harness::split_tool_result_attachments` so there is exactly one
-/// place that decides what reaches a model; this cap just stops a runaway
-/// child from making the runtime read unbounded data.
+/// Safety bound only; the per-result image policy lives in
+/// `native_harness::split_tool_result_attachments`.
 const MAX_SPOOLED_ATTACHMENTS_PER_DRAIN: usize = 16;
-/// Generous next to the harness' 6 MiB base64 limit, so an image that is only
-/// slightly too large is still reported as dropped by the harness rather than
-/// vanishing here without explanation.
+/// Generous next to the harness' 6 MiB base64 limit, so a slightly oversized
+/// envelope is reported by the harness rather than vanishing here.
 const MAX_SPOOLED_ATTACHMENT_BYTES: u64 = 12 * 1024 * 1024;
 /// Per-drain ceiling across all images together, so many merely-legal files
 /// cannot add up to an unbounded read.
 const MAX_SPOOL_DRAIN_TOTAL_BYTES: u64 = 24 * 1024 * 1024;
+/// Ceiling for a raw image file, chosen so its base64 lands exactly on the
+/// harness' 6 MiB limit: one clear error here beats a silent drop later.
+const MAX_SPOOLED_IMAGE_BYTES: u64 = 6 * 1024 * 1024 / 4 * 3;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessManager {
@@ -103,6 +97,8 @@ struct ProcessEntry {
     /// directory could not be created, in which case the process simply has no
     /// image channel and everything else behaves exactly as before.
     attachment_spool: Option<PathBuf>,
+    /// Why this process has no image channel, when it has none.
+    attachment_channel_error: Option<String>,
 }
 
 impl Drop for ProcessEntry {
@@ -310,7 +306,11 @@ impl ProcessManager {
         }
 
         let process_id = Uuid::new_v4();
-        let attachment_spool = create_attachment_spool(process_id);
+        let (attachment_spool, attachment_channel_error) = match create_attachment_spool(process_id)
+        {
+            Ok(spool) => (Some(spool), None),
+            Err(error) => (None, Some(error)),
+        };
         let mut process = shell_command(&command);
         crate::process_environment::configure_host_child_environment(&mut process);
         process.envs(environment);
@@ -365,6 +365,7 @@ impl ProcessManager {
             cancellation: cancel.clone(),
             updates: self.inner.updates.clone(),
             attachment_spool,
+            attachment_channel_error,
         });
         self.inner
             .processes
@@ -732,54 +733,57 @@ impl HeadTailBuffer {
 
 /// Create this process' private image spool. Failure is not fatal: the process
 /// runs with no image channel, exactly as it did before this channel existed.
-fn create_attachment_spool(process_id: Uuid) -> Option<PathBuf> {
+/// Losing the image channel is reported, not swallowed: without it a
+/// screenshot silently degrades back into truncated base64 text, which is the
+/// exact failure this channel exists to prevent.
+fn create_attachment_spool(process_id: Uuid) -> Result<PathBuf, String> {
     let dir = std::env::temp_dir().join(format!("borg-attachments-{}", process_id.simple()));
     let mut builder = std::fs::DirBuilder::new();
     // A screenshot can show anything on the user's desktop, and the system
-    // temporary directory is shared. Owner-only, and `create_new` semantics so
-    // this never adopts a directory — or a symlink — somebody else put here.
+    // temporary directory is shared. Owner-only, and non-recursive so this
+    // never adopts a directory — or a symlink — somebody else put here.
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(0o700);
     }
     match builder.create(&dir) {
-        Ok(()) => Some(dir),
+        Ok(()) => Ok(dir),
         Err(error) => {
-            tracing::debug!(
+            tracing::warn!(
                 %process_id,
                 %error,
-                "failed to create the process image spool; continuing without an image channel"
+                "failed to create the process image spool; this command cannot return images"
             );
-            None
+            Err(format!(
+                "image channel unavailable: {} ({error})",
+                dir.display()
+            ))
         }
     }
 }
 
 /// Take every image the process has handed over since the last snapshot.
 ///
-/// Two properties matter here and both come from the file protocol rather than
-/// from locking. A writer creates its file under a `.tmp` name and renames it
-/// into place, so a file with the final suffix is always complete and a
-/// half-written screenshot can never be read. And every file that is looked at
-/// is removed, so an image is delivered exactly once: re-reading a still-running
-/// session cannot resend — or re-bill — an image the model already saw.
+/// Publishing is a rename, so a file with a final suffix is always complete.
+/// Draining removes it, so each image is delivered once; this is delivery
+/// semantics only, since conversation replay still carries the image.
 ///
-/// Everything read here is chosen by the child process, so the read is bounded
-/// per file and in total, and only regular files are opened: a symlink dropped
-/// in the spool must never make the runtime read an unrelated file and hand it
-/// to the model. A refused image is reported rather than silently discarded —
-/// a missing screenshot the model cannot explain is worse than an error it can.
+/// The child chooses this content, so reads are bounded per file and in total,
+/// and only regular files are opened. Refusals are reported rather than
+/// dropped: a missing screenshot the model cannot explain is worse than an
+/// error it can.
 fn drain_attachment_spool(dir: &Path) -> (Vec<ModelInputAttachment>, Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return (Vec::new(), Vec::new());
     };
-    // Writers prefix a timestamp, so sorting by name replays the images in the
-    // order they were produced even across several commands in one session.
+    // Writers prefix a timestamp, so sorting by name replays images in the
+    // order produced. `.tmp` is a publish in progress; `.json` is an envelope;
+    // anything else is an image file dropped in as-is.
     let mut files: Vec<PathBuf> = entries
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|suffix| suffix == "json"))
+        .filter(|path| path.extension().is_none_or(|suffix| suffix != "tmp"))
         .collect();
     files.sort();
 
@@ -819,10 +823,15 @@ fn read_spooled_attachment(
     // itself instead of quietly measuring whatever it points at.
     let metadata = std::fs::symlink_metadata(path).context("unreadable")?;
     ensure!(metadata.is_file(), "not a regular file");
-    ensure!(
-        metadata.len() <= MAX_SPOOLED_ATTACHMENT_BYTES,
-        "image exceeds {MAX_SPOOLED_ATTACHMENT_BYTES} bytes"
-    );
+    // A `.json` file is an envelope carrying base64; anything else is the
+    // image itself, and gets the tighter raw-bytes ceiling.
+    let envelope = path.extension().is_some_and(|suffix| suffix == "json");
+    let ceiling = if envelope {
+        MAX_SPOOLED_ATTACHMENT_BYTES
+    } else {
+        MAX_SPOOLED_IMAGE_BYTES
+    };
+    ensure!(metadata.len() <= ceiling, "image exceeds {ceiling} bytes");
     let remaining = MAX_SPOOL_DRAIN_TOTAL_BYTES.saturating_sub(total);
     ensure!(
         remaining > 0,
@@ -842,17 +851,48 @@ fn read_spooled_attachment(
         bytes.len() as u64 <= limit,
         "image grew past its allowed size"
     );
-    serde_json::from_slice::<ModelInputAttachment>(&bytes).context("not a valid image attachment")
+    if envelope {
+        return serde_json::from_slice::<ModelInputAttachment>(&bytes)
+            .context("not a valid image attachment");
+    }
+    // The name is decoration. What the file actually contains decides the
+    // media type, so a `.png` that is really a JPEG is sent correctly instead
+    // of failing to decode at the provider.
+    let media_type = image_media_type(&bytes).context("not a PNG, JPEG, GIF, or WebP image")?;
+    Ok(ModelInputAttachment {
+        media_type: media_type.to_string(),
+        data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        filename: path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+    })
+}
+
+/// Identify an image by signature. Only formats a vision model can be shown
+/// are accepted; anything else is refused here rather than failing later.
+fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 fn snapshot(process_id: Uuid, entry: &ProcessEntry, max_output_tokens: usize) -> ProcessSnapshot {
     // Drained before the output lock is taken: this touches the filesystem and
     // has nothing to do with the stdout buffers.
-    let (attachments, attachment_errors) = entry
+    let (attachments, mut attachment_errors) = entry
         .attachment_spool
         .as_deref()
         .map(drain_attachment_spool)
         .unwrap_or_default();
+    attachment_errors.extend(entry.attachment_channel_error.clone());
     let output = entry
         .output
         .lock()
@@ -2304,8 +2344,8 @@ mod tests {
         .expect("write attachment");
 
         assert_eq!(drain_attachment_spool(spool.path()).0.len(), 1);
-        // A second read of a still-running session must not resend — or
-        // re-bill — an image the model has already been shown.
+        // A second read of a still-running session must not resend an image
+        // the model has already been shown.
         assert!(drain_attachment_spool(spool.path()).0.is_empty());
     }
 
@@ -2385,7 +2425,11 @@ mod tests {
     #[cfg(unix)]
     fn a_symlink_in_the_spool_is_refused_and_reported() {
         let spool = tempfile::tempdir().expect("spool");
-        let secret = spool.path().join("secret.txt");
+        // The target sits outside the spool, which is the point: a link is how
+        // a child would try to make the runtime read, and hand to the model, a
+        // file it was never given.
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let secret = elsewhere.path().join("secret.txt");
         std::fs::write(
             &secret,
             r#"{"media_type":"image/png","data_base64":"c3Vwb3Nlc2VjcmV0"}"#,
@@ -2453,6 +2497,143 @@ mod tests {
                 .as_str()
                 .is_some_and(|reason| reason.contains("not a valid image attachment")),
             "the model cannot see why the image is missing: {result}"
+        );
+    }
+
+    /// The shell-first promise for an image that already exists on disk: a
+    /// program hands the file over as-is, with no base64 and no JSON envelope,
+    /// and the model is shown pixels. This is the path `borg image` rides on,
+    /// and the one any script can use directly.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_existing_png_file_is_delivered_by_copying_it_into_the_spool() {
+        let root = tempfile::tempdir().expect("workspace");
+        let png = test_png(64, 64);
+        let source = root.path().join("existing.png");
+        std::fs::write(&source, &png).expect("write fixture");
+
+        let manager = ProcessManager::default();
+        let snapshot = manager
+            .exec(
+                Uuid::new_v4(),
+                root.path(),
+                format!(
+                    // Land on `.tmp`, then rename inside the spool. The spool
+                    // is usually on a different filesystem from the source, so
+                    // a direct move would be copy-then-unlink and the runtime
+                    // could read a half-copied image.
+                    "cp {source} \"$BORG_ATTACHMENT_SPOOL/shot.tmp\" \
+                     && mv \"$BORG_ATTACHMENT_SPOOL/shot.tmp\" \"$BORG_ATTACHMENT_SPOOL/shot.png\"",
+                    source = source.display()
+                ),
+                None,
+                Some(20_000),
+                Some(1_000),
+                30_000,
+                None,
+            )
+            .await
+            .expect("spawn");
+
+        assert_eq!(snapshot.exit_code, Some(0), "command failed: {snapshot:?}");
+        assert!(snapshot.attachment_errors.is_empty(), "{snapshot:?}");
+        assert_eq!(snapshot.attachments.len(), 1);
+        assert_eq!(snapshot.attachments[0].media_type, "image/png");
+        assert_eq!(
+            snapshot.attachments[0].filename.as_deref(),
+            Some("shot.png")
+        );
+        let delivered = base64::engine::general_purpose::STANDARD
+            .decode(&snapshot.attachments[0].data_base64)
+            .expect("base64");
+        assert_eq!(delivered, png, "the delivered file is not the source file");
+    }
+
+    /// The file name is decoration; the bytes decide. A misnamed image that
+    /// was forwarded on its extension would fail to decode at the provider,
+    /// far from the cause.
+    #[test]
+    fn the_media_type_comes_from_content_not_from_the_file_name() {
+        let spool = tempfile::tempdir().expect("spool");
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE0];
+        jpeg.extend_from_slice(b"pretend this is a photograph");
+        std::fs::write(spool.path().join("0001.png"), &jpeg).expect("write");
+
+        let (attachments, errors) = drain_attachment_spool(spool.path());
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].media_type, "image/jpeg");
+    }
+
+    #[test]
+    fn a_file_that_is_not_an_image_is_refused_with_a_visible_reason() {
+        let spool = tempfile::tempdir().expect("spool");
+        // The realistic accident: something drops a log or a text file into
+        // the channel. It must not reach the model as a broken image.
+        std::fs::write(
+            spool.path().join("0001.png"),
+            b"#!/bin/sh\necho not an image\n",
+        )
+        .expect("write");
+
+        let (attachments, errors) = drain_attachment_spool(spool.path());
+
+        assert!(attachments.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0].contains("not a PNG, JPEG, GIF, or WebP"),
+            "{errors:?}"
+        );
+    }
+
+    /// Raw files get the tighter ceiling, because base64 inflates by a third
+    /// and the harness refuses anything over 6 MiB encoded. Catching it here
+    /// gives one clear reason instead of a silent drop further along.
+    #[test]
+    fn an_oversized_image_file_is_refused_before_it_is_encoded() {
+        let spool = tempfile::tempdir().expect("spool");
+        let mut oversized = b"\x89PNG\r\n\x1a\n".to_vec();
+        oversized.resize((MAX_SPOOLED_IMAGE_BYTES + 1) as usize, 0);
+        std::fs::write(spool.path().join("0001.png"), &oversized).expect("write");
+
+        let (attachments, errors) = drain_attachment_spool(spool.path());
+
+        assert!(attachments.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("exceeds"), "{errors:?}");
+        assert!(
+            MAX_SPOOLED_IMAGE_BYTES.div_ceil(3) * 4 <= 6 * 1024 * 1024,
+            "the raw ceiling must keep base64 within the harness limit"
+        );
+    }
+
+    /// Envelopes and raw files share one spool, and a publish in progress is
+    /// invisible whichever form it takes.
+    #[test]
+    fn envelopes_and_raw_files_coexist_and_in_flight_writes_are_ignored() {
+        let spool = tempfile::tempdir().expect("spool");
+        std::fs::write(
+            spool.path().join("0001.json"),
+            br#"{"media_type":"image/png","data_base64":"AAAA"}"#,
+        )
+        .expect("envelope");
+        std::fs::write(spool.path().join("0002.gif"), b"GIF89a and some pixels").expect("raw");
+        std::fs::write(
+            spool.path().join("0003.tmp"),
+            b"\x89PNG\r\n\x1a\nhalf written",
+        )
+        .expect("in flight");
+
+        let (attachments, errors) = drain_attachment_spool(spool.path());
+
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].data_base64, "AAAA");
+        assert_eq!(attachments[1].media_type, "image/gif");
+        assert!(
+            spool.path().join("0003.tmp").exists(),
+            "an in-flight write was consumed"
         );
     }
 }
