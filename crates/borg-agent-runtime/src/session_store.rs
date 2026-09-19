@@ -728,6 +728,37 @@ impl SessionEventKind {
         matches!(self, Self::SubagentActivity { .. })
     }
 
+    /// Whether this event should advance the session's user-visible activity
+    /// clock -- the "last activity" a resume list sorts and displays.
+    ///
+    /// The journal appends bookkeeping that belongs to the host rather than to
+    /// the conversation: a periodic provider-admission probe writes
+    /// `ProviderCapabilitiesUpdated` into every live session, and a shutdown or
+    /// crash sweep stamps `StatusChanged { stopped }` across every session it
+    /// reaps at once. Treating those as activity made a dozen untouched
+    /// sessions all claim the same recent timestamp and outrank the one the
+    /// user was actually working in, which is exactly the session they came
+    /// back to find. Durability is unaffected: every event is still journaled,
+    /// and only this display/ordering clock is held back.
+    pub fn advances_activity_clock(&self) -> bool {
+        match self {
+            Self::ProviderCapabilitiesUpdated { .. }
+            | Self::EffectiveCapabilitiesUpdated { .. }
+            | Self::ContextWindowUpdated { .. }
+            | Self::UsageUpdated { .. } => false,
+            // Entering an active state is the user starting work; a terminal
+            // mark is the host tidying up, and any real work that preceded it
+            // already moved the clock moments earlier.
+            Self::StatusChanged { status, .. } => matches!(
+                status,
+                SessionStatus::Starting
+                    | SessionStatus::Running
+                    | SessionStatus::WaitingForApproval
+            ),
+            _ => true,
+        }
+    }
+
     fn is_recovery_relevant(&self) -> bool {
         self.is_context_relevant() || self.is_queue_relevant() || self.is_subagent_relevant()
     }
@@ -1006,7 +1037,9 @@ impl SessionState {
             event.sequence
         );
         self.latest_sequence = event.sequence;
-        self.activity_at = Some(event.created_at);
+        if event.kind.advances_activity_clock() {
+            self.activity_at = Some(event.created_at);
+        }
         match &event.kind {
             SessionEventKind::SessionStarted => self.started_at = Some(event.created_at),
             SessionEventKind::ProviderEvent { kind, payload, .. }

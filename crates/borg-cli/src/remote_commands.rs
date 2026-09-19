@@ -31,7 +31,7 @@ use borg_remote::{
     run_agent_session_with_store_writer_and_peers, run_attached_session,
     run_host_with_executor_factory, send_local_session_command, session_control_socket_path,
 };
-use chrono::{Local, TimeZone, Utc};
+use chrono::{DateTime, Local, TimeZone, Utc};
 use futures_util::{FutureExt, StreamExt};
 use pulldown_cmark::{Event as MarkdownEvent, Parser as MarkdownParser};
 use serde::Deserialize;
@@ -2141,17 +2141,10 @@ async fn run_local_agent_session(
     } else {
         args.provider().into()
     };
-    let requested_model = args.model.clone().or_else(|| match requested_provider {
-        CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
-        CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
-        CodingProvider::Glm => Some(borg_provider::glm_product_model().to_string()),
-        CodingProvider::OpenCode => None,
-        CodingProvider::OpenRouter => Some(borg_provider::openrouter_product_model().to_string()),
-        CodingProvider::OpenAiCompatible => std::env::var("BORG_OPENAI_COMPATIBLE_MODEL")
-            .ok()
-            .filter(|model| !model.trim().is_empty()),
-        CodingProvider::Claude => None,
-    });
+    let requested_model = args
+        .model
+        .clone()
+        .or_else(|| default_model_for_provider(requested_provider));
     let requested_effort = args.effort.clone().or_else(|| match requested_provider {
         CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
         // OpenRouter spans reasoning and non-reasoning models. Only send its
@@ -7852,9 +7845,9 @@ async fn latest_session_id_excluding(
 
 async fn recent_session_ids(sessions_dir: &Path, store: &dyn SessionStore) -> Result<Vec<Uuid>> {
     fs::create_dir_all(sessions_dir)?;
-    Ok(store
-        .list_sessions(10_000)
-        .await?
+    let mut summaries = store.list_sessions(10_000).await?;
+    sort_sessions_by_activity(&mut summaries);
+    Ok(summaries
         .into_iter()
         .filter(|session| session_has_resumable_activity(&session.state))
         .map(|session| session.session_id)
@@ -7865,15 +7858,57 @@ fn session_has_resumable_activity(state: &borg_remote::SessionState) -> bool {
     state.has_resumable_activity()
 }
 
+/// The model a fresh session pins when the user did not pass `--model`.
+///
+/// Every provider that can be chosen by default must answer with something, or
+/// the session records an empty model: the status bar then shows no model at
+/// all and the user cannot tell what they are talking to. Only OpenCode is
+/// allowed to defer, because it resolves its model from the running OpenCode
+/// server rather than from a static catalog.
+fn default_model_for_provider(provider: CodingProvider) -> Option<String> {
+    match provider {
+        CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
+        CodingProvider::Claude => Some(borg_provider::claude_product_model().to_string()),
+        CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
+        CodingProvider::Glm => Some(borg_provider::glm_product_model().to_string()),
+        CodingProvider::OpenRouter => Some(borg_provider::openrouter_product_model().to_string()),
+        CodingProvider::OpenAiCompatible => std::env::var("BORG_OPENAI_COMPATIBLE_MODEL")
+            .ok()
+            .filter(|model| !model.trim().is_empty()),
+        CodingProvider::OpenCode => None,
+    }
+}
+
+/// When this session was last actually worked in.
+///
+/// `sessions.updated_at` orders the SQL listing, but it tracks every durable
+/// write, including the host bookkeeping that never touches the conversation.
+/// Cold storage and archival still want that physical clock, so the resume
+/// paths re-order on the projection's activity clock instead of changing what
+/// `updated_at` means.
+fn session_activity_order(state: &borg_remote::SessionState) -> Option<DateTime<Utc>> {
+    state.activity_at.or(state.started_at)
+}
+
+/// Most recently worked-in first, so "the session I had open last night" is the
+/// one at the top rather than whichever session a shutdown sweep stamped last.
+fn sort_sessions_by_activity(summaries: &mut [borg_remote::SessionSummary]) {
+    summaries.sort_by(|left, right| {
+        session_activity_order(&right.state)
+            .cmp(&session_activity_order(&left.state))
+            .then_with(|| right.session_id.cmp(&left.session_id))
+    });
+}
+
 async fn latest_session_id_in_directory(
     sessions_dir: &Path,
     store: &dyn SessionStore,
     current_dir: &Path,
 ) -> Result<Option<Uuid>> {
     fs::create_dir_all(sessions_dir)?;
-    Ok(store
-        .list_sessions(10_000)
-        .await?
+    let mut summaries = store.list_sessions(10_000).await?;
+    sort_sessions_by_activity(&mut summaries);
+    Ok(summaries
         .into_iter()
         .find(|session| {
             session_has_resumable_activity(&session.state)
@@ -7894,7 +7929,8 @@ async fn recent_session_options(
     limit: usize,
 ) -> Result<Vec<ResumeSessionOption>> {
     fs::create_dir_all(sessions_dir)?;
-    let summaries = store.list_sessions(10_000).await?;
+    let mut summaries = store.list_sessions(10_000).await?;
+    sort_sessions_by_activity(&mut summaries);
     let session_ids = summaries
         .iter()
         .filter(|summary| session_has_resumable_activity(&summary.state))

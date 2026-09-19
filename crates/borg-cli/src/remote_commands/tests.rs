@@ -2571,8 +2571,43 @@ async fn resume_switch_rejects_remote_owned_session_before_stopping_current() {
     assert!(error.to_string().contains("background Borg remote host"));
 }
 
+/// A session must always know which model it is talking to. Leaving the model
+/// unset let the provider CLI pick one silently, and the status bar then had
+/// nothing to show -- the user sent a message without knowing what answered it.
+#[test]
+fn every_defaultable_provider_pins_a_model_for_a_fresh_session() {
+    assert_eq!(
+        default_model_for_provider(CodingProvider::Claude).as_deref(),
+        Some("claude-opus-5"),
+        "a Claude session must pin Opus 5 rather than record an empty model"
+    );
+    assert_eq!(
+        borg_provider::claude_default_effort(),
+        "medium",
+        "and pair it with the medium reasoning default"
+    );
+    for provider in [
+        CodingProvider::Codex,
+        CodingProvider::Claude,
+        CodingProvider::Kimi,
+        CodingProvider::Glm,
+        CodingProvider::OpenRouter,
+    ] {
+        assert!(
+            default_model_for_provider(provider).is_some_and(|model| !model.trim().is_empty()),
+            "{provider:?} must default to a concrete model"
+        );
+    }
+    // OpenCode is the one deferral: it resolves its model from the running
+    // OpenCode server, so a static catalog guess here would be wrong.
+    assert_eq!(default_model_for_provider(CodingProvider::OpenCode), None);
+}
+
+/// Ordering follows the latest *conversation* activity, not the latest durable
+/// write. The trailing `StatusChanged { Ready }` below is host bookkeeping with
+/// no user work behind it, so the session holding a newer real message wins.
 #[tokio::test]
-async fn recent_sessions_are_ordered_by_latest_persisted_activity() {
+async fn recent_sessions_are_ordered_by_latest_conversation_activity() {
     let dir = tempdir().expect("session directory");
     let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
         .await
@@ -2667,7 +2702,130 @@ async fn recent_sessions_are_ordered_by_latest_persisted_activity() {
 
     assert_eq!(
         recent_session_ids(dir.path(), &store).await.unwrap(),
-        vec![recently_active, recent_message]
+        vec![recent_message, recently_active]
+    );
+}
+
+/// A crash or shutdown sweep stamps `StatusChanged { Stopped }` across every
+/// session it reaps in one pass, and the provider-admission probe writes
+/// `ProviderCapabilitiesUpdated` into every session it can see. Both are host
+/// bookkeeping. Counting them as activity buried the session the user was
+/// actually working in under a wall of untouched sessions that all claimed the
+/// same recent timestamp -- which is exactly the session they reopen Borg to
+/// find.
+#[tokio::test]
+async fn host_bookkeeping_does_not_outrank_the_session_the_user_worked_in() {
+    let dir = tempdir().expect("session directory");
+    let store = SqliteSessionStore::open(dir.path().join("sessions.sqlite3"))
+        .await
+        .unwrap();
+    let worked_in = Uuid::new_v4();
+    let idle_one = Uuid::new_v4();
+    let idle_two = Uuid::new_v4();
+    let now = Utc::now();
+
+    async fn write(
+        store: &SqliteSessionStore,
+        cwd: &Path,
+        session_id: Uuid,
+        events: Vec<(chrono::DateTime<Utc>, SessionEventKind)>,
+    ) {
+        let first = events.first().map_or_else(Utc::now, |(at, _)| *at);
+        let records = [
+            (
+                first - chrono::TimeDelta::seconds(2),
+                SessionEventKind::SessionStarted,
+            ),
+            (
+                first - chrono::TimeDelta::seconds(1),
+                SessionEventKind::SessionConfigured {
+                    cwd: cwd.to_path_buf(),
+                    provider: CodingProvider::Claude,
+                    model: Some("claude-opus-5".to_string()),
+                    effort: Some("medium".to_string()),
+                    fast: false,
+                    response_language: ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                },
+            ),
+        ]
+        .into_iter()
+        .chain(events)
+        .enumerate()
+        .map(|(index, (created_at, kind))| SessionEvent {
+            id: Uuid::new_v4(),
+            session_id,
+            sequence: index as u64 + 1,
+            created_at,
+            kind,
+        })
+        .collect::<Vec<_>>();
+        store.create_session(session_id).await.unwrap();
+        for event in records {
+            store.append(event).await.unwrap();
+        }
+    }
+
+    // The session the user actually worked in, an hour ago.
+    write(
+        &store,
+        dir.path(),
+        worked_in,
+        vec![(
+            now - chrono::TimeDelta::hours(1),
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "the work I came back for".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        )],
+    )
+    .await;
+
+    // Two sessions untouched for days, then swept and probed seconds ago.
+    for idle in [idle_one, idle_two] {
+        write(
+            &store,
+            dir.path(),
+            idle,
+            vec![
+                (
+                    now - chrono::TimeDelta::days(3),
+                    SessionEventKind::Message {
+                        message_id: Uuid::new_v4(),
+                        actor: EventActor::User,
+                        text: "stale work".to_string(),
+                        attachments: Vec::new(),
+                        status: MessageStatus::Complete,
+                        delivery: None,
+                    },
+                ),
+                (
+                    now - chrono::TimeDelta::seconds(20),
+                    SessionEventKind::ProviderCapabilitiesUpdated {
+                        providers: Vec::new(),
+                    },
+                ),
+                (
+                    now - chrono::TimeDelta::seconds(10),
+                    SessionEventKind::StatusChanged {
+                        status: SessionStatus::Stopped,
+                        detail: None,
+                    },
+                ),
+            ],
+        )
+        .await;
+    }
+
+    let ordered = recent_session_ids(dir.path(), &store).await.unwrap();
+    assert_eq!(
+        ordered.first(),
+        Some(&worked_in),
+        "a shutdown sweep and a capability probe must not outrank real work"
     );
 }
 

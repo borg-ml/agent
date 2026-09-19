@@ -69,6 +69,13 @@ pub fn codex_product_model() -> &'static str {
     CODEX_MODEL_CATALOG.default_model
 }
 
+/// The model a Claude session runs on when the user did not name one. Borg
+/// pins it explicitly rather than leaving the field empty, so the session
+/// records and displays the model it is actually talking to.
+pub fn claude_product_model() -> &'static str {
+    CLAUDE_MODEL_CATALOG.default_model
+}
+
 pub fn claude_default_effort() -> &'static str {
     "medium"
 }

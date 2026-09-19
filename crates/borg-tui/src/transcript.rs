@@ -1952,7 +1952,9 @@ impl Transcript {
                     });
                 }
             }
-            SessionEventKind::ProviderEvent { kind, .. } if kind == "context_compaction_failed" => {
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction_failed" =>
+            {
                 self.finish_reasoning(event.created_at);
                 self.cache_diagnostics.reset();
                 if matches!(
@@ -1965,6 +1967,31 @@ impl Transcript {
                     removed_entry = self.order.len().checked_sub(1);
                     self.order.pop();
                 }
+                // Compaction failing used to leave nothing on screen, so the
+                // history it was protecting could be dropped by the backstop
+                // with no visible cause. Say what happened and what it cost.
+                let detail = payload
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("the provider did not return a summary");
+                let text = if payload
+                    .get("history_preserved")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    format!(
+                        "Context compaction could not run, so this turn kept its full \
+                         history and failed on the underlying cause instead of \
+                         discarding messages: {detail}"
+                    )
+                } else {
+                    format!("Context compaction could not run: {detail}")
+                };
+                self.order.push(TranscriptEntry::Info {
+                    title: "Compaction failed".to_string(),
+                    text,
+                    time: local_event_time(event),
+                });
             }
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if is_context_compaction(kind) =>

@@ -3337,6 +3337,12 @@ async fn run_agent_session_store_kernel_inner(
         // replay — the same shape Pi and the native auto-compaction path use.
         // The deterministic projection that drops whole messages is only a
         // defensive backstop when compaction itself cannot run.
+        //
+        // Every provider Borg turns around gets this, not a named pair. A
+        // provider left out of compaction silently fell through to the
+        // message-dropping backstop on its very first oversized replay, which
+        // is the one outcome this path exists to prevent.
+        let mut compaction_unavailable = false;
         if !native_provider
             && retained_context.as_deref().is_some_and(|context| {
                 subscription_context_needs_projection(
@@ -3346,10 +3352,6 @@ async fn run_agent_session_store_kernel_inner(
                     reuse_subscription_context,
                 )
             })
-            && matches!(
-                launch.provider,
-                CodingProvider::Codex | CodingProvider::Claude
-            )
         {
             let full_context = retained_context
                 .take()
@@ -3410,13 +3412,24 @@ async fn run_agent_session_store_kernel_inner(
                     retained_context = retained_conversation_context(journal.context_events());
                 }
                 Err(error) => {
-                    // Compaction could not run; restore the oversized context so
-                    // the announced projection below still bounds the request.
+                    // Compaction could not run; restore the oversized context.
                     retained_context = Some(full_context);
+                    // Why it failed decides what may happen next. A provider
+                    // failure -- revoked OAuth, an expired session, a dropped
+                    // connection -- says nothing about the size of the history,
+                    // and the turn that follows will fail on the same cause. So
+                    // discarding thousands of durable messages to "fit" buys
+                    // nothing and destroys the context the user gets back after
+                    // re-authenticating. Only a structural failure, where
+                    // compaction genuinely cannot reduce this transcript, still
+                    // licenses the deterministic backstop.
+                    let provider_failure = compaction_failure_is_provider_side(&error);
+                    compaction_unavailable = provider_failure;
                     tracing::warn!(
                         session_id = %session_id,
                         %error,
-                        "automatic subscription replay compaction failed; using the projection backstop"
+                        provider_failure,
+                        "automatic subscription replay compaction failed"
                     );
                     record(
                         &mut journal,
@@ -3429,6 +3442,10 @@ async fn run_agent_session_store_kernel_inner(
                                 "automatic": true,
                                 "trigger": "provider_input_size",
                                 "error": format!("{error:#}"),
+                                // The client renders these: history was kept
+                                // whole, and the turn fails on the real cause.
+                                "history_preserved": provider_failure,
+                                "provider_failure": provider_failure,
                             }),
                         },
                     )
@@ -3437,7 +3454,12 @@ async fn run_agent_session_store_kernel_inner(
             }
         }
 
+        // `compaction_unavailable` means the summary failed for a provider
+        // reason, not a size one. Keep the durable replay intact and let the
+        // turn surface that cause; dropping history here would be silent damage
+        // in exchange for a request that fails identically either way.
         if !native_provider
+            && !compaction_unavailable
             && retained_context.as_deref().is_some_and(|context| {
                 subscription_context_needs_projection(
                     context,
@@ -6779,6 +6801,23 @@ fn compaction_tool_is_high_value(tool_name: Option<&str>, content: &str) -> bool
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+}
+
+/// Whether a failed compaction failed for a provider-side reason rather than a
+/// structural one.
+///
+/// This decides whether the deterministic message-dropping backstop is allowed
+/// to run. A revoked token, an expired session or a dropped connection says
+/// nothing about how large the history is, and the turn that follows fails on
+/// the identical cause -- so discarding thousands of durable messages to "fit"
+/// destroys context and buys the user nothing. Only a structural failure, where
+/// compaction genuinely cannot reduce this transcript, still justifies the
+/// backstop.
+fn compaction_failure_is_provider_side(error: &anyhow::Error) -> bool {
+    !matches!(
+        borg_provider::provider::classify_provider_error(error),
+        borg_provider::provider::ProviderErrorKind::Unknown
+    )
 }
 
 /// A provider-replay projection plus what it had to drop to fit the budget.

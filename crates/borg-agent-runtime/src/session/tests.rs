@@ -9953,6 +9953,40 @@ fn deterministic_recovery_projection_fits_the_complete_provider_request() {
     );
 }
 
+/// Compaction failing because the provider refused -- a revoked token, an
+/// expired OAuth session, a dropped connection -- must never license dropping
+/// durable history. The turn that follows fails on that same cause whatever the
+/// context looks like, so truncating it destroys the user's conversation and
+/// buys nothing. Only a structural failure keeps the backstop.
+#[test]
+fn a_provider_side_compaction_failure_does_not_license_dropping_history() {
+    use borg_provider::provider::{ProviderErrorKind, ProviderStreamError};
+
+    let revoked = anyhow::Error::new(ProviderStreamError {
+        kind: ProviderErrorKind::Fatal,
+        message: "claude SDK API error: 401 OAuth access token has been revoked".to_string(),
+    });
+    assert!(
+        compaction_failure_is_provider_side(&revoked),
+        "a revoked token must keep the durable history intact"
+    );
+
+    let dropped = anyhow::Error::new(ProviderStreamError {
+        kind: ProviderErrorKind::ConnectionLost,
+        message: "stream ended before the summary".to_string(),
+    });
+    assert!(
+        compaction_failure_is_provider_side(&dropped),
+        "a lost connection says nothing about how large the history is"
+    );
+
+    let structural = anyhow::anyhow!("retained context is empty");
+    assert!(
+        !compaction_failure_is_provider_side(&structural),
+        "a structural failure still permits the bounded backstop"
+    );
+}
+
 /// A pathological replay drops whole messages. The projection must report how
 /// many, so the durable `context_replay_projected` event explains the omission
 /// marker instead of leaving a reader to re-derive the projection in code.
