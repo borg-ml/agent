@@ -2729,14 +2729,6 @@ async fn run_local_agent_session(
         eprintln!("\n  {notice}\n");
     }
     let mut displayed_update_notice = startup_update_notice;
-    if interactive_store_open || args.session_host.is_some() {
-        let maintenance_store = Arc::clone(&durable_store);
-        tokio::spawn(async move {
-            if let Err(error) = maintenance_store.finish_interactive_open(session_id).await {
-                tracing::warn!(%session_id, %error, "deferred local store maintenance failed");
-            }
-        });
-    }
     // Pending prompts are durable queue state, not part of the bounded
     // transcript bootstrap. Hydrate them after first paint so a long queue
     // cannot make resume wait on the full recovery projection, and ask the

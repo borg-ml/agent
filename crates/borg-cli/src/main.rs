@@ -171,6 +171,20 @@ async fn doctor(json: bool, deep: bool) -> Result<()> {
                 "not checked (run `borg doctor --deep`)"
             }
         );
+        // The one readiness property whose absence loses acknowledged work.
+        // Report the server setting it was derived from, not just the verdict:
+        // an operator told the store is degraded has to know what to change.
+        println!(
+            "  durable commits: {}",
+            if health.durable_commits {
+                format!("yes ({})", health.commit_durability)
+            } else {
+                format!(
+                    "NO ({}) · an acknowledged write can be lost on restart",
+                    health.commit_durability
+                )
+            }
+        );
         println!(
             "  durable rows: {} sessions · {} events · {} payloads",
             health.sessions, health.events, health.payloads
