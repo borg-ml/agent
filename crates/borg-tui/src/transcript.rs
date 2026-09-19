@@ -149,6 +149,7 @@ struct Transcript {
     auto_expand_tools: bool,
     action_descriptors: bool,
     show_subagent_messages: bool,
+    tool_click_behavior: ToolClickBehavior,
     user_label: String,
     assistant_label: String,
     user_label_color: Color,
@@ -258,6 +259,7 @@ impl Default for Transcript {
             auto_expand_tools: false,
             action_descriptors: true,
             show_subagent_messages: false,
+            tool_click_behavior: ToolClickBehavior::Fullscreen,
             user_label: "user".to_string(),
             assistant_label: "borg".to_string(),
             user_label_color: USER_LABEL_BLUE,
@@ -2174,7 +2176,7 @@ impl Transcript {
                             body: Some(text.clone()),
                             time: local_event_time(event),
                             state: TranscriptActionState::Complete,
-                            expanded: true,
+                            expanded: !from_peer,
                         });
                     }
                 }
@@ -3814,6 +3816,7 @@ impl Transcript {
                 lines.len()
             } else {
                 if starts_labeled_group
+                    && tool_window.is_none()
                     && lines
                         .last()
                         .is_none_or(|line| !line_is_unstyled_blank(line))
@@ -4109,23 +4112,40 @@ impl Transcript {
                     if focused_tool.is_none()
                         && body.as_deref().is_some_and(|body| !body.trim().is_empty())
                     {
-                        summary.push_str(if *expanded {
-                            " · click to collapse"
-                        } else {
-                            " · click to expand"
-                        });
+                        summary.push_str(
+                            if self.tool_click_behavior == ToolClickBehavior::Fullscreen {
+                                " · click to open full screen"
+                            } else if *expanded {
+                                " · click to collapse"
+                            } else {
+                                " · click to expand"
+                            },
+                        );
                     }
                     let action_start = lines.len();
-                    for line in wrap_display(&summary, width.saturating_sub(prefix.len() + 2)) {
+                    for line in wrap_display(
+                        &summary,
+                        width.saturating_sub(UnicodeWidthStr::width(prefix) + 2),
+                    ) {
                         lines.push(Line::from(vec![
                             Span::styled(prefix, Style::default().fg(Color::DarkGray)),
                             Span::styled(line, Style::default().fg(color)),
                         ]));
                     }
-                    if (*expanded || focused_tool == Some(index))
+                    if (*expanded
+                        || focused_tool == Some(index)
+                        || (*kind == TranscriptActionKind::Agent && label == "Peer"))
                         && let Some(body) = body.as_deref().filter(|body| !body.trim().is_empty())
                     {
-                        for line in wrap_display(body, width.saturating_sub(prefix.len() + 6)) {
+                        let mut body_lines = wrap_display(
+                            body,
+                            width.saturating_sub(UnicodeWidthStr::width(prefix) + 6),
+                        );
+                        if !expanded && focused_tool.is_none() && body_lines.len() > 3 {
+                            body_lines.truncate(3);
+                            body_lines[2] = "…".into();
+                        }
+                        for line in body_lines {
                             lines.push(Line::from(vec![
                                 Span::styled(
                                     if tool_window.is_some() {
@@ -4975,10 +4995,10 @@ impl Transcript {
                     continue;
                 }
                 if action_run_bridge(&self.order[index])
-                    && matches!(
-                        self.order.get(index + 1),
-                        Some(TranscriptEntry::Tool { .. })
-                    )
+                    && self.order[index + 1..]
+                        .iter()
+                        .find(|entry| !action_run_bridge(entry))
+                        .is_some_and(|entry| matches!(entry, TranscriptEntry::Tool { .. }))
                 {
                     index += 1;
                     continue;

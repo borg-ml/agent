@@ -10489,7 +10489,7 @@ fn boxed_thinking_rows_keep_one_edge_separator_without_duplicates() {
 }
 
 #[test]
-fn action_errors_leave_the_scrollbox_gutter_neutral() {
+fn peer_reports_and_errors_keep_one_continuous_neutral_actions_gutter() {
     let mut transcript = Transcript::default();
     transcript
         .order
@@ -10514,9 +10514,45 @@ fn action_errors_leave_the_scrollbox_gutter_neutral() {
             expanded: false,
         }));
 
+    for label in ["Peer one", "Peer two"] {
+        transcript.order.insert(
+            4,
+            TranscriptEntry::Action {
+                kind: TranscriptActionKind::Agent,
+                label: label.into(),
+                detail: "abundance".into(),
+                body: Some(
+                    "A report with enough text to wrap over multiple lines in the actions group."
+                        .into(),
+                ),
+                time: "12:00".into(),
+                state: TranscriptActionState::Complete,
+                expanded: true,
+            },
+        );
+    }
     let lines = transcript
         .render_with_tool_run_viewport(80, 40, None, None, None)
         .0;
+    let start = lines
+        .iter()
+        .position(|line| line.to_string().starts_with("┌─"))
+        .unwrap();
+    let end = lines
+        .iter()
+        .rposition(|line| line.to_string().starts_with("└─"))
+        .unwrap();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|line| line.to_string().starts_with("┌─"))
+            .count(),
+        1
+    );
+    for line in &lines[start + 1..end] {
+        assert!(line.to_string().starts_with("│ "), "{line:?}");
+        assert_eq!(line.spans[0].style.fg, Some(Color::DarkGray));
+    }
     let line = lines
         .iter()
         .find(|line| line.to_string().contains("Ran failed"))
@@ -13791,7 +13827,7 @@ fn peer_agent_message_is_visible_without_subagent_opt_in() {
             message_id: Uuid::new_v4(),
             sender_id: Uuid::new_v4(),
             sender_name: "agent".to_string(),
-            text: "From session 94a66b94: steer orphaning confirmed.".to_string(),
+            text: "From session 94a66b94: steer orphaning confirmed.\nSecond line\nThird line\nREPORT_END".to_string(),
         },
     );
     // Default transcript: child subagent reports are hidden ...
@@ -13808,6 +13844,41 @@ fn peer_agent_message_is_visible_without_subagent_opt_in() {
     // peer Borg instance and always renders.
     assert!(rendered.contains("Peer"), "{rendered}");
     assert!(rendered.contains("steer orphaning confirmed"), "{rendered}");
+    assert!(!rendered.contains("REPORT_END"), "{rendered}");
+    assert!(rendered.contains("click to open full screen"), "{rendered}");
+    assert!(
+        transcript.order[0]
+            .copy_text_owned()
+            .unwrap()
+            .contains("REPORT_END")
+    );
+    transcript.tool_click_behavior = ToolClickBehavior::Inline;
+    let render = |transcript: &Transcript| {
+        transcript
+            .lines(100)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    assert!(render(&transcript).contains("click to expand"));
+    transcript.toggle_action_expansion(0);
+    let expanded = render(&transcript);
+    assert!(expanded.contains("REPORT_END"));
+    assert!(expanded.contains("click to collapse"));
+    transcript.tool_click_behavior = ToolClickBehavior::Fullscreen;
+    assert!(render(&transcript).contains("click to open full screen"));
+    assert!(!render(&transcript).contains("click to collapse"));
+    transcript.toggle_action_expansion(0);
+    let focused = transcript
+        .render_tool_for_cache(0, 100, 40)
+        .0
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(focused.contains("REPORT_END"));
+    assert!(!focused.contains("click to"));
 }
 
 #[test]

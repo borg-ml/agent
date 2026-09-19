@@ -5075,6 +5075,8 @@ impl BorgTerminal {
 
     pub fn set_tool_click_behavior(&mut self, behavior: ToolClickBehavior) {
         self.tool_click_behavior = behavior;
+        self.transcript.tool_click_behavior = behavior;
+        self.invalidate_transcript_render_cache();
     }
 
     pub fn set_dictation_icon(&mut self, style: DictationIconStyle) {
@@ -6798,6 +6800,10 @@ impl BorgTerminal {
     }
 
     fn draw_internal(&mut self, input_fast_path: bool) -> Result<()> {
+        if self.transcript.tool_click_behavior != self.tool_click_behavior {
+            self.transcript.tool_click_behavior = self.tool_click_behavior;
+            self.invalidate_transcript_render_cache();
+        }
         self.drain_git_push_results();
         if self
             .copy_notice_expires_at
@@ -9944,6 +9950,7 @@ fn fresh_transcript_like(previous: &Transcript) -> Transcript {
     Transcript {
         diff_expansion: previous.diff_expansion,
         auto_expand_tools: previous.auto_expand_tools,
+        tool_click_behavior: previous.tool_click_behavior,
         show_subagent_messages: previous.show_subagent_messages,
         follow_tail: previous.follow_tail,
         user_label: previous.user_label.clone(),
