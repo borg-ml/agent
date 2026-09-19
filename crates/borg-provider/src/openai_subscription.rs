@@ -63,6 +63,12 @@ pub fn select_auth_file(path: &Path) -> Result<()> {
     let path = path
         .canonicalize()
         .context("cannot locate saved ChatGPT login")?;
+    if let Some(overridden) = crate::env::nonempty_var("BORG_OPENAI_AUTH_FILE") {
+        ensure!(
+            PathBuf::from(overridden).canonicalize()? == path,
+            "BORG_OPENAI_AUTH_FILE overrides the requested authority; unset it before selecting another file"
+        );
+    }
     account_from_document(&load(&path)?)?;
     crate::credentials::set_openai_subscription_auth_file(&path)?;
     Ok(())

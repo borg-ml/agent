@@ -102,6 +102,9 @@ pub(crate) enum Command {
         /// Store an API key instead of signing in to a subscription.
         #[arg(long)]
         api_key: bool,
+        /// Use an existing ChatGPT auth file in place, without copying rotating tokens.
+        #[arg(long, conflicts_with = "api_key", requires = "provider")]
+        auth_file: Option<PathBuf>,
     },
     /// Locate, create, open, or validate the agent configuration file.
     Config {

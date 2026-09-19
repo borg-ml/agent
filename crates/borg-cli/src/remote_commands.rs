@@ -582,7 +582,7 @@ pub(crate) async fn run_remote_command(command: RemoteCommand) -> Result<()> {
             );
         }
         RemoteCommand::Login { provider } => {
-            login_command(Some(provider), false).await?;
+            login_command(Some(provider), false, None).await?;
         }
         RemoteCommand::Status { roots } => {
             let roots = roots
@@ -7438,7 +7438,20 @@ fn model_selection_command(
 pub(crate) async fn login_command(
     provider: Option<crate::cli::RemoteProviderArg>,
     api_key: bool,
+    auth_file: Option<PathBuf>,
 ) -> Result<()> {
+    if let Some(path) = auth_file {
+        anyhow::ensure!(
+            provider.map(CodingProvider::from) == Some(CodingProvider::Codex) && !api_key,
+            "--auth-file selects an existing ChatGPT subscription only"
+        );
+        borg_provider::openai_subscription::select_auth_file(&path)?;
+        borg_provider::credentials::set_openai_auth_mode(
+            borg_provider::credentials::OpenAiAuthMode::Subscription,
+        )?;
+        println!("ChatGPT subscription authority selected in place. No tokens were copied.");
+        return Ok(());
+    }
     let Some(provider) = provider else {
         println!("Providers on this machine:\n");
         for provider in [

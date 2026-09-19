@@ -237,12 +237,19 @@ pub fn opencode_go_api_key() -> Option<String> {
     })
 }
 
-/// File-backed status for admission and the footer. The request adapter also
-/// asks Codex's auth manager, which covers operating-system credential stores.
+/// Billing selection for admission and requests. A selected subscription authority
+/// never silently falls through to an unrelated legacy API key.
 pub fn openai_uses_api_key() -> bool {
     match openai_auth_mode() {
         Ok(Some(OpenAiAuthMode::ApiKey)) => true,
         Ok(Some(OpenAiAuthMode::Subscription)) | Err(_) => false,
+        Ok(None)
+            if crate::openai_subscription::auth_path()
+                .map(|path| path.exists())
+                .unwrap_or(true) =>
+        {
+            false
+        }
         Ok(None) => match codex_auth_json() {
             Some(auth) => match auth["auth_mode"].as_str() {
                 Some("apikey") => true,

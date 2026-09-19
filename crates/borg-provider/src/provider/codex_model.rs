@@ -6,7 +6,6 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
-use base64::Engine;
 use borg_core::{CostBasis, ModelProviderState, ProviderCallUsage};
 use futures::StreamExt;
 use serde::Deserialize;
@@ -94,8 +93,7 @@ struct CachedModels {
     models: Vec<ModelCapabilities>,
 }
 
-// Never serialize or debug credentials. Refresh tokens remain in the original
-// persistent Codex credential store, owned by Codex's authentication manager.
+// Never serialize or debug credentials. Native auth owns refresh-token persistence.
 struct SubscriptionAccess {
     token: String,
     account_id: String,
@@ -188,25 +186,10 @@ impl SubscriptionAccess {
         if !cache.as_ref().is_some_and(|entry| {
             entry.account == account && entry.fetched.elapsed() < Duration::from_secs(300)
         }) {
-            let mut command = crate::provider_bin::codex_command().await?;
-            let version = tokio::time::timeout(
-                Duration::from_secs(10),
-                command.arg("--version").kill_on_drop(true).output(),
-            )
-            .await
-            .context("Codex version query timed out")?
-            .context("Codex version query failed")?;
-            ensure!(version.status.success(), "Codex version query failed");
-            let version = String::from_utf8(version.stdout).context("invalid Codex version")?;
-            let version = version
-                .trim()
-                .strip_prefix("codex-cli ")
-                .and_then(|version| version.split('-').next())
-                .filter(|version| {
-                    version.split('.').count() == 3
-                        && version.split('.').all(|part| part.parse::<u64>().is_ok())
-                })
-                .context("unrecognized Codex version for model catalog")?;
+            // The catalog gates model visibility on its client protocol version, not Borg releases.
+            // Keep Borg identified by originator; no installed executable is needed.
+            let version = "0.154.0";
+            let rejected_token = self.token.clone();
             let response = self
                 .send_with_recovery(
                     client
@@ -215,7 +198,7 @@ impl SubscriptionAccess {
                         .header("originator", "borg")
                         .timeout(Duration::from_secs(30)),
                     &account,
-                    Self::read(true),
+                    Self::read(Some(rejected_token)),
                 )
                 .await?;
             let response = check_subscription_response(response).await?;
@@ -248,98 +231,28 @@ impl SubscriptionAccess {
             .context("selected model is not available in this Codex account's catalog")
     }
 
-    async fn read(refresh: bool) -> Result<Self> {
-        use crate::credentials::{
-            OpenAiAuthMode, openai_api_key, openai_auth_mode, openai_uses_api_key,
-        };
-        let mode = openai_auth_mode()?;
-        if (mode == Some(OpenAiAuthMode::ApiKey) || (mode.is_none() && openai_uses_api_key()))
-            && let Some(token) = openai_api_key()
-        {
+    async fn read(rejected_token: Option<String>) -> Result<Self> {
+        use crate::credentials::{openai_api_key, openai_auth_mode, openai_uses_api_key};
+        openai_auth_mode()?;
+        if openai_uses_api_key() {
             return Ok(Self {
-                token,
+                token: openai_api_key()
+                    .context("OpenAI API key missing; add one with borg login codex --api-key")?,
                 account_id: String::new(),
             });
         }
-        let response = tokio::time::timeout(
-            Duration::from_secs(60),
-            super::chat_stream::codex_account_request(
-                "getAuthStatus",
-                json!({
-                    "includeToken": true, "refreshToken": refresh
-                }),
-            ),
-        )
-        .await
-        .context("Codex subscription authentication lookup unavailable: timed out")?
-        .map_err(|error| {
-            let error = error.to_string().to_ascii_lowercase();
-            if [
-                "refresh_token_expired",
-                "refresh_token_reused",
-                "refresh_token_invalidated",
-                "invalid_grant",
-                "refresh token has expired",
-                "refresh token has already been used",
-                "refresh token has been revoked",
-            ]
-            .iter()
-            .any(|reason| error.contains(reason))
-            {
-                anyhow::anyhow!("Codex subscription credentials rejected; reconnect Codex")
-            } else {
-                anyhow::anyhow!("Codex subscription authentication lookup unavailable")
-            }
-        })?;
-        let auth = &response["result"];
-        if mode != Some(OpenAiAuthMode::Subscription) && auth["authMethod"] == "apikey" {
-            return Ok(Self {
-                token: auth["authToken"].as_str().filter(|token| !token.is_empty()).map(str::to_string)
-                    .or_else(openai_api_key)
-                    .context("Codex is signed in with an API key but did not provide it; add the key with /login")?,
-                account_id: String::new(),
-            });
-        }
-        ensure!(
-            mode != Some(OpenAiAuthMode::ApiKey),
-            "OpenAI API key missing; add one with /login or borg login codex --api-key"
-        );
-        ensure!(
-            matches!(
-                auth["authMethod"].as_str(),
-                Some("chatgpt" | "chatgptAuthTokens")
-            ),
-            "ChatGPT subscription is selected, but Codex is not signed in to ChatGPT; use /login to connect it or select OpenAI API billing"
-        );
-        let token = auth["authToken"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .context("Codex did not provide subscription access; reconnect Codex")?
-            .to_owned();
-        let payload = token
-            .split('.')
-            .nth(1)
-            .context("invalid Codex subscription token format")?;
-        let claims: Value = serde_json::from_slice(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(payload)
-                .map_err(|_| anyhow::anyhow!("invalid Codex subscription token encoding"))?,
-        )
-        .map_err(|_| anyhow::anyhow!("invalid Codex subscription token claims"))?;
-        let account_id = claims
-            .pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .context("Codex subscription token has no account identity")?
-            .to_owned();
-        Ok(Self { token, account_id })
+        let access = crate::openai_subscription::access(rejected_token).await?;
+        Ok(Self {
+            token: access.token,
+            account_id: access.account_id,
+        })
     }
 }
 
 impl CodexModelProvider {
     /// Non-secret access identity, captured by Borg for this turn only.
     pub async fn account_identity() -> Result<String> {
-        Ok(SubscriptionAccess::read(false).await?.identity())
+        Ok(SubscriptionAccess::read(None).await?.identity())
     }
 
     /// Keep the credentials selected at turn admission stable while this turn runs.
@@ -368,7 +281,7 @@ impl CodexModelProvider {
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(30))
                 .build()?;
-            let mut access = SubscriptionAccess::read(false).await?;
+            let mut access = SubscriptionAccess::read(None).await?;
             trace.invocation.executable = access.endpoint().into();
             ensure!(access.identity() == expected_account,
                 "OpenAI credentials changed during this turn; retry to use the currently selected account");
@@ -592,11 +505,12 @@ impl CodexModelProvider {
         if let Some(id) = &request.request_id {
             http = http.header("X-Client-Request-Id", id);
         }
+        let rejected_token = access.token.clone();
         access
             .send_with_recovery(
                 apply_provider_request_timeout(http),
                 expected_account,
-                SubscriptionAccess::read(true),
+                SubscriptionAccess::read(Some(rejected_token)),
             )
             .await
     }

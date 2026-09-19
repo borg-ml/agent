@@ -46,7 +46,13 @@ borg extensions list
 
 Use `/login` (or `/connect`) to choose ChatGPT subscription access or OpenAI
 API billing on this machine. Borg keeps the saved API key when you switch back
-to ChatGPT. Without a selection in Borg, it follows your Codex login. You can
+to ChatGPT. ChatGPT login and token recovery are handled natively by Borg.
+To keep an existing file-backed subscription, select its authority in place:
+`borg login codex --auth-file /path/to/auth.json`. Borg stores the path, not a
+second copy of its rotating tokens. `BORG_OPENAI_AUTH_FILE` overrides that path.
+Fresh device logins use `~/.borg/openai-subscription.json` unless an existing
+authority was selected or discovered through `CODEX_HOME` or `~/.codex/auth.json`.
+Keychain-only logins need a fresh `borg login codex` device approval. You can
 also add a key directly with `borg login codex --api-key`; input is hidden,
 or you can pipe it through stdin.
 

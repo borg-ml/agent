@@ -1464,17 +1464,10 @@ async fn probe_provider(
 
 fn provider_subscription_credentials_present(provider: CodingProvider) -> bool {
     match provider {
-        CodingProvider::Codex => codex_auth_path()
-            .and_then(|path| read_bounded_auth_json(&path))
-            .as_ref()
-            .is_some_and(|auth| {
-                auth["auth_mode"] != "apikey"
-                    && auth["tokens"].as_object().is_some_and(|tokens| {
-                        tokens
-                            .values()
-                            .any(|value| nonempty_json_string(Some(value)))
-                    })
-            }),
+        CodingProvider::Codex => borg_provider::openai_subscription::account()
+            .ok()
+            .flatten()
+            .is_some(),
         CodingProvider::Claude => {
             nonempty_env("CLAUDE_CODE_OAUTH_TOKEN").is_some()
                 || claude_credentials_path()
@@ -1510,12 +1503,6 @@ fn claude_keychain_credentials_present() -> bool {
 #[cfg(not(target_os = "macos"))]
 fn claude_keychain_credentials_present() -> bool {
     false
-}
-
-fn codex_auth_path() -> Option<PathBuf> {
-    nonempty_path_env("CODEX_HOME")
-        .map(|directory| directory.join("auth.json"))
-        .or_else(|| nonempty_path_env("HOME").map(|home| home.join(".codex").join("auth.json")))
 }
 
 fn claude_credentials_path() -> Option<PathBuf> {
@@ -1631,11 +1618,15 @@ fn nonempty_env(name: &str) -> Option<String> {
 
 async fn provider_auth_status(provider: CodingProvider) -> Result<String> {
     match provider {
-        // Each of these resolves its executable by probing candidates rather
-        // than trusting the first entry on PATH, which may be a broken launcher.
-        CodingProvider::Codex => {
-            runtime_output(borg_provider::Runtime::Codex, &["login", "status"]).await
-        }
+        // CLI-backed providers probe executable candidates rather than trusting a broken launcher on PATH.
+        CodingProvider::Codex => Ok(
+            if borg_provider::openai_subscription::account()?.is_some() {
+                "Logged in using ChatGPT"
+            } else {
+                "Not logged in"
+            }
+            .to_string(),
+        ),
         CodingProvider::Claude => {
             runtime_output(
                 borg_provider::Runtime::Claude,
@@ -1782,9 +1773,7 @@ fn provider_login_command(provider: CodingProvider, mut command: Command) -> Res
         );
     }
     match provider {
-        CodingProvider::Codex => {
-            command.args(["login", "--device-auth"]);
-        }
+        CodingProvider::Codex => bail!("ChatGPT subscription login is handled natively"),
         CodingProvider::Claude => {
             command.args(["auth", "login"]);
         }
@@ -1802,10 +1791,10 @@ fn provider_login_command(provider: CodingProvider, mut command: Command) -> Res
 }
 
 pub async fn login_provider(provider: CodingProvider) -> Result<()> {
-    let command = match provider {
-        CodingProvider::Codex => borg_provider::provider_bin::codex_command().await?,
-        _ => Command::new(provider.executable()),
-    };
+    if provider == CodingProvider::Codex {
+        return login_provider_with_output(provider, |line| println!("{line}")).await;
+    }
+    let command = Command::new(provider.executable());
     let status = provider_login_command(provider, command)?
         .status()
         .await
@@ -1853,10 +1842,26 @@ pub async fn login_provider_with_output(
     provider: CodingProvider,
     mut on_output: impl FnMut(&str) + Send,
 ) -> Result<()> {
-    let command = match provider {
-        CodingProvider::Codex => borg_provider::provider_bin::codex_command().await?,
-        _ => Command::new(provider.executable()),
-    };
+    if provider == CodingProvider::Codex {
+        let login = borg_provider::openai_subscription::begin_device_login().await?;
+        on_output(&format!(
+            "Open {} and enter code {} (expires in 15 minutes).",
+            login.verification_url, login.user_code
+        ));
+        borg_provider::openai_subscription::complete_device_login(login).await?;
+        borg_provider::credentials::set_openai_auth_mode(
+            borg_provider::credentials::OpenAiAuthMode::Subscription,
+        )?;
+        if let Some(cache) = PROVIDER_CAPABILITIES_CACHE.get() {
+            cache.lock().await.clear();
+        }
+        if let Some(cache) = crate::provider_usage::PROVIDER_USAGE_CACHE.get() {
+            cache.lock().await.clear();
+        }
+        on_output("Connected ChatGPT subscription. Saved API credentials were kept.");
+        return Ok(());
+    }
+    let command = Command::new(provider.executable());
     let mut command = provider_login_command(provider, command)?;
     command
         .stdin(Stdio::null())
@@ -6203,15 +6208,7 @@ mod tests {
 
     #[test]
     fn native_provider_login_commands_use_non_terminal_flows() {
-        let codex = provider_login_command(CodingProvider::Codex, Command::new("codex")).unwrap();
-        assert_eq!(
-            codex
-                .as_std()
-                .get_args()
-                .map(|argument| argument.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-            ["login", "--device-auth"]
-        );
+        assert!(provider_login_command(CodingProvider::Codex, Command::new("codex")).is_err());
         let claude =
             provider_login_command(CodingProvider::Claude, Command::new("claude")).unwrap();
         assert_eq!(
