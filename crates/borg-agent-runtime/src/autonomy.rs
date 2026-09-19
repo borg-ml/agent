@@ -1492,6 +1492,95 @@ pub(crate) fn to_u64(value: i64, field: &str) -> Result<u64> {
     u64::try_from(value).with_context(|| format!("invalid {field} value {value}"))
 }
 
+#[async_trait]
+impl AutonomyStore for SqliteAutonomyStore {
+    async fn enqueue(&self, input: EnqueueAutonomyJob) -> Result<AutonomyJob> {
+        Self::enqueue(self, input).await
+    }
+
+    async fn get(&self, job_id: Uuid) -> Result<Option<AutonomyJob>> {
+        Self::get(self, job_id).await
+    }
+
+    async fn claim_due(
+        &self,
+        now: DateTime<Utc>,
+        lease_owner: &str,
+        lease_duration: Duration,
+        limit: u32,
+    ) -> Result<Vec<AutonomyJob>> {
+        Self::claim_due(self, now, lease_owner, lease_duration, limit).await
+    }
+
+    async fn claim_due_for_session(
+        &self,
+        now: DateTime<Utc>,
+        lease_owner: &str,
+        lease_duration: Duration,
+        limit: u32,
+        session_id: Uuid,
+    ) -> Result<Vec<AutonomyJob>> {
+        Self::claim_due_for_session(self, now, lease_owner, lease_duration, limit, session_id).await
+    }
+
+    async fn heartbeat(
+        &self,
+        job_id: Uuid,
+        lease: &AutonomyLease,
+        now: DateTime<Utc>,
+        lease_duration: Duration,
+    ) -> Result<AutonomyJob> {
+        Self::heartbeat(self, job_id, lease, now, lease_duration).await
+    }
+
+    async fn transition(
+        &self,
+        job_id: Uuid,
+        expected: AutonomyJobState,
+        next: AutonomyJobState,
+        lease: Option<&AutonomyLease>,
+        reason: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<AutonomyJob> {
+        Self::transition(self, job_id, expected, next, lease, reason, now).await
+    }
+
+    async fn complete(
+        &self,
+        job_id: Uuid,
+        lease: &AutonomyLease,
+        result: Value,
+        now: DateTime<Utc>,
+    ) -> Result<AutonomyJob> {
+        Self::complete(self, job_id, lease, result, now).await
+    }
+
+    async fn recover_expired(&self, now: DateTime<Utc>, limit: u32) -> Result<Vec<AutonomyJob>> {
+        Self::recover_expired(self, now, limit).await
+    }
+
+    async fn recover_expired_for_session(
+        &self,
+        now: DateTime<Utc>,
+        limit: u32,
+        session_id: Uuid,
+    ) -> Result<Vec<AutonomyJob>> {
+        Self::recover_expired_for_session(self, now, limit, session_id).await
+    }
+
+    async fn save_checkpoint(&self, input: SaveAutonomyCheckpoint) -> Result<AutonomyCheckpoint> {
+        Self::save_checkpoint(self, input).await
+    }
+
+    async fn list_checkpoints(&self, job_id: Uuid) -> Result<Vec<AutonomyCheckpoint>> {
+        Self::list_checkpoints(self, job_id).await
+    }
+
+    async fn list_transitions(&self, job_id: Uuid) -> Result<Vec<AutonomyJobTransition>> {
+        Self::list_transitions(self, job_id).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1983,94 +2072,5 @@ mod tests {
             Some(serde_json::json!({"job_id": job.job_id, "kind": "test.runtime"}))
         );
         assert_eq!(store.list_transitions(job.job_id).await.unwrap().len(), 4);
-    }
-}
-
-#[async_trait]
-impl AutonomyStore for SqliteAutonomyStore {
-    async fn enqueue(&self, input: EnqueueAutonomyJob) -> Result<AutonomyJob> {
-        Self::enqueue(self, input).await
-    }
-
-    async fn get(&self, job_id: Uuid) -> Result<Option<AutonomyJob>> {
-        Self::get(self, job_id).await
-    }
-
-    async fn claim_due(
-        &self,
-        now: DateTime<Utc>,
-        lease_owner: &str,
-        lease_duration: Duration,
-        limit: u32,
-    ) -> Result<Vec<AutonomyJob>> {
-        Self::claim_due(self, now, lease_owner, lease_duration, limit).await
-    }
-
-    async fn claim_due_for_session(
-        &self,
-        now: DateTime<Utc>,
-        lease_owner: &str,
-        lease_duration: Duration,
-        limit: u32,
-        session_id: Uuid,
-    ) -> Result<Vec<AutonomyJob>> {
-        Self::claim_due_for_session(self, now, lease_owner, lease_duration, limit, session_id).await
-    }
-
-    async fn heartbeat(
-        &self,
-        job_id: Uuid,
-        lease: &AutonomyLease,
-        now: DateTime<Utc>,
-        lease_duration: Duration,
-    ) -> Result<AutonomyJob> {
-        Self::heartbeat(self, job_id, lease, now, lease_duration).await
-    }
-
-    async fn transition(
-        &self,
-        job_id: Uuid,
-        expected: AutonomyJobState,
-        next: AutonomyJobState,
-        lease: Option<&AutonomyLease>,
-        reason: Option<String>,
-        now: DateTime<Utc>,
-    ) -> Result<AutonomyJob> {
-        Self::transition(self, job_id, expected, next, lease, reason, now).await
-    }
-
-    async fn complete(
-        &self,
-        job_id: Uuid,
-        lease: &AutonomyLease,
-        result: Value,
-        now: DateTime<Utc>,
-    ) -> Result<AutonomyJob> {
-        Self::complete(self, job_id, lease, result, now).await
-    }
-
-    async fn recover_expired(&self, now: DateTime<Utc>, limit: u32) -> Result<Vec<AutonomyJob>> {
-        Self::recover_expired(self, now, limit).await
-    }
-
-    async fn recover_expired_for_session(
-        &self,
-        now: DateTime<Utc>,
-        limit: u32,
-        session_id: Uuid,
-    ) -> Result<Vec<AutonomyJob>> {
-        Self::recover_expired_for_session(self, now, limit, session_id).await
-    }
-
-    async fn save_checkpoint(&self, input: SaveAutonomyCheckpoint) -> Result<AutonomyCheckpoint> {
-        Self::save_checkpoint(self, input).await
-    }
-
-    async fn list_checkpoints(&self, job_id: Uuid) -> Result<Vec<AutonomyCheckpoint>> {
-        Self::list_checkpoints(self, job_id).await
-    }
-
-    async fn list_transitions(&self, job_id: Uuid) -> Result<Vec<AutonomyJobTransition>> {
-        Self::list_transitions(self, job_id).await
     }
 }

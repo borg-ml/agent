@@ -477,15 +477,15 @@ mod tests {
 
         // Compression is only acceptable if it is lossless; a cold body that
         // decodes to anything else is silent history corruption.
-        let after: Vec<(i64, Option<serde_json::Value>, Option<Vec<u8>>, Option<i32>)> =
-            sqlx::query_as(
-                "select sequence, event_json, event_body, dict_id from session_events \
+        type ColdRow = (i64, Option<serde_json::Value>, Option<Vec<u8>>, Option<i32>);
+        let after: Vec<ColdRow> = sqlx::query_as(
+            "select sequence, event_json, event_body, dict_id from session_events \
                  where session_id = $1 order by sequence",
-            )
-            .bind(session_id)
-            .fetch_all(store.pool())
-            .await
-            .expect("read cold bodies");
+        )
+        .bind(session_id)
+        .fetch_all(store.pool())
+        .await
+        .expect("read cold bodies");
         for ((sequence, original), (cold_sequence, json, bytes, dict_id)) in
             before.into_iter().zip(after)
         {

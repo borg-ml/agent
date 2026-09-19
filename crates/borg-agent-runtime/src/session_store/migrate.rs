@@ -58,7 +58,7 @@ pub struct MigrationOutcome {
 }
 
 /// How to run a migration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MigrationOptions {
     /// Report what would be copied without writing anything.
     pub dry_run: bool,
@@ -69,16 +69,6 @@ pub struct MigrationOptions {
     /// Defaults to false: one unreadable session in a journal of a thousand
     /// should not cost the other nine hundred and ninety-nine.
     pub fail_fast: bool,
-}
-
-impl Default for MigrationOptions {
-    fn default() -> Self {
-        Self {
-            dry_run: false,
-            max_sessions: None,
-            fail_fast: false,
-        }
-    }
 }
 
 /// Copy every session from `source` into `destination`.

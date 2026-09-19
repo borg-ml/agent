@@ -61,7 +61,7 @@ const POSTGRES_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Advisory lock key guarding schema bootstrap. Arbitrary but fixed: every
 /// process must choose the same number for the lock to mean anything.
-const SCHEMA_BOOTSTRAP_LOCK: i64 = 0x0B01_6_5E55_101;
+const SCHEMA_BOOTSTRAP_LOCK: i64 = 0x0B01_65E5_5101;
 
 /// The durable session journal, backed by PostgreSQL.
 #[derive(Debug, Clone)]

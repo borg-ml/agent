@@ -777,6 +777,62 @@ async fn append_receipt_transition(
     Ok(())
 }
 
+#[async_trait]
+impl ReceiptBackend for SqliteReceiptStore {
+    async fn load_value(
+        &self,
+        request_id: Uuid,
+        request: &serde_json::Value,
+    ) -> Result<ReceiptState<serde_json::Value>> {
+        Self::load_value(self, request_id, request).await
+    }
+
+    async fn begin_value(&self, request_id: Uuid, request: &serde_json::Value) -> Result<()> {
+        Self::begin_value(self, request_id, request).await
+    }
+
+    async fn finish_value(
+        &self,
+        request_id: Uuid,
+        request: &serde_json::Value,
+        response: &serde_json::Value,
+    ) -> Result<()> {
+        Self::finish_value(self, request_id, request, response).await
+    }
+
+    async fn enqueue_host_operation(
+        &self,
+        host_id: Uuid,
+        request_id: Uuid,
+        command: &serde_json::Value,
+    ) -> Result<()> {
+        Self::enqueue_host_operation(self, host_id, request_id, command).await
+    }
+
+    async fn next_host_operation(
+        &self,
+        host_id: Uuid,
+    ) -> Result<Option<(Uuid, serde_json::Value)>> {
+        Self::next_host_operation(self, host_id).await
+    }
+
+    async fn quarantine_host_operation(&self, host_id: Uuid, request_id: Uuid) -> Result<()> {
+        Self::quarantine_host_operation(self, host_id, request_id).await
+    }
+
+    async fn queued_host_operation(
+        &self,
+        host_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<Option<serde_json::Value>> {
+        Self::queued_host_operation(self, host_id, request_id).await
+    }
+
+    async fn finish_host_operation(&self, host_id: Uuid, request_id: Uuid) -> Result<()> {
+        Self::finish_host_operation(self, host_id, request_id).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,61 +1140,5 @@ mod tests {
                 .await
                 .is_err()
         );
-    }
-}
-
-#[async_trait]
-impl ReceiptBackend for SqliteReceiptStore {
-    async fn load_value(
-        &self,
-        request_id: Uuid,
-        request: &serde_json::Value,
-    ) -> Result<ReceiptState<serde_json::Value>> {
-        Self::load_value(self, request_id, request).await
-    }
-
-    async fn begin_value(&self, request_id: Uuid, request: &serde_json::Value) -> Result<()> {
-        Self::begin_value(self, request_id, request).await
-    }
-
-    async fn finish_value(
-        &self,
-        request_id: Uuid,
-        request: &serde_json::Value,
-        response: &serde_json::Value,
-    ) -> Result<()> {
-        Self::finish_value(self, request_id, request, response).await
-    }
-
-    async fn enqueue_host_operation(
-        &self,
-        host_id: Uuid,
-        request_id: Uuid,
-        command: &serde_json::Value,
-    ) -> Result<()> {
-        Self::enqueue_host_operation(self, host_id, request_id, command).await
-    }
-
-    async fn next_host_operation(
-        &self,
-        host_id: Uuid,
-    ) -> Result<Option<(Uuid, serde_json::Value)>> {
-        Self::next_host_operation(self, host_id).await
-    }
-
-    async fn quarantine_host_operation(&self, host_id: Uuid, request_id: Uuid) -> Result<()> {
-        Self::quarantine_host_operation(self, host_id, request_id).await
-    }
-
-    async fn queued_host_operation(
-        &self,
-        host_id: Uuid,
-        request_id: Uuid,
-    ) -> Result<Option<serde_json::Value>> {
-        Self::queued_host_operation(self, host_id, request_id).await
-    }
-
-    async fn finish_host_operation(&self, host_id: Uuid, request_id: Uuid) -> Result<()> {
-        Self::finish_host_operation(self, host_id, request_id).await
     }
 }

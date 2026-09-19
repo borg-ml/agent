@@ -1173,10 +1173,7 @@ impl SessionStore for PostgresSessionStore {
                         Some(dict_id) => Some(self.dictionary(dict_id).await?),
                         None => None,
                     };
-                    let dictionary = match dictionary {
-                        Some(dictionary) => Some((*dictionary).clone()),
-                        None => None,
-                    };
+                    let dictionary = dictionary.map(|dictionary| (*dictionary).clone());
                     serde_json::from_slice(&super::body::decompress(
                         &bytes.unwrap_or_default(),
                         dictionary.as_ref(),
