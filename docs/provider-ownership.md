@@ -514,3 +514,40 @@ unverified. No authentication token contents are included in these receipts.
 The retained baseline script also passed a second live run: first-round input
 17,415 (0 cached), second-round input 17,476 (17,280 cached, 196 uncached;
 98.88% cached). This reproduces the baseline workflow, not a second native sample.
+
+### Full application process restart and recovery UI
+
+The rebuilt `borg` CLI passed a two-process Pro smoke run using an isolated
+`BORG_HOME`, explicit SQLite storage, and the existing subscription authority
+selected in place with `BORG_OPENAI_AUTH_FILE`. Both processes ran with an empty
+PATH, `BORG_CODEX_BIN=/nonexistent/codex`, automatic installation disabled, and
+the seccomp guard denying `execve` and `execveat`. Process one recorded a random
+marker and exited. Process two resumed the same durable session and returned
+the exact marker in a **new** assistant event (sequences 17–29), not merely
+replayed history. Both exited successfully without tool calls. Resumed usage
+was 248 uncached input + 1,792 cached input + 24 output tokens, with cost basis
+`subscription_equivalent`. This verifies the rebuilt application across an
+OS-process boundary; it does not upgrade the already running installed client.
+The initial long scratch path exceeded the Unix socket path limit before model
+access; the successful run used a shorter isolated path.
+
+The TUI now clears stale reconnecting state on actual assistant/reasoning/tool
+progress even without a `network_recovered` marker. A real-PTY regression
+passed for all three progress types and verifies that a Running transition or
+heartbeat alone does not prematurely clear the retry. The ordinary TUI suite
+passed 397 tests (10 PTY tests ignored in that run). Native reasoning summary
+part/item separators already exist; their targeted Codex-enabled regression
+passed, so no duplicate separator implementation was added.
+
+For any later Claude migration, preserve selected-account identity and billing,
+opaque continuation state, stable cache prefixes, and usage semantics as
+separate contracts. Test the rebuilt client across process boundaries and
+measure against an explicit external baseline; a provider-level cache hit alone
+is not parity evidence. Claude remains on its existing implementation.
+
+Final runtime verification: `cargo test -p borg-agent-runtime --lib` passed
+812 tests, with 16 ignored and no failures, including the interrupt regression
+that exceeded its timing threshold in the earlier run. The edited TUI source
+and tests have clean targeted LSP diagnostics. Fresh device approval is still
+unverified and requires human confirmation before replacing the selected Pro
+authority through a new sign-in.
