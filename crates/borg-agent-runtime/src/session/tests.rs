@@ -9641,6 +9641,10 @@ fn provider_neutral_replay_carries_subscription_tools_across_provider_switches()
     ];
 
     let replay = native_conversation(&events, CodingProvider::OpenRouter).unwrap();
+    assert_eq!(
+        native_conversation(&events, CodingProvider::Codex).unwrap(),
+        replay
+    );
     assert_eq!(replay.len(), 5);
     assert_eq!(replay[0], ModelMessage::user("inspect the repository"));
     assert_eq!(

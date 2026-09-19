@@ -377,8 +377,6 @@ pub trait AgentTurnExecutor: Send + Sync {
 #[derive(Clone)]
 pub struct LocalAgentTurnExecutor {
     native_harness: NativeHarness,
-    codex_model_only: bool,
-    codex_session_native: bool,
     /// The durable OpenCode route pinned for this session. Only the
     /// `opencode-go` aliases have an API Borg calls directly; a legacy CLI
     /// history stays on the OpenCode compatibility route.
@@ -404,8 +402,6 @@ impl Default for LocalAgentTurnExecutor {
         };
         Self {
             native_harness: NativeHarness::default(),
-            codex_model_only: false,
-            codex_session_native: false,
             opencode_session_native: false,
             runtime_extensions: Arc::new(RwLock::new(RuntimeExtensions::default())),
             runtime_extension_loader: None,
@@ -696,11 +692,9 @@ pub struct LocalAgentSettings {
 }
 
 impl LocalAgentTurnExecutor {
-    /// Require model-only execution, including isolated admission probes.
-    /// This does not override an existing session's compatibility route.
+    /// Compatibility builder: Codex execution is now always model-only.
     #[cfg(feature = "subscription-adapters")]
-    pub fn with_codex_model_only(mut self) -> Self {
-        self.codex_model_only = true;
+    pub fn with_codex_model_only(self) -> Self {
         self
     }
 
@@ -957,14 +951,6 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         store: &dyn crate::SessionStore,
         model: Option<&str>,
     ) -> Result<Option<Arc<dyn AgentTurnExecutor>>> {
-        // Harness routing lives on the journal itself; this used to detour
-        // through the autonomy tier to recover a concrete handle, which is no
-        // longer necessary now that the routes are on the store trait.
-        let native = store.uses_native_codex_harness(session_id).await?;
-        anyhow::ensure!(
-            !self.codex_model_only || native,
-            "this session retains its Codex compatibility route; start a new session for Borg-owned execution"
-        );
         // Resolve the pinned OpenCode route too. A `opencode-go` session must
         // run Borg's native harness (gateway, steering, structured context);
         // a legacy CLI history must keep the compatibility route. The model
@@ -974,15 +960,13 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             .uses_native_opencode_harness(session_id, model)
             .await?;
         let mut executor = self.clone();
-        executor.codex_session_native = native;
         executor.opencode_session_native = opencode_native;
         Ok(Some(Arc::new(executor)))
     }
 
     fn uses_native_harness(&self, provider: CodingProvider) -> bool {
         provider.uses_native_harness()
-            || ((self.codex_model_only || self.codex_session_native)
-                && provider == CodingProvider::Codex)
+            || provider == CodingProvider::Codex
             || (self.opencode_session_native && provider == CodingProvider::OpenCode)
     }
 
@@ -1137,65 +1121,6 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         )
     }
 
-    async fn compact(&self, mut turn: AgentTurn) -> Result<Option<ProviderCallUsage>> {
-        anyhow::ensure!(
-            turn.provider == CodingProvider::Codex,
-            "provider-session compaction is unavailable for {:?}",
-            turn.provider
-        );
-        let provider_session_id = turn
-            .provider_session_id
-            .clone()
-            .context("Codex native compaction requires a provider thread")?;
-        self.prepare_local_turn(&mut turn).await?;
-        let permission = local_permission(turn.permission_mode);
-        let mut request = direct_chat_stream_request(&turn, true, "");
-        let lifecycle_key = subscription_lifecycle_key(&turn, &request, turn.permission_mode);
-        let prepared = self
-            .subscription_pools
-            .prepare(
-                turn.session_id,
-                SubscriptionTurnInput {
-                    context_generation: turn.context_generation,
-                    provider: turn.provider,
-                    provider_session_id: Some(provider_session_id.clone()),
-                    provider_fork_turn_id: None,
-                    prompt: String::new(),
-                    prompt_delta: String::new(),
-                    lifecycle_key,
-                },
-            )
-            .await;
-        request.prompt = prepared.prompt.clone();
-        request.lifecycle_key = Some(prepared.lifecycle_key.clone());
-        request.session_id = prepared.resume_session_id.clone();
-        request.fork_turn_id = None;
-        request.resume_unavailable_prompt = prepared.resume_unavailable_prompt.clone();
-        request.persist_session = Some(true);
-        append_volatile_system_prompt(&mut request, &turn);
-        let pool = match prepared.pool {
-            SubscriptionPool::Codex(pool) => pool,
-            SubscriptionPool::Claude(_) => unreachable!("Codex slot contained Claude pool"),
-        };
-        match pool
-            .compact(request, permission, &provider_session_id)
-            .await
-        {
-            Ok(usage) => {
-                self.subscription_pools
-                    .mark(turn.session_id, CodingProvider::Codex, true)
-                    .await;
-                Ok(Some(usage))
-            }
-            Err(error) => {
-                self.subscription_pools
-                    .mark(turn.session_id, CodingProvider::Codex, false)
-                    .await;
-                Err(error)
-            }
-        }
-    }
-
     async fn compact_native(
         &self,
         access: ModelAccessContext,
@@ -1342,16 +1267,6 @@ pub async fn run_agent_turn_controlled(
         None
     };
     let executor: &dyn AgentTurnExecutor = bound.as_deref().unwrap_or(&executor);
-    #[cfg(feature = "subscription-adapters")]
-    if turn.provider == CodingProvider::Codex
-        && !executor.uses_native_harness(CodingProvider::Codex)
-    {
-        // Fail closed: without durable routing this turn would silently run
-        // the provider-owned compatibility loop at the public entry point.
-        anyhow::bail!(
-            "Codex execution requires durable harness routing; start a new session for Borg-owned execution"
-        );
-    }
     executor.execute(turn, events, controls).await
 }
 
@@ -2739,7 +2654,7 @@ mod tests {
 
     #[cfg(feature = "subscription-adapters")]
     #[tokio::test]
-    async fn session_executor_resolves_each_durable_route_without_inheriting_a_previous_choice() {
+    async fn codex_executor_migrates_legacy_routes_without_provider_thread_reuse() {
         use crate::SessionStore;
         let directory = tempfile::tempdir().unwrap();
         let store = crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
@@ -2764,19 +2679,22 @@ mod tests {
             .unwrap();
         assert!(native.uses_native_harness(CodingProvider::Codex));
         assert!(!native.supports_subscription_context_reuse(CodingProvider::Codex));
-        let compatibility = native
+        assert!(!store.uses_native_codex_harness(legacy).await.unwrap());
+        let migrated = native
             .for_session(legacy, &store, None)
             .await
             .unwrap()
             .unwrap();
-        assert!(!compatibility.uses_native_harness(CodingProvider::Codex));
-        assert!(compatibility.supports_subscription_context_reuse(CodingProvider::Codex));
+        assert!(migrated.uses_native_harness(CodingProvider::Codex));
+        assert!(!migrated.supports_subscription_context_reuse(CodingProvider::Codex));
+        assert!(!migrated.uses_native_harness(CodingProvider::Claude));
+        assert!(migrated.supports_subscription_context_reuse(CodingProvider::Claude));
         assert!(
             LocalAgentTurnExecutor::default()
                 .with_codex_model_only()
                 .for_session(legacy, &store, None)
                 .await
-                .is_err()
+                .is_ok()
         );
     }
 
@@ -2815,7 +2733,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn controlled_codex_entry_requires_durable_routing_before_provider_launch() {
+    async fn controlled_codex_entry_requires_durable_access_before_provider_launch() {
         let directory = tempfile::tempdir().unwrap();
         // A nonexistent cwd prevents a provider process even on the broken route.
         let mut turn = lifecycle_test_turn(&directory.path().join("missing"));
@@ -2832,7 +2750,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("Codex execution requires durable harness routing"),
+                .contains("requires durable Borg session storage"),
             "{error:#}"
         );
         assert!(matches!(
