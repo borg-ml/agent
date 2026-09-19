@@ -4058,7 +4058,8 @@ async fn run_agent_session_store_kernel_inner(
         watchdog_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = generation.wait(), if !interrupted => {
+                biased;
+                _ = generation.wait(), if !interrupted && provider_events.is_empty() => {
                     if !provider_events.is_empty() { continue; }
                     for kind in generation.expire(tokio::time::Instant::now()) {
                         complete_consumed_steers(
@@ -4521,149 +4522,6 @@ async fn run_agent_session_store_kernel_inner(
                             .get_or_insert_with(|| "Interrupted".to_string());
                     }
                     break;
-                }
-                kind = provider_events.recv(), if provider_events_open => {
-                    let Some(first_kind) = kind else {
-                        provider_events_open = false;
-                        continue;
-                    };
-                    // Each batch gets a fresh window: an observer that recovers
-                    // must not stay penalised, and one that has not must not be
-                    // waited on again inside this batch.
-                    begin_live_delivery_burst();
-                    let mut provider_batch = Vec::with_capacity(8);
-                    push_coalesced_provider_event(&mut provider_batch, first_kind);
-                    let mut consumed = 1;
-                    while consumed < 64 {
-                        let Ok(kind) = provider_events.try_recv() else {
-                            break;
-                        };
-                        consumed += 1;
-                        push_coalesced_provider_event(&mut provider_batch, kind);
-                    }
-                    for kind in provider_batch {
-                    // Classify liveness on the raw event: coalescing drops
-                    // streaming fragments, which are still real progress.
-                    let progress = provider_event_is_progress(&kind);
-                    if network_recovery_pending && provider_event_is_progress(&kind) {
-                        network_recovery_pending = false;
-                        record(&mut journal, &events, session_id, SessionEventKind::ProviderEvent {
-                            provider: launch.provider,
-                            kind: "network_recovered".into(),
-                            payload: serde_json::json!({}),
-                        }).await?;
-                    }
-                    let Some(kind) = generation.observe(kind, tokio::time::Instant::now()) else {
-                        // Fragments end a stall episode like any other output,
-                        // so the reported stall has to be withdrawn here too.
-                        if progress && watchdog.note_output() {
-                            record(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                SessionEventKind::StatusChanged {
-                                    status: SessionStatus::Running,
-                                    detail: Some(watchdog.phase().detail().to_string()),
-                                },
-                            ).await?;
-                        }
-                        continue;
-                    };
-                    if is_executor_lifecycle_status(&kind) {
-                        if executor_reports_provider_drained(&kind) {
-                            watchdog.set_phase(TurnPhase::Draining);
-                        }
-                        continue;
-                    }
-                    if interrupted && matches!(
-                        &kind,
-                        SessionEventKind::Error { message }
-                            if provider_error_is_expected_interrupt(launch.provider, message)
-                    ) {
-                        continue;
-                    }
-                    if matches!(
-                        &kind,
-                        SessionEventKind::Error { message }
-                            if is_safe_automatic_retry_error(message) || provider_error_is_connection_lost(message) || provider_error_is_auth_lookup_unavailable(message)
-                    ) {
-                        retryable_provider_errors.push(kind);
-                        continue;
-                    }
-                    turn_reported_error |= matches!(&kind, SessionEventKind::Error { .. });
-                    turn_had_side_effects |= provider_event_has_side_effect(&kind);
-                    if watchdog.phase() == TurnPhase::AwaitingProvider {
-                        watchdog.set_phase(TurnPhase::Active);
-                        record(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            SessionEventKind::StatusChanged {
-                                status: SessionStatus::Running,
-                                detail: Some(TurnPhase::Active.detail().to_string()),
-                            },
-                        ).await?;
-                    }
-                    if watchdog.observe(&kind, progress) {
-                        record(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            SessionEventKind::StatusChanged {
-                                status: SessionStatus::Running,
-                                detail: Some(watchdog.phase().detail().to_string()),
-                            },
-                        ).await?;
-                    }
-                    let compaction_status = context_compaction_status(&kind);
-                    if compaction_status == Some("started") {
-                        context_compaction_in_progress = true;
-                    } else if compaction_status == Some("completed") {
-                        context_compaction_in_progress = false;
-                    }
-                    let retry_steers = provider_event_is_steer_boundary(&kind)
-                        || compaction_status == Some("completed");
-                    if matches!(&kind, SessionEventKind::ApprovalRequested { .. })
-                        && pending_approval.as_ref().is_some_and(|pending| pending.response.is_some()) {
-                        deny_pending_approval(&mut journal, &events, session_id, &mut pending_approval).await?;
-                    }
-                    track_approval(&kind, &mut pending_approval);
-                    track_provider_interaction(&kind, &mut pending_provider_interaction);
-                    let usage = goal_token_usage(&kind);
-                    if context_usage_observation(&kind) {
-                        provider_context_usage_valid = true;
-                    }
-                    complete_consumed_steers(
-                        &kind,
-                        &mut steers_awaiting_consumption,
-                        &mut journal,
-                        &events,
-                        session_id,
-                    )
-                    .await?;
-                    record(&mut journal, &events, session_id, kind).await?;
-                    if retry_steers && !context_compaction_in_progress && !user_stop && !interrupted {
-                        steer_boundary_generation = steer_boundary_generation.saturating_add(1);
-                        retry_pending_steers(
-                            &control_tx,
-                            &steer_result_tx,
-                            &mut pending_steers,
-                            steer_boundary_generation, launch.capabilities.frames_steers_for(launch.provider, launch.model.as_deref()),
-                        )
-                        .await;
-                    }
-                    if let Some(tokens) = usage {
-                        account_goal_tokens(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            &mut goal,
-                            &mut goal_active_since,
-                            tokens,
-                        )
-                        .await?;
-                    }
-                    }
                 }
                 activity = subagent_activity_rx.recv(), if owns_team => {
                     if let Ok(activity) = activity {
@@ -5795,6 +5653,149 @@ async fn run_agent_session_store_kernel_inner(
                         .await?;
                     }
                     request.response.send(result).ok();
+                }
+                kind = provider_events.recv(), if provider_events_open => {
+                    let Some(first_kind) = kind else {
+                        provider_events_open = false;
+                        continue;
+                    };
+                    // Each batch gets a fresh window: an observer that recovers
+                    // must not stay penalised, and one that has not must not be
+                    // waited on again inside this batch.
+                    begin_live_delivery_burst();
+                    let mut provider_batch = Vec::with_capacity(8);
+                    push_coalesced_provider_event(&mut provider_batch, first_kind);
+                    let mut consumed = 1;
+                    while consumed < 64 {
+                        let Ok(kind) = provider_events.try_recv() else {
+                            break;
+                        };
+                        consumed += 1;
+                        push_coalesced_provider_event(&mut provider_batch, kind);
+                    }
+                    for kind in provider_batch {
+                    // Classify liveness on the raw event: coalescing drops
+                    // streaming fragments, which are still real progress.
+                    let progress = provider_event_is_progress(&kind);
+                    if network_recovery_pending && provider_event_is_progress(&kind) {
+                        network_recovery_pending = false;
+                        record(&mut journal, &events, session_id, SessionEventKind::ProviderEvent {
+                            provider: launch.provider,
+                            kind: "network_recovered".into(),
+                            payload: serde_json::json!({}),
+                        }).await?;
+                    }
+                    let Some(kind) = generation.observe(kind, tokio::time::Instant::now()) else {
+                        // Fragments end a stall episode like any other output,
+                        // so the reported stall has to be withdrawn here too.
+                        if progress && watchdog.note_output() {
+                            record(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                SessionEventKind::StatusChanged {
+                                    status: SessionStatus::Running,
+                                    detail: Some(watchdog.phase().detail().to_string()),
+                                },
+                            ).await?;
+                        }
+                        continue;
+                    };
+                    if is_executor_lifecycle_status(&kind) {
+                        if executor_reports_provider_drained(&kind) {
+                            watchdog.set_phase(TurnPhase::Draining);
+                        }
+                        continue;
+                    }
+                    if interrupted && matches!(
+                        &kind,
+                        SessionEventKind::Error { message }
+                            if provider_error_is_expected_interrupt(launch.provider, message)
+                    ) {
+                        continue;
+                    }
+                    if matches!(
+                        &kind,
+                        SessionEventKind::Error { message }
+                            if is_safe_automatic_retry_error(message) || provider_error_is_connection_lost(message) || provider_error_is_auth_lookup_unavailable(message)
+                    ) {
+                        retryable_provider_errors.push(kind);
+                        continue;
+                    }
+                    turn_reported_error |= matches!(&kind, SessionEventKind::Error { .. });
+                    turn_had_side_effects |= provider_event_has_side_effect(&kind);
+                    if watchdog.phase() == TurnPhase::AwaitingProvider {
+                        watchdog.set_phase(TurnPhase::Active);
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::StatusChanged {
+                                status: SessionStatus::Running,
+                                detail: Some(TurnPhase::Active.detail().to_string()),
+                            },
+                        ).await?;
+                    }
+                    if watchdog.observe(&kind, progress) {
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            SessionEventKind::StatusChanged {
+                                status: SessionStatus::Running,
+                                detail: Some(watchdog.phase().detail().to_string()),
+                            },
+                        ).await?;
+                    }
+                    let compaction_status = context_compaction_status(&kind);
+                    if compaction_status == Some("started") {
+                        context_compaction_in_progress = true;
+                    } else if compaction_status == Some("completed") {
+                        context_compaction_in_progress = false;
+                    }
+                    let retry_steers = provider_event_is_steer_boundary(&kind)
+                        || compaction_status == Some("completed");
+                    if matches!(&kind, SessionEventKind::ApprovalRequested { .. })
+                        && pending_approval.as_ref().is_some_and(|pending| pending.response.is_some()) {
+                        deny_pending_approval(&mut journal, &events, session_id, &mut pending_approval).await?;
+                    }
+                    track_approval(&kind, &mut pending_approval);
+                    track_provider_interaction(&kind, &mut pending_provider_interaction);
+                    let usage = goal_token_usage(&kind);
+                    if context_usage_observation(&kind) {
+                        provider_context_usage_valid = true;
+                    }
+                    complete_consumed_steers(
+                        &kind,
+                        &mut steers_awaiting_consumption,
+                        &mut journal,
+                        &events,
+                        session_id,
+                    )
+                    .await?;
+                    record(&mut journal, &events, session_id, kind).await?;
+                    if retry_steers && !context_compaction_in_progress && !user_stop && !interrupted {
+                        steer_boundary_generation = steer_boundary_generation.saturating_add(1);
+                        retry_pending_steers(
+                            &control_tx,
+                            &steer_result_tx,
+                            &mut pending_steers,
+                            steer_boundary_generation, launch.capabilities.frames_steers_for(launch.provider, launch.model.as_deref()),
+                        )
+                        .await;
+                    }
+                    if let Some(tokens) = usage {
+                        account_goal_tokens(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            &mut goal,
+                            &mut goal_active_since,
+                            tokens,
+                        )
+                        .await?;
+                    }
+                    }
                 }
             }
         }
