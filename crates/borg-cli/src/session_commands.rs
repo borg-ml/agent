@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
 use borg_remote::{
     CodingProvider, EventActor, MessageStatus, PermissionMode, PromptDelivery, ResponseLanguage,
     SessionConfiguration, SessionEvent, SessionEventKind, SessionStore, SessionSummary,
-    WorkspaceSnapshot, default_host_config_path,
+    WorkspaceSnapshot,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -63,13 +63,6 @@ pub(crate) async fn run(command: SessionCommand) -> Result<()> {
             json,
         } => restore_snapshot(input, cwd, prune, json).await,
         SessionCommand::Import { input, cwd, json } => import_session(input, cwd, json).await,
-        SessionCommand::Migrate {
-            to,
-            dry_run,
-            limit,
-            fail_fast,
-            json,
-        } => migrate_journal_command(to, dry_run, limit, fail_fast, json).await,
         command => {
             let store = open_store().await?;
             match command {
@@ -98,7 +91,6 @@ pub(crate) async fn run(command: SessionCommand) -> Result<()> {
                     compact_store(store.as_ref(), !no_vacuum, json).await
                 }
                 SessionCommand::Import { .. }
-                | SessionCommand::Migrate { .. }
                 | SessionCommand::Snapshot { .. }
                 | SessionCommand::Restore { .. } => unreachable!("handled above"),
             }
@@ -146,107 +138,13 @@ fn human_bytes(bytes: i64) -> String {
     }
 }
 
-/// Copy the configured journal into another backend.
-///
-/// The destination is opened with the same factory as any other entry point,
-/// so it applies its own schema and proves its satellite tiers before a single
-/// event is written -- a half-configured destination fails here rather than
-/// half way through a long copy.
-async fn migrate_journal_command(
-    to: String,
-    dry_run: bool,
-    limit: Option<u64>,
-    fail_fast: bool,
-    json: bool,
-) -> Result<()> {
-    let source_path = default_host_config_path()
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("sessions/sessions.sqlite3");
-    let source_config =
-        borg_remote::session_store::factory::SessionStoreConfig::from_env(&source_path);
-    let destination_config =
-        borg_remote::session_store::factory::SessionStoreConfig::with_url(&to, &source_path);
-    ensure!(
-        source_config.backend() != destination_config.backend()
-            || source_config.describe() != destination_config.describe(),
-        "the source and destination are the same store"
-    );
-
-    let source = Arc::clone(
-        borg_remote::session_store::factory::open(&source_config)
-            .await?
-            .session(),
-    );
-    let destination = Arc::clone(
-        borg_remote::session_store::factory::open_resolved(&destination_config)
-            .await?
-            .session(),
-    );
-
-    let options = borg_remote::session_store::migrate::MigrationOptions {
-        dry_run,
-        max_sessions: limit,
-        fail_fast,
-    };
-    let mut report = |line: &str| {
-        if !json {
-            println!("{line}");
-        }
-    };
-    let outcome = borg_remote::session_store::migrate::migrate_journal(
-        source,
-        destination,
-        &options,
-        &mut report,
-    )
-    .await?;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "dry_run": dry_run,
-                "sessions_copied": outcome.sessions_copied,
-                "sessions_skipped": outcome.sessions_skipped,
-                "sessions_failed": outcome.sessions_failed,
-                "events_copied": outcome.events_copied,
-                "payloads_copied": outcome.payloads_copied,
-                "failures": outcome
-                    .failures
-                    .iter()
-                    .map(|(id, reason)| serde_json::json!({"session": id, "error": reason}))
-                    .collect::<Vec<_>>(),
-            }))?
-        );
-    } else {
-        println!(
-            "{} {} session(s), skipped {}, failed {}; {} event(s), {} payload(s)",
-            if dry_run { "Would copy" } else { "Copied" },
-            outcome.sessions_copied,
-            outcome.sessions_skipped,
-            outcome.sessions_failed,
-            outcome.events_copied,
-            outcome.payloads_copied
-        );
-        for (session, reason) in &outcome.failures {
-            println!("  failed {session}: {reason}");
-        }
-    }
-    Ok(())
-}
-
 async fn open_store() -> Result<Arc<dyn SessionStore>> {
-    let path = default_host_config_path()
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("sessions/sessions.sqlite3");
-    // `borg session` inspects and maintains whichever backend this machine is
-    // configured for; every operation it performs is on the store trait, so it
-    // needs the journal but none of the satellite tiers.
+    // `borg session` inspects and maintains this machine's journal; every
+    // operation it performs is on the store trait, so it needs the journal but
+    // none of the satellite tiers.
     Ok(Arc::clone(
         borg_remote::session_store::factory::open(
-            &borg_remote::session_store::factory::SessionStoreConfig::from_env(path),
+            &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
         )
         .await?
         .session(),

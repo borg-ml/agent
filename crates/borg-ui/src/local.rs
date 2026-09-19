@@ -365,9 +365,7 @@ async fn launch_new_session_owner() -> Result<(LocalSessionClient, Option<tokio:
         .join("sessions");
     let store = Arc::clone(
         borg_remote::session_store::factory::open(
-            &borg_remote::session_store::factory::SessionStoreConfig::from_env(
-                sessions_dir.join("sessions.sqlite3"),
-            ),
+            &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
         )
         .await?
         .session(),
@@ -473,9 +471,7 @@ impl LocalSessionClient {
             .join("sessions");
         let store = Arc::clone(
             borg_remote::session_store::factory::open(
-                &borg_remote::session_store::factory::SessionStoreConfig::from_env(
-                    sessions_dir.join("sessions.sqlite3"),
-                ),
+                &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
             )
             .await?
             .session(),
@@ -497,9 +493,7 @@ impl LocalSessionClient {
             .join("sessions");
         let store = Arc::clone(
             borg_remote::session_store::factory::open(
-                &borg_remote::session_store::factory::SessionStoreConfig::from_env(
-                    sessions_dir.join("sessions.sqlite3"),
-                ),
+                &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
             )
             .await?
             .session(),

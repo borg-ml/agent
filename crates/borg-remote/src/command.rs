@@ -331,7 +331,7 @@ async fn execute(
         .and_then(|result| result)
         .map_err(anyhow_failure)?;
     let finished_at = Utc::now();
-    // The complete output is persisted by the host's SQLite receipt in the
+    // The complete output is persisted by the host's durable receipt in the
     // same transaction as the mutation identity. Keep only a stable virtual
     // locator in the wire contract; writing a second JSON manifest beside the
     // workspace would create an untracked, non-transactional source of truth.

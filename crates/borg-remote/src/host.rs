@@ -25,7 +25,6 @@ use crate::receipt::{ReceiptBackend, ReceiptState};
 // Only the tests build a concrete receipt store; production resolves the tier
 // through the session store so the backend stays configurable.
 #[cfg(test)]
-use crate::receipt::SqliteReceiptStore;
 // Test fixtures still build a concrete journal directly; production resolves
 // the backend through the factory.
 use crate::session::AbortTask;
@@ -46,7 +45,6 @@ use crate::{
     run_agent_session_with_store_and_writer_and_lsp_policy,
 };
 #[cfg(test)]
-use borg_agent_runtime::SqliteSessionStore;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct HostConfig {
@@ -1999,9 +1997,7 @@ pub async fn run_host_with_executor_factory(
     // process is long-running by definition, so there is no ownership race to
     // settle first and nothing to defer.
     let resolved = crate::session_store::factory::open_resolved(
-        &crate::session_store::factory::SessionStoreConfig::from_env(
-            session_root.join("sessions.sqlite3"),
-        ),
+        &crate::session_store::factory::SessionStoreConfig::from_env(),
     )
     .await?;
     let session_store = Arc::clone(resolved.session());
@@ -4783,9 +4779,7 @@ async fn spawn_host_session(
             // backend, and if even that fails, leave the bootstrap marker
             // rather than guessing at the session's state.
             if let Ok(opened) = crate::session_store::factory::open(
-                &crate::session_store::factory::SessionStoreConfig::from_env(
-                    session_root.join("sessions.sqlite3"),
-                ),
+                &crate::session_store::factory::SessionStoreConfig::from_env(),
             )
             .await
             {
@@ -4881,26 +4875,24 @@ async fn run_session(
     launch.cwd = validate_host_cwd(&config.roots, &launch.cwd)?;
     discard_serialized_extension_roots(&mut launch);
     // This session is about to run, so resolve every tier before starting it.
-    let sqlite_store = Arc::clone(
+    let durable_store = Arc::clone(
         crate::session_store::factory::open_resolved(
-            &crate::session_store::factory::SessionStoreConfig::from_env(
-                session_root.join("sessions.sqlite3"),
-            ),
+            &crate::session_store::factory::SessionStoreConfig::from_env(),
         )
         .await?
         .session(),
     );
-    ensure_host_launch_owner(&client, &config, sqlite_store.as_ref(), session_id).await?;
+    ensure_host_launch_owner(&client, &config, durable_store.as_ref(), session_id).await?;
     // Expired recovery must not depend on relay availability or create a provider.
-    if stored_host_session_state(sqlite_store.as_ref(), session_id)
+    if stored_host_session_state(durable_store.as_ref(), session_id)
         .await?
         .as_ref()
         .is_some_and(|state| remaining_host_session_duration(&config, Some(state)).is_zero())
     {
         let writer = SessionWriterLease::acquire(session_root.join(format!("{session_id}.lock")))?;
-        let state = stored_host_session_state(sqlite_store.as_ref(), session_id).await?;
+        let state = stored_host_session_state(durable_store.as_ref(), session_id).await?;
         if remaining_host_session_duration(&config, state.as_ref()).is_zero() {
-            expire_host_session(&config, sqlite_store.as_ref(), session_id, &writer).await?;
+            expire_host_session(&config, durable_store.as_ref(), session_id, &writer).await?;
             return Ok(());
         }
     }
@@ -4909,10 +4901,10 @@ async fn run_session(
     }
     let lock_path = session_root.join(format!("{session_id}.lock"));
     let writer = Arc::new(SessionWriterLease::acquire(&lock_path)?);
-    validate_stored_host_identity(&config, sqlite_store.as_ref(), session_id).await?;
+    validate_stored_host_identity(&config, durable_store.as_ref(), session_id).await?;
     // Another host may have stopped this session while startup awaited the relay.
     // Recheck under writer ownership before constructing an actor or provider.
-    if stored_host_session_state(sqlite_store.as_ref(), session_id)
+    if stored_host_session_state(durable_store.as_ref(), session_id)
         .await?
         .is_some_and(|state| {
             matches!(
@@ -4925,7 +4917,7 @@ async fn run_session(
             )
         })
     {
-        sqlite_store
+        durable_store
             .settle_terminal_host_session(session_id)
             .await?;
         return Ok(());
@@ -4939,17 +4931,17 @@ async fn run_session(
     let workspace_attachment = attachment
         .as_ref()
         .and_then(|attachment| attachment.workspace_id.zip(attachment.participant_id));
-    if !sqlite_store.contains_session(session_id).await? {
+    if !durable_store.contains_session(session_id).await? {
         if let Some((workspace_id, participant_id)) = workspace_attachment {
-            sqlite_store
+            durable_store
                 .create_session_in_workspace_as(session_id, workspace_id, participant_id)
                 .await?;
         } else {
-            sqlite_store.create_session(session_id).await?;
+            durable_store.create_session(session_id).await?;
         }
     }
     if let Some((workspace_id, participant_id)) = workspace_attachment {
-        sqlite_store
+        durable_store
             .attach_workspace(crate::SessionWorkspaceBinding {
                 session_id,
                 workspace_id,
@@ -4959,17 +4951,17 @@ async fn run_session(
             })
             .await?;
     }
-    let effective_workspace_binding = sqlite_store
+    let effective_workspace_binding = durable_store
         .workspace_binding(session_id)
         .await?
         .context("remote session has no local workspace binding")?;
-    sqlite_store
+    durable_store
         .attach_workspace(crate::SessionWorkspaceBinding {
             host_id: Some(config.host_id),
             ..effective_workspace_binding.clone()
         })
         .await?;
-    let workspace_store = sqlite_store.workspace_store().await?;
+    let workspace_store = durable_store.workspace_store().await?;
     if let Some(store) = workspace_store.as_ref() {
         let human_display_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
         let human_participant_id = crate::local_human_participant_id(&human_display_name);
@@ -4990,17 +4982,17 @@ async fn run_session(
             )
             .await?;
     }
-    let store: Arc<dyn SessionStore> = sqlite_store.clone();
+    let store: Arc<dyn SessionStore> = durable_store.clone();
     let cursor = load_session_sync(&client, &config, session_id).await?;
     let mut sync = JournalSync::new(cursor, attachment.is_some());
-    sync.uploaded_workspace_sequences = sqlite_store
+    sync.uploaded_workspace_sequences = durable_store
         .host_workspace_cursors(config.host_id, session_id)
         .await?;
     flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
     flush_host_workspace_messages(
         &client,
         &config,
-        sqlite_store.as_ref(),
+        durable_store.as_ref(),
         workspace_store.as_deref(),
         session_id,
         workspace_attachment.map(|(workspace_id, _)| workspace_id),
@@ -5009,11 +5001,11 @@ async fn run_session(
     .await?;
     let (event_tx, mut event_rx) = mpsc::channel(256);
     let actor_session_root = session_root.clone();
-    let actor_store = Arc::clone(&sqlite_store);
+    let actor_store = Arc::clone(&durable_store);
     let remaining =
-        remaining_host_session_duration(&config, Some(&sqlite_store.state(session_id).await?));
+        remaining_host_session_duration(&config, Some(&durable_store.state(session_id).await?));
     if remaining.is_zero() {
-        expire_host_session(&config, sqlite_store.as_ref(), session_id, &writer).await?;
+        expire_host_session(&config, durable_store.as_ref(), session_id, &writer).await?;
         return Ok(());
     }
     let session_deadline = tokio::time::Instant::now() + remaining;
@@ -5054,7 +5046,7 @@ async fn run_session(
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
             if !bootstrap_finished {
-                match finish_ready_host_bootstrap(sqlite_store.as_ref(), session_id, initial_prompt_id).await {
+                match finish_ready_host_bootstrap(durable_store.as_ref(), session_id, initial_prompt_id).await {
                     Ok(finished) => bootstrap_finished = finished,
                     Err(error) => {
                         tracing::warn!(%error, %session_id, "cannot settle host bootstrap; retaining recovery marker")
@@ -5066,7 +5058,7 @@ async fn run_session(
                 flush_host_workspace_messages(
                     &client,
                     &config,
-                    sqlite_store.as_ref(),
+                    durable_store.as_ref(),
                     workspace_store.as_deref(),
                     session_id,
                     workspace_attachment.map(|(workspace_id, _)| workspace_id),
@@ -5101,16 +5093,16 @@ async fn run_session(
         let _ = (&mut actor.0).await;
         // Keep writer ownership through settlement; final publication belongs
         // to the independent journal/message workers, not an unavailable relay.
-        expire_host_session(&config, sqlite_store.as_ref(), session_id, &writer).await?;
+        expire_host_session(&config, durable_store.as_ref(), session_id, &writer).await?;
         tracing::warn!(%session_id, "host session duration expired; terminal output queued for recovery");
         return Ok(());
     }
-    finish_ready_host_bootstrap(sqlite_store.as_ref(), session_id, initial_prompt_id).await?;
+    finish_ready_host_bootstrap(durable_store.as_ref(), session_id, initial_prompt_id).await?;
     flush_pending(&client, &config, store.as_ref(), session_id, &mut sync).await?;
     flush_host_workspace_messages(
         &client,
         &config,
-        sqlite_store.as_ref(),
+        durable_store.as_ref(),
         workspace_store.as_deref(),
         session_id,
         workspace_attachment.map(|(workspace_id, _)| workspace_id),
@@ -5520,17 +5512,7 @@ pub async fn sync_remote_session(
     let config: HostConfig = serde_json::from_slice(&fs::read(config_path)?)?;
     config.validate()?;
     ensure_execution_boundary(&config)?;
-    let database = config_path
-        .parent()
-        .context("host config has no parent")?
-        .join("sessions/sessions.sqlite3");
-    let config_store = crate::session_store::factory::SessionStoreConfig::from_env(&database);
-    // Only SQLite keeps its journal in a file, so only SQLite can be missing
-    // one. A configured Postgres URL is expected to be reachable, and a
-    // connection failure there is reported rather than read as "no database".
-    if config_store.backend() == crate::session_store::factory::SessionBackend::Sqlite {
-        ensure!(database.is_file(), "session database does not exist");
-    }
+    let config_store = crate::session_store::factory::SessionStoreConfig::from_env();
     let store = Arc::clone(
         crate::session_store::factory::open(&config_store)
             .await?
@@ -5572,9 +5554,8 @@ pub async fn sync_remote_session(
             uploaded_sequence: 0,
             uploaded_live_revision: 0,
             workspace_retry_at: HashMap::new(),
-            // The trait method, not the SQLite-specific one it used to call:
-            // the cursor set is the same either way, and reaching for the
-            // backend-specific name here would pin this path to SQLite.
+            // The store trait, never a backend-specific entry point, so this
+            // path stays independent of which database is underneath.
             uploaded_workspace_sequences: store
                 .host_workspace_cursors(config.host_id, session_id)
                 .await?,
@@ -6227,7 +6208,10 @@ fn platform() -> String {
 #[cfg(test)]
 mod tests {
     use chrono::Duration as ChronoDuration;
-    use sqlx::sqlite::SqlitePoolOptions;
+    use crate::receipt::PostgresReceiptStore;
+    use crate::session_store::postgres::PostgresSessionStore;
+    use crate::session_store::postgres::testing::ScratchDatabase;
+    use sqlx::postgres::PgPoolOptions;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -6260,13 +6244,16 @@ mod tests {
     }
     use crate::{RuntimeMcpServer, WorkspaceFilesystemOperation};
 
-    async fn sqlite_receipts() -> SqliteReceiptStore {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        SqliteReceiptStore::open(pool).await.unwrap()
+    /// Receipts live in the same scratch database as the session store that
+    /// bootstrapped its schema, which is how a host holds them in production.
+    async fn receipts_on(scratch: &ScratchDatabase) -> PostgresReceiptStore {
+        PostgresReceiptStore::from_pool(
+            PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&scratch.url)
+                .await
+                .unwrap(),
+        )
     }
 
     #[test]
@@ -6333,11 +6320,8 @@ mod tests {
             config.server = format!("http://{}", listener.local_addr().unwrap());
             let config_path = root.path().join("host.json");
             write_config(&config_path, &config).unwrap();
-            let store: Arc<dyn SessionStore> = Arc::new(
-                SqliteSessionStore::open(root.path().join("sessions/sessions.sqlite3"))
-                    .await
-                    .unwrap(),
-            );
+            let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+            let store: Arc<dyn SessionStore> = Arc::new(postgres);
             let id = Uuid::new_v4();
             let launch = bootstrap_test_launch(root.path());
             persist_launch_metadata(&config, store.as_ref(), id, &launch, None)
@@ -6492,6 +6476,7 @@ mod tests {
                 journal
             );
         }
+        scratch.discard().await;
     }
 
     fn error_events(session_id: Uuid, count: usize, message_bytes: usize) -> Vec<SessionEvent> {
@@ -6763,11 +6748,8 @@ mod tests {
         });
 
         let root = tempdir().unwrap();
-        let store: Arc<dyn SessionStore> = Arc::new(
-            crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-                .await
-                .unwrap(),
-        );
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(postgres);
         let remote_recipient = Uuid::new_v4();
         store.create_session(session_id).await.unwrap();
         let workspace = store.workspace_store().await.unwrap().unwrap();
@@ -6920,14 +6902,13 @@ mod tests {
             messages[0]["recipient_participant_ids"],
             serde_json::json!([remote_recipient])
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn relay_inbox_replay_preserves_one_durable_agent_message_before_ack() {
         let root = tempdir().unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let recipient = Uuid::new_v4();
         store.create_session(recipient).await.unwrap();
         let workspace = store.workspace_store().await.unwrap().unwrap();
@@ -7021,14 +7002,13 @@ mod tests {
             ParticipantKind::Agent
         );
         assert!(!store.contains_message(recipient, message_id).await.unwrap());
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn private_instance_relay_retries_without_starving_or_duplicating_local_recipients() {
         let root = tempdir().unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let sender = Uuid::new_v4();
         let local_recipient = Uuid::new_v4();
         let retry_recipient = Uuid::new_v4();
@@ -7310,6 +7290,7 @@ mod tests {
         assert_eq!(healthy_deliveries.len(), 1);
         assert_eq!(healthy_deliveries[0].state, crate::DeliveryState::Relayed);
         assert_eq!(healthy_deliveries[0].attempts, 1);
+        scratch.discard().await;
     }
 
     #[test]
@@ -7503,9 +7484,7 @@ mod tests {
     #[tokio::test]
     async fn nested_child_payload_upload_uses_the_enclosing_session_and_original_bytes() {
         let root = tempdir().unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let root_session_id = Uuid::new_v4();
         let child_session_id = Uuid::new_v4();
         store.create_session(root_session_id).await.unwrap();
@@ -7606,14 +7585,13 @@ mod tests {
         assert!(event_body.len() < TARGET_EVENT_BATCH_BYTES);
         assert_eq!(uploaded_sequence, 1);
         assert_eq!(root_event.kind.payload_refs().len(), 0);
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn auxiliary_upload_rejection_preserves_status_and_unacknowledged_output() {
         let root = tempdir().unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let session_id = Uuid::new_v4();
         store.create_session(session_id).await.unwrap();
         store
@@ -7792,15 +7770,14 @@ mod tests {
         assert!(paths[0].contains("/payloads/"));
         assert!(paths[1].ends_with(&format!("/{session_id}/messages")));
         assert!(paths[2].ends_with("/workspace/messages"));
+        scratch.discard().await;
     }
 
     #[tokio::test]
     #[ignore = "explicit remote payload upload concurrency profile"]
     async fn remote_payload_upload_concurrency_profile() {
         let root = tempdir().unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let session_id = Uuid::new_v4();
         store.create_session(session_id).await.unwrap();
         for index in 0..4 {
@@ -7881,6 +7858,7 @@ mod tests {
             elapsed < Duration::from_millis(400),
             "remote payload upload exceeded 400 ms: {elapsed:?}"
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -7893,9 +7871,7 @@ mod tests {
         .await;
 
         let root = tempdir().unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let session_id = Uuid::new_v4();
         let events = error_events(session_id, 4, 16);
         let config = HostConfig {
@@ -7922,6 +7898,7 @@ mod tests {
             server.await.unwrap(),
             vec![vec![1, 2, 3, 4], vec![1, 2], vec![3, 4]]
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -7933,9 +7910,7 @@ mod tests {
         ])
         .await;
         let root = tempdir().unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let events = error_events(Uuid::new_v4(), 4, 16);
         let config = HostConfig {
             server: server_url,
@@ -7961,6 +7936,7 @@ mod tests {
             server.await.unwrap(),
             vec![vec![1, 2, 3, 4], vec![1, 2], vec![3, 4]]
         );
+        scratch.discard().await;
     }
 
     /// Serve `statuses` in order on /api/remote/host/live-state, recording the
@@ -8060,9 +8036,7 @@ mod tests {
         ])
         .await;
         let root = tempdir().unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let session_id = Uuid::new_v4();
         let config = HostConfig {
             server: server_url,
@@ -8105,6 +8079,7 @@ mod tests {
                 .is_empty(),
             "no live event is left behind the cursor to be retried forever"
         );
+        scratch.discard().await;
     }
 
     /// 5xx, 408, 429 stay retryable: the payload is fine, the relay is not.
@@ -8112,9 +8087,7 @@ mod tests {
     async fn transient_live_state_rejection_is_retried_without_advancing() {
         let (server_url, server) = live_state_server(vec!["503 Service Unavailable"]).await;
         let root = tempdir().unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let session_id = Uuid::new_v4();
         let config = HostConfig {
             server: server_url,
@@ -8139,6 +8112,7 @@ mod tests {
             "a transient failure must not drop live state"
         );
         assert_eq!(server.await.unwrap().len(), 1, "no bisection on a 5xx");
+        scratch.discard().await;
     }
 
     #[test]
@@ -8161,9 +8135,7 @@ mod tests {
     async fn permanent_client_rejection_blocks_the_replay_cursor() {
         let (server_url, server) = event_server(vec!["400 Bad Request"]).await;
         let root = tempdir().unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let events = error_events(Uuid::new_v4(), 1, 16);
         let config = HostConfig {
             server: server_url,
@@ -8188,15 +8160,14 @@ mod tests {
         ));
         assert_eq!(uploaded_sequence, 0);
         assert_eq!(server.await.unwrap(), vec![vec![1]]);
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn singleton_payload_too_large_is_irreducible_and_never_skipped() {
         let (server_url, server) = event_server(vec!["413 Payload Too Large"]).await;
         let root = tempdir().unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let events = error_events(Uuid::new_v4(), 1, 16);
         let config = HostConfig {
             server: server_url,
@@ -8224,6 +8195,7 @@ mod tests {
         ));
         assert_eq!(uploaded_sequence, 0);
         assert_eq!(server.await.unwrap(), vec![vec![1]]);
+        scratch.discard().await;
     }
 
     #[test]
@@ -8334,11 +8306,8 @@ mod tests {
             extension_skill_roots: Vec::new(),
             team_policy: None,
         };
-        let session_store: Arc<dyn SessionStore> = Arc::new(
-            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-                .await
-                .unwrap(),
-        );
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let session_store: Arc<dyn SessionStore> = Arc::new(postgres);
         persist_launch_metadata(
             &config,
             session_store.as_ref(),
@@ -8349,7 +8318,7 @@ mod tests {
         .await
         .unwrap();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
-        let receipts: Arc<dyn ReceiptBackend> = Arc::new(sqlite_receipts().await);
+        let receipts: Arc<dyn ReceiptBackend> = Arc::new(receipts_on(&scratch).await);
 
         assert!(
             dispatch(
@@ -8368,6 +8337,7 @@ mod tests {
             "a denied command must be acknowledged as handled"
         );
         assert!(sessions.lock().await.is_empty());
+        scratch.discard().await;
     }
 
     fn bootstrap_test_launch(root: &Path) -> LaunchSession {
@@ -8465,8 +8435,7 @@ mod tests {
             .unwrap();
         let id = Uuid::new_v4();
         let launch = bootstrap_test_launch(root.path());
-        let path = root.path().join("sessions.sqlite3");
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         persist_launch_metadata(&config, &store, id, &launch, None)
             .await
             .unwrap();
@@ -8525,7 +8494,9 @@ mod tests {
                 .is_some()
         );
         drop(store);
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+            .await
+            .unwrap();
         let state = store.state(id).await.unwrap();
         assert_eq!(
             state.status,
@@ -8574,6 +8545,7 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -8585,8 +8557,7 @@ mod tests {
             config.server = format!("http://{}", listener.local_addr().unwrap());
             config.resource_limits.max_session_seconds = 10;
             config.resource_limits.max_concurrent_sessions = 1;
-            let path = root.path().join("sessions.sqlite3");
-            let store = SqliteSessionStore::open(&path).await.unwrap();
+            let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
             let id = Uuid::new_v4();
             let launch = bootstrap_test_launch(root.path());
             let metadata = serde_json::to_value(PersistedLaunchMetadata {
@@ -8647,7 +8618,9 @@ mod tests {
             .await
             .unwrap();
             drop(store);
-            let store = SqliteSessionStore::open(&path).await.unwrap();
+            let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+                .await
+                .unwrap();
             let original = serde_json::to_value(store.read(id).await.unwrap()).unwrap();
             let sessions = Arc::new(Mutex::new(HashMap::new()));
             let (tx, _rx) = mpsc::channel(1);
@@ -8785,7 +8758,9 @@ mod tests {
             );
             let settled = serde_json::to_value(store.read(id).await.unwrap()).unwrap();
             drop(store);
-            let store = SqliteSessionStore::open(&path).await.unwrap();
+            let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+                .await
+                .unwrap();
             resume_pending_host_sessions(
                 0,
                 &client,
@@ -8812,6 +8787,7 @@ mod tests {
                     .is_err()
             );
         }
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -8823,8 +8799,7 @@ mod tests {
         config.resource_limits.max_session_seconds = 10;
         let id = Uuid::new_v4();
         let launch = bootstrap_test_launch(root.path());
-        let path = root.path().join("sessions.sqlite3");
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         persist_launch_metadata(&config, &store, id, &launch, None)
             .await
             .unwrap();
@@ -8877,7 +8852,9 @@ mod tests {
             .await
             .is_err()
         );
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+            .await
+            .unwrap();
         assert_ne!(
             store.state(id).await.unwrap().status,
             Some(crate::SessionStatus::Failed)
@@ -8907,7 +8884,9 @@ mod tests {
             "expired recovery must settle locally before contacting an unavailable relay"
         );
         result.unwrap().unwrap();
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+            .await
+            .unwrap();
         assert_eq!(
             store.state(id).await.unwrap().status,
             Some(crate::SessionStatus::Failed)
@@ -8925,6 +8904,7 @@ mod tests {
                 .await
                 .is_err()
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -8954,8 +8934,7 @@ mod tests {
                     socket.write_all(format!("HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                 }
             }));
-            let path = root.path().join("sessions.sqlite3");
-            let store = SqliteSessionStore::open(&path).await.unwrap();
+            let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
             let id = Uuid::new_v4();
             let launch = bootstrap_test_launch(root.path());
             persist_launch_metadata(&config, &store, id, &launch, None)
@@ -9045,7 +9024,9 @@ mod tests {
             .await
             .expect("startup panic must release writer ownership");
             drop(store);
-            let store = SqliteSessionStore::open(&path).await.unwrap();
+            let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+                .await
+                .unwrap();
             let journal = serde_json::to_value(store.read(id).await.unwrap()).unwrap();
             if started {
                 assert_ne!(
@@ -9103,6 +9084,7 @@ mod tests {
             );
             assert!(sessions.lock().await.is_empty());
         }
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -9196,13 +9178,22 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(30), started.notified())
             .await
             .unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
-        // Corrupt only a disposable live projection, not the authoritative journal.
-        sqlx::query("insert into session_live_state(session_id,live_key,revision,event_json,updated_at) values(?,?,?,?,?)")
-            .bind(session_id.to_string()).bind("injected").bind(i64::MAX).bind("{")
-            .bind(Utc::now().to_rfc3339()).execute(store.pool()).await.unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        // Corrupt only a disposable live projection, not the authoritative
+        // journal. The row is valid jsonb the column accepts but not a valid
+        // event, so the projection read fails where the journal still reads.
+        sqlx::query(
+            "insert into session_live_state(session_id,live_key,revision,event_json,updated_at) \
+             values($1,$2,$3,$4,$5)",
+        )
+        .bind(session_id)
+        .bind("injected")
+        .bind(i64::MAX)
+        .bind(serde_json::json!({"not": "an event"}))
+        .bind(Utc::now())
+        .execute(store.pool())
+        .await
+        .unwrap();
         assert!(store.live_events_after(session_id, 0).await.is_err());
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(
@@ -9214,8 +9205,8 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        sqlx::query("delete from session_live_state where session_id=? and live_key=?")
-            .bind(session_id.to_string())
+        sqlx::query("delete from session_live_state where session_id=$1 and live_key=$2")
+            .bind(session_id)
             .bind("injected")
             .execute(store.pool())
             .await
@@ -9315,14 +9306,14 @@ mod tests {
                     .is_some()
             );
         }
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn legacy_launch_owner_requires_relay_proof_and_rechecks_binding() {
         use std::sync::atomic::{AtomicU16, Ordering};
         let root = tempdir().unwrap();
-        let path = root.path().join("sessions.sqlite3");
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let id = Uuid::new_v4();
         let metadata = serde_json::to_value(PersistedLaunchMetadata {
             request: bootstrap_test_launch(root.path()),
@@ -9339,7 +9330,11 @@ mod tests {
             .await
             .unwrap();
         drop(store);
-        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let store: Arc<dyn SessionStore> = Arc::new(
+            PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+                .await
+                .unwrap(),
+        );
         assert!(
             store.host_launch_owner(id).await.unwrap().is_none(),
             "schema upgrade must not invent an owner"
@@ -9500,13 +9495,13 @@ mod tests {
             store.workspace_binding(racing).await.unwrap().unwrap(),
             binding
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn prestart_launch_keeps_its_host_and_relay_owner_after_reopen() {
         let root = tempdir().unwrap();
-        let path = root.path().join("sessions.sqlite3");
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let config = test_config(root.path());
         let id = Uuid::new_v4();
         persist_launch_metadata(
@@ -9521,7 +9516,9 @@ mod tests {
         store.begin_host_bootstrap(id).await.unwrap();
         assert!(!store.contains_session(id).await.unwrap());
         drop(store);
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+            .await
+            .unwrap();
         let mut foreign = config.clone();
         foreign.host_id = Uuid::new_v4();
         assert!(
@@ -9541,17 +9538,15 @@ mod tests {
         validate_stored_host_identity(&config, &store, id)
             .await
             .unwrap();
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn reenrolled_host_cannot_rebind_or_settle_another_host_session() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let root = tempdir().unwrap();
-        let store: Arc<dyn SessionStore> = Arc::new(
-            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-                .await
-                .unwrap(),
-        );
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(postgres);
         let session_id = Uuid::new_v4();
         let original_host = Uuid::new_v4();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -9800,6 +9795,7 @@ mod tests {
                 .0,
             unstarted
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -9812,9 +9808,7 @@ mod tests {
         config.server = format!("http://{}", listener.local_addr().unwrap());
         let config_path = root.path().join("host.json");
         write_config(&config_path, &config).unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions/sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let (gates_tx, mut gates) = mpsc::channel(2);
         let stop = Arc::new(AtomicBool::new(false));
         let uploads = Arc::new(AtomicUsize::new(0));
@@ -9876,10 +9870,13 @@ mod tests {
             .unwrap();
         store.begin_host_bootstrap(id).await.unwrap();
         let metadata = store.load_host_launch_metadata(id).await.unwrap().unwrap();
-        // Corrupt only the disposable recovery row after the host is already polling.
-        sqlx::query("update host_launches set metadata_json=? where session_id=?")
-            .bind("{")
-            .bind(id.to_string())
+        // Corrupt only the disposable recovery row after the host is already
+        // polling. The value is jsonb the column accepts but not launch
+        // metadata, so recovery faults on decode rather than on the column.
+        let corrupted = serde_json::json!({"not": "launch metadata"});
+        sqlx::query("update host_launches set metadata_json=$1 where session_id=$2")
+            .bind(&corrupted)
+            .bind(id)
             .execute(store.pool())
             .await
             .unwrap();
@@ -9901,19 +9898,19 @@ mod tests {
             }
         }).await.expect("command polling must continue during a local recovery scan failure");
         assert!(!store.contains_session(id).await.unwrap());
-        let retained: String =
-            sqlx::query_scalar("select metadata_json from host_launches where session_id=?")
-                .bind(id.to_string())
+        let retained: serde_json::Value =
+            sqlx::query_scalar("select metadata_json from host_launches where session_id=$1")
+                .bind(id)
                 .fetch_one(store.pool())
                 .await
                 .unwrap();
         assert_eq!(
-            retained, "{",
+            retained, corrupted,
             "failed recovery must not rewrite or discard the faulted row"
         );
-        sqlx::query("update host_launches set metadata_json=? where session_id=?")
-            .bind(serde_json::to_string(&metadata).unwrap())
-            .bind(id.to_string())
+        sqlx::query("update host_launches set metadata_json=$1 where session_id=$2")
+            .bind(serde_json::to_value(&metadata).unwrap())
+            .bind(id)
             .execute(store.pool())
             .await
             .unwrap();
@@ -9955,6 +9952,7 @@ mod tests {
             error.to_string().contains("token was rejected"),
             "relay revocation must remain fatal: {error:#}"
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -9964,8 +9962,7 @@ mod tests {
         let mut config = test_config(root.path());
         config.server = format!("http://{}", listener.local_addr().unwrap());
         config.resource_limits.max_concurrent_sessions = 1;
-        let path = root.path().join("sessions.sqlite3");
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let launch = bootstrap_test_launch(root.path());
         let expired = serde_json::to_value(PersistedLaunchMetadata {
             request: launch.clone(),
@@ -10041,7 +10038,9 @@ mod tests {
         .await
         .unwrap();
         drop(store);
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+            .await
+            .unwrap();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let executor: HostExecutorFactory =
             Arc::new(|_, _| panic!("recovery probe must stop before provider construction"));
@@ -10132,6 +10131,7 @@ mod tests {
                 .await
                 .is_err()
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -10145,9 +10145,8 @@ mod tests {
             let mut config = test_config(root.path());
             config.server = format!("http://{}", listener.local_addr().unwrap());
             config.resource_limits.max_concurrent_sessions = capacity;
-            let path = root.path().join("sessions.sqlite3");
-            let store: Arc<dyn SessionStore> =
-                Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+            let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+            let store: Arc<dyn SessionStore> = Arc::new(postgres);
             let session_id = Uuid::new_v4();
             let active_id = Uuid::new_v4();
             let launch = bootstrap_test_launch(root.path());
@@ -10206,7 +10205,7 @@ mod tests {
             let executor: HostExecutorFactory =
                 Arc::new(|_, _| panic!("expired lease cannot authorize actor restoration"));
             let client = Client::new();
-            let receipts: Arc<dyn ReceiptBackend> = Arc::new(sqlite_receipts().await);
+            let receipts: Arc<dyn ReceiptBackend> = Arc::new(receipts_on(&scratch).await);
             let context = |store: &Arc<dyn SessionStore>| DispatchContext {
                 client: client.clone(),
                 config: config.clone(),
@@ -10295,8 +10294,11 @@ mod tests {
             assert!(workspace.contains_message(message_id).await.unwrap());
             drop(workspace);
             drop(store);
-            let store: Arc<dyn SessionStore> =
-                Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+            let store: Arc<dyn SessionStore> = Arc::new(
+                PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+                    .await
+                    .unwrap(),
+            );
             for field in ["text", "attachments", "delivery"] {
                 let mut conflicting = prompt();
                 let HostCommand::Prompt {
@@ -10512,6 +10514,7 @@ mod tests {
                 "durable deferral and inactive Stop must not contact the relay"
             );
         }
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -10521,8 +10524,8 @@ mod tests {
         config.resource_limits.max_concurrent_sessions = 1;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         config.server = format!("http://{}", listener.local_addr().unwrap());
-        let path = root.path().join("sessions.sqlite3");
-        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(postgres);
         let session_id = Uuid::new_v4();
         let launch = bootstrap_test_launch(root.path());
         persist_launch_metadata(&config, store.as_ref(), session_id, &launch, None)
@@ -10602,8 +10605,11 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(HostCommand::Stop { session_id }) if session_id == active_id)
         );
-        let reopened: Arc<dyn SessionStore> =
-            Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let reopened: Arc<dyn SessionStore> = Arc::new(
+            PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+                .await
+                .unwrap(),
+        );
         assert!(
             reopened
                 .contains_message(session_id, message_id)
@@ -10778,6 +10784,7 @@ connection: close
             sessions.lock().await.is_empty(),
             "terminal retry cannot resurrect an actor after capacity frees"
         );
+        scratch.discard().await;
     }
 
     #[cfg(unix)]
@@ -10820,14 +10827,13 @@ connection: close
             assert_eq!(responses[1]["outcome"]["code"], "indeterminate");
             assert_eq!(responses[2]["outcome"]["code"], "cancelled");
         });
-        let path = root.path().join("sessions.sqlite3");
-        let sqlite = SqliteSessionStore::open(&path).await.unwrap();
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
         // Kept alongside the trait handle purely so the assertion below can
         // read `quarantine_reason` directly. The queue API deliberately does
         // not expose that column -- quarantine is a terminal state callers act
         // on, not inspect -- so the probe reaches past the trait on purpose.
-        let probe_pool = sqlite.pool().clone();
-        let store: Arc<dyn SessionStore> = Arc::new(sqlite);
+        let probe_pool = postgres.pool().clone();
+        let store: Arc<dyn SessionStore> = Arc::new(postgres);
         // Same authority as the journal, obtained the way production does.
         let receipts = store.receipt_store().await.unwrap();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
@@ -11055,7 +11061,11 @@ connection: close
         drop(receipts);
         drop(store);
 
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+
+            .await
+
+            .unwrap();
         // Same authority as the journal, obtained the way production does.
         let receipts = store.receipt_store().await.unwrap();
         let _worker = AbortTask(tokio::spawn(run_host_operation_loop(
@@ -11087,7 +11097,7 @@ connection: close
         assert!(!root.path().join("must-not-run").exists());
         assert!(!root.path().join("cancelled-must-not-run").exists());
         let reason: Option<String> = sqlx::query_scalar(
-            "select quarantine_reason from host_operation_queue where request_id=?",
+            "select quarantine_reason from host_operation_queue where request_id=$1",
         )
         .bind(poisoned.to_string())
         .fetch_one(&probe_pool)
@@ -11097,15 +11107,14 @@ connection: close
             reason.is_some(),
             "unsupported command is retained, not executed or silently deleted"
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn workspace_roster_recovers_without_restarting_or_losing_queued_messages() {
         use std::sync::atomic::{AtomicU16, Ordering};
         let root = tempdir().unwrap();
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let id = Uuid::new_v4();
         store.create_session(id).await.unwrap();
         let binding = store.workspace_binding(id).await.unwrap().unwrap();
@@ -11268,14 +11277,14 @@ connection: close
             requests.try_recv().is_err(),
             "caught-up messages and a fresh roster must not repeat"
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn failed_shared_upload_does_not_skip_private_messages_or_advance_its_cursor() {
         use std::sync::atomic::{AtomicU16, Ordering};
         let root = tempdir().unwrap();
-        let path = root.path().join("sessions.sqlite3");
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let session_id = Uuid::new_v4();
         store.create_session(session_id).await.unwrap();
         let binding = store.workspace_binding(session_id).await.unwrap().unwrap();
@@ -11453,7 +11462,9 @@ connection: close
         }
         drop(workspace);
         drop(store);
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+            .await
+            .unwrap();
         let workspace = store.workspace_store().await.unwrap().unwrap();
         status.store(204, Ordering::SeqCst);
         let later = Instant::now() + Duration::from_secs(60);
@@ -11496,21 +11507,25 @@ connection: close
             received.try_recv().is_err(),
             "acknowledged private messages must not replay after reopen"
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn stopped_host_recovers_final_messages_without_an_actor_or_pending_journal() {
         use std::sync::atomic::{AtomicU16, Ordering};
         let root = tempdir().unwrap();
-        let path = root.path().join("sessions.sqlite3");
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         // Current-v5 databases acquire the additive table without losing their journal.
         sqlx::query("drop table host_workspace_cursors")
             .execute(store.pool())
             .await
             .unwrap();
         drop(store);
-        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let store: Arc<dyn SessionStore> = Arc::new(
+            PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+                .await
+                .unwrap(),
+        );
         let session_id = Uuid::new_v4();
         let recipient = Uuid::new_v4();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -11681,7 +11696,11 @@ connection: close
         );
         drop(workspace);
         drop(store);
-        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let store: Arc<dyn SessionStore> = Arc::new(
+            PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+                .await
+                .unwrap(),
+        );
         let workspace = store.workspace_store().await.unwrap().unwrap();
         for rejected in [0, 401] {
             status.store(rejected, Ordering::SeqCst);
@@ -11790,7 +11809,9 @@ connection: close
         );
         drop(workspace);
         drop(store);
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+            .await
+            .unwrap();
         let workspace = store.workspace_store().await.unwrap().unwrap();
         assert_eq!(
             store
@@ -12016,6 +12037,7 @@ connection: close
             1,
             "message recovery must not consume another actor slot"
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -12063,8 +12085,7 @@ connection: close
             confirmed_tx.send(()).unwrap();
             uploads
         });
-        let path = root.path().join("sessions.sqlite3");
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         persist_launch_metadata(
             &config,
             &store,
@@ -12119,7 +12140,11 @@ connection: close
         );
         drop(store);
 
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+
+            .await
+
+            .unwrap();
         recover_host_journal(&client, &config, &store, session_id)
             .await
             .unwrap();
@@ -12145,7 +12170,11 @@ connection: close
         );
         drop(store);
 
-        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let store: Arc<dyn SessionStore> = Arc::new(
+            PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+                .await
+                .unwrap(),
+        );
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let active_id = Uuid::new_v4();
         let (tx, _rx) = mpsc::channel(1);
@@ -12185,6 +12214,7 @@ connection: close
             uploads[0], uploads[1],
             "failed upload replays identical events"
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -12194,8 +12224,8 @@ connection: close
         let mut config = test_config(root.path());
         config.server = format!("http://{}", listener.local_addr().unwrap());
         config.resource_limits.max_concurrent_sessions = 1;
-        let path = root.path().join("sessions.sqlite3");
-        let store: Arc<dyn SessionStore> = Arc::new(SqliteSessionStore::open(&path).await.unwrap());
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(postgres);
         let [expired, locked, started, active, foreign, legacy] =
             std::array::from_fn(|_| Uuid::new_v4());
         let metadata = serde_json::to_value(PersistedLaunchMetadata {
@@ -12297,7 +12327,7 @@ connection: close
                     session_root: root.path().to_path_buf(),
                     sessions: Arc::clone(&sessions),
                     session_store: Arc::clone(&store),
-                    receipts: Arc::new(sqlite_receipts().await),
+                    receipts: Arc::new(receipts_on(&scratch).await),
                     executor_factory: Arc::clone(&executor),
                 },
                 HostCommand::Stop { session_id: active }
@@ -12309,7 +12339,9 @@ connection: close
         );
         drop(writer);
         drop(store);
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+            .await
+            .unwrap();
         tokio::time::timeout(
             Duration::from_secs(2),
             resume_pending_host_sessions(
@@ -12393,7 +12425,9 @@ connection: close
                 .contains(&expired)
         );
         drop(store);
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+            .await
+            .unwrap();
         recover_host_journal(&client, &config, &store, expired)
             .await
             .unwrap();
@@ -12413,6 +12447,7 @@ connection: close
             uploads[0], uploads[1],
             "publication retries preserve the exact failure journal"
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -12473,11 +12508,8 @@ connection: close
             }
             uploads
         });
-        let store: Arc<dyn SessionStore> = Arc::new(
-            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-                .await
-                .unwrap(),
-        );
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(postgres);
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let executor: HostExecutorFactory =
             Arc::new(|_, _| panic!("failed bootstrap must never execute"));
@@ -12493,7 +12525,7 @@ connection: close
                     session_root: root.path().to_path_buf(),
                     sessions: Arc::clone(&sessions),
                     session_store: Arc::clone(&store),
-                    receipts: Arc::new(sqlite_receipts().await),
+                    receipts: Arc::new(receipts_on(&scratch).await),
                     executor_factory: Arc::clone(&executor),
                 },
                 HostCommand::Launch {
@@ -12534,7 +12566,7 @@ connection: close
         );
         drop(store);
         let store: Arc<dyn SessionStore> = Arc::new(
-            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+            PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
                 .await
                 .unwrap(),
         );
@@ -12570,7 +12602,7 @@ connection: close
                     session_root: root.path().to_path_buf(),
                     sessions: Arc::clone(&sessions),
                     session_store: Arc::clone(&store),
-                    receipts: Arc::new(sqlite_receipts().await),
+                    receipts: Arc::new(receipts_on(&scratch).await),
                     executor_factory: Arc::clone(&executor),
                 },
                 HostCommand::Launch {
@@ -12603,6 +12635,7 @@ connection: close
             uploads[0], uploads[2],
             "background publication preserves failure identity"
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -12610,10 +12643,9 @@ connection: close
         let root = tempdir().unwrap();
         let mut config = test_config(root.path());
         config.resource_limits.max_concurrent_sessions = 1;
-        let path = root.path().join("sessions.sqlite3");
         let session_id = Uuid::new_v4();
         let launch = bootstrap_test_launch(root.path());
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         persist_launch_metadata(&config, &store, session_id, &launch, None)
             .await
             .unwrap();
@@ -12627,10 +12659,14 @@ connection: close
             .await
             .unwrap();
         drop(store);
-        let store = SqliteSessionStore::open_interactive(&path).await.unwrap();
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+            .await
+            .unwrap();
         store.begin_host_bootstrap(session_id).await.unwrap();
         drop(store);
-        let store = SqliteSessionStore::open(&path).await.unwrap();
+        let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+            .await
+            .unwrap();
         assert_eq!(
             store.pending_host_launch_metadata(8).await.unwrap()[0].0,
             session_id
@@ -12729,6 +12765,7 @@ connection: close
                 .iter()
                 .all(|(id, _)| *id != stopped_id)
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -12784,15 +12821,12 @@ connection: close
                 }),
                 _ => None,
             };
-            let session_store: Arc<dyn SessionStore> = Arc::new(
-                SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-                    .await
-                    .unwrap(),
-            );
+            let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+            let session_store: Arc<dyn SessionStore> = Arc::new(postgres);
             let sessions = Arc::new(Mutex::new(HashMap::new()));
             let (active_tx, mut active_rx) = mpsc::channel(1);
             sessions.lock().await.insert(active_id, active_tx);
-            let receipts: Arc<dyn ReceiptBackend> = Arc::new(sqlite_receipts().await);
+            let receipts: Arc<dyn ReceiptBackend> = Arc::new(receipts_on(&scratch).await);
             let context = |store: &Arc<dyn SessionStore>| DispatchContext {
                 client: Client::new(),
                 config: config.clone(),
@@ -12989,7 +13023,7 @@ connection: close
             // Restart after metadata admission but before the failure journal exists.
             drop(session_store);
             let session_store: Arc<dyn SessionStore> = Arc::new(
-                SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
                     .await
                     .unwrap(),
             );
@@ -13068,7 +13102,7 @@ connection: close
             // Failed publication must survive process restart with exactly the same journal.
             drop(session_store);
             let session_store: Arc<dyn SessionStore> = Arc::new(
-                SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
                     .await
                     .unwrap(),
             );
@@ -13091,7 +13125,7 @@ connection: close
             // Reopen the durable journal after the slot is free: rejection must not
             // turn into a deferred launch or accept a new prompt into an actor.
             let session_store: Arc<dyn SessionStore> = Arc::new(
-                SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
+                PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
                     .await
                     .unwrap(),
             );
@@ -13144,6 +13178,7 @@ connection: close
                 vec![vec![1]; 4]
             );
         }
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -13168,11 +13203,8 @@ connection: close
             extension_skill_roots: Vec::new(),
             team_policy: None,
         };
-        let session_store: Arc<dyn SessionStore> = Arc::new(
-            SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-                .await
-                .unwrap(),
-        );
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let session_store: Arc<dyn SessionStore> = Arc::new(postgres);
         session_store.create_session(session_id).await.unwrap();
         for kind in [
             crate::SessionEventKind::SessionStarted,
@@ -13206,7 +13238,7 @@ connection: close
                 session_root: root.path().to_path_buf(),
                 sessions,
                 session_store: Arc::clone(&session_store),
-                receipts: Arc::new(sqlite_receipts().await),
+                receipts: Arc::new(receipts_on(&scratch).await),
                 executor_factory: default_host_executor_factory(),
             },
             HostCommand::Prompt {
@@ -13237,6 +13269,7 @@ connection: close
                 .collect::<Vec<_>>(),
             [session_id]
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -13357,7 +13390,10 @@ connection: close
                 recursive: false,
             },
         };
-        let receipts: Arc<dyn ReceiptBackend> = Arc::new(sqlite_receipts().await);
+        // The session store owns schema bootstrap for the whole database,
+        // including the receipt tier this test writes to.
+        let (scratch, _store) = crate::session_store::postgres::testing::session_store().await;
+        let receipts: Arc<dyn ReceiptBackend> = Arc::new(receipts_on(&scratch).await);
         receipts.begin(request.request_id, &request).await.unwrap();
 
         let response = filesystem_response(receipts.as_ref(), &test_config(root.path()), &request)
@@ -13380,6 +13416,7 @@ connection: close
                 .unwrap(),
             ReceiptState::Terminal(_)
         ));
+        scratch.discard().await;
     }
 
     #[cfg(unix)]
@@ -13400,7 +13437,10 @@ connection: close
             timeout_ms: 1_000,
             output_max_bytes: 1_024,
         };
-        let receipts: Arc<dyn ReceiptBackend> = Arc::new(sqlite_receipts().await);
+        // The session store owns schema bootstrap for the whole database,
+        // including the receipt tier this test writes to.
+        let (scratch, _store) = crate::session_store::postgres::testing::session_store().await;
+        let receipts: Arc<dyn ReceiptBackend> = Arc::new(receipts_on(&scratch).await);
         receipts.begin(request.request_id, &request).await.unwrap();
 
         let response =
@@ -13420,6 +13460,7 @@ connection: close
                 ..
             }
         ));
+        scratch.discard().await;
     }
 
     #[test]

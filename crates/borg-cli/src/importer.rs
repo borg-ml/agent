@@ -174,14 +174,10 @@ pub(crate) async fn execute(
     threads: bool,
     memory: bool,
 ) -> Result<ImportReport> {
-    let database = borg_remote::default_host_config_path()
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("sessions/sessions.sqlite3");
-    // Import writes into the canonical journal, whichever backend that is.
+    // Import writes into the canonical journal.
     let store = std::sync::Arc::clone(
         borg_remote::session_store::factory::open(
-            &borg_remote::session_store::factory::SessionStoreConfig::from_env(database),
+            &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
         )
         .await?
         .session(),
@@ -501,7 +497,7 @@ fn read_line(prompt: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use borg_remote::{SessionStore, SqliteSessionStore};
+    use borg_remote::SessionStore;
 
     #[tokio::test]
     async fn portable_import_preserves_history_copies_attachments_and_skips_duplicates() {
@@ -526,9 +522,7 @@ mod tests {
             yes: true,
             json: false,
         };
-        let store = SqliteSessionStore::open(root.path().join("borg.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
         let memories = root.path().join("imports/memory");
         let plan = prepare(&args).await.unwrap();
         assert_eq!(plan.counts(), (1, 1));
@@ -579,6 +573,7 @@ mod tests {
             .unwrap();
         assert_eq!(report.duplicates_skipped, 2);
         assert_eq!(store.read(id).await.unwrap().len(), events.len());
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -615,14 +610,13 @@ mod tests {
         assert!(plan.threads.is_empty());
         assert_eq!(plan.staged_threads.len(), 1);
         std::fs::remove_file(transcript).unwrap();
-        let store = SqliteSessionStore::open(root.path().join("borg.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
         let report = execute_into(plan, true, false, &store, &root.path().join("memory"))
             .await
             .unwrap();
         assert_eq!(report.threads_copied, 1);
         assert!(store.read(report.session_ids[0]).await.unwrap().iter().any(|event| matches!(&event.kind, SessionEventKind::Message { text, .. } if text == "Answer")));
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -630,9 +624,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         for (threads, memory) in [(true, false), (false, true)] {
             let destination = root.path().join(format!("{threads}-{memory}"));
-            let store = SqliteSessionStore::open(destination.join("sessions.sqlite3"))
-                .await
-                .unwrap();
+            let (scratch, store) =
+                borg_remote::session_store::postgres::testing::session_store().await;
             let memories = destination.join("memory");
             let plan = PreparedImport {
                 staged_threads: Vec::new(),
@@ -670,6 +663,7 @@ mod tests {
                 usize::from(threads)
             );
             assert_eq!(memories.exists(), memory);
+            scratch.discard().await;
         }
     }
 }

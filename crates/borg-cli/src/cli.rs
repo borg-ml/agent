@@ -172,7 +172,7 @@ pub(crate) enum Command {
     Doctor {
         #[arg(long)]
         json: bool,
-        /// Include SQLite's exhaustive full-database integrity scan.
+        /// Include the exhaustive full-database integrity scan.
         #[arg(long)]
         deep: bool,
     },
@@ -296,28 +296,6 @@ pub(crate) enum SessionCommand {
         input: PathBuf,
         #[arg(long)]
         cwd: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Copy this machine's journal into another backend.
-    ///
-    /// Reads the configured source (BORG_SESSIONS_URL, or the local SQLite
-    /// journal) and replays it into `--to`. The source is never written to, so
-    /// this is safe to run against a journal that is still in use, and safe to
-    /// abandon part-way. Re-running it resumes.
-    Migrate {
-        /// Destination connection string, e.g. postgres://user@host/db.
-        #[arg(long)]
-        to: String,
-        /// Report what would be copied without writing anything.
-        #[arg(long)]
-        dry_run: bool,
-        /// Stop after this many sessions.
-        #[arg(long)]
-        limit: Option<u64>,
-        /// Abandon the run on the first failure instead of continuing past it.
-        #[arg(long)]
-        fail_fast: bool,
         #[arg(long)]
         json: bool,
     },

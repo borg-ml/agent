@@ -15,10 +15,11 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{Agent, ConnectionTo, Error, Responder, Stdio};
 use anyhow::{Context, Result};
 use borg_remote::{
-    ApprovalDecision, EventActor, HostCommand, LaunchSession, MessageStatus, PlanItemStatus,
-    PromptDelivery, ResponseLanguage, SessionCapabilities, SessionConfiguration, SessionEvent,
-    SessionEventKind, SessionStore, SessionWriterLease, default_host_config_path,
-    probe_provider_admission_capabilities, run_agent_session_with_writer,
+    ApprovalDecision, EventActor, HostCommand, LaunchSession, LocalAgentTurnExecutor,
+    MessageStatus, PlanItemStatus, PromptDelivery, ResponseLanguage, SessionCapabilities,
+    SessionConfiguration, SessionEvent, SessionEventKind, SessionStore, SessionWriterLease,
+    default_host_config_path, probe_provider_admission_capabilities,
+    run_agent_session_with_store_and_writer,
 };
 use tokio::sync::{Mutex, broadcast, mpsc};
 use uuid::Uuid;
@@ -50,9 +51,7 @@ pub(crate) async fn run(args: AcpArgs) -> Result<()> {
         .join("sessions");
     let store = Arc::clone(
         borg_remote::session_store::factory::open(
-            &borg_remote::session_store::factory::SessionStoreConfig::from_env(
-                sessions_dir.join("sessions.sqlite3"),
-            ),
+            &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
         )
         .await?
         .session(),
@@ -560,11 +559,20 @@ impl AcpRuntime {
             extension_skill_roots: Vec::new(),
             team_policy: None,
         };
-        let actor_lock = lock_path;
+        let actor_session_root = self.sessions_dir.clone();
+        let actor_store = Arc::clone(&self.store);
         tokio::spawn(async move {
-            if let Err(error) =
-                run_agent_session_with_writer(&actor_lock, id, launch, command_rx, event_tx, writer)
-                    .await
+            if let Err(error) = run_agent_session_with_store_and_writer(
+                &actor_session_root,
+                id,
+                launch,
+                command_rx,
+                event_tx,
+                Arc::new(LocalAgentTurnExecutor::default()),
+                actor_store,
+                writer,
+            )
+            .await
             {
                 tracing::error!(session_id = %id, %error, "ACP session actor failed");
             }
@@ -624,10 +632,20 @@ impl AcpRuntime {
             extension_skill_roots: Vec::new(),
             team_policy: None,
         };
+        let actor_session_root = self.sessions_dir.clone();
+        let actor_store = Arc::clone(&self.store);
         tokio::spawn(async move {
-            if let Err(error) =
-                run_agent_session_with_writer(&lock_path, id, launch, command_rx, event_tx, writer)
-                    .await
+            if let Err(error) = run_agent_session_with_store_and_writer(
+                &actor_session_root,
+                id,
+                launch,
+                command_rx,
+                event_tx,
+                Arc::new(LocalAgentTurnExecutor::default()),
+                actor_store,
+                writer,
+            )
+            .await
             {
                 tracing::error!(session_id = %id, %error, "resumed ACP session actor failed");
             }

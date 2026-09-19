@@ -14,8 +14,6 @@ use borg_provider::provider::{
     ClaudeAccountRateLimits, ClaudeRateLimitWindow, CodexAccountRateLimits, CodexRateLimitWindow,
     read_claude_account_rate_limits, read_codex_account_rate_limits,
 };
-#[cfg(test)]
-use borg_remote::SqliteSessionStore;
 use borg_remote::{
     AgentTurnExecutor, ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus,
     HostCommand, HostConfig, HostExecutionProfile, HostExecutorFactory, LaunchSession,
@@ -84,8 +82,8 @@ const RICH_TUI_HISTORY_PAGE_SIZE: usize = 512;
 const RICH_TUI_PROMPT_HISTORY_LIMIT: usize = 64;
 /// Bounded fan-out for per-child resume reads.
 ///
-/// Matched to the SQLite pool so a large team saturates the available
-/// connections without queueing work the store cannot start anyway.
+/// Matched to the store's connection pool so a large team saturates the
+/// available connections without queueing work the store cannot start anyway.
 const SUBAGENT_HYDRATION_CONCURRENCY: usize = 4;
 type BluDiscoveryResult = Result<(
     crate::extensions::ExtensionCatalog,
@@ -1366,9 +1364,8 @@ fn should_use_detached_session_host(args: &LocalAgentCliArgs) -> bool {
 }
 
 // Every caller runs on the interactive launch path before the first frame, so
-// this must not take the global SQLite writer lock merely to re-verify a schema
-// that is already current: a busy journal would otherwise stall the menu behind
-// the writer wait.
+// this must not re-verify a schema that is already current: the extra work
+// would stall the menu before it can draw.
 async fn open_local_session_store() -> Result<Arc<dyn SessionStore>> {
     let sessions_dir = default_host_config_path()
         .parent()
@@ -1379,10 +1376,7 @@ async fn open_local_session_store() -> Result<Arc<dyn SessionStore>> {
     // `OpenSessionStore` for why resolving them is deferred.
     Ok(Arc::clone(
         borg_remote::session_store::factory::open(
-            &borg_remote::session_store::factory::SessionStoreConfig::from_env(
-                sessions_dir.join("sessions.sqlite3"),
-            )
-            .interactive(true),
+            &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
         )
         .await?
         .session(),
@@ -1706,23 +1700,11 @@ fn print_mode_banner() {
 }
 
 pub(crate) async fn print_local_workspaces(json: bool) -> Result<()> {
-    let host_config_path = default_host_config_path();
-    let sessions_dir = host_config_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("sessions");
-    let session_path = sessions_dir.join("sessions.sqlite3");
-    let config = borg_remote::session_store::factory::SessionStoreConfig::from_env(&session_path);
-    // Listing workspaces must not CREATE a database. On SQLite that means
-    // skipping a journal that does not exist yet; a configured Postgres URL
-    // names a server that is expected to be there, so it is always consulted
-    // and a connection failure is reported rather than silently shown as "no
-    // workspaces".
-    let absent = config.backend() == borg_remote::session_store::factory::SessionBackend::Sqlite
-        && !session_path.is_file();
-    let workspaces = if absent {
-        Vec::new()
-    } else {
+    let config = borg_remote::session_store::factory::SessionStoreConfig::from_env();
+    // The configured URL names a server that is expected to be there, so it is
+    // always consulted and a connection failure is reported rather than
+    // silently shown as "no workspaces".
+    let workspaces = {
         let resolved = borg_remote::session_store::factory::open_resolved(&config).await?;
         let display_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
         resolved
@@ -1757,7 +1739,7 @@ enum SessionSwitch {
 /// Durable session projection advanced by the same ordered event stream the
 /// local TUI consumes.
 ///
-/// The SQLite projection can be ahead of this stream because the session actor
+/// The durable projection can be ahead of this stream because the session actor
 /// commits an event before forwarding it. Keeping a delivery-aligned projection
 /// prevents an asynchronous store read from moving the UI backward or forward
 /// across events it has not rendered yet.
@@ -2035,18 +2017,15 @@ async fn run_local_agent_session(
     // resolves every satellite tier up front and fails if one is missing, so a
     // misconfigured backend is a startup error rather than a stall later on.
     let opened = borg_remote::session_store::factory::open(
-        &borg_remote::session_store::factory::SessionStoreConfig::from_env(
-            sessions_dir.join("sessions.sqlite3"),
-        )
-        .interactive(interactive_store_open || args.session_host.is_some()),
+        &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
     )
     .await?;
-    let sqlite_store = Arc::clone(opened.session());
+    let durable_store = Arc::clone(opened.session());
     let store_open_ms = store_open_started.elapsed().as_millis() as u64;
     let session_id = if let Some(session_id) =
         selected_session.or(args.resume).or(args.session_host)
     {
-        session_id_if_present(sqlite_store.as_ref(), session_id).await?
+        session_id_if_present(durable_store.as_ref(), session_id).await?
     } else if args.continue_latest {
         let current_dir = args
             .cwd
@@ -2054,7 +2033,7 @@ async fn run_local_agent_session(
             .unwrap_or_else(|| Path::new("."))
             .canonicalize()
             .context("current project directory does not exist")?;
-        latest_session_id_in_directory(&sessions_dir, sqlite_store.as_ref(), &current_dir)
+        latest_session_id_in_directory(&sessions_dir, durable_store.as_ref(), &current_dir)
             .await?
             .context("there are no non-empty local Borg sessions to continue in this directory")?
     } else {
@@ -2063,7 +2042,7 @@ async fn run_local_agent_session(
     crash_context.set_session_id(session_id);
     let lock_path = sessions_dir.join(format!("{session_id}.lock"));
     let control_socket_path = session_control_socket_path(&sessions_dir, session_id);
-    let remote_launch_present = sqlite_store
+    let remote_launch_present = durable_store
         .load_host_launch_metadata(session_id)
         .await?
         .is_some();
@@ -2074,27 +2053,27 @@ async fn run_local_agent_session(
         LocalSessionAccess::Attached
     };
     // A competing launcher may have started the host while this process opened
-    // SQLite. A host must never become a viewer or stop the winning owner.
+    // the store. A host must never become a viewer or stop the winning owner.
     if args.session_host.is_some() && session_access.is_attached() {
         return Ok(None);
     }
-    if !sqlite_store.contains_session(session_id).await? {
+    if !durable_store.contains_session(session_id).await? {
         anyhow::ensure!(
             !session_access.is_attached(),
-            "local Borg session {session_id} has no SQLite state"
+            "local Borg session {session_id} has no durable state"
         );
         if let Some(workspace_id) = args.workspace {
-            sqlite_store
+            durable_store
                 .create_session_in_workspace(session_id, workspace_id)
                 .await?;
         } else {
-            sqlite_store.create_session(session_id).await?;
+            durable_store.create_session(session_id).await?;
         }
     }
     // Past the ownership race: this process is running, so prove every tier is
     // present before entering any loop that would otherwise retry a missing one
-    // forever. A host that exited above never reaches here, and so never takes
-    // the SQLite writer lock to build tiers it would not have used.
+    // forever. A host that exited above never reaches here, and so never pays
+    // to build tiers it would not have used.
     let resolved = opened.resolve().await?;
     let store: Arc<dyn SessionStore> = Arc::clone(resolved.session());
     let mut session_state = store.state(session_id).await?;
@@ -2513,7 +2492,7 @@ async fn run_local_agent_session(
     let (session_command_tx, session_commands) = mpsc::channel(64);
     // The owned actor is the single ordered live source. A generous bounded
     // queue absorbs bursty child/tool traffic while preserving backpressure;
-    // do not merge the same actor stream back through SQLite here, because a
+    // do not merge the same actor stream back through the store here, because a
     // durable boundary can delete its preceding live row before that second
     // reader observes it and permanently desynchronise the owner UI.
     let (session_event_tx, mut session_events) = mpsc::channel(4_096);
@@ -2546,7 +2525,7 @@ async fn run_local_agent_session(
         ))
     } else {
         let writer = writer.expect("session owner holds writer lease");
-        let actor_store = Arc::clone(&sqlite_store);
+        let actor_store = Arc::clone(&durable_store);
         let actor_session_root = sessions_dir.clone();
         tokio::spawn(async move {
             if initial_peers.is_empty() {
@@ -2751,7 +2730,7 @@ async fn run_local_agent_session(
     }
     let mut displayed_update_notice = startup_update_notice;
     if interactive_store_open || args.session_host.is_some() {
-        let maintenance_store = Arc::clone(&sqlite_store);
+        let maintenance_store = Arc::clone(&durable_store);
         tokio::spawn(async move {
             if let Err(error) = maintenance_store.finish_interactive_open(session_id).await {
                 tracing::warn!(%session_id, %error, "deferred local store maintenance failed");
@@ -4585,14 +4564,14 @@ async fn run_local_agent_session(
                     continue;
                 }
                 if line == "/resume" {
-                    print_recent_sessions(&sessions_dir, sqlite_store.as_ref(), session_id, &cwd)
+                    print_recent_sessions(&sessions_dir, durable_store.as_ref(), session_id, &cwd)
                         .await?;
                     continue;
                 }
                 if let Some(target) = line.strip_prefix("/resume ") {
                     match resolve_resume_switch(
                         &sessions_dir,
-                        sqlite_store.as_ref(),
+                        durable_store.as_ref(),
                         session_id,
                         target,
                         session_access,
@@ -4814,7 +4793,7 @@ async fn run_local_agent_session(
                 // Resume hydration is deliberately deferred until after the
                 // first paint. Never await it from a key handler: even history
                 // recall must leave the input/render loop schedulable while
-                // SQLite or the filesystem is slow.
+                // the store or the filesystem is slow.
                 if terminal_event.is_up() {
                     let should_wait_for_composer_history = terminal
                         .as_ref()
@@ -6700,7 +6679,7 @@ async fn run_local_agent_session(
                                     .set_notice("Session lookup is still running".to_string());
                             } else {
                                 let lookup_sessions_dir = sessions_dir.clone();
-                                let lookup_store = Arc::clone(&sqlite_store);
+                                let lookup_store = Arc::clone(&durable_store);
                                 let lookup_cwd = cwd.clone();
                                 resume_lookup_task = Some(tokio::spawn(async move {
                                     ResumeLookupResult::Options(
@@ -6730,7 +6709,7 @@ async fn run_local_agent_session(
                                     .set_notice("Session lookup is still running".to_string());
                             } else {
                                 let lookup_sessions_dir = sessions_dir.clone();
-                                let lookup_store = Arc::clone(&sqlite_store);
+                                let lookup_store = Arc::clone(&durable_store);
                                 let target = target.to_string();
                                 resume_lookup_task = Some(tokio::spawn(async move {
                                     ResumeLookupResult::Switch(
@@ -7303,7 +7282,7 @@ async fn run_local_agent_session(
         user_requested_exit,
         relaunches_same_session,
     ) {
-        match sqlite_store.discard_empty_session(session_id).await {
+        match durable_store.discard_empty_session(session_id).await {
             Ok(discarded) => discarded,
             Err(error) => {
                 tracing::warn!(%session_id, %error, "failed to discard empty local session");
@@ -7842,11 +7821,7 @@ fn relaunch_prompt(
 
 fn local_resume_error_is_retryable(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}").to_ascii_lowercase();
-    message.contains("database is locked")
-        || message.contains("database table is locked")
-        || message.contains("database is busy")
-        || message.contains("pool timed out")
-        || message.contains("database or disk is full")
+    message.contains("pool timed out")
         || message.contains("no space left on device")
 }
 
@@ -8553,7 +8528,7 @@ async fn load_subagent_thread_state(
     reconcile_subagent_snapshots(store, sessions_dir, &mut team_snapshots).await;
     // A large team hydrates one bounded tail per child. Run those reads with
     // bounded concurrency instead of one round trip at a time: a session with
-    // two dozen subagents otherwise serialises dozens of SQLite queries behind
+    // two dozen subagents otherwise serialises dozens of store queries behind
     // each other before the team panel can leave its hydrating state.
     let child_histories = futures_util::stream::iter(
         team_snapshots

@@ -427,9 +427,7 @@ async fn host(session_id: Uuid, relay: &str) -> Result<()> {
         .join("sessions");
     let store = Arc::clone(
         borg_remote::session_store::factory::open(
-            &borg_remote::session_store::factory::SessionStoreConfig::from_env(
-                sessions_dir.join("sessions.sqlite3"),
-            ),
+            &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
         )
         .await?
         .session(),

@@ -7,8 +7,8 @@ use anyhow::{Context, Result, ensure};
 use borg_remote::{
     AgentTurnExecutor, ApprovalDecision, CodingProvider, ConsultationRequest, HostCommand,
     LaunchSession, LocalAgentTurnExecutor, MessageStatus, ModelAccessContext, PermissionMode,
-    PromptDelivery, ResponseLanguage, SessionEventKind, SessionStore, SqliteSessionStore,
-    run_agent_session_with_executor,
+    PromptDelivery, ResponseLanguage, SessionEventKind, SessionStore, SessionWriterLease,
+    run_agent_session_with_store_and_writer,
 };
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -33,14 +33,25 @@ async fn probe() -> Result<()> {
     let nonce = Uuid::new_v4().to_string();
     tokio::fs::write(root.path().join("probe.txt"), &nonce).await?;
     let session_id = Uuid::new_v4();
+    // The probe runs against this machine's configured journal, the same one
+    // every other entry point opens.
+    let store = Arc::clone(
+        borg_remote::session_store::factory::open_resolved(
+            &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
+        )
+        .await?
+        .session(),
+    );
     for resumed in [false, true] {
         let (commands, command_rx) = mpsc::channel(8);
         let (events, mut event_rx) = mpsc::channel(128);
         let cwd = root.path().to_path_buf();
         let message_id = Uuid::new_v4();
+        let actor_store = Arc::clone(&store);
+        let writer = SessionWriterLease::acquire(root.path().join("session.lock"))?;
         let actor = tokio::spawn(async move {
-            run_agent_session_with_executor(
-                &cwd.join("session.lock"), session_id,
+            run_agent_session_with_store_and_writer(
+                &cwd, session_id,
                 LaunchSession {
                     request_id: message_id, cwd: cwd.clone(), provider: CodingProvider::Codex,
                     model: Some(borg_provider::codex_product_model().into()),
@@ -54,6 +65,8 @@ async fn probe() -> Result<()> {
                     extension_skill_roots: Vec::new(), team_policy: None,
                 }, command_rx, events,
                 Arc::new(LocalAgentTurnExecutor::default()),
+                actor_store,
+                writer,
             ).await
         });
         let result: Result<()> = async {
@@ -188,7 +201,6 @@ async fn probe() -> Result<()> {
         let _ = commands.send(HostCommand::Stop { session_id }).await;
         actor.await??;
         result?;
-        let store = SqliteSessionStore::open(root.path().join("sessions.sqlite3")).await?;
         let journal = store.read(session_id).await?;
         let native_outputs = journal
             .iter()
@@ -258,9 +270,17 @@ async fn control_probe() -> Result<()> {
         let (commands, command_rx) = mpsc::channel(8);
         let (events, mut event_rx) = mpsc::channel(128);
         let cwd = root.path().to_path_buf();
+        let store = Arc::clone(
+            borg_remote::session_store::factory::open_resolved(
+                &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
+            )
+            .await?
+            .session(),
+        );
+        let writer = SessionWriterLease::acquire(root.path().join("session.lock"))?;
         let actor = tokio::spawn(async move {
-            run_agent_session_with_executor(
-                &cwd.join("session.lock"), session_id,
+            run_agent_session_with_store_and_writer(
+                &cwd, session_id,
                 LaunchSession {
                     request_id: message_id, cwd: cwd.clone(), provider: CodingProvider::Codex,
                     model: Some(borg_provider::codex_product_model().into()),
@@ -272,6 +292,8 @@ async fn control_probe() -> Result<()> {
                     extension_skill_roots: Vec::new(), team_policy: None,
                 }, command_rx, events,
                 Arc::new(LocalAgentTurnExecutor::default()),
+                store,
+                writer,
             ).await
         });
         let result = tokio::time::timeout(Duration::from_secs(90), async {

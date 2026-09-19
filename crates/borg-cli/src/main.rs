@@ -106,17 +106,11 @@ async fn run_gui(session: Option<uuid::Uuid>) -> Result<()> {
 }
 
 async fn doctor(json: bool, deep: bool) -> Result<()> {
-    let sessions_dir = borg_remote::default_host_config_path()
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("sessions");
-    // `borg doctor` reports on whichever backend this machine is configured
-    // for, so it opens through the factory like everything else. Journal only:
-    // a health report must not create satellite schemas as a side effect.
+    // `borg doctor` reports on the journal this machine is configured for, so
+    // it opens through the factory like everything else. Journal only: a
+    // health report must not create satellite schemas as a side effect.
     let opened = borg_remote::session_store::factory::open(
-        &borg_remote::session_store::factory::SessionStoreConfig::from_env(
-            sessions_dir.join("sessions.sqlite3"),
-        ),
+        &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
     )
     .await?;
     let store = opened.session();
@@ -138,10 +132,6 @@ async fn doctor(json: bool, deep: bool) -> Result<()> {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                // Which engine produced the report. The health fields are
-                // SQLite-shaped and mapped onto Postgres equivalents, so
-                // without this an operator cannot tell the two apart.
-                "session_backend": opened.backend().as_str(),
                 "session_store": health,
                 "coding_plan": borg_provider::subscription::describe(),
                 "runtimes": runtimes
@@ -165,7 +155,6 @@ async fn doctor(json: bool, deep: bool) -> Result<()> {
             }))?
         );
     } else {
-        println!("Session backend: {}", opened.backend());
         println!(
             "Durable session store: {}",
             if health.is_ready() {
@@ -182,24 +171,6 @@ async fn doctor(json: bool, deep: bool) -> Result<()> {
                 "not checked (run `borg doctor --deep`)"
             }
         );
-        // These two lines report SQLite pragmas and its write-ahead log. On
-        // Postgres they described nothing, and printing "sqlite: ..." under
-        // "Session backend: postgres" read as though the report had come from
-        // the wrong database. Now that Postgres is the default, every user
-        // would have seen that.
-        if opened.backend() == borg_remote::session_store::factory::SessionBackend::Sqlite {
-            println!(
-                "  sqlite: {} · synchronous={} · foreign_keys={}",
-                health.journal_mode, health.synchronous, health.foreign_keys
-            );
-            println!(
-                "  WAL: busy={} · log={} · checkpointed={} · retained limit={} MiB",
-                health.wal_busy,
-                health.wal_log_frames,
-                health.wal_checkpointed_frames,
-                health.journal_size_limit_bytes / (1024 * 1024)
-            );
-        }
         println!(
             "  durable rows: {} sessions · {} events · {} payloads",
             health.sessions, health.events, health.payloads
