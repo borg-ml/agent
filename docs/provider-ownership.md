@@ -551,3 +551,18 @@ that exceeded its timing threshold in the earlier run. The edited TUI source
 and tests have clean targeted LSP diagnostics. Fresh device approval is still
 unverified and requires human confirmation before replacing the selected Pro
 authority through a new sign-in.
+
+
+A follow-up verification ran both ignored inspector-identity tests in a real
+pseudoterminal, serially: 2 passed. Selection stayed anchored through plan/goal
+updates and late-message reordering. The provider library suite with
+`subscription-adapters` enabled also passed: 127 tests, 3 ignored, no failures,
+including concurrent credential rotation and foreign-account rejection.
+
+A second native Pro cache probe, again with executable launches denied,
+reported first-round input 8,278 (0 cached), then 133 uncached + 8,192 cached
+input tokens (98.40% cached). Both native samples therefore retained the same
+8,192-token warm prefix; their cached fractions were 98.34% and 98.40%, versus
+98.90% and 98.88% for the two external Codex samples. This strengthens
+repeatability for the measured workload without asserting byte-identical or
+universal parity. No new device sign-in was initiated for these checks.
