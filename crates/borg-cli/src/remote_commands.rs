@@ -1222,11 +1222,15 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
     let mut reusable_terminal = None;
     let mut resume_retry_delay = LOCAL_RESUME_RETRY_INITIAL_DELAY;
     loop {
-        if let Some(session_id) = detached_session {
+        if let Some((session_id, include_initial_prompt)) = detached_host_target(
+            detached_session,
+            selected_session,
+            include_initial_host_prompt,
+        ) {
             match ensure_detached_session_host(
                 &args,
                 session_id,
-                include_initial_host_prompt,
+                include_initial_prompt,
                 &mut reusable_terminal,
             )
             .await
@@ -1339,6 +1343,16 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
             Err(payload) => panic::resume_unwind(payload),
         };
     }
+}
+
+fn detached_host_target(
+    initial_session: Option<Uuid>,
+    selected_session: Option<Uuid>,
+    include_initial_prompt: bool,
+) -> Option<(Uuid, bool)> {
+    initial_session
+        .zip(selected_session)
+        .map(|(initial, selected)| (selected, include_initial_prompt && selected == initial))
 }
 
 fn should_use_detached_session_host(args: &LocalAgentCliArgs) -> bool {

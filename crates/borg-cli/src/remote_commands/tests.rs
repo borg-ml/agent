@@ -3481,3 +3481,25 @@ async fn resume_hydration_over_a_real_session_store_is_bounded() {
         queue.len(),
     );
 }
+
+#[test]
+fn detached_host_tracks_session_switch_and_revert_without_replaying_launch_prompt() {
+    let initial = Uuid::new_v4();
+    let resumed = Uuid::new_v4();
+    let reverted = Uuid::new_v4();
+    assert_eq!(
+        detached_host_target(Some(initial), Some(initial), true),
+        Some((initial, true))
+    );
+    for selected in [resumed, reverted] {
+        assert_eq!(
+            detached_host_target(Some(initial), Some(selected), true),
+            Some((selected, false))
+        );
+    }
+    assert_eq!(
+        detached_host_target(Some(initial), Some(initial), false),
+        Some((initial, false))
+    );
+    assert_eq!(detached_host_target(None, Some(resumed), true), None);
+}
