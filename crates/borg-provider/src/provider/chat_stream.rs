@@ -982,7 +982,29 @@ fn parse_claude_account_rate_limits(value: &Value) -> Result<ClaudeAccountRateLi
 #[cfg(feature = "codex")]
 async fn read_codex_account_rate_limits_inner() -> Result<CodexAccountRateLimits> {
     let response = codex_account_request("account/rateLimits/read", serde_json::json!({})).await?;
-    parse_codex_account_rate_limits(&response)
+    let mut limits = parse_codex_account_rate_limits(&response)?;
+    if limits
+        .plan_type
+        .as_deref()
+        .is_none_or(|plan| plan.trim().is_empty())
+        && let Ok(Ok(account)) = tokio::time::timeout(
+            Duration::from_secs(2),
+            codex_account_request("account/read", serde_json::json!({"refreshToken": false})),
+        )
+        .await
+        && account
+            .pointer("/result/account/type")
+            .and_then(Value::as_str)
+            == Some("chatgpt")
+    {
+        limits.plan_type = account
+            .pointer("/result/account/planType")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|plan| !plan.is_empty())
+            .map(str::to_owned);
+    }
+    Ok(limits)
 }
 
 pub(super) async fn codex_account_request(method: &str, params: Value) -> Result<Value> {

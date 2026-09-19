@@ -1671,10 +1671,17 @@ fn codex_auth_status_authenticated(output: &str) -> bool {
             .or_else(|| value.get("authenticated"))
             .and_then(serde_json::Value::as_bool)
     {
-        return authenticated;
+        let method = value
+            .get("authMethod")
+            .or_else(|| value.get("auth_mode"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        return authenticated && !matches!(method, "apikey" | "api_key" | "api-key");
     }
     let normalized = output.to_ascii_lowercase();
-    !normalized.trim().is_empty()
+    !normalized.contains("api key")
+        && !normalized.contains("apikey")
+        && !normalized.trim().is_empty()
         && !normalized.contains("not logged in")
         && !normalized.contains("logged out")
         && !normalized.contains("unauthenticated")
@@ -1762,13 +1769,12 @@ pub fn provider_credentials_present(provider: CodingProvider) -> bool {
     }
 }
 
-fn provider_login_command(provider: CodingProvider) -> Result<Command> {
+fn provider_login_command(provider: CodingProvider, mut command: Command) -> Result<Command> {
     if provider.uses_native_harness() {
         bail!(
             "{provider:?} uses API credentials from the environment; configure the provider key and endpoint variables"
         );
     }
-    let mut command = Command::new(provider.executable());
     match provider {
         CodingProvider::Codex => {
             command.args(["login", "--device-auth"]);
@@ -1790,7 +1796,11 @@ fn provider_login_command(provider: CodingProvider) -> Result<Command> {
 }
 
 pub async fn login_provider(provider: CodingProvider) -> Result<()> {
-    let status = provider_login_command(provider)?
+    let command = match provider {
+        CodingProvider::Codex => borg_provider::provider_bin::codex_command().await?,
+        _ => Command::new(provider.executable()),
+    };
+    let status = provider_login_command(provider, command)?
         .status()
         .await
         .with_context(|| format!("failed to start {} login", provider.executable()))?;
@@ -1805,6 +1815,7 @@ pub async fn login_provider(provider: CodingProvider) -> Result<()> {
     })?;
     anyhow::ensure!(
         match provider {
+            CodingProvider::Codex => codex_auth_status_authenticated(&auth),
             CodingProvider::Claude => claude_auth_status_authenticated(&auth),
             _ => !auth.trim().is_empty(),
         },
@@ -1836,7 +1847,11 @@ pub async fn login_provider_with_output(
     provider: CodingProvider,
     mut on_output: impl FnMut(&str) + Send,
 ) -> Result<()> {
-    let mut command = provider_login_command(provider)?;
+    let command = match provider {
+        CodingProvider::Codex => borg_provider::provider_bin::codex_command().await?,
+        _ => Command::new(provider.executable()),
+    };
+    let mut command = provider_login_command(provider, command)?;
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1875,6 +1890,7 @@ pub async fn login_provider_with_output(
     })?;
     anyhow::ensure!(
         match provider {
+            CodingProvider::Codex => codex_auth_status_authenticated(&auth),
             CodingProvider::Claude => claude_auth_status_authenticated(&auth),
             _ => !auth.trim().is_empty(),
         },
@@ -6181,7 +6197,7 @@ mod tests {
 
     #[test]
     fn native_provider_login_commands_use_non_terminal_flows() {
-        let codex = provider_login_command(CodingProvider::Codex).unwrap();
+        let codex = provider_login_command(CodingProvider::Codex, Command::new("codex")).unwrap();
         assert_eq!(
             codex
                 .as_std()
@@ -6190,7 +6206,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["login", "--device-auth"]
         );
-        let claude = provider_login_command(CodingProvider::Claude).unwrap();
+        let claude =
+            provider_login_command(CodingProvider::Claude, Command::new("claude")).unwrap();
         assert_eq!(
             claude
                 .as_std()
@@ -13389,6 +13406,12 @@ connection: close
     fn codex_auth_status_rejects_non_authenticated_status_text() {
         assert!(codex_auth_status_authenticated("Logged in using ChatGPT"));
         assert!(codex_auth_status_authenticated("authenticated"));
+        assert!(!codex_auth_status_authenticated(
+            "Logged in using an API key"
+        ));
+        assert!(!codex_auth_status_authenticated(
+            r#"{"loggedIn":true,"authMethod":"apikey"}"#
+        ));
         assert!(!codex_auth_status_authenticated("Not logged in"));
         assert!(!codex_auth_status_authenticated(""));
     }
