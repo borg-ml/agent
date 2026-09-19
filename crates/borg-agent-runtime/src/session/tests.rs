@@ -699,6 +699,7 @@ async fn durable_session_events_project_once_into_the_bound_workspace() {
                     body: crate::WorkspaceMessageBody {
                         text: "coordinate this".to_string(),
                         mentions: Vec::new(),
+                        attachments: Vec::new(),
                     },
                     audience: crate::Audience::Direct {
                         participant: binding.participant_id,
@@ -1025,6 +1026,7 @@ async fn a_forked_session_never_reprojects_the_inherited_ancestry() {
                     body: crate::WorkspaceMessageBody {
                         text: "coordinate this".to_string(),
                         mentions: Vec::new(),
+                        attachments: Vec::new(),
                     },
                     audience: crate::Audience::Direct {
                         participant: binding.participant_id,
@@ -13373,6 +13375,7 @@ async fn imported_relay_message_wakes_the_actor_as_system_provenance() {
                 body: crate::WorkspaceMessageBody {
                     text: "the benchmark rerun finished".to_string(),
                     mentions: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 audience: crate::Audience::Direct {
                     participant: binding.participant_id,
@@ -15016,6 +15019,7 @@ async fn append_team_message(
                     body: crate::WorkspaceMessageBody {
                         text: text.to_string(),
                         mentions: Vec::new(),
+                        attachments: Vec::new(),
                     },
                     audience: crate::Audience::Direct {
                         participant: binding.participant_id,
