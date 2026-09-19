@@ -2248,7 +2248,7 @@ async fn run_agent_session_store_kernel_inner(
                                                     session_id,
                                                     message_id: message.message_id,
                                                     text: message.text,
-                                                    attachments: Vec::new(),
+                                                    attachments: message.attachments,
                                                     output_schema: None,
                                                     delivery: message.delivery,
                                                 })
@@ -4416,7 +4416,7 @@ async fn run_agent_session_store_kernel_inner(
                                 session_id,
                                 message_id: message.message_id,
                                 text: message.text,
-                                attachments: Vec::new(),
+                                attachments: message.attachments,
                                 output_schema: None,
                                 delivery: message.delivery,
                             });
@@ -5193,6 +5193,27 @@ async fn run_agent_session_store_kernel_inner(
                                 executor.uses_native_harness(launch.provider),
                             ) =>
                         {
+                            // Ask the turn to stop before doing any durable work.
+                            // Pausing the goal and latching the stop gate are both
+                            // journal round trips, and `record` can additionally
+                            // spend a live-delivery window on a lagging observer --
+                            // exactly the state a flood of subagent notes puts the
+                            // session in. Paying that before signalling put journal
+                            // I/O inside the human's Escape latency, which is the
+                            // one interval a human actually feels.
+                            //
+                            // The snapshot stays ahead of the signal: it is pure
+                            // in-memory bookkeeping that must describe the instant
+                            // Escape was received, and `pending` is owned by this
+                            // task, so no await below can change it. Both records
+                            // still happen before any successor can be admitted, so
+                            // the stop gate is as durable as it was.
+                            snapshot_stale_user_prompts(&mut stale_user_prompts, &pending);
+                            stale_user_prompts.extend(
+                                pending_steers.iter().map(|steer| steer.prompt.message_id),
+                            );
+                            retry_not_before = None;
+                            control_tx.send(AgentTurnControl::Interrupt).await.ok();
                             pause_active_goal(
                                 &mut journal,
                                 &events,
@@ -5200,10 +5221,6 @@ async fn run_agent_session_store_kernel_inner(
                                 &mut goal,
                                 &mut goal_active_since,
                             ).await?;
-                            snapshot_stale_user_prompts(&mut stale_user_prompts, &pending);
-                            stale_user_prompts.extend(
-                                pending_steers.iter().map(|steer| steer.prompt.message_id),
-                            );
                             set_user_stop(
                                 &mut journal,
                                 &events,
@@ -5211,8 +5228,6 @@ async fn run_agent_session_store_kernel_inner(
                                 &mut user_stop,
                                 true,
                             ).await?;
-                            retry_not_before = None;
-                            control_tx.send(AgentTurnControl::Interrupt).await.ok();
                             if pending_approval.as_ref().is_some_and(|pending| pending.response.is_some()) {
                                 deny_pending_approval(&mut journal, &events, session_id, &mut pending_approval).await?;
                             }
@@ -7965,7 +7980,7 @@ fn defer_root_inbox_behind_current_command(
             session_id,
             message_id: message.message_id,
             text: message.text,
-            attachments: Vec::new(),
+            attachments: message.attachments,
             output_schema: None,
             delivery: message.delivery,
         });
