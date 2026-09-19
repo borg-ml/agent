@@ -78,6 +78,9 @@ impl GenerationActivity {
             {
                 self.pending.remove(&None);
             }
+            SessionEventKind::ProviderEvent { kind, .. } if kind == "native_steer_applied" => {
+                self.pending.clear();
+            }
             SessionEventKind::ToolStarted {
                 tool_call_id,
                 name,
@@ -153,6 +156,36 @@ mod tests {
             kind: kind.into(),
             payload: json!({"tool_call_id": id, "label": label}),
         }
+    }
+
+    #[test]
+    fn steering_retires_abandoned_tool_argument_generation() {
+        let mut state = GenerationActivity::new(CodingProvider::Codex);
+        let start = Instant::now();
+        state.observe(input("action/preparing", Some("old"), "edit"), start);
+        state.observe(input("action/preparing", None, ""), start);
+        assert_eq!(state.expire(start + INPUT_IDLE_TIMEOUT).len(), 2);
+        state.observe(
+            input("native_steer_applied", None, ""),
+            start + INPUT_IDLE_TIMEOUT,
+        );
+        assert!(state.expire(start + INPUT_IDLE_TIMEOUT * 2).is_empty());
+        assert!(
+            state
+                .observe(
+                    input("action/input_delta", Some("old"), ""),
+                    start + INPUT_IDLE_TIMEOUT * 2
+                )
+                .is_none()
+        );
+        state.observe(
+            input("action/preparing", Some("new"), "read"),
+            start + INPUT_IDLE_TIMEOUT * 2,
+        );
+        let events = state.expire(start + INPUT_IDLE_TIMEOUT * 3);
+        assert!(
+            matches!(events.as_slice(), [SessionEventKind::ProviderEvent { payload, .. }] if payload["tool_call_id"] == "new")
+        );
     }
 
     #[test]

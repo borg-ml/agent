@@ -357,6 +357,7 @@ enum TranscriptEntry {
         /// status can only say the row is settled, so the partial text would
         /// otherwise read as a finished answer.
         user_interrupted: bool,
+        redirected: bool,
     },
     Activity {
         text: String,
@@ -1183,10 +1184,12 @@ impl Transcript {
                     detail
                         .as_deref()
                         .is_some_and(|detail| detail.eq_ignore_ascii_case("interrupted")),
+                    false,
                 );
             }
             SessionEventKind::ProviderEvent { kind, .. } if kind == "native_steer_applied" => {
-                self.finish_live_assistant_messages(event.created_at, true);
+                self.finish_live_assistant_messages(event.created_at, false, true);
+                self.settle_stale_preparations(event.created_at);
             }
             SessionEventKind::TurnCompleted { error, .. } => {
                 self.live_turn_closed = true;
@@ -1195,6 +1198,7 @@ impl Transcript {
                     error
                         .as_deref()
                         .is_some_and(|error| error.to_ascii_lowercase().contains("interrupted")),
+                    false,
                 );
             }
             _ => {}
@@ -1536,6 +1540,7 @@ impl Transcript {
                                 MessageStatus::Complete | MessageStatus::Failed
                             ),
                             user_interrupted: false,
+                            redirected: false,
                         },
                     );
                 }
@@ -3097,6 +3102,7 @@ impl Transcript {
         &mut self,
         completed_at: DateTime<Utc>,
         user_interrupted_turn: bool,
+        redirected_turn: bool,
     ) {
         for (index, entry) in self.order.iter_mut().enumerate() {
             let TranscriptEntry::Message {
@@ -3104,6 +3110,7 @@ impl Transcript {
                 status,
                 complete,
                 user_interrupted,
+                redirected,
                 ..
             } = entry
             else {
@@ -3117,6 +3124,7 @@ impl Transcript {
             // The stream stopped mid-sentence. Settling the row silently would
             // present the fragment as the assistant's finished answer.
             *user_interrupted = user_interrupted_turn;
+            *redirected = redirected_turn;
             self.message_markdown_cache
                 .get_mut()
                 .messages
@@ -3825,6 +3833,7 @@ impl Transcript {
                     status,
                     complete,
                     user_interrupted,
+                    redirected,
                 } => {
                     if *status == MessageStatus::Queued {
                         continue;
@@ -4004,9 +4013,14 @@ impl Transcript {
                             "    ◌ responding",
                             Style::default().fg(Color::Cyan),
                         )));
-                    } else if *actor == EventActor::Assistant && *user_interrupted {
+                    } else if *actor == EventActor::Assistant && (*user_interrupted || *redirected)
+                    {
                         lines.push(Line::from(Span::styled(
-                            "    ■ user interrupted",
+                            if *redirected {
+                                "    ↪ redirected by follow-up"
+                            } else {
+                                "    ■ user interrupted"
+                            },
                             Style::default().fg(Color::Red),
                         )));
                     }

@@ -1052,6 +1052,7 @@ fn transcript_attachment_rows_link_to_the_local_image() {
         status: MessageStatus::Complete,
         complete: true,
         user_interrupted: false,
+        redirected: false,
     });
 
     let rendered = transcript.render(100, None, None, None);
@@ -1086,6 +1087,7 @@ fn transcript_attachment_rows_link_to_the_local_image() {
         status: MessageStatus::Complete,
         complete: true,
         user_interrupted: false,
+        redirected: false,
     });
     assert!(
         transcript
@@ -2684,7 +2686,7 @@ fn generation_status_hides_action_description_and_preserves_the_card() {
             .join("\n");
         assert!(
             rendered.contains(if waiting {
-                "Waiting for provider…"
+                "Awaiting tool-call arguments…"
             } else {
                 "Generating tool call…"
             }),
@@ -3280,7 +3282,7 @@ fn action_status_updates_refresh_cached_transcript_text() {
             3,
             "action/generation_status",
             serde_json::json!({"waiting": true}),
-            "Waiting for provider…",
+            "Awaiting tool-call arguments…",
         ),
         (
             4,
@@ -7190,6 +7192,7 @@ fn transcript_copy_selection_can_move_beyond_last_assistant_message() {
         status: MessageStatus::Complete,
         complete: true,
         user_interrupted: false,
+        redirected: false,
     });
     transcript.order.push(TranscriptEntry::Activity {
         text: "subagent · completed".to_string(),
@@ -7224,6 +7227,7 @@ fn last_assistant_message_copy_ignores_later_activity_and_selection() {
         status: MessageStatus::Complete,
         complete: true,
         user_interrupted: false,
+        redirected: false,
     });
     transcript.order.push(TranscriptEntry::Activity {
         text: "finished".to_string(),
@@ -7255,6 +7259,7 @@ fn copied_markdown_message_omits_fenced_code_markers() {
         status: MessageStatus::Complete,
         complete: true,
         user_interrupted: false,
+        redirected: false,
     };
     assert_eq!(
         entry.copy_text_owned().as_deref(),
@@ -7287,6 +7292,7 @@ fn assistant_message_actions_stay_out_of_the_transcript() {
         status: MessageStatus::Complete,
         complete: true,
         user_interrupted: false,
+        redirected: false,
     });
 
     let idle = transcript.lines(80);
@@ -7324,6 +7330,7 @@ fn message_hover_shows_copy_hint_for_user_and_assistant() {
             status: MessageStatus::Complete,
             complete: false,
             user_interrupted: false,
+            redirected: false,
         },
         TranscriptEntry::Message {
             actor: EventActor::User,
@@ -7335,6 +7342,7 @@ fn message_hover_shows_copy_hint_for_user_and_assistant() {
             status: MessageStatus::Complete,
             complete: true,
             user_interrupted: false,
+            redirected: false,
         },
     ];
 
@@ -8589,7 +8597,7 @@ fn running_tool_suppresses_stale_response_spinner() {
 }
 
 #[test]
-fn redirected_reply_is_visibly_interrupted_not_a_finished_answer() {
+fn redirected_reply_is_marked_as_redirected_not_user_interrupted() {
     let mut transcript = Transcript::default();
     let session_id = Uuid::new_v4();
     transcript.apply(&SessionEvent::new(
@@ -8604,15 +8612,45 @@ fn redirected_reply_is_visibly_interrupted_not_a_finished_answer() {
             delivery: None,
         },
     ));
+    for (sequence, kind, payload) in [
+        (
+            2,
+            "action/preparing",
+            serde_json::json!({"tool_call_id":"old", "label":"edit"}),
+        ),
+        (
+            3,
+            "action/generation_status",
+            serde_json::json!({"tool_call_id":"old", "waiting":true}),
+        ),
+    ] {
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: kind.into(),
+                payload,
+            },
+        ));
+    }
     transcript.apply(&SessionEvent::new(
         session_id,
-        2,
+        4,
         SessionEventKind::ProviderEvent {
             provider: CodingProvider::Codex,
             kind: "native_steer_applied".into(),
             payload: serde_json::json!({}),
         },
     ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        5,
+        SessionEventKind::ReasoningDelta {
+            text: "New direction".into(),
+        },
+    ));
+    assert!(!transcript.order.iter().any(|entry| matches!(entry, TranscriptEntry::Tool { source_name, complete: false, .. } if source_name == "action_preparing")));
     let rendered = transcript
         .lines(100)
         .into_iter()
@@ -8620,7 +8658,12 @@ fn redirected_reply_is_visibly_interrupted_not_a_finished_answer() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(rendered.contains("I can see"), "{rendered}");
-    assert!(rendered.contains("interrupted"), "{rendered}");
+    assert!(rendered.contains("redirected by follow-up"), "{rendered}");
+    assert!(!rendered.contains("user interrupted"), "{rendered}");
+    assert!(
+        !rendered.contains("Awaiting tool-call arguments…"),
+        "{rendered}"
+    );
 }
 
 #[test]
@@ -9911,6 +9954,7 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         status: MessageStatus::Complete,
         complete: true,
         user_interrupted: false,
+        redirected: false,
     });
     transcript.order.push(TranscriptEntry::Tool {
         source_name: "command_execution".to_string(),
@@ -9938,6 +9982,7 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         status: MessageStatus::Complete,
         complete: true,
         user_interrupted: false,
+        redirected: false,
     });
     transcript.order.push(TranscriptEntry::Tool {
         source_name: "command_execution".to_string(),
@@ -10088,6 +10133,7 @@ fn adjacent_tool_calls_are_compact_but_leave_gap_before_following_message() {
         status: MessageStatus::Complete,
         complete: true,
         user_interrupted: false,
+        redirected: false,
     });
 
     let rendered = transcript.render(80, None, None, None);
@@ -10118,6 +10164,7 @@ fn message_tool_message_edges_have_one_separator_row_each() {
         status: MessageStatus::Complete,
         complete: true,
         user_interrupted: false,
+        redirected: false,
     };
     transcript
         .order
@@ -10210,6 +10257,7 @@ fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
         status: MessageStatus::Complete,
         complete: true,
         user_interrupted: false,
+        redirected: false,
     });
 
     let lines = transcript.lines(80);

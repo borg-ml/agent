@@ -10,8 +10,12 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 pub fn tool_lifecycle_label(name: &str, complete: bool) -> Cow<'_, str> {
-    if complete && name == "Wait for provider" {
-        return Cow::Borrowed("Stopped waiting for provider");
+    if name == "Wait for provider" {
+        return Cow::Borrowed(if complete {
+            "Tool preparation ended"
+        } else {
+            "Awaiting tool-call arguments…"
+        });
     }
     if name == "Generate" || name.starts_with("Generate ") {
         let label = name.strip_prefix("Generate ").unwrap_or("");
@@ -343,6 +347,16 @@ impl TimelineProjector {
                         .insert(provider_tool_id.to_string(), index);
                 } else {
                     self.unkeyed_preparing_tools.push(index);
+                }
+            }
+            SessionEventKind::ProviderEvent { kind, .. } if kind == "native_steer_applied" => {
+                for index in self
+                    .preparing_tools
+                    .drain()
+                    .map(|(_, index)| index)
+                    .chain(self.unkeyed_preparing_tools.drain(..))
+                {
+                    Arc::make_mut(&mut self.entries[index]).running = false;
                 }
             }
             SessionEventKind::ProviderEvent { kind, payload, .. }
@@ -858,7 +872,7 @@ mod tests {
             if waiting {
                 assert_eq!(
                     tool_lifecycle_label(&projector.entries[0].title, false),
-                    "Waiting for provider…"
+                    "Awaiting tool-call arguments…"
                 );
             }
         }
