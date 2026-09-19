@@ -1649,6 +1649,7 @@ async fn spawn_tool_reuses_a_compatible_ready_worker_for_a_new_task() {
         .call_tool(
             "spawn_agent",
             json!({
+                "action": "delegate task",
                 "task_name": "first_task",
                 "message": "Complete the first bounded task."
             }),
@@ -1671,6 +1672,7 @@ async fn spawn_tool_reuses_a_compatible_ready_worker_for_a_new_task() {
         .call_tool(
             "spawn_agent",
             json!({
+                "action": "reuse worker",
                 "task_name": "second_task",
                 "message": "Complete the second bounded task."
             }),

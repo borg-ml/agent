@@ -1255,11 +1255,14 @@ impl AgentToolDispatcher {
     async fn call_with_workflow_control_and_invocation(
         &self,
         name: &str,
-        arguments: Value,
+        mut arguments: Value,
         workflow_approved: bool,
         workflow_cancel: Option<CancellationToken>,
         explicit_invocation_id: Option<Uuid>,
     ) -> Result<Value> {
+        if let Some(arguments) = arguments.as_object_mut() {
+            arguments.remove("action");
+        }
         let is_command = self.extension_api_snapshot().command(name).is_some();
         let event_prefix = if is_command { "command" } else { "tool" };
         let serialized = serde_json::to_vec(&arguments)?;
@@ -5171,8 +5174,11 @@ impl SubagentCoordinator {
         &self,
         actor_session_id: Uuid,
         name: &str,
-        arguments: Value,
+        mut arguments: Value,
     ) -> Result<Value> {
+        if let Some(arguments) = arguments.as_object_mut() {
+            arguments.remove("action");
+        }
         match name {
             "spawn_agent" => {
                 let args: SpawnAgentArgs = serde_json::from_value(arguments)?;
