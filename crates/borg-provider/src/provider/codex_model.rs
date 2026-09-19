@@ -874,8 +874,12 @@ impl ResponseState {
                 _ => bail!("Codex returned an unsupported output item; no tools were executed"),
             }
         }
+        // A reply cut at `max_output_tokens` before any text or tool call was
+        // emitted spent its whole budget on reasoning. That is a resumable
+        // length stop, not an empty answer: keeping it lets the harness
+        // continue from the preserved reasoning instead of failing the turn.
         ensure!(
-            !content.is_empty() || !calls.is_empty(),
+            !content.is_empty() || !calls.is_empty() || response_hit_output_limit(&response),
             "Codex returned no answer or tool calls"
         );
         response["output"] = json!(output);
@@ -1539,5 +1543,46 @@ mod tests {
         );
         assert!(response_hit_output_limit(&raw));
         assert!(!response_hit_output_limit(&json!({"status": "completed"})));
+    }
+
+    /// A `max_output_tokens` cut that lands before any text or tool call is
+    /// emitted used its whole budget on reasoning. It must stay a continuable
+    /// length stop, or the harness never reaches its continuation path and the
+    /// turn dies with "Codex returned no answer or tool calls".
+    #[test]
+    fn output_limit_during_reasoning_stays_a_continuable_length_finish() {
+        let response = json!({
+            "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"},
+            "output": [{"type":"reasoning","id":"reason","encrypted_content":"opaque","summary":[]}],
+        });
+        let (message, raw) = ResponseState::default()
+            .finish(response)
+            .expect("a reasoning-only length stop stays continuable");
+        let ModelMessage::Assistant {
+            content,
+            tool_calls,
+            provider_state,
+            ..
+        } = message
+        else {
+            panic!("expected an assistant message");
+        };
+        assert!(content.is_none());
+        assert!(tool_calls.is_empty());
+        assert!(response_hit_output_limit(&raw));
+        // The encrypted reasoning has to survive so the continuation resumes
+        // from it instead of re-deriving the whole chain.
+        assert!(matches!(
+            provider_state,
+            Some(ModelProviderState::OpenAiResponses { output, .. })
+                if output.len() == 1 && output[0]["encrypted_content"] == "opaque"
+        ));
+        // A completed response that carries nothing is still a real failure.
+        assert!(
+            ResponseState::default()
+                .finish(json!({"status":"completed","output":[{"type":"reasoning"}]}))
+                .is_err()
+        );
     }
 }
