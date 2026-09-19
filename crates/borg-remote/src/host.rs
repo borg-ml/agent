@@ -5613,6 +5613,7 @@ async fn sync_relay_inbox(
                     body: crate::WorkspaceMessageBody {
                         text: incoming.text,
                         mentions: Vec::new(),
+                        attachments: Vec::new(),
                     },
                     audience: Audience::Direct {
                         participant: participant_id,
@@ -6789,6 +6790,7 @@ mod tests {
                 author_id: session_id,
                 text: "mirror this private handoff".to_string(),
                 mentions: Vec::new(),
+                attachments: Vec::new(),
                 audience: Audience::Direct {
                     participant: remote_recipient,
                 },
@@ -7080,6 +7082,7 @@ mod tests {
                     author_id: sender,
                     text: text.to_string(),
                     mentions: Vec::new(),
+                    attachments: Vec::new(),
                     audience: Audience::Direct {
                         participant: recipient,
                     },
@@ -7694,6 +7697,7 @@ mod tests {
                     author_id: session_id,
                     text: "retain on rejection".to_string(),
                     mentions: Vec::new(),
+                    attachments: Vec::new(),
                     audience: if shared {
                         Audience::Workspace
                     } else {
@@ -10276,6 +10280,7 @@ mod tests {
                 body: crate::WorkspaceMessageBody {
                     text: "retain while authorization is expired".into(),
                     mentions: vec![],
+                    attachments: Vec::new(),
                 },
                 audience: Audience::Direct {
                     participant: session_id,
@@ -11136,6 +11141,7 @@ connection: close
                 author_id: id,
                 text: "queued through roster recovery".to_string(),
                 mentions: Vec::new(),
+                attachments: Vec::new(),
                 audience: Audience::Workspace,
                 mode: crate::DeliveryMode::NextTurn,
                 thread_id: None,
@@ -11381,6 +11387,7 @@ connection: close
                         author_id: session_id,
                         text: format!("{text}-{attempt}"),
                         mentions: Vec::new(),
+                        attachments: Vec::new(),
                         audience,
                         mode: crate::DeliveryMode::NextTurn,
                         thread_id: None,
@@ -11595,6 +11602,7 @@ connection: close
                 author_id: session_id,
                 text: "final private report".to_string(),
                 mentions: Vec::new(),
+                attachments: Vec::new(),
                 audience: Audience::Direct {
                     participant: recipient,
                 },
@@ -11870,6 +11878,7 @@ connection: close
                 author_id: session_id,
                 text: "final shared report".to_string(),
                 mentions: Vec::new(),
+                attachments: Vec::new(),
                 audience: Audience::Workspace,
                 mode: crate::DeliveryMode::NextTurn,
                 thread_id: None,
@@ -11931,6 +11940,7 @@ connection: close
                 author_id: session_id,
                 text: "shared route unavailable".to_string(),
                 mentions: Vec::new(),
+                attachments: Vec::new(),
                 audience: Audience::Workspace,
                 mode: crate::DeliveryMode::NextTurn,
                 thread_id: None,
@@ -11944,6 +11954,7 @@ connection: close
             author_id: session_id,
             text: text.to_string(),
             mentions: Vec::new(),
+            attachments: Vec::new(),
             audience: Audience::Direct {
                 participant: recipient,
             },
