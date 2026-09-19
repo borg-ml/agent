@@ -4712,6 +4712,137 @@ async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
     scratch.discard().await;
 }
 
+/// Failure mode this pins: with provider cleanup unresponsive, a human who
+/// presses Escape gets no terminal boundary until the cleanup bound expires.
+/// That bound used to be the watchdog's, which is sized for recovering a wedged
+/// provider unattended, so the cancelling footer could sit on screen for tens of
+/// seconds after the keypress.
+///
+/// The ordering invariant is deliberately NOT changed here: `Ready` still
+/// follows cleanup, which
+/// `interrupt_timeout_cannot_publish_ready_before_provider_cleanup_finishes`
+/// pins. Only the wait is human-sized. Note what this test does and does not
+/// claim: it proves the human is answered promptly, NOT that the processes were
+/// reaped -- an expired bound reports that they may still be running.
+///
+/// Time is paused so the assertion is about simulated duration rather than how
+/// busy the machine is: the boundary must land inside the human bound and well
+/// short of the watchdog budget.
+#[tokio::test(start_paused = true)]
+async fn an_unresponsive_cleanup_answers_escape_on_a_human_bound() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let started = Arc::new(Notify::new());
+    let cleanup_started = Arc::new(Notify::new());
+    // Never released: this cleanup never returns.
+    let release_cleanup = Arc::new(Notify::new());
+    let executor = Arc::new(CleanupBarrierExecutor {
+        cooperative: true,
+        started: Arc::clone(&started),
+        cleanup_started: Arc::clone(&cleanup_started),
+        release_cleanup: Arc::clone(&release_cleanup),
+        cleanup_calls: AtomicUsize::new(0),
+    });
+    let actor_store = Arc::clone(&store);
+    let actor = tokio::spawn(async move {
+        run_session_actor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+            actor_store,
+        )
+        .await
+    });
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "run until interrupted".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("provider starts");
+
+    let escape_at = tokio::time::Instant::now();
+    command_tx
+        .send(HostCommand::Interrupt { session_id })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), cleanup_started.notified())
+        .await
+        .expect("interrupt enters provider cleanup");
+
+    let mut boundary_at = None;
+    while boundary_at.is_none() {
+        let event = tokio::time::timeout(TURN_WATCHDOG_STOP_TIMEOUT * 4, event_rx.recv())
+            .await
+            .expect("the human is answered without waiting on a cleanup that never returns")
+            .expect("session remains open");
+        if matches!(event.kind, SessionEventKind::TurnCompleted { .. }) {
+            boundary_at = Some(tokio::time::Instant::now());
+        }
+    }
+    let waited = boundary_at.expect("terminal boundary observed") - escape_at;
+    assert!(
+        waited < TURN_WATCHDOG_STOP_TIMEOUT,
+        "Escape must not inherit the watchdog budget: waited {waited:?}"
+    );
+
+    // The successor is unharmed: an explicit human prompt still runs a turn,
+    // and the previous generation's cleanup never reached it.
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "carry on".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("a successor turn still starts after an unresponsive cleanup");
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
+    scratch.discard().await;
+}
+
 #[tokio::test]
 async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
     let root = tempdir().unwrap();
@@ -8089,6 +8220,7 @@ fn resumed_team_backlog_is_deferred_behind_the_triggering_user_prompt() {
             report_text: "old report".to_string(),
             sender_session_id: Uuid::new_v4(),
             delivery: PromptDelivery::Queue,
+            attachments: Vec::new(),
         })
         .collect();
     let mut team_message_ids = HashSet::new();
@@ -13793,7 +13925,7 @@ async fn unstoppable_provider_cleanup_is_bounded_and_reported() {
     let executor: Arc<dyn AgentTurnExecutor> = Arc::new(NeverStoppingExecutor);
     let reason = tokio::time::timeout(
         TURN_WATCHDOG_STOP_TIMEOUT * 4,
-        stop_session_bounded(&executor, Uuid::new_v4()),
+        stop_session_bounded(&executor, Uuid::new_v4(), TURN_WATCHDOG_STOP_TIMEOUT),
     )
     .await
     .expect("cleanup cannot outlive its bound");

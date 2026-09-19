@@ -822,6 +822,20 @@ const TURN_WATCHDOG_WAKE_GAP: Duration = Duration::from_secs(30);
 const TURN_WATCHDOG_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const TURN_WATCHDOG_STOP_TIMEOUT: Duration = Duration::from_millis(500);
+/// The same cleanup, bounded for a human who just pressed Escape.
+///
+/// The terminal boundary still follows cleanup -- publishing `Ready` while
+/// session-owned processes are alive would be a lie, and is what
+/// `interrupt_timeout_cannot_publish_ready_before_provider_cleanup_finishes`
+/// pins. But the watchdog's budget is sized for recovering a wedged provider
+/// unattended, not for a person waiting at the keyboard, so reusing it put
+/// tens of seconds between Escape and any acknowledgement. A human-initiated
+/// stop gets its own, much tighter bound; an unresponsive provider is then
+/// reported that much sooner.
+#[cfg(not(test))]
+const INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
 const PROVIDER_DRAIN_LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -1101,13 +1115,9 @@ fn humanize_idle(idle: Duration) -> String {
 async fn stop_session_bounded(
     executor: &Arc<dyn AgentTurnExecutor>,
     session_id: Uuid,
+    bound: Duration,
 ) -> Option<String> {
-    match tokio::time::timeout(
-        TURN_WATCHDOG_STOP_TIMEOUT,
-        executor.stop_session(session_id),
-    )
-    .await
-    {
+    match tokio::time::timeout(bound, executor.stop_session(session_id)).await {
         Ok(Ok(())) => None,
         Ok(Err(error)) => {
             tracing::warn!(%session_id, %error, "stopping a stalled provider session failed");
@@ -1117,7 +1127,7 @@ async fn stop_session_bounded(
             tracing::warn!(%session_id, "stopping a stalled provider session timed out");
             Some(format!(
                 "provider cleanup did not finish within {}s; its processes may still be running",
-                TURN_WATCHDOG_STOP_TIMEOUT.as_secs_f32()
+                bound.as_secs_f32()
             ))
         }
     }
@@ -3975,7 +3985,7 @@ async fn run_agent_session_store_kernel_inner(
                         // Cooperative turn cancellation does not stop session-owned processes.
                         // Reap them before publishing the interrupted terminal boundary, but
                         // never let an unresponsive process hold that boundary hostage.
-                        let _ = stop_session_bounded(&executor, session_id).await;
+                        let _ = stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT).await;
                         Ok(crate::AgentTurnResult {
                             provider_session_id: None,
                             final_text: String::new(),
@@ -4443,7 +4453,7 @@ async fn run_agent_session_store_kernel_inner(
                     provider_fork_turn_id = None;
                     running.0.abort();
                     let _ = (&mut running.0).await;
-                    let _ = stop_session_bounded(&executor, session_id).await;
+                    let _ = stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT).await;
                     deny_pending_approval(
                         &mut journal,
                         &events,
@@ -4530,7 +4540,7 @@ async fn run_agent_session_store_kernel_inner(
                     let _ = (&mut running.0).await;
                     // Cleanup failure is part of the user-visible story: it is
                     // why processes may still be alive after the turn ends.
-                    let error = match stop_session_bounded(&executor, session_id).await {
+                    let error = match stop_session_bounded(&executor, session_id, TURN_WATCHDOG_STOP_TIMEOUT).await {
                         Some(cleanup) => format!("{error}; {cleanup}"),
                         None => error,
                     };
@@ -4980,7 +4990,7 @@ async fn run_agent_session_store_kernel_inner(
                             // without latching user-stop or pausing the goal.
                             running.0.abort();
                             let _ = (&mut running.0).await;
-                            let _ = stop_session_bounded(&executor, session_id).await;
+                            let _ = stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT).await;
                             subscription_context_reusable = false;
                             provider_session_id = None;
                             provider_fork_turn_id = None;
@@ -5298,7 +5308,7 @@ async fn run_agent_session_store_kernel_inner(
                             retry_not_before = None;
                             running.0.abort();
                             let _ = (&mut running.0).await;
-                            let _ = stop_session_bounded(&executor, session_id).await;
+                            let _ = stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT).await;
                             subscription_context_reusable = false;
                             provider_session_id = None;
                             provider_fork_turn_id = None;
@@ -5396,7 +5406,7 @@ async fn run_agent_session_store_kernel_inner(
                             ).await?;
                             running.0.abort();
                             let _ = (&mut running.0).await;
-                            let _ = stop_session_bounded(&executor, session_id).await;
+                            let _ = stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT).await;
                             deny_pending_approval(
                                 &mut journal,
                                 &events,
