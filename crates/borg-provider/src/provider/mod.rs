@@ -18,8 +18,7 @@ pub use chat_stream::{
     ProviderStreamError, SteerAdmission, classify_provider_error, read_claude_account_rate_limits,
     read_codex_account_rate_limits, read_codex_subscription_status, run_claude_chat_stream,
     run_claude_chat_stream_with_control, run_claude_local_chat_stream,
-    run_claude_local_chat_stream_pooled, run_codex_chat_stream, run_codex_chat_stream_with_control,
-    run_codex_freeform_chat_stream, run_codex_local_chat_stream, run_opencode_local_chat_stream,
+    run_claude_local_chat_stream_pooled, run_opencode_local_chat_stream,
 };
 pub use model_turn::{
     ModelFunctionCall, ModelInputAttachment, ModelMessage, ModelToolCall, ModelToolDefinition,

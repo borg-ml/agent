@@ -1,78 +1,17 @@
-#![cfg(all(unix, feature = "codex"))]
+#![cfg(all(unix, feature = "claude"))]
 
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use borg_provider::ProviderChannel;
-use borg_provider::provider::{
-    ChatStreamRequest, LocalAgentPermission, run_codex_local_chat_stream,
-};
+use borg_provider::provider::{ChatStreamRequest, LocalAgentPermission};
 
 // This test binary has one single-threaded test: the runtime override never
 // races another test or invokes an authenticated provider.
 #[tokio::test(flavor = "current_thread")]
 async fn cancellation_reaps_subscription_processes_and_releases_the_pool() {
     let root = tempfile::tempdir().unwrap();
-    let executable = root.path().join("codex");
-    std::fs::write(
-        &executable,
-        r#"#!/bin/sh
-if [ "$1" = "--version" ]; then echo "codex 1.0.0"; exit; fi
-stage=$(cat stage)
-while IFS= read -r line; do
-    case "$line" in
-        *initialize*) method=initialize; id=1; result="{}" ;;
-        *thread/start*) method=thread/start; id=2; result='{"thread":{"id":"test-thread"}}' ;;
-        *turn/start*) method=turn/start; id=3; result='{"turn":{"id":"test-turn"}}' ;;
-        *) continue ;;
-    esac
-    if [ "$method" = "$stage" ]; then
-        echo $$ > ready
-        while IFS= read -r ignored; do :; done
-        exit
-    fi
-    printf '{"id":%s,"result":%s}
-' "$id" "$result"
-    if [ "$method" = "turn/start" ]; then
-        echo $$ > ready
-        while IFS= read -r ignored; do :; done
-        exit
-    fi
-done
-"#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-    unsafe {
-        std::env::set_var("BORG_CODEX_BIN", &executable);
-    }
-    for stage in ["initialize", "thread/start", "turn/start", "stream"] {
-        std::fs::write(root.path().join("stage"), stage).unwrap();
-        let request = request(root.path());
-        let stream = run_codex_local_chat_stream(request, None, LocalAgentPermission::FullAccess);
-        let ready = root.path().join("ready");
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !ready.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("fake provider never reached {stage}"));
-        let pid: i32 = std::fs::read_to_string(&ready)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        drop(stream);
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while unsafe { libc::kill(pid, 0) } == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("cancellation wedged at {stage}"));
-        std::fs::remove_file(ready).unwrap();
-    }
+    let executable = root.path().join("claude");
     #[cfg(feature = "claude")]
     {
         use borg_provider::provider::{
@@ -89,6 +28,7 @@ while IFS= read -r ignored; do :; done
 "#,
         )
         .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         unsafe {
             std::env::set_var("BORG_CLAUDE_BIN", &executable);
         }
