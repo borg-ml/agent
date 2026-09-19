@@ -1007,6 +1007,21 @@ async fn read_codex_account_rate_limits_inner() -> Result<CodexAccountRateLimits
     Ok(limits)
 }
 
+/// Ask the same runtime used for model requests, including its wrapper or keychain.
+/// Reading a guessed auth.json path cannot establish the active subscription.
+pub async fn read_codex_subscription_status() -> Result<bool> {
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        codex_account_request("account/read", serde_json::json!({"refreshToken": false})),
+    )
+    .await
+    .context("timed out reading Codex subscription status")??;
+    let account = response
+        .pointer("/result/account")
+        .context("Codex account response omitted account status")?;
+    Ok(account.get("type").and_then(Value::as_str) == Some("chatgpt"))
+}
+
 pub(super) async fn codex_account_request(method: &str, params: Value) -> Result<Value> {
     let mut command = crate::provider_bin::codex_command().await?;
     command

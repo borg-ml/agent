@@ -62,17 +62,12 @@ pub async fn refresh_provider_capability_usage(
                     capability.authenticated = false;
                 }
             } else {
-                let auth = borg_provider::credentials::codex_auth_json();
-                let authenticated = auth.as_ref().map_or(
-                    capability.authenticated
-                        && capability.billing == Some(crate::BillingLane::Subscription),
-                    |auth| {
-                        auth["auth_mode"] != "apikey"
-                            && auth["tokens"]["access_token"]
-                                .as_str()
-                                .is_some_and(|token| !token.is_empty())
-                    },
-                );
+                let authenticated = borg_provider::provider::read_codex_subscription_status()
+                    .await
+                    .unwrap_or(
+                        capability.authenticated
+                            && capability.billing == Some(crate::BillingLane::Subscription),
+                    );
                 capability.billing = Some(crate::BillingLane::Subscription);
                 capability.authenticated = authenticated;
                 if authenticated

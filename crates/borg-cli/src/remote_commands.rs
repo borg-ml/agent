@@ -2482,7 +2482,7 @@ async fn run_local_agent_session(
             );
         } else if interactive && !has_initial_prompt {
             println!("  Type a request. /help shows controls.\n");
-            if !provider_credentials_present(provider) {
+            if !provider_connection_ready(provider).await {
                 println!(
                     "  {} is not connected yet: {}\n",
                     provider.label(),
@@ -2673,7 +2673,7 @@ async fn run_local_agent_session(
         let credential_preflight_shown = !resuming
             && !has_initial_prompt
             && !configured_route
-            && !provider_credentials_present(provider);
+            && !provider_connection_ready(provider).await;
         if credential_preflight_shown {
             if provider.uses_native_harness() {
                 terminal.set_notice(format!(
@@ -5103,7 +5103,7 @@ async fn run_local_agent_session(
                         };
                         let connected = if model.starts_with("opencode-go/") {
                             borg_provider::credentials::opencode_go_api_key().is_some()
-                        } else { provider_credentials_present(target) };
+                        } else { provider_connection_ready(target).await };
                         if !configured && !connected {
                             terminal
                                 .as_mut()
@@ -5133,7 +5133,15 @@ async fn run_local_agent_session(
                                     .to_string(),
                             );
                         } else {
-                            let interactive = provider_auth_requires_terminal(target, choice);
+                            let interactive = match provider_auth_requires_terminal(target, choice).await {
+                                Ok(interactive) => interactive,
+                                Err(error) => {
+                                    terminal.as_mut().expect("terminal").set_notice(format!(
+                                        "Could not check saved login: {error}. Credentials were not changed."
+                                    ));
+                                    continue;
+                                }
+                            };
                             if interactive {
                                 shutdown_terminal(&mut terminal, &crash_context.tui_active).await;
                             }
@@ -7442,7 +7450,7 @@ pub(crate) async fn login_command(
             CodingProvider::Glm,
             CodingProvider::OpenAiCompatible,
         ] {
-            let state = if provider_credentials_present(provider) {
+            let state = if provider_connection_ready(provider).await {
                 "connected"
             } else {
                 "not connected"
@@ -7538,9 +7546,22 @@ fn prompt_and_store_api_key(provider: CodingProvider) -> Result<PathBuf> {
     borg_provider::credentials::store_api_key(credential, &key)
 }
 
-fn provider_auth_requires_terminal(provider: CodingProvider, choice: ProviderAuthChoice) -> bool {
+async fn provider_connection_ready(provider: CodingProvider) -> bool {
+    if provider == CodingProvider::Codex && !borg_provider::credentials::openai_uses_api_key() {
+        borg_provider::provider::read_codex_subscription_status()
+            .await
+            .unwrap_or_else(|_| provider_credentials_present(provider))
+    } else {
+        provider_credentials_present(provider)
+    }
+}
+
+async fn provider_auth_requires_terminal(
+    provider: CodingProvider,
+    choice: ProviderAuthChoice,
+) -> Result<bool> {
     use borg_provider::credentials;
-    match choice {
+    Ok(match choice {
         ProviderAuthChoice::ReplaceApiKey | ProviderAuthChoice::ReconnectSubscription => true,
         ProviderAuthChoice::ApiKey => match provider {
             CodingProvider::Codex => credentials::openai_api_key().is_none(),
@@ -7549,13 +7570,9 @@ fn provider_auth_requires_terminal(provider: CodingProvider, choice: ProviderAut
         },
         ProviderAuthChoice::Subscription => {
             provider != CodingProvider::Codex
-                || !credentials::codex_auth_json().is_some_and(|auth| {
-                    auth["tokens"]["access_token"]
-                        .as_str()
-                        .is_some_and(|token| !token.is_empty())
-                })
+                || !borg_provider::provider::read_codex_subscription_status().await?
         }
-    }
+    })
 }
 
 async fn authenticate_provider(
@@ -7568,7 +7585,7 @@ async fn authenticate_provider(
         ProviderAuthChoice::ApiKey | ProviderAuthChoice::ReplaceApiKey
     );
     if api {
-        if provider_auth_requires_terminal(provider, choice) {
+        if provider_auth_requires_terminal(provider, choice).await? {
             prompt_and_store_api_key(provider)?;
         }
         if provider == CodingProvider::Codex {
@@ -7592,7 +7609,7 @@ async fn authenticate_provider(
         }
         return Ok(format!("{} API key saved.", provider.label()));
     }
-    if provider_auth_requires_terminal(provider, choice) {
+    if provider_auth_requires_terminal(provider, choice).await? {
         if provider == CodingProvider::Codex
             && credentials::stored_api_key(credentials::ApiKeyCredential::OpenAi).is_none()
             && let Some(key) = credentials::codex_auth_json()

@@ -1283,7 +1283,13 @@ async fn probe_provider(
             (version, authenticated)
         }
         ProviderProbeMode::Admission => {
-            let authenticated = provider_subscription_credentials_present(provider);
+            let authenticated = if provider == CodingProvider::Codex {
+                borg_provider::provider::read_codex_subscription_status()
+                    .await
+                    .unwrap_or(false)
+            } else {
+                provider_subscription_credentials_present(provider)
+            };
             #[cfg(target_os = "macos")]
             let authenticated = if provider == CodingProvider::Claude && !authenticated {
                 provider_auth_status(provider)
