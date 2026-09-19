@@ -16,6 +16,16 @@ async fn main() -> Result<()> {
 }
 
 async fn probe() -> Result<()> {
+    ensure!(
+        !borg_provider::credentials::openai_uses_api_key(),
+        "subscription probe refuses API billing"
+    );
+    let subscription = borg_provider::openai_subscription::account()?
+        .context("ChatGPT subscription not selected")?;
+    println!(
+        "ChatGPT plan: {}",
+        subscription.plan.as_deref().unwrap_or("unknown")
+    );
     let fast = std::env::args().any(|arg| arg == "--fast");
     let account = CodexModelProvider::account_identity().await?;
     let provider = CodexModelProvider {
@@ -51,6 +61,10 @@ async fn probe() -> Result<()> {
     let first = provider
         .model_turn_for_account(request.clone(), Some(tx), &account)
         .await?;
+    ensure!(
+        first.usage.cost_basis == borg_core::CostBasis::SubscriptionEquivalent,
+        "first probe round did not use subscription billing"
+    );
     if fast {
         println!(
             "Requested priority; first response reports service tier {:?} (not a delivery guarantee)",
@@ -99,6 +113,10 @@ async fn probe() -> Result<()> {
                 .and_then(serde_json::Value::as_str)
         );
     }
+    ensure!(
+        second.usage.cost_basis == borg_core::CostBasis::SubscriptionEquivalent,
+        "second probe round did not use subscription billing"
+    );
     let (content, _, calls) = second
         .assistant_parts()
         .context("expected final response")?;
