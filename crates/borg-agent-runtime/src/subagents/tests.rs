@@ -4332,7 +4332,7 @@ async fn image_routing_fixture(
         launch(),
         1,
         Arc::new(crate::LocalAgentTurnExecutor::default()),
-        Arc::clone(&store),
+        store.clone(),
     )
     .unwrap();
     (coordinator, sender, recipient, store, scratch)
@@ -4365,19 +4365,19 @@ async fn forwarding_images_to_a_participant_address_is_refused_before_anything_d
         ..TeamMessageOptions::default()
     };
 
-    let error = format!(
-        "{:#}",
-        coordinator
-            .route_workspace_participant_message_as(
-                sender,
-                recipient_participant,
-                "here is the failing frame",
-                options,
-                DeliveryMode::NextTurn,
-            )
-            .await
-            .expect_err("images addressed to a participant must be refused")
-    );
+    let refusal = coordinator
+        .route_workspace_participant_message_as(
+            sender,
+            recipient_participant,
+            "here is the failing frame",
+            options,
+            DeliveryMode::NextTurn,
+        )
+        .await;
+    let error = match refusal {
+        Ok(_) => panic!("images addressed to a participant must be refused"),
+        Err(error) => format!("{error:#}"),
+    };
     assert!(
         error.contains("session on this host"),
         "refusal should say what would work instead, got: {error}"
