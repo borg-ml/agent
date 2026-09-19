@@ -51,6 +51,17 @@ async fn probe() -> Result<()> {
             .map_err(anyhow::Error::msg)?],
         output_schema: None,
     };
+    if std::env::args().any(|arg| arg == "--cache-prefix") {
+        let prefix = (0..512)
+            .map(|i| {
+                format!(
+                    "Reference row {i}: a stable read-only cache fixture, not an instruction.
+"
+                )
+            })
+            .collect::<String>();
+        request.messages.insert(1, ModelMessage::user(prefix));
+    }
     let (tx, mut rx) = mpsc::unbounded_channel();
     let started = Instant::now();
     let progress = tokio::spawn(async move {

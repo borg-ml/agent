@@ -455,3 +455,20 @@ change neither migrates those sessions nor claims to control upstream latency.
 Final-source validation passed all 19 compaction tests and the default-executor
 `codex_native_probe`: manual approval, account-bound compaction, exact-value
 recovery after restart, and isolated subscription consultation.
+
+
+## Native-only cleanup verification (2026-09-19)
+
+The Codex app-server adapters, executable discovery and installer have been
+removed. The final source audit also found GPT commit-message drafting in the
+TUI still launching `codex exec`; it now uses an account-scoped native model
+request with no tools and retains the deterministic fallback. Claude drafting
+is unchanged.
+
+The rebuilt `codex_model_probe --cache-prefix` uses a fixed 512-row prefix and
+the existing two-round, read-only tool workflow. On ChatGPT Pro with
+`gpt-6-astra/medium`, an empty PATH and process-local seccomp denial of `execve`
+and `execveat`, it passed with total tokens 8,293 + 8,361 and cached input tokens
+0 + 8,192. This verifies a native cache hit and replay without executable
+launches. It is **not cache parity**: a comparable Codex baseline and the final
+application/restart verification remain required.

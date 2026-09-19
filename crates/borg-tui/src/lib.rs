@@ -1294,9 +1294,8 @@ fn commit_message_prompt(stat: &str, diff: &str) -> String {
     )
 }
 
-/// Ask the configured cheap model for a commit message. Codex-family models
-/// (`gpt-*`) go through `codex exec`; Claude models through `claude -p`.
-/// Returns None when the CLI is missing, fails, or produces nothing usable.
+/// Draft with native GPT model access or the unchanged Claude CLI route.
+/// Returns None on failure so the caller can use its deterministic fallback.
 fn draft_commit_message(
     cwd: &Path,
     model: &CommitMessageModel,
@@ -1326,38 +1325,49 @@ fn draft_commit_message(
         child.stdin.take()?.write_all(prompt.as_bytes()).ok()?;
         child.wait_with_output().ok()?
     } else {
-        let last_message =
-            std::env::temp_dir().join(format!("borg-commit-message-{}.txt", std::process::id()));
-        let mut child = Command::new("codex")
-            .args([
-                "exec",
-                "--model",
-                &model.model,
-                "-c",
-                &format!("model_reasoning_effort=\"{}\"", model.effort),
-                "--sandbox",
-                "read-only",
-                "--skip-git-repo-check",
-                "--ephemeral",
-                "--color",
-                "never",
-                "--output-last-message",
-            ])
-            .arg(&last_message)
-            .arg("-")
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .ok()?;
-        child.stdin.take()?.write_all(prompt.as_bytes()).ok()?;
-        let mut output = child.wait_with_output().ok()?;
-        if let Ok(text) = std::fs::read(&last_message) {
-            output.stdout = text;
+        #[cfg(not(feature = "subscription-adapters"))]
+        return None;
+        #[cfg(feature = "subscription-adapters")]
+        {
+            use borg_provider::provider::{CodexModelProvider, ModelMessage, ModelTurnRequest};
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            return runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(90), async {
+                    let account = CodexModelProvider::account_identity().await.ok()?;
+                    let provider = CodexModelProvider {
+                        model: model.model.clone(),
+                        effort: model.effort.clone(),
+                    };
+                    let result = provider
+                        .model_turn_for_account(
+                            ModelTurnRequest {
+                                fast: false,
+                                request_id: Some(uuid::Uuid::new_v4().to_string()),
+                                session_id: None,
+                                prompt_cache_key: None,
+                                messages: vec![ModelMessage::user(prompt)],
+                                tools: Vec::new(),
+                                output_schema: None,
+                            },
+                            None,
+                            &account,
+                        )
+                        .await
+                        .ok()?;
+                    let (content, _, calls) = result.assistant_parts()?;
+                    if !calls.is_empty() {
+                        return None;
+                    }
+                    clean_commit_message(content.as_deref()?)
+                })
+                .await
+                .ok()
+                .flatten()
+            });
         }
-        let _ = std::fs::remove_file(&last_message);
-        output
     };
     if !output.status.success() {
         return None;

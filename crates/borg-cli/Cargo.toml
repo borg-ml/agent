@@ -15,6 +15,7 @@ default = ["subscription-adapters"]
 subscription-adapters = [
     "borg-provider/subscription-adapters",
     "borg-remote/subscription-adapters",
+    "borg-tui/subscription-adapters",
 ]
 profiling = ["borg-remote/profiling"]
 tui-stress = ["dep:termwiz"]
