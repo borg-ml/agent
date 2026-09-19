@@ -98,11 +98,35 @@ pub struct StructuredMention {
     pub start: u32,
     pub end: u32,
 }
+/// A durable reference to an image forwarded with a team message.
+///
+/// Carries a digest, never a path. The bytes are captured into a
+/// content-addressed store when the message is sent, so a recipient resolves
+/// the digest inside its own store and never opens a filesystem location the
+/// sender chose -- a forwarded image cannot double as a request to read an
+/// arbitrary file on the recipient's machine. It is also what makes replay
+/// honest: the captured bytes are the artifact, so a message still delivers
+/// the real image after the sender has deleted the original.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageAttachment {
+    /// Final path component of the sender's file, kept as a human label only.
+    pub name: String,
+    /// Sniffed from the leading bytes, never from the file extension.
+    pub media_type: String,
+    pub byte_len: u64,
+    /// Lowercase hex SHA-256 of the captured bytes; the store address.
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceMessageBody {
     pub text: String,
     #[serde(default)]
     pub mentions: Vec<StructuredMention>,
+    /// Defaulted so journals written before image forwarding replay unchanged
+    /// rather than failing to deserialize.
+    #[serde(default)]
+    pub attachments: Vec<MessageAttachment>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -134,6 +158,8 @@ pub struct NewWorkspaceMessage {
     pub text: String,
     #[serde(default)]
     pub mentions: Vec<StructuredMention>,
+    #[serde(default)]
+    pub attachments: Vec<MessageAttachment>,
     pub audience: Audience,
     pub mode: DeliveryMode,
     pub thread_id: Option<Uuid>,
@@ -609,6 +635,7 @@ pub trait WorkspaceStore: Send + Sync {
                     body: WorkspaceMessageBody {
                         text: input.text.clone(),
                         mentions: input.mentions.clone(),
+                        attachments: input.attachments.clone(),
                     },
                     audience: input.audience.clone(),
                     created_at,
@@ -654,6 +681,7 @@ pub trait WorkspaceStore: Send + Sync {
                     && message.reply_to_message_id == input.reply_to_message_id
                     && message.body.text == input.text
                     && message.body.mentions == input.mentions
+                    && message.body.attachments == input.attachments
                     && message.audience == input.audience
                     && *mode == input.mode
         );

@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(not(unix))]
 use tokio::net::TcpListener;
@@ -23,6 +24,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 use crate::persistent_runtime::{PersistentRuntimeRegistry, RuntimeHost};
+use crate::workspace::MessageAttachment;
 use crate::{
     ApprovalDecision, AtomicWorkClaim, Audience, CodingProvider, DeliveryMode, EventActor,
     HostCommand, HostResourceLimits, LaunchSession, MessageStatus, ModelGoalStatus,
@@ -2704,12 +2706,18 @@ pub(crate) struct TeamInboxMessage {
     pub report_text: String,
     pub sender_session_id: Uuid,
     pub delivery: PromptDelivery,
+    /// Verified local files for this message's images, ready to hand to the
+    /// recipient's prompt. Resolved from durable digests, never from a path
+    /// the sender supplied.
+    pub attachments: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct TeamMessageOptions {
     pub mentions: Vec<StructuredMention>,
     pub reply_to_message_id: Option<Uuid>,
+    /// Durable references to images captured from the sender before routing.
+    pub attachments: Vec<MessageAttachment>,
 }
 
 struct RoutedTeamMessage {
@@ -2961,6 +2969,23 @@ impl SubagentCoordinator {
     // Message persistence keeps sender, recipient, admission, and audience
     // metadata explicit so none can be inferred incorrectly during replay.
     #[allow(clippy::too_many_arguments)]
+    /// Capture the sender's images before any routing decision is made.
+    ///
+    /// Reading happens once, here, in the sender's own process and under its
+    /// own authority. Everything after this point travels as digests, so no
+    /// recipient is ever asked to open a path this caller chose.
+    async fn message_options_with_attachments(
+        &self,
+        args: &MessageArgs,
+    ) -> Result<TeamMessageOptions> {
+        let mut options = args.options();
+        if !args.attachments.is_empty() {
+            options.attachments =
+                capture_message_attachments(&self.journal_root, &args.attachments).await?;
+        }
+        Ok(options)
+    }
+
     async fn persist_team_message(
         &self,
         actor_session_id: Uuid,
@@ -2971,6 +2996,13 @@ impl SubagentCoordinator {
         delivery_mode: DeliveryMode,
         options: TeamMessageOptions,
     ) -> Result<(TeamInboxMessage, Option<WorkspaceMessageReceipt>)> {
+        // Prove the images before anything durable happens. A message whose
+        // bytes cannot be verified must not reach the journal at all, so that
+        // no recipient can ever be handed the text with its images silently
+        // missing.
+        let attachments = options.attachments.clone();
+        let attachment_paths =
+            resolve_message_attachments(&self.journal_root, &attachments).await?;
         if !self.root_launch.capabilities.multiplayer {
             return Ok((
                 TeamInboxMessage {
@@ -2979,6 +3011,7 @@ impl SubagentCoordinator {
                     report_text: message.to_string(),
                     sender_session_id: actor_session_id,
                     delivery: prompt_delivery,
+                    attachments: attachment_paths,
                 },
                 None,
             ));
@@ -3025,6 +3058,20 @@ impl SubagentCoordinator {
             format!("participant:{}", actor_binding.participant_id)
         };
         let text = attributed_team_message(actor, &reply_target, message);
+        // Cross-host image forwarding has no byte transfer yet, and the
+        // recipient resolves digests in ITS OWN store, so a relayed message
+        // would arrive with its images unresolvable. Refuse before the append
+        // rather than deliver text that quietly lost its pictures. This asks
+        // the same host-binding evidence the router already uses; it does not
+        // assume a capability record that nothing populates.
+        ensure!(
+            attachments.is_empty()
+                || !self
+                    .session_message_needs_relay(actor_session_id, recipient_session_id)
+                    .await?,
+            "forwarding images to a session on another host is not supported yet; \
+             send the message without attachments, or reach a session on this host"
+        );
         let idempotency_id = Uuid::new_v4();
         let receipt = workspace_store
             .append_message(NewWorkspaceMessage {
@@ -3032,6 +3079,7 @@ impl SubagentCoordinator {
                 author_id: actor_binding.participant_id,
                 text: message.to_string(),
                 mentions: options.mentions,
+                attachments,
                 audience: Audience::Direct {
                     participant: recipient_binding.participant_id,
                 },
@@ -3048,6 +3096,7 @@ impl SubagentCoordinator {
                 report_text: message.to_string(),
                 sender_session_id: actor_session_id,
                 delivery: prompt_delivery,
+                attachments: attachment_paths,
             },
             Some(receipt),
         ))
@@ -3093,6 +3142,12 @@ impl SubagentCoordinator {
                             format!("participant:{}", message.author_id),
                         ),
                     };
+                // Replay resolves the captured bytes from this host's store,
+                // which is why a message still delivers its images long after
+                // the sender's original file is gone.
+                let attachments =
+                    resolve_message_attachments(&self.journal_root, &message.body.attachments)
+                        .await?;
                 messages.push((
                     ordering,
                     TeamInboxMessage {
@@ -3104,6 +3159,7 @@ impl SubagentCoordinator {
                             DeliveryMode::Boundary | DeliveryMode::Wake => PromptDelivery::Steer,
                             DeliveryMode::NextTurn | DeliveryMode::Notify => PromptDelivery::Queue,
                         },
+                        attachments,
                     },
                 ));
             }
@@ -4510,6 +4566,7 @@ impl SubagentCoordinator {
                 author_id: sender.participant_id,
                 text: message.clone(),
                 mentions: Vec::new(),
+                attachments: Vec::new(),
                 audience: Audience::Workspace,
                 mode: DeliveryMode::NextTurn,
                 thread_id: None,
@@ -4523,6 +4580,7 @@ impl SubagentCoordinator {
             report_text: message,
             sender_session_id: actor_session_id,
             delivery: PromptDelivery::Queue,
+            attachments: Vec::new(),
         };
         let root_session_id = self.table.lock().await.root_session_id;
         for recipient in recipients {
@@ -4725,7 +4783,7 @@ impl SubagentCoordinator {
                             session_id: id,
                             message_id: inbox_message.message_id,
                             text: inbox_message.text.clone(),
-                            attachments: Vec::new(),
+                            attachments: inbox_message.attachments.clone(),
                             output_schema: None,
                             delivery: inbox_message.delivery,
                         },
@@ -4904,7 +4962,7 @@ impl SubagentCoordinator {
                             session_id: id,
                             message_id: inbox_message.message_id,
                             text: inbox_message.text,
-                            attachments: Vec::new(),
+                            attachments: inbox_message.attachments,
                             output_schema: None,
                             delivery: PromptDelivery::Steer,
                         },
@@ -5019,6 +5077,16 @@ impl SubagentCoordinator {
         options: TeamMessageOptions,
         mode: DeliveryMode,
     ) -> Result<RoutedTeamMessage> {
+        // Refuse first: this path can create a direct workspace and append a
+        // message, both durable. A participant address carries no evidence
+        // that the recipient resolves digests in this host's store, and there
+        // is no byte transfer yet, so images addressed this way would arrive
+        // unresolvable. Fail before the first durable write rather than after.
+        ensure!(
+            options.attachments.is_empty(),
+            "images can only be forwarded to a session on this host; address the \
+             recipient as session:<UUID> on this machine, or send without attachments"
+        );
         let actor = self
             .store
             .workspace_binding(actor_session_id)
@@ -5076,6 +5144,7 @@ impl SubagentCoordinator {
                 author_id: actor.participant_id,
                 text: message.to_string(),
                 mentions: options.mentions,
+                attachments: Vec::new(),
                 audience: Audience::Direct {
                     participant: recipient_participant_id,
                 },
@@ -5476,12 +5545,13 @@ impl SubagentCoordinator {
             }
             "send_message" => {
                 let args: MessageArgs = serde_json::from_value(arguments)?;
+                let options = self.message_options_with_attachments(&args).await?;
                 let routed = if args.wake {
                     self.route_followup_task_with_options_as(
                         actor_session_id,
                         &args.target,
                         &args.message,
-                        args.options(),
+                        options,
                     )
                     .await?
                 } else {
@@ -5489,7 +5559,7 @@ impl SubagentCoordinator {
                         actor_session_id,
                         &args.target,
                         &args.message,
-                        args.options(),
+                        options,
                     )
                     .await?
                 };
@@ -5498,12 +5568,13 @@ impl SubagentCoordinator {
             }
             "followup_task" => {
                 let args: MessageArgs = serde_json::from_value(arguments)?;
+                let options = self.message_options_with_attachments(&args).await?;
                 let routed = self
                     .route_followup_task_with_options_as(
                         actor_session_id,
                         &args.target,
                         &args.message,
-                        args.options(),
+                        options,
                     )
                     .await?;
                 self.with_sender_address(actor_session_id, routed_message_json(routed, "accepted"))
@@ -7158,6 +7229,10 @@ struct MessageArgs {
     mentions: Vec<StructuredMention>,
     #[serde(default)]
     reply_to_message_id: Option<Uuid>,
+    /// Sender-local image files. These paths are read once, here, under the
+    /// sender's own authority; what travels is captured bytes.
+    #[serde(default)]
+    attachments: Vec<PathBuf>,
 }
 
 impl MessageArgs {
@@ -7165,6 +7240,7 @@ impl MessageArgs {
         TeamMessageOptions {
             mentions: self.mentions.clone(),
             reply_to_message_id: self.reply_to_message_id,
+            attachments: Vec::new(),
         }
     }
 }
@@ -7456,6 +7532,170 @@ fn lsp_position_schema() -> Value {
     })
 }
 
+/// Matches what the local image channel already accepts, so a forwarded image
+/// and a directly attached one are refused for the same reasons.
+const MAX_MESSAGE_ATTACHMENTS: usize = 4;
+const MAX_MESSAGE_ATTACHMENT_BYTES: u64 = 6 * 1024 * 1024 / 4 * 3;
+
+/// PNG and JPEG by signature, never by file extension.
+///
+/// The extension is a label the sender chose; the leading bytes are what the
+/// recipient's model will actually try to decode. Sniffing here also means a
+/// renamed executable or a text file cannot ride along as an "image".
+fn message_attachment_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else {
+        None
+    }
+}
+
+fn message_attachment_extension(media_type: &str) -> &'static str {
+    if media_type == "image/png" {
+        "png"
+    } else {
+        "jpg"
+    }
+}
+
+fn attachment_blob_path(journal_root: &Path, attachment: &MessageAttachment) -> PathBuf {
+    journal_root.join("attachments").join(format!(
+        "{}.{}",
+        attachment.sha256,
+        message_attachment_extension(&attachment.media_type)
+    ))
+}
+
+/// Read the sender's files once and keep the bytes.
+///
+/// Everything downstream works from the returned digests, so this is the only
+/// point where a sender-chosen path is ever opened, and it happens under the
+/// sender's own authority rather than the recipient's. Copying rather than
+/// referencing is also what makes the message survive its source: once these
+/// bytes are in the store, deleting the original changes nothing.
+async fn capture_message_attachments(
+    journal_root: &Path,
+    paths: &[PathBuf],
+) -> Result<Vec<MessageAttachment>> {
+    ensure!(
+        paths.len() <= MAX_MESSAGE_ATTACHMENTS,
+        "a message carries at most {MAX_MESSAGE_ATTACHMENTS} attachments, got {}",
+        paths.len()
+    );
+    let directory = journal_root.join("attachments");
+    tokio::fs::create_dir_all(&directory)
+        .await
+        .with_context(|| format!("failed to create {}", directory.display()))?;
+    let mut captured = Vec::with_capacity(paths.len());
+    for path in paths {
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .with_context(|| format!("failed to open attachment {}", path.display()))?;
+        ensure!(
+            metadata.is_file(),
+            "attachment must be a regular file: {}",
+            path.display()
+        );
+        ensure!(
+            metadata.len() <= MAX_MESSAGE_ATTACHMENT_BYTES,
+            "attachment exceeds {MAX_MESSAGE_ATTACHMENT_BYTES} bytes: {}",
+            path.display()
+        );
+        let bytes = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("failed to read attachment {}", path.display()))?;
+        // Re-check after reading: the metadata above described the file as it
+        // was a moment ago, not necessarily as it was read.
+        ensure!(
+            bytes.len() as u64 <= MAX_MESSAGE_ATTACHMENT_BYTES,
+            "attachment exceeds {MAX_MESSAGE_ATTACHMENT_BYTES} bytes: {}",
+            path.display()
+        );
+        let media_type = message_attachment_media_type(&bytes)
+            .with_context(|| format!("attachment must be PNG or JPEG: {}", path.display()))?;
+        let sha256 = hex::encode(Sha256::digest(&bytes));
+        let attachment = MessageAttachment {
+            name: path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| {
+                    format!("{sha256}.{}", message_attachment_extension(media_type))
+                }),
+            media_type: media_type.to_string(),
+            byte_len: bytes.len() as u64,
+            sha256,
+        };
+        write_attachment_blob(&attachment_blob_path(journal_root, &attachment), &bytes).await?;
+        captured.push(attachment);
+    }
+    Ok(captured)
+}
+
+/// Content-addressed write. A blob that is already there has this digest, so
+/// it is already these bytes and rewriting it would only risk tearing a file
+/// another message is reading. The temporary name is unique per write and the
+/// rename is atomic, so concurrent senders cannot publish a partial blob.
+async fn write_attachment_blob(path: &Path, bytes: &[u8]) -> Result<()> {
+    if tokio::fs::try_exists(path).await.unwrap_or(false) {
+        return Ok(());
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = parent.join(format!(".{}.tmp", Uuid::new_v4()));
+    tokio::fs::write(&temporary, bytes)
+        .await
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    #[cfg(unix)]
+    tokio::fs::set_permissions(&temporary, Permissions::from_mode(0o600))
+        .await
+        .with_context(|| format!("failed to secure {}", temporary.display()))?;
+    tokio::fs::rename(&temporary, path)
+        .await
+        .with_context(|| format!("failed to publish {}", path.display()))?;
+    Ok(())
+}
+
+/// Turn durable references back into files, proving the bytes on the way out.
+///
+/// The digest is recomputed on every read instead of being trusted from the
+/// journal, because this is the last point before the bytes become pixels in
+/// someone's context. A truncated, swapped or half-written blob has to fail
+/// here and take the whole message with it: handing over unverified bytes as
+/// if they were the sender's image is precisely the fake delivery this path
+/// exists to prevent.
+async fn resolve_message_attachments(
+    journal_root: &Path,
+    attachments: &[MessageAttachment],
+) -> Result<Vec<PathBuf>> {
+    let mut resolved = Vec::with_capacity(attachments.len());
+    for attachment in attachments {
+        let path = attachment_blob_path(journal_root, attachment);
+        let bytes = tokio::fs::read(&path).await.with_context(|| {
+            format!(
+                "image {} ({}) is not in this host's attachment store",
+                attachment.name, attachment.sha256
+            )
+        })?;
+        ensure!(
+            bytes.len() as u64 == attachment.byte_len,
+            "image {} is {} bytes but the message recorded {}",
+            attachment.name,
+            bytes.len(),
+            attachment.byte_len
+        );
+        let digest = hex::encode(Sha256::digest(&bytes));
+        ensure!(
+            digest == attachment.sha256,
+            "image {} failed integrity verification: expected {}, found {digest}",
+            attachment.name,
+            attachment.sha256
+        );
+        resolved.push(path);
+    }
+    Ok(resolved)
+}
+
 fn message_tool(name: &str, description: &str) -> Value {
     let mut definition = tool(
         name,
@@ -7466,7 +7706,12 @@ fn message_tool(name: &str, description: &str) -> Value {
                 "target": { "type": "string" },
                 "message": { "type": "string" },
                 "mentions": { "type": "array" },
-                "reply_to_message_id": { "type": "string" }
+                "reply_to_message_id": { "type": "string" },
+                "attachments": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Up to 4 local PNG/JPEG paths to forward as images. Bytes are captured and verified at send time; the recipient sees pixels, never your path. Same-host recipients only -- a target that needs a host relay is refused before the message is sent."
+                }
             },
             "required": ["target", "message"],
             "additionalProperties": false

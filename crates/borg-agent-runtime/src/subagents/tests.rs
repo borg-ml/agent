@@ -4033,6 +4033,7 @@ async fn acknowledging_an_already_admitted_team_message_is_idempotent() {
             author_id: director,
             text: "freeze the build".to_string(),
             mentions: Vec::new(),
+            attachments: Vec::new(),
             audience: crate::Audience::Direct {
                 participant: binding.participant_id,
             },
@@ -4142,4 +4143,149 @@ async fn agent_tool_provider_environment_parses_back_for_every_provider() {
             "{sent:?} must round trip back to the provider that sent it"
         );
     }
+}
+
+/// One-pixel PNG, small but a genuine PNG signature.
+fn sample_png() -> Vec<u8> {
+    let mut bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+    bytes.extend_from_slice(b"fake IDAT payload for tests");
+    bytes
+}
+
+/// The whole point of capturing bytes rather than forwarding a path: the
+/// message has to still deliver the real image once the sender's file is gone.
+/// A path-carrying design passes every test until exactly this moment.
+#[tokio::test]
+async fn a_forwarded_image_replays_from_captured_bytes_after_the_original_is_deleted() {
+    let root = tempdir().expect("journal root");
+    let source = root.path().join("evidence.png");
+    let original = sample_png();
+    std::fs::write(&source, &original).expect("write source image");
+
+    let captured = capture_message_attachments(root.path(), &[source.clone()])
+        .await
+        .expect("capture image");
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].media_type, "image/png");
+    assert_eq!(captured[0].byte_len, original.len() as u64);
+    assert_eq!(captured[0].name, "evidence.png");
+    // The durable reference must not smuggle the sender's location.
+    let reference = serde_json::to_string(&captured[0]).expect("serialize reference");
+    assert!(
+        !reference.contains(source.to_str().expect("utf-8 path")),
+        "durable reference leaked the sender's path: {reference}"
+    );
+
+    std::fs::remove_file(&source).expect("delete the sender's original");
+
+    let resolved = resolve_message_attachments(root.path(), &captured)
+        .await
+        .expect("replay must not depend on the sender's file");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        std::fs::read(&resolved[0]).expect("read replayed image"),
+        original,
+        "replay delivered different bytes than were captured"
+    );
+}
+
+/// Verification exists so a damaged blob fails loudly instead of being handed
+/// to a model as though it were the sender's image.
+#[tokio::test]
+async fn a_tampered_attachment_fails_verification_instead_of_being_delivered() {
+    let root = tempdir().expect("journal root");
+    let source = root.path().join("shot.png");
+    std::fs::write(&source, sample_png()).expect("write source image");
+    let captured = capture_message_attachments(root.path(), &[source])
+        .await
+        .expect("capture image");
+
+    let blob = attachment_blob_path(root.path(), &captured[0]);
+    let mut corrupted = sample_png();
+    corrupted.extend_from_slice(b"appended by something else");
+    std::fs::write(&blob, corrupted).expect("corrupt the stored blob");
+
+    let error = resolve_message_attachments(root.path(), &captured)
+        .await
+        .expect_err("a blob that no longer matches its digest must not be delivered");
+    let error = format!("{error:#}");
+    assert!(
+        error.contains("integrity verification") || error.contains("recorded"),
+        "unexpected error: {error}"
+    );
+
+    // A blob that is simply missing must fail too, rather than silently
+    // delivering a message with its images dropped.
+    std::fs::remove_file(&blob).expect("remove blob");
+    assert!(
+        resolve_message_attachments(root.path(), &captured)
+            .await
+            .is_err(),
+        "a missing blob must fail the message, not drop the image"
+    );
+}
+
+/// The capture boundary is what stops a message attachment from becoming a
+/// way to read arbitrary files, so it refuses on content rather than on name.
+#[tokio::test]
+async fn attachment_capture_refuses_non_images_and_oversized_and_overlong_sets() {
+    let root = tempdir().expect("journal root");
+
+    // A non-image renamed to look like one is still not an image.
+    let disguised = root.path().join("secrets.png");
+    std::fs::write(&disguised, b"BORG_TOKEN=supersecret\n").expect("write disguised file");
+    let error = format!(
+        "{:#}",
+        capture_message_attachments(root.path(), &[disguised])
+            .await
+            .expect_err("a non-image must be refused on content, not trusted by extension")
+    );
+    assert!(error.contains("PNG or JPEG"), "unexpected error: {error}");
+
+    // A directory is not a regular file.
+    let directory = root.path().join("a_directory.png");
+    std::fs::create_dir(&directory).expect("create directory");
+    assert!(
+        capture_message_attachments(root.path(), &[directory])
+            .await
+            .is_err(),
+        "a directory must not be captured as an image"
+    );
+
+    // Oversized content is refused before it can reach anyone's context.
+    let oversized = root.path().join("huge.png");
+    let mut big = sample_png();
+    big.resize(MAX_MESSAGE_ATTACHMENT_BYTES as usize + 1, 0);
+    std::fs::write(&oversized, &big).expect("write oversized image");
+    assert!(
+        capture_message_attachments(root.path(), &[oversized])
+            .await
+            .is_err(),
+        "an oversized image must be refused"
+    );
+
+    // More attachments than the channel accepts.
+    let mut many = Vec::new();
+    for index in 0..=MAX_MESSAGE_ATTACHMENTS {
+        let path = root.path().join(format!("shot{index}.png"));
+        std::fs::write(&path, sample_png()).expect("write image");
+        many.push(path);
+    }
+    assert!(
+        capture_message_attachments(root.path(), &many)
+            .await
+            .is_err(),
+        "more than {MAX_MESSAGE_ATTACHMENTS} attachments must be refused"
+    );
+}
+
+/// Journals written before image forwarding must keep replaying. A body that
+/// fails to deserialize would strand every earlier message in the workspace.
+#[test]
+fn a_message_body_written_before_image_forwarding_still_replays() {
+    let body: crate::WorkspaceMessageBody =
+        serde_json::from_str(r#"{"text":"older message","mentions":[]}"#)
+            .expect("bodies written before attachments must still deserialize");
+    assert_eq!(body.text, "older message");
+    assert!(body.attachments.is_empty());
 }

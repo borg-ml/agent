@@ -79,6 +79,7 @@ fn message_event(
                 body: WorkspaceMessageBody {
                     text: text.to_string(),
                     mentions: Vec::new(),
+                    attachments: Vec::new(),
                 },
                 audience,
                 created_at: Utc::now(),
@@ -855,6 +856,7 @@ async fn a_relay_message_lands_locally_without_local_reference_checks() {
             body: WorkspaceMessageBody {
                 text: "from another installation".to_string(),
                 mentions: Vec::new(),
+                attachments: Vec::new(),
             },
             audience: Audience::Direct {
                 participant: recipient,
