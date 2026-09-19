@@ -903,6 +903,15 @@ impl SessionStore for PostgresSessionStore {
         Self::contains_session(self, session_id).await
     }
 
+    async fn prompt_cache_session_id(&self, session_id: Uuid) -> Result<Uuid> {
+        Ok(sqlx::query_scalar(
+            "with recursive lineage(id, parent_session_id) as (select id, parent_session_id from sessions where id = $1 union select s.id, s.parent_session_id from sessions s join lineage l on s.id = l.parent_session_id) select id from lineage where parent_session_id is null",
+        )
+        .bind(session_id)
+        .fetch_one(self.pool())
+        .await?)
+    }
+
     async fn create_session_in_workspace(
         &self,
         session_id: Uuid,

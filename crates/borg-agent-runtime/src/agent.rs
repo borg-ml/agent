@@ -125,6 +125,8 @@ fn provider_native_orchestration_tool(name: &str) -> bool {
 #[derive(Clone)]
 pub struct AgentTurn {
     pub session_id: Uuid,
+    /// Shared fork ancestry for prefix-cache routing, never live continuation.
+    pub prompt_cache_session_id: Option<Uuid>,
     pub message_id: Uuid,
     /// Durable canonical-context epoch used to derive provider cache identity.
     /// It changes only at an explicit context boundary, not on reconnect or
@@ -2377,6 +2379,7 @@ mod tests {
         let session_id = uuid::Uuid::new_v4();
         super::AgentTurn {
             session_id,
+            prompt_cache_session_id: None,
             message_id: uuid::Uuid::new_v4(),
             context_generation: 0,
             provider: crate::CodingProvider::Claude,

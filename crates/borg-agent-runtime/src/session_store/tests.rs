@@ -3019,6 +3019,17 @@ async fn inherited_event_pages_match_the_full_projection_across_lineage_boundari
             .unwrap();
     }
     store.fork_before(child_id, grandchild_id, 8).await.unwrap();
+    for id in [parent_id, child_id, grandchild_id] {
+        assert_eq!(store.prompt_cache_session_id(id).await.unwrap(), parent_id);
+    }
+    assert!(
+        store
+            .state(grandchild_id)
+            .await
+            .unwrap()
+            .provider_session_id
+            .is_none()
+    );
     for text in ["grandchild-a", "grandchild-b"] {
         store
             .append(SessionEvent::new(

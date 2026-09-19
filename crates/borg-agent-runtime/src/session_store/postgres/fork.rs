@@ -359,6 +359,17 @@ mod tests {
             .fork_before(child, grandchild, child_tail + 1)
             .await
             .expect("fork the fork");
+        for id in [parent, child, grandchild] {
+            assert_eq!(store.prompt_cache_session_id(id).await.unwrap(), parent);
+        }
+        assert!(
+            store
+                .state(grandchild)
+                .await
+                .unwrap()
+                .provider_session_id
+                .is_none()
+        );
         assert_eq!(
             texts(&store.read(grandchild).await.unwrap()),
             vec!["reply 0", "reply 1", "reply 2", "child reply"],

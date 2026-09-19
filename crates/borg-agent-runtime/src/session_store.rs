@@ -1720,6 +1720,11 @@ pub trait SessionStore: Send + Sync {
         Ok(messages)
     }
     async fn state(&self, session_id: Uuid) -> Result<SessionState>;
+    /// Cache-routing identity only; a fork must still start its own provider continuation.
+    async fn prompt_cache_session_id(&self, session_id: Uuid) -> Result<Uuid> {
+        Ok(session_id)
+    }
+
     /// Number of leading events this session inherited from a fork parent.
     ///
     /// Reads renumber inherited events into the child's own sequence space, so
@@ -7202,6 +7207,16 @@ impl SessionStore for SqliteSessionStore {
 
     async fn contains_session(&self, session_id: Uuid) -> Result<bool> {
         Self::contains_session(self, session_id).await
+    }
+
+    async fn prompt_cache_session_id(&self, session_id: Uuid) -> Result<Uuid> {
+        let root: String = sqlx::query_scalar(
+            "with recursive lineage(id, parent_session_id) as (select id, parent_session_id from sessions where id = ? union select s.id, s.parent_session_id from sessions s join lineage l on s.id = l.parent_session_id) select id from lineage where parent_session_id is null",
+        )
+        .bind(session_id.to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(Uuid::parse_str(&root)?)
     }
 
     async fn create_session_in_workspace(

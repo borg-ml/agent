@@ -3017,6 +3017,7 @@ async fn run_agent_session_store_kernel_inner(
                                 let usage = executor
                                     .compact(AgentTurn {
                                         session_id,
+                                        prompt_cache_session_id: None,
                                         message_id: Uuid::new_v4(),
                                         context_generation: journal
                                             .state(session_id)
@@ -3972,6 +3973,7 @@ async fn run_agent_session_store_kernel_inner(
         }
         let turn = AgentTurn {
             session_id,
+            prompt_cache_session_id: Some(journal.store.prompt_cache_session_id(session_id).await?),
             message_id: prompt.message_id,
             context_generation: journal.state(session_id).await?.context_generation,
             provider: launch.provider,
@@ -6698,6 +6700,7 @@ async fn run_retained_compaction(
     executor
         .compact_retained_context(AgentTurn {
             session_id,
+            prompt_cache_session_id: None,
             message_id: Uuid::new_v4(),
             context_generation: 0,
             provider: launch.provider,

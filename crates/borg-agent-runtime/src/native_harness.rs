@@ -342,7 +342,7 @@ impl NativeHarness {
         canonicalize_native_messages(&mut messages);
         let provider_session_id = format!("borg-session:{}", turn.session_id);
         let prompt_cache_key = native_prompt_cache_key(
-            turn.session_id,
+            turn.prompt_cache_session_id.unwrap_or(turn.session_id),
             turn.context_generation,
             turn.provider,
             &model,
@@ -3487,6 +3487,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let cwd = root.path().to_path_buf();
             let session_id = Uuid::new_v4();
+            let cache_root = Uuid::new_v4();
             let client = Arc::new(BatchClient {
                 tool_rounds,
                 requests: Mutex::new(Vec::new()),
@@ -3498,6 +3499,7 @@ mod tests {
             };
             let turn = AgentTurn {
                 session_id,
+                prompt_cache_session_id: Some(cache_root),
                 message_id: Uuid::new_v4(),
                 context_generation: 0,
                 provider: crate::CodingProvider::OpenRouter,
@@ -3609,6 +3611,23 @@ mod tests {
                 "queued action must not execute"
             );
             let result = task.await.unwrap();
+            let expected_session = format!("borg-session:{session_id}");
+            let expected_cache_key = native_prompt_cache_key(
+                cache_root,
+                0,
+                crate::CodingProvider::OpenRouter,
+                "test-model",
+                "",
+                &[],
+            );
+            assert!(
+                client.requests.lock().unwrap().iter().all(|request| request
+                    .prompt_cache_key
+                    .as_deref()
+                    == Some(expected_cache_key.as_str())
+                    && request.session_id.as_deref() == Some(expected_session.as_str()))
+            );
+
             assert!(
                 client
                     .requests
@@ -4705,6 +4724,7 @@ mod tests {
         let mut durable = conversation.clone();
         let turn = AgentTurn {
             session_id,
+            prompt_cache_session_id: None,
             message_id: Uuid::new_v4(),
             context_generation: 0,
             provider: crate::CodingProvider::OpenRouter,
