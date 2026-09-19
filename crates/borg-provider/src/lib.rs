@@ -1,4 +1,3 @@
-pub mod codex_install;
 pub mod credentials;
 pub mod local;
 pub mod mcp;
@@ -6,6 +5,7 @@ pub mod openai_subscription;
 pub mod provider;
 pub mod provider_auth;
 pub mod provider_bin;
+pub mod provider_install;
 pub mod runtime;
 pub mod subscription;
 
@@ -15,11 +15,10 @@ mod env;
 pub mod subprocess;
 
 pub use auth::{ProviderAuthBundle, ProviderAuthFile, ProviderAuthProvider};
-pub use codex_install::Healed;
 pub use provider_bin::{
-    CODEX_BIN_ENV, Runtime, codex_command, codex_executable, command as runtime_command,
-    executable as runtime_executable,
+    CODEX_BIN_ENV, Runtime, command as runtime_command, executable as runtime_executable,
 };
+pub use provider_install::Healed;
 pub use runtime::{
     CLAUDE_EFFORT_LEVELS, CLAUDE_MODEL_CATALOG, CLAUDE_SELECTABLE_MODELS, CODEX_EFFORT_LEVELS,
     CODEX_MODEL_CATALOG, CODEX_SELECTABLE_MODELS, CostBasis, DynamicModelEntry, MODEL_CATALOGS,

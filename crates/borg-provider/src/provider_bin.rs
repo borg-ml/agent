@@ -1,26 +1,5 @@
-//! Resolution, health-checking and self-healing for the external provider CLIs
-//! Borg drives (`codex`, `claude`, `opencode`).
-//!
-//! Why this exists:
-//!   - Borg used to spawn bare `Command::new("codex")` and friends, trusting the
-//!     first match on `PATH`. That is fragile on a fresh machine and fails in a
-//!     way users cannot diagnose.
-//!   - Real example: macOS XProtect quarantined the npm `@openai/codex`
-//!     package's native binary and moved it to the Bin, leaving a launcher on
-//!     `PATH` that exits non-zero while a perfectly good notarized standalone
-//!     build sat unused in `~/.local/bin`.
-//!   - `curl -fsSL https://borg.ml/install | sh` has to be the only thing a user
-//!     ever runs, so when a runtime is missing or broken Borg repairs it rather
-//!     than printing homework.
-//!
-//! The design is deliberately table-driven. Everything that matters — probing,
-//! candidate discovery, de-duplication, caching, the healing ladder, the error
-//! text — is shared. A runtime contributes only three facts: what its
-//! executable is called, where else to look for it, and how to install it. That
-//! keeps adding the next provider a one-line change rather than a new subsystem.
-//!
-//! Nothing here runs eagerly. A runtime is resolved the first time Borg actually
-//! needs it, so a user who never touches Codex never downloads Codex.
+//! Discovery and installation of external provider executables.
+//! GPT subscription access is native and is not an external runtime.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,7 +10,7 @@ use anyhow::{Result, anyhow};
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-use crate::codex_install;
+use crate::provider_install;
 
 /// How long a candidate gets to answer `--version`.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -42,7 +21,6 @@ pub const AUTO_INSTALL_ENV: &str = "BORG_AUTO_INSTALL";
 /// An external CLI that Borg drives as a provider backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Runtime {
-    Codex,
     Claude,
     OpenCode,
     /// xAI's CLI. Grok's coding plan is only reachable through this binary:
@@ -61,17 +39,13 @@ pub enum Runtime {
 /// How a runtime is installed when it is missing or broken.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum InstallStrategy {
-    /// Download the signed release package directly and verify its checksum
-    /// before installing. Preferred: it is auditable and needs no shell.
-    CodexPackage,
     /// Pipe the vendor's official installer. Used where the vendor publishes no
     /// checksummed package manifest, so their script is the canonical channel.
     Script { url: &'static str },
 }
 
 impl Runtime {
-    pub const ALL: [Runtime; 6] = [
-        Runtime::Codex,
+    pub const ALL: [Runtime; 5] = [
         Runtime::Claude,
         Runtime::OpenCode,
         Runtime::Grok,
@@ -82,7 +56,6 @@ impl Runtime {
     /// Human-facing name, also used in log and error text.
     pub fn label(self) -> &'static str {
         match self {
-            Runtime::Codex => "Codex",
             Runtime::Claude => "Claude Code",
             Runtime::OpenCode => "OpenCode",
             Runtime::Grok => "Grok",
@@ -94,7 +67,6 @@ impl Runtime {
     /// The executable's base name, without any platform extension.
     pub fn program(self) -> &'static str {
         match self {
-            Runtime::Codex => "codex",
             Runtime::Claude => "claude",
             Runtime::OpenCode => "opencode",
             Runtime::Grok => "grok",
@@ -106,7 +78,6 @@ impl Runtime {
     /// Environment variable that pins this runtime to an explicit path.
     pub fn pin_env(self) -> &'static str {
         match self {
-            Runtime::Codex => "BORG_CODEX_BIN",
             Runtime::Claude => "BORG_CLAUDE_BIN",
             Runtime::OpenCode => "BORG_OPENCODE_BIN",
             Runtime::Grok => "BORG_GROK_BIN",
@@ -117,7 +88,6 @@ impl Runtime {
 
     pub(crate) fn install_strategy(self) -> InstallStrategy {
         match self {
-            Runtime::Codex => InstallStrategy::CodexPackage,
             Runtime::Claude => InstallStrategy::Script {
                 url: "https://claude.ai/install.sh",
             },
@@ -151,16 +121,6 @@ impl Runtime {
         let mut dirs: Vec<PathBuf> = Vec::new();
         if let Some(home) = home_directory() {
             match self {
-                Runtime::Codex => {
-                    dirs.push(home.join(".local").join("bin"));
-                    dirs.push(
-                        home.join(".codex")
-                            .join("packages")
-                            .join("standalone")
-                            .join("current")
-                            .join("bin"),
-                    );
-                }
                 Runtime::Claude => {
                     dirs.push(home.join(".local").join("bin"));
                     dirs.push(home.join(".claude").join("local"));
@@ -228,7 +188,7 @@ pub async fn executable(runtime: Runtime) -> Result<PathBuf> {
         return cached.clone().map_err(|message| anyhow!(message));
     }
 
-    let resolved = codex_install::ensure(runtime)
+    let resolved = provider_install::ensure(runtime)
         .await
         .map(|(path, _)| path)
         .map_err(|error| format!("{error:#}"));
@@ -239,16 +199,6 @@ pub async fn executable(runtime: Runtime) -> Result<PathBuf> {
 /// A `tokio` `Command` for a resolved runtime.
 pub async fn command(runtime: Runtime) -> Result<Command> {
     Ok(Command::new(executable(runtime).await?))
-}
-
-/// Resolve the Codex CLI. Convenience wrapper over [`executable`].
-pub async fn codex_executable() -> Result<PathBuf> {
-    executable(Runtime::Codex).await
-}
-
-/// A `tokio` `Command` for the Codex CLI.
-pub async fn codex_command() -> Result<Command> {
-    command(Runtime::Codex).await
 }
 
 /// Whether Borg is permitted to install runtimes on its own.
@@ -434,9 +384,6 @@ pub(crate) fn unresolved_message(runtime: Runtime, rejected: &[Rejected]) -> Str
     }
 
     let install_hint = match runtime.install_strategy() {
-        InstallStrategy::CodexPackage => {
-            "curl -fsSL https://chatgpt.com/codex/install.sh | sh".to_string()
-        }
         InstallStrategy::Script { url } => format!("curl -fsSL {url} | sh"),
     };
     message.push_str(&format!(
@@ -444,28 +391,11 @@ pub(crate) fn unresolved_message(runtime: Runtime, rejected: &[Rejected]) -> Str
         runtime.label()
     ));
 
-    if runtime == Runtime::Codex
-        && cfg!(target_os = "macos")
-        && rejected.iter().any(is_probably_gutted_npm_shim)
-    {
-        message.push_str(
-            "\nOne of the entries above is the npm/Homebrew global install of `@openai/codex`. \
-             macOS XProtect quarantines that package's native binary on some systems, leaving \
-             a launcher that cannot start. Remove it so Borg can use a working install:\n  \
-             npm uninstall -g @openai/codex\n",
-        );
-    }
-
     message.push_str(&format!(
         "\nTo pin a specific build instead, set {} to its full path.\n",
         runtime.pin_env()
     ));
     message
-}
-
-fn is_probably_gutted_npm_shim(entry: &Rejected) -> bool {
-    let path = entry.path.to_string_lossy();
-    path.contains("node_modules") || path.contains("/homebrew/") || path.contains("/usr/local/bin/")
 }
 
 /// One-line health summary per runtime, for `borg doctor`. Read-only: this
@@ -500,11 +430,6 @@ mod tests {
     }
 
     #[test]
-    fn codex_pin_env_matches_the_documented_constant() {
-        assert_eq!(Runtime::Codex.pin_env(), CODEX_BIN_ENV);
-    }
-
-    #[test]
     fn missing_file_is_not_executable() {
         assert!(!is_executable_file(Path::new("/definitely/not/here/codex")));
     }
@@ -517,7 +442,7 @@ mod tests {
     #[tokio::test]
     async fn probe_rejects_a_command_that_exits_non_zero() {
         assert!(
-            probe_path(Runtime::Codex, Path::new("/usr/bin/false"))
+            probe_path(Runtime::Claude, Path::new("/usr/bin/false"))
                 .await
                 .is_err()
         );
@@ -526,7 +451,7 @@ mod tests {
     #[tokio::test]
     async fn probe_accepts_a_command_that_exits_zero() {
         assert!(
-            probe_path(Runtime::Codex, Path::new("/usr/bin/true"))
+            probe_path(Runtime::Claude, Path::new("/usr/bin/true"))
                 .await
                 .is_ok()
         );
@@ -535,13 +460,13 @@ mod tests {
     #[test]
     fn unresolved_message_names_every_rejected_candidate() {
         let message = unresolved_message(
-            Runtime::Codex,
+            Runtime::Claude,
             &[Rejected {
-                path: PathBuf::from("/opt/homebrew/bin/codex"),
+                path: PathBuf::from("/opt/homebrew/bin/claude"),
                 reason: "`--version` failed: boom".to_string(),
             }],
         );
-        assert!(message.contains("/opt/homebrew/bin/codex"));
+        assert!(message.contains("/opt/homebrew/bin/claude"));
         assert!(message.contains("boom"));
         assert!(message.contains("borg doctor"));
     }
@@ -550,20 +475,10 @@ mod tests {
     fn each_runtime_suggests_its_own_installer() {
         assert!(unresolved_message(Runtime::Claude, &[]).contains("claude.ai/install.sh"));
         assert!(unresolved_message(Runtime::OpenCode, &[]).contains("opencode.ai/install"));
-        assert!(unresolved_message(Runtime::Codex, &[]).contains("chatgpt.com/codex/install.sh"));
+
         assert!(unresolved_message(Runtime::Grok, &[]).contains("x.ai/cli/install.sh"));
         assert!(unresolved_message(Runtime::Kimi, &[]).contains("code.kimi.com"));
         assert!(unresolved_message(Runtime::Muse, &[]).contains("dev.meta.ai/install.sh"));
-    }
-
-    #[test]
-    fn the_npm_hint_is_codex_only() {
-        let entry = Rejected {
-            path: PathBuf::from("/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js"),
-            reason: "`--version` failed".to_string(),
-        };
-        assert!(is_probably_gutted_npm_shim(&entry));
-        assert!(!unresolved_message(Runtime::Claude, &[entry]).contains("npm uninstall"));
     }
 
     #[test]
