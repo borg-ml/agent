@@ -646,7 +646,6 @@ async fn claude_steers_stay_pending_input_until_the_cli_reports_consumption() {
 
 #[tokio::test]
 async fn durable_session_events_project_once_into_the_bound_workspace() {
-    let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
     let (scratch, session_store) = crate::session_store::postgres::testing::session_store().await;
     let session_store = Arc::new(session_store);
@@ -3500,9 +3499,10 @@ async fn detached_live_projection_cannot_block_durable_turn_terminalization() {
     let (event_tx, event_rx) = mpsc::channel(1);
     drop(event_rx);
     let (scratch, session_store) = crate::session_store::postgres::testing::session_store().await;
+    let session_store: Arc<dyn SessionStore> = Arc::new(session_store);
     session_store.create_session(session_id).await.unwrap();
     let (actor_result_tx, mut actor_result_rx) = tokio::sync::oneshot::channel();
-    let actor_store = Arc::clone(&store);
+    let actor_store = Arc::clone(&session_store);
     let actor = tokio::spawn({
         let cwd = root.path().to_path_buf();
         async move {
@@ -4727,10 +4727,13 @@ async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
 /// claim: it proves the human is answered promptly, NOT that the processes were
 /// reaped -- an expired bound reports that they may still be running.
 ///
-/// Time is paused so the assertion is about simulated duration rather than how
-/// busy the machine is: the boundary must land inside the human bound and well
-/// short of the watchdog budget.
-#[tokio::test(start_paused = true)]
+/// The assertion is a ratio, not a stopwatch reading: the boundary must land
+/// well short of the watchdog budget it used to inherit. Under the old code the
+/// wait IS that budget, so this fails loudly; the human bound is five times
+/// smaller under cfg(test), which leaves the margin wide. A paused-clock version
+/// would be strictly better and needs tokio's `test-util` feature, which the
+/// workspace does not currently enable.
+#[tokio::test]
 async fn an_unresponsive_cleanup_answers_escape_on_a_human_bound() {
     let root = tempdir().unwrap();
     let journal_path = root.path().join("session.lock");
@@ -4795,7 +4798,7 @@ async fn an_unresponsive_cleanup_answers_escape_on_a_human_bound() {
         .await
         .expect("provider starts");
 
-    let escape_at = tokio::time::Instant::now();
+    let escape_at = std::time::Instant::now();
     command_tx
         .send(HostCommand::Interrupt { session_id })
         .await
@@ -4811,7 +4814,7 @@ async fn an_unresponsive_cleanup_answers_escape_on_a_human_bound() {
             .expect("the human is answered without waiting on a cleanup that never returns")
             .expect("session remains open");
         if matches!(event.kind, SessionEventKind::TurnCompleted { .. }) {
-            boundary_at = Some(tokio::time::Instant::now());
+            boundary_at = Some(std::time::Instant::now());
         }
     }
     let waited = boundary_at.expect("terminal boundary observed") - escape_at;
@@ -6705,7 +6708,11 @@ async fn an_autonomy_job_runs_through_the_session_turn_boundary() {
         SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
     let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
     let store = Arc::new(store);
-    let autonomy = store.autonomy_store().await.unwrap();
+    let autonomy = store
+        .autonomy_store()
+        .await
+        .unwrap()
+        .expect("the Postgres store exposes the autonomy projection");
     let job = autonomy
         .enqueue(crate::EnqueueAutonomyJob {
             job_id: None,
@@ -6795,7 +6802,11 @@ async fn a_blu_workflow_job_runs_without_blocking_the_session_actor() {
         SessionWriterLease::acquire(root.path().join(format!("{session_id}.lock"))).unwrap();
     let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
     let store = Arc::new(store);
-    let autonomy = store.autonomy_store().await.unwrap();
+    let autonomy = store
+        .autonomy_store()
+        .await
+        .unwrap()
+        .expect("the Postgres store exposes the autonomy projection");
     let job = autonomy
         .enqueue(crate::EnqueueAutonomyJob {
             job_id: None,
@@ -8259,7 +8270,6 @@ fn resumed_team_backlog_is_deferred_behind_the_triggering_user_prompt() {
 
 #[tokio::test]
 async fn inactive_team_reports_settle_without_starting_a_provider_turn() {
-    let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
     let (scratch, store, mut runtime) = runtime_store(session_id).await;
     let (event_tx, mut event_rx) = mpsc::channel(8);
@@ -8309,7 +8319,6 @@ async fn inactive_team_reports_settle_without_starting_a_provider_turn() {
 
 #[tokio::test]
 async fn inactive_wake_report_is_retained_for_the_root_provider_turn() {
-    let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
     let (scratch, _store, mut runtime) = runtime_store(session_id).await;
     let (event_tx, mut event_rx) = mpsc::channel(8);
@@ -14942,9 +14951,7 @@ async fn steer_in_flight_when_the_turn_ends_starts_a_new_turn() {
 
 /// Build a workspace directed at `recipient` and return its stores plus a
 /// projection standing in for one long-running child session.
-async fn team_delivery_fixture(
-    root: &std::path::Path,
-) -> (
+async fn team_delivery_fixture() -> (
     crate::session_store::postgres::testing::ScratchDatabase,
     Uuid,
     Arc<PostgresSessionStore>,
@@ -15073,9 +15080,8 @@ async fn delivery_state(
 /// accumulated its whole history as unread.
 #[tokio::test]
 async fn an_accepted_steer_settles_a_long_running_child_team_delivery() {
-    let root = tempdir().unwrap();
     let (scratch, session_id, session_store, workspace_store, binding, projection) =
-        team_delivery_fixture(root.path()).await;
+        team_delivery_fixture().await;
     let message_id = append_team_message(
         &workspace_store,
         &binding,
@@ -15150,9 +15156,8 @@ async fn an_accepted_steer_settles_a_long_running_child_team_delivery() {
 /// surfaced as a warn-level projection diagnostic. The delivery stayed pending.
 #[tokio::test]
 async fn a_completed_queued_team_turn_acknowledges_its_delivery() {
-    let root = tempdir().unwrap();
     let (scratch, session_id, session_store, workspace_store, binding, projection) =
-        team_delivery_fixture(root.path()).await;
+        team_delivery_fixture().await;
     let message_id = append_team_message(
         &workspace_store,
         &binding,
