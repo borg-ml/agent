@@ -50,7 +50,11 @@ Any real input ends the wait:
 - a watcher event — **including from a watcher you did not name**, because
   unrelated output can still unblock the goal;
 - a human message, or team input;
-- any other queued instruction.
+- any other queued instruction;
+- all named watchers finishing or being stopped, even without output.
+
+An explicit user stop holds automatic continuation and watcher output until a
+human returns. A yield is also cleared when its goal leaves the active state.
 
 While yielded, the session stops emitting its automatic goal-continuation
 prompt, so **no model turn runs until something real arrives**. It is not a
@@ -61,6 +65,9 @@ journal records a `goal_yielded` event once, then `goal_resumed` with
 `waited_ms` when input arrives. Waiting is visible, never a silent stall.
 
 ## `not_waiting`
+
+An **active goal** is required; otherwise the tool returns `not_waiting` without
+recording a yield.
 
 Only a **running** watcher can be waited on. Ids that are unknown, finished, or
 pruned are dropped. If none of the named watchers is still running, nothing is
@@ -111,17 +118,17 @@ you constantly and defeats the point of yielding.
   this tool; its owner has to restart on a build that contains it. Rebuilding
   alone changes nothing for a live process.
 
-## Status
+## Implementation and verification
 
-Honest state at the time of writing, from the source rather than from intent:
+The feature is committed in `86ed7db`, with lifecycle and explicit-stop repairs
+in `381a8f3`.
 
-- Implemented in the working tree only — `watch.rs`, `subagents.rs`, and
-  `session.rs` are all uncommitted. There is no commit to cite for it yet.
-- Covered by one unit test, `a_wait_needs_a_live_watcher_and_never_strands_on_a_finished_one`
-  in `watch.rs`, which exercises the `begin_yield`/`resume` contract: no wait on
-  an unknown or stopped watcher, a live watcher accepted alongside an unknown
-  id, and resume handing the wait back exactly once.
-- **Not covered by a test:** the session-loop integration — suppression of
-  automatic continuation, the `goal_yielded`/`goal_resumed` journal events, and
-  waking on watcher output. Those paths are implemented and readable in
-  `session.rs`, but nothing asserts them yet.
+- The watcher unit test
+  `a_wait_needs_a_live_watcher_and_never_strands_on_a_finished_one` covers live,
+  unknown and stopped watcher handling and one-time resume.
+- Session-level regression tests cover automatic-continuation suppression,
+  yield/resume journalling, watcher completion without ending the session,
+  silent watcher cancellation, and interrupting a yield while preserving
+  watcher output until a human returns.
+- The v0.9.0 release verification run passed these regressions as part of the
+  runtime suite: 845 passed, 0 failed, 16 ignored.
