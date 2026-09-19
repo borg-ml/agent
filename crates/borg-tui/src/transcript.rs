@@ -113,8 +113,10 @@ fn extend_tool_lifecycle_spans(
 struct Transcript {
     order: Vec<TranscriptEntry>,
     messages: HashMap<Uuid, usize>,
-    director_context: bool,
-    director_prompt: Option<Uuid>,
+    /// Whether this transcript projects a delegated child session, whose
+    /// opening prompt came from the director agent rather than the operator.
+    child_transcript: bool,
+    director_prompt: DirectorPrompt,
     tools: HashMap<String, usize>,
     foreground_tool: Option<String>,
     preparing_tools: HashMap<String, String>,
@@ -223,8 +225,8 @@ impl Default for Transcript {
         Self {
             order: Vec::new(),
             messages: HashMap::new(),
-            director_context: false,
-            director_prompt: None,
+            child_transcript: false,
+            director_prompt: DirectorPrompt::Unknown,
             tools: HashMap::new(),
             foreground_tool: None,
             preparing_tools: HashMap::new(),
@@ -420,6 +422,27 @@ enum TranscriptActionKind {
     Approval,
     ProviderInteraction,
     Error,
+}
+
+/// Whether the director's opening assignment can still be identified among
+/// the rows this transcript is showing.
+///
+/// A child's history is replayed as a bounded tail, so the oldest visible user
+/// row is usually just an ordinary human prompt. Only a window that starts
+/// where the session starts can contain the assignment at all, and badging is
+/// armed for that window alone: everywhere else the operator keeps their own
+/// identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectorPrompt {
+    /// A root transcript, a truncated child window, or a child whose
+    /// assignment has been cleared away: nothing visible here is the
+    /// assignment.
+    Unknown,
+    /// A child window that starts at the session's first event, so the next
+    /// user row it materializes is the assignment.
+    Expected,
+    /// The message that carries the assignment.
+    Row(Uuid),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -619,6 +642,9 @@ impl Transcript {
         self.tool_body_cache.get_mut().lines.clear();
         self.selected = None;
         self.follow_tail = true;
+        // The assignment row is gone, so nothing visible can carry the badge.
+        // Staying armed would hand it to the next prompt the operator types.
+        self.director_prompt = DirectorPrompt::Unknown;
     }
 
     fn show_goal(&mut self, goal: Option<&SessionGoal>) -> Option<usize> {
@@ -664,7 +690,7 @@ impl Transcript {
     }
 
     fn show_director_context_boundary(&mut self) {
-        self.director_context = true;
+        self.child_transcript = true;
         self.order.push(TranscriptEntry::Activity {
             text: DIRECTOR_CONTEXT_BOUNDARY.to_string(),
             time: canonical_local_time(Local::now()),
@@ -1294,6 +1320,14 @@ impl Transcript {
                 self.context_remaining_percent =
                     context_remaining_percent(*context_tokens, *context_window_tokens);
             }
+            SessionEventKind::SessionStarted if self.child_transcript => {
+                // Sequence 1 of a fresh session. Reaching it means the window
+                // being replayed really does start at the child's beginning,
+                // so the first user row it materializes is the director's
+                // assignment. A bounded tail never carries this event, and
+                // stays unarmed.
+                self.director_prompt = DirectorPrompt::Expected;
+            }
             SessionEventKind::ContextCleared => {
                 self.clear_visible_entries();
                 self.context_remaining_percent = 100;
@@ -1451,18 +1485,14 @@ impl Transcript {
                     if insertion_index < self.order.len() {
                         self.reindex_after_insertion(insertion_index);
                     }
-                    // The prompt that opens a child session is the
-                    // director's assignment, not the operator's. Claim the
-                    // badge for the first user row this transcript actually
-                    // materializes after the context boundary: queued,
-                    // withdrawn and provider-input messages never reach here,
-                    // so a genuine later human follow-up keeps its own
-                    // identity.
-                    if self.director_context
+                    // Claim the badge for the first user row this window
+                    // materializes. Queued, withdrawn and provider-input
+                    // messages never reach here, so only a row the reader can
+                    // actually see can be the assignment.
+                    if self.director_prompt == DirectorPrompt::Expected
                         && *actor == EventActor::User
-                        && self.director_prompt.is_none()
                     {
-                        self.director_prompt = Some(*message_id);
+                        self.director_prompt = DirectorPrompt::Row(*message_id);
                     }
                     self.messages.insert(*message_id, insertion_index);
                     self.order.insert(
@@ -2222,12 +2252,22 @@ impl Transcript {
         }
     }
 
+    /// The row carrying the director's assignment, if this window shows it.
+    /// Both the renderer and the markdown prefill resolve it here so a cached
+    /// body can never disagree with the badge above it.
+    fn director_prompt_row(&self) -> Option<usize> {
+        match self.director_prompt {
+            DirectorPrompt::Row(prompt) => self.messages.get(&prompt).copied(),
+            DirectorPrompt::Unknown | DirectorPrompt::Expected => None,
+        }
+    }
+
     fn remove_message(&mut self, message_id: Uuid) -> Option<usize> {
         let index = self.messages.remove(&message_id)?;
-        if self.director_prompt == Some(message_id) {
-            // A withdrawn row must not keep the badge reserved for an entry
-            // that no longer exists.
-            self.director_prompt = None;
+        if self.director_prompt == DirectorPrompt::Row(message_id) {
+            // The assignment is gone from view. Disarm rather than re-arm:
+            // the next user row to arrive is the operator, not the director.
+            self.director_prompt = DirectorPrompt::Unknown;
         }
         self.order.remove(index);
         self.reindex_after_removal(index);
@@ -3688,9 +3728,7 @@ impl Transcript {
             ));
             lines.push(Line::default());
         }
-        let director_prompt_row = self
-            .director_prompt
-            .and_then(|prompt| self.messages.get(&prompt).copied());
+        let director_prompt_row = self.director_prompt_row();
         for (index, entry) in self.order.iter().enumerate() {
             if focused_tool.is_some_and(|focused| focused != index) {
                 continue;
@@ -3767,7 +3805,9 @@ impl Transcript {
                     }
                     let from_director = director_prompt_row == Some(index);
                     let (label, color) = match actor {
-                        EventActor::User if from_director => ("director".to_string(), SUBAGENT_PINK),
+                        EventActor::User if from_director => {
+                            ("director".to_string(), SUBAGENT_PINK)
+                        }
                         EventActor::User => (self.user_label.clone(), self.user_label_color),
                         EventActor::Assistant => {
                             (self.assistant_label.clone(), self.assistant_label_color)
@@ -4812,6 +4852,7 @@ impl Transcript {
         let chunk_size = self.order.len().div_ceil(worker_count);
         let content_width = width.saturating_sub(MESSAGE_HORIZONTAL_PADDING * 2);
         let user_message_color = self.user_message_color;
+        let director_prompt_row = self.director_prompt_row();
         let assistant_message_color = self.assistant_message_color;
         let messages = thread::scope(|scope| {
             let cached_indices = &cached_indices;
@@ -4842,6 +4883,9 @@ impl Transcript {
                                     return None;
                                 }
                                 let text_color = match actor {
+                                    EventActor::User if Some(index) == director_prompt_row => {
+                                        Some(SUBAGENT_PINK)
+                                    }
                                     EventActor::User => Some(user_message_color),
                                     EventActor::Assistant => Some(assistant_message_color),
                                     _ => None,

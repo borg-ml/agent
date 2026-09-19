@@ -696,6 +696,9 @@ fn a_child_badges_its_director_assignment_and_leaves_later_prompts_alone() {
             },
         )
     };
+    // Sequence 1 of a fresh session: its presence is what tells the child
+    // window that it starts where the session starts.
+    let started = SessionEvent::new(session, 1, SessionEventKind::SessionStarted);
     let row_color = |transcript: &Transcript, text: &str| {
         let rendered = transcript.render(100, None, None, None).0;
         let row = rendered
@@ -708,7 +711,7 @@ fn a_child_badges_its_director_assignment_and_leaves_later_prompts_alone() {
             .filter_map(|span| span.style.fg)
             .collect::<Vec<_>>()
     };
-    let replay = |events: &[SessionEvent]| {
+    let child = |events: &[SessionEvent]| {
         let mut transcript = Transcript::default();
         transcript.show_director_context_boundary();
         for event in events {
@@ -719,11 +722,12 @@ fn a_child_badges_its_director_assignment_and_leaves_later_prompts_alone() {
 
     let mut transcript = Transcript::default();
     transcript.show_director_context_boundary();
+    transcript.apply(&started);
     // A prompt the operator queues before the assignment lands never becomes
     // a transcript row, so it must not reserve the director identity.
     transcript.apply(&SessionEvent::new(
         session,
-        1,
+        2,
         SessionEventKind::Message {
             message_id: Uuid::new_v4(),
             actor: EventActor::User,
@@ -733,8 +737,8 @@ fn a_child_badges_its_director_assignment_and_leaves_later_prompts_alone() {
             delivery: None,
         },
     ));
-    assert_eq!(transcript.director_prompt, None);
-    transcript.apply(&prompt(assignment, 2, "director assignment"));
+    assert_eq!(transcript.director_prompt, DirectorPrompt::Expected);
+    transcript.apply(&prompt(assignment, 3, "director assignment"));
 
     // The prompt that opens the child came from the director agent, so it
     // carries the team identity rather than the operator's.
@@ -747,7 +751,7 @@ fn a_child_badges_its_director_assignment_and_leaves_later_prompts_alone() {
     );
 
     // A human following up in the same child is still the human.
-    transcript.apply(&prompt(followup, 2, "human follow-up"));
+    transcript.apply(&prompt(followup, 4, "human follow-up"));
     let followup_body = row_color(&transcript, "human follow-up");
     assert!(
         followup_body.contains(&transcript.user_message_color),
@@ -761,26 +765,143 @@ fn a_child_badges_its_director_assignment_and_leaves_later_prompts_alone() {
 
     // Replaying the same history, and redelivering the assignment, must land
     // on the same row rather than moving the badge.
-    let replayed = replay(&[
-        prompt(assignment, 1, "director assignment"),
-        prompt(followup, 2, "human follow-up"),
+    let replayed = child(&[
+        started.clone(),
+        prompt(assignment, 3, "director assignment"),
+        prompt(followup, 4, "human follow-up"),
     ]);
-    assert_eq!(replayed.director_prompt, Some(assignment));
+    assert_eq!(replayed.director_prompt, DirectorPrompt::Row(assignment));
     assert!(row_color(&replayed, "director assignment").contains(&SUBAGENT_PINK));
     assert!(!row_color(&replayed, "human follow-up").contains(&SUBAGENT_PINK));
-    transcript.apply(&prompt(assignment, 3, "director assignment"));
-    assert_eq!(transcript.director_prompt, Some(assignment));
+    transcript.apply(&prompt(assignment, 5, "director assignment"));
+    assert_eq!(transcript.director_prompt, DirectorPrompt::Row(assignment));
 
-    // A root transcript has no director context, so nothing is badged.
+    // A child reconnects with a bounded tail: the assignment is older than
+    // the window, so its oldest visible prompt is a human one and must keep
+    // the operator's identity.
+    let tail = child(&[
+        prompt(followup, 900, "human follow-up"),
+        prompt(Uuid::new_v4(), 901, "second human prompt"),
+    ]);
+    assert_eq!(tail.director_prompt, DirectorPrompt::Unknown);
+    let oldest = row_color(&tail, "human follow-up");
+    assert!(oldest.contains(&tail.user_message_color), "{oldest:?}");
+    assert!(!oldest.contains(&SUBAGENT_PINK), "{oldest:?}");
+    assert!(
+        !tail
+            .render(100, None, None, None)
+            .0
+            .iter()
+            .any(|line| line.to_string().contains("▌ director ▐")),
+        "a truncated window has no assignment to badge"
+    );
+
+    // Clearing the context takes the assignment away with it, and must not
+    // hand its identity to whatever the operator types next.
+    let mut cleared = child(&[
+        started.clone(),
+        prompt(assignment, 3, "director assignment"),
+    ]);
+    cleared.apply(&SessionEvent::new(
+        session,
+        6,
+        SessionEventKind::ContextCleared,
+    ));
+    assert_eq!(cleared.director_prompt, DirectorPrompt::Unknown);
+    cleared.apply(&prompt(Uuid::new_v4(), 7, "prompt after clearing"));
+    let after_clear = row_color(&cleared, "prompt after clearing");
+    assert!(
+        after_clear.contains(&cleared.user_message_color),
+        "{after_clear:?}"
+    );
+    assert!(!after_clear.contains(&SUBAGENT_PINK), "{after_clear:?}");
+
+    // A root transcript is never a child, so its own session start arms
+    // nothing and every prompt stays the operator's.
     let mut root = Transcript::default();
-    root.apply(&prompt(assignment, 1, "root prompt"));
-    assert_eq!(root.director_prompt, None);
+    root.apply(&started);
+    root.apply(&prompt(assignment, 2, "root prompt"));
+    assert_eq!(root.director_prompt, DirectorPrompt::Unknown);
     let root_prompt = row_color(&root, "root prompt");
     assert!(
         root_prompt.contains(&root.user_message_color),
         "{root_prompt:?}"
     );
     assert!(!root_prompt.contains(&SUBAGENT_PINK), "{root_prompt:?}");
+}
+
+#[test]
+fn a_long_child_transcript_keeps_the_assignment_body_pink_under_the_markdown_cache() {
+    // Past PARALLEL_MARKDOWN_RENDER_MIN_MESSAGES the message bodies are
+    // rendered by the parallel prefill instead of the draw loop. It has to
+    // agree with the badge, or the assignment shows a pink header over an
+    // operator-coloured body.
+    let session = Uuid::new_v4();
+    let assignment = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.show_director_context_boundary();
+    transcript.apply_history(&SessionEvent::new(
+        session,
+        1,
+        SessionEventKind::SessionStarted,
+    ));
+    for index in 0..=PARALLEL_MARKDOWN_RENDER_MIN_MESSAGES {
+        let (message_id, actor, text) = if index == 0 {
+            (
+                assignment,
+                EventActor::User,
+                "director assignment".to_string(),
+            )
+        } else if index % 2 == 0 {
+            (
+                Uuid::new_v4(),
+                EventActor::User,
+                format!("human prompt {index}"),
+            )
+        } else {
+            (
+                Uuid::new_v4(),
+                EventActor::Assistant,
+                format!("reply {index}"),
+            )
+        };
+        transcript.apply_history(&SessionEvent::new(
+            session,
+            index as u64 + 2,
+            SessionEventKind::Message {
+                message_id,
+                actor,
+                text,
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ));
+    }
+    assert_eq!(transcript.director_prompt, DirectorPrompt::Row(assignment));
+
+    let rendered = transcript.render(100, None, None, None).0;
+    let body = rendered
+        .iter()
+        .find(|line| line.to_string().contains("director assignment"))
+        .expect("the assignment is rendered");
+    assert!(
+        body.spans
+            .iter()
+            .any(|span| span.style.fg == Some(SUBAGENT_PINK)),
+        "the cached assignment body lost the director identity"
+    );
+    let human = rendered
+        .iter()
+        .find(|line| line.to_string().contains("human prompt 2"))
+        .expect("a later human prompt is rendered");
+    assert!(
+        human
+            .spans
+            .iter()
+            .all(|span| span.style.fg != Some(SUBAGENT_PINK)),
+        "a human prompt must not be pink"
+    );
 }
 
 #[test]
