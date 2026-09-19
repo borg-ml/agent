@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,269 +31,6 @@ pub const MAX_HOST_LAUNCH_METADATA_BYTES: usize = 512 * 1024;
 const FORK_PROJECTION_CHECKPOINT_INTERVAL: u64 = 256;
 pub const SESSION_PROJECTION_VERSION: i32 = 3;
 const SESSION_SCHEMA_VERSION: i64 = 5;
-const DISPOSABLE_SCHEMA_ERROR: &str = "Borg session database schema is incompatible";
-
-/// The canonical schema. Older databases are migrated forward by re-running
-/// this batch and adding the columns it declares that they lack.
-const SESSION_SCHEMA_SQL: &str = r#"
-            create table if not exists sessions (
-                id text primary key,
-                parent_session_id text references sessions(id),
-                parent_cut_sequence integer,
-                owner_session_id text references sessions(id),
-                inherited_event_count integer not null default 0,
-                next_sequence integer not null default 1,
-                live_revision integer not null default 0,
-                state_json text not null,
-                projection_version integer not null default 3,
-                created_at text not null,
-                updated_at text not null
-            );
-
-            create table if not exists session_model_access (
-                session_id text not null references sessions(id) on delete cascade,
-                provider text not null,
-                account_identity text not null,
-                primary key (session_id, provider)
-            );
-
-            create table if not exists session_harness_routes (
-                session_id text not null references sessions(id) on delete cascade,
-                provider text not null,
-                native integer not null check (native in (0, 1)),
-                primary key (session_id, provider)
-            );
-
-            create table if not exists session_events (
-                session_id text not null references sessions(id) on delete cascade,
-                sequence integer not null,
-                event_id text not null,
-                event_kind text not null,
-                event_json text not null,
-                projection_json text not null,
-                fork_inheritable integer not null,
-                recovery_relevant integer not null,
-                message_id text,
-                created_at text not null,
-                primary key (session_id, sequence),
-                unique (session_id, event_id)
-            );
-
-            create table if not exists session_actions (
-                action_id text primary key,
-                session_id text not null references sessions(id) on delete cascade,
-                action_kind text not null,
-                state text not null,
-                delivery_policy text not null,
-                wake_policy text not null,
-                payload_json text not null,
-                attempt integer not null default 0,
-                error text,
-                created_at text not null,
-                updated_at text not null,
-                accepted_at text,
-                delivered_at text,
-                completed_at text,
-                lease_owner text,
-                lease_token text,
-                lease_heartbeat_at text,
-                lease_expires_at text
-            );
-
-            create index if not exists idx_session_actions_pending
-                on session_actions (session_id, state, created_at);
-
-            create table if not exists session_action_transitions (
-                action_id text not null references session_actions(action_id) on delete cascade,
-                session_id text not null references sessions(id) on delete cascade,
-                transition_no integer not null,
-                from_state text,
-                to_state text not null,
-                error text,
-                created_at text not null,
-                primary key (action_id, transition_no)
-            );
-
-            create index if not exists idx_session_action_transitions_session
-                on session_action_transitions (session_id, created_at, action_id);
-
-            create table if not exists session_live_state (
-                session_id text not null references sessions(id) on delete cascade,
-                live_key text not null,
-                revision integer not null,
-                event_json text not null,
-                updated_at text not null,
-                primary key (session_id, live_key)
-            );
-
-            create index if not exists idx_session_live_revision
-                on session_live_state (session_id, revision);
-
-            create table if not exists session_payloads (
-                id text primary key,
-                session_id text not null references sessions(id) on delete cascade,
-                event_id text not null,
-                payload_kind text not null,
-                payload blob not null,
-                byte_len integer not null,
-                created_at text not null
-            );
-
-            create index if not exists idx_session_payloads_event
-                on session_payloads (session_id, event_id);
-
-            -- Search is a disposable projection. The event row and payload
-            -- blobs above remain the only source of truth, while this table
-            -- gives exact tenant/range filtering and FTS a compact join key.
-            create table if not exists session_event_search (
-                rowid integer primary key,
-                session_id text not null references sessions(id) on delete cascade,
-                sequence integer not null,
-                event_id text not null,
-                event_kind text not null,
-                actor text,
-                body text not null,
-                unique (session_id, event_id)
-            );
-
-            create index if not exists idx_session_event_search_sequence
-                on session_event_search (session_id, sequence);
-
-            create virtual table if not exists session_event_fts using fts5(
-                body,
-                content='session_event_search',
-                content_rowid='rowid',
-                tokenize='unicode61 remove_diacritics 2'
-            );
-
-            create trigger if not exists session_event_search_insert
-            after insert on session_event_search begin
-                insert into session_event_fts(rowid, body) values (new.rowid, new.body);
-            end;
-
-            create trigger if not exists session_event_search_delete
-            after delete on session_event_search begin
-                insert into session_event_fts(session_event_fts, rowid, body)
-                    values ('delete', old.rowid, old.body);
-            end;
-
-            create trigger if not exists session_event_search_update
-            after update on session_event_search begin
-                insert into session_event_fts(session_event_fts, rowid, body)
-                    values ('delete', old.rowid, old.body);
-                insert into session_event_fts(rowid, body) values (new.rowid, new.body);
-            end;
-
-            create index if not exists idx_session_events_message
-                on session_events (session_id, message_id)
-                where message_id is not null;
-
-            create index if not exists idx_session_events_message_sequence
-                on session_events (session_id, sequence desc)
-                where event_kind = 'message';
-
-            create index if not exists idx_session_events_fork_inheritable
-                on session_events (session_id, sequence)
-                where fork_inheritable = 1;
-
-            create index if not exists idx_session_events_recovery
-                on session_events (session_id, sequence)
-                where recovery_relevant = 1;
-
-            create index if not exists idx_session_events_subagent_recovery
-                on session_events (
-                    session_id,
-                    event_kind,
-                    json_extract(event_json, '$.kind.agent.session_id'),
-                    sequence desc
-                ) where event_kind = 'subagent_activity';
-
-            create index if not exists idx_session_events_context_compaction
-                on session_events (session_id, sequence desc)
-                where event_kind = 'provider_event'
-                  and json_extract(event_json, '$.kind.kind') = 'context_compaction';
-
-            create index if not exists idx_session_events_context_clear
-                on session_events (session_id, sequence desc)
-                where event_kind = 'context_cleared';
-
-            create index if not exists idx_sessions_activity
-                on sessions (updated_at desc);
-
-            create table if not exists session_workspace_bindings (
-                session_id text primary key references sessions(id) on delete cascade,
-                workspace_id text not null,
-                participant_id text not null,
-                host_id text,
-                attached_at text not null
-            );
-
-            create index if not exists idx_session_workspace_bindings_workspace
-                on session_workspace_bindings (workspace_id, session_id);
-
-            create table if not exists host_launches (
-                session_id text primary key,
-                metadata_json text not null,
-                created_at text not null,
-                updated_at text not null
-            );
-
-            create table if not exists host_launch_owners (
-                session_id text primary key references host_launches(session_id) on delete cascade,
-                host_id text not null,
-                relay_origin text not null
-            );
-
-            create table if not exists host_journal_cursors (
-                session_id text primary key references host_launches(session_id) on delete cascade,
-                event_cursor integer not null default 0,
-                live_revision integer not null default 0
-            );
-
-            create table if not exists host_workspace_cursors (
-                host_id text not null,
-                session_id text not null references sessions(id) on delete cascade,
-                workspace_id text not null,
-                sequence integer not null default 0,
-                primary key(host_id,session_id,workspace_id)
-            );
-
-            create table if not exists host_bootstraps (
-                session_id text primary key references host_launches(session_id) on delete cascade
-            );
-
-            -- A runtime manifest records how a trusted namespace was opened
-            -- and whether its worker survived. Checkpoints are explicit JSON
-            -- data; executable code is never replayed automatically.
-            create table if not exists runtime_manifests (
-                session_id text primary key references sessions(id) on delete cascade,
-                manifest_version integer not null,
-                runtime text not null,
-                root text not null,
-                command text not null,
-                worker_id text not null,
-                status text not null,
-                execution_count integer not null default 0,
-                last_code_hash text,
-                last_error text,
-                created_at text not null,
-                updated_at text not null
-            );
-
-            create table if not exists runtime_checkpoints (
-                session_id text not null references sessions(id) on delete cascade,
-                checkpoint_key text not null,
-                state_json text not null,
-                content_hash text not null,
-                revision integer not null,
-                created_at text not null,
-                primary key (session_id, checkpoint_key),
-                unique (session_id, revision)
-            );
-
-            create index if not exists idx_runtime_checkpoints_revision
-                on runtime_checkpoints (session_id, revision desc);
-            "#;
 pub(crate) const DEFAULT_HISTORY_LIMIT: usize = 50;
 pub(crate) const MAX_HISTORY_LIMIT: usize = 200;
 pub(crate) const DEFAULT_HISTORY_SCAN_LIMIT: usize = 10_000;
@@ -1545,33 +1282,25 @@ pub trait SessionStore: Send + Sync {
     /// Durable per-workspace relay upload cursors for one host session.
     async fn host_workspace_cursors(
         &self,
-        _host_id: Uuid,
-        _session_id: Uuid,
-    ) -> Result<HashMap<Uuid, u64>> {
-        Ok(HashMap::new())
-    }
+        host_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<HashMap<Uuid, u64>>;
     async fn acknowledge_host_workspaces(
         &self,
-        _host_id: Uuid,
-        _session_id: Uuid,
-        _cursors: &HashMap<Uuid, u64>,
-    ) -> Result<()> {
-        Ok(())
-    }
+        host_id: Uuid,
+        session_id: Uuid,
+        cursors: &HashMap<Uuid, u64>,
+    ) -> Result<()>;
     async fn register_child_session(
         &self,
-        _owner_session_id: Uuid,
+        owner_session_id: Uuid,
         session_id: Uuid,
-    ) -> Result<()> {
-        anyhow::bail!("session store cannot register child session {session_id}")
-    }
+    ) -> Result<()>;
     async fn append(&self, event: SessionEvent) -> Result<SessionEvent>;
     /// Durably accept a user prompt exactly once before any in-memory routing
     /// or caller acknowledgement. Repeating the same admission is a no-op;
     /// reusing its message id with different content is rejected.
-    async fn admit_prompt(&self, _event: SessionEvent) -> Result<SessionEvent> {
-        bail!("session store does not support durable idempotent prompt admission")
-    }
+    async fn admit_prompt(&self, event: SessionEvent) -> Result<SessionEvent>;
     async fn enqueue_action(&self, action: SessionAction) -> Result<SessionAction>;
     async fn transition_action(
         &self,
@@ -1642,18 +1371,7 @@ pub trait SessionStore: Send + Sync {
         &self,
         session_id: Uuid,
         limit: usize,
-    ) -> Result<Vec<SessionEvent>> {
-        let mut messages = self
-            .read(session_id)
-            .await?
-            .into_iter()
-            .filter(|event| event.kind.is_recallable_user_message())
-            .rev()
-            .take(limit)
-            .collect::<Vec<_>>();
-        messages.reverse();
-        Ok(messages)
-    }
+    ) -> Result<Vec<SessionEvent>>;
     /// Return the newest conversation turns **this session authored itself**,
     /// ordered from oldest to newest, in the session's logical sequence space.
     ///
@@ -1676,42 +1394,16 @@ pub trait SessionStore: Send + Sync {
     /// authored a long local tail but fewer than `limit` local messages, which
     /// returns fewer rows rather than wrong ones, and the remainder still
     /// pages in normally.
-    async fn recent_messages(&self, session_id: Uuid, limit: usize) -> Result<Vec<SessionEvent>> {
-        let inherited = self.inherited_event_count(session_id).await?;
-        let mut messages = self
-            .read(session_id)
-            .await?
-            .into_iter()
-            .filter(|event| {
-                event.sequence > inherited
-                    && matches!(
-                        event.kind,
-                        SessionEventKind::Message {
-                            actor: EventActor::User | EventActor::Assistant,
-                            status: MessageStatus::Complete | MessageStatus::InProgress,
-                            ..
-                        }
-                    )
-            })
-            .rev()
-            .take(limit)
-            .collect::<Vec<_>>();
-        messages.reverse();
-        Ok(messages)
-    }
+    async fn recent_messages(&self, session_id: Uuid, limit: usize) -> Result<Vec<SessionEvent>>;
     async fn state(&self, session_id: Uuid) -> Result<SessionState>;
     /// Cache-routing identity only; a fork must still start its own provider continuation.
-    async fn prompt_cache_session_id(&self, session_id: Uuid) -> Result<Uuid> {
-        Ok(session_id)
-    }
+    async fn prompt_cache_session_id(&self, session_id: Uuid) -> Result<Uuid>;
 
     /// Number of leading events this session inherited from a fork parent.
     ///
     /// Reads renumber inherited events into the child's own sequence space, so
     /// this is the only way to tell what the session actually authored.
-    async fn inherited_event_count(&self, _session_id: Uuid) -> Result<u64> {
-        Ok(0)
-    }
+    async fn inherited_event_count(&self, session_id: Uuid) -> Result<u64>;
     async fn recovery(&self, session_id: Uuid) -> Result<SessionRecovery>;
     /// Recover only the requested slices.
     ///
@@ -1722,17 +1414,13 @@ pub trait SessionStore: Send + Sync {
     async fn recovery_parts(
         &self,
         session_id: Uuid,
-        _parts: RecoveryParts,
-    ) -> Result<SessionRecovery> {
-        self.recovery(session_id).await
-    }
+        parts: RecoveryParts,
+    ) -> Result<SessionRecovery>;
     async fn recovery_from_provider_checkpoint(
         &self,
-        _session_id: Uuid,
-        _provider_session_id: &str,
-    ) -> Result<Option<SessionRecovery>> {
-        Ok(None)
-    }
+        session_id: Uuid,
+        provider_session_id: &str,
+    ) -> Result<Option<SessionRecovery>>;
     async fn live_events_after(
         &self,
         session_id: Uuid,
@@ -1750,19 +1438,11 @@ pub trait SessionStore: Send + Sync {
     async fn attach_workspace(
         &self,
         binding: SessionWorkspaceBinding,
-    ) -> Result<SessionWorkspaceBinding> {
-        anyhow::bail!(
-            "session store cannot attach session {} to workspace {}",
-            binding.session_id,
-            binding.workspace_id
-        )
-    }
+    ) -> Result<SessionWorkspaceBinding>;
     async fn workspace_binding(
         &self,
-        _session_id: Uuid,
-    ) -> Result<Option<SessionWorkspaceBinding>> {
-        Ok(None)
-    }
+        session_id: Uuid,
+    ) -> Result<Option<SessionWorkspaceBinding>>;
     /// Return the durable autonomous runtime journal on the same authority as
     /// this store, when it has one. Optional so the trait keeps a small
     /// in-memory test seam; the store factory refuses a production backend that
@@ -1770,16 +1450,12 @@ pub trait SessionStore: Send + Sync {
     /// reported.
     async fn autonomy_store(
         &self,
-    ) -> Result<Option<std::sync::Arc<dyn crate::autonomy::AutonomyStore>>> {
-        Ok(None)
-    }
+    ) -> Result<Option<std::sync::Arc<dyn crate::autonomy::AutonomyStore>>>;
     /// Return the workspace projection on the same durable authority when the
     /// store supports it. Keeping this optional preserves the trait's small
     /// in-memory test seam without allowing production sessions to silently
     /// create a second workspace database.
-    async fn workspace_store(&self) -> Result<Option<std::sync::Arc<dyn crate::WorkspaceStore>>> {
-        Ok(None)
-    }
+    async fn workspace_store(&self) -> Result<Option<std::sync::Arc<dyn crate::WorkspaceStore>>>;
 
     // The persistent-runtime tier: manifests, checkpoints and harness state.
     //
@@ -1901,9 +1577,7 @@ pub trait SessionStore: Send + Sync {
     ///
     /// Postgres serialises writers per session row, so it defers nothing and
     /// this is a no-op for the only shipped backend.
-    async fn finish_interactive_open(&self, _session_id: Uuid) -> Result<()> {
-        Ok(())
-    }
+    async fn finish_interactive_open(&self, session_id: Uuid) -> Result<()>;
     /// The durable launch metadata a relay host recorded for this session.
     async fn load_host_launch_metadata(
         &self,
@@ -2126,17 +1800,24 @@ pub struct SessionStoreCompaction {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionStoreHealth {
+    /// The result of the integrity check, or why it was not run.
     pub integrity: String,
     #[serde(default)]
     pub integrity_checked: bool,
-    pub journal_mode: String,
-    pub synchronous: i64,
-    pub foreign_keys: bool,
+    /// Whether a commit is durable before the caller is told it succeeded.
+    ///
+    /// This is the one readiness property worth reporting, because it is the
+    /// one whose absence loses work that the journal already acknowledged. A
+    /// server configured to acknowledge before the write reaches disk will
+    /// answer every query correctly right up until it restarts.
     #[serde(default)]
-    pub journal_size_limit_bytes: i64,
-    pub wal_busy: i64,
-    pub wal_log_frames: i64,
-    pub wal_checkpointed_frames: i64,
+    pub durable_commits: bool,
+    /// The server setting `durable_commits` was derived from, verbatim.
+    ///
+    /// Reported rather than reduced to the boolean because an operator asked
+    /// to fix a degraded store needs to see the value that made it degraded.
+    #[serde(default)]
+    pub commit_durability: String,
     pub sessions: i64,
     pub events: i64,
     pub actions: i64,
@@ -2145,25 +1826,11 @@ pub struct SessionStoreHealth {
 }
 
 impl SessionStoreHealth {
+    /// Ready means the journal answered, nothing it actually checked came back
+    /// wrong, and an acknowledged write will survive a restart.
     pub fn is_ready(&self) -> bool {
-        (!self.integrity_checked || self.integrity == "ok")
-            && self.journal_mode.eq_ignore_ascii_case("wal")
-            && self.synchronous >= 2
-            && self.foreign_keys
-            && self.wal_busy == 0
+        (!self.integrity_checked || self.integrity == "ok") && self.durable_commits
     }
-}
-
-fn is_disposable_schema_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().starts_with(DISPOSABLE_SCHEMA_ERROR))
-}
-
-fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_os_string();
-    value.push(suffix);
-    PathBuf::from(value)
 }
 
 fn enum_text<T: Serialize>(value: &T) -> Result<String> {
@@ -2177,16 +1844,6 @@ fn parse_enum<T: DeserializeOwned>(value: &str) -> Result<T> {
     Ok(serde_json::from_value(serde_json::Value::String(
         value.to_string(),
     ))?)
-}
-
-fn parse_timestamp(value: Option<&str>) -> Result<Option<DateTime<Utc>>> {
-    value
-        .map(|value| {
-            DateTime::parse_from_rfc3339(value)
-                .map(|timestamp| timestamp.with_timezone(&Utc))
-                .map_err(Into::into)
-        })
-        .transpose()
 }
 
 fn same_prompt_payload_ignoring_delivery(
@@ -2282,10 +1939,6 @@ fn validate_live_lease(
         action.action_id
     );
     Ok(())
-}
-
-fn payload_kind_name(kind: SessionPayloadKind) -> &'static str {
-    kind.as_str()
 }
 
 pub fn deferred_json_payload(payload: &SessionPayloadRef) -> serde_json::Value {
@@ -2407,36 +2060,6 @@ fn history_actor_name(actor: crate::EventActor) -> &'static str {
     }
 }
 
-fn history_fts_query(text: &str) -> Result<String> {
-    let terms = history_literal_terms(text, true)?;
-    ensure!(
-        !terms.is_empty(),
-        "history lexical query has no searchable terms"
-    );
-    Ok(terms
-        .into_iter()
-        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" AND "))
-}
-
-fn history_literal_terms(text: &str, case_sensitive: bool) -> Result<Vec<String>> {
-    let terms = text
-        .split_whitespace()
-        .filter(|term| !term.is_empty())
-        .take(64)
-        .map(|term| {
-            if case_sensitive {
-                term.to_string()
-            } else {
-                term.to_lowercase()
-            }
-        })
-        .collect::<Vec<_>>();
-    ensure!(!terms.is_empty(), "history query has no searchable terms");
-    Ok(terms)
-}
-
 fn history_regex(text: &str, case_sensitive: bool) -> Result<Regex> {
     RegexBuilder::new(text)
         .case_insensitive(!case_sensitive)
@@ -2444,23 +2067,6 @@ fn history_regex(text: &str, case_sensitive: bool) -> Result<Regex> {
         .dfa_size_limit(8 * 1024 * 1024)
         .build()
         .context("invalid bounded history regular expression")
-}
-
-fn history_literal_match(
-    body: &str,
-    terms: &[String],
-    case_sensitive: bool,
-) -> Option<(usize, usize)> {
-    let mut first = None;
-    for term in terms {
-        let expression = RegexBuilder::new(&regex::escape(term))
-            .case_insensitive(!case_sensitive)
-            .build()
-            .ok()?;
-        let found = expression.find(body)?;
-        first.get_or_insert((found.start(), found.end()));
-    }
-    first
 }
 
 fn history_match_snippet(body: &str, start: usize, end: usize) -> String {

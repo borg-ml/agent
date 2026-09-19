@@ -36,6 +36,9 @@ pub mod workflow;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
+#[cfg(test)]
+mod contracts;
+
 /// The journal schema. Its fingerprint prevents replaying DDL on ordinary opens.
 const POSTGRES_SCHEMA_SQL: &str = include_str!("postgres_schema.sql");
 
@@ -346,9 +349,6 @@ impl PostgresSessionStore {
     }
 
     async fn health_snapshot(&self, check_integrity: bool) -> Result<SessionStoreHealth> {
-        // SessionStoreHealth was shaped for SQLite pragmas. The fields are
-        // mapped to their Postgres equivalents rather than renamed, so existing
-        // health reporting and `is_ready` keep working across both backends.
         let integrity = if check_integrity {
             // Postgres has no `quick_check`. The equivalent cheap assertion is
             // that the journal is readable and its constraints are intact;
@@ -360,7 +360,11 @@ impl PostgresSessionStore {
         } else {
             "not_checked".to_string()
         };
-        let synchronous_commit: String = sqlx::query_scalar("show synchronous_commit")
+        // The durability question, asked of the server rather than assumed.
+        // `off` and `local` both acknowledge a commit that a crash can still
+        // lose, and they are set by operators chasing throughput, so this is
+        // worth reading every time rather than trusting a default.
+        let commit_durability: String = sqlx::query_scalar("show synchronous_commit")
             .fetch_one(&self.pool)
             .await?;
         let sessions: i64 = sqlx::query_scalar("select count(*) from sessions")
@@ -378,26 +382,11 @@ impl PostgresSessionStore {
         Ok(SessionStoreHealth {
             integrity,
             integrity_checked: check_integrity,
-            // Postgres is always write-ahead logged; reporting "wal" keeps
-            // `SessionStoreHealth::is_ready` meaningful for both backends.
-            journal_mode: "wal".to_string(),
-            // `is_ready` demands >= 2, which for SQLite meant FULL. The
-            // Postgres analogue of a durable commit is synchronous_commit=on.
-            synchronous: if matches!(
-                synchronous_commit.as_str(),
+            durable_commits: matches!(
+                commit_durability.as_str(),
                 "on" | "remote_apply" | "remote_write"
-            ) {
-                2
-            } else {
-                0
-            },
-            foreign_keys: true,
-            journal_size_limit_bytes: 0,
-            // There is no per-file WAL busy counter to expose: writer waits are
-            // per session row, which is the entire point of this backend.
-            wal_busy: 0,
-            wal_log_frames: 0,
-            wal_checkpointed_frames: 0,
+            ),
+            commit_durability,
             sessions,
             events,
             actions,
@@ -555,10 +544,19 @@ mod tests {
         let health = store.health().await.expect("health");
         assert_eq!(health.integrity, "ok");
         assert!(health.integrity_checked);
-        assert_eq!(health.journal_mode, "wal");
-        assert!(health.foreign_keys);
-        assert_eq!(health.wal_busy, 0);
         assert_eq!(health.projection_version, crate::SESSION_PROJECTION_VERSION);
+        // Readiness turns on durability, so the reported setting has to be the
+        // server's real one rather than a constant: a test that accepted any
+        // value here would pass against a server configured to lose commits.
+        assert!(
+            health.durable_commits,
+            "a default server acknowledges commits durably, got synchronous_commit={}",
+            health.commit_durability
+        );
+        assert!(
+            !health.commit_durability.is_empty(),
+            "the setting behind the verdict must be reported for diagnosis"
+        );
 
         let readiness = store.readiness().await.expect("readiness");
         assert_eq!(readiness.integrity, "not_checked");

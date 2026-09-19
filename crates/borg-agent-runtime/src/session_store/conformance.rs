@@ -1282,6 +1282,7 @@ async fn the_relay_sweep_spans_the_journal_and_workspace_tiers() {
                 workspace_id,
                 author_id: author,
                 text: "relay me".to_string(),
+                attachments: Vec::new(),
                 mentions: Vec::new(),
                 audience: crate::workspace::Audience::Workspace,
                 mode: crate::workspace::DeliveryMode::Notify,

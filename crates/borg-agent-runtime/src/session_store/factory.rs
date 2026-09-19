@@ -337,7 +337,7 @@ mod tests {
     }
 
     use crate::session_store::{
-        RawSessionEvent, SessionLineage, SessionStoreCompaction, SessionStoreHealth,
+        RawSessionEvent, RecoveryParts, SessionLineage, SessionStoreCompaction, SessionStoreHealth,
         SessionWorkspaceBinding,
     };
     use crate::session_store::{
@@ -350,6 +350,7 @@ mod tests {
         SessionStoreFork, SessionSummary,
     };
     use chrono::{DateTime, Utc};
+    use std::collections::HashMap;
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -375,6 +376,82 @@ mod tests {
         /// The tier under test: withheld unless the fixture supplies one.
         async fn workspace_store(&self) -> Result<Option<Arc<dyn crate::WorkspaceStore>>> {
             Ok(self.workspace.clone())
+        }
+        async fn host_workspace_cursors(
+            &self,
+            _host_id: Uuid,
+            _session_id: Uuid,
+        ) -> Result<HashMap<Uuid, u64>> {
+            unimplemented!("journal access is not part of this test")
+        }
+        async fn acknowledge_host_workspaces(
+            &self,
+            _host_id: Uuid,
+            _session_id: Uuid,
+            _cursors: &HashMap<Uuid, u64>,
+        ) -> Result<()> {
+            unimplemented!("journal access is not part of this test")
+        }
+        async fn register_child_session(
+            &self,
+            _owner_session_id: Uuid,
+            _session_id: Uuid,
+        ) -> Result<()> {
+            unimplemented!("journal access is not part of this test")
+        }
+        async fn admit_prompt(&self, _event: SessionEvent) -> Result<SessionEvent> {
+            unimplemented!("journal access is not part of this test")
+        }
+        async fn recent_user_messages(
+            &self,
+            _session_id: Uuid,
+            _limit: usize,
+        ) -> Result<Vec<SessionEvent>> {
+            unimplemented!("journal access is not part of this test")
+        }
+        async fn recent_messages(&self, _session_id: Uuid, limit: usize) -> Result<Vec<SessionEvent>> {
+            unimplemented!("journal access is not part of this test")
+        }
+        async fn prompt_cache_session_id(&self, _session_id: Uuid) -> Result<Uuid> {
+            unimplemented!("journal access is not part of this test")
+        }
+        async fn inherited_event_count(&self, _session_id: Uuid) -> Result<u64> {
+            unimplemented!("journal access is not part of this test")
+        }
+        async fn recovery_parts(
+            &self,
+            _session_id: Uuid,
+            _parts: RecoveryParts,
+        ) -> Result<SessionRecovery> {
+            unimplemented!("journal access is not part of this test")
+        }
+        async fn recovery_from_provider_checkpoint(
+            &self,
+            _session_id: Uuid,
+            _provider_session_id: &str,
+        ) -> Result<Option<SessionRecovery>> {
+            unimplemented!("journal access is not part of this test")
+        }
+        async fn attach_workspace(
+            &self,
+            _binding: SessionWorkspaceBinding,
+        ) -> Result<SessionWorkspaceBinding> {
+            unimplemented!("journal access is not part of this test")
+        }
+        async fn workspace_binding(
+            &self,
+            _session_id: Uuid,
+        ) -> Result<Option<SessionWorkspaceBinding>> {
+            unimplemented!("journal access is not part of this test")
+        }
+        async fn autonomy_store(
+            &self,
+        ) -> Result<Option<std::sync::Arc<dyn crate::autonomy::AutonomyStore>>> {
+            // The tier this fixture deliberately withholds.
+            Ok(None)
+        }
+        async fn finish_interactive_open(&self, _session_id: Uuid) -> Result<()> {
+            unimplemented!("journal access is not part of this test")
         }
         async fn create_session(&self, _session_id: Uuid) -> Result<()> {
             unimplemented!("journal access is not part of this test")
