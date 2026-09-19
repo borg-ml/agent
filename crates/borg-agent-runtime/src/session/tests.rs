@@ -4727,20 +4727,26 @@ async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
 /// claim: it proves the human is answered promptly, NOT that the processes were
 /// reaped -- an expired bound reports that they may still be running.
 ///
-/// Deliberately NOT on a paused clock, despite that being the usual way to make
-/// a timing test deterministic. The interval measured here is not made of
-/// timers: between Escape and the boundary the actor does three Postgres round
-/// trips -- pausing the goal, latching the stop gate, and recording
-/// `TurnCompleted`. A paused clock auto-advances whenever no task is runnable,
-/// which includes while those writes are outstanding, so it would jump the
-/// reading to the next armed timer and fail the very assertion below. Real time
-/// is the honest instrument for this one.
+/// The clock is paused only across the measured window: the store connects and
+/// the turn starts on the real clock, because a paused clock auto-advances
+/// while a task waits on a socket and would fire the setup guards spuriously.
+/// It is resumed before the scratch database is dropped so teardown talks to
+/// Postgres on a real clock too.
 ///
-/// What keeps it from being a flaky stopwatch is that the assertion is a ratio,
-/// not an absolute: the boundary must land short of the watchdog budget it used
-/// to inherit. Under cfg(test) that is 100ms of human bound against a 500ms
-/// watchdog budget, and under the old code the wait IS the watchdog budget, so
-/// this fails loudly rather than marginally.
+/// The assertion is a ratio rather than an absolute reading: the boundary must
+/// land short of the watchdog budget this path used to inherit. Under
+/// cfg(test) that is a 100ms human bound against a 500ms watchdog budget, and
+/// under the old code the wait IS the watchdog budget, so this fails loudly.
+///
+/// Known residual risk, recorded so a flake is diagnosable rather than
+/// mysterious: the measured window still contains three Postgres round trips
+/// (pausing the goal, latching the stop gate, recording `TurnCompleted`). While
+/// those are outstanding no task is runnable, so the paused clock advances to
+/// the next armed timer, and the turn loop's watchdog poll re-arms every 20ms
+/// under cfg(test). A slow database can therefore accumulate simulated time
+/// during a single real write. If this test ever flakes on a loaded machine,
+/// that is the mechanism, and the fix is to measure `std::time::Instant` and
+/// drop the pause/resume pair -- the ratio assertion works on either clock.
 #[tokio::test]
 async fn an_unresponsive_cleanup_answers_escape_on_a_human_bound() {
     let root = tempdir().unwrap();
@@ -4806,7 +4812,10 @@ async fn an_unresponsive_cleanup_answers_escape_on_a_human_bound() {
         .await
         .expect("provider starts");
 
-    let escape_at = std::time::Instant::now();
+    // Everything above needed the real clock. From here the interesting
+    // durations are the cleanup bounds, so measure them on the paused one.
+    tokio::time::pause();
+    let escape_at = tokio::time::Instant::now();
     command_tx
         .send(HostCommand::Interrupt { session_id })
         .await
@@ -4822,7 +4831,7 @@ async fn an_unresponsive_cleanup_answers_escape_on_a_human_bound() {
             .expect("the human is answered without waiting on a cleanup that never returns")
             .expect("session remains open");
         if matches!(event.kind, SessionEventKind::TurnCompleted { .. }) {
-            boundary_at = Some(std::time::Instant::now());
+            boundary_at = Some(tokio::time::Instant::now());
         }
     }
     let waited = boundary_at.expect("terminal boundary observed") - escape_at;
@@ -4830,6 +4839,10 @@ async fn an_unresponsive_cleanup_answers_escape_on_a_human_bound() {
         waited < TURN_WATCHDOG_STOP_TIMEOUT,
         "Escape must not inherit the watchdog budget: waited {waited:?}"
     );
+
+    // Back to the real clock: the successor turn and the teardown below both
+    // talk to Postgres, which must not race an auto-advancing timer.
+    tokio::time::resume();
 
     // The successor is unharmed: an explicit human prompt still runs a turn,
     // and the previous generation's cleanup never reached it.
