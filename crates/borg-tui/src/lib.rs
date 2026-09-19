@@ -5903,11 +5903,10 @@ impl BorgTerminal {
         let current = self
             .transcript
             .tool_run_offset(nested.tool_run_start, nested.max_offset);
-        // Inner scrolling invalidates the render cache. Coalesce it into one
-        // frame, then ease any overflow through the ordinary transcript path.
-        let (next, remainder) = nested
-            .motion
-            .advance_immediately(current, nested.max_offset);
+        // Inner scrolling invalidates the render cache, so coalesce the whole
+        // pending input into one frame.
+        let (next, handoff) =
+            nested_scroll_handoff(current, nested.max_offset, nested.motion.take_pending());
         if next != current {
             let delta = if next >= current {
                 isize::try_from(next - current).unwrap_or(isize::MAX)
@@ -5918,23 +5917,23 @@ impl BorgTerminal {
                 .scroll_tool_run(nested.tool_run_start, nested.max_offset, delta);
             self.invalidate_transcript_render_cache();
         }
-        if remainder != 0 {
+        if handoff != 0 {
             // Inner offsets grow downward; transcript offsets grow upward.
-            // Transfer even the partial event that crosses the edge, keeping
-            // the outer viewport's normal wheel speed and pending momentum.
+            // Convert the handed-off input to the outer viewport's normal
+            // wheel speed so the transcript keeps its usual momentum.
             let terminal_height = self.terminal.size().map(|size| size.height).unwrap_or(1);
             let viewport_height = self.transcript_viewport_area.map_or(1, |area| area.height);
-            let lines = remainder
+            let lines = handoff
                 .unsigned_abs()
                 .saturating_mul(wheel_scroll_lines(viewport_height) as usize)
                 .div_ceil(nested_wheel_scroll_lines(terminal_height) as usize);
             let lines = isize::try_from(lines).unwrap_or(isize::MAX);
-            self.history_page_requested = remainder < 0 && self.focused_tool.is_none();
-            if remainder < 0 {
+            self.history_page_requested = handoff < 0 && self.focused_tool.is_none();
+            if handoff < 0 {
                 self.transcript.follow_tail = false;
             }
             self.scroll_motion
-                .push(if remainder < 0 { lines } else { -lines });
+                .push(if handoff < 0 { lines } else { -lines });
         }
     }
 
@@ -11323,22 +11322,8 @@ impl ScrollMotion {
         )
     }
 
-    fn advance_immediately(
-        &mut self,
-        scroll_from_bottom: usize,
-        scroll_max: usize,
-    ) -> (usize, isize) {
-        let requested = std::mem::take(&mut self.remaining_lines);
-        let next = if requested > 0 {
-            scroll_from_bottom
-                .saturating_add(requested as usize)
-                .min(scroll_max)
-        } else {
-            scroll_from_bottom.saturating_sub(requested.unsigned_abs())
-        };
-        let moved = isize::try_from(next.abs_diff(scroll_from_bottom)).unwrap_or(isize::MAX)
-            * requested.signum();
-        (next, requested.saturating_sub(moved))
+    fn take_pending(&mut self) -> isize {
+        std::mem::take(&mut self.remaining_lines)
     }
 
     fn advance_with_limits(
@@ -14128,6 +14113,24 @@ fn nested_wheel_scroll_lines(terminal_height: u16) -> isize {
 fn nested_wheel_scroll_distance(terminal_height: u16, repetitions: usize) -> isize {
     nested_wheel_scroll_lines(terminal_height)
         .saturating_mul(isize::try_from(repetitions).unwrap_or(isize::MAX))
+}
+
+/// Split one coalesced nested wheel input between an action accordion and the
+/// transcript behind it, returning the accordion's new offset and the lines
+/// handed to the transcript.
+///
+/// An input the accordion can act on is consumed there in full, even when it
+/// lands on an edge, so reaching the top of an action list never scrolls the
+/// background in the same input. Only an input that starts at that edge —
+/// including a wheel over an accordion short enough that it cannot scroll —
+/// reaches the transcript.
+fn nested_scroll_handoff(offset: usize, max_offset: usize, lines: isize) -> (usize, isize) {
+    let next = if lines > 0 {
+        offset.saturating_add(lines.unsigned_abs()).min(max_offset)
+    } else {
+        offset.saturating_sub(lines.unsigned_abs())
+    };
+    (next, if next == offset { lines } else { 0 })
 }
 
 fn sticky_tool_run_header_row(

@@ -10322,8 +10322,8 @@ fn nested_wheel_motion_applies_a_coalesced_gesture_in_one_render_frame() {
     motion.push(event_lines);
     let mut frames = 0;
     while motion.is_active() {
-        let (next, remainder) = motion.advance_immediately(scroll, 500);
-        assert_eq!(remainder, 0);
+        let (next, handoff) = nested_scroll_handoff(scroll, 500, motion.take_pending());
+        assert_eq!(handoff, 0);
         scroll = next;
         frames += 1;
     }
@@ -10665,41 +10665,38 @@ fn action_viewport_uses_up_to_one_third_of_the_terminal() {
 }
 
 #[test]
-fn nested_tool_scroll_passes_boundary_overflow_without_a_gesture_pause() {
-    for direction in [-1, 1] {
+fn nested_tool_scroll_keeps_a_boundary_crossing_input_inside_the_accordion() {
+    // Upward reaches the top of the action list; downward reaches its bottom.
+    for (direction, edge) in [(-1isize, 0usize), (1, 12)] {
         let mut inner = ScrollMotion::default();
-        let mut outer = ScrollMotion::default();
-        let mut inner_offset = if direction < 0 { 2 } else { 10 };
-        let mut outer_offset = 100;
-        // Every burst is part of the same continuous gesture. The first one
-        // crosses the inner edge; every later one starts at that edge.
-        for burst in [5, 3, 12, 1, 6] {
-            inner.push(direction * burst);
-            let (next, remainder) = inner.advance_immediately(inner_offset, 12);
-            let moved = next.abs_diff(inner_offset) as isize;
-            assert_eq!(
-                moved + remainder.abs(),
-                burst,
-                "no wheel input may disappear at an inner edge"
-            );
-            assert_ne!(remainder, 0);
-            inner_offset = next;
-            outer.push(-remainder);
-            let next_outer = outer.advance(outer_offset, 200);
-            assert_ne!(
-                next_outer, outer_offset,
-                "the same frame must move the outer viewport"
-            );
-            outer_offset = next_outer;
-        }
-        assert_eq!(inner_offset, if direction < 0 { 0 } else { 12 });
+        let mut offset = if direction < 0 { 2 } else { 10 };
 
-        // Reversing at the edge immediately moves the inner viewport again.
+        // The input that runs into the edge is consumed by the accordion in
+        // full: the transcript behind it must not move on the same input.
+        inner.push(direction * 9);
+        let (next, handoff) = nested_scroll_handoff(offset, 12, inner.take_pending());
+        assert_eq!(next, edge);
+        assert_eq!(
+            handoff, 0,
+            "an input that can still move the accordion must not scroll the transcript"
+        );
+        offset = next;
+
+        // Only the next input, which starts at the edge, is handed off whole.
+        inner.push(direction * 4);
+        let (next, handoff) = nested_scroll_handoff(offset, 12, inner.take_pending());
+        assert_eq!(next, edge);
+        assert_eq!(handoff, direction * 4);
+
+        // Reversing at the edge stays inside the accordion again.
         inner.push(-direction * 3);
-        let (next, remainder) = inner.advance_immediately(inner_offset, 12);
-        assert_eq!(next.abs_diff(inner_offset), 3);
-        assert_eq!(remainder, 0);
+        let (next, handoff) = nested_scroll_handoff(edge, 12, inner.take_pending());
+        assert_eq!(next.abs_diff(edge), 3);
+        assert_eq!(handoff, 0);
     }
+
+    // An accordion whose rows all fit cannot consume anything.
+    assert_eq!(nested_scroll_handoff(0, 0, -5), (0, -5));
 }
 
 #[test]

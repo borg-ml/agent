@@ -12,6 +12,7 @@ mod editor_preferences {
 }
 mod extensions;
 mod importer;
+mod image_delivery;
 mod inspect;
 mod limits;
 mod protection;
@@ -63,6 +64,7 @@ async fn main() -> Result<()> {
         Command::Remote { command } => run_remote_command(command).await,
         Command::Update(args) => updater::run(args).await,
         Command::Capabilities(args) => print_capabilities(args),
+        Command::Image { files, session } => image_delivery::run(files, session).await,
         Command::Tools { name } => agent_mcp::list_tools(name.as_deref()).await,
         Command::Call { name, arguments } => {
             agent_mcp::call_tool(&name, arguments.as_deref()).await

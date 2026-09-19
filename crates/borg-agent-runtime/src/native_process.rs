@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
+use borg_provider::provider::ModelInputAttachment;
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
@@ -21,6 +22,34 @@ const MAX_YIELD_MS: u64 = 30_000;
 const DEFAULT_OUTPUT_TOKENS: usize = 10_000;
 const MAX_OUTPUT_TOKENS: usize = 64_000;
 const JOURNAL_OUTPUT_TOKENS: usize = 16_384;
+
+/// Absolute path of a private directory where a child process can hand images
+/// back to the model out of band.
+///
+/// Images cannot travel in stdout. `exec` captures a child's stdout into
+/// [`HeadTailBuffer`], which keeps at most [`CAPTURE_BYTES`] and is rendered
+/// down to a token budget on every snapshot, so a screenshot's base64 is cut
+/// in half by `… bytes omitted …` long before any caller could parse it back
+/// out. Raising those limits is not an option either: shell output is meant to
+/// stay small, and megabytes of base64 would flow through the secret scrubber,
+/// the journal, and the tool-result bound on every single read.
+///
+/// So the bytes take a different road. A child writes each image as its own
+/// file here, the snapshot drains them, and only a short descriptor is left in
+/// stdout. Because this rides on an inherited environment variable instead of
+/// the stdout text, it survives pipes, redirection, subshells, and nested
+/// scripts — anything that inherits the environment can deliver an image.
+pub(crate) const ATTACHMENT_SPOOL_ENV: &str = "BORG_ATTACHMENT_SPOOL";
+/// Safety bound only. The canonical per-result image policy (how many images,
+/// how large, and the `dropped_attachments` diagnostics) lives in
+/// `native_harness::split_tool_result_attachments` so there is exactly one
+/// place that decides what reaches a model; this cap just stops a runaway
+/// child from making the runtime read unbounded data.
+const MAX_SPOOLED_ATTACHMENTS_PER_DRAIN: usize = 16;
+/// Generous next to the harness' 6 MiB base64 limit, so an image that is only
+/// slightly too large is still reported as dropped by the harness rather than
+/// vanishing here without explanation.
+const MAX_SPOOLED_ATTACHMENT_BYTES: u64 = 12 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessManager {
@@ -67,6 +96,21 @@ struct ProcessEntry {
     finished: Notify,
     cancellation: CancellationToken,
     updates: broadcast::Sender<(Uuid, Option<Vec<u8>>)>,
+    /// Private directory this process may drop images into. `None` when the
+    /// directory could not be created, in which case the process simply has no
+    /// image channel and everything else behaves exactly as before.
+    attachment_spool: Option<PathBuf>,
+}
+
+impl Drop for ProcessEntry {
+    fn drop(&mut self) {
+        // The registry drops its handle as soon as the process is reaped, so
+        // this is the one place that covers every exit path: normal exit,
+        // timeout, cancellation, `terminate_session`, and the startup guard.
+        if let Some(spool) = &self.attachment_spool {
+            let _ = std::fs::remove_dir_all(spool);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -107,6 +151,14 @@ pub struct ProcessSnapshot {
     pub stderr_omitted_bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Images this process handed back out of band, serialized under the same
+    /// top-level key the native harness already lifts out of a tool result.
+    /// That is the whole point of the key name: once the snapshot carries it at
+    /// the top level, `split_tool_result_attachments` turns these into real
+    /// typed provider vision attachments with no provider-specific code, so
+    /// every model backend gets pixels instead of base64 text.
+    #[serde(rename = "borg_attachments", skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ModelInputAttachment>,
 }
 
 impl Default for ProcessManager {
@@ -249,9 +301,19 @@ impl ProcessManager {
         }
 
         let process_id = Uuid::new_v4();
+        let attachment_spool = create_attachment_spool(process_id);
         let mut process = shell_command(&command);
         crate::process_environment::configure_host_child_environment(&mut process);
         process.envs(environment);
+        // Set after the caller's environment so a session-scoped variable can
+        // never shadow this process' own private spool with another one's.
+        if let Some(spool) = &attachment_spool {
+            process.env(ATTACHMENT_SPOOL_ENV, spool);
+        } else {
+            // A stale value inherited from the supervisor would point a child
+            // at a directory nobody drains.
+            process.env_remove(ATTACHMENT_SPOOL_ENV);
+        }
         process
             .current_dir(&cwd)
             .stdin(Stdio::piped())
@@ -293,6 +355,7 @@ impl ProcessManager {
             finished: Notify::new(),
             cancellation: cancel.clone(),
             updates: self.inner.updates.clone(),
+            attachment_spool,
         });
         self.inner
             .processes
@@ -658,7 +721,72 @@ impl HeadTailBuffer {
     }
 }
 
+/// Create this process' private image spool. Failure is not fatal: the process
+/// runs with no image channel, exactly as it did before this channel existed.
+fn create_attachment_spool(process_id: Uuid) -> Option<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("borg-attachments-{}", process_id.simple()));
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => Some(dir),
+        Err(error) => {
+            tracing::debug!(
+                %process_id,
+                %error,
+                "failed to create the process image spool; continuing without an image channel"
+            );
+            None
+        }
+    }
+}
+
+/// Take every image the process has handed over since the last snapshot.
+///
+/// Two properties matter here and both come from the file protocol rather than
+/// from locking. A writer creates its file under a `.tmp` name and renames it
+/// into place, so a file with the final suffix is always complete and a
+/// half-written screenshot can never be read. And every file that is looked at
+/// is removed, so an image is delivered exactly once: re-reading a still-running
+/// session cannot resend — or re-bill — an image the model already saw.
+fn drain_attachment_spool(dir: &Path) -> Vec<ModelInputAttachment> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    // Writers prefix a timestamp, so sorting by name replays the images in the
+    // order they were produced even across several commands in one session.
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|suffix| suffix == "json"))
+        .collect();
+    files.sort();
+    let mut attachments = Vec::new();
+    for path in files {
+        let oversized = std::fs::metadata(&path)
+            .is_ok_and(|metadata| metadata.len() > MAX_SPOOLED_ATTACHMENT_BYTES);
+        let parsed = if oversized || attachments.len() >= MAX_SPOOLED_ATTACHMENTS_PER_DRAIN {
+            None
+        } else {
+            std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<ModelInputAttachment>(&bytes).ok())
+        };
+        // Removed whether or not it parsed: a file that cannot be delivered
+        // must not be retried against a later, unrelated tool result.
+        let _ = std::fs::remove_file(&path);
+        if let Some(attachment) = parsed {
+            attachments.push(attachment);
+        }
+    }
+    attachments
+}
+
 fn snapshot(process_id: Uuid, entry: &ProcessEntry, max_output_tokens: usize) -> ProcessSnapshot {
+    // Drained before the output lock is taken: this touches the filesystem and
+    // has nothing to do with the stdout buffers.
+    let attachments = entry
+        .attachment_spool
+        .as_deref()
+        .map(drain_attachment_spool)
+        .unwrap_or_default();
     let output = entry
         .output
         .lock()
@@ -682,6 +810,7 @@ fn snapshot(process_id: Uuid, entry: &ProcessEntry, max_output_tokens: usize) ->
         stdout_omitted_bytes,
         stderr_omitted_bytes,
         error: status.error,
+        attachments,
     }
 }
 
@@ -1928,5 +2057,241 @@ mod tests {
             })
             .count();
         assert_eq!(completions, 1);
+    }
+
+    /// A real PNG, built here rather than checked in so the test carries its
+    /// own fixture and can pick a size that matters. Stored (uncompressed)
+    /// deflate blocks keep the encoder short; the result is a byte-exact,
+    /// standards-valid PNG that any decoder opens.
+    fn test_png(width: u32, height: u32) -> Vec<u8> {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for byte in bytes {
+                crc ^= u32::from(*byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 0 {
+                        crc >> 1
+                    } else {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    };
+                }
+            }
+            !crc
+        }
+        fn adler32(bytes: &[u8]) -> u32 {
+            let (mut low, mut high) = (1u32, 0u32);
+            for byte in bytes {
+                low = (low + u32::from(*byte)) % 65521;
+                high = (high + low) % 65521;
+            }
+            (high << 16) | low
+        }
+        fn chunk(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut checked = kind.to_vec();
+            checked.extend_from_slice(payload);
+            let mut out = (payload.len() as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(&checked);
+            out.extend_from_slice(&crc32(&checked).to_be_bytes());
+            out
+        }
+        fn stored_zlib(raw: &[u8]) -> Vec<u8> {
+            let mut out = vec![0x78, 0x01];
+            let mut offset = 0;
+            while offset < raw.len() {
+                let len = (raw.len() - offset).min(0xFFFF);
+                let final_block = offset + len == raw.len();
+                out.push(u8::from(final_block));
+                out.extend_from_slice(&(len as u16).to_le_bytes());
+                out.extend_from_slice(&(!(len as u16)).to_le_bytes());
+                out.extend_from_slice(&raw[offset..offset + len]);
+                offset += len;
+            }
+            out.extend_from_slice(&adler32(raw).to_be_bytes());
+            out
+        }
+
+        let mut scanlines = Vec::new();
+        for y in 0..height {
+            scanlines.push(0); // filter type: none
+            for x in 0..width {
+                scanlines.push((x % 256) as u8);
+                scanlines.push((y % 256) as u8);
+                scanlines.push(((x ^ y) % 256) as u8);
+            }
+        }
+        let mut header = width.to_be_bytes().to_vec();
+        header.extend_from_slice(&height.to_be_bytes());
+        header.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB, no interlace
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&chunk(b"IHDR", &header));
+        png.extend_from_slice(&chunk(b"IDAT", &stored_zlib(&scanlines)));
+        png.extend_from_slice(&chunk(b"IEND", b""));
+        png
+    }
+
+    /// The regression this whole channel exists for.
+    ///
+    /// A screenshot taken by a child process used to reach the model as
+    /// truncated base64 text: the bytes went out through stdout, and stdout is
+    /// deliberately bounded, so `… bytes omitted …` landed in the middle of the
+    /// image. Nothing downstream could recover it, and the failure was silent —
+    /// the model just saw garbled text where a picture should be.
+    ///
+    /// Every cheaper test misses this. Unit tests over hand-written JSON pass
+    /// today against the broken path, because the damage happens in the
+    /// process boundary itself: the size of a real image against a real output
+    /// budget. So this test insists on all three at once — a real child
+    /// process, a real PNG larger than the entire stdout budget, and stdout
+    /// genuinely overflowing at the same time — and then checks the bytes that
+    /// come out the far end are the same bytes that went in.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_real_png_survives_the_shell_process_boundary_while_stdout_truncates() {
+        use base64::Engine as _;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let png = test_png(160, 160);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+        // The image must be bigger than the text channel could ever carry, so
+        // that surviving intact can only mean it bypassed that channel.
+        let stdout_budget = 1_000 * 4;
+        assert!(
+            encoded.len() > stdout_budget * 4,
+            "fixture is too small to prove anything: {} bytes",
+            encoded.len()
+        );
+        let source = root.path().join("screenshot.png");
+        std::fs::write(&source, &png).expect("write fixture");
+
+        let manager = ProcessManager::default();
+        let command = format!(
+            // Exactly what a capability does: encode the image, hand it over
+            // through the spool with a tmp-then-rename, and print only text.
+            // The flood makes stdout overflow at the same time.
+            "base64 < {source} | tr -d '\\n' \
+             | sed 's/^/{{\"media_type\":\"image\\/png\",\"data_base64\":\"/; s/$/\"}}/' \
+             > \"$BORG_ATTACHMENT_SPOOL/shot.tmp\" \
+             && mv \"$BORG_ATTACHMENT_SPOOL/shot.tmp\" \"$BORG_ATTACHMENT_SPOOL/shot.json\" \
+             && head -c 200000 /dev/zero | tr '\\0' 'x' \
+             && printf 'done\\n'",
+            source = source.display()
+        );
+        let snapshot = manager
+            .exec(
+                Uuid::new_v4(),
+                root.path(),
+                command,
+                None,
+                Some(20_000),
+                Some(1_000),
+                30_000,
+                None,
+            )
+            .await
+            .expect("spawn");
+
+        assert_eq!(snapshot.exit_code, Some(0), "command failed: {snapshot:?}");
+        assert!(
+            snapshot.stdout_omitted_bytes > 0,
+            "stdout did not overflow, so this run never exercised the hazard"
+        );
+
+        // 1. The image reached the snapshot as an image, not as text.
+        assert_eq!(snapshot.attachments.len(), 1, "snapshot: {snapshot:?}");
+        assert_eq!(snapshot.attachments[0].media_type, "image/png");
+        let delivered = base64::engine::general_purpose::STANDARD
+            .decode(&snapshot.attachments[0].data_base64)
+            .expect("delivered image is valid base64");
+        assert_eq!(
+            delivered, png,
+            "the delivered image is not byte-identical to the source PNG"
+        );
+        assert_eq!(&delivered[..8], b"\x89PNG\r\n\x1a\n");
+
+        // 2. Its bytes never entered the text channel.
+        assert!(!snapshot.stdout.contains(&encoded[..64]));
+
+        // 3. The harness lifts it into a real typed provider attachment. This
+        //    is the step that used to fail even with intact bytes, because the
+        //    key was buried in a string inside `stdout` instead of sitting at
+        //    the top level of the tool result.
+        let result = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        assert!(result.get("borg_attachments").is_some());
+        let (text, attachments) =
+            crate::native_harness::split_tool_result_attachments(result.to_string());
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].data_base64, encoded);
+        assert!(
+            !text.contains(&encoded[..64]),
+            "image base64 was left behind in the tool result text"
+        );
+    }
+
+    #[test]
+    fn a_spooled_image_is_delivered_exactly_once() {
+        let spool = tempfile::tempdir().expect("spool");
+        std::fs::write(
+            spool.path().join("0001.json"),
+            br#"{"media_type":"image/png","data_base64":"AAAA"}"#,
+        )
+        .expect("write attachment");
+
+        assert_eq!(drain_attachment_spool(spool.path()).len(), 1);
+        // A second read of a still-running session must not resend — or
+        // re-bill — an image the model has already been shown.
+        assert!(drain_attachment_spool(spool.path()).is_empty());
+    }
+
+    #[test]
+    fn a_half_written_image_is_never_delivered() {
+        let spool = tempfile::tempdir().expect("spool");
+        // A writer in the middle of `base64`-ing a screenshot: the bytes are
+        // there, the rename has not happened, and reading now would hand the
+        // model a corrupt image.
+        std::fs::write(
+            spool.path().join("0001.tmp"),
+            br#"{"media_type":"image/png","data_base"#,
+        )
+        .expect("write partial");
+
+        assert!(drain_attachment_spool(spool.path()).is_empty());
+        assert!(
+            spool.path().join("0001.tmp").exists(),
+            "an in-flight write must be left alone, not deleted"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn the_image_spool_is_removed_when_the_process_is_reaped() {
+        let root = tempfile::tempdir().expect("workspace");
+        let manager = ProcessManager::default();
+        let snapshot = manager
+            .exec(
+                Uuid::new_v4(),
+                root.path(),
+                "printf %s \"$BORG_ATTACHMENT_SPOOL\"".to_string(),
+                None,
+                Some(20_000),
+                Some(1_000),
+                30_000,
+                None,
+            )
+            .await
+            .expect("spawn");
+        assert!(!snapshot.running);
+        let spool = PathBuf::from(snapshot.stdout.trim());
+        assert!(
+            spool.is_absolute(),
+            "the child was not given a spool directory: {snapshot:?}"
+        );
+        // The entry is dropped when the finished process leaves the registry.
+        for _ in 0..50 {
+            if !spool.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!spool.exists(), "the spool outlived the process: {spool:?}");
     }
 }

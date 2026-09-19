@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -18,16 +18,34 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Servers publish diagnostics only after their first analysis pass; waiting
 /// three seconds produced empty results on any non-trivial workspace.
 const PUBLISHED_DIAGNOSTICS_TIMEOUT: Duration = Duration::from_secs(15);
-const LSP_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+/// An agent's gap between two tool calls is routinely minutes, so a short
+/// idle timeout reaped servers between a targeted request and the follow-up
+/// workspace pass and forced a full (for clangd and rust-analyzer, very
+/// expensive) restart. Keep warm servers long enough to span normal turns.
+const LSP_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const LSP_REAPER_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_LSP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_WORKSPACE_DIAGNOSTIC_FILES: usize = 4096;
+/// Whole-call wall clock for a workspace diagnostics pass. Without it, the
+/// per-document fallback multiplies its own timeout by the file count, which
+/// on a large C++ workspace is hours; callers get a bounded partial report
+/// instead of a hang.
+const WORKSPACE_DIAGNOSTICS_BUDGET: Duration = Duration::from_secs(90);
+/// Remembered reaps, so a later "nothing is active" answer can say a server
+/// *was* active rather than implying one never started.
+const MAX_REMEMBERED_REAPS: usize = 8;
+/// Coverage scanning reads the compilation database directly; large
+/// generated databases are checked only up to these bounds, and report
+/// `unknown` rather than guessing beyond them.
+const MAX_COMPILATION_DATABASE_SCAN_BYTES: u64 = 32 * 1024 * 1024;
+const COMPILATION_DATABASE_SCAN_BUDGET: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct LspService {
     root: PathBuf,
     path_policy: LspPathPolicy,
     clients: std::sync::Arc<Mutex<HashMap<LspClientKey, LspClientSlot>>>,
+    reaped: std::sync::Arc<Mutex<Vec<ReapRecord>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,14 +120,81 @@ struct LspClient {
 /// One language server per (server, workspace root). The map lock is held
 /// only to find or create the slot; the slot's own lock serialises traffic
 /// to that server, so a slow rust-analyzer start or request never blocks a
-/// hover against gopls in the same session. `None` means the server has not
-/// started successfully yet; the first caller to lock the slot starts it.
+/// hover against gopls in the same session. The first caller to lock the
+/// slot starts the server.
 struct LspClientSlot {
     client: SharedLspClient,
     last_used: Instant,
 }
 
-type SharedLspClient = std::sync::Arc<Mutex<Option<LspClient>>>;
+/// A leased slot is not evidence that a server runs there. Recording the
+/// distinction keeps `status` and workspace results from presenting a server
+/// that failed to start as an active one answering with no diagnostics.
+enum LspClientState {
+    NotStarted,
+    Ready(Box<LspClient>),
+    Failed(String),
+}
+
+impl LspClientState {
+    fn ready_mut(&mut self) -> Option<&mut LspClient> {
+        match self {
+            Self::Ready(client) => Some(client),
+            _ => None,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Ready(_) => "ready",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    /// The report for a workspace whose server is not answering. Returning
+    /// this instead of skipping the slot keeps an unstarted server out of a
+    /// result set that would otherwise read as "no problems found".
+    fn unavailable_report(&self) -> Value {
+        let mut report = json!({
+            "status": self.label(),
+            "items": [],
+            "unavailable": true
+        });
+        match self {
+            Self::Failed(error) => {
+                report["error"] = Value::String(error.clone());
+            }
+            Self::NotStarted => {
+                report["error"] = Value::String(
+                    "language server has not started for this workspace yet".to_string(),
+                );
+            }
+            Self::Ready(_) => {}
+        }
+        report
+    }
+}
+
+type SharedLspClient = std::sync::Arc<Mutex<LspClientState>>;
+
+#[derive(Clone)]
+struct ReapRecord {
+    server_id: &'static str,
+    workspace_root: PathBuf,
+    reason: &'static str,
+}
+
+impl ReapRecord {
+    fn describe(&self) -> String {
+        format!(
+            "{} for {} ({})",
+            self.server_id,
+            self.workspace_root.display(),
+            self.reason
+        )
+    }
+}
 
 impl LspService {
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -118,34 +203,66 @@ impl LspService {
 
     pub(crate) fn with_path_policy(root: impl Into<PathBuf>, path_policy: LspPathPolicy) -> Self {
         let clients = std::sync::Arc::new(Mutex::new(HashMap::new()));
-        spawn_idle_reaper(&clients);
+        let reaped = std::sync::Arc::new(Mutex::new(Vec::new()));
+        spawn_idle_reaper(&clients, &reaped);
         Self {
             root: root.into(),
             path_policy,
             clients,
+            reaped,
         }
     }
 
     pub async fn status(&self) -> Value {
-        let clients = self.clients.lock().await;
-        let mut active = clients
-            .keys()
-            .map(|key| key.server_id)
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+        let slots = self.active_clients().await;
+        let mut active = Vec::new();
+        let mut active_workspaces = Vec::new();
+        for (key, shared) in &slots {
+            let mut workspace = json!({ "server": key.server_id, "root": key.workspace_root });
+            // Never block on a slot: status must stay answerable while a
+            // long workspace pass holds the server.
+            match shared.try_lock() {
+                Ok(state) => {
+                    if matches!(*state, LspClientState::Ready(_)) {
+                        active.push(key.server_id);
+                    }
+                    workspace["state"] = Value::String(state.label().to_string());
+                    if let LspClientState::Failed(error) = &*state {
+                        workspace["error"] = Value::String(error.clone());
+                    }
+                }
+                Err(_) => {
+                    active.push(key.server_id);
+                    workspace["state"] = Value::String("busy".to_string());
+                }
+            }
+            active_workspaces.push(workspace);
+        }
         active.sort_unstable();
-        let mut active_workspaces = clients
-            .keys()
-            .map(|key| json!({ "server": key.server_id, "root": key.workspace_root }))
-            .collect::<Vec<_>>();
+        active.dedup();
         active_workspaces.sort_by_key(|workspace| workspace.to_string());
-        json!({
+        let mut status = json!({
             "root": self.root,
             "active_servers": active,
             "active_workspaces": active_workspaces,
             "supported_servers": supported_server_status()
-        })
+        });
+        let reaped = self.reaped.lock().await;
+        if !reaped.is_empty() {
+            status["recently_stopped"] = Value::Array(
+                reaped
+                    .iter()
+                    .map(|record| {
+                        json!({
+                            "server": record.server_id,
+                            "root": record.workspace_root,
+                            "reason": record.reason
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        status
     }
 
     pub fn supported_status() -> Value {
@@ -157,9 +274,16 @@ impl LspService {
         let shared = self.lease_client(spec, &workspace_root).await;
         let mut slot = shared.lock().await;
         let client = ready_client(&mut slot, spec, &workspace_root).await?;
-        client
+        let mut report = client
             .document_diagnostics(&path, &uri, spec.language_id)
-            .await
+            .await?;
+        drop(slot);
+        if let Some(context) = compilation_context_status(&workspace_root, spec, Some(&path)).await
+            && let Value::Object(report) = &mut report
+        {
+            report.insert("compilationContext".to_string(), context);
+        }
+        Ok(report)
     }
 
     /// Find or create the slot for `(spec, root)` under the map lock, without
@@ -171,7 +295,7 @@ impl LspService {
         };
         let mut clients = self.clients.lock().await;
         let slot = clients.entry(key).or_insert_with(|| LspClientSlot {
-            client: std::sync::Arc::new(Mutex::new(None)),
+            client: std::sync::Arc::new(Mutex::new(LspClientState::NotStarted)),
             last_used: Instant::now(),
         });
         slot.last_used = Instant::now();
@@ -179,13 +303,39 @@ impl LspService {
     }
 
     /// Snapshot of every slot, taken under the map lock and released before
-    /// any server is spoken to.
+    /// any server is spoken to. Taking the snapshot counts as use: a long
+    /// workspace pass must not leave its own servers looking idle.
     async fn active_clients(&self) -> Vec<(LspClientKey, SharedLspClient)> {
-        let clients = self.clients.lock().await;
+        let mut clients = self.clients.lock().await;
+        let now = Instant::now();
         clients
-            .iter()
-            .map(|(key, slot)| (key.clone(), slot.client.clone()))
+            .iter_mut()
+            .map(|(key, slot)| {
+                slot.last_used = now;
+                (key.clone(), slot.client.clone())
+            })
             .collect()
+    }
+
+    /// Why a workspace-wide request has nothing to talk to. Distinguishes
+    /// "never started one" from "started one and stopped it while idle".
+    async fn no_active_server_error(&self) -> anyhow::Error {
+        let reaped = self.reaped.lock().await;
+        let Some(last) = reaped.last() else {
+            return anyhow::anyhow!(
+                "no language server is active; provide a representative source path to initialize one"
+            );
+        };
+        let stopped = reaped
+            .iter()
+            .map(ReapRecord::describe)
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::anyhow!(
+            "no language server is active; {stopped} stopped earlier in this session. \
+             Provide a representative source path (for example one under {}) to start it again",
+            last.workspace_root.display()
+        )
     }
 
     pub async fn hover(&self, path: &Path, line: u32, character: u32) -> Result<Value> {
@@ -217,28 +367,22 @@ impl LspService {
     pub async fn workspace_symbols(&self, query: &str) -> Result<Value> {
         let clients = self.active_clients().await;
         if clients.is_empty() {
-            bail!("no language server is active; inspect a supported source file first");
+            return Err(self.no_active_server_error().await);
         }
-        let mut server_counts = HashMap::new();
-        for (key, _) in &clients {
-            *server_counts.entry(key.server_id).or_insert(0usize) += 1;
-        }
+        let server_counts = server_counts(&clients);
         let mut results = serde_json::Map::new();
         for (key, shared) in &clients {
+            let label = workspace_label(key, server_counts[key.server_id]);
             let mut slot = shared.lock().await;
-            let Some(client) = slot.as_mut() else {
+            let Some(client) = slot.ready_mut() else {
+                results.insert(label, slot.unavailable_report());
                 continue;
             };
             let value = client
                 .request("workspace/symbol", json!({ "query": query }))
                 .await
-                .with_context(|| {
-                    format!(
-                        "{} workspace symbol request failed",
-                        workspace_label(key, server_counts[key.server_id])
-                    )
-                })?;
-            results.insert(workspace_label(key, server_counts[key.server_id]), value);
+                .with_context(|| format!("{label} workspace symbol request failed"))?;
+            results.insert(label, value);
         }
         Ok(Value::Object(results))
     }
@@ -257,45 +401,42 @@ impl LspService {
 
         let clients = self.active_clients().await;
         if clients.is_empty() {
-            bail!(
-                "no language server is active; provide a representative source path to initialize one"
-            );
+            return Err(self.no_active_server_error().await);
         }
-        let mut server_counts = HashMap::new();
-        for (key, _) in &clients {
-            *server_counts.entry(key.server_id).or_insert(0usize) += 1;
-        }
+        let server_counts = server_counts(&clients);
+        let deadline = Instant::now() + WORKSPACE_DIAGNOSTICS_BUDGET;
         let mut results = serde_json::Map::new();
         for (key, shared) in &clients {
+            let label = workspace_label(key, server_counts[key.server_id]);
             let mut slot = shared.lock().await;
-            let Some(client) = slot.as_mut() else {
+            let Some(client) = slot.ready_mut() else {
+                results.insert(label, slot.unavailable_report());
                 continue;
             };
+            // The budget is shared across workspaces, so one slow server
+            // cannot consume the whole call and leave the rest unreported.
+            if Instant::now() >= deadline {
+                results.insert(label, skipped_for_budget_report());
+                continue;
+            }
             let value = match client.workspace_diagnostics().await {
                 Ok(value) => value,
                 Err(error) if is_unknown_workspace_diagnostics_request(&error) => {
                     let spec = spec_for_id(key.server_id)
                         .with_context(|| format!("unknown language server `{}`", key.server_id))?;
                     client
-                        .document_workspace_diagnostics(&key.workspace_root, spec)
+                        .document_workspace_diagnostics(&key.workspace_root, spec, deadline)
                         .await
                         .with_context(|| {
-                            format!(
-                                "{} document diagnostics fallback failed ({error:#})",
-                                workspace_label(key, server_counts[key.server_id])
-                            )
+                            format!("{label} document diagnostics fallback failed ({error:#})")
                         })?
                 }
                 Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!(
-                            "{} workspace diagnostics request failed",
-                            workspace_label(key, server_counts[key.server_id])
-                        )
-                    });
+                    return Err(error)
+                        .with_context(|| format!("{label} workspace diagnostics request failed"));
                 }
             };
-            results.insert(workspace_label(key, server_counts[key.server_id]), value);
+            results.insert(label, value);
         }
         Ok(Value::Object(results))
     }
@@ -508,14 +649,26 @@ impl LspClient {
         }
     }
 
+    /// Walk the workspace one document at a time for servers without
+    /// `workspace/diagnostic`. Stops at `deadline` and reports how far it
+    /// got, because the alternative on a large C++ tree is an unbounded call
+    /// that the caller can only kill.
     async fn document_workspace_diagnostics(
         &mut self,
         workspace_root: &Path,
         spec: &ServerSpec,
+        deadline: Instant,
     ) -> Result<Value> {
         let scan = discover_workspace_documents(workspace_root, spec.extensions).await;
+        let total = scan.paths.len();
         let mut items = Vec::new();
+        let mut failed = 0usize;
+        let mut exhausted = false;
         for path in scan.paths {
+            if Instant::now() >= deadline {
+                exhausted = true;
+                break;
+            }
             let uri = Url::from_file_path(&path)
                 .map_err(|_| anyhow::anyhow!("cannot convert {} to a file URI", path.display()))?
                 .to_string();
@@ -525,18 +678,49 @@ impl LspClient {
             let report = self
                 .document_diagnostics(&path, &uri, spec.language_id)
                 .await;
-            let close = self.close_document(&path, &uri).await;
-            let report =
-                report.with_context(|| format!("diagnostics failed for {}", path.display()))?;
-            close.with_context(|| format!("failed to close {}", path.display()))?;
-            items.push(workspace_document_report(&uri, report));
+            self.close_document(&path, &uri)
+                .await
+                .with_context(|| format!("failed to close {}", path.display()))?;
+            // One unreadable or slow document used to abort the whole pass
+            // and discard every diagnostic already collected.
+            match report {
+                Ok(report) => items.push(workspace_document_report(&uri, report)),
+                Err(error) => {
+                    failed += 1;
+                    items.push(json!({
+                        "uri": uri,
+                        "kind": "full",
+                        "items": [],
+                        "error": format!("{error:#}")
+                    }));
+                }
+            }
         }
+        let scanned = items.len();
         let mut result = json!({ "kind": "full", "items": items });
+        if failed > 0 {
+            result["failedDocuments"] = json!(failed);
+        }
+        let mut partial_reasons = Vec::new();
         if scan.truncated {
-            result["partial"] = Value::Bool(true);
-            result["partialReason"] = Value::String(format!(
+            partial_reasons.push(format!(
                 "workspace scan limited to {MAX_WORKSPACE_DIAGNOSTIC_FILES} files"
             ));
+        }
+        if exhausted {
+            partial_reasons.push(format!(
+                "time budget of {}s exhausted after {scanned} of {total} discovered files",
+                WORKSPACE_DIAGNOSTICS_BUDGET.as_secs()
+            ));
+        }
+        if !partial_reasons.is_empty() {
+            result["partial"] = Value::Bool(true);
+            result["partialReason"] = Value::String(partial_reasons.join("; "));
+            result["documentsScanned"] = json!(scanned);
+            result["documentsDiscovered"] = json!(total);
+        }
+        if let Some(context) = compilation_context_status(workspace_root, spec, None).await {
+            result["compilationContext"] = context;
         }
         Ok(result)
     }
@@ -688,15 +872,23 @@ impl LspClient {
 /// Start the server for a slot on first use. Runs under the slot lock, so
 /// concurrent callers for the same workspace wait for one start instead of
 /// racing, while other servers stay reachable.
+/// A previous failure is recorded but not sticky: installing the server and
+/// retrying is the normal fix, so the next caller attempts a fresh start.
 async fn ready_client<'a>(
-    slot: &'a mut Option<LspClient>,
+    slot: &'a mut LspClientState,
     spec: &'static ServerSpec,
     root: &Path,
 ) -> Result<&'a mut LspClient> {
-    if slot.is_none() {
-        *slot = Some(LspClient::start(spec, root).await?);
+    if !matches!(slot, LspClientState::Ready(_)) {
+        match LspClient::start(spec, root).await {
+            Ok(client) => *slot = LspClientState::Ready(Box::new(client)),
+            Err(error) => {
+                *slot = LspClientState::Failed(format!("{error:#}"));
+                return Err(error);
+            }
+        }
     }
-    Ok(slot.as_mut().expect("started LSP client"))
+    Ok(slot.ready_mut().expect("started LSP client"))
 }
 
 /// The UTF-16 code-unit column for a character (code point) column on `line`.
@@ -708,8 +900,12 @@ fn utf16_column(line: &str, character_column: u32) -> u32 {
         .sum::<u32>()
 }
 
-fn spawn_idle_reaper(clients: &std::sync::Arc<Mutex<HashMap<LspClientKey, LspClientSlot>>>) {
+fn spawn_idle_reaper(
+    clients: &std::sync::Arc<Mutex<HashMap<LspClientKey, LspClientSlot>>>,
+    reaped: &std::sync::Arc<Mutex<Vec<ReapRecord>>>,
+) {
     let clients = std::sync::Arc::downgrade(clients);
+    let reaped = std::sync::Arc::downgrade(reaped);
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
     };
@@ -719,17 +915,33 @@ fn spawn_idle_reaper(clients: &std::sync::Arc<Mutex<HashMap<LspClientKey, LspCli
         interval.tick().await;
         loop {
             interval.tick().await;
-            let Some(clients) = clients.upgrade() else {
+            let (Some(clients), Some(reaped)) = (clients.upgrade(), reaped.upgrade()) else {
                 return;
             };
+            let mut records = Vec::new();
             clients.lock().await.retain(|key, slot| {
-                if !lsp_client_should_reap(key, slot.last_used.elapsed()) {
+                let Some(reason) = lsp_client_reap_reason(key, slot.last_used.elapsed()) else {
                     return true;
-                }
+                };
                 // A slot whose server is mid-request is not idle, whatever
                 // its timestamp says.
-                slot.client.try_lock().is_err()
+                if slot.client.try_lock().is_err() {
+                    return true;
+                }
+                records.push(ReapRecord {
+                    server_id: key.server_id,
+                    workspace_root: key.workspace_root.clone(),
+                    reason,
+                });
+                false
             });
+            if records.is_empty() {
+                continue;
+            }
+            let mut reaped = reaped.lock().await;
+            reaped.extend(records);
+            let overflow = reaped.len().saturating_sub(MAX_REMEMBERED_REAPS);
+            reaped.drain(..overflow);
         }
     });
 }
@@ -738,8 +950,11 @@ fn lsp_client_is_expired(idle_for: Duration) -> bool {
     idle_for >= LSP_IDLE_TIMEOUT
 }
 
-fn lsp_client_should_reap(key: &LspClientKey, idle_for: Duration) -> bool {
-    lsp_client_is_expired(idle_for) || !key.workspace_root.is_dir()
+fn lsp_client_reap_reason(key: &LspClientKey, idle_for: Duration) -> Option<&'static str> {
+    if !key.workspace_root.is_dir() {
+        return Some("workspace root no longer exists");
+    }
+    lsp_client_is_expired(idle_for).then_some("stopped after being idle")
 }
 
 fn server_initialization_options(spec: &ServerSpec) -> Option<Value> {
@@ -751,6 +966,178 @@ fn server_initialization_options(spec: &ServerSpec) -> Option<Value> {
             "check": { "allTargets": false }
         })
     })
+}
+
+fn server_counts(clients: &[(LspClientKey, SharedLspClient)]) -> HashMap<&'static str, usize> {
+    let mut counts = HashMap::new();
+    for (key, _) in clients {
+        *counts.entry(key.server_id).or_insert(0usize) += 1;
+    }
+    counts
+}
+
+fn skipped_for_budget_report() -> Value {
+    json!({
+        "status": "skipped",
+        "items": [],
+        "partial": true,
+        "partialReason": format!(
+            "time budget of {}s was consumed by earlier workspaces; query this one directly",
+            WORKSPACE_DIAGNOSTICS_BUDGET.as_secs()
+        )
+    })
+}
+
+/// Servers that read a compilation database answer from default flags when
+/// it is absent, producing confident errors (unknown includes, undefined
+/// types) that describe the missing configuration rather than the code.
+/// Reporting that state keeps callers from acting on those diagnostics.
+fn uses_compilation_database(spec: &ServerSpec) -> bool {
+    spec.id == "clangd"
+}
+
+async fn compilation_context_status(
+    workspace_root: &Path,
+    spec: &ServerSpec,
+    file: Option<&Path>,
+) -> Option<Value> {
+    if !uses_compilation_database(spec) {
+        return None;
+    }
+    let search_start = file
+        .and_then(Path::parent)
+        .unwrap_or(workspace_root)
+        .to_path_buf();
+    let Some(database) = find_compilation_database(&search_start, workspace_root).await else {
+        return Some(json!({
+            "status": "missing",
+            "searchedFrom": search_start,
+            "warning": "no compile_commands.json or compile_flags.txt was found; \
+clangd is using fallback flags, so missing-include and unknown-type diagnostics \
+likely describe absent build configuration rather than defects in the code"
+        }));
+    };
+    let mut status = json!({
+        "status": "present",
+        "kind": database.kind,
+        "path": database.path
+    });
+    let Ok(metadata) = tokio::fs::metadata(&database.path).await else {
+        return Some(status);
+    };
+    status["sizeBytes"] = json!(metadata.len());
+    if database.kind != "compile_commands.json" {
+        return Some(status);
+    }
+    if let Some(file) = file {
+        match compilation_database_covers(&database.path, file).await {
+            Coverage::Covered => {
+                status["coversFile"] = Value::Bool(true);
+            }
+            Coverage::Absent => {
+                status["coversFile"] = Value::Bool(false);
+                status["status"] = Value::String("stale".to_string());
+                status["warning"] = Value::String(format!(
+                    "{} has no entry for this file; clangd is inferring flags from a \
+different translation unit, so its diagnostics may be misleading. Regenerate the \
+compilation database to include this file",
+                    database.path.display()
+                ));
+            }
+            Coverage::Unknown => {
+                status["coversFile"] = Value::String("unknown".to_string());
+                status["coverageNote"] = Value::String(format!(
+                    "compilation database exceeds the {} MiB / {}s inspection budget; \
+coverage was not determined",
+                    MAX_COMPILATION_DATABASE_SCAN_BYTES / (1024 * 1024),
+                    COMPILATION_DATABASE_SCAN_BUDGET.as_secs()
+                ));
+            }
+        }
+        if let Ok(source) = tokio::fs::metadata(file).await
+            && let (Ok(source_time), Ok(database_time)) = (source.modified(), metadata.modified())
+            && source_time > database_time
+        {
+            status["staleAgainstSource"] = Value::Bool(true);
+        }
+    }
+    Some(status)
+}
+
+struct CompilationDatabase {
+    path: PathBuf,
+    kind: &'static str,
+}
+
+/// clangd looks in each ancestor directory and in its `build` subdirectory;
+/// mirror that rather than inventing a broader search.
+async fn find_compilation_database(start: &Path, root: &Path) -> Option<CompilationDatabase> {
+    let mut current = Some(start.to_path_buf());
+    let mut reached_root = false;
+    while let Some(directory) = current {
+        for (relative, kind) in [
+            (PathBuf::from("compile_commands.json"), "compile_commands.json"),
+            (
+                PathBuf::from("build").join("compile_commands.json"),
+                "compile_commands.json",
+            ),
+            (PathBuf::from("compile_flags.txt"), "compile_flags.txt"),
+        ] {
+            let candidate = directory.join(relative);
+            if tokio::fs::metadata(&candidate).await.is_ok() {
+                return Some(CompilationDatabase {
+                    path: candidate,
+                    kind,
+                });
+            }
+        }
+        if reached_root {
+            break;
+        }
+        if directory == root {
+            reached_root = true;
+        }
+        current = directory.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
+enum Coverage {
+    Covered,
+    Absent,
+    Unknown,
+}
+
+/// Generated databases for large projects reach hundreds of megabytes, so
+/// this scans for the file path within a byte and time budget and reports
+/// `Unknown` rather than parsing the whole document or guessing.
+async fn compilation_database_covers(database: &Path, file: &Path) -> Coverage {
+    let Some(needle) = file.to_str() else {
+        return Coverage::Unknown;
+    };
+    let Ok(contents) = tokio::fs::read(database).await else {
+        return Coverage::Unknown;
+    };
+    if contents.len() as u64 > MAX_COMPILATION_DATABASE_SCAN_BYTES {
+        return Coverage::Unknown;
+    }
+    let started = Instant::now();
+    let Ok(text) = std::str::from_utf8(&contents) else {
+        return Coverage::Unknown;
+    };
+    if text.contains(needle) {
+        return Coverage::Covered;
+    }
+    if started.elapsed() > COMPILATION_DATABASE_SCAN_BUDGET {
+        return Coverage::Unknown;
+    }
+    // A database may record the file under a different but equivalent path;
+    // the file name alone is a weaker signal, so absence of both is what
+    // justifies reporting the file as uncovered.
+    match file.file_name().and_then(|name| name.to_str()) {
+        Some(name) if text.contains(name) => Coverage::Unknown,
+        _ => Coverage::Absent,
+    }
 }
 
 fn workspace_label(key: &LspClientKey, server_count: usize) -> String {
@@ -854,6 +1241,13 @@ fn ignored_workspace_directory(path: &Path) -> bool {
                 | "dist"
                 | ".venv"
                 | "__pycache__"
+                // Generated and derived trees in large C++/Unreal projects
+                // hold far more source-shaped files than the project itself,
+                // and diagnostics on them are noise.
+                | "Intermediate"
+                | "Binaries"
+                | "DerivedDataCache"
+                | "Saved"
         )
     )
 }
@@ -1131,10 +1525,10 @@ mod tests {
             server_id: "rust-analyzer",
             workspace_root: workspace.path().to_path_buf(),
         };
-        assert!(!lsp_client_should_reap(&key, Duration::ZERO));
+        assert!(lsp_client_reap_reason(&key, Duration::ZERO).is_none());
 
         drop(workspace);
-        assert!(lsp_client_should_reap(&key, Duration::ZERO));
+        assert!(lsp_client_reap_reason(&key, Duration::ZERO).is_some());
     }
 
     #[test]
@@ -1288,13 +1682,190 @@ mod tests {
             .expect("active clangd client")
             .client
             .clone();
-        let client = shared.lock().await;
+        let mut client = shared.lock().await;
         assert!(
             client
-                .as_ref()
+                .ready_mut()
                 .expect("started clangd client")
                 .opened_versions
                 .is_empty()
         );
+    }
+
+    /// A leased-but-unstarted server used to appear in `active_servers` and
+    /// contribute nothing to workspace results, so a failed start read as a
+    /// clean workspace.
+    #[tokio::test]
+    async fn a_server_that_failed_to_start_is_never_reported_as_active() {
+        let root = tempfile::tempdir().expect("workspace");
+        let service = LspService::new(root.path());
+        let key = LspClientKey {
+            server_id: "clangd",
+            workspace_root: root.path().to_path_buf(),
+        };
+        service.clients.lock().await.insert(
+            key,
+            LspClientSlot {
+                client: std::sync::Arc::new(Mutex::new(LspClientState::Failed(
+                    "clangd is not available; install it on PATH".to_string(),
+                ))),
+                last_used: Instant::now(),
+            },
+        );
+
+        let status = service.status().await;
+        assert_eq!(status["active_servers"], json!([]));
+        assert_eq!(status["active_workspaces"][0]["state"], json!("failed"));
+
+        let report = service
+            .workspace_diagnostics(None)
+            .await
+            .expect("an unavailable server still reports its state");
+        assert_eq!(report["clangd"]["unavailable"], json!(true));
+        assert_eq!(report["clangd"]["status"], json!("failed"));
+        assert!(
+            report["clangd"]["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("not available")),
+            "the reason a workspace has no diagnostics must survive into the report"
+        );
+    }
+
+    /// Without a compilation database clangd answers from fallback flags, so
+    /// its confident errors describe build configuration, not the code.
+    #[tokio::test]
+    async fn clangd_diagnostics_report_their_compilation_context() {
+        let root = tempfile::tempdir().expect("workspace");
+        let source = root.path().join("main.cpp");
+        tokio::fs::write(&source, "int main() { return 0; }\n")
+            .await
+            .expect("write source");
+        let clangd = spec_for_id("clangd").expect("clangd spec");
+
+        let missing = compilation_context_status(root.path(), clangd, Some(&source))
+            .await
+            .expect("clangd reports compilation context");
+        assert_eq!(missing["status"], json!("missing"));
+        assert!(
+            missing["warning"]
+                .as_str()
+                .is_some_and(|warning| warning.contains("fallback flags")),
+            "a missing database must say why the diagnostics are suspect"
+        );
+
+        let database = root.path().join("compile_commands.json");
+        tokio::fs::write(
+            &database,
+            r#"[{"directory":"/other","file":"/other/unrelated.cpp","command":"clang++ unrelated.cpp"}]"#,
+        )
+        .await
+        .expect("write database");
+        let uncovered = compilation_context_status(root.path(), clangd, Some(&source))
+            .await
+            .expect("clangd reports compilation context");
+        assert_eq!(uncovered["status"], json!("stale"));
+        assert_eq!(uncovered["coversFile"], json!(false));
+
+        tokio::fs::write(
+            &database,
+            format!(
+                r#"[{{"directory":"{}","file":"{}","command":"clang++ main.cpp"}}]"#,
+                root.path().display(),
+                source.display()
+            ),
+        )
+        .await
+        .expect("write database");
+        let covered = compilation_context_status(root.path(), clangd, Some(&source))
+            .await
+            .expect("clangd reports compilation context");
+        assert_eq!(covered["status"], json!("present"));
+        assert_eq!(covered["coversFile"], json!(true));
+
+        let rust = spec_for_id("rust-analyzer").expect("rust-analyzer spec");
+        assert!(
+            compilation_context_status(root.path(), rust, Some(&source))
+                .await
+                .is_none(),
+            "servers that do not read a compilation database stay unannotated"
+        );
+    }
+
+    /// The per-document fallback multiplied its own timeout by the file
+    /// count, so a large workspace produced an unbounded call. It must stop
+    /// at the deadline and say how far it got.
+    #[tokio::test]
+    async fn workspace_document_diagnostics_stop_at_their_time_budget() {
+        if !Command::new("clangd")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .is_ok_and(|status| status.success())
+        {
+            return;
+        }
+        let root = tempfile::tempdir().expect("workspace");
+        for index in 0..4 {
+            tokio::fs::write(
+                root.path().join(format!("unit{index}.cpp")),
+                "int main() { return 0; }\n",
+            )
+            .await
+            .expect("write source");
+        }
+        let service = LspService::new(root.path());
+        service
+            .diagnostics(Path::new("unit0.cpp"))
+            .await
+            .expect("clangd diagnostics");
+        let shared = service
+            .clients
+            .lock()
+            .await
+            .values()
+            .next()
+            .expect("active clangd client")
+            .client
+            .clone();
+        let mut state = shared.lock().await;
+        let client = state.ready_mut().expect("started clangd client");
+        let clangd = spec_for_id("clangd").expect("clangd spec");
+
+        let report = client
+            .document_workspace_diagnostics(root.path(), clangd, Instant::now())
+            .await
+            .expect("an exhausted budget returns a partial report, not an error");
+
+        assert_eq!(report["partial"], json!(true));
+        assert_eq!(report["documentsScanned"], json!(0));
+        assert_eq!(report["documentsDiscovered"], json!(4));
+        assert!(
+            report["partialReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("time budget")),
+            "the caller must learn the result was cut short by time"
+        );
+    }
+}
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn repro_after_fix() {
+        let root = tempfile::tempdir().expect("root");
+        tokio::fs::write(root.path().join("a.ts"), "let x: number = 'nope';\n")
+            .await
+            .expect("write ts");
+        let service = LspService::new(root.path());
+        let _ = service.diagnostics(Path::new("a.ts")).await;
+        let status = service.status().await;
+        println!("active_servers = {}", status["active_servers"]);
+        println!("active_workspaces = {}", status["active_workspaces"]);
+        let ws = service.workspace_diagnostics(None).await;
+        println!("WORKSPACE = {}", serde_json::to_string_pretty(&ws.unwrap()).unwrap());
     }
 }

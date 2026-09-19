@@ -54,6 +54,7 @@ impl Cli {
                 | "update"
                 | "install"
                 | "capabilities"
+                | "image"
                 | "tools"
                 | "call"
                 | "extensions"
@@ -127,6 +128,14 @@ pub(crate) enum Command {
     Update(UpdateArgs),
     /// Show configured and effective optional runtime capabilities.
     Capabilities(CapabilitiesArgs),
+    /// Deliver selected PNG or JPEG files as model-visible images.
+    Image {
+        #[arg(required = true, num_args = 1..=4)]
+        files: Vec<PathBuf>,
+        /// Send to a running local session, including an older session owner.
+        #[arg(long)]
+        session: Option<Uuid>,
+    },
     /// List session-scoped Borg and Blu capabilities as JSON.
     Tools {
         /// Show one capability by name.
@@ -912,6 +921,25 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn image_command_is_not_an_agent_prompt_and_bounds_file_count() {
+        let session = "22222222-2222-2222-2222-222222222222";
+        let args = Cli::agent_default_args(
+            ["borg", "image", "capture.png", "--session", session].map(OsString::from),
+        );
+        let Command::Image {
+            files,
+            session: target,
+        } = Cli::try_parse_from(args).unwrap().command_or_agent()
+        else {
+            panic!("image must remain a command, not an agent prompt");
+        };
+        assert_eq!(files, vec![PathBuf::from("capture.png")]);
+        assert_eq!(target, Some(Uuid::parse_str(session).unwrap()));
+        assert!(Cli::try_parse_from(["borg", "image"]).is_err());
+        assert!(Cli::try_parse_from(["borg", "image", "a", "b", "c", "d", "e"]).is_err());
     }
 
     #[test]

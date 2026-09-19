@@ -62,8 +62,97 @@ pub(crate) async fn call_tool(name: &str, arguments: Option<&str>) -> Result<()>
     }
     let endpoint = AgentToolEndpoint::from_env()?;
     let output = forward(&endpoint, name, arguments, None).await?;
+    let output = spool_result_attachments(output);
     println!("{}", serde_json::to_string(&output)?);
     Ok(())
+}
+
+/// Number of images spooled, left in stdout in place of the base64 so the
+/// printed result still says what happened.
+const SPOOLED_IMAGES_KEY: &str = "spooled_images";
+const ATTACHMENTS_KEY: &str = "borg_attachments";
+const ATTACHMENT_SPOOL_ENV: &str = "BORG_ATTACHMENT_SPOOL";
+/// Tool results are shallow envelopes; this is enough to reach the images
+/// without ever walking a deep structure a capability happens to return.
+const MAX_ATTACHMENT_SEARCH_DEPTH: usize = 6;
+
+/// Move a capability's images out of this command's stdout and into the
+/// runtime's image spool.
+///
+/// `borg call` normally runs inside `exec`, which captures stdout into a
+/// bounded head/tail buffer and renders it down to a token budget. A
+/// screenshot printed as base64 is therefore cut in half by an
+/// `… bytes omitted …` marker and reaches the model as unusable text — the
+/// bytes are already destroyed by the time anything could parse them back out.
+/// Writing each image to `$BORG_ATTACHMENT_SPOOL` instead keeps stdout small
+/// and lets the runtime deliver real vision attachments.
+///
+/// With no spool set (a human running `borg call` in a terminal, or an older
+/// runtime) the result is returned untouched, so this only ever adds a path.
+pub(crate) fn spool_result_attachments(mut output: Value) -> Value {
+    let Some(dir) = std::env::var_os(ATTACHMENT_SPOOL_ENV).map(std::path::PathBuf::from) else {
+        return output;
+    };
+    spool_attachments_in(&mut output, &dir, 0);
+    output
+}
+
+fn spool_attachments_in(value: &mut Value, dir: &std::path::Path, depth: usize) {
+    if depth > MAX_ATTACHMENT_SEARCH_DEPTH {
+        return;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    // Capabilities differ in where they put the key: beside the result, or
+    // nested under `value` for a runtime script. Search rather than assume.
+    if let Some(Value::Array(attachments)) = object.remove(ATTACHMENTS_KEY) {
+        let mut written = 0usize;
+        for (index, attachment) in attachments.iter().enumerate() {
+            if write_spooled_attachment(dir, attachment, index).is_ok() {
+                written += 1;
+            }
+        }
+        if written == attachments.len() {
+            object.insert(SPOOLED_IMAGES_KEY.to_string(), json!(written));
+        } else {
+            // Anything that could not be spooled goes back inline. Truncated
+            // base64 in stdout is poor, but silently dropping an image the
+            // capability produced is worse.
+            object.insert(ATTACHMENTS_KEY.to_string(), Value::Array(attachments));
+        }
+    }
+    for (_, nested) in object.iter_mut() {
+        spool_attachments_in(nested, dir, depth + 1);
+    }
+}
+
+/// Write one image into the spool.
+///
+/// The runtime reads any file it finds, so a partly written file would be read
+/// as a corrupt image. Writing to a `.tmp` name and renaming into place makes
+/// the file appear atomically and complete. The timestamp prefix keeps images
+/// in production order when one `exec` session makes several calls, and the
+/// process id keeps two concurrent commands from colliding on a name.
+fn write_spooled_attachment(
+    dir: &std::path::Path,
+    attachment: &Value,
+    index: usize,
+) -> Result<()> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let name = format!("{nanos:039}-{}-{index:03}", std::process::id());
+    let temporary = dir.join(format!("{name}.tmp"));
+    std::fs::write(&temporary, serde_json::to_vec(attachment)?)?;
+    let final_path = dir.join(format!("{name}.json"));
+    match std::fs::rename(&temporary, &final_path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            Err(error.into())
+        }
+    }
 }
 
 async fn serve<R, W>(endpoint: Arc<AgentToolEndpoint>, read: R, mut write: W) -> Result<()>
@@ -640,6 +729,57 @@ fn rpc_error_with_data(id: Value, code: i64, message: String, data: Value) -> Va
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    /// The reason `borg call` writes images to a spool instead of printing
+    /// them: stdout is captured into a bounded buffer by `exec`, so base64
+    /// left inline is truncated into unusable text. Stdout must come back
+    /// carrying a count and nothing else.
+    #[test]
+    fn images_leave_stdout_and_land_in_the_spool_intact() {
+        let spool = tempfile::tempdir().expect("spool");
+        let image = "iVBORw0KGgoAAAANSUhEUg".repeat(4096);
+        let mut result = json!({
+            "ok": true,
+            "value": {
+                "note": "screenshot taken",
+                "borg_attachments": [{"media_type": "image/png", "data_base64": image}],
+            },
+        });
+
+        spool_attachments_in(&mut result, spool.path(), 0);
+
+        assert!(
+            !result.to_string().contains("iVBORw0KGgo"),
+            "image base64 was left in stdout: {result}"
+        );
+        assert_eq!(result["value"][SPOOLED_IMAGES_KEY], json!(1));
+        assert_eq!(result["value"]["note"], "screenshot taken");
+
+        let spooled: Vec<_> = std::fs::read_dir(spool.path())
+            .expect("read spool")
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert_eq!(spooled.len(), 1);
+        // Only a renamed, complete file is ever visible to the runtime.
+        assert_eq!(spooled[0].extension().and_then(|s| s.to_str()), Some("json"));
+        let written: Value =
+            serde_json::from_slice(&std::fs::read(&spooled[0]).expect("read")).expect("json");
+        assert_eq!(written["media_type"], "image/png");
+        assert_eq!(written["data_base64"], image);
+    }
+
+    #[test]
+    fn a_result_without_images_is_left_alone() {
+        let spool = tempfile::tempdir().expect("spool");
+        let mut result = json!({"ok": true, "value": {"lines": 3}});
+        let before = result.clone();
+
+        spool_attachments_in(&mut result, spool.path(), 0);
+
+        assert_eq!(result, before);
+        assert_eq!(std::fs::read_dir(spool.path()).unwrap().count(), 0);
+    }
 
     #[tokio::test]
     async fn local_proxy_exposes_the_shared_agent_tool_catalog() {

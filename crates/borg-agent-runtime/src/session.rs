@@ -419,6 +419,72 @@ impl WorkspaceProjection {
         Ok(())
     }
 
+    /// Walk one recipient delivery forward to `target`, never backwards.
+    ///
+    /// The store's transition table is strict on purpose: it rejects
+    /// regressions and the `Pending -> Acknowledged` shortcut alike, and a
+    /// rejection here surfaces only as a warn-level projection diagnostic.
+    /// Tolerance therefore belongs in this caller, which knows a replayed or
+    /// already-settled delivery is ordinary, rather than in the shared
+    /// contract that both the SQLite and Postgres backends rely on to keep
+    /// delivery state monotonic.
+    ///
+    /// Returning `Ok(())` for an unknown message or an unaddressed
+    /// participant matches `transition_message_delivery`: a session projects
+    /// plenty of events that were never anyone's mail.
+    async fn settle_delivery(
+        &self,
+        message_id: Uuid,
+        target: crate::DeliveryState,
+        attempt: Option<crate::DeliveryAttempt>,
+    ) -> Result<()> {
+        use crate::DeliveryState;
+        let Some(current) = self
+            .store
+            .message_deliveries(message_id)
+            .await?
+            .into_iter()
+            .find(|delivery| {
+                delivery.workspace_id == self.workspace_id
+                    && delivery.recipient_id == self.agent_participant_id
+            })
+            .map(|delivery| delivery.state)
+        else {
+            return Ok(());
+        };
+        // Only forward edges the store already allows. Anything else --
+        // already at or past the target, or settled as failed/recalled -- is a
+        // quiet no-op so a replay cannot drag an acknowledged delivery back to
+        // admitted.
+        let steps: &[DeliveryState] = match (current, target) {
+            (DeliveryState::Pending, DeliveryState::Admitted) => &[DeliveryState::Admitted],
+            (DeliveryState::Pending, DeliveryState::Acknowledged) => {
+                &[DeliveryState::Admitted, DeliveryState::Acknowledged]
+            }
+            (DeliveryState::Pending, DeliveryState::Recalled) => &[DeliveryState::Recalled],
+            (DeliveryState::Relayed | DeliveryState::Admitted, DeliveryState::Acknowledged) => {
+                &[DeliveryState::Acknowledged]
+            }
+            _ => &[],
+        };
+        for (index, step) in steps.iter().copied().enumerate() {
+            // Attribute the attempt to the first hop only; the intermediate
+            // admission and its acknowledgement are one observation, and
+            // counting both would inflate `attempts`.
+            let attempt = (index == 0).then(|| attempt.clone()).flatten();
+            self.store
+                .transition_message_delivery(
+                    self.workspace_id,
+                    message_id,
+                    self.agent_participant_id,
+                    step,
+                    attempt,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn project_one(&self, event: &SessionEvent) -> Result<()> {
         let workspace_event = self.workspace_event(event);
         if self
@@ -435,47 +501,35 @@ impl WorkspaceProjection {
         match &event.kind {
             SessionEventKind::Message {
                 message_id,
-                actor,
                 status: MessageStatus::Complete,
                 ..
-            } if *actor == EventActor::User => {
-                // Team messages already cross their workspace delivery
-                // boundary in SubagentCoordinator. Re-projecting the mirrored
-                // system message here can try to move an acknowledged delivery
-                // backwards to admitted.
-                self.store
-                    .transition_message_delivery(
-                        self.workspace_id,
-                        *message_id,
-                        self.agent_participant_id,
-                        crate::DeliveryState::Admitted,
-                        Some(crate::DeliveryAttempt {
-                            attempted_at: event.created_at,
-                            detail: Some("admitted at session provider boundary".to_string()),
-                        }),
-                    )
-                    .await?;
+            } => {
+                // Admission is the durable transcript event, whoever authored
+                // it. Team messages are journaled as `System`, so gating this
+                // on `User` left their deliveries pending forever: nothing
+                // admitted them, and the acknowledgement below was then
+                // rejected as a non-monotonic `Pending -> Acknowledged` jump.
+                // Every later inbox read replayed them as unread.
+                //
+                // Only `Complete` admits. A steer that the provider has
+                // accepted but the model has not consumed is still
+                // `InProgress`, so it stays pending until it really lands.
+                self.settle_delivery(
+                    *message_id,
+                    crate::DeliveryState::Admitted,
+                    Some(crate::DeliveryAttempt {
+                        attempted_at: event.created_at,
+                        detail: Some("admitted at session provider boundary".to_string()),
+                    }),
+                )
+                .await?;
             }
             SessionEventKind::PromptRecalled { message_id, .. } => {
-                self.store
-                    .transition_message_delivery(
-                        self.workspace_id,
-                        *message_id,
-                        self.agent_participant_id,
-                        crate::DeliveryState::Recalled,
-                        None,
-                    )
+                self.settle_delivery(*message_id, crate::DeliveryState::Recalled, None)
                     .await?;
             }
             SessionEventKind::TurnCompleted { message_id, .. } => {
-                self.store
-                    .transition_message_delivery(
-                        self.workspace_id,
-                        *message_id,
-                        self.agent_participant_id,
-                        crate::DeliveryState::Acknowledged,
-                        None,
-                    )
+                self.settle_delivery(*message_id, crate::DeliveryState::Acknowledged, None)
                     .await?;
             }
             _ => {}
