@@ -1,6 +1,52 @@
 use super::*;
 
 #[test]
+fn watcher_yield_labels_ready_as_waiting_until_resumed_or_restarted() {
+    let mut transcript = Transcript::default();
+    let session = Uuid::new_v4();
+    let event = |kind: &str| {
+        SessionEvent::new(
+            session,
+            1,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Claude,
+                kind: kind.to_string(),
+                payload: serde_json::json!({}),
+            },
+        )
+    };
+    assert_eq!(transcript.status_label(SessionStatus::Ready), "ready");
+    transcript.apply(&event("goal_yielded"));
+    transcript.apply(&SessionEvent::new(
+        session,
+        2,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: Some("Waiting on 1 watcher(s)".to_string()),
+        },
+    ));
+    assert_eq!(transcript.status_label(SessionStatus::Ready), "waiting");
+    transcript.apply(&event("goal_resumed"));
+    assert_eq!(transcript.status_label(SessionStatus::Ready), "ready");
+    for status in [
+        SessionStatus::Starting,
+        SessionStatus::Running,
+        SessionStatus::Stopped,
+    ] {
+        transcript.apply(&event("goal_yielded"));
+        transcript.apply(&SessionEvent::new(
+            session,
+            3,
+            SessionEventKind::StatusChanged {
+                status,
+                detail: None,
+            },
+        ));
+        assert_eq!(transcript.status_label(SessionStatus::Ready), "ready");
+    }
+}
+
+#[test]
 fn completion_alert_policies_respect_window_focus() {
     assert!(!completion_alert_enabled(CompletionAlertPolicy::Off, false));
     assert!(!completion_alert_enabled(

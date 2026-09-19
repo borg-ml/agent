@@ -127,6 +127,7 @@ struct Transcript {
     provider_capabilities: Vec<borg_remote::ProviderCapability>,
     active_turn: Option<ActiveTurnDisplayConfig>,
     live_turn_closed: bool,
+    waiting_on_watchers: bool,
     subagents: HashMap<Uuid, SubagentStatus>,
     subagent_snapshots: HashMap<Uuid, SubagentSnapshot>,
     /// Watches the agent armed (last `WatchesChanged` snapshot).
@@ -236,6 +237,7 @@ impl Default for Transcript {
             config: None,
             active_turn: None,
             live_turn_closed: false,
+            waiting_on_watchers: false,
             subagents: HashMap::new(),
             subagent_snapshots: HashMap::new(),
             watches: Vec::new(),
@@ -1065,6 +1067,14 @@ impl Transcript {
         self.tool_run_windows()[index].map(|window| window.start)
     }
 
+    fn status_label(&self, status: SessionStatus) -> &'static str {
+        if status == SessionStatus::Ready && self.waiting_on_watchers {
+            "waiting"
+        } else {
+            status_label(status)
+        }
+    }
+
     fn apply(&mut self, event: &SessionEvent) -> Option<usize> {
         self.apply_event(event, true)
     }
@@ -1081,6 +1091,22 @@ impl Transcript {
         // Scope recorded insertions to this event so a transcript nobody
         // drains (an unfocused child) cannot accumulate stale indices.
         self.pending_entry_insertions.clear();
+        match &event.kind {
+            SessionEventKind::ProviderEvent { kind, .. } if kind == "goal_yielded" => {
+                self.waiting_on_watchers = true;
+            }
+            SessionEventKind::ProviderEvent { kind, .. } if kind == "goal_resumed" => {
+                self.waiting_on_watchers = false;
+            }
+            SessionEventKind::TurnStarted { .. } | SessionEventKind::SessionStarted => {
+                self.waiting_on_watchers = false;
+            }
+            SessionEventKind::StatusChanged { status, .. } if *status != SessionStatus::Ready => {
+                self.waiting_on_watchers = false;
+            }
+            _ => {}
+        }
+
         let provider_advanced = matches!(
             &event.kind,
             SessionEventKind::Message {

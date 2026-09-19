@@ -6994,7 +6994,7 @@ impl BorgTerminal {
         {
             "borging"
         } else {
-            status_label(status)
+            self.transcript.status_label(status)
         };
         let status_glyph = activity_glyph(status);
         let status_is_interruptible = status_control_is_actionable(status);
