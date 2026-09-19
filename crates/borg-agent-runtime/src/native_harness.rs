@@ -141,14 +141,6 @@ impl NativeHarness {
         bound.run_bound(turn, events, controls, steers).await
     }
 
-    pub(crate) async fn with_model_access(
-        &self,
-        provider: crate::CodingProvider,
-        access: &crate::ModelAccessContext,
-    ) -> Result<Self> {
-        self.with_model_access_for(provider, None, access).await
-    }
-
     /// Bind model access for a turn whose model is known.
     ///
     /// The model matters for OpenCode: only the `opencode-go` aliases have an
