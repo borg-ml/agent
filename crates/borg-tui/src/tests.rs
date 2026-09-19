@@ -13568,3 +13568,72 @@ fn a_genuinely_queued_prompt_is_released_when_another_turn_starts() {
         OptimisticPromptDecision::Ignore,
     );
 }
+
+#[tokio::test]
+#[ignore = "requires a PTY; verifies reconnect status follows live progress"]
+async fn resumed_work_clears_reconnecting_without_recovery_marker() {
+    let session_id = Uuid::new_v4();
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        session_id,
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    for progress in [
+        SessionEventKind::ReasoningDelta {
+            text: "Resumed thinking".into(),
+        },
+        SessionEventKind::ToolStarted {
+            tool_call_id: "resumed-tool".into(),
+            name: "exec".into(),
+            input: serde_json::json!({"cmd": "true"}),
+            input_ref: None,
+        },
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "Resumed answer".into(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    ] {
+        terminal.apply_session_event(&SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "network_retry".into(),
+                payload: serde_json::json!({"delay_ms": 0}),
+            },
+        ));
+        for waiting in [
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Running,
+                detail: None,
+            },
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "heartbeat".into(),
+                payload: serde_json::json!({}),
+            },
+        ] {
+            terminal.apply_session_event(&SessionEvent::new(session_id, 2, waiting));
+            assert!(terminal.connection_retry_at.is_some());
+            assert!(
+                terminal
+                    .notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("Connection interrupted")
+            );
+        }
+        terminal.apply_session_event(&SessionEvent::new(session_id, 3, progress));
+        assert!(terminal.connection_retry_at.is_none());
+        assert!(terminal.notice.is_none());
+        assert_eq!(terminal.active_status(), SessionStatus::Running);
+    }
+    terminal.shutdown().await;
+}

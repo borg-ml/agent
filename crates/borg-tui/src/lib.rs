@@ -3317,6 +3317,19 @@ impl BorgTerminal {
 
     pub fn apply_session_event(&mut self, event: &SessionEvent) -> bool {
         if !self.replaying_history {
+            if self.connection_retry_at.is_some()
+                && matches!(
+                    &event.kind,
+                    SessionEventKind::Message {
+                        actor: EventActor::Assistant,
+                        ..
+                    } | SessionEventKind::ReasoningDelta { .. }
+                        | SessionEventKind::ToolStarted { .. }
+                )
+            {
+                self.connection_retry_at = None;
+                self.notice = None;
+            }
             match &event.kind {
                 SessionEventKind::ProviderEvent { kind, payload, .. }
                     if kind == "usage_limit_retry" =>
