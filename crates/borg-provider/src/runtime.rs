@@ -81,7 +81,7 @@ pub fn claude_default_effort() -> &'static str {
 }
 
 pub fn codex_default_effort() -> &'static str {
-    "low"
+    "medium"
 }
 
 pub fn codex_effort_levels() -> Vec<String> {
@@ -344,9 +344,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codex_defaults_use_astra_at_low_effort() {
+    fn codex_defaults_use_astra_at_medium_effort() {
         assert_eq!(codex_product_model(), "gpt-6-astra");
-        assert_eq!(codex_default_effort(), "low");
+        assert_eq!(codex_default_effort(), "medium");
         assert!(codex_effort_supported(codex_default_effort()));
         assert!(codex_effort_supported("none"));
     }
