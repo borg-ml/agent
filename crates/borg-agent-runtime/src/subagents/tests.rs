@@ -4173,15 +4173,15 @@ async fn agent_tool_provider_environment_parses_back_for_every_provider() {
             .expect("the provider is always passed to the tool server")
             .clone();
 
-        let parsed: CodingProvider =
-            serde_json::from_value(serde_json::Value::String(sent.clone())).unwrap_or_else(
-                |error| {
-                    panic!(
-                        "{provider:?} sends BORG_AGENT_TOOL_PROVIDER={sent:?}, which \
+        let parsed: CodingProvider = serde_json::from_value(serde_json::Value::String(
+            sent.clone(),
+        ))
+        .unwrap_or_else(|error| {
+            panic!(
+                "{provider:?} sends BORG_AGENT_TOOL_PROVIDER={sent:?}, which \
                          `borg __agent-mcp` rejects: {error}"
-                    )
-                },
-            );
+            )
+        });
         assert_eq!(
             parsed, provider,
             "{sent:?} must round trip back to the provider that sent it"
