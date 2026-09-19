@@ -1,7 +1,7 @@
 # Backend architecture — decision review map
 
 Borg is a local-first Rust agent host. **One session actor owns execution;
-SQLite owns durable truth; frontends attach as clients.** Provider-neutral
+PostgreSQL owns durable truth; frontends attach as clients.** Provider-neutral
 ownership is the direction, not yet the reality of every provider route.
 
 Source baseline: `d6b19e2` (v0.8.1). This is one diagram-led reference page,
@@ -18,7 +18,7 @@ flowchart TB
     Remote -->|"HostCommand / protocol v1"| Session
     subgraph Host["Session execution host — detached for local interactive use [D1]"]
         Session["borg-agent-runtime / session.rs<br/>admission, steering, stop, recovery"]
-        Session <--> DB[("SQLite session store")]
+        Session <--> DB[("PostgreSQL session store")]
         Session --> Exec["agent.rs / AgentTurnExecutor"]
         Exec --> Native["NativeHarness<br/>Borg model-tool loop"]
         Exec --> Compat["Compatibility route<br/>upstream inner loop [D2]"]
@@ -48,7 +48,7 @@ ephemeral execution need not detach.
 sequenceDiagram
     participant C as Client
     participant S as Session actor
-    participant J as SQLite
+    participant J as PostgreSQL
     participant E as Turn executor
     participant P as Provider adapter/runtime
     participant T as Borg capabilities
@@ -99,7 +99,7 @@ account-scoped, not the authority for session identity.
 ```mermaid
 flowchart LR
     Events["Session events"] --> Classify["EventPersistence"]
-    Classify -->|"durable"| Journal[("Canonical WAL journal [D3]<br/>SQLite or PostgreSQL")]
+    Classify -->|"durable"| Journal[("Canonical WAL journal [D3]<br/>PostgreSQL")]
     Classify -->|"coalesced"| Live["Latest live-state projection"]
     Classify -->|"ephemeral"| Stream["Live delivery only"]
     Journal --> Recovery["SessionState / resume / fork / retry"]
@@ -118,7 +118,7 @@ deltas and mirrored child activity are deliberately coalesced/filtered.
 Session-scoped process memory is not recovered from the event log.
 
 **Source:** `SessionEventKind::persistence` / the `SessionStore` trait and its
-`SqliteSessionStore` and `PostgresSessionStore` backends in
+`PostgresSessionStore` backend in
 [session_store.rs](../crates/borg-agent-runtime/src/session_store.rs)
 and [postgres/](../crates/borg-agent-runtime/src/session_store/postgres/),
 selected by [factory.rs](../crates/borg-agent-runtime/src/session_store/factory.rs),
@@ -179,7 +179,7 @@ Questions below are review prompts, not confirmed defects.
 |---|---|---|
 | **D1** | Detached single-writer host → continuity, but leases/sockets/stale-owner recovery. | Is per-session process overhead justified? |
 | **D2** | Native + upstream compatibility loops → subscription UX, but duplicated control/context paths. | Which upstream responsibilities are truly required? Preserve login, continuation, cancellation and usage when migrating. |
-| **D3** | Journal + live/search projections → local recovery, but contention/migrations/projection correctness. SQLite is the default; PostgreSQL removes the machine-wide write lock. | Which events must remain lossless? Which backend does this deployment need? [Backends](session-store-backends.md). |
+| **D3** | Journal + live/search projections → local recovery, but contention/migrations/projection correctness. PostgreSQL serialises writers per session row, not machine-wide. | Which events must remain lossless? Managed cluster or an existing server? [Backends](session-store-backends.md). |
 | **D4** | Full Access / Auto reviewer / Manual → permission gates, **not a sandbox**. | Is trusted-user authority appropriate for this deployment? |
 | **D5** | Durable jobs/actions + non-durable OS effects → recoverable intent, not universal exactly-once execution. | Which interrupted effects require reconciliation? |
 | **D6** | Separate child journals, potentially shared workspace → cheap collaboration, possible write conflicts. | Where are worktrees or stronger isolation needed? |

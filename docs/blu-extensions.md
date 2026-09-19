@@ -256,8 +256,8 @@ each external provider's MCP policy format.
 The native harness advertises each active package workflow through the generic
 `run_workflow` tool. Blu workflows additionally retain `run_blu_extension` and
 the explicit `run_blu_workflow` request for compatibility. Embedded Blu host
-calls are permission-checked and journaled in the canonical SQLite session
-store. External runtimes are supervised as trusted processes and their
+calls are permission-checked and journaled in the canonical session store.
+External runtimes are supervised as trusted processes and their
 workflow lifecycle/output is journaled; their normal Python/JavaScript library
 calls are intentionally not rewritten into fake Blu handles. Workflow source
 is bounded to 256 KiB, must remain inside its package, and is frozen for the
@@ -266,20 +266,20 @@ turn that loaded it.
 ## Extension-scoped durable storage
 
 Extensions can use the host-owned `plugin_store` boundary for correctness-critical
-state without receiving a SQLite handle. Persistent Python and Bun runtimes use
+state without receiving a database handle. Persistent Python and Bun runtimes use
 `borg.storage("extension-id")`; Blu workflows use `borg_plugin_store(call_id,
 request_json)`. The store supports session or project scope, bounded JSON values,
 compare-and-swap revisions, content-addressed artifact receipts, provenance, and
 idempotent commits.
 
-A commit validates and hashes every declared artifact before one SQLite
-`BEGIN IMMEDIATE` transaction applies the state writes, artifact receipts, and
-mutation receipt. Reusing the same idempotency key with the same request replays
+A commit validates and hashes every declared artifact before one database
+transaction applies the state writes, artifact receipts, and mutation receipt.
+Reusing the same idempotency key with the same request replays
 the stored result; reusing it with different content is rejected. `verify_artifact`
 rehashes the current workspace file so a modified external result is visible as
 invalid. External files remain the plugin or benchmark's authority and cannot be
-rolled back by SQLite; Borg makes their receipt, hash, provenance, and recovery
-state durable.
+rolled back by the store; Borg makes their receipt, hash, provenance, and
+recovery state durable.
 
 Workflows that need to preserve a failed process attempt should commit its
 append-only evidence first, then call `borg_assert_exec_success(call_id,
@@ -374,7 +374,7 @@ supervised workers for cases that need their ecosystems.
 
 ## Lossless history retrieval
 
-The durable SQLite journal is the authority for normalized model-visible
+The durable journal is the authority for normalized model-visible
 inputs, messages, tool calls/results, workflow and child-agent events,
 approvals, goals, plans, and external outcomes. Large tool inputs and outputs
 remain lossless payload blobs referenced by compact event rows. Streaming UI
@@ -386,13 +386,13 @@ Codex/Claude/OpenCode MCP lanes, Blu workflows, and the persistent Python bridge
 
 - empty `text`: exact event-id, typed actor/kind, and inclusive sequence-range
   reads over canonical rows;
-- `mode=lexical`: tenant-scoped SQLite FTS5 discovery;
+- `mode=lexical`: tenant-scoped full-text discovery;
 - `mode=regex`: a bounded Rust regex scan, optionally narrowed first with a
   literal `prefilter` through FTS;
 - `expand_payloads=true`: bounded expansion of deferred payloads under one
   aggregate response byte budget.
 
-The FTS table is a rebuildable projection. It is updated in the same SQLite
+The full-text index is a rebuildable projection. It is updated in the same
 transaction as each durable append and backfilled from event rows and payload
 blobs when an existing store opens. Every result is rehydrated from
 `session_events`; search snippets and scores are discovery aids, never the

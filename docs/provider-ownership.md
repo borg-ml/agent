@@ -282,7 +282,7 @@ approval/execution, compaction, restart, and isolated consultation after this
 change; the stalled-admission cancellation check itself remains deterministic
 and offline.
 
-Borg commits an immutable subscription account fingerprint in its SQLite
+Borg commits an immutable subscription account fingerprint in its durable
 session authority before the first model request. It is not a credential or
 model context. Every model round checks the current account against that
 binding before connecting, including authentication recovery. Binding survives
@@ -518,7 +518,7 @@ The retained baseline script also passed a second live run: first-round input
 ### Full application process restart and recovery UI
 
 The rebuilt `borg` CLI passed a two-process Pro smoke run using an isolated
-`BORG_HOME`, explicit SQLite storage, and the existing subscription authority
+`BORG_HOME`, an isolated session store, and the existing subscription authority
 selected in place with `BORG_OPENAI_AUTH_FILE`. Both processes ran with an empty
 PATH, `BORG_CODEX_BIN=/nonexistent/codex`, automatic installation disabled, and
 the seccomp guard denying `execve` and `execveat`. Process one recorded a random

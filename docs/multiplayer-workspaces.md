@@ -27,7 +27,7 @@ Each kind of fact has exactly one durable authority:
 
 The product backend extends its existing `workspaces` and `chat_messages`
 tables. It must not create a second cloud chat log. The local runtime keeps a
-SQLite projection of the same contracts. `SessionEvent` remains the complete
+local projection of the same contracts. `SessionEvent` remains the complete
 execution transcript; workspace events reference session IDs and sequences
 instead of copying tool deltas.
 
@@ -251,8 +251,8 @@ The same cursor protocol serves local CLI, remote CLI, and web:
 5. receive live events and advance durable read/delivery cursors;
 6. reconnect from the last committed cursor.
 
-Cloud workspaces use Postgres as authority. Local-only workspaces use SQLite as
-authority. Attaching a local workspace to cloud is an explicit one-time
+Cloud workspaces use the product backend as authority. Local-only workspaces
+use the local Postgres journal as authority. Attaching a local workspace to cloud is an explicit one-time
 authority transfer/import with recorded provenance; Borg never silently merges
 two writable authorities with the same workspace ID.
 

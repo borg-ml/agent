@@ -48,9 +48,10 @@ tags, and frames larger than the configured limit.
 - A disconnect or timeout before the commit outcome is known is *indeterminate*,
   not failed. Recovery resolves it from the receipt/event stores before retry.
 
-SQLite uses WAL, foreign keys, a busy timeout, and `synchronous=FULL` for durable
-authorities. Startup verifies schema/projection versions and replays projections
-from the canonical log when a clean checkpoint is absent.
+Durable authorities commit through PostgreSQL, whose write-ahead log and
+referential constraints provide the same guarantees. Startup verifies
+schema/projection versions and replays projections from the canonical log when
+a clean checkpoint is absent.
 
 ## ACP mapping
 
@@ -138,5 +139,5 @@ borg acp --provider codex --permission manual
 
 Run `borg doctor` (or `borg doctor --json`) for a non-content-bearing durability
 readiness report. A degraded result exits unsuccessfully so service managers can
-use it as a readiness probe. Add `--deep` when an exhaustive SQLite integrity
-scan is required; that scan intentionally reads the full durable database.
+use it as a readiness probe. Add `--deep` when an exhaustive integrity scan is
+required; that scan intentionally reads the full durable database.

@@ -72,12 +72,11 @@ after five minutes only when the session is ready, has no pending prompt, and
 has no running background processes.
 See [`docs/session-lifecycle.md`](docs/session-lifecycle.md).
 
-Session history is kept in a durable journal. SQLite is the default and is the
-faster choice for a handful of agents. Setting `BORG_SESSIONS_URL` runs the
-journal on PostgreSQL instead, which trades per-append latency for writer
-concurrency: SQLite's throughput plateaus at the single-file write lock, while
-Postgres keeps scaling as agents are added. History does not move between
-backends. See [`docs/session-store-backends.md`](docs/session-store-backends.md).
+Session history is kept in a durable journal on PostgreSQL, which Borg
+provisions for you; `BORG_SESSIONS_URL` points it at an existing server
+instead. Writers serialise per session row rather than per file, so throughput
+keeps scaling as agents are added. See
+[`docs/session-store-backends.md`](docs/session-store-backends.md).
 
 The default native-provider harness exposes one shell-first `exec` surface.
 The model can use shell pipelines or invoke the installed language best suited

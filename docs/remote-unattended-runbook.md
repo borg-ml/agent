@@ -83,7 +83,7 @@ Check all of the following:
 - The effective service has `Type=notify`, `NotifyAccess=all`, and a
   90-second watchdog.
 - The journal contains a recent `Borg Remote host connected` message.
-- The Borg database reports healthy WAL, foreign keys, and synchronous mode.
+- `borg doctor` reports the durable session store as ready.
 - There is ample free disk space. Investigate before free space falls below
   the amount a long turn, build, and WAL checkpoint may need.
 
@@ -258,7 +258,7 @@ On the first upgraded start, historical hosted journals are checked too; they
 are not assumed delivered. Missing relay sessions (404/410) retain their local
 journal and retry with a five-minute backoff.
 
-These are additive SQLite changes, not a database reset. They do not establish
+These are additive schema changes, not a database reset. They do not establish
 full recovery for idle actors, every failure inside actor initialization,
 workspace/private-message final delivery, or loss of the relay database itself;
 those need separate acceptance.
@@ -456,7 +456,7 @@ Message-upload retry timers are scoped to each workspace and are independent
 of the session journal retry timer. Inactive recovery retains them across
 worker passes and cancelled attempts, so a new private message can upload while
 an unrelated shared workspace remains in its five-minute backoff. Recovery
-reloads confirmed SQLite cursors on every attempt; a cancelled cursor checkpoint
+reloads confirmed durable cursors on every attempt; a cancelled cursor checkpoint
 cannot make uncommitted in-memory progress authoritative. Expired timer entries
 are discarded. Timers are process-local: a host restart can retry earlier, with
 unchanged durable message identities and cursor/idempotency protection.
@@ -509,7 +509,7 @@ The additive current-v5 table leaves legacy rows unowned. It never infers their
 owner from the currently enrolled host. Background journal recovery scans these
 rows even without a session journal and verifies `/sessions/SESSION_UUID/sync`
 using the configured host credentials. Only a successful, valid response permits
-a one-time owner claim; the SQLite transaction rechecks local binding/attachment
+a one-time owner claim; the database transaction rechecks local binding/attachment
 identity and any concurrent owner claim. A 401, 404, outage, or malformed reply
 retains the original metadata/bootstrap without constructing an actor, settling
 work, or inventing ownership. Known mismatches are rejected before any probe.
@@ -535,7 +535,7 @@ local CLI mirror re-enrollment policy remain separate work.
 
 Shell and workspace command acknowledgements mean **durable local admission**,
 not execution success. The host stores the immutable command in
-`host_operation_queue` in `sessions.sqlite3` before advancing its relay cursor.
+`host_operation_queue` in the session store before advancing its relay cursor.
 An independent, serial worker executes these operations and uploads their
 results; a long command or failed result upload does not block host polling,
 Stop/Interrupt delivery to session actors, presence, or session journal upload.
@@ -638,10 +638,12 @@ du -sh "$HOME/.borg"
 borg doctor --json
 ```
 
-Do not delete `sessions.sqlite3`, `workspaces.sqlite3`, or any `-wal`/`-shm`
-file while Borg processes are running. Stop the affected Borg services and
-take a filesystem-level copy before attempting manual SQLite repair. A full
-disk is not fixed by repeatedly restarting the remote service.
+Do not delete or hand-edit the PostgreSQL data directory (`$BORG_HOME/pgdata`
+by default) while Borg processes are running. Stop the affected Borg services
+first, and take a `pg_dump` of `borg_sessions` before attempting any manual
+repair. A full disk is not fixed by repeatedly restarting the remote service;
+check `$BORG_HOME/logs/postgres.log`, which is where a cluster that refuses to
+start says why.
 
 ## Independent access and physical failures
 

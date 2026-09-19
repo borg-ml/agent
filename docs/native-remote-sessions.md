@@ -14,7 +14,7 @@ ssh -t pc.example 'borg resume SESSION_UUID'
 
 The second command runs the Borg TUI on the PC through an SSH PTY. `borg resume`
 detects the existing session owner and attaches through Borg's local Unix
-control socket while tailing the durable SQLite journal. Closing the SSH client
+control socket while tailing the durable journal. Closing the SSH client
 detaches that view without stopping the owning session.
 
 This route already covers the important operational properties:
