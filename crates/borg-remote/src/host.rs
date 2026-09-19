@@ -22,11 +22,6 @@ use uuid::Uuid;
 
 use crate::BillingLane;
 use crate::receipt::{ReceiptBackend, ReceiptState};
-// Only the tests build a concrete receipt store; production resolves the tier
-// through the session store so the backend stays configurable.
-#[cfg(test)]
-// Test fixtures still build a concrete journal directly; production resolves
-// the backend through the factory.
 use crate::session::AbortTask;
 use crate::{
     AgentRuntimeCommandEnvelope, AgentRuntimeEventEnvelope, AgentTurnExecutor, Audience,
@@ -44,7 +39,6 @@ use crate::{
     execute_workspace_filesystem_with_limits,
     run_agent_session_with_store_and_writer_and_lsp_policy,
 };
-#[cfg(test)]
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct HostConfig {
@@ -6209,7 +6203,7 @@ fn platform() -> String {
 #[cfg(test)]
 mod tests {
     use chrono::Duration as ChronoDuration;
-    use crate::receipt::PostgresReceiptStore;
+    use borg_agent_runtime::receipt_postgres::PostgresReceiptStore;
     use crate::session_store::postgres::PostgresSessionStore;
     use crate::session_store::postgres::testing::ScratchDatabase;
     use sqlx::postgres::PgPoolOptions;
@@ -6476,8 +6470,8 @@ mod tests {
                 serde_json::to_value(store.read(id).await.unwrap()).unwrap(),
                 journal
             );
+            scratch.discard().await;
         }
-        scratch.discard().await;
     }
 
     fn error_events(session_id: Uuid, count: usize, message_bytes: usize) -> Vec<SessionEvent> {
@@ -8790,8 +8784,8 @@ mod tests {
                     .await
                     .is_err()
             );
+            scratch.discard().await;
         }
-        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -9087,8 +9081,8 @@ mod tests {
                 journal
             );
             assert!(sessions.lock().await.is_empty());
+            scratch.discard().await;
         }
-        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -10518,8 +10512,8 @@ mod tests {
                     .is_err(),
                 "durable deferral and inactive Stop must not contact the relay"
             );
+            scratch.discard().await;
         }
-        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -13188,8 +13182,8 @@ connection: close
                     .unwrap(),
                 vec![vec![1]; 4]
             );
+            scratch.discard().await;
         }
-        scratch.discard().await;
     }
 
     #[tokio::test]
