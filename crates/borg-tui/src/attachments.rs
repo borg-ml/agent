@@ -140,6 +140,29 @@ impl AttachmentStore {
             });
         }
 
+        let normalized = normalize_newlines(pasted);
+        if let Some((text, images)) = normalized.rsplit_once("\n\n") {
+            let paths = images
+                .lines()
+                .map(|line| {
+                    let url = line.strip_prefix("![Borg image](")?.strip_suffix(")")?;
+                    url::Url::parse(url).ok()?.to_file_path().ok()
+                })
+                .collect::<Option<Vec<_>>>();
+            if let Some(paths) = paths.filter(|paths| !paths.is_empty()) {
+                if !paths.iter().all(|path| is_supported_image(path)) {
+                    bail!("a copied image is no longer available or has an unsupported format");
+                }
+                return Ok(PasteOutcome {
+                    text: text.to_owned(),
+                    attachments: paths
+                        .iter()
+                        .map(|path| self.stage_path(path))
+                        .collect::<Result<_>>()?,
+                });
+            }
+        }
+
         let mut paths = pasted_paths(pasted, cwd);
         if paths.iter().any(|path| !is_supported_image(path)) {
             paths.clear();

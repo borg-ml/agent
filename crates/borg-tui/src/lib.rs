@@ -12385,6 +12385,19 @@ fn format_context_tokens(tokens: u64) -> String {
 impl TranscriptEntry {
     fn copy_text_owned(&self) -> Option<String> {
         match self {
+            Self::Message {
+                text, attachments, ..
+            } if !attachments.is_empty() => {
+                let images = attachments
+                    .iter()
+                    .map(|(_, path)| {
+                        url::Url::from_file_path(path)
+                            .ok()
+                            .map(|url| format!("![Borg image]({url})"))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(format!("{}\n\n{}", text, images.join("\n")))
+            }
             Self::Message { text, .. } | Self::Activity { text, .. } | Self::Info { text, .. } => {
                 Some(markdown_plain_text(text))
             }

@@ -14128,3 +14128,45 @@ async fn resumed_work_clears_reconnecting_without_recovery_marker() {
     }
     terminal.shutdown().await;
 }
+
+#[test]
+fn copied_image_message_round_trips_text_and_ordered_images_into_another_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let sources = [
+        temp.path().join("z 漢字 #1.png"),
+        temp.path().join("a (two).png"),
+    ];
+    for (index, path) in sources.iter().enumerate() {
+        image::RgbaImage::from_pixel(2, 3, image::Rgba([index as u8, 12, 34, 255]))
+            .save(path)
+            .unwrap();
+    }
+    let store = AttachmentStore::for_session(temp.path(), Uuid::new_v4()).unwrap();
+    for caption in ["Inspect these pictures\n\nKeep this paragraph.", ""] {
+        let mut transcript = Transcript::default();
+        transcript.order.push(TranscriptEntry::Message {
+            actor: EventActor::Assistant,
+            text: caption.into(),
+            attachments: sources.iter().cloned().enumerate().collect(),
+            model: None,
+            effort: None,
+            time: "12:00".into(),
+            status: MessageStatus::Complete,
+            complete: true,
+            user_interrupted: false,
+            redirected: false,
+        });
+        let copied = transcript.order[0].copy_text_owned().unwrap();
+        assert_eq!(transcript.last_assistant_message_text().unwrap(), copied);
+        let pasted = store.stage_paste(&copied, temp.path()).unwrap();
+        assert_eq!(pasted.text, caption);
+        assert_eq!(pasted.attachments.len(), sources.len());
+        for (source, staged) in sources.iter().zip(&pasted.attachments) {
+            assert_ne!(source, staged);
+            assert_eq!(
+                std::fs::read(source).unwrap(),
+                std::fs::read(staged).unwrap()
+            );
+        }
+    }
+}

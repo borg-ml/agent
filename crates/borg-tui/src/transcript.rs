@@ -5035,9 +5035,8 @@ impl Transcript {
         self.order.iter().rev().find_map(|entry| match entry {
             TranscriptEntry::Message {
                 actor: EventActor::Assistant,
-                text,
                 ..
-            } => Some(markdown_plain_text(text)),
+            } => entry.copy_text_owned(),
             _ => None,
         })
     }
