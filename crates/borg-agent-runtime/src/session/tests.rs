@@ -4727,12 +4727,20 @@ async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
 /// claim: it proves the human is answered promptly, NOT that the processes were
 /// reaped -- an expired bound reports that they may still be running.
 ///
-/// The assertion is a ratio, not a stopwatch reading: the boundary must land
-/// well short of the watchdog budget it used to inherit. Under the old code the
-/// wait IS that budget, so this fails loudly; the human bound is five times
-/// smaller under cfg(test), which leaves the margin wide. A paused-clock version
-/// would be strictly better and needs tokio's `test-util` feature, which the
-/// workspace does not currently enable.
+/// Deliberately NOT on a paused clock, despite that being the usual way to make
+/// a timing test deterministic. The interval measured here is not made of
+/// timers: between Escape and the boundary the actor does three Postgres round
+/// trips -- pausing the goal, latching the stop gate, and recording
+/// `TurnCompleted`. A paused clock auto-advances whenever no task is runnable,
+/// which includes while those writes are outstanding, so it would jump the
+/// reading to the next armed timer and fail the very assertion below. Real time
+/// is the honest instrument for this one.
+///
+/// What keeps it from being a flaky stopwatch is that the assertion is a ratio,
+/// not an absolute: the boundary must land short of the watchdog budget it used
+/// to inherit. Under cfg(test) that is 100ms of human bound against a 500ms
+/// watchdog budget, and under the old code the wait IS the watchdog budget, so
+/// this fails loudly rather than marginally.
 #[tokio::test]
 async fn an_unresponsive_cleanup_answers_escape_on_a_human_bound() {
     let root = tempdir().unwrap();
