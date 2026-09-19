@@ -7,6 +7,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  BORG_TEST_SESSIONS_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+
 permissions:
   contents: read
 
@@ -26,6 +29,7 @@ jobs:
           components: rustfmt, clippy
       - name: Install quality tools
         run: cargo install --locked just cargo-deny cargo-audit
+      - uses: ./.github/actions/test-postgres
       - name: Run workspace verification
         run: just verify
 
@@ -62,8 +66,9 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build Borg Agent
         run: cargo build --locked --release --target ${{ matrix.target }} -p borg
+      - uses: ./.github/actions/test-postgres
       - name: Run native Borg Agent core-flow tests
-        run: cargo test --locked --target ${{ matrix.target }} -p borg --no-fail-fast
+        run: cargo test --locked --target ${{ matrix.target }} -p borg --no-fail-fast -- --test-threads=4
       - name: Smoke-test the native Borg Agent binary
         shell: bash
         run: |

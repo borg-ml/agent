@@ -1,0 +1,30 @@
+name: Test Postgres
+description: Provision an isolated CI server for per-test scratch databases
+runs:
+  using: composite
+  steps:
+    - uses: ankane/setup-postgres@b1a598d92f86cb2ed364411898d150d4eac6d5ca
+      if: runner.os != 'Windows' || runner.arch != 'ARM64'
+      with:
+        user: postgres
+    # The setup action rejects Windows ARM; Windows runs the x64 server under emulation.
+    - name: Install Postgres on Windows ARM
+      if: runner.os == 'Windows' && runner.arch == 'ARM64'
+      shell: pwsh
+      run: |
+        $installer = Join-Path $env:RUNNER_TEMP "postgres-installer.exe"
+        Invoke-WebRequest "https://get.enterprisedb.com/postgresql/postgresql-17.9-3-windows-x64.exe" -OutFile $installer
+        if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne "99FCB47132698D8CC715AFF197DBD23EADF828B3F3524AA279C538F6948FA194") {
+          throw "Postgres installer checksum mismatch"
+        }
+        $prefix = Join-Path $env:RUNNER_TEMP "postgres"
+        $install = Start-Process $installer -Wait -PassThru -ArgumentList @(
+          "--mode", "unattended", "--unattendedmodeui", "none",
+          "--prefix", $prefix, "--datadir", "$prefix/data",
+          "--superpassword", "postgres", "--serverport", "5432",
+          "--servicename", "borg-test-postgres",
+          "--disable-components", "pgAdmin,stackbuilder"
+        )
+        if ($install.ExitCode -ne 0) { throw "Postgres installation failed: $($install.ExitCode)" }
+        & "$prefix/bin/pg_isready.exe" -h 127.0.0.1 -p 5432 -U postgres
+        if ($LASTEXITCODE -ne 0) { throw "Test Postgres is not ready" }

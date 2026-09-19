@@ -50,6 +50,7 @@ tui-stress:
 
 # Run the repository quality gates used by local development and CI.
 verify:
+    @test -n "$BORG_TEST_SESSIONS_URL" || { echo "Set BORG_TEST_SESSIONS_URL to a Postgres test server with CREATEDB permission" >&2; exit 1; }
     cargo fmt --all -- --check
     cargo check --workspace --exclude borg-gui --locked
     cargo test --workspace --exclude borg-gui --locked --no-fail-fast -- --test-threads=1
