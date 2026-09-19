@@ -278,7 +278,8 @@ impl NativeHarness {
                 "Use shell commands for orchestration and invoke the language or installed runtime that best fits the problem, such as TypeScript/JavaScript for web and JSON work or Python for data and scientific work. ",
                 "This is trusted user-authority execution, not a security sandbox. ",
                 "Use `borg tools` to discover Borg, Blu, plugin, history, workflow, and collaboration capabilities on demand, and `borg call NAME JSON` to invoke one. ",
-                "Inside commands, `$BORG_AGENT_CLI` is the exact Borg executable when `borg` is not on PATH. Keep intermediate data in files, pipes, or programs and return only useful results."
+                "Inside commands, `$BORG_AGENT_CLI` is the exact Borg executable when `borg` is not on PATH. Keep intermediate data in files, pipes, or programs and return only useful results. ",
+                "To actually see an image, run `borg image FILE` on a PNG or JPEG; printing base64 to stdout does not work, because shell output is truncated and arrives as text."
             )),
             HarnessMode::Native => system_prompt.push_str(concat!(
                 "\n\nUse the available Borg capabilities directly. `exec_command` runs trusted user-authority shell commands and can invoke any installed language runtime. ",
@@ -301,14 +302,9 @@ impl NativeHarness {
             .await;
             system_prompt.push_str(&format!("\nExternal MCP server {} is unavailable for this turn. Its tools are not available; do not claim to have used them.", serde_json::to_string(server)?));
         }
-        for appendix in [
-            &turn.system_prompt_appendix,
-            &turn.volatile_system_prompt_appendix,
-        ] {
-            if !appendix.is_empty() {
-                system_prompt.push_str("\n\n");
-                system_prompt.push_str(appendix);
-            }
+        if !turn.system_prompt_appendix.is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&turn.system_prompt_appendix);
         }
         if let Some(instruction) = turn.response_language.instruction() {
             system_prompt.push_str("\n\n");
@@ -329,6 +325,17 @@ impl NativeHarness {
         let harness_prompt_appendix = turn.agent_tools.harness_prompt_appendix().await?;
         if !harness_prompt_appendix.is_empty() {
             let context_message = ModelMessage::user(harness_prompt_appendix);
+            record_native_prompt_context(&events, turn.provider, &context_message).await?;
+            messages.push(context_message);
+        }
+        // Provider admission status carries live usage percentages and reset
+        // timestamps, so it differs between turns. In the system prompt it sat
+        // ahead of the entire conversation and invalidated the provider prefix
+        // cache on every tick. Recording it as durable trailing context instead
+        // keeps the prefix byte-identical: the previous turn's status stays in
+        // history and the current one is appended after it.
+        if !turn.volatile_system_prompt_appendix.is_empty() {
+            let context_message = ModelMessage::user(turn.volatile_system_prompt_appendix.clone());
             record_native_prompt_context(&events, turn.provider, &context_message).await?;
             messages.push(context_message);
         }
@@ -4633,5 +4640,221 @@ mod tests {
             ),
             None
         );
+    }
+
+    struct PrefixClient {
+        rounds: Mutex<Vec<Vec<ModelMessage>>>,
+        truncate_forever: bool,
+    }
+
+    #[async_trait]
+    impl NativeModelClient for PrefixClient {
+        async fn model_turn(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+            request: ModelTurnRequest,
+            _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+        ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+            self.rounds.lock().unwrap().push(request.messages.clone());
+            let (content, finish_reason) = if self.truncate_forever {
+                (None, "length")
+            } else {
+                (Some("done".to_string()), "stop")
+            };
+            Ok(ModelTurnResult {
+                message: ModelMessage::assistant(content, None, None, Vec::new()),
+                finish_reason: finish_reason.to_string(),
+                usage: ProviderCallUsage::default(),
+                raw_response: Value::Null,
+                trace: ProviderAttemptTrace::default(),
+            })
+        }
+    }
+
+    struct PrefixTurn {
+        rounds: Vec<Vec<ModelMessage>>,
+        /// The conversation the next turn replays, rebuilt from the durable
+        /// events this turn emitted in the order `session.rs` replays them.
+        durable: Vec<ModelMessage>,
+        completed: bool,
+    }
+
+    async fn run_prefix_turn(
+        cwd: PathBuf,
+        session_id: Uuid,
+        conversation: Vec<ModelMessage>,
+        prompt: &str,
+        volatile: &str,
+        truncate_forever: bool,
+    ) -> PrefixTurn {
+        let client = Arc::new(PrefixClient {
+            rounds: Mutex::new(Vec::new()),
+            truncate_forever,
+        });
+        let harness = NativeHarness {
+            model_client: client.clone(),
+            harness: HarnessMode::Native,
+            ..NativeHarness::default()
+        };
+        let mut durable = conversation.clone();
+        let turn = AgentTurn {
+            session_id,
+            message_id: Uuid::new_v4(),
+            context_generation: 0,
+            provider: crate::CodingProvider::OpenRouter,
+            provider_session_id: None,
+            provider_fork_turn_id: None,
+            cwd: cwd.clone(),
+            prompt_delta: prompt.to_string(),
+            prompt: prompt.to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            model: Some("test-model".to_string()),
+            effort: None,
+            fast: Some(true),
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+            conversation,
+            agent_mcp_server: borg_provider::mcp::ExternalMcpServer {
+                name: "test".to_string(),
+                command: "test".to_string(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                allowed_tools: Vec::new(),
+            },
+            agent_tools: crate::AgentToolDispatcher::new(
+                crate::session::SessionGoalTools::disconnected(),
+                crate::session::SessionTodoTools::disconnected(),
+                None,
+                crate::LspService::new(&cwd),
+                crate::CodingProvider::OpenRouter,
+                session_id,
+                false,
+                None,
+                None,
+                cwd.clone(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                crate::native_process::ProcessManager::default(),
+                PermissionMode::FullAccess,
+            ),
+            external_mcp_servers: Vec::new(),
+            runtime_mcp_context: Default::default(),
+            extension_skill_roots: Vec::new(),
+            extension_workflows: Vec::new(),
+            extension_api: Default::default(),
+            system_prompt_appendix: String::new(),
+            volatile_system_prompt_appendix: volatile.to_string(),
+        };
+        let (events_tx, mut events_rx) = mpsc::channel(256);
+        let task = tokio::spawn(async move { harness.run(turn, events_tx, None).await });
+        // The timeout has to enclose the drain as well as the join, or a harness
+        // that never finishes hangs the test instead of failing it.
+        let completed = tokio::time::timeout(Duration::from_secs(30), async {
+            while let Some(event) = events_rx.recv().await {
+                if let SessionEventKind::ProviderEvent { kind, payload, .. } = event
+                    && (kind == "native_prompt_context" || kind == "native_model_message")
+                    && let Ok(message) = serde_json::from_value::<ModelMessage>(payload)
+                {
+                    durable.push(message);
+                }
+            }
+            task.await.expect("the harness task joined").is_ok()
+        })
+        .await
+        .expect("the harness turn finished inside the timeout");
+        let rounds = client.rounds.lock().unwrap().clone();
+        PrefixTurn {
+            rounds,
+            durable,
+            completed,
+        }
+    }
+
+    /// Provider admission status carries live usage percentages and reset
+    /// timestamps, so it differs between turns. Held in the system prompt it
+    /// precedes the whole conversation, so every tick rewrites the head of the
+    /// request and the provider re-processes the entire history -- the failure
+    /// an unattended loop hits hardest. The real contract is that a later turn
+    /// EXTENDS the earlier request verbatim, so this replays the first turn's
+    /// durable journal into the second exactly as `session.rs` rebuilds it.
+    #[tokio::test]
+    async fn a_usage_tick_never_rewrites_the_replayed_request_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().to_path_buf();
+        let session_id = Uuid::new_v4();
+
+        let first = run_prefix_turn(
+            cwd.clone(),
+            session_id,
+            Vec::new(),
+            "check status",
+            "usage available: 5-hour 65% left (resets 2026-01-01T00:00:00Z)",
+            false,
+        )
+        .await;
+        assert!(first.completed, "the first turn completes");
+
+        // Same session, replayed history, and the usage has since ticked.
+        let second = run_prefix_turn(
+            cwd.clone(),
+            session_id,
+            first.durable.clone(),
+            "still checking",
+            "usage available: 5-hour 12% left (resets 2026-01-02T00:00:00Z)",
+            false,
+        )
+        .await;
+        assert!(second.completed, "the replayed turn completes");
+
+        let first_messages = first.rounds.first().expect("a first model round");
+        let second_messages = second.rounds.first().expect("a second model round");
+        let json = |messages: &[ModelMessage]| serde_json::to_value(messages).unwrap();
+
+        assert!(
+            second_messages.len() > first_messages.len(),
+            "the replayed turn must extend the first request, not replace it"
+        );
+        assert_eq!(
+            json(&second_messages[..first_messages.len()]),
+            json(first_messages),
+            "a usage tick must not rewrite any part of the already-cached prefix"
+        );
+
+        // The status still reaches the model, at the tail, and does not linger
+        // in the new tail from the previous turn.
+        let tail = |messages: &[ModelMessage]| match messages.last() {
+            Some(ModelMessage::User { content, .. }) => content.clone(),
+            other => panic!("expected trailing user context, got {other:?}"),
+        };
+        assert!(tail(first_messages).contains("65% left"));
+        assert!(tail(second_messages).contains("12% left"));
+        assert!(!tail(second_messages).contains("65% left"));
+    }
+
+    /// A reply that keeps stopping at the output-token limit must terminate and
+    /// report, rather than continue forever and hide the failure.
+    #[tokio::test]
+    async fn repeated_output_limit_stops_stay_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let turn = run_prefix_turn(
+            root.path().to_path_buf(),
+            Uuid::new_v4(),
+            Vec::new(),
+            "write it all",
+            "",
+            true,
+        )
+        .await;
+        assert!(
+            !turn.completed,
+            "an unresolvable truncation surfaces as an error"
+        );
+        assert_eq!(turn.rounds.len(), MAX_LENGTH_CONTINUATIONS + 1);
     }
 }
