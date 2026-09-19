@@ -298,7 +298,9 @@ fn dictation_config_with_preferences(preferences: &EditorPreferences) -> LocalDi
     config
 }
 
-fn spawn_editor_preferences_writer() -> (
+fn spawn_editor_preferences_writer(
+    mut previous: EditorPreferences,
+) -> (
     mpsc::UnboundedSender<EditorPreferences>,
     mpsc::UnboundedReceiver<String>,
     EditorPreferencesTask,
@@ -310,7 +312,13 @@ fn spawn_editor_preferences_writer() -> (
             while let Ok(latest) = preferences_rx.try_recv() {
                 preferences = latest;
             }
-            let result = tokio::task::spawn_blocking(move || preferences.save()).await;
+            let baseline = previous.clone();
+            let next = preferences.clone();
+            let result =
+                tokio::task::spawn_blocking(move || preferences.save_changes(&baseline)).await;
+            if matches!(result, Ok(Ok(()))) {
+                previous = next;
+            }
             let error = match result {
                 Ok(Ok(())) => None,
                 Ok(Err(error)) => Some(format!("Could not save editor preferences: {error:#}")),
@@ -2558,7 +2566,7 @@ async fn run_local_agent_session(
     let (ui_interaction_tx, mut ui_interaction_completions, ui_interaction_task) =
         spawn_ui_interaction_dispatcher(Arc::clone(&store), session_command_tx.clone());
     let (editor_preferences_tx, mut editor_preferences_errors, editor_preferences_task) =
-        spawn_editor_preferences_writer();
+        spawn_editor_preferences_writer(editor_preferences.clone());
     let (payload_hydration_tx, mut payload_hydration_results, payload_hydration_task) =
         spawn_payload_hydrator(Arc::clone(&store));
     let (terminal_io_tx, mut terminal_io_completions) = spawn_terminal_io_worker();
@@ -4176,6 +4184,7 @@ async fn run_local_agent_session(
                 let line = line?;
                 let expanded = agent_config.expand_command(line.trim());
                 let line = expanded.trim();
+                let previous_preferences = editor_preferences.clone();
                 if line.is_empty() {
                     continue;
                 }
@@ -4344,7 +4353,7 @@ async fn run_local_agent_session(
                 if let Some(value) = line.strip_prefix("/icons ") {
                     if let Some(style) = parse_dictation_icon_style(value) {
                         editor_preferences.presentation.dictation_icon = Some(style);
-                        editor_preferences.save()?;
+                        editor_preferences.save_changes(&previous_preferences)?;
                         println!(
                             "\n  Microphone icon: {}.\n",
                             match style {
@@ -4383,7 +4392,7 @@ async fn run_local_agent_session(
                 }
                 if let Some(value) = line.strip_prefix("/color ") {
                     match update_transcript_color(&mut editor_preferences, value)
-                        .and_then(|()| editor_preferences.save())
+                        .and_then(|()| editor_preferences.save_changes(&previous_preferences))
                     {
                         Ok(()) => println!("\n{}\n", transcript_colors_summary(&editor_preferences)),
                         Err(error) => eprintln!("\n  {error}\n"),
@@ -4407,7 +4416,7 @@ async fn run_local_agent_session(
                             continue;
                         }
                     }
-                    editor_preferences.save()?;
+                    editor_preferences.save_changes(&previous_preferences)?;
                     println!(
                         "\n  Messages sent while Borg works: {}.\n",
                         if steer_active_turn {
@@ -4427,7 +4436,7 @@ async fn run_local_agent_session(
                             interaction_tick = tui_render_interval(tui_frame_interval(tui_fps));
                             editor_preferences.presentation.refresh_rate_fps =
                                 u16::try_from(tui_fps).expect("bounded refresh rate fits u16");
-                            editor_preferences.save()?;
+                            editor_preferences.save_changes(&previous_preferences)?;
                             println!("\n  Refresh rate set to {tui_fps} FPS.\n");
                         }
                         _ => eprintln!(
@@ -4464,7 +4473,7 @@ async fn run_local_agent_session(
                             }
                         }
                     }
-                    editor_preferences.save()?;
+                    editor_preferences.save_changes(&previous_preferences)?;
                     println!(
                         "\n  {}.\n",
                         sleep_setting_notice(enabled, lid, sleep_inhibitor.lid_status())
@@ -4473,7 +4482,7 @@ async fn run_local_agent_session(
                 }
                 if let Some(value) = line.strip_prefix("/user-label ") {
                     match update_transcript_label(&mut editor_preferences, true, value)
-                        .and_then(|()| editor_preferences.save())
+                        .and_then(|()| editor_preferences.save_changes(&previous_preferences))
                     {
                         Ok(()) => println!(
                             "\n  User transcript label: {}.\n",
@@ -4485,7 +4494,7 @@ async fn run_local_agent_session(
                 }
                 if let Some(value) = line.strip_prefix("/assistant-label ") {
                     match update_transcript_label(&mut editor_preferences, false, value)
-                        .and_then(|()| editor_preferences.save())
+                        .and_then(|()| editor_preferences.save_changes(&previous_preferences))
                     {
                         Ok(()) => println!(
                             "\n  Assistant transcript label: {}.\n",

@@ -273,6 +273,29 @@ impl EditorPreferences {
         Ok(())
     }
 
+    /// Save only fields changed by this frontend, preserving other open sessions.
+    pub fn save_changes(&self, previous: &Self) -> Result<()> {
+        self.save_changes_to(previous, &default_path()?)
+    }
+
+    pub fn save_changes_to(&self, previous: &Self, path: &Path) -> Result<()> {
+        let parent = path.parent().context("preferences path has no parent")?;
+        fs::create_dir_all(parent)?;
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))?;
+        lock.lock().context("lock editor preferences")?;
+        let before = toml::Value::try_from(previous)?;
+        let after = toml::Value::try_from(self)?;
+        let mut current = toml::Value::try_from(Self::load_from(path)?)?;
+        merge_preference_changes(&mut current, &before, &after);
+        let merged: Self = current.try_into()?;
+        merged.save_to(path)
+    }
+
     pub fn validate(&self) -> Result<()> {
         validate_label("user", &self.transcript.user_label)?;
         validate_label("assistant", &self.transcript.assistant_label)?;
@@ -302,6 +325,30 @@ impl EditorPreferences {
             "composer maximum height must be between 3 and 30 rows"
         );
         Ok(())
+    }
+}
+
+fn merge_preference_changes(current: &mut toml::Value, before: &toml::Value, after: &toml::Value) {
+    if before == after {
+        return;
+    }
+    if let (Some(current), Some(before), Some(after)) =
+        (current.as_table_mut(), before.as_table(), after.as_table())
+    {
+        for (key, value) in after {
+            match (before.get(key), current.get_mut(key)) {
+                (Some(old), Some(stored)) => merge_preference_changes(stored, old, value),
+                (old, _) if old != Some(value) => {
+                    current.insert(key.clone(), value.clone());
+                }
+                _ => {}
+            }
+        }
+        for key in before.keys().filter(|key| !after.contains_key(*key)) {
+            current.remove(key);
+        }
+    } else {
+        *current = after.clone();
     }
 }
 
@@ -427,6 +474,44 @@ fn validate_label(kind: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_sessions_preserve_dictation_and_newer_build_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("editor.toml");
+        let original = EditorPreferences::default();
+        original.save_to(&path).unwrap();
+        let mut dictation = original.clone();
+        dictation.interaction.dictation_enabled = true;
+        dictation.presentation.dictation_model = Some("parakeet-v3".into());
+        dictation.presentation.dictation_accelerator = Some("nvidia".into());
+        dictation.save_changes_to(&original, &path).unwrap();
+        let mut source = fs::read_to_string(&path).unwrap();
+        source.push_str(
+            "
+[future]
+keep = true
+",
+        );
+        fs::write(&path, source).unwrap();
+        let mut stale = original.clone();
+        stale.layout.horizontal_margin = 4;
+        stale.save_changes_to(&original, &path).unwrap();
+        let saved = EditorPreferences::load_from(&path).unwrap();
+        assert!(saved.interaction.dictation_enabled);
+        assert_eq!(
+            saved.presentation.dictation_model.as_deref(),
+            Some("parakeet-v3")
+        );
+        assert_eq!(
+            saved.presentation.dictation_accelerator.as_deref(),
+            Some("nvidia")
+        );
+        assert_eq!(saved.layout.horizontal_margin, 4);
+        assert!(fs::read_to_string(&path).unwrap().contains("keep = true"));
+        stale.save_changes_to(&stale, &path).unwrap();
+        assert_eq!(EditorPreferences::load_from(&path).unwrap(), saved);
+    }
 
     #[test]
     fn round_trip_preserves_label_casing_and_all_preferences() {

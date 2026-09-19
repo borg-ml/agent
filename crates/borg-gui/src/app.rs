@@ -92,8 +92,9 @@ impl BorgGui {
                 match UiLanguage::parse(value) {
                     Some(language) => {
                         let mut preferences = EditorPreferences::load().unwrap_or_default();
+                        let previous = preferences.clone();
                         preferences.presentation.ui_language = language;
-                        match preferences.save() {
+                        match preferences.save_changes(&previous) {
                             Ok(()) => {
                                 this.ui_language = language;
                                 this.info_panel = Some((
