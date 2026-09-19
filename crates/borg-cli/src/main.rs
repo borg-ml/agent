@@ -180,17 +180,24 @@ async fn doctor(json: bool, deep: bool) -> Result<()> {
                 "not checked (run `borg doctor --deep`)"
             }
         );
-        println!(
-            "  sqlite: {} · synchronous={} · foreign_keys={}",
-            health.journal_mode, health.synchronous, health.foreign_keys
-        );
-        println!(
-            "  WAL: busy={} · log={} · checkpointed={} · retained limit={} MiB",
-            health.wal_busy,
-            health.wal_log_frames,
-            health.wal_checkpointed_frames,
-            health.journal_size_limit_bytes / (1024 * 1024)
-        );
+        // These two lines report SQLite pragmas and its write-ahead log. On
+        // Postgres they described nothing, and printing "sqlite: ..." under
+        // "Session backend: postgres" read as though the report had come from
+        // the wrong database. Now that Postgres is the default, every user
+        // would have seen that.
+        if opened.backend() == borg_remote::session_store::factory::SessionBackend::Sqlite {
+            println!(
+                "  sqlite: {} · synchronous={} · foreign_keys={}",
+                health.journal_mode, health.synchronous, health.foreign_keys
+            );
+            println!(
+                "  WAL: busy={} · log={} · checkpointed={} · retained limit={} MiB",
+                health.wal_busy,
+                health.wal_log_frames,
+                health.wal_checkpointed_frames,
+                health.journal_size_limit_bytes / (1024 * 1024)
+            );
+        }
         println!(
             "  durable rows: {} sessions · {} events · {} payloads",
             health.sessions, health.events, health.payloads

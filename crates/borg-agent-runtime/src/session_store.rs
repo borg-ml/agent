@@ -8667,6 +8667,7 @@ fn workflow_event_id(kind: &SessionEventKind) -> Option<Uuid> {
     }
 }
 
+pub mod cluster;
 pub mod factory;
 pub mod migrate;
 pub mod postgres;

@@ -2,36 +2,100 @@
 
 Status: implementation contract
 
-Borg's durable journal runs on either SQLite or PostgreSQL. SQLite remains the
-default and needs no configuration. PostgreSQL is selected by one environment
-variable and exists to remove a specific, measured failure: SQLite permits one
-writer per FILE, and every Borg process on a machine shares one journal file.
+Borg's durable journal runs on either SQLite or PostgreSQL. **PostgreSQL is the
+default**, and Borg provisions it for you. SQLite is still supported and is
+selected by name.
+
+The default follows from what Borg is for. Several agents commonly run at once
+on one machine, and SQLite permits one writer per FILE while every Borg process
+here shares one journal file -- so a SQLite default puts every agent behind a
+single machine-wide lock whose throughput does not improve as writers are added.
 
 ## Which one do you want?
 
-**SQLite unless many agents share one machine.** It is the default, needs no
-service, and is roughly 60x faster per append at low concurrency because there
-is no network round trip.
+**PostgreSQL unless you are certain you run one agent at a time.** It is the
+default and needs no setup: with no configuration Borg initialises a cluster
+under its own home directory and starts it. SQLite's throughput plateaus at
+about 780 appends/second no matter how many writers are added -- that plateau is
+the single-file write lock. Postgres scales roughly linearly with writers and
+overtakes SQLite at around 32 concurrent writers. It also brings
+dictionary-compressed cold storage and cross-session search.
 
-**PostgreSQL when writer concurrency is the constraint.** SQLite's throughput
-plateaus at about 780 appends/second no matter how many writers are added --
-that plateau is the single-file write lock. Postgres scales roughly linearly
-with writers and overtakes SQLite at around 32 concurrent writers. It also
-brings dictionary-compressed cold storage and cross-session search.
+**SQLite when a single agent is the whole story.** It needs no service and is
+roughly 60x faster per append at low concurrency, because there is no network
+round trip. That advantage is real and it is why SQLite remains supported; it
+simply stops mattering the moment a second writer appears.
 
-Switching does not move history. See [Concurrency](#concurrency) and
-[Storage](#storage) for the measurements behind both claims.
+Switching does not move history -- see [Migrating](#migrating-an-existing-journal).
+See [Concurrency](#concurrency) and [Storage](#storage) for the measurements
+behind both claims.
 
 ## Choosing a backend
 
 ```sh
-# SQLite (default): no configuration.
+# PostgreSQL (default): no configuration. Borg provisions and starts a cluster
+# in its own home directory the first time it runs.
 borg
 
-# PostgreSQL: one variable, read once at startup.
+# An existing PostgreSQL server instead of the managed one.
 export BORG_SESSIONS_URL="postgres://borg@localhost:5432/borg"
 borg
+
+# SQLite, for a single agent at a time.
+export BORG_SESSIONS_BACKEND=sqlite
+borg
 ```
+
+`BORG_SESSIONS_URL` outranks `BORG_SESSIONS_BACKEND`, because naming a specific
+server is the more specific instruction.
+
+## The managed cluster
+
+With no configuration, Borg owns a cluster of its own:
+
+| | |
+|---|---|
+| Data directory | `$BORG_HOME/pgdata` (default `~/.borg/pgdata`) |
+| Port | `5433`, or `BORG_SESSIONS_PORT` |
+| Role / database | `borg` / `borg_sessions` |
+| Log | `$BORG_HOME/logs/postgres.log` |
+
+Port 5433 rather than 5432 is deliberate: a developer machine frequently
+already runs a system PostgreSQL on 5432, and adopting someone else's cluster is
+not Borg's decision to make.
+
+Borg does **not** install PostgreSQL. It locates the `initdb` and `pg_ctl` that
+an installation already provides -- including the version-suffixed directories
+distributions keep off `PATH`, such as `/usr/lib/postgresql/17/bin`. When they
+are absent it fails with the install command for the platform and with both
+escape hatches, rather than silently dropping to SQLite. A silent drop would
+split one machine's history across two databases, and the split stays invisible
+until someone goes looking for a session that was quietly written elsewhere.
+
+Several Borg processes routinely start at the same moment and all of them run
+this. No lock is taken; instead each step treats losing the race as having had
+nothing to do. `initdb` refuses a populated directory and `pg_ctl start` refuses
+a running cluster, and both outcomes are re-checked against live state before
+being treated as failures.
+
+A crash leaves `postmaster.pid` behind and the next start refuses, assuming the
+old server is alive. Borg checks whether that process actually exists and clears
+the file if it does not, because the machine this runs on does crash.
+
+## Migrating an existing journal
+
+Changing the backend does not move history. A journal written to SQLite stays
+there, visible again the moment `BORG_SESSIONS_BACKEND=sqlite` is set. To bring
+it across:
+
+```sh
+borg session migrate --to "postgres://borg@127.0.0.1:5433/borg_sessions"
+```
+
+Migration replays events through the destination's own `append` rather than
+copying rows, so the destination derives its own projections and search index.
+The source is only ever read, so this is safe to run against a journal still in
+use and safe to abandon partway.
 
 `borg doctor` reports which backend a process resolved to:
 

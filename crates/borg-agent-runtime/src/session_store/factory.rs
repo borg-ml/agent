@@ -22,7 +22,7 @@
 //! store from configuration; constructing a backend directly is for tests and
 //! for tools that deliberately want one specific backend.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -55,6 +55,17 @@ impl std::fmt::Display for SessionBackend {
     }
 }
 
+/// Which journal a process was told to use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Selection {
+    /// An explicit `BORG_SESSIONS_URL`, or a URL pinned in code.
+    Url(String),
+    /// An explicit opt-out to the single-writer journal.
+    Sqlite,
+    /// The default: Borg's own PostgreSQL cluster on this machine.
+    Managed,
+}
+
 /// Where a process should look for its journal.
 ///
 /// Held as a value rather than read from the environment at each call site so
@@ -63,39 +74,87 @@ impl std::fmt::Display for SessionBackend {
 /// test suite is threaded.
 #[derive(Debug, Clone)]
 pub struct SessionStoreConfig {
-    /// The Postgres connection string, when one is configured.
-    url: Option<String>,
-    /// Where the SQLite journal lives when no URL is configured.
+    /// What the environment or the caller asked for.
+    selection: Selection,
+    /// Where the SQLite journal lives when SQLite was selected.
     sqlite_path: PathBuf,
+    /// The Borg home directory that hosts the managed cluster.
+    home: PathBuf,
     /// Interactive processes wait longer for the SQLite write lock instead of
     /// failing a user-visible command. Ignored by Postgres, which has no
     /// machine-wide write lock to wait on.
     interactive: bool,
 }
 
+/// Opt out of the managed cluster and use the single-writer journal.
+pub const SESSIONS_BACKEND_ENV: &str = "BORG_SESSIONS_BACKEND";
+
+/// The Borg home that hosts the managed cluster.
+///
+/// Machine-scoped rather than derived from the journal path, because there is
+/// one managed cluster per Borg installation and several call sites pass a
+/// scratch or non-canonical journal path. Deriving from those produced a
+/// cluster directory at an arbitrary root; anchoring to `BORG_HOME` means every
+/// process on a machine agrees on one cluster, and a test or a second
+/// installation scopes itself by setting `BORG_HOME` as it already does for
+/// every other piece of durable state.
+fn default_home() -> PathBuf {
+    crate::default_host_config_path()
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(".borg"))
+}
+
 impl SessionStoreConfig {
-    /// Resolve from the environment, falling back to `sqlite_path`.
+    /// Resolve from the environment.
+    ///
+    /// The default is the managed PostgreSQL cluster. Borg's normal posture is
+    /// several agents running at once, and SQLite admits one writer per file
+    /// machine-wide, so a SQLite default silently serialises every agent behind
+    /// one lock. SQLite remains available, but only when asked for.
     pub fn from_env(sqlite_path: impl Into<PathBuf>) -> Self {
+        let sqlite_path = sqlite_path.into();
+        let selection = select(
+            PostgresSessionStore::url_from_env(),
+            std::env::var(SESSIONS_BACKEND_ENV).ok().as_deref(),
+            journal_is_the_default_one(&sqlite_path),
+        );
         Self {
-            url: PostgresSessionStore::url_from_env(),
-            sqlite_path: sqlite_path.into(),
+            selection,
+            home: default_home(),
+            sqlite_path,
             interactive: false,
         }
     }
 
     /// Pin a specific Postgres URL, ignoring the environment.
     pub fn with_url(url: impl Into<String>, sqlite_path: impl Into<PathBuf>) -> Self {
+        let sqlite_path = sqlite_path.into();
         Self {
-            url: Some(url.into()),
-            sqlite_path: sqlite_path.into(),
+            selection: Selection::Url(url.into()),
+            home: default_home(),
+            sqlite_path,
             interactive: false,
         }
     }
 
     /// Pin SQLite, ignoring the environment.
     pub fn sqlite(sqlite_path: impl Into<PathBuf>) -> Self {
+        let sqlite_path = sqlite_path.into();
         Self {
-            url: None,
+            selection: Selection::Sqlite,
+            home: default_home(),
+            sqlite_path,
+            interactive: false,
+        }
+    }
+
+    /// Pin the managed cluster under a specific home, ignoring the environment.
+    pub fn managed(home: impl Into<PathBuf>, sqlite_path: impl Into<PathBuf>) -> Self {
+        Self {
+            selection: Selection::Managed,
+            home: home.into(),
             sqlite_path: sqlite_path.into(),
             interactive: false,
         }
@@ -114,24 +173,64 @@ impl SessionStoreConfig {
     /// configured and is fit for an error message the operator sees, not for a
     /// log that leaves the machine.
     pub fn describe(&self) -> String {
-        match &self.url {
-            Some(url) => url.clone(),
-            None => self.sqlite_path.display().to_string(),
+        match &self.selection {
+            Selection::Url(url) => url.clone(),
+            Selection::Sqlite => self.sqlite_path.display().to_string(),
+            Selection::Managed => self.cluster().data_dir().display().to_string(),
         }
     }
 
     /// Which backend this configuration selects, without connecting.
     ///
-    /// A configured URL always wins. There is no auto-detection and no
-    /// fallback: silently dropping to SQLite because Postgres was unreachable
-    /// would split one machine's history across two databases, which is worse
-    /// than not starting.
+    /// There is no auto-detection and no fallback in either direction: an
+    /// unreachable Postgres does not quietly become SQLite, because that would
+    /// split one machine's history across two databases, and the split stays
+    /// invisible until someone goes looking for a session that was written
+    /// somewhere else.
     pub fn backend(&self) -> SessionBackend {
-        match self.url {
-            Some(_) => SessionBackend::Postgres,
-            None => SessionBackend::Sqlite,
+        match self.selection {
+            Selection::Url(_) | Selection::Managed => SessionBackend::Postgres,
+            Selection::Sqlite => SessionBackend::Sqlite,
         }
     }
+
+    /// The managed cluster this configuration would use.
+    pub fn cluster(&self) -> super::cluster::ManagedCluster {
+        super::cluster::ManagedCluster::in_home(&self.home)
+    }
+}
+
+/// Decide the journal from configuration values.
+///
+/// Pure so the precedence rule can be tested directly: `std::env::set_var` is
+/// not sound to call while other threads run, and this suite is threaded.
+fn select(url: Option<String>, backend: Option<&str>, default_journal: bool) -> Selection {
+    // An explicit URL wins over everything, including an explicit backend
+    // name, because it is the more specific instruction.
+    if let Some(url) = url {
+        return Selection::Url(url);
+    }
+    if backend
+        .map(str::trim)
+        .is_some_and(|name| name.eq_ignore_ascii_case("sqlite"))
+    {
+        return Selection::Sqlite;
+    }
+    // The managed cluster serves the installation's own journal. A caller that
+    // pointed somewhere else -- a scratch directory, a second journal being
+    // read for migration -- has deliberately left that installation, and there
+    // is no cluster there to reach for. Provisioning one beside every scratch
+    // path would turn a temp directory into a database server.
+    if default_journal {
+        Selection::Managed
+    } else {
+        Selection::Sqlite
+    }
+}
+
+/// Whether this journal path is the one the local Borg installation owns.
+fn journal_is_the_default_one(sqlite_path: &Path) -> bool {
+    sqlite_path.starts_with(default_home())
 }
 
 /// A session store whose satellite tiers are known to be present.
@@ -236,8 +335,8 @@ impl OpenSessionStore {
 /// separate.
 pub async fn open(config: &SessionStoreConfig) -> Result<OpenSessionStore> {
     let backend = config.backend();
-    let session: Arc<dyn SessionStore> = match &config.url {
-        Some(url) => {
+    let session: Arc<dyn SessionStore> = match &config.selection {
+        Selection::Url(url) => {
             let store = PostgresSessionStore::connect(url).await.with_context(|| {
                 format!("{SESSIONS_URL_ENV} is set, so Borg requires PostgreSQL")
             })?;
@@ -248,7 +347,23 @@ pub async fn open(config: &SessionStoreConfig) -> Result<OpenSessionStore> {
             store.ensure_single_owner().await?;
             Arc::new(store)
         }
-        None => {
+        Selection::Managed => {
+            // Provisioning happens here rather than in `from_env` because it
+            // starts a server: a configuration value must stay cheap to build,
+            // and only a process that actually opens the journal should pay
+            // for one.
+            let cluster = config.cluster();
+            let url = cluster.ensure_running().await?;
+            let store = PostgresSessionStore::connect(&url)
+                .await
+                .context("could not open the Borg session cluster's journal")?;
+            // The managed cluster is this machine's own, so a second OS user
+            // reaching it is the same accident the configured-URL path guards
+            // against.
+            store.ensure_single_owner().await?;
+            Arc::new(store)
+        }
+        Selection::Sqlite => {
             let path = config.sqlite_path.clone();
             if config.interactive {
                 Arc::new(SqliteSessionStore::open_interactive(path).await?)
@@ -319,6 +434,65 @@ fn missing_tier_context(backend: SessionBackend, tier: &str) -> String {
 mod tests {
     use super::*;
     use crate::CodingProvider;
+
+    /// Borg's default posture is several agents at once, and SQLite admits one
+    /// writer per file machine-wide. So the default must be Postgres, and
+    /// SQLite must still be reachable for anyone who wants it.
+    #[test]
+    fn postgres_is_the_default_and_sqlite_is_opt_in() {
+        assert_eq!(select(None, None, true), Selection::Managed);
+        assert_eq!(select(None, Some("sqlite"), true), Selection::Sqlite);
+        assert_eq!(select(None, Some("  SQLite  "), true), Selection::Sqlite);
+        // An unrecognised name must not silently become SQLite.
+        assert_eq!(select(None, Some("postgres"), true), Selection::Managed);
+        assert_eq!(select(None, Some(""), true), Selection::Managed);
+    }
+
+    /// The managed cluster belongs to the installation's own journal. A caller
+    /// pointing at a scratch path has left that installation, and must not
+    /// have a database server provisioned beside it.
+    #[test]
+    fn a_journal_outside_the_borg_home_does_not_get_a_cluster() {
+        assert_eq!(select(None, None, false), Selection::Sqlite);
+        // An explicit URL still reaches whatever it names.
+        assert_eq!(
+            select(Some("postgres://x@y/z".to_string()), None, false),
+            Selection::Url("postgres://x@y/z".to_string())
+        );
+    }
+
+    /// A configured URL is the more specific instruction, so it outranks a
+    /// backend name rather than being contradicted by one.
+    #[test]
+    fn an_explicit_url_outranks_every_other_selection() {
+        let url = "postgres://borg@localhost:5433/borg_sessions";
+        assert_eq!(
+            select(Some(url.to_string()), None, true),
+            Selection::Url(url.to_string())
+        );
+        assert_eq!(
+            select(Some(url.to_string()), Some("sqlite"), true),
+            Selection::Url(url.to_string())
+        );
+    }
+
+    #[test]
+    fn each_selection_reports_the_backend_it_will_open() {
+        assert_eq!(
+            SessionStoreConfig::sqlite("/tmp/borg/sessions.sqlite3").backend(),
+            SessionBackend::Sqlite
+        );
+        assert_eq!(
+            SessionStoreConfig::managed("/tmp/borg", "/tmp/borg/sessions.sqlite3").backend(),
+            SessionBackend::Postgres
+        );
+        assert_eq!(
+            SessionStoreConfig::with_url("postgres://x@y/z", "/tmp/borg/sessions.sqlite3")
+                .backend(),
+            SessionBackend::Postgres
+        );
+    }
+
     use crate::session_store::{
         RawSessionEvent, SessionLineage, SessionStoreCompaction, SessionStoreHealth,
         SessionWorkspaceBinding,
@@ -781,14 +955,6 @@ mod tests {
         ) -> Result<()> {
             unimplemented!("journal access is not part of this test")
         }
-    }
-
-    #[test]
-    fn a_configured_url_selects_postgres_and_its_absence_selects_sqlite() {
-        let postgres = SessionStoreConfig::with_url("postgres://localhost/borg", "/tmp/s.sqlite3");
-        assert_eq!(postgres.backend(), SessionBackend::Postgres);
-        let sqlite = SessionStoreConfig::sqlite("/tmp/s.sqlite3");
-        assert_eq!(sqlite.backend(), SessionBackend::Sqlite);
     }
 
     /// The central guarantee: a backend missing a tier fails here, loudly,
