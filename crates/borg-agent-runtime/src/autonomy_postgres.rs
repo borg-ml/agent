@@ -2,11 +2,9 @@
 //!
 //! This tier is a lease-fenced work queue, so it gets the same treatment as the
 //! session action queue: every read-modify-write takes a row lock, and the
-//! scheduler's claim sweep uses `for update skip locked`. That last part is a
-//! real improvement on the original rather than a translation -- SQLite's
-//! version selects candidates, then discovers it lost a race by checking
-//! `rows_affected`, because its database-wide lock made anything finer
-//! pointless. Here two schedulers take disjoint work on the first try.
+//! scheduler's claim sweep uses `for update skip locked`, so two schedulers
+//! take disjoint work on the first try rather than selecting candidates and
+//! then discovering they lost the race.
 //!
 //! Validation, hashing and lease rules are imported from `autonomy`, not
 //! reimplemented: they decide whether work is admitted, retried or abandoned,
@@ -28,7 +26,7 @@ use crate::autonomy::{
     validate_optional_text, validate_owner,
 };
 
-/// Matches the SQLite store's bounds.
+/// Payload and error bounds for one queued job.
 const MAX_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_ERROR_BYTES: usize = 8 * 1024;
 const MAX_CHECKPOINTS_PER_LIST: i64 = 512;

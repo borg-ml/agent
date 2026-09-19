@@ -1,9 +1,8 @@
-//! Plugin storage tier: one suite, both backends.
+//! Plugin storage tier conformance.
 //!
 //! Plugin state is compare-and-set storage with idempotent commits. The rules
-//! that matter are the ones that decide whether a write is applied, rejected as
-//! a revision conflict, or replayed -- so they are asserted against both
-//! engines with identical inputs.
+//! that matter decide whether a write is applied, rejected as a revision
+//! conflict, or replayed, so they are asserted here.
 
 use serde_json::{Value, json};
 use sha2::Digest;
@@ -12,7 +11,6 @@ use uuid::Uuid;
 use crate::plugin_store::postgres::PostgresPluginStore;
 use crate::plugin_store::{
     ArtifactInput, CommitScope, PluginBackend, PluginScope, PluginWrite, PreparedArtifact,
-    SqlitePluginStore,
 };
 use crate::session_store::postgres::PostgresSessionStore;
 use crate::session_store::postgres::testing::{ScratchDatabase, test_url};
@@ -20,50 +18,31 @@ use crate::session_store::postgres::testing::{ScratchDatabase, test_url};
 struct Harness {
     name: &'static str,
     store: Box<dyn PluginBackend>,
-    _directory: Option<tempfile::TempDir>,
-    scratch: Option<ScratchDatabase>,
+    scratch: ScratchDatabase,
 }
 
 impl Harness {
     async fn discard(self) {
-        if let Some(scratch) = self.scratch {
-            scratch.discard().await;
-        }
+        self.scratch.discard().await;
     }
 }
 
 async fn harnesses() -> Vec<Harness> {
-    let mut harnesses = Vec::new();
-    let directory = tempfile::tempdir().expect("temp dir");
-    let session = crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-        .await
-        .expect("open sqlite session store");
-    let sqlite = SqlitePluginStore::new(session.pool().clone());
-    crate::plugin_store::ensure_schema(session.pool())
-        .await
-        .expect("plugin schema");
-    harnesses.push(Harness {
-        name: "sqlite",
-        store: Box::new(sqlite),
-        _directory: Some(directory),
-        scratch: None,
-    });
-
-    if let Some(url) = test_url() {
-        let scratch = ScratchDatabase::create(&url).await;
-        let session = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
-            .await
-            .expect("bootstrap postgres schema");
-        harnesses.push(Harness {
-            name: "postgres",
-            store: Box::new(PostgresPluginStore::new(session.pool().clone())),
-            _directory: None,
-            scratch: Some(scratch),
-        });
-    } else {
+    let Some(url) = test_url() else {
         eprintln!("plugin conformance: skipping postgres, BORG_TEST_SESSIONS_URL is not set");
-    }
-    harnesses
+        return Vec::new();
+    };
+    let scratch = ScratchDatabase::create(&url).await;
+    // The session store owns schema bootstrap for the whole database,
+    // including the satellite tiers this store reads.
+    let session = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+        .await
+        .expect("bootstrap postgres schema");
+    vec![Harness {
+        name: "postgres",
+        store: Box::new(PostgresPluginStore::new(session.pool().clone())),
+        scratch,
+    }]
 }
 
 const EXTENSION: &str = "conformance-extension";
@@ -394,13 +373,11 @@ async fn a_recorded_artifact_is_verified_against_the_file_on_disk() {
 /// The dispatch entry point, not just the storage methods underneath it.
 ///
 /// `plugin_store::call` carries all the backend-agnostic policy -- request
-/// validation, scope resolution, idempotency hashing -- and was lifted out of
-/// the SQLite store so a second engine could reuse it rather than reimplement
-/// it. This drives that exact entry point on both backends; without it the
-/// suite would only prove the five storage primitives agree, while the rules
-/// built on top of them went untested on Postgres.
+/// validation, scope resolution, idempotency hashing -- and sits above the
+/// five storage primitives. Driving that exact entry point is what keeps the
+/// rules built on top of them from going untested.
 #[tokio::test]
-async fn the_call_entry_point_behaves_identically_on_both_backends() {
+async fn the_call_entry_point_applies_the_shared_policy() {
     for harness in harnesses().await {
         let name = harness.name;
         let root = tempfile::tempdir().expect("temp root");
@@ -494,12 +471,14 @@ async fn the_call_entry_point_behaves_identically_on_both_backends() {
     }
 }
 
+/// Postgres is the only backend, so an unset or broken `BORG_TEST_SESSIONS_URL`
+/// leaves `harnesses()` empty and every test above passes without asserting
+/// anything. This is the guard that makes that vacuum visible instead of green.
 #[tokio::test]
-async fn both_plugin_backends_are_exercised_when_configured() {
+async fn postgres_coverage_follows_its_configuration() {
     let configured = test_url().is_some();
     let harnesses = harnesses().await;
     let names: Vec<&str> = harnesses.iter().map(|harness| harness.name).collect();
-    assert!(names.contains(&"sqlite"));
     assert_eq!(
         names.contains(&"postgres"),
         configured,

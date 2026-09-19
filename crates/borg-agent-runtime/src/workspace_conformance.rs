@@ -1,9 +1,8 @@
-//! Workspace tier: one suite, both backends.
+//! Workspace tier conformance.
 //!
-//! The workspace store carries the rules that decide who receives a message and
-//! whether a retry is a duplicate. Those are exactly the rules that must not
-//! drift between engines, so they are asserted here against SQLite and
-//! PostgreSQL with identical inputs.
+//! The workspace store carries the rules that decide who receives a message
+//! and whether a retry is a duplicate. Those rules are asserted here against
+//! the shipped backend.
 
 use chrono::{Duration, Utc};
 use uuid::Uuid;
@@ -11,58 +10,40 @@ use uuid::Uuid;
 use crate::session_store::postgres::PostgresSessionStore;
 use crate::session_store::postgres::testing::{ScratchDatabase, test_url};
 use crate::workspace::{
-    Audience, DeliveryMode, DeliveryState, Participant, ParticipantKind, PresenceLease,
-    SqliteWorkspaceStore, Thread, Workspace, WorkspaceEvent, WorkspaceEventKind,
-    WorkspaceMembership, WorkspaceMessage, WorkspaceMessageBody, WorkspaceRole, WorkspaceStore,
+    Audience, DeliveryMode, DeliveryState, Participant, ParticipantKind, PresenceLease, Thread,
+    Workspace, WorkspaceEvent, WorkspaceEventKind, WorkspaceMembership, WorkspaceMessage,
+    WorkspaceMessageBody, WorkspaceRole, WorkspaceStore,
 };
 use crate::workspace_postgres::PostgresWorkspaceStore;
 
 struct Harness {
     name: &'static str,
     store: Box<dyn WorkspaceStore>,
-    _directory: Option<tempfile::TempDir>,
-    scratch: Option<ScratchDatabase>,
+    scratch: ScratchDatabase,
 }
 
 impl Harness {
     async fn discard(self) {
-        if let Some(scratch) = self.scratch {
-            scratch.discard().await;
-        }
+        self.scratch.discard().await;
     }
 }
 
 async fn harnesses() -> Vec<Harness> {
-    let mut harnesses = Vec::new();
-    let directory = tempfile::tempdir().expect("temp dir");
-    let sqlite = SqliteWorkspaceStore::open(directory.path().join("workspace.sqlite3"))
-        .await
-        .expect("open sqlite workspace store");
-    harnesses.push(Harness {
-        name: "sqlite",
-        store: Box::new(sqlite),
-        _directory: Some(directory),
-        scratch: None,
-    });
-
-    if let Some(url) = test_url() {
-        let scratch = ScratchDatabase::create(&url).await;
-        // The session store owns schema bootstrap for the whole database,
-        // including the satellite tiers this store reads.
-        let session = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
-            .await
-            .expect("bootstrap postgres schema");
-        let store = PostgresWorkspaceStore::from_pool(session.pool().clone());
-        harnesses.push(Harness {
-            name: "postgres",
-            store: Box::new(store),
-            _directory: None,
-            scratch: Some(scratch),
-        });
-    } else {
+    let Some(url) = test_url() else {
         eprintln!("workspace conformance: skipping postgres, BORG_TEST_SESSIONS_URL is not set");
-    }
-    harnesses
+        return Vec::new();
+    };
+    let scratch = ScratchDatabase::create(&url).await;
+    // The session store owns schema bootstrap for the whole database,
+    // including the satellite tiers this store reads.
+    let session = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+        .await
+        .expect("bootstrap postgres schema");
+    vec![Harness {
+        name: "postgres",
+        store: Box::new(PostgresWorkspaceStore::from_pool(session.pool().clone())),
+        scratch,
+    }]
 }
 
 fn participant(id: Uuid, name: &str) -> Participant {
@@ -1117,14 +1098,14 @@ async fn instance_discovery_tombstones_and_revives_identically() {
     }
 }
 
-/// The same guard as the session conformance suite: a broken Postgres
-/// connection must not turn this file green while testing only SQLite.
+/// Postgres is the only backend, so an unset or broken `BORG_TEST_SESSIONS_URL`
+/// leaves `harnesses()` empty and every test above passes without asserting
+/// anything. This is the guard that makes that vacuum visible instead of green.
 #[tokio::test]
-async fn both_workspace_backends_are_exercised_when_configured() {
+async fn postgres_coverage_follows_its_configuration() {
     let configured = test_url().is_some();
     let harnesses = harnesses().await;
     let names: Vec<&str> = harnesses.iter().map(|harness| harness.name).collect();
-    assert!(names.contains(&"sqlite"));
     assert_eq!(
         names.contains(&"postgres"),
         configured,

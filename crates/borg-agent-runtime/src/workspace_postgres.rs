@@ -1,13 +1,11 @@
 //! `WorkspaceStore` on PostgreSQL.
 //!
-//! The workspace tier is the second-largest writer in the journal file (1.6M
-//! events on this machine), so leaving it on SQLite would keep every Borg
-//! process queueing on that file's single write lock even after the session
-//! journal became contention-free. Here the sequence allocator takes a row lock
-//! on the workspace it is appending to, so two workspaces never contend.
+//! The workspace tier is one of the largest writers in the journal (1.6M
+//! events on this machine). The sequence allocator takes a row lock on the
+//! workspace it is appending to, so two workspaces never contend.
 //!
 //! Canonicalisation and audience resolution are NOT reimplemented here: they
-//! are shared with the SQLite store, because two backends that disagreed on
+//! are shared with the `workspace` module, because a store that disagreed on
 //! either would accept a message twice or deliver it to the wrong people.
 
 use anyhow::{Context, Result, bail, ensure};
@@ -258,8 +256,8 @@ impl PostgresWorkspaceStore {
 
     /// Validate an event against the workspace's current state.
     ///
-    /// Mirrors the SQLite store's checks. Anywhere this drifts, the shared
-    /// workspace conformance tests fail on one backend and not the other.
+    /// The workspace conformance suite asserts these checks; anywhere this
+    /// drifts from the shared rules, that suite fails.
     async fn validate(
         transaction: &mut Transaction<'_, Postgres>,
         event: &WorkspaceEvent,

@@ -13,7 +13,7 @@ use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::receipt::{
-    MAX_SQLITE_RECEIPT_TRANSITIONS, RECEIPT_STATE_STARTED, RECEIPT_STATE_TERMINAL, RECEIPT_VERSION,
+    MAX_RECEIPT_TRANSITIONS, RECEIPT_STATE_STARTED, RECEIPT_STATE_TERMINAL, RECEIPT_VERSION,
     ReceiptRecord, ReceiptState, ReceiptTransition, bounded_json_value, validate_existing_request,
     validate_receipt_projection,
 };
@@ -138,7 +138,7 @@ impl PostgresReceiptStore {
              from receipt_transitions where request_id = $1 order by sequence limit $2",
         )
         .bind(request_id.to_string())
-        .bind(i64::try_from(MAX_SQLITE_RECEIPT_TRANSITIONS + 1)?)
+        .bind(i64::try_from(MAX_RECEIPT_TRANSITIONS + 1)?)
         .fetch_all(&mut **transaction)
         .await?;
         let transitions: Vec<ReceiptTransition> =
@@ -192,7 +192,7 @@ impl PostgresReceiptStore {
              from receipt_transitions where request_id = $1 order by sequence limit $2",
         )
         .bind(request_id.to_string())
-        .bind(i64::try_from(MAX_SQLITE_RECEIPT_TRANSITIONS + 1)?)
+        .bind(i64::try_from(MAX_RECEIPT_TRANSITIONS + 1)?)
         .fetch_all(&mut *transaction)
         .await?;
         let Ok(transitions) = rows
@@ -213,8 +213,8 @@ impl PostgresReceiptStore {
         } else {
             match record.state.as_str() {
                 RECEIPT_STATE_STARTED => ReceiptState::Started,
-                // As in the SQLite backend: hand back the stored body and let
-                // the generic wrapper decide whether it fits the caller's type.
+                // Hand back the stored body and let the generic wrapper decide
+                // whether it fits the caller's type.
                 RECEIPT_STATE_TERMINAL => match record.response {
                     Some(response) => ReceiptState::Terminal(response),
                     None => ReceiptState::Corrupt,

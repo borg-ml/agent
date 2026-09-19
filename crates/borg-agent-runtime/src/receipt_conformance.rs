@@ -1,13 +1,13 @@
-//! Receipt tier: one suite, both backends.
+//! Receipt tier conformance.
 //!
-//! A receipt is the identity of a mutation. If the two backends disagree about
-//! what counts as a replay, a host either repeats a mutation it already made or
-//! refuses a legitimate retry -- so the rules are asserted against both.
+//! A receipt is the identity of a mutation. Get the replay rules wrong and a
+//! host either repeats a mutation it already made or refuses a legitimate
+//! retry, so they are asserted here against the shipped backend.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::receipt::{ReceiptBackend, ReceiptState, SqliteReceiptStore};
+use crate::receipt::{ReceiptBackend, ReceiptState};
 use crate::receipt_postgres::PostgresReceiptStore;
 use crate::session_store::postgres::PostgresSessionStore;
 use crate::session_store::postgres::testing::{ScratchDatabase, test_url};
@@ -31,49 +31,31 @@ struct Response {
 struct Harness {
     name: &'static str,
     store: Box<dyn ReceiptBackend>,
-    _directory: Option<tempfile::TempDir>,
-    scratch: Option<ScratchDatabase>,
+    scratch: ScratchDatabase,
 }
 
 impl Harness {
     async fn discard(self) {
-        if let Some(scratch) = self.scratch {
-            scratch.discard().await;
-        }
+        self.scratch.discard().await;
     }
 }
 
 async fn harnesses() -> Vec<Harness> {
-    let mut harnesses = Vec::new();
-    let directory = tempfile::tempdir().expect("temp dir");
-    let session = crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-        .await
-        .expect("open sqlite session store");
-    let sqlite = SqliteReceiptStore::open(session.pool().clone())
-        .await
-        .expect("open sqlite receipt store");
-    harnesses.push(Harness {
-        name: "sqlite",
-        store: Box::new(sqlite),
-        _directory: Some(directory),
-        scratch: None,
-    });
-
-    if let Some(url) = test_url() {
-        let scratch = ScratchDatabase::create(&url).await;
-        let session = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
-            .await
-            .expect("bootstrap postgres schema");
-        harnesses.push(Harness {
-            name: "postgres",
-            store: Box::new(PostgresReceiptStore::from_pool(session.pool().clone())),
-            _directory: None,
-            scratch: Some(scratch),
-        });
-    } else {
+    let Some(url) = test_url() else {
         eprintln!("receipt conformance: skipping postgres, BORG_TEST_SESSIONS_URL is not set");
-    }
-    harnesses
+        return Vec::new();
+    };
+    let scratch = ScratchDatabase::create(&url).await;
+    // The session store owns schema bootstrap for the whole database,
+    // including the satellite tiers this store reads.
+    let session = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+        .await
+        .expect("bootstrap postgres schema");
+    vec![Harness {
+        name: "postgres",
+        store: Box::new(PostgresReceiptStore::from_pool(session.pool().clone())),
+        scratch,
+    }]
 }
 
 fn request_for(target: &str) -> Request {
@@ -338,12 +320,14 @@ async fn the_host_queue_is_ordered_idempotent_and_quarantinable() {
     }
 }
 
+/// Postgres is the only backend, so an unset or broken `BORG_TEST_SESSIONS_URL`
+/// leaves `harnesses()` empty and every test above passes without asserting
+/// anything. This is the guard that makes that vacuum visible instead of green.
 #[tokio::test]
-async fn both_receipt_backends_are_exercised_when_configured() {
+async fn postgres_coverage_follows_its_configuration() {
     let configured = test_url().is_some();
     let harnesses = harnesses().await;
     let names: Vec<&str> = harnesses.iter().map(|harness| harness.name).collect();
-    assert!(names.contains(&"sqlite"));
     assert_eq!(
         names.contains(&"postgres"),
         configured,

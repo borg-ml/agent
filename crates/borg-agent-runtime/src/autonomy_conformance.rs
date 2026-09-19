@@ -1,9 +1,8 @@
-//! Autonomy tier: one suite, both backends.
+//! Autonomy tier conformance.
 //!
 //! This queue decides whether durable background work runs once, twice, or is
-//! abandoned. Those rules are asserted here against SQLite and PostgreSQL with
-//! identical inputs, because a disagreement means real work is lost or
-//! duplicated rather than merely reported differently.
+//! abandoned. Getting it wrong means real work is lost or duplicated rather
+//! than merely reported differently, so the rules are asserted here.
 
 use std::time::Duration;
 
@@ -12,7 +11,7 @@ use uuid::Uuid;
 
 use crate::autonomy::{
     AutonomyJob, AutonomyJobState, AutonomyLease, AutonomyStore, EnqueueAutonomyJob,
-    SaveAutonomyCheckpoint, SqliteAutonomyStore,
+    SaveAutonomyCheckpoint,
 };
 use crate::autonomy_postgres::PostgresAutonomyStore;
 use crate::session_store::postgres::PostgresSessionStore;
@@ -25,51 +24,31 @@ use crate::session_store::postgres::testing::{ScratchDatabase, test_url};
 struct Harness {
     name: &'static str,
     store: Box<dyn AutonomyStore>,
-    _directory: Option<tempfile::TempDir>,
-    scratch: Option<ScratchDatabase>,
+    scratch: ScratchDatabase,
 }
 
 impl Harness {
     async fn discard(self) {
-        if let Some(scratch) = self.scratch {
-            scratch.discard().await;
-        }
+        self.scratch.discard().await;
     }
 }
 
 async fn harnesses() -> Vec<Harness> {
-    let mut harnesses = Vec::new();
-    let directory = tempfile::tempdir().expect("temp dir");
-    // The autonomy store shares the session journal's pool, exactly as it does
-    // in production: it must never become a second database authority.
-    let session = crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-        .await
-        .expect("open sqlite session store");
-    let sqlite = SqliteAutonomyStore::open(session.pool().clone())
-        .await
-        .expect("open sqlite autonomy store");
-    harnesses.push(Harness {
-        name: "sqlite",
-        store: Box::new(sqlite),
-        _directory: Some(directory),
-        scratch: None,
-    });
-
-    if let Some(url) = test_url() {
-        let scratch = ScratchDatabase::create(&url).await;
-        let session = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
-            .await
-            .expect("bootstrap postgres schema");
-        harnesses.push(Harness {
-            name: "postgres",
-            store: Box::new(PostgresAutonomyStore::from_pool(session.pool().clone())),
-            _directory: None,
-            scratch: Some(scratch),
-        });
-    } else {
+    let Some(url) = test_url() else {
         eprintln!("autonomy conformance: skipping postgres, BORG_TEST_SESSIONS_URL is not set");
-    }
-    harnesses
+        return Vec::new();
+    };
+    let scratch = ScratchDatabase::create(&url).await;
+    // The session store owns schema bootstrap for the whole database,
+    // including the satellite tiers this store reads.
+    let session = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
+        .await
+        .expect("bootstrap postgres schema");
+    vec![Harness {
+        name: "postgres",
+        store: Box::new(PostgresAutonomyStore::from_pool(session.pool().clone())),
+        scratch,
+    }]
 }
 
 fn job(key: &str, max_attempts: u32) -> EnqueueAutonomyJob {
@@ -439,12 +418,14 @@ async fn a_checkpoint_key_is_write_once_per_job() {
     }
 }
 
+/// Postgres is the only backend, so an unset or broken `BORG_TEST_SESSIONS_URL`
+/// leaves `harnesses()` empty and every test above passes without asserting
+/// anything. This is the guard that makes that vacuum visible instead of green.
 #[tokio::test]
-async fn both_autonomy_backends_are_exercised_when_configured() {
+async fn postgres_coverage_follows_its_configuration() {
     let configured = test_url().is_some();
     let harnesses = harnesses().await;
     let names: Vec<&str> = harnesses.iter().map(|harness| harness.name).collect();
-    assert!(names.contains(&"sqlite"));
     assert_eq!(
         names.contains(&"postgres"),
         configured,
