@@ -57,7 +57,10 @@ pinned to those commits and were not re-verifiable at write time**; Borg claims
 were re-verified symbol-by-symbol against the live tree.
 
 Citations are **symbol-based, not line numbers**: `session.rs` was edited by
-another agent during the audit and line numbers shifted twice.
+another agent during the audit and line numbers shifted twice. The re-verification
+pass behind every Borg claim below was run against tree `86ed7db` (2026-09-19);
+`native_harness.rs` and `session.rs` have both moved since `601bcdf`, so re-check
+the symbols if reading this at a later commit.
 
 ## 2. Verified findings
 
@@ -146,9 +149,13 @@ Borg's prompt is specifically hardened against).
 - No end-to-end agent runs: nobody measured whether an agent *resumed correctly*,
   only whether facts survived.
 
-Evidence: fixture, fact list, per-arm prompts, raw outputs, blind mapping (seed
-20260919), judge report, and quarantined runs are in `/tmp/cmpaudit/eval/`.
-The superseded first draft is kept at `superseded_v1_report.md`.
+Evidence: fixture, fact list, per-arm prompts, raw outputs, blind mapping
+(`blind_mapping.json`; shuffle seed 20260919, recorded in the superseded draft,
+not in the mapping file itself), judge report (`blind_scores.md`), and the 7
+quarantined runs are in `/tmp/cmpaudit/eval/`. The superseded first draft is kept
+there as `superseded_v1_report.md`. **That directory is tmpfs and does not
+survive a reboot** — the §4 numbers are not independently re-checkable once it is
+gone, and nothing in it has been copied into the repo.
 
 ## 5. Bottom line
 
