@@ -1244,63 +1244,73 @@ async fn probe_provider(
     managed_kimi: bool,
     mode: ProviderProbeMode,
 ) -> ProviderCapability {
-    let (version, subscription_authenticated) = match mode {
-        ProviderProbeMode::Detailed => {
-            let (version, auth_status) = tokio::join!(
-                async {
-                    command_output(provider.executable(), &["--version"])
+    let (version, subscription_authenticated) = if provider == CodingProvider::Codex {
+        (
+            None,
+            borg_provider::openai_subscription::account()
+                .ok()
+                .flatten()
+                .is_some(),
+        )
+    } else {
+        match mode {
+            ProviderProbeMode::Detailed => {
+                let (version, auth_status) = tokio::join!(
+                    async {
+                        command_output(provider.executable(), &["--version"])
+                            .await
+                            .ok()
+                            .filter(|value| !value.is_empty())
+                    },
+                    async {
+                        match provider {
+                            CodingProvider::Codex
+                            | CodingProvider::Claude
+                            | CodingProvider::OpenCode => provider_auth_status(provider).await.ok(),
+                            CodingProvider::Kimi
+                            | CodingProvider::Glm
+                            | CodingProvider::OpenRouter
+                            | CodingProvider::OpenAiCompatible => None,
+                        }
+                    }
+                );
+                let authenticated = match provider {
+                    CodingProvider::Codex => auth_status
+                        .as_deref()
+                        .is_some_and(codex_auth_status_authenticated),
+                    CodingProvider::Claude => auth_status
+                        .as_deref()
+                        .is_some_and(claude_auth_status_authenticated),
+                    CodingProvider::OpenCode => auth_status
+                        .as_deref()
+                        .is_some_and(opencode_auth_status_authenticated),
+                    CodingProvider::Kimi
+                    | CodingProvider::Glm
+                    | CodingProvider::OpenRouter
+                    | CodingProvider::OpenAiCompatible => false,
+                };
+                (version, authenticated)
+            }
+            ProviderProbeMode::Admission => {
+                let authenticated = if provider == CodingProvider::Codex {
+                    borg_provider::provider::read_codex_subscription_status()
+                        .await
+                        .unwrap_or(false)
+                } else {
+                    provider_subscription_credentials_present(provider)
+                };
+                #[cfg(target_os = "macos")]
+                let authenticated = if provider == CodingProvider::Claude && !authenticated {
+                    provider_auth_status(provider)
                         .await
                         .ok()
-                        .filter(|value| !value.is_empty())
-                },
-                async {
-                    match provider {
-                        CodingProvider::Codex
-                        | CodingProvider::Claude
-                        | CodingProvider::OpenCode => provider_auth_status(provider).await.ok(),
-                        CodingProvider::Kimi
-                        | CodingProvider::Glm
-                        | CodingProvider::OpenRouter
-                        | CodingProvider::OpenAiCompatible => None,
-                    }
-                }
-            );
-            let authenticated = match provider {
-                CodingProvider::Codex => auth_status
-                    .as_deref()
-                    .is_some_and(codex_auth_status_authenticated),
-                CodingProvider::Claude => auth_status
-                    .as_deref()
-                    .is_some_and(claude_auth_status_authenticated),
-                CodingProvider::OpenCode => auth_status
-                    .as_deref()
-                    .is_some_and(opencode_auth_status_authenticated),
-                CodingProvider::Kimi
-                | CodingProvider::Glm
-                | CodingProvider::OpenRouter
-                | CodingProvider::OpenAiCompatible => false,
-            };
-            (version, authenticated)
-        }
-        ProviderProbeMode::Admission => {
-            let authenticated = if provider == CodingProvider::Codex {
-                borg_provider::provider::read_codex_subscription_status()
-                    .await
-                    .unwrap_or(false)
-            } else {
-                provider_subscription_credentials_present(provider)
-            };
-            #[cfg(target_os = "macos")]
-            let authenticated = if provider == CodingProvider::Claude && !authenticated {
-                provider_auth_status(provider)
-                    .await
-                    .ok()
-                    .as_deref()
-                    .is_some_and(claude_auth_status_authenticated)
-            } else {
-                authenticated
-            };
-            (None, authenticated)
+                        .as_deref()
+                        .is_some_and(claude_auth_status_authenticated)
+                } else {
+                    authenticated
+                };
+                (None, authenticated)
+            }
         }
     };
     let mut auth_methods = Vec::new();
@@ -1313,7 +1323,7 @@ async fn probe_provider(
         CodingProvider::Codex => {
             if subscription_authenticated {
                 auth_methods.push(ProviderAuthMethod::Subscription);
-                detail.push("Codex subscription authenticated");
+                detail.push("Native ChatGPT subscription authenticated");
             }
             let api_key = borg_provider::credentials::openai_api_key().is_some();
             if api_key {
@@ -1432,16 +1442,25 @@ async fn probe_provider(
             }
         }
     };
-    let authenticated = !auth_methods.is_empty();
+    let authenticated = if provider == CodingProvider::Codex {
+        match billing {
+            Some(BillingLane::Subscription) => subscription_authenticated,
+            Some(BillingLane::ApiKey) => auth_methods.contains(&ProviderAuthMethod::ApiKey),
+            _ => false,
+        }
+    } else {
+        !auth_methods.is_empty()
+    };
     let installed = match provider {
         // These routes execute in Borg's native harness; they do not depend
         // on a separately installed `borg` executable being discoverable in a
         // service user's PATH.
-        CodingProvider::Kimi
+        CodingProvider::Codex
+        | CodingProvider::Kimi
         | CodingProvider::Glm
         | CodingProvider::OpenRouter
         | CodingProvider::OpenAiCompatible => true,
-        CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => match mode {
+        CodingProvider::Claude | CodingProvider::OpenCode => match mode {
             ProviderProbeMode::Admission => {
                 executable_in_path(Path::new(provider.executable())).is_some()
             }
@@ -6205,6 +6224,16 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
+
+    #[tokio::test]
+    async fn native_codex_admission_does_not_require_an_executable() {
+        for mode in [ProviderProbeMode::Admission, ProviderProbeMode::Detailed] {
+            let capability = probe_provider(CodingProvider::Codex, false, mode).await;
+            assert!(capability.installed);
+            assert!(capability.version.is_none());
+            assert_eq!(capability.can_spawn, capability.authenticated);
+        }
+    }
 
     #[test]
     fn native_provider_login_commands_use_non_terminal_flows() {

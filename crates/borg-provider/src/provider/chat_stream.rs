@@ -714,23 +714,13 @@ pub struct ClaudeAccountRateLimits {
     pub last_known_at: Option<DateTime<Utc>>,
 }
 
-/// Read the authenticated Codex account limits through the same app-server
-/// protocol used for subscription turns. The command layer decides how to
-/// present an unavailable account view for other providers.
+/// Read native ChatGPT subscription usage without starting a provider process.
 pub async fn read_codex_account_rate_limits() -> Result<CodexAccountRateLimits> {
-    #[cfg(not(feature = "codex"))]
-    {
-        bail!("Codex account limits require the Codex subscription adapter")
-    }
-    #[cfg(feature = "codex")]
-    {
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            read_codex_account_rate_limits_inner(),
-        )
-        .await
-        .context("timed out reading Codex account limits")?
-    }
+    let response =
+        tokio::time::timeout(Duration::from_secs(10), crate::openai_subscription::usage())
+            .await
+            .context("timed out reading ChatGPT account limits")??;
+    parse_codex_account_rate_limits(&response)
 }
 
 /// Read Claude's structured `/usage` data through the native CLI control
@@ -979,105 +969,23 @@ fn parse_claude_account_rate_limits(value: &Value) -> Result<ClaudeAccountRateLi
     })
 }
 
-#[cfg(feature = "codex")]
-async fn read_codex_account_rate_limits_inner() -> Result<CodexAccountRateLimits> {
-    let response = codex_account_request("account/rateLimits/read", serde_json::json!({})).await?;
-    let mut limits = parse_codex_account_rate_limits(&response)?;
-    if limits
-        .plan_type
-        .as_deref()
-        .is_none_or(|plan| plan.trim().is_empty())
-        && let Ok(Ok(account)) = tokio::time::timeout(
-            Duration::from_secs(2),
-            codex_account_request("account/read", serde_json::json!({"refreshToken": false})),
-        )
-        .await
-        && account
-            .pointer("/result/account/type")
-            .and_then(Value::as_str)
-            == Some("chatgpt")
-    {
-        limits.plan_type = account
-            .pointer("/result/account/planType")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|plan| !plan.is_empty())
-            .map(str::to_owned);
-    }
-    Ok(limits)
-}
-
 /// Read the explicitly selected native subscription authority without refreshing tokens.
 pub async fn read_codex_subscription_status() -> Result<bool> {
     Ok(crate::openai_subscription::account()?.is_some())
 }
 
-pub(super) async fn codex_account_request(method: &str, params: Value) -> Result<Value> {
-    let mut command = crate::provider_bin::codex_command().await?;
-    command
-        .args(["app-server", "--stdio"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .context("failed to start Codex app server for account limits")?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("Codex app server stdin pipe missing")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("Codex app server stdout pipe missing")?;
-    let mut lines = BufReader::new(stdout).lines();
-    let result = async {
-        write_codex_request(
-            &mut stdin,
-            1,
-            "initialize",
-            serde_json::json!({
-                "clientInfo": {
-                    "name": "borg",
-                    "title": "Borg",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "capabilities": {
-                    "experimentalApi": true,
-                    "optOutNotificationMethods": []
-                }
-            }),
-        )
-        .await
-        .context("failed to initialize Codex app server for account limits")?;
-        read_codex_response(&mut lines, 1).await?;
-        write_codex_notification(&mut stdin, "initialized", Value::Object(Default::default()))
-            .await?;
-        write_codex_request(&mut stdin, 2, method, params).await?;
-        read_codex_response(&mut lines, 2).await
-    }
-    .await;
-    drop(lines);
-    drop(stdin);
-    child.start_kill().ok();
-    let _ = tokio::time::timeout(Duration::from_secs(1), child.wait()).await;
-    result
-}
-
 fn parse_codex_account_rate_limits(response: &Value) -> Result<CodexAccountRateLimits> {
     let limits = response
-        .pointer("/result/rateLimits")
-        .or_else(|| response.get("rateLimits"))
-        .context("Codex account response did not contain rate limits")?;
+        .get("rate_limit")
+        .filter(|limits| limits.is_object())
+        .context("ChatGPT usage response omitted rate limits")?;
     Ok(CodexAccountRateLimits {
-        plan_type: limits
-            .get("planType")
-            .or_else(|| limits.get("plan_type"))
+        plan_type: response
+            .get("plan_type")
             .and_then(Value::as_str)
-            .map(str::to_string),
-        primary: parse_codex_rate_limit_window(limits.get("primary"))?,
-        secondary: parse_codex_rate_limit_window(limits.get("secondary"))?,
+            .map(str::to_owned),
+        primary: parse_codex_rate_limit_window(limits.get("primary_window"))?,
+        secondary: parse_codex_rate_limit_window(limits.get("secondary_window"))?,
     })
 }
 
@@ -1086,28 +994,18 @@ fn parse_codex_rate_limit_window(value: Option<&Value>) -> Result<Option<CodexRa
         return Ok(None);
     };
     let used_percent = value
-        .get("usedPercent")
-        .or_else(|| value.get("used_percent"))
+        .get("used_percent")
         .and_then(Value::as_u64)
-        .context("Codex account response omitted rate-limit usage")?
+        .context("ChatGPT usage response omitted rate-limit usage")?
         .min(100) as u8;
-    let window_duration_mins = value
-        .get("windowDurationMins")
-        .or_else(|| value.get("window_duration_mins"))
+    let seconds = value
+        .get("limit_window_seconds")
         .and_then(Value::as_u64)
-        .context("Codex account response omitted rate-limit window")?;
-    let resets_at = value
-        .get("resetsAt")
-        .or_else(|| value.get("resets_at"))
-        .and_then(|value| {
-            value
-                .as_i64()
-                .or_else(|| value.as_u64().map(|value| value as i64))
-        });
+        .context("ChatGPT usage response omitted rate-limit window")?;
     Ok(Some(CodexRateLimitWindow {
         used_percent,
-        window_duration_mins,
-        resets_at,
+        window_duration_mins: seconds.div_ceil(60),
+        resets_at: value.get("reset_at").and_then(Value::as_i64),
     }))
 }
 
@@ -4564,18 +4462,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn codex_account_rate_limits_parse_app_server_shape() {
+    fn codex_account_rate_limits_parse_native_usage_shape() {
         let parsed = parse_codex_account_rate_limits(&serde_json::json!({
-            "result": {
-                "rateLimits": {
-                    "planType": "pro",
-                    "primary": {
-                        "usedPercent": 49,
-                        "windowDurationMins": 10080,
-                        "resetsAt": 1788137121
-                    },
-                    "secondary": null
-                }
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 49,
+                    "limit_window_seconds": 604800,
+                    "reset_at": 1788137121
+                },
+                "secondary_window": null
             }
         }))
         .expect("Codex account limits");

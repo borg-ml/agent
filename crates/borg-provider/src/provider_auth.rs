@@ -357,33 +357,37 @@ async fn validate_claude_home(home_dir: &Path) -> Result<ProviderAuthValidation>
 }
 
 async fn validate_openai_home(home_dir: &Path) -> Result<ProviderAuthValidation> {
-    let codex_home = ensure_codex_home(home_dir)?;
-    let mut cmd = crate::provider_bin::codex_command().await?;
-    cmd.args(["login", "status"])
-        .env("HOME", home_dir)
-        .env("CODEX_HOME", &codex_home)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output = run_provider_auth_status_command(&mut cmd, "codex login status").await?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let ok = output.status.success() && openai_status_is_logged_in(&stdout, &stderr);
     let auth_json = read_openai_auth_json(home_dir)?;
+    let validation = match auth_json.as_ref() {
+        Some(auth)
+            if matches!(
+                auth["auth_mode"].as_str(),
+                Some("chatgpt" | "chatgptAuthTokens")
+            ) || auth_json_holds_chatgpt_session(auth) =>
+        {
+            crate::openai_subscription::account_from_document(auth).map(|_| ())
+        }
+        Some(auth)
+            if auth["OPENAI_API_KEY"]
+                .as_str()
+                .is_some_and(|key| !key.trim().is_empty()) =>
+        {
+            Ok(())
+        }
+        _ => Err(anyhow!("No saved OpenAI credentials")),
+    };
     let (account_email, account_label, expires_at) =
         openai_identity_from_auth_json(auth_json.as_ref());
     Ok(ProviderAuthValidation {
-        ok,
+        ok: validation.is_ok(),
         auth_kind: auth_kind_for_provider(ProviderAuthProvider::Openai, auth_json.as_ref()),
         account_email,
         account_label,
         expires_at,
-        last_error: if ok {
-            String::new()
-        } else if !stderr.is_empty() {
-            stderr
-        } else {
-            stdout
-        },
+        last_error: validation
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default(),
     })
 }
 
@@ -437,11 +441,6 @@ fn provider_auth_validation_timeout() -> Result<Duration> {
             "invalid {PROVIDER_AUTH_VALIDATION_TIMEOUT_ENV}: {error}"
         )),
     }
-}
-
-fn openai_status_is_logged_in(stdout: &str, stderr: &str) -> bool {
-    let status_text = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-    status_text.contains("logged in")
 }
 
 pub fn should_revalidate(
@@ -679,9 +678,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn openai_status_accepts_logged_in_message_on_stderr() {
-        assert!(openai_status_is_logged_in("", "Logged in using ChatGPT"));
+    #[tokio::test]
+    async fn openai_validation_checks_credentials_without_a_provider_executable() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!validate_openai_home(home.path()).await.unwrap().ok);
+        let directory = ensure_codex_home(home.path()).unwrap();
+        std::fs::write(
+            directory.join("auth.json"),
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":"test-key"}"#,
+        )
+        .unwrap();
+        assert!(validate_openai_home(home.path()).await.unwrap().ok);
+        for tokens in [
+            serde_json::json!(null),
+            serde_json::json!({"access_token": "invalid-token"}),
+        ] {
+            let document = serde_json::json!({"auth_mode": "chatgpt", "OPENAI_API_KEY": "test-key", "tokens": tokens});
+            std::fs::write(directory.join("auth.json"), document.to_string()).unwrap();
+            assert!(!validate_openai_home(home.path()).await.unwrap().ok);
+        }
     }
 
     #[cfg(unix)]

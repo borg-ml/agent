@@ -193,7 +193,7 @@ async fn credential_lock(path: &Path) -> Result<fs::File> {
     .context("ChatGPT credential lock task failed")?
 }
 
-fn account_from_document(document: &Value) -> Result<SubscriptionAccount> {
+pub(crate) fn account_from_document(document: &Value) -> Result<SubscriptionAccount> {
     ensure!(
         document["auth_mode"] != "apikey",
         "saved credentials use API billing, not ChatGPT"
@@ -296,6 +296,39 @@ async fn response_json(response: reqwest::Response) -> Result<Value> {
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).context("invalid ChatGPT authentication response")
+}
+
+/// Account usage metadata is subscription-only and never starts a model turn.
+pub async fn usage() -> Result<Value> {
+    let mut credentials = access(None).await?;
+    let account_id = credentials.account_id.clone();
+    let client = client()?;
+    for attempt in 0..2 {
+        let response = client
+            .get("https://chatgpt.com/backend-api/wham/usage")
+            .bearer_auth(&credentials.token)
+            .header("ChatGPT-Account-Id", &credentials.account_id)
+            .header("originator", "borg")
+            .send()
+            .await
+            .context("ChatGPT usage connection failed")?;
+        if attempt == 0 && response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            drop(response);
+            credentials = access(Some(credentials.token)).await?;
+            ensure!(
+                credentials.account_id == account_id,
+                "ChatGPT account changed during usage recovery; retry for the selected account"
+            );
+            continue;
+        }
+        ensure!(
+            response.status().is_success(),
+            "ChatGPT usage unavailable (HTTP {})",
+            response.status()
+        );
+        return response_json(response).await;
+    }
+    unreachable!("the second usage attempt always returns")
 }
 
 /// Device approval details are displayed only by the login UI, never journaled as credentials.

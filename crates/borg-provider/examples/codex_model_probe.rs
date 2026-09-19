@@ -26,6 +26,11 @@ async fn probe() -> Result<()> {
         "ChatGPT plan: {}",
         subscription.plan.as_deref().unwrap_or("unknown")
     );
+    if std::env::args().any(|arg| arg == "--usage-only") {
+        let usage = borg_provider::provider::read_codex_account_rate_limits().await?;
+        println!("Native usage: {usage:?}");
+        return Ok(());
+    }
     let fast = std::env::args().any(|arg| arg == "--fast");
     let account = CodexModelProvider::account_identity().await?;
     let provider = CodexModelProvider {
