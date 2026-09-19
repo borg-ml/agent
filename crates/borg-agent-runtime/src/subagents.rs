@@ -1515,6 +1515,23 @@ impl AgentToolDispatcher {
                     .watches
                     .as_ref()
                     .context("watchers are unavailable for this session")?;
+                // Yielding is only meaningful against an active goal; without one
+                // nothing would resume the session on its own.
+                let goal = self
+                    .goals
+                    .call(SessionGoalToolRequest::Get)
+                    .await
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                if !goal
+                    .goal
+                    .as_ref()
+                    .is_some_and(|goal| goal.status == crate::GoalStatus::Active)
+                {
+                    return Ok(json!({
+                        "status": "not_waiting",
+                        "detail": "There is no active goal, so nothing would resume you. Finish the work in front of you.",
+                    }));
+                }
                 // A watcher that finished or was pruned between the decision and
                 // this call is not an error: report it so the model keeps working
                 // instead of stranding on something that will never fire again.

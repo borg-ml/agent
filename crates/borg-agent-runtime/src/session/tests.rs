@@ -14807,3 +14807,485 @@ async fn a_completed_queued_team_turn_acknowledges_its_delivery() {
         crate::DeliveryState::Acknowledged
     );
 }
+
+/// The first turn starts a silent watcher and yields on it through the real
+/// tool dispatcher. After that the session must stop calling the model even
+/// though the goal is still active -- that is the whole point of the yield, and
+/// a watch-level test cannot show it. A real prompt must then resume it.
+struct YieldingExecutor {
+    calls: Arc<AtomicUsize>,
+    watch_id: Arc<Mutex<Option<Uuid>>>,
+    yielded: Arc<Notify>,
+    /// Stop the watcher right after yielding on it. A stopped watcher is
+    /// cancelled, so it never flushes a final event: the only thing that can
+    /// end the wait is the liveness re-check.
+    stop_after_yield: bool,
+    /// The watched command, so a test can arrange output to arrive later.
+    command: &'static str,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for YieldingExecutor {
+    async fn execute(
+        &self,
+        turn: AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            turn.agent_tools
+                .call(
+                    "create_goal",
+                    json!({"objective": "finish the sweep", "token_budget": null}),
+                )
+                .await
+                .expect("the goal is created");
+            // A watcher that prints nothing: the only way out is the explicit
+            // resume, never a stray line of output.
+            let started = turn
+                .agent_tools
+                .call(
+                    "watch",
+                    json!({"command": self.command, "label": "Sweep", "workdir": null}),
+                )
+                .await
+                .expect("the watcher starts");
+            let watch_id: Uuid =
+                serde_json::from_value(started["watch_id"].clone()).expect("a watch id");
+            *self.watch_id.lock().unwrap() = Some(watch_id);
+            let waited = turn
+                .agent_tools
+                .call(
+                    "await_watchers",
+                    json!({"watch_ids": [watch_id], "reason": "every remaining step needs the sweep"}),
+                )
+                .await
+                .expect("the yield is accepted");
+            assert_eq!(waited["status"], "waiting", "{waited}");
+            if self.stop_after_yield {
+                let tools = turn.agent_tools.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    let _ = tools
+                        .call("stop_watcher", json!({"watch_id": watch_id}))
+                        .await;
+                });
+            }
+        }
+        events
+            .send(SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: "waiting on the sweep".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            })
+            .await
+            .unwrap();
+        self.yielded.notify_one();
+        Ok(AgentTurnResult {
+            provider_session_id: None,
+            final_text: "waiting on the sweep".to_string(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_explicit_watcher_yield_stops_automatic_goal_turns_until_real_input() {
+    let root = tempdir().unwrap();
+    let root_path = root.path().to_path_buf();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let yielded = Arc::new(Notify::new());
+    let executor = Arc::new(YieldingExecutor {
+        calls: Arc::clone(&calls),
+        watch_id: Arc::new(Mutex::new(None)),
+        yielded: Arc::clone(&yielded),
+        stop_after_yield: false,
+        command: "sleep 30",
+    });
+    let actor = tokio::spawn({
+        let journal_path = root_path.join("session.lock");
+        let cwd = root_path.clone();
+        let executor = Arc::clone(&executor);
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                    name: None,
+                    initial_prompt: Some("run the sweep".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(20), yielded.notified())
+        .await
+        .expect("the first turn yields");
+
+    // The goal is active and unbudgeted, so without the yield the session would
+    // immediately issue continuation turns. It must stay quiet instead.
+    let mut journalled_yield = false;
+    let quiet = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(event) = event_rx.recv().await {
+            if let SessionEventKind::ProviderEvent { kind, .. } = &event.kind
+                && kind == "goal_yielded"
+            {
+                journalled_yield = true;
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "the session ended instead of waiting");
+    assert!(journalled_yield, "the wait is journalled, never silent");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a held yield must not spend any further model turns"
+    );
+
+    // Real input resumes it.
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "status?".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), yielded.notified())
+        .await
+        .expect("real input resumes the session");
+    assert!(calls.load(Ordering::SeqCst) >= 2, "the prompt ran a turn");
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
+}
+
+/// Stopping a watcher cancels it, so it never flushes a final event. Nothing
+/// will ever arrive to resume the goal, and the session is parked in the idle
+/// select where the outer loop's liveness check never runs. Without the
+/// re-check inside the WatchesChanged arm this strands the goal forever.
+#[tokio::test]
+async fn a_stopped_silent_watcher_ends_the_yield_instead_of_stranding_the_goal() {
+    let root = tempdir().unwrap();
+    let root_path = root.path().to_path_buf();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let yielded = Arc::new(Notify::new());
+    let executor = Arc::new(YieldingExecutor {
+        calls: Arc::clone(&calls),
+        watch_id: Arc::new(Mutex::new(None)),
+        yielded: Arc::clone(&yielded),
+        stop_after_yield: true,
+        command: "sleep 30",
+    });
+    let actor = tokio::spawn({
+        let journal_path = root_path.join("session.lock");
+        let cwd = root_path.clone();
+        let executor = Arc::clone(&executor);
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                    name: None,
+                    initial_prompt: Some("run the sweep".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        }
+    });
+
+    // First turn yields, then the watcher is stopped out from under it.
+    tokio::time::timeout(Duration::from_secs(20), yielded.notified())
+        .await
+        .expect("the first turn yields");
+    // No prompt, no watcher output: only the liveness re-check can resume this.
+    tokio::time::timeout(Duration::from_secs(20), yielded.notified())
+        .await
+        .expect("a stopped watcher must release the goal, not strand it");
+    assert!(calls.load(Ordering::SeqCst) >= 2);
+
+    let mut resumed_cause = None;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(Duration::from_millis(200), event_rx.recv()).await
+    {
+        if let SessionEventKind::ProviderEvent { kind, payload, .. } = &event.kind
+            && kind == "goal_resumed"
+        {
+            resumed_cause = payload["cause"].as_str().map(str::to_string);
+            break;
+        }
+    }
+    // Either cause is correct and both prove the goal was released rather than
+    // stranded: the stop announcement can reach the session before the watcher
+    // task has finished marking itself not-running, in which case the ordinary
+    // queued-event path clears the wait first. What must never happen is no
+    // resume at all, which is what the timeout above pins.
+    assert!(
+        matches!(
+            resumed_cause.as_deref(),
+            Some("watchers_finished") | Some("input")
+        ),
+        "unexpected resume cause {resumed_cause:?}"
+    );
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
+}
+
+/// Interrupting a session that is parked on a yield is a stop, and a stop has
+/// to hold. Before this, the idle command match only honoured an interrupt when
+/// a retry was pending; anything else fell to `Some(_) => continue`, so the
+/// human's interrupt was swallowed and `user_stop` was never set. A yield parks
+/// the session indefinitely, which turns that narrow window into a real one:
+/// watcher output would then start a model turn the human had just stopped.
+#[tokio::test]
+async fn an_interrupt_while_yielded_holds_watcher_output_until_a_human_returns() {
+    let root = tempdir().unwrap();
+    let root_path = root.path().to_path_buf();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let yielded = Arc::new(Notify::new());
+    let executor = Arc::new(YieldingExecutor {
+        calls: Arc::clone(&calls),
+        watch_id: Arc::new(Mutex::new(None)),
+        yielded: Arc::clone(&yielded),
+        stop_after_yield: false,
+        // Output lands well after the interrupt, so it is the stop that is
+        // under test and not a race with the first flush.
+        command: "sleep 2; printf 'progress\\n'; sleep 30",
+    });
+    let actor = tokio::spawn({
+        let journal_path = root_path.join("session.lock");
+        let cwd = root_path.clone();
+        let executor = Arc::clone(&executor);
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                    name: None,
+                    initial_prompt: Some("run the sweep".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(20), yielded.notified())
+        .await
+        .expect("the first turn yields");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // Let the session actually park in the idle select first. An interrupt
+    // delivered any earlier is drained by collect_input_at_turn_boundary and
+    // would never reach the idle path this test is about.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    command_tx
+        .send(HostCommand::Interrupt { session_id })
+        .await
+        .unwrap();
+
+    // The watcher then produces real output. It must be held, not run.
+    let mut saw_stop = false;
+    let quiet = tokio::time::timeout(Duration::from_secs(6), async {
+        while let Some(event) = event_rx.recv().await {
+            if let SessionEventKind::UserStopChanged { engaged, .. } = &event.kind
+                && *engaged
+            {
+                saw_stop = true;
+            }
+        }
+    })
+    .await;
+    assert!(quiet.is_err(), "the session ended instead of holding");
+    assert!(saw_stop, "the interrupt must record a user stop");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "watcher output must not run a model turn after a human interrupt"
+    );
+
+    // Only the human restarts the work.
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "carry on".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), yielded.notified())
+        .await
+        .expect("the human resumes the session");
+    assert!(calls.load(Ordering::SeqCst) >= 2);
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
+}
+
+/// A watcher that finishes on its own while the session is parked on a yield.
+/// The liveness re-check in the `WatchesChanged` arm has to hand control back
+/// to the outer loop; leaving the idle select with `None` is the session's
+/// shutdown signal, so getting this wrong silently ends the session and drops
+/// the watcher's final output instead of resuming the goal.
+///
+/// This is the completion branch rather than the stop branch on purpose.
+/// Stopping a watcher kills a live process, and that teardown is slow enough
+/// that the session almost always consumes the stop announcement before the
+/// watcher is marked not-running. A natural exit has no process left to reap,
+/// so `running = false` lands first and the re-check is what actually runs.
+/// Multi-threaded for the same reason: a current-thread runtime serialises the
+/// two tasks and hides the ordering this test is about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watcher_that_finishes_while_yielded_resumes_the_goal_without_ending_the_session() {
+    let root = tempdir().unwrap();
+    let root_path = root.path().to_path_buf();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, _event_rx) = mpsc::channel(256);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let yielded = Arc::new(Notify::new());
+    let executor = Arc::new(YieldingExecutor {
+        calls: Arc::clone(&calls),
+        watch_id: Arc::new(Mutex::new(None)),
+        yielded: Arc::clone(&yielded),
+        stop_after_yield: false,
+        // Runs long enough to be a legal thing to wait on, then exits by
+        // itself while the session is parked in the idle select.
+        command: "sleep 2",
+    });
+    let mut actor = tokio::spawn({
+        let journal_path = root_path.join("session.lock");
+        let cwd = root_path.clone();
+        let executor = Arc::clone(&executor);
+        async move {
+            run_agent_session_with_executor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::FullAccess,
+                    name: None,
+                    initial_prompt: Some("run the sweep".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+            )
+            .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(20), yielded.notified())
+        .await
+        .expect("the first turn yields");
+
+    // Nothing else is sent: the watcher exiting is the only thing that can
+    // move this session, and it must resume the goal rather than end it.
+    tokio::select! {
+        resumed = tokio::time::timeout(Duration::from_secs(20), yielded.notified()) => {
+            resumed.expect("a finished watcher must resume the goal");
+        }
+        actor_result = &mut actor => {
+            panic!("the session exited instead of resuming the goal: {actor_result:?}");
+        }
+    }
+    assert!(calls.load(Ordering::SeqCst) >= 2, "the goal kept working");
+    assert!(
+        !actor.is_finished(),
+        "the session must still be running after the watcher finished"
+    );
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
+}
