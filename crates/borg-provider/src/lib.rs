@@ -2,6 +2,7 @@ pub mod codex_install;
 pub mod credentials;
 pub mod local;
 pub mod mcp;
+pub mod openai_subscription;
 pub mod provider;
 pub mod provider_auth;
 pub mod provider_bin;

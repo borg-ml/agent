@@ -151,6 +151,26 @@ pub fn set_openai_auth_mode(mode: OpenAiAuthMode) -> Result<PathBuf> {
     )
 }
 
+pub fn openai_subscription_auth_file() -> Result<Option<PathBuf>> {
+    if let Some(path) = crate::env::nonempty_var("BORG_OPENAI_AUTH_FILE") {
+        return Ok(Some(PathBuf::from(path)));
+    }
+    let Some(path) = credentials_path() else {
+        return Ok(None);
+    };
+    Ok(read_credentials(&path)?
+        .keys
+        .get("openai_subscription_auth_file")
+        .map(PathBuf::from))
+}
+
+pub fn set_openai_subscription_auth_file(path: &Path) -> Result<PathBuf> {
+    store_value(
+        "openai_subscription_auth_file",
+        path.to_str().context("ChatGPT auth path must be UTF-8")?,
+    )
+}
+
 pub fn codex_auth_json() -> Option<serde_json::Value> {
     let directory = crate::env::nonempty_var("CODEX_HOME")
         .map(PathBuf::from)
