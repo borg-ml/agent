@@ -31,7 +31,6 @@ mod profiling;
 pub mod provider_usage;
 pub mod receipt;
 mod runtime_protocol;
-mod schema_migration;
 mod secret_scrub;
 mod self_service;
 pub mod session;
@@ -65,8 +64,7 @@ pub use agent::{
 };
 pub use autonomy::{
     AutonomyCheckpoint, AutonomyJob, AutonomyJobHandler, AutonomyJobState, AutonomyJobTransition,
-    AutonomyLease, EnqueueAutonomyJob, SaveAutonomyCheckpoint, SqliteAutonomyStore,
-    SqliteAutonomySupervisor,
+    AutonomyLease, AutonomySupervisor, EnqueueAutonomyJob, SaveAutonomyCheckpoint,
 };
 pub use blu_workflow::{BluWorkflowRequest, BluWorkflowResult};
 pub use contract::*;
@@ -105,10 +103,8 @@ pub use runtime_protocol::{
 };
 pub use session::run_agent_session_with_store_and_writer_and_lsp_policy;
 pub use session::{
-    SessionConsultationTools, SessionGoalTools, SessionTodoTools, run_agent_session,
-    run_agent_session_with_executor, run_agent_session_with_executor_and_writer,
+    SessionConsultationTools, SessionGoalTools, SessionTodoTools,
     run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
-    run_agent_session_with_writer,
 };
 pub use session_action::{
     ActionDeliveryPolicy, ActionWakePolicy, SessionAction, SessionActionKind, SessionActionState,
@@ -121,7 +117,7 @@ pub use session_store::{
     SessionConfiguration, SessionHistoryHit, SessionHistoryIndexDocument, SessionHistoryPage,
     SessionHistoryPayload, SessionHistoryQuery, SessionHistorySearchMode, SessionLiveEvent,
     SessionRecovery, SessionState, SessionStore, SessionStoreCompaction, SessionStoreFork,
-    SessionStoreHealth, SessionSummary, SessionUsage, SessionWorkspaceBinding, SqliteSessionStore,
+    SessionStoreHealth, SessionSummary, SessionUsage, SessionWorkspaceBinding,
 };
 pub use subagents::{
     AgentToolDispatcher, AgentToolServer, DEFAULT_MAX_SUBAGENTS, SpawnSubagent, SubagentActivity,
@@ -141,12 +137,12 @@ pub use tool_presentation::{
 pub use workspace::{
     AgentInstance, AtomicWorkClaim, Audience, DeliveryAttempt, DeliveryCursor, DeliveryMode,
     DeliveryState, HostAttachment, HostIdentity, NewWorkspaceMessage, Participant, ParticipantKind,
-    PresenceLease, Provenance, RecipientDelivery, SharedWork, SqliteWorkspaceStore,
-    StructuredMention, Thread, WorkDependency, WorkReview, Workspace, WorkspaceArtifact,
-    WorkspaceDecision, WorkspaceEvent, WorkspaceEventKind, WorkspaceHost,
-    WorkspaceHostCapabilities, WorkspaceMembership, WorkspaceMessage, WorkspaceMessageBody,
-    WorkspaceMessageReceipt, WorkspaceReference, WorkspaceReviewRequest, WorkspaceRole,
-    WorkspaceRosterEntry, WorkspaceStore, local_human_participant_id,
+    PresenceLease, Provenance, RecipientDelivery, SharedWork, StructuredMention, Thread,
+    WorkDependency, WorkReview, Workspace, WorkspaceArtifact, WorkspaceDecision, WorkspaceEvent,
+    WorkspaceEventKind, WorkspaceHost, WorkspaceHostCapabilities, WorkspaceMembership,
+    WorkspaceMessage, WorkspaceMessageBody, WorkspaceMessageReceipt, WorkspaceReference,
+    WorkspaceReviewRequest, WorkspaceRole, WorkspaceRosterEntry, WorkspaceStore,
+    local_human_participant_id,
 };
 pub use workspace_snapshot::{
     DEFAULT_MAX_SNAPSHOT_BYTES, DEFAULT_MAX_SNAPSHOT_FILES, MAX_SNAPSHOT_FILE_BYTES,

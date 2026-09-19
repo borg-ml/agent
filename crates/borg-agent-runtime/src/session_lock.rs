@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 
 /// Exclusive ownership of a session actor.
 ///
-/// Session state itself lives in SQLite. This file is only the process-level
+/// Session state itself lives in Postgres. This file is only the process-level
 /// ownership boundary that prevents two actors from driving the same session
 /// concurrently.
 #[derive(Debug)]

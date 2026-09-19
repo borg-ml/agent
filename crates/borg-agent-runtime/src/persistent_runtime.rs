@@ -1591,9 +1591,7 @@ mod tests {
             }
         }
         let root = tempdir().unwrap();
-        let store = crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let session_id = Uuid::new_v4();
         store.create_session(session_id).await.unwrap();
         let runtime = Arc::new(PersistentRuntimeWorker::for_python(
@@ -1693,6 +1691,7 @@ mod tests {
             "cancelled predecessor cannot overwrite the successor's durable result"
         );
         runtime.stop().await;
+        scratch.discard().await;
     }
 
     #[tokio::test]

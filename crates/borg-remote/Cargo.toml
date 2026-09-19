@@ -36,3 +36,6 @@ tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+borg-agent-runtime = { path = "../borg-agent-runtime", default-features = false, features = ["test-support"] }

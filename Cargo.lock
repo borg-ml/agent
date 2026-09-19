@@ -1000,6 +1000,7 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "base64 0.23.1",
+ "borg-agent-runtime",
  "borg-dictation",
  "borg-provider",
  "borg-remote",

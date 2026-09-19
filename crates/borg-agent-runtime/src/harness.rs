@@ -702,9 +702,7 @@ mod tests {
     #[tokio::test]
     async fn crud_is_persisted_and_injected_into_the_next_turn() {
         let directory = tempdir().unwrap();
-        let store = crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let session_id = Uuid::new_v4();
         store.create_session(session_id).await.unwrap();
         let lock = Arc::new(Mutex::new(()));
@@ -776,5 +774,6 @@ mod tests {
         .unwrap();
         assert_eq!(overview["counts"]["memory"], 1);
         assert_eq!(overview["scopes"]["local"]["refinements"], 1);
+        scratch.discard().await;
     }
 }

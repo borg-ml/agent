@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::SqliteRow;
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::postgres::PgRow;
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 /// Stable identifier for a provider adapter, not a provider-specific enum.
@@ -983,7 +983,7 @@ impl TeamPolicyRuntime {
 
 /// Upper bound for the number of policy events retained by one runtime.
 pub const MAX_TEAM_POLICY_EVENTS: usize = 10_000;
-/// Upper bound for one page returned by [`SqliteTeamPolicyStore::events_after`].
+/// Upper bound for one page returned by [`PostgresTeamPolicyStore::events_after`].
 pub const MAX_TEAM_POLICY_PAGE_SIZE: usize = 256;
 /// Upper bound for a serialized policy.
 pub const MAX_TEAM_POLICY_BYTES: usize = 1024 * 1024;
@@ -1002,32 +1002,24 @@ pub struct TeamPolicyEventRecord {
     pub event: TeamEvent,
 }
 
-/// SQLite persistence for provider-neutral team policy runtimes.
+/// Postgres persistence for provider-neutral team policy runtimes.
 ///
 /// The caller owns the pool and its lifetime. This store owns only the two
 /// `team_*` tables it creates and never starts provider processes or sessions.
 #[derive(Clone)]
-pub struct SqliteTeamPolicyStore {
-    pool: SqlitePool,
+pub struct PostgresTeamPolicyStore {
+    pool: PgPool,
 }
 
-impl SqliteTeamPolicyStore {
-    /// Construct a store around a caller-supplied SQLite pool.
-    ///
-    /// Schema creation is lazy so this constructor remains synchronous; every
-    /// public async operation ensures the schema before accessing it.
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
-    }
-
+impl PostgresTeamPolicyStore {
     /// Construct and eagerly create the store tables.
-    pub async fn open(pool: SqlitePool) -> Result<Self> {
-        let store = Self::new(pool);
+    pub async fn open(pool: PgPool) -> Result<Self> {
+        let store = Self { pool };
         store.ensure_schema().await?;
         Ok(store)
     }
 
-    pub fn pool(&self) -> &SqlitePool {
+    pub fn pool(&self) -> &PgPool {
         &self.pool
     }
 
@@ -1041,17 +1033,17 @@ impl SqliteTeamPolicyStore {
         validate_team_id(team_id)?;
         let policy_json = serialize_bounded(&policy, MAX_TEAM_POLICY_BYTES, "team policy")?;
         let mut transaction = self.begin_write().await?;
-        let exists: i64 =
-            sqlx::query_scalar("select exists(select 1 from team_runtimes where team_id = ?)")
+        let exists: bool =
+            sqlx::query_scalar("select exists(select 1 from team_runtimes where team_id = $1)")
                 .bind(team_id.to_string())
                 .fetch_one(&mut *transaction)
                 .await?;
-        ensure!(exists == 0, "team runtime {team_id} already exists");
+        ensure!(!exists, "team runtime {team_id} already exists");
 
         let now = Utc::now().to_rfc3339();
         sqlx::query(
             "insert into team_runtimes(team_id,policy_json,next_sequence,created_at,updated_at) \
-             values(?,?,0,?,?)",
+             values($1,$2,0,$3,$4)",
         )
         .bind(team_id.to_string())
         .bind(policy_json)
@@ -1066,13 +1058,13 @@ impl SqliteTeamPolicyStore {
     /// Load and replay a runtime. A missing team is represented by `None`.
     pub async fn load(&self, team_id: Uuid) -> Result<Option<TeamPolicyRuntime>> {
         validate_team_id(team_id)?;
-        self.ensure_schema().await?;
         let mut transaction = self.pool.begin().await?;
-        let Some(row) =
-            sqlx::query("select policy_json,next_sequence from team_runtimes where team_id = ?")
-                .bind(team_id.to_string())
-                .fetch_optional(&mut *transaction)
-                .await?
+        let Some(row) = sqlx::query(
+            "select policy_json,next_sequence from team_runtimes where team_id = $1 for share",
+        )
+        .bind(team_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?
         else {
             transaction.commit().await?;
             return Ok(None);
@@ -1113,14 +1105,14 @@ impl SqliteTeamPolicyStore {
         );
         let event = event.borrow().clone();
         let event_json = serialize_bounded(&event, MAX_TEAM_EVENT_BYTES, "team event")?;
-        self.ensure_schema().await?;
         let mut transaction = self.begin_write().await?;
 
-        let Some(runtime_row) =
-            sqlx::query("select policy_json,next_sequence from team_runtimes where team_id = ?")
-                .bind(team_id.to_string())
-                .fetch_optional(&mut *transaction)
-                .await?
+        let Some(runtime_row) = sqlx::query(
+            "select policy_json,next_sequence from team_runtimes where team_id = $1 for update",
+        )
+        .bind(team_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?
         else {
             bail!("team runtime {team_id} does not exist");
         };
@@ -1134,7 +1126,7 @@ impl SqliteTeamPolicyStore {
 
         let by_event_id = sqlx::query(
             "select team_id,sequence,event_id,idempotency_key,event_json \
-             from team_events where team_id=? and event_id=?",
+             from team_events where team_id=$1 and event_id=$2",
         )
         .bind(team_id.to_string())
         .bind(event_id.to_string())
@@ -1144,7 +1136,7 @@ impl SqliteTeamPolicyStore {
         .transpose()?;
         let by_idempotency_key = sqlx::query(
             "select team_id,sequence,event_id,idempotency_key,event_json \
-             from team_events where team_id=? and idempotency_key=?",
+             from team_events where team_id=$1 and idempotency_key=$2",
         )
         .bind(team_id.to_string())
         .bind(&idempotency_key)
@@ -1195,20 +1187,20 @@ impl SqliteTeamPolicyStore {
         sqlx::query(
             "insert into team_events \
              (team_id,sequence,event_id,idempotency_key,event_json,created_at) \
-             values(?,?,?,?,?,?)",
+             values($1,$2,$3,$4,$5,$6)",
         )
         .bind(stored.team_id.to_string())
-        .bind(i64::try_from(stored.sequence).context("team event sequence exceeds SQLite range")?)
+        .bind(i64::try_from(stored.sequence).context("team event sequence exceeds Postgres range")?)
         .bind(stored.event_id.to_string())
         .bind(&stored.idempotency_key)
         .bind(event_json)
         .bind(Utc::now().to_rfc3339())
         .execute(&mut *transaction)
         .await?;
-        sqlx::query("update team_runtimes set next_sequence=?,updated_at=? where team_id=?")
+        sqlx::query("update team_runtimes set next_sequence=$1,updated_at=$2 where team_id=$3")
             .bind(
                 i64::try_from(stored.sequence)
-                    .context("team event sequence exceeds SQLite range")?,
+                    .context("team event sequence exceeds Postgres range")?,
             )
             .bind(Utc::now().to_rfc3339())
             .bind(stored.team_id.to_string())
@@ -1235,39 +1227,43 @@ impl SqliteTeamPolicyStore {
             bail!("team runtime {team_id} does not exist");
         };
         let after_sequence =
-            i64::try_from(after_sequence).context("event sequence exceeds SQLite range")?;
+            i64::try_from(after_sequence).context("event sequence exceeds Postgres range")?;
         let rows = sqlx::query(
             "select team_id,sequence,event_id,idempotency_key,event_json \
-             from team_events where team_id=? and sequence>? order by sequence limit ?",
+             from team_events where team_id=$1 and sequence>$2 order by sequence limit $3",
         )
         .bind(team_id.to_string())
         .bind(after_sequence)
-        .bind(i64::try_from(limit).context("event page size exceeds SQLite range")?)
+        .bind(i64::try_from(limit).context("event page size exceeds Postgres range")?)
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(decode_event_record).collect()
     }
 
-    async fn begin_write(&self) -> Result<Transaction<'static, Sqlite>> {
-        Ok(crate::SqliteSessionStore::begin_sqlite_write(&self.pool).await?)
+    async fn begin_write(&self) -> Result<Transaction<'static, Postgres>> {
+        Ok(self.pool.begin().await?)
     }
 
     async fn ensure_schema(&self) -> Result<()> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("select pg_advisory_xact_lock(hashtext('borg.team-policy.schema'))")
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query(
             "create table if not exists team_runtimes (\
                 team_id text primary key not null,\
                 policy_json text not null,\
-                next_sequence integer not null default 0,\
+                next_sequence bigint not null default 0,\
                 created_at text not null,\
                 updated_at text not null\
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         sqlx::query(
             "create table if not exists team_events (\
                 team_id text not null,\
-                sequence integer not null,\
+                sequence bigint not null,\
                 event_id text not null,\
                 idempotency_key text not null,\
                 event_json text not null,\
@@ -1278,25 +1274,26 @@ impl SqliteTeamPolicyStore {
                 foreign key(team_id) references team_runtimes(team_id) on delete cascade\
             )",
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         sqlx::query(
             "create index if not exists team_events_after_idx \
              on team_events(team_id, sequence)",
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(())
     }
 }
 
 async fn read_records_from_transaction(
-    transaction: &mut Transaction<'_, Sqlite>,
+    transaction: &mut Transaction<'_, Postgres>,
     team_id: Uuid,
 ) -> Result<Vec<TeamPolicyEventRecord>> {
     let rows = sqlx::query(
         "select team_id,sequence,event_id,idempotency_key,event_json \
-         from team_events where team_id=? order by sequence limit ?",
+         from team_events where team_id=$1 order by sequence limit $2",
     )
     .bind(team_id.to_string())
     .bind(i64::try_from(MAX_TEAM_POLICY_EVENTS + 1)?)
@@ -1327,7 +1324,7 @@ fn serialize_bounded<T: Serialize>(value: &T, limit: usize, label: &str) -> Resu
     Ok(json)
 }
 
-fn decode_event_record(row: &SqliteRow) -> Result<TeamPolicyEventRecord> {
+fn decode_event_record(row: &PgRow) -> Result<TeamPolicyEventRecord> {
     let team_id = Uuid::parse_str(row.try_get::<String, _>("team_id")?.as_str())?;
     let sequence = u64::try_from(row.try_get::<i64, _>("sequence")?)
         .context("persisted team event sequence is negative")?;
@@ -1423,7 +1420,6 @@ fn event_handoff(event: &TeamEvent) -> &Handoff {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::sqlite::SqlitePoolOptions;
 
     fn fixture() -> (TeamPolicy, Uuid, Uuid) {
         let director = Uuid::new_v4();
@@ -1614,15 +1610,6 @@ mod tests {
         }
     }
 
-    async fn sqlite_store() -> SqliteTeamPolicyStore {
-        let pool = SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        SqliteTeamPolicyStore::open(pool).await.unwrap()
-    }
-
     #[test]
     fn runtime_durably_applies_authorized_assignment_report_and_stop_rules() {
         let (mut policy, director, worker) = fixture();
@@ -1809,8 +1796,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_team_store_creates_replays_and_pages_events() {
-        let store = sqlite_store().await;
+    async fn postgres_team_store_creates_replays_and_pages_events() {
+        let (scratch, journal) = crate::session_store::postgres::testing::session_store().await;
+        let store = PostgresTeamPolicyStore::open(journal.pool().clone())
+            .await
+            .unwrap();
         let (mut policy, director, worker) = fixture();
         policy.review_conditions.clear();
         let team_id = policy.topology.team_id;
@@ -1831,11 +1821,15 @@ mod tests {
         let page = store.events_after(team_id, 0, 1).await.unwrap();
         assert_eq!(page, vec![record]);
         assert!(store.events_after(team_id, 1, 1).await.unwrap().is_empty());
+        scratch.discard().await;
     }
 
     #[tokio::test]
-    async fn sqlite_team_store_makes_event_retries_idempotent_and_rejects_conflicts() {
-        let store = sqlite_store().await;
+    async fn postgres_team_store_makes_event_retries_idempotent_and_rejects_conflicts() {
+        let (scratch, journal) = crate::session_store::postgres::testing::session_store().await;
+        let store = PostgresTeamPolicyStore::open(journal.pool().clone())
+            .await
+            .unwrap();
         let (mut policy, director, worker) = fixture();
         policy.review_conditions.clear();
         let team_id = policy.topology.team_id;
@@ -1870,11 +1864,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 1);
+        scratch.discard().await;
     }
 
     #[tokio::test]
-    async fn sqlite_team_store_validates_replay_and_bounds_inputs() {
-        let store = sqlite_store().await;
+    async fn postgres_team_store_validates_replay_and_bounds_inputs() {
+        let (scratch, journal) = crate::session_store::postgres::testing::session_store().await;
+        let store = PostgresTeamPolicyStore::open(journal.pool().clone())
+            .await
+            .unwrap();
         let (mut policy, director, worker) = fixture();
         policy.review_conditions.clear();
         let team_id = policy.topology.team_id;
@@ -1916,12 +1914,13 @@ mod tests {
             .append(team_id, Uuid::new_v4(), "valid", &event)
             .await
             .unwrap();
-        sqlx::query("update team_events set event_json=? where team_id=?")
+        sqlx::query("update team_events set event_json=$1 where team_id=$2")
             .bind(serde_json::to_string(&invalid).unwrap())
             .bind(team_id.to_string())
             .execute(store.pool())
             .await
             .unwrap();
         assert!(store.load(team_id).await.is_err());
+        scratch.discard().await;
     }
 }

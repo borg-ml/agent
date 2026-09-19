@@ -438,7 +438,7 @@ pub async fn send_local_session_command(
 
 /// Single-owner local command endpoint for a durable session.
 ///
-/// The session lock remains exclusive. Additional terminals tail SQLite
+/// The session lock remains exclusive. Additional terminals tail journal
 /// events and send typed commands through this endpoint.
 #[cfg(unix)]
 pub struct LocalSessionControlServer {
@@ -1205,11 +1205,8 @@ mod tests {
         let writer = SessionWriterLease::try_acquire(&journal_path)
             .unwrap()
             .unwrap();
-        let store: Arc<dyn SessionStore> = Arc::new(
-            crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-                .await
-                .unwrap(),
-        );
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
         store.create_session(session_id).await.unwrap();
         store
             .append(SessionEvent::new(
@@ -1305,6 +1302,7 @@ mod tests {
                 .contains("different session")
         );
         assert!(owner_rx.try_recv().is_err());
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -1357,11 +1355,8 @@ mod tests {
         let writer = SessionWriterLease::try_acquire(&lock_path)
             .unwrap()
             .unwrap();
-        let store: Arc<dyn SessionStore> = Arc::new(
-            crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-                .await
-                .unwrap(),
-        );
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
         store.create_session(session_id).await.unwrap();
         store
             .append(SessionEvent::new(
@@ -1441,6 +1436,7 @@ mod tests {
             owner_rx.recv().await.unwrap(),
             HostCommand::FlushPendingInput { .. }
         ));
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -1486,13 +1482,10 @@ mod tests {
             .unwrap();
         let (_command_tx, command_rx) = mpsc::channel(1);
         let (event_tx, _event_rx) = mpsc::channel(1);
-        let sqlite = Arc::new(
-            crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-                .await
-                .unwrap(),
-        );
-        sqlite.create_session(session_id).await.unwrap();
-        let store: Arc<dyn SessionStore> = sqlite;
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let postgres = Arc::new(postgres);
+        postgres.create_session(session_id).await.unwrap();
+        let store: Arc<dyn SessionStore> = postgres;
 
         let attachment = tokio::spawn(run_attached_session(
             store,
@@ -1511,6 +1504,7 @@ mod tests {
             .expect("attachment should notice released ownership")
             .expect("attachment task should not panic")
             .expect("owner loss is a clean detach");
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -1611,13 +1605,10 @@ mod tests {
         let _writer = SessionWriterLease::try_acquire(&journal_path)
             .unwrap()
             .unwrap();
-        let sqlite = Arc::new(
-            crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-                .await
-                .unwrap(),
-        );
-        sqlite.create_session(session_id).await.unwrap();
-        sqlite
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let postgres = Arc::new(postgres);
+        postgres.create_session(session_id).await.unwrap();
+        postgres
             .append(SessionEvent::new(
                 session_id,
                 0,
@@ -1625,7 +1616,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let ready = sqlite
+        let ready = postgres
             .append(SessionEvent::new(
                 session_id,
                 0,
@@ -1636,7 +1627,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let running = sqlite
+        let running = postgres
             .append(SessionEvent::new(
                 session_id,
                 0,
@@ -1647,7 +1638,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        sqlite
+        postgres
             .append(SessionEvent::new(
                 session_id,
                 0,
@@ -1661,7 +1652,7 @@ mod tests {
 
         let (command_tx, command_rx) = mpsc::channel(1);
         let (event_tx, mut event_rx) = mpsc::channel(4);
-        let store: Arc<dyn SessionStore> = sqlite;
+        let store: Arc<dyn SessionStore> = postgres;
         let attachment = tokio::spawn(run_attached_session(
             store,
             session_id,
@@ -1702,6 +1693,7 @@ mod tests {
             .await
             .unwrap();
         attachment.await.unwrap().unwrap();
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -1713,13 +1705,10 @@ mod tests {
         let _writer = SessionWriterLease::try_acquire(&journal_path)
             .unwrap()
             .unwrap();
-        let sqlite = Arc::new(
-            crate::SqliteSessionStore::open(root.path().join("sessions.sqlite3"))
-                .await
-                .unwrap(),
-        );
-        sqlite.create_session(session_id).await.unwrap();
-        sqlite
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let postgres = Arc::new(postgres);
+        postgres.create_session(session_id).await.unwrap();
+        postgres
             .append(SessionEvent::new(
                 session_id,
                 0,
@@ -1727,7 +1716,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        sqlite
+        postgres
             .append(SessionEvent::new(
                 session_id,
                 0,
@@ -1745,7 +1734,7 @@ mod tests {
                 .unwrap();
         let (command_tx, command_rx) = mpsc::channel(4);
         let (event_tx, _event_rx) = mpsc::channel(1);
-        let store: Arc<dyn SessionStore> = sqlite;
+        let store: Arc<dyn SessionStore> = postgres;
         let attachment = tokio::spawn(run_attached_session(
             store,
             session_id,
@@ -1775,6 +1764,7 @@ mod tests {
             .await
             .unwrap();
         attachment.await.unwrap().unwrap();
+        scratch.discard().await;
     }
 
     #[test]

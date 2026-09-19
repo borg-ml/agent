@@ -55,7 +55,7 @@ serde_ignored.workspace = true
 serde_json.workspace = true
 semver = "1"
 sha2.workspace = true
-sqlx.workspace = true
+sqlx = { workspace = true, features = ["sqlite"] }
 zip = { version = "8", default-features = false, features = ["deflate"] }
 shlex = "2.0"
 termwiz = { version = "0.23.3", optional = true }
@@ -87,4 +87,5 @@ windows-sys = { version = "0.61.2", features = [
 ] }
 
 [dev-dependencies]
+borg-agent-runtime = { path = "../borg-agent-runtime", features = ["test-support"] }
 sqlx.workspace = true

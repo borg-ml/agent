@@ -2524,9 +2524,7 @@ mod tests {
     async fn codex_executor_migrates_legacy_routes_without_provider_thread_reuse() {
         use crate::SessionStore;
         let directory = tempfile::tempdir().unwrap();
-        let store = crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let fresh = Uuid::new_v4();
         let legacy = Uuid::new_v4();
         store.create_session(fresh).await.unwrap();
@@ -2563,6 +2561,7 @@ mod tests {
                 .await
                 .is_ok()
         );
+        scratch.discard().await;
     }
 
     /// An `opencode-go` session must run Borg's native harness so it gets the
@@ -2575,9 +2574,7 @@ mod tests {
     async fn opencode_go_resolves_to_the_native_harness_and_legacy_stays_on_the_cli() {
         use crate::SessionStore;
         let directory = tempfile::tempdir().unwrap();
-        let store = crate::SqliteSessionStore::open(directory.path().join("sessions.sqlite3"))
-            .await
-            .unwrap();
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
 
         let go = Uuid::new_v4();
         store.create_session(go).await.unwrap();
@@ -2597,6 +2594,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!cli_executor.uses_native_harness(CodingProvider::OpenCode));
+        scratch.discard().await;
     }
 
     #[tokio::test]

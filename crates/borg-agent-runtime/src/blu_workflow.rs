@@ -1,7 +1,7 @@
 //! Bounded Blu guest execution over Borg's durable host boundary.
 //!
 //! Blu owns control flow. Borg owns every effect: guest code receives no
-//! SQLite, filesystem, provider, or process handles. Each host call is
+//! Database, filesystem, provider, or process handles. Each host call is
 //! journaled before and after execution and is replayed by workflow/call id.
 
 use std::collections::HashMap;
@@ -1446,62 +1446,42 @@ mod tests {
 
     use super::*;
 
-    async fn runner(permission: PermissionMode) -> BluWorkflowRunner {
-        // The runner owns only the SQLite pool; keep the test database alive
-        // across the extra connections used by workflow leases/heartbeats.
-        let directory = tempdir().expect("tempdir").keep();
-        let sqlite = crate::SqliteSessionStore::open(directory.join("sessions.sqlite3"))
-            .await
-            .expect("store");
-        let session_id = Uuid::new_v4();
-        let autonomy: Arc<dyn crate::autonomy::AutonomyStore> = Arc::new(
-            crate::SqliteAutonomyStore::open(sqlite.pool().clone())
-                .await
-                .expect("autonomy"),
-        );
-        let store: Arc<dyn SessionStore> = Arc::new(sqlite);
-        store.create_session(session_id).await.expect("session");
-        BluWorkflowRunner::new(
-            session_id,
-            store,
-            autonomy,
-            None,
-            ProcessManager::default(),
-            PathBuf::from("."),
-            permission,
-        )
-    }
+    use crate::session_store::postgres::testing::{ScratchDatabase, session_store};
 
-    async fn external_runner(permission: PermissionMode) -> (BluWorkflowRunner, PathBuf) {
-        let directory = tempdir().expect("tempdir").keep();
-        let sqlite = crate::SqliteSessionStore::open(directory.join("sessions.sqlite3"))
-            .await
-            .expect("store");
+    async fn runner(permission: PermissionMode) -> (ScratchDatabase, BluWorkflowRunner) {
+        let (scratch, journal) = session_store().await;
         let session_id = Uuid::new_v4();
-        let autonomy: Arc<dyn crate::autonomy::AutonomyStore> = Arc::new(
-            crate::SqliteAutonomyStore::open(sqlite.pool().clone())
-                .await
-                .expect("autonomy"),
-        );
-        let store: Arc<dyn SessionStore> = Arc::new(sqlite);
+        let autonomy = Arc::new(crate::autonomy_postgres::PostgresAutonomyStore::from_pool(
+            journal.pool().clone(),
+        ));
+        let store: Arc<dyn SessionStore> = Arc::new(journal);
         store.create_session(session_id).await.expect("session");
         (
+            scratch,
             BluWorkflowRunner::new(
                 session_id,
                 store,
                 autonomy,
                 None,
                 ProcessManager::default(),
-                directory.clone(),
+                PathBuf::from("."),
                 permission,
             ),
-            directory,
         )
+    }
+
+    async fn external_runner(
+        permission: PermissionMode,
+    ) -> (ScratchDatabase, BluWorkflowRunner, tempfile::TempDir) {
+        let directory = tempdir().expect("tempdir");
+        let (scratch, mut runner) = runner(permission).await;
+        runner.root = directory.path().to_path_buf();
+        (scratch, runner, directory)
     }
 
     #[tokio::test]
     async fn pure_workflow_is_durable_and_idempotent() {
-        let runner = runner(PermissionMode::FullAccess).await;
+        let (scratch, runner) = runner(PermissionMode::FullAccess).await;
         let request = BluWorkflowRequest {
             workflow_id: Uuid::new_v4(),
             name: "math".to_string(),
@@ -1511,11 +1491,12 @@ mod tests {
         assert_eq!(first.values, vec![json!(4)]);
         assert!(first.success);
         assert_eq!(first, runner.run(request).await.expect("replay"));
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn workflow_id_is_stable_and_replayed() {
-        let runner = runner(PermissionMode::Manual).await;
+        let (scratch, runner) = runner(PermissionMode::Manual).await;
         let request = BluWorkflowRequest {
             workflow_id: Uuid::new_v4(),
             name: "identity".to_string(),
@@ -1525,13 +1506,13 @@ mod tests {
         assert!(first.success, "{first:?}");
         assert_eq!(first.values, vec![json!(request.workflow_id.to_string())]);
         assert_eq!(first, runner.run(request).await.expect("replay"));
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn workflow_invocation_arguments_are_journaled_and_available_to_blu() {
-        let runner = runner(PermissionMode::Manual)
-            .await
-            .with_invocation_arguments(json!({"query": "release"}));
+        let (scratch, runner) = runner(PermissionMode::Manual).await;
+        let runner = runner.with_invocation_arguments(json!({"query": "release"}));
         let request = BluWorkflowRequest {
             workflow_id: Uuid::new_v4(),
             name: "arguments".to_string(),
@@ -1540,11 +1521,12 @@ mod tests {
         let result = runner.run(request).await.expect("run");
         assert!(result.success, "{result:?}");
         assert_eq!(result.values, vec![json!(r#"{"query":"release"}"#)]);
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn concurrent_workflow_admission_publishes_one_started_event() {
-        let runner = runner(PermissionMode::FullAccess).await;
+        let (scratch, runner) = runner(PermissionMode::FullAccess).await;
         let request = BluWorkflowRequest {
             workflow_id: Uuid::new_v4(),
             name: "concurrent".to_string(),
@@ -1583,11 +1565,12 @@ mod tests {
                 .count(),
             1
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn lua_and_luau_sources_use_the_embedded_blu_engine() {
-        let runner = runner(PermissionMode::FullAccess).await;
+        let (scratch, runner) = runner(PermissionMode::FullAccess).await;
         for (extension, profile, source) in [
             ("lua", SemanticProfile::Blu, "return 40 + 2"),
             (
@@ -1612,6 +1595,7 @@ mod tests {
             assert_eq!(result.values.len(), 1, "{result:?}");
             assert_eq!(result.values[0].as_f64(), Some(42.0), "{result:?}");
         }
+        scratch.discard().await;
     }
 
     #[tokio::test]
@@ -1623,7 +1607,8 @@ mod tests {
         {
             return;
         }
-        let (runner, root) = external_runner(PermissionMode::FullAccess).await;
+        let (scratch, runner, directory) = external_runner(PermissionMode::FullAccess).await;
+        let root = directory.path().to_path_buf();
         let entrypoint = root.join("workflow.py");
         std::fs::write(&entrypoint, "print('python-runtime-ok')\n").expect("workflow");
         let request = RuntimeWorkflowRequest {
@@ -1670,11 +1655,13 @@ mod tests {
                 .count(),
             1
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn external_javascript_and_typescript_profiles_use_their_default_commands() {
-        let (runner, root) = external_runner(PermissionMode::FullAccess).await;
+        let (scratch, runner, directory) = external_runner(PermissionMode::FullAccess).await;
+        let root = directory.path().to_path_buf();
         for (runtime, command, extension, source, marker) in [
             (
                 WorkflowRuntime::Javascript,
@@ -1720,11 +1707,12 @@ mod tests {
             assert!(result.success, "{result:?}");
             assert!(result.stdout.contains(marker), "{result:?}");
         }
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn host_call_is_journaled_and_replayed() {
-        let runner = runner(PermissionMode::FullAccess).await;
+        let (scratch, runner) = runner(PermissionMode::FullAccess).await;
         let request = BluWorkflowRequest {
             workflow_id: Uuid::new_v4(),
             name: "emit".to_string(),
@@ -1754,11 +1742,13 @@ mod tests {
                 .count(),
             1
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn blu_plugin_store_receipts_are_replayed_and_verify_artifact_bytes() {
-        let (runner, root) = external_runner(PermissionMode::FullAccess).await;
+        let (scratch, runner, directory) = external_runner(PermissionMode::FullAccess).await;
+        let root = directory.path().to_path_buf();
         let runner = runner.with_extension_id("harvey-lab");
         tokio::fs::write(root.join("result.json"), br#"{"ok":true}"#)
             .await
@@ -1834,12 +1824,14 @@ return borg_plugin_store(2, "{\"op\":\"commit\",\"scope\":\"session\",\"idempote
                 .count(),
             1
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
     #[cfg(unix)]
     async fn plugin_receipt_commits_before_a_failed_process_assertion() {
-        let (runner, root) = external_runner(PermissionMode::FullAccess).await;
+        let (scratch, runner, directory) = external_runner(PermissionMode::FullAccess).await;
+        let root = directory.path().to_path_buf();
         let runner = runner.with_extension_id("harvey-lab");
         tokio::fs::write(root.join("failed.json"), br#"{"status":"failed"}"#)
             .await
@@ -1877,11 +1869,12 @@ return receipt
             .await
             .expect("failed receipt");
         assert_eq!(entry["entry"]["value"]["state"], "recorded");
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn blu_history_reads_the_same_canonical_journal_without_full_access() {
-        let runner = runner(PermissionMode::Manual).await;
+        let (scratch, runner) = runner(PermissionMode::Manual).await;
         runner
             .store
             .append(SessionEvent::new(
@@ -1942,11 +1935,12 @@ return receipt
             index["next_after_sequence"],
             documents.last().expect("last history document")["sequence"]
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn expired_workflow_lease_is_reclaimable_and_stale_completion_is_fenced() {
-        let runner = runner(PermissionMode::FullAccess).await;
+        let (scratch, runner) = runner(PermissionMode::FullAccess).await;
         let request = BluWorkflowRequest {
             workflow_id: Uuid::new_v4(),
             name: "recoverable".to_string(),
@@ -2026,11 +2020,12 @@ return receipt
                 .count(),
             1
         );
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn mutating_calls_require_full_access() {
-        let runner = runner(PermissionMode::Manual).await;
+        let (scratch, runner) = runner(PermissionMode::Manual).await;
         let result = runner
             .run(BluWorkflowRequest {
                 workflow_id: Uuid::new_v4(),
@@ -2041,11 +2036,12 @@ return receipt
             .expect("terminal failure");
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("full access"));
+        scratch.discard().await;
     }
 
     #[tokio::test]
     async fn cancellation_interrupts_a_running_blu_program_and_commits_failure() {
-        let runner = runner(PermissionMode::FullAccess).await;
+        let (scratch, runner) = runner(PermissionMode::FullAccess).await;
         let cancel = CancellationToken::new();
         let workflow_id = Uuid::new_v4();
         let task_runner = runner.clone();
@@ -2080,5 +2076,6 @@ return receipt
                 .iter()
                 .any(|event| matches!(event.kind, SessionEventKind::BluWorkflowCompleted { .. }))
         );
+        scratch.discard().await;
     }
 }

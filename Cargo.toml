@@ -58,7 +58,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
 sha2 = "0.11.0"
-sqlx = { version = "0.9.0", default-features = false, features = ["chrono", "json", "postgres", "runtime-tokio", "sqlite", "tls-rustls", "uuid"] }
+sqlx = { version = "0.9.0", default-features = false, features = ["chrono", "json", "postgres", "runtime-tokio", "tls-rustls", "uuid"] }
 tar = "0.4"
 tempfile = "3.27.0"
 toml = "1.1.4"
