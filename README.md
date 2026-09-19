@@ -5,13 +5,12 @@ terminal and native GPUI frontends, durable sessions, native tools, provider
 adapters, and optional remote hosts. Releases include the `borg` CLI; the
 experimental `borg-gui` frontend is developed and built separately.
 
-[Repository](https://github.com/borg-ml/agent) ·
-[Blu language](https://github.com/borg-ml/blu) ·
-[Documentation](docs/) ·
-[Backend architecture](docs/architecture.md) ·
 [简体中文](docs/zh-Hans/README.md) ·
 [Español](docs/es/README.md) ·
-[Русский](docs/ru/README.md)
+[Русский](docs/ru/README.md) · 
+[Blu language](https://github.com/borg-ml/blu) ·
+[Documentation](docs/) ·
+[Backend architecture](docs/architecture.md)
 
 ## Install
 
