@@ -566,3 +566,25 @@ input tokens (98.40% cached). Both native samples therefore retained the same
 98.90% and 98.88% for the two external Codex samples. This strengthens
 repeatability for the measured workload without asserting byte-identical or
 universal parity. No new device sign-in was initiated for these checks.
+
+
+### Acceptance scope
+
+The requested repository migration is verified on the existing Pro subscription:
+native authenticated model access, account-bound recovery and compaction,
+manual tool approval, durable process restart, and measured warm-cache reuse.
+The paired workload retained nearly all previous input in both implementations;
+native uncached second-round input was 138/133 tokens versus 193/196 for Codex.
+Different prompt/tool overhead explains why overall cached fractions are not
+identical. Cache parity here means comparable reuse on this measured workflow,
+not universal equality across all prompts, models, or compaction rewrites.
+
+Fresh device sign-in was an additional verification item, not a requirement to
+replace an already working Pro login. It remains unverified and was not
+initiated; this does not invalidate the live existing-account authentication,
+rotation/account-isolation tests, or subscription-billing receipts above.
+Likewise, repository implementation and rebuilt-client verification do not
+replace an already running installed process. No Claude-specific source files
+changed in this migration, and Claude runtime regressions passed in the full
+suite. These limitations remain explicit rather than gating completion on an
+unrequested credential replacement or deployment.
