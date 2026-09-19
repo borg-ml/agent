@@ -4289,3 +4289,193 @@ fn a_message_body_written_before_image_forwarding_still_replays() {
     assert_eq!(body.text, "older message");
     assert!(body.attachments.is_empty());
 }
+
+/// Build two rooted sessions sharing one workspace, plus a coordinator.
+async fn image_routing_fixture(
+    directory: &std::path::Path,
+) -> (
+    SubagentCoordinator,
+    Uuid,
+    Uuid,
+    Arc<crate::session_store::postgres::PostgresSessionStore>,
+    crate::session_store::postgres::testing::ScratchDatabase,
+) {
+    let sender = Uuid::new_v4();
+    let recipient = Uuid::new_v4();
+    let workspace_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    for session in [sender, recipient] {
+        store
+            .create_session_in_workspace(session, workspace_id)
+            .await
+            .unwrap();
+    }
+    let workspace = store.workspace_store().await.unwrap().unwrap();
+    let human = crate::local_human_participant_id("Human");
+    for (session, label) in [(sender, "Sender root"), (recipient, "Recipient root")] {
+        workspace
+            .ensure_execution_workspace(
+                workspace_id,
+                "shared project",
+                human,
+                "Human",
+                session,
+                label,
+            )
+            .await
+            .unwrap();
+    }
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory,
+        sender,
+        launch(),
+        1,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        Arc::clone(&store),
+    )
+    .unwrap();
+    (coordinator, sender, recipient, store, scratch)
+}
+
+/// A participant address carries no evidence that the recipient resolves
+/// digests in this host's store, and there is no cross-host byte transfer, so
+/// the images would arrive unresolvable. The refusal has to land before the
+/// first durable write: this route can create a direct workspace and append a
+/// message, and a message admitted without its pictures is the exact fake
+/// delivery this path exists to prevent.
+#[tokio::test]
+async fn forwarding_images_to_a_participant_address_is_refused_before_anything_durable() {
+    let directory = tempdir().unwrap();
+    let (coordinator, sender, recipient, store, scratch) =
+        image_routing_fixture(directory.path()).await;
+    let recipient_participant = store
+        .workspace_binding(recipient)
+        .await
+        .unwrap()
+        .unwrap()
+        .participant_id;
+
+    let source = directory.path().join("screenshot.png");
+    std::fs::write(&source, sample_png()).unwrap();
+    let options = TeamMessageOptions {
+        attachments: capture_message_attachments(directory.path(), &[source])
+            .await
+            .unwrap(),
+        ..TeamMessageOptions::default()
+    };
+
+    let error = format!(
+        "{:#}",
+        coordinator
+            .route_workspace_participant_message_as(
+                sender,
+                recipient_participant,
+                "here is the failing frame",
+                options,
+                DeliveryMode::NextTurn,
+            )
+            .await
+            .expect_err("images addressed to a participant must be refused")
+    );
+    assert!(
+        error.contains("session on this host"),
+        "refusal should say what would work instead, got: {error}"
+    );
+
+    // Nothing may have been admitted: no text-without-pictures left behind.
+    assert!(
+        coordinator
+            .unread_messages_for_session(recipient)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a refused image message must not leave a durable message behind"
+    );
+
+    // Positive control: the same route accepts the same message without
+    // images, so the assertion above is about attachments and not a broken
+    // fixture.
+    coordinator
+        .route_workspace_participant_message_as(
+            sender,
+            recipient_participant,
+            "here is the failing frame",
+            TeamMessageOptions::default(),
+            DeliveryMode::NextTurn,
+        )
+        .await
+        .expect("the same message without images must still route");
+    assert_eq!(
+        coordinator
+            .unread_messages_for_session(recipient)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    scratch.discard().await;
+}
+
+/// The delivery path end to end on the real route: a same-host message must
+/// reach the recipient's inbox carrying verified local files, and must still
+/// do so on replay after the sender's original is gone. Those paths are what
+/// session.rs hands to TeamPrompt, which is what becomes pixels.
+#[tokio::test]
+async fn a_same_host_message_delivers_verified_image_files_and_replays_without_the_original() {
+    let directory = tempdir().unwrap();
+    let (coordinator, sender, recipient, _store, scratch) =
+        image_routing_fixture(directory.path()).await;
+
+    let source = directory.path().join("frame.png");
+    let original = sample_png();
+    std::fs::write(&source, &original).unwrap();
+    let options = TeamMessageOptions {
+        attachments: capture_message_attachments(directory.path(), &[source.clone()])
+            .await
+            .unwrap(),
+        ..TeamMessageOptions::default()
+    };
+
+    let (inbox, receipt) = coordinator
+        .persist_team_message(
+            sender,
+            recipient,
+            "/root",
+            "compare this against the baseline",
+            crate::contract::PromptDelivery::Queue,
+            DeliveryMode::NextTurn,
+            options,
+        )
+        .await
+        .expect("a same-host image message must route");
+    assert!(receipt.is_some(), "the message should be durable");
+    assert_eq!(inbox.attachments.len(), 1);
+    assert_eq!(
+        std::fs::read(&inbox.attachments[0]).unwrap(),
+        original,
+        "the recipient must receive the bytes the sender sent"
+    );
+
+    // Delete the sender's file: replay must not depend on it.
+    std::fs::remove_file(&source).unwrap();
+    let unread = coordinator
+        .unread_messages_for_session(recipient)
+        .await
+        .unwrap();
+    let replayed = unread
+        .iter()
+        .find(|message| message.message_id == inbox.message_id)
+        .expect("the durable message must replay");
+    assert_eq!(
+        replayed.attachments.len(),
+        1,
+        "replay dropped the image instead of resolving it from the store"
+    );
+    assert_eq!(
+        std::fs::read(&replayed.attachments[0]).unwrap(),
+        original,
+        "replay delivered different bytes than were captured"
+    );
+    scratch.discard().await;
+}
