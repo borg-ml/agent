@@ -13157,6 +13157,50 @@ fn a_cleanly_completed_response_is_not_marked_interrupted() {
 }
 
 #[tokio::test]
+#[ignore = "requires a PTY; verifies inspector identity across plan updates"]
+async fn action_inspector_stays_on_its_tool_when_plan_or_goal_moves() {
+    for update in [
+        SessionEventKind::PlanUpdated { items: Vec::new() },
+        SessionEventKind::GoalUpdated {
+            goal: SessionGoal::new("keep working".into(), None),
+        },
+    ] {
+        let session_id = Uuid::new_v4();
+        let directory = tempfile::tempdir().unwrap();
+        let mut terminal = BorgTerminal::enter(
+            directory.path(),
+            session_id,
+            directory.path().to_path_buf(),
+            &KeybindingConfig::default(),
+        )
+        .unwrap();
+        terminal.apply_session_event(&SessionEvent::new(session_id, 1, update.clone()));
+        terminal.apply_session_event(&SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::ToolStarted {
+                tool_call_id: "selected-tool".into(),
+                name: "exec".into(),
+                input: serde_json::json!({"cmd": "cargo check"}),
+                input_ref: None,
+            },
+        ));
+        let tool = terminal.transcript.tools["selected-tool"];
+        terminal.open_tool_inspector(tool);
+        terminal.apply_session_event(&SessionEvent::new(session_id, 3, update.clone()));
+        assert_eq!(
+            terminal.focused_tool,
+            Some(terminal.transcript.tools["selected-tool"])
+        );
+        assert!(matches!(
+            terminal.transcript.order[terminal.focused_tool.unwrap()],
+            TranscriptEntry::Tool { .. }
+        ));
+        terminal.shutdown().await;
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires a PTY; verifies live inspector identity across reordered entries"]
 async fn action_inspector_stays_on_its_entry_when_late_messages_arrive() {
     let session_id = Uuid::new_v4();

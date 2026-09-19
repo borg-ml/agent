@@ -1830,7 +1830,7 @@ impl Transcript {
             }
             SessionEventKind::GoalUpdated { goal } => {
                 self.goal = Some(goal.clone());
-                self.upsert_goal(goal.clone(), local_event_time(event));
+                return self.upsert_goal(goal.clone(), local_event_time(event));
             }
             SessionEventKind::GoalCleared { .. } => {
                 self.goal = None;
@@ -1841,7 +1841,7 @@ impl Transcript {
             }
             SessionEventKind::PlanUpdated { items } => {
                 self.todos = items.clone();
-                self.upsert_plan(items.clone(), local_event_time(event));
+                return self.upsert_plan(items.clone(), local_event_time(event));
             }
             SessionEventKind::RuntimeProcessStarted {
                 process_id,
