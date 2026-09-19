@@ -6843,7 +6843,16 @@ impl BorgTerminal {
         let terminal_size = self.terminal.size()?;
         let content_width = terminal_content_width(terminal_size.width);
         let tool_run_viewport_height = tool_run_viewport_height(terminal_size.height as usize);
-        let full_transcript_width = transcript_width_for_viewport(content_width, 0, 0);
+        // Frozen to the last committed frame during an input-only redraw so the
+        // committed-snapshot lookup below is keyed to the width that snapshot
+        // was actually rendered at.
+        let full_transcript_width = transcript_frame_width(
+            content_width,
+            input_fast_path,
+            self.last_committed_viewport_render
+                .as_ref()
+                .map(|(width, ..)| *width),
+        );
         let goal_tick = self.transcript.active_goal_cache_tick();
         let tool_elapsed_tick = self.transcript.tool_elapsed_cache_tick();
         let render_time = Utc::now();
@@ -7309,7 +7318,9 @@ impl BorgTerminal {
             transcript_viewport_height,
         );
         let transcript_render =
-            if reuse_current_transcript_width(input_fast_path, transcript_snapshot_current) {
+            if reuse_current_transcript_width(input_fast_path, transcript_snapshot_current)
+                && transcript_width == full_transcript_width
+            {
                 Arc::clone(&full_transcript_render)
             } else if transcript_width == full_transcript_width {
                 if self.focused_tool.is_none() {
@@ -7573,8 +7584,8 @@ impl BorgTerminal {
                 next_transcript_viewport_area = Some(content_area);
                 let scrollbar_area = if scroll_max > 0 && transcript_area.width > 4 {
                     Some(Rect {
-                        x: transcript_area.right() - 2,
-                        width: 2,
+                        x: transcript_area.right() - TRANSCRIPT_SCROLLBAR_GUTTER_WIDTH,
+                        width: TRANSCRIPT_SCROLLBAR_GUTTER_WIDTH,
                         ..transcript_area
                     })
                 } else {
@@ -7918,7 +7929,7 @@ impl BorgTerminal {
                         .map(|row| {
                             let in_thumb = row >= thumb_top && row < thumb_top + thumb_height;
                             Line::from(Span::styled(
-                                " ▊",
+                                " █ ",
                                 Style::default().fg(if in_thumb {
                                     if self.focused_child.is_some() {
                                         if self.scrollbar_hovered || self.dragging_scrollbar {
@@ -13868,12 +13879,24 @@ fn reuse_current_transcript_width(input_fast_path: bool, snapshot_current: bool)
 
 fn transcript_width_for_viewport(
     content_width: u16,
-    _transcript_height: usize,
-    _viewport_height: usize,
+    transcript_height: usize,
+    viewport_height: usize,
 ) -> usize {
-    // Reserve the scrollbar lane from the first transcript frame. Tool and
-    // streaming activity can otherwise cross the overflow threshold and
-    // rewrap every existing row by three columns in the middle of a turn.
+    if transcript_height > viewport_height {
+        transcript_width_with_gutter(content_width)
+    } else {
+        transcript_width_without_gutter(content_width)
+    }
+}
+
+/// The transcript width when history fits on screen and no scrollbar is drawn.
+fn transcript_width_without_gutter(content_width: u16) -> usize {
+    content_width.max(1) as usize
+}
+
+/// The transcript width when a scrollbar is drawn and its gutter is reserved.
+/// A terminal too narrow to spare the lane keeps every column it has.
+fn transcript_width_with_gutter(content_width: u16) -> usize {
     if content_width > 4 {
         content_width
             .saturating_sub(TRANSCRIPT_SCROLLBAR_GUTTER_WIDTH)
@@ -13881,6 +13904,31 @@ fn transcript_width_for_viewport(
     } else {
         content_width.max(1) as usize
     }
+}
+
+/// The width a frame lays history out at before its own height is known.
+///
+/// An ordinary frame measures at the ungutted width and lets
+/// `transcript_width_for_viewport` reserve the gutter once the measured height
+/// proves history overflows. An input-only redraw must not re-decide that: the
+/// transcript is unchanged, so the width the last committed frame was rendered
+/// at is still the correct one, and it is the width that frame is cached under.
+/// Measuring at any other width keys the committed-snapshot lookup to a width
+/// the snapshot was never rendered at, misses on every keystroke, and rebuilds
+/// the history the fast path exists to reuse. A committed width that no longer
+/// belongs to this terminal is discarded, so a resize still measures afresh.
+fn transcript_frame_width(
+    content_width: u16,
+    input_fast_path: bool,
+    committed_width: Option<usize>,
+) -> usize {
+    committed_width
+        .filter(|_| input_fast_path)
+        .filter(|width| {
+            *width == transcript_width_without_gutter(content_width)
+                || *width == transcript_width_with_gutter(content_width)
+        })
+        .unwrap_or_else(|| transcript_width_without_gutter(content_width))
 }
 
 fn responsive_launch_width(available: u16) -> u16 {

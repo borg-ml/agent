@@ -7509,10 +7509,30 @@ fn launch_resume_picker_height_is_stable_and_reserved_once() {
 }
 
 #[test]
-fn transcript_width_is_stable_when_activity_crosses_scrollbar_threshold() {
-    assert_eq!(transcript_width_for_viewport(100, 24, 24), 97);
+fn transcript_gutter_is_reserved_only_when_content_overflows() {
+    assert_eq!(transcript_width_for_viewport(100, 0, 24), 100);
+    assert_eq!(transcript_width_for_viewport(100, 24, 24), 100);
     assert_eq!(transcript_width_for_viewport(100, 25, 24), 97);
     assert_eq!(transcript_width_for_viewport(4, 25, 24), 4);
+}
+
+/// An input-only redraw reuses the last committed frame, so it has to measure
+/// at the width that frame was rendered at. Measuring at the ungutted width
+/// instead keys the committed-snapshot lookup to a width the snapshot never
+/// had, misses on every keystroke, and rebuilds history the fast path exists
+/// to reuse.
+#[test]
+fn input_redraw_measures_history_at_the_committed_frame_width() {
+    // Overflowing history committed at the guttered width stays there.
+    assert_eq!(transcript_frame_width(100, true, Some(97)), 97);
+    // History that fit on screen was committed ungutted and stays ungutted.
+    assert_eq!(transcript_frame_width(100, true, Some(100)), 100);
+    // An ordinary frame always measures full width and decides for itself.
+    assert_eq!(transcript_frame_width(100, false, Some(97)), 100);
+    // Nothing committed yet, so there is no width to hold on to.
+    assert_eq!(transcript_frame_width(100, true, None), 100);
+    // A width from a terminal this narrow no longer belongs to: measure afresh.
+    assert_eq!(transcript_frame_width(100, true, Some(57)), 100);
 }
 
 #[tokio::test]
