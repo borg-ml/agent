@@ -5,8 +5,7 @@ use std::time::Duration;
 
 use borg_provider::ProviderChannel;
 use borg_provider::provider::{
-    ChatStreamRequest, CodexSubscriptionPool, LocalAgentPermission, run_codex_local_chat_stream,
-    run_codex_local_chat_stream_pooled,
+    ChatStreamRequest, LocalAgentPermission, run_codex_local_chat_stream,
 };
 
 // This test binary has one single-threaded test: the runtime override never
@@ -47,45 +46,32 @@ done
     unsafe {
         std::env::set_var("BORG_CODEX_BIN", &executable);
     }
-    let pool = CodexSubscriptionPool::default();
-    for pooled in [false, true] {
-        for stage in ["initialize", "thread/start", "turn/start", "stream"] {
-            std::fs::write(root.path().join("stage"), stage).unwrap();
-            let request = request(root.path());
-            let stream = if pooled {
-                run_codex_local_chat_stream_pooled(
-                    request,
-                    None,
-                    LocalAgentPermission::FullAccess,
-                    pool.clone(),
-                )
-            } else {
-                run_codex_local_chat_stream(request, None, LocalAgentPermission::FullAccess)
-            };
-            let ready = root.path().join("ready");
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !ready.exists() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("fake provider never reached {stage}, pooled={pooled}"));
-            let pid: i32 = std::fs::read_to_string(&ready)
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
-            drop(stream);
-            tokio::time::timeout(Duration::from_secs(3), async {
-                pool.shutdown().await;
-                while unsafe { libc::kill(pid, 0) } == 0 {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("cancellation wedged at {stage}, pooled={pooled}"));
-            std::fs::remove_file(ready).unwrap();
-        }
+    for stage in ["initialize", "thread/start", "turn/start", "stream"] {
+        std::fs::write(root.path().join("stage"), stage).unwrap();
+        let request = request(root.path());
+        let stream = run_codex_local_chat_stream(request, None, LocalAgentPermission::FullAccess);
+        let ready = root.path().join("ready");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("fake provider never reached {stage}"));
+        let pid: i32 = std::fs::read_to_string(&ready)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("cancellation wedged at {stage}"));
+        std::fs::remove_file(ready).unwrap();
     }
     #[cfg(feature = "claude")]
     {
