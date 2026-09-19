@@ -6148,7 +6148,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         ),
         tool(
             "await_watchers",
-            "Yield the active goal until a watcher reports progress, when every remaining step is blocked on watchers you already started. Only call this after finishing all other actionable work: name the watchers you are blocked on and say why nothing else can proceed. It does not pause, complete, or otherwise change the goal, and it does not stop any watcher. The next watcher update, message, or instruction resumes you automatically. If none of the named watchers is still running you get `not_waiting` back and should keep working.",
+            "Yield the active goal until a watcher reports progress, when every remaining step is blocked on watchers you already started. Only call this after finishing all other actionable work: name the watchers you are blocked on and say why nothing else can proceed. It does not pause, complete, or otherwise change the goal, and it does not stop any watcher. The next watcher update, human prompt, or explicit team wake resumes you automatically. Ordinary queued team reports are recorded without starting a turn. If none of the named watchers is still running you get `not_waiting` back and should keep working.",
             json!({
                 "type": "object",
                 "properties": {

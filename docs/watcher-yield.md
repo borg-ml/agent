@@ -45,13 +45,17 @@ of what you named:
 
 ## What wakes you
 
-Any real input ends the wait:
+Wake-capable input ends the wait:
 
 - a watcher event — **including from a watcher you did not name**, because
   unrelated output can still unblock the goal;
-- a human message, or team input;
-- any other queued instruction;
+- a human message or an explicit team wake/steer message;
 - all named watchers finishing or being stopped, even without output.
+
+Ordinary queued (`next_turn`) team reports do **not** end the wait. Reports
+already queued at the turn boundary, and reports arriving while parked, are
+recorded in the durable transcript without spending model turns. They remain
+context for the next real wake.
 
 An explicit user stop holds automatic continuation and watcher output until a
 human returns. A yield is also cleared when its goal leaves the active state.

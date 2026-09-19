@@ -7937,7 +7937,7 @@ async fn inactive_team_reports_settle_without_starting_a_provider_turn() {
         batch: Vec::new(),
     }]);
 
-    settle_inactive_team_notifications(
+    settle_non_waking_team_notifications(
         &mut runtime,
         &event_tx,
         session_id,
@@ -7987,7 +7987,7 @@ async fn inactive_wake_report_is_retained_for_the_root_provider_turn() {
         batch: Vec::new(),
     }]);
 
-    settle_inactive_team_notifications(
+    settle_non_waking_team_notifications(
         &mut runtime,
         &event_tx,
         session_id,
@@ -14813,6 +14813,7 @@ async fn a_completed_queued_team_turn_acknowledges_its_delivery() {
 /// though the goal is still active -- that is the whole point of the yield, and
 /// a watch-level test cannot show it. A real prompt must then resume it.
 struct YieldingExecutor {
+    queued_reports: Option<mpsc::Sender<HostCommand>>,
     calls: Arc<AtomicUsize>,
     watch_id: Arc<Mutex<Option<Uuid>>>,
     yielded: Arc<Notify>,
@@ -14863,6 +14864,22 @@ impl AgentTurnExecutor for YieldingExecutor {
                 .await
                 .expect("the yield is accepted");
             assert_eq!(waited["status"], "waiting", "{waited}");
+            if let Some(commands) = &self.queued_reports {
+                for index in 0..3 {
+                    commands
+                        .send(HostCommand::TeamPrompt {
+                            session_id: turn.session_id,
+                            message_id: Uuid::new_v4(),
+                            text: format!("old queued report {index}"),
+                            attachments: Vec::new(),
+                            output_schema: None,
+                            delivery: PromptDelivery::Queue,
+                        })
+                        .await
+                        .unwrap();
+                }
+            }
+
             if self.stop_after_yield {
                 let tools = turn.agent_tools.clone();
                 tokio::spawn(async move {
@@ -14894,6 +14911,15 @@ impl AgentTurnExecutor for YieldingExecutor {
 
 #[tokio::test]
 async fn an_explicit_watcher_yield_stops_automatic_goal_turns_until_real_input() {
+    assert_watcher_yield_blocks_automatic_turns(false).await;
+}
+
+#[tokio::test]
+async fn queued_team_reports_do_not_spend_turns_while_yielded() {
+    assert_watcher_yield_blocks_automatic_turns(true).await;
+}
+
+async fn assert_watcher_yield_blocks_automatic_turns(queue_reports: bool) {
     let root = tempdir().unwrap();
     let root_path = root.path().to_path_buf();
     let session_id = Uuid::new_v4();
@@ -14903,6 +14929,7 @@ async fn an_explicit_watcher_yield_stops_automatic_goal_turns_until_real_input()
     let calls = Arc::new(AtomicUsize::new(0));
     let yielded = Arc::new(Notify::new());
     let executor = Arc::new(YieldingExecutor {
+        queued_reports: queue_reports.then(|| command_tx.clone()),
         calls: Arc::clone(&calls),
         watch_id: Arc::new(Mutex::new(None)),
         yielded: Arc::clone(&yielded),
@@ -14948,8 +14975,20 @@ async fn an_explicit_watcher_yield_stops_automatic_goal_turns_until_real_input()
     // The goal is active and unbudgeted, so without the yield the session would
     // immediately issue continuation turns. It must stay quiet instead.
     let mut journalled_yield = false;
+    let mut settled_reports = 0;
     let quiet = tokio::time::timeout(Duration::from_secs(3), async {
         while let Some(event) = event_rx.recv().await {
+            if let SessionEventKind::Message {
+                actor: EventActor::System,
+                status: MessageStatus::Complete,
+                text,
+                ..
+            } = &event.kind
+                && text.starts_with("old queued report")
+            {
+                settled_reports += 1;
+            }
+
             if let SessionEventKind::ProviderEvent { kind, .. } = &event.kind
                 && kind == "goal_yielded"
             {
@@ -14966,18 +15005,54 @@ async fn an_explicit_watcher_yield_stops_automatic_goal_turns_until_real_input()
         "a held yield must not spend any further model turns"
     );
 
+    if queue_reports {
+        assert_eq!(
+            settled_reports, 3,
+            "queued reports remain durable without turns"
+        );
+        let late_report = Uuid::new_v4();
+        command_tx
+            .send(HostCommand::TeamPrompt {
+                session_id,
+                message_id: late_report,
+                text: "report arriving after the yield parked".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Queue,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = event_rx.recv().await {
+                if matches!(event.kind, SessionEventKind::Message { message_id, status: MessageStatus::Complete, .. } if message_id == late_report) {
+                    break;
+                }
+            }
+        }).await.expect("the late report is recorded without waking");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     // Real input resumes it.
-    command_tx
-        .send(HostCommand::Prompt {
+    let wake = if queue_reports {
+        HostCommand::TeamPrompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "explicit wake: new actionable result".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        }
+    } else {
+        HostCommand::Prompt {
             session_id,
             message_id: Uuid::new_v4(),
             text: "status?".to_string(),
             attachments: Vec::new(),
             output_schema: None,
             delivery: PromptDelivery::Steer,
-        })
-        .await
-        .unwrap();
+        }
+    };
+    command_tx.send(wake).await.unwrap();
     tokio::time::timeout(Duration::from_secs(20), yielded.notified())
         .await
         .expect("real input resumes the session");
@@ -15005,6 +15080,7 @@ async fn a_stopped_silent_watcher_ends_the_yield_instead_of_stranding_the_goal()
     let calls = Arc::new(AtomicUsize::new(0));
     let yielded = Arc::new(Notify::new());
     let executor = Arc::new(YieldingExecutor {
+        queued_reports: None,
         calls: Arc::clone(&calls),
         watch_id: Arc::new(Mutex::new(None)),
         yielded: Arc::clone(&yielded),
@@ -15101,6 +15177,7 @@ async fn an_interrupt_while_yielded_holds_watcher_output_until_a_human_returns()
     let calls = Arc::new(AtomicUsize::new(0));
     let yielded = Arc::new(Notify::new());
     let executor = Arc::new(YieldingExecutor {
+        queued_reports: None,
         calls: Arc::clone(&calls),
         watch_id: Arc::new(Mutex::new(None)),
         yielded: Arc::clone(&yielded),
@@ -15223,6 +15300,7 @@ async fn a_watcher_that_finishes_while_yielded_resumes_the_goal_without_ending_t
     let calls = Arc::new(AtomicUsize::new(0));
     let yielded = Arc::new(Notify::new());
     let executor = Arc::new(YieldingExecutor {
+        queued_reports: None,
         calls: Arc::clone(&calls),
         watch_id: Arc::new(Mutex::new(None)),
         yielded: Arc::clone(&yielded),

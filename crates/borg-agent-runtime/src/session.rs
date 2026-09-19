@@ -2107,8 +2107,8 @@ async fn run_agent_session_store_kernel_inner(
         let goal_was_active = goal
             .as_ref()
             .is_some_and(|goal| goal.status == GoalStatus::Active);
-        if !goal_was_active || user_stop {
-            settle_inactive_team_notifications(
+        if !goal_was_active || user_stop || watches.yielded().is_some() {
+            settle_non_waking_team_notifications(
                 &mut journal,
                 &events,
                 session_id,
@@ -2175,8 +2175,8 @@ async fn run_agent_session_store_kernel_inner(
             let goal_active_after_boundary = goal
                 .as_ref()
                 .is_some_and(|goal| goal.status == GoalStatus::Active);
-            if !goal_active_after_boundary || user_stop {
-                settle_inactive_team_notifications(
+            if !goal_active_after_boundary || user_stop || watches.yielded().is_some() {
+                settle_non_waking_team_notifications(
                     &mut journal,
                     &events,
                     session_id,
@@ -2582,9 +2582,10 @@ async fn run_agent_session_store_kernel_inner(
                             && !is_autonomy
                             && (user_stop
                                 || (delivery == PromptDelivery::Queue
-                                    && !goal
-                                        .as_ref()
-                                        .is_some_and(|goal| goal.status == GoalStatus::Active)))
+                                    && (watches.yielded().is_some()
+                                        || !goal.as_ref().is_some_and(|goal| {
+                                            goal.status == GoalStatus::Active
+                                        }))))
                         {
                             settle_team_notification(
                                 &mut journal,
@@ -7846,14 +7847,14 @@ async fn settle_team_notification(
     Ok(())
 }
 
-/// An idle root without an active durable goal must not spend provider turns
-/// replying to internal reports. The report remains present in the durable
-/// transcript/subagent projection and becomes context for later turns, but it
+/// An idle root without an active durable goal, or explicitly yielded to
+/// watchers, must not spend provider turns replying to queued internal reports.
+/// The report remains present in the durable transcript/subagent projection and becomes context for later turns, but it
 /// cannot seize the boundary from a human or make Escape advance to another
 /// invisible system turn. While the user-stop gate is engaged this also
 /// settles `Steer`-delivery reports that would otherwise be retained for a
 /// root turn.
-async fn settle_inactive_team_notifications(
+async fn settle_non_waking_team_notifications(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
