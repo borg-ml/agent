@@ -155,23 +155,6 @@ pub async fn refresh_opencode_go_model_catalog() -> anyhow::Result<Vec<DynamicMo
         entry.id = format!("opencode-go/{}", entry.id);
         entry.detail = Some("OpenCode Go subscription · uses your Go allowance".to_string());
     }
-    // The installed adapter must understand the model's wire protocol too.
-    // Its catalog can be narrower than the service's list of model IDs.
-    if let Ok(Ok(output)) = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::process::Command::new("opencode")
-            .args(["models", "opencode-go"])
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-        && output.status.success()
-    {
-        let supported = String::from_utf8_lossy(&output.stdout);
-        entries.retain(|entry| supported.lines().any(|line| line.trim() == entry.id));
-    }
     anyhow::ensure!(
         !entries.is_empty(),
         "OpenCode Go returned no models; try /model again"

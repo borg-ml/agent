@@ -1244,7 +1244,11 @@ async fn probe_provider(
     managed_kimi: bool,
     mode: ProviderProbeMode,
 ) -> ProviderCapability {
-    let (version, subscription_authenticated) = if provider == CodingProvider::Codex {
+    let native_go = provider == CodingProvider::OpenCode
+        && borg_provider::credentials::opencode_go_api_key().is_some();
+    let (version, subscription_authenticated) = if native_go {
+        (None, true)
+    } else if provider == CodingProvider::Codex {
         (
             None,
             borg_provider::openai_subscription::account()
@@ -1368,7 +1372,11 @@ async fn probe_provider(
                 || borg_provider::credentials::opencode_go_api_key().is_some()
             {
                 auth_methods.push(ProviderAuthMethod::Subscription);
-                detail.push("OpenCode provider credentials available");
+                detail.push(if native_go {
+                    "OpenCode Go native subscription available; other routes require OpenCode"
+                } else {
+                    "OpenCode provider credentials available"
+                });
             }
             (!auth_methods.is_empty()).then_some(BillingLane::Subscription)
         }
@@ -1460,6 +1468,7 @@ async fn probe_provider(
         | CodingProvider::Glm
         | CodingProvider::OpenRouter
         | CodingProvider::OpenAiCompatible => true,
+        CodingProvider::OpenCode if native_go => true,
         CodingProvider::Claude | CodingProvider::OpenCode => match mode {
             ProviderProbeMode::Admission => {
                 executable_in_path(Path::new(provider.executable())).is_some()
