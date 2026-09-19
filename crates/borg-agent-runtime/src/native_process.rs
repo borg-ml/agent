@@ -50,6 +50,9 @@ const MAX_SPOOLED_ATTACHMENTS_PER_DRAIN: usize = 16;
 /// slightly too large is still reported as dropped by the harness rather than
 /// vanishing here without explanation.
 const MAX_SPOOLED_ATTACHMENT_BYTES: u64 = 12 * 1024 * 1024;
+/// Per-drain ceiling across all images together, so many merely-legal files
+/// cannot add up to an unbounded read.
+const MAX_SPOOL_DRAIN_TOTAL_BYTES: u64 = 24 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessManager {
@@ -159,6 +162,12 @@ pub struct ProcessSnapshot {
     /// every model backend gets pixels instead of base64 text.
     #[serde(rename = "borg_attachments", skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ModelInputAttachment>,
+    /// Images the process offered that could not be delivered, and why. Named
+    /// apart from the harness' own `dropped_attachments` so the two sets of
+    /// reasons cannot overwrite each other, and reported to the model so a
+    /// missing screenshot is explained rather than silently absent.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attachment_errors: Vec<String>,
 }
 
 impl Default for ProcessManager {
@@ -725,7 +734,16 @@ impl HeadTailBuffer {
 /// runs with no image channel, exactly as it did before this channel existed.
 fn create_attachment_spool(process_id: Uuid) -> Option<PathBuf> {
     let dir = std::env::temp_dir().join(format!("borg-attachments-{}", process_id.simple()));
-    match std::fs::create_dir_all(&dir) {
+    let mut builder = std::fs::DirBuilder::new();
+    // A screenshot can show anything on the user's desktop, and the system
+    // temporary directory is shared. Owner-only, and `create_new` semantics so
+    // this never adopts a directory — or a symlink — somebody else put here.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(&dir) {
         Ok(()) => Some(dir),
         Err(error) => {
             tracing::debug!(
@@ -746,9 +764,15 @@ fn create_attachment_spool(process_id: Uuid) -> Option<PathBuf> {
 /// half-written screenshot can never be read. And every file that is looked at
 /// is removed, so an image is delivered exactly once: re-reading a still-running
 /// session cannot resend — or re-bill — an image the model already saw.
-fn drain_attachment_spool(dir: &Path) -> Vec<ModelInputAttachment> {
+///
+/// Everything read here is chosen by the child process, so the read is bounded
+/// per file and in total, and only regular files are opened: a symlink dropped
+/// in the spool must never make the runtime read an unrelated file and hand it
+/// to the model. A refused image is reported rather than silently discarded —
+/// a missing screenshot the model cannot explain is worse than an error it can.
+fn drain_attachment_spool(dir: &Path) -> (Vec<ModelInputAttachment>, Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     // Writers prefix a timestamp, so sorting by name replays the images in the
     // order they were produced even across several commands in one session.
@@ -758,31 +782,73 @@ fn drain_attachment_spool(dir: &Path) -> Vec<ModelInputAttachment> {
         .filter(|path| path.extension().is_some_and(|suffix| suffix == "json"))
         .collect();
     files.sort();
+
     let mut attachments = Vec::new();
+    let mut errors = Vec::new();
+    let mut total = 0u64;
     for path in files {
-        let oversized = std::fs::metadata(&path)
-            .is_ok_and(|metadata| metadata.len() > MAX_SPOOLED_ATTACHMENT_BYTES);
-        let parsed = if oversized || attachments.len() >= MAX_SPOOLED_ATTACHMENTS_PER_DRAIN {
-            None
-        } else {
-            std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<ModelInputAttachment>(&bytes).ok())
-        };
-        // Removed whether or not it parsed: a file that cannot be delivered
-        // must not be retried against a later, unrelated tool result.
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let outcome = read_spooled_attachment(&path, attachments.len(), total);
+        // Removed whether or not it could be delivered: a file that failed
+        // once must not be retried against a later, unrelated tool result.
         let _ = std::fs::remove_file(&path);
-        if let Some(attachment) = parsed {
-            attachments.push(attachment);
+        match outcome {
+            Ok(attachment) => {
+                total = total.saturating_add(attachment.data_base64.len() as u64);
+                attachments.push(attachment);
+            }
+            Err(error) => errors.push(format!("{name}: {error}")),
         }
     }
-    attachments
+    (attachments, errors)
+}
+
+fn read_spooled_attachment(
+    path: &Path,
+    delivered: usize,
+    total: u64,
+) -> Result<ModelInputAttachment> {
+    ensure!(
+        delivered < MAX_SPOOLED_ATTACHMENTS_PER_DRAIN,
+        "more than {MAX_SPOOLED_ATTACHMENTS_PER_DRAIN} images in one result"
+    );
+    // `symlink_metadata` does not follow the link, so this rejects the link
+    // itself instead of quietly measuring whatever it points at.
+    let metadata = std::fs::symlink_metadata(path).context("unreadable")?;
+    ensure!(metadata.is_file(), "not a regular file");
+    ensure!(
+        metadata.len() <= MAX_SPOOLED_ATTACHMENT_BYTES,
+        "image exceeds {MAX_SPOOLED_ATTACHMENT_BYTES} bytes"
+    );
+    let remaining = MAX_SPOOL_DRAIN_TOTAL_BYTES.saturating_sub(total);
+    ensure!(
+        remaining > 0,
+        "images exceed the total size allowed per result"
+    );
+
+    // Bounded even if the file grew, or was swapped, between the check above
+    // and this open: `take` is what actually limits the read.
+    let limit = metadata.len().min(remaining);
+    let mut bytes = Vec::with_capacity(limit as usize);
+    // Fully qualified: `read_to_end` would otherwise resolve to tokio's async
+    // extension trait, which is in scope here.
+    let mut reader =
+        std::io::Read::take(std::fs::File::open(path).context("unreadable")?, limit + 1);
+    std::io::Read::read_to_end(&mut reader, &mut bytes).context("unreadable")?;
+    ensure!(
+        bytes.len() as u64 <= limit,
+        "image grew past its allowed size"
+    );
+    serde_json::from_slice::<ModelInputAttachment>(&bytes).context("not a valid image attachment")
 }
 
 fn snapshot(process_id: Uuid, entry: &ProcessEntry, max_output_tokens: usize) -> ProcessSnapshot {
     // Drained before the output lock is taken: this touches the filesystem and
     // has nothing to do with the stdout buffers.
-    let attachments = entry
+    let (attachments, attachment_errors) = entry
         .attachment_spool
         .as_deref()
         .map(drain_attachment_spool)
@@ -811,6 +877,7 @@ fn snapshot(process_id: Uuid, entry: &ProcessEntry, max_output_tokens: usize) ->
         stderr_omitted_bytes,
         error: status.error,
         attachments,
+        attachment_errors,
     }
 }
 
@@ -2236,10 +2303,10 @@ mod tests {
         )
         .expect("write attachment");
 
-        assert_eq!(drain_attachment_spool(spool.path()).len(), 1);
+        assert_eq!(drain_attachment_spool(spool.path()).0.len(), 1);
         // A second read of a still-running session must not resend — or
         // re-bill — an image the model has already been shown.
-        assert!(drain_attachment_spool(spool.path()).is_empty());
+        assert!(drain_attachment_spool(spool.path()).0.is_empty());
     }
 
     #[test]
@@ -2254,7 +2321,7 @@ mod tests {
         )
         .expect("write partial");
 
-        assert!(drain_attachment_spool(spool.path()).is_empty());
+        assert!(drain_attachment_spool(spool.path()).0.is_empty());
         assert!(
             spool.path().join("0001.tmp").exists(),
             "an in-flight write must be left alone, not deleted"
@@ -2293,5 +2360,99 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(!spool.exists(), "the spool outlived the process: {spool:?}");
+    }
+
+    /// A screenshot can show anything on the user's desktop, and the spool
+    /// lives in a shared temporary directory.
+    #[test]
+    #[cfg(unix)]
+    fn the_spool_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let spool = create_attachment_spool(Uuid::new_v4()).expect("spool");
+        let mode = std::fs::metadata(&spool)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o700, "spool is readable by other users");
+        let _ = std::fs::remove_dir_all(&spool);
+    }
+
+    /// Everything in the spool is chosen by the child process, so a link
+    /// planted there must never make the runtime read an unrelated file and
+    /// hand its contents to the model.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_in_the_spool_is_refused_and_reported() {
+        let spool = tempfile::tempdir().expect("spool");
+        let secret = spool.path().join("secret.txt");
+        std::fs::write(
+            &secret,
+            r#"{"media_type":"image/png","data_base64":"c3Vwb3Nlc2VjcmV0"}"#,
+        )
+        .expect("write target");
+        std::os::unix::fs::symlink(&secret, spool.path().join("0001.json")).expect("symlink");
+
+        let (attachments, errors) = drain_attachment_spool(spool.path());
+
+        assert!(
+            attachments.is_empty(),
+            "followed a symlink out of the spool"
+        );
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("not a regular file"), "{errors:?}");
+        assert!(secret.exists(), "the link target must not be touched");
+    }
+
+    #[test]
+    fn an_oversized_image_is_refused_with_a_visible_reason() {
+        let spool = tempfile::tempdir().expect("spool");
+        // Larger than the per-file bound, so it must never be read into memory.
+        let bloated = vec![b'x'; (MAX_SPOOLED_ATTACHMENT_BYTES + 1) as usize];
+        std::fs::write(spool.path().join("0001.json"), &bloated).expect("write");
+
+        let (attachments, errors) = drain_attachment_spool(spool.path());
+
+        assert!(attachments.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("exceeds"), "{errors:?}");
+        // A refused image is still consumed, so it cannot reappear later
+        // attached to an unrelated command.
+        assert!(!spool.path().join("0001.json").exists());
+    }
+
+    /// The reason a refusal is reported at all: a screenshot that silently
+    /// fails to arrive looks to the model exactly like a command that took no
+    /// screenshot, and it will confidently describe something it cannot see.
+    #[test]
+    fn refusals_reach_the_model_through_the_snapshot() {
+        let spool = tempfile::tempdir().expect("spool");
+        std::fs::write(spool.path().join("0001.json"), b"not json at all").expect("write");
+
+        let (_, errors) = drain_attachment_spool(spool.path());
+
+        assert_eq!(errors.len(), 1);
+        let snapshot = ProcessSnapshot {
+            session_id: Uuid::new_v4(),
+            running: false,
+            exit_code: Some(0),
+            timed_out: false,
+            command: "borg call computer_use".to_string(),
+            cwd: PathBuf::from("/tmp"),
+            stdout: String::new(),
+            stderr: String::new(),
+            stdout_omitted_bytes: 0,
+            stderr_omitted_bytes: 0,
+            error: None,
+            attachments: Vec::new(),
+            attachment_errors: errors,
+        };
+        let result = serde_json::to_value(&snapshot).expect("serialize");
+        assert!(
+            result["attachment_errors"][0]
+                .as_str()
+                .is_some_and(|reason| reason.contains("not a valid image attachment")),
+            "the model cannot see why the image is missing: {result}"
+        );
     }
 }

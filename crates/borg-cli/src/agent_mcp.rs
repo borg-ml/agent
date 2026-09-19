@@ -72,6 +72,9 @@ pub(crate) async fn call_tool(name: &str, arguments: Option<&str>) -> Result<()>
 const SPOOLED_IMAGES_KEY: &str = "spooled_images";
 const ATTACHMENTS_KEY: &str = "borg_attachments";
 const ATTACHMENT_SPOOL_ENV: &str = "BORG_ATTACHMENT_SPOOL";
+/// Why images stayed inline, when they did. Reported rather than swallowed so
+/// a degraded result is visible instead of looking like a clean one.
+const SPOOL_ERROR_KEY: &str = "spool_error";
 /// Tool results are shallow envelopes; this is enough to reach the images
 /// without ever walking a deep structure a capability happens to return.
 const MAX_ATTACHMENT_SEARCH_DEPTH: usize = 6;
@@ -107,19 +110,31 @@ fn spool_attachments_in(value: &mut Value, dir: &std::path::Path, depth: usize) 
     // Capabilities differ in where they put the key: beside the result, or
     // nested under `value` for a runtime script. Search rather than assume.
     if let Some(Value::Array(attachments)) = object.remove(ATTACHMENTS_KEY) {
-        let mut written = 0usize;
+        let mut written = Vec::new();
+        let mut failure = None;
         for (index, attachment) in attachments.iter().enumerate() {
-            if write_spooled_attachment(dir, attachment, index).is_ok() {
-                written += 1;
+            match write_spooled_attachment(dir, attachment, index) {
+                Ok(path) => written.push(path),
+                Err(error) => {
+                    failure = Some(format!("image #{index}: {error}"));
+                    break;
+                }
             }
         }
-        if written == attachments.len() {
-            object.insert(SPOOLED_IMAGES_KEY.to_string(), json!(written));
-        } else {
-            // Anything that could not be spooled goes back inline. Truncated
-            // base64 in stdout is poor, but silently dropping an image the
-            // capability produced is worse.
-            object.insert(ATTACHMENTS_KEY.to_string(), Value::Array(attachments));
+        match failure {
+            None => {
+                object.insert(SPOOLED_IMAGES_KEY.to_string(), json!(written.len()));
+            }
+            Some(error) => {
+                // Put the whole set back inline rather than dropping images.
+                // The already-written files must go first: leaving them would
+                // deliver those images twice, once as files and once as text.
+                for path in &written {
+                    let _ = std::fs::remove_file(path);
+                }
+                object.insert(ATTACHMENTS_KEY.to_string(), Value::Array(attachments));
+                object.insert(SPOOL_ERROR_KEY.to_string(), json!(error));
+            }
         }
     }
     for (_, nested) in object.iter_mut() {
@@ -127,32 +142,50 @@ fn spool_attachments_in(value: &mut Value, dir: &std::path::Path, depth: usize) 
     }
 }
 
-/// Write one image into the spool.
+/// Write one image into the spool, returning where it landed.
 ///
-/// The runtime reads any file it finds, so a partly written file would be read
-/// as a corrupt image. Writing to a `.tmp` name and renaming into place makes
-/// the file appear atomically and complete. The timestamp prefix keeps images
-/// in production order when one `exec` session makes several calls, and the
-/// process id keeps two concurrent commands from colliding on a name.
+/// The runtime reads any complete file it finds, so a partly written file
+/// would be read as a corrupt image. Writing to a `.tmp` name and renaming
+/// into place makes the file appear atomically and whole. The timestamp prefix
+/// keeps images in production order when one `exec` session makes several
+/// calls, and the process id keeps concurrent commands from colliding.
+///
+/// A screenshot can show anything on the user's desktop, so the file is
+/// owner-only, and `create_new` refuses to follow a symlink or overwrite an
+/// existing file planted under the name this process is about to use.
 fn write_spooled_attachment(
     dir: &std::path::Path,
     attachment: &Value,
     index: usize,
-) -> Result<()> {
+) -> Result<std::path::PathBuf> {
+    use std::io::Write as _;
+
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
     let name = format!("{nanos:039}-{}-{index:03}", std::process::id());
     let temporary = dir.join(format!("{name}.tmp"));
-    std::fs::write(&temporary, serde_json::to_vec(attachment)?)?;
-    let final_path = dir.join(format!("{name}.json"));
-    match std::fs::rename(&temporary, &final_path) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            Err(error.into())
-        }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
+    let write = |temporary: &std::path::Path| -> Result<()> {
+        let mut file = options.open(temporary)?;
+        file.write_all(&serde_json::to_vec(attachment)?)?;
+        // The runtime may read this the instant it is renamed.
+        file.sync_all()?;
+        Ok(())
+    };
+    write(&temporary).with_context(|| format!("write {}", temporary.display()))?;
+    let final_path = dir.join(format!("{name}.json"));
+    if let Err(error) = std::fs::rename(&temporary, &final_path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(anyhow::Error::new(error).context(format!("publish {}", final_path.display())));
+    }
+    Ok(final_path)
 }
 
 async fn serve<R, W>(endpoint: Arc<AgentToolEndpoint>, read: R, mut write: W) -> Result<()>
@@ -762,11 +795,79 @@ mod tests {
             .collect();
         assert_eq!(spooled.len(), 1);
         // Only a renamed, complete file is ever visible to the runtime.
-        assert_eq!(spooled[0].extension().and_then(|s| s.to_str()), Some("json"));
+        assert_eq!(
+            spooled[0].extension().and_then(|s| s.to_str()),
+            Some("json")
+        );
         let written: Value =
             serde_json::from_slice(&std::fs::read(&spooled[0]).expect("read")).expect("json");
         assert_eq!(written["media_type"], "image/png");
         assert_eq!(written["data_base64"], image);
+    }
+
+    /// The spooled file holds a full screenshot of the user's desktop.
+    #[test]
+    #[cfg(unix)]
+    fn a_spooled_image_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let spool = tempfile::tempdir().expect("spool");
+        let mut result =
+            json!({"borg_attachments": [{"media_type": "image/png", "data_base64": "AAAA"}]});
+
+        spool_attachments_in(&mut result, spool.path(), 0);
+
+        let written = std::fs::read_dir(spool.path())
+            .expect("read spool")
+            .flatten()
+            .next()
+            .expect("one image")
+            .path();
+        let mode = std::fs::metadata(&written)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "screenshot is readable by other users");
+    }
+
+    /// A failed write must not leave half the images in the spool while the
+    /// whole set also goes back into stdout: the model would be shown the
+    /// same screenshot twice, once as pixels and once as text.
+    #[test]
+    #[cfg(unix)]
+    fn a_partial_spool_failure_does_not_deliver_an_image_twice() {
+        let spool = tempfile::tempdir().expect("spool");
+        let image = json!({"media_type": "image/png", "data_base64": "AAAA"});
+        let mut result = json!({"borg_attachments": [image.clone(), image.clone()]});
+        // Make the second write fail by removing write access to the spool
+        // after the first image has landed.
+        let first = write_spooled_attachment(spool.path(), &image, 0).expect("seed");
+        std::fs::remove_file(&first).expect("clear seed");
+        let mut permissions = std::fs::metadata(spool.path())
+            .expect("metadata")
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(spool.path(), permissions).expect("lock spool");
+
+        spool_attachments_in(&mut result, spool.path(), 0);
+
+        let mut permissions = std::fs::metadata(spool.path())
+            .expect("metadata")
+            .permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(spool.path(), permissions).expect("unlock spool");
+
+        assert_eq!(
+            std::fs::read_dir(spool.path()).unwrap().count(),
+            0,
+            "a spooled file survived the fallback"
+        );
+        assert_eq!(result["borg_attachments"].as_array().map(Vec::len), Some(2));
+        assert!(
+            result[SPOOL_ERROR_KEY].is_string(),
+            "the failure was not reported: {result}"
+        );
     }
 
     #[test]

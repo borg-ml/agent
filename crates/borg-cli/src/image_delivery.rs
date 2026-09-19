@@ -44,7 +44,9 @@ pub(crate) async fn run(files: Vec<PathBuf>, session: Option<Uuid>) -> Result<()
         } else {
             anyhow::bail!("expected PNG or JPEG content: {}", path.display());
         };
-        attachments.push(json!({"media_type": media_type, "data_base64": base64::engine::general_purpose::STANDARD.encode(bytes)}));
+        if session.is_none() {
+            attachments.push(json!({"media_type": media_type, "data_base64": base64::engine::general_purpose::STANDARD.encode(bytes)}));
+        }
         paths.push(path);
     }
     if let Some(session_id) = session {
@@ -68,8 +70,13 @@ pub(crate) async fn run(files: Vec<PathBuf>, session: Option<Uuid>) -> Result<()
             json!({"message_id": message_id, "session_id": session_id, "images": count, "status": "admitted", "note": "Recipient pixel inspection is not yet verified; explicit user stop remains authoritative."})
         );
     } else {
+        let expected = attachments.len() as u64;
         let output =
             crate::agent_mcp::spool_result_attachments(json!({"borg_attachments": attachments}));
+        ensure!(
+            output["spooled_images"].as_u64() == Some(expected),
+            "failed to spool all images; no inline base64 fallback will be printed"
+        );
         println!("{}", serde_json::to_string(&output)?);
     }
     Ok(())

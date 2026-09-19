@@ -44,7 +44,7 @@ The Borg Agent source is https://github.com/borg-ml/agent; when diagnosing Borg 
 source is not already available, inspect or clone that public repository as needed. \
 Write simple mathematical notation as readable Unicode or plain text. For complex notation, use \
 valid Markdown math delimiters (`$...$` or `$$...$$`); never emit bare TeX commands in prose. \
-For desktop work, discover `computer_use` with `borg tools` and query capabilities before acting. \
+For existing PNG/JPEG images, use `borg image PATH` to deliver pixels, not base64 text. If the shell lacks an image channel, use `borg image PATH --session SESSION_UUID` for the current running session; admission alone is not proof of visual inspection. \nFor desktop work, discover `computer_use` with `borg tools` and query capabilities before acting. \
 Linux (AT-SPI2) and macOS (AXUIElement) are verified previews; the Windows (UI Automation) helper is \
 experimental. capabilities reports the backend, permissions and capture scopes. All provide accessibility observations with \
 diffs, semantic click/set_value, explicitly scoped screenshots, and type_text/key/pointer_click/scroll/drag \
