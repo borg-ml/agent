@@ -1850,22 +1850,3 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod repro_tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn repro_after_fix() {
-        let root = tempfile::tempdir().expect("root");
-        tokio::fs::write(root.path().join("a.ts"), "let x: number = 'nope';\n")
-            .await
-            .expect("write ts");
-        let service = LspService::new(root.path());
-        let _ = service.diagnostics(Path::new("a.ts")).await;
-        let status = service.status().await;
-        println!("active_servers = {}", status["active_servers"]);
-        println!("active_workspaces = {}", status["active_workspaces"]);
-        let ws = service.workspace_diagnostics(None).await;
-        println!("WORKSPACE = {}", serde_json::to_string_pretty(&ws.unwrap()).unwrap());
-    }
-}
