@@ -4326,6 +4326,21 @@ async fn image_routing_fixture(
             .await
             .unwrap();
     }
+    // Both sessions record the SAME host. That is one of the three things the
+    // attachment preflight accepts as proof of a shared blob store; without
+    // it these sessions are merely two rows that nothing places on this
+    // machine.
+    let host_id = Uuid::new_v4();
+    for session in [sender, recipient] {
+        let binding = store.workspace_binding(session).await.unwrap().unwrap();
+        store
+            .attach_workspace(crate::SessionWorkspaceBinding {
+                host_id: Some(host_id),
+                ..binding
+            })
+            .await
+            .unwrap();
+    }
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory,
         sender,
@@ -4338,23 +4353,24 @@ async fn image_routing_fixture(
     (coordinator, sender, recipient, store, scratch)
 }
 
-/// A participant address carries no evidence that the recipient resolves
-/// digests in this host's store, and there is no cross-host byte transfer, so
-/// the images would arrive unresolvable. The refusal has to land before the
-/// first durable write: this route can create a direct workspace and append a
-/// message, and a message admitted without its pictures is the exact fake
-/// delivery this path exists to prevent.
+/// A participant with no session in this installation is reached through the
+/// workspace, not through a process here, so nothing can resolve its image
+/// digests. The refusal has to land before the first durable write: this route
+/// creates a direct workspace and appends a message, and a message admitted
+/// without its pictures is the fake delivery this path exists to prevent.
+///
+/// The guard must sit AFTER the local-session redirect, though. Participant
+/// addressing is the normal way to reach a known peer, and refusing every
+/// attachment on sight made same-host forwarding work only through
+/// session:<UUID> syntax -- see the sibling test.
 #[tokio::test]
-async fn forwarding_images_to_a_participant_address_is_refused_before_anything_durable() {
+async fn forwarding_images_to_a_participant_with_no_local_session_is_refused_before_durable_writes()
+{
     let directory = tempdir().unwrap();
-    let (coordinator, sender, recipient, store, scratch) =
+    let (coordinator, sender, _recipient, _store, scratch) =
         image_routing_fixture(directory.path()).await;
-    let recipient_participant = store
-        .workspace_binding(recipient)
-        .await
-        .unwrap()
-        .unwrap()
-        .participant_id;
+    // Discovered elsewhere: no binding here, so the local redirect cannot fire.
+    let elsewhere = Uuid::new_v4();
 
     let source = directory.path().join("screenshot.png");
     std::fs::write(&source, sample_png()).unwrap();
@@ -4368,52 +4384,34 @@ async fn forwarding_images_to_a_participant_address_is_refused_before_anything_d
     let refusal = coordinator
         .route_workspace_participant_message_as(
             sender,
-            recipient_participant,
+            elsewhere,
             "here is the failing frame",
             options,
             DeliveryMode::NextTurn,
         )
         .await;
     let error = match refusal {
-        Ok(_) => panic!("images addressed to a participant must be refused"),
+        Ok(_) => panic!("images to a participant with no local session must be refused"),
         Err(error) => format!("{error:#}"),
     };
     assert!(
-        error.contains("session on this host"),
-        "refusal should say what would work instead, got: {error}"
+        error.contains("no local session here"),
+        "refusal should say why, got: {error}"
     );
 
-    // Nothing may have been admitted: no text-without-pictures left behind.
-    assert!(
-        coordinator
-            .unread_messages_for_session(recipient)
-            .await
-            .unwrap()
-            .is_empty(),
-        "a refused image message must not leave a durable message behind"
-    );
-
-    // Positive control: the same route accepts the same message without
-    // images, so the assertion above is about attachments and not a broken
-    // fixture.
+    // Positive control: the identical message without images still routes,
+    // creating the direct workspace the refusal above had to prevent. Without
+    // this the assertion could pass on a broken fixture.
     coordinator
         .route_workspace_participant_message_as(
             sender,
-            recipient_participant,
+            elsewhere,
             "here is the failing frame",
             TeamMessageOptions::default(),
             DeliveryMode::NextTurn,
         )
         .await
         .expect("the same message without images must still route");
-    assert_eq!(
-        coordinator
-            .unread_messages_for_session(recipient)
-            .await
-            .unwrap()
-            .len(),
-        1
-    );
     scratch.discard().await;
 }
 
@@ -4757,6 +4755,144 @@ async fn images_sent_to_a_local_subagent_arrive_in_its_model_turn() {
         std::fs::read(&delivered[0]).unwrap(),
         original,
         "the turn carried a file, but not the bytes that were sent"
+    );
+    scratch.discard().await;
+}
+
+/// participant:<id> is the ordinary way to address a discovered peer, and for
+/// a peer with a session here it redirects to session routing. A guard placed
+/// ahead of that redirect refused images to same-host peers that were
+/// perfectly reachable, leaving forwarding working only through session:<UUID>
+/// syntax. The images must survive the redirect.
+#[tokio::test]
+async fn images_reach_a_same_host_peer_through_ordinary_participant_addressing() {
+    let directory = tempdir().unwrap();
+    let (coordinator, sender, recipient, store, scratch) =
+        image_routing_fixture(directory.path()).await;
+    let recipient_participant = store
+        .workspace_binding(recipient)
+        .await
+        .unwrap()
+        .unwrap()
+        .participant_id;
+
+    let source = directory.path().join("frame.png");
+    let original = sample_png();
+    std::fs::write(&source, &original).unwrap();
+    let options = TeamMessageOptions {
+        attachments: capture_message_attachments(directory.path(), &[source])
+            .await
+            .unwrap(),
+        ..TeamMessageOptions::default()
+    };
+
+    coordinator
+        .route_workspace_participant_message_as(
+            sender,
+            recipient_participant,
+            "compare this against the baseline",
+            options,
+            DeliveryMode::NextTurn,
+        )
+        .await
+        .expect("a same-host peer addressed as a participant must accept images");
+
+    let unread = coordinator
+        .unread_messages_for_session(recipient)
+        .await
+        .unwrap();
+    let delivered = unread
+        .iter()
+        .find(|message| !message.attachments.is_empty())
+        .expect("the forwarded image must survive the participant redirect");
+    assert_eq!(delivered.attachments.len(), 1);
+    assert_eq!(
+        std::fs::read(&delivered.attachments[0]).unwrap(),
+        original,
+        "the peer received a file, but not the bytes that were sent"
+    );
+    scratch.discard().await;
+}
+
+/// Absent host bindings mean "nothing recorded a host", which is not the same
+/// as "same host". Treating missing information as local would forward images
+/// to a recipient whose store cannot resolve them, and the refusal must leave
+/// no durable trace behind.
+#[tokio::test]
+async fn images_are_refused_when_nothing_proves_the_recipient_shares_this_host() {
+    let directory = tempdir().unwrap();
+    let workspace_id = Uuid::new_v4();
+    let sender = Uuid::new_v4();
+    let recipient = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    for session in [sender, recipient] {
+        store
+            .create_session_in_workspace(session, workspace_id)
+            .await
+            .unwrap();
+    }
+    let workspace = store.workspace_store().await.unwrap().unwrap();
+    let human = crate::local_human_participant_id("Human");
+    for (session, label) in [(sender, "Sender root"), (recipient, "Recipient root")] {
+        workspace
+            .ensure_execution_workspace(
+                workspace_id,
+                "shared project",
+                human,
+                "Human",
+                session,
+                label,
+            )
+            .await
+            .unwrap();
+    }
+    // Deliberately no host recorded on either side, and the recipient is
+    // neither a child of this coordinator nor a live local owner.
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        sender,
+        launch(),
+        1,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+
+    let source = directory.path().join("frame.png");
+    std::fs::write(&source, sample_png()).unwrap();
+    let options = TeamMessageOptions {
+        attachments: capture_message_attachments(directory.path(), &[source])
+            .await
+            .unwrap(),
+        ..TeamMessageOptions::default()
+    };
+
+    let refusal = coordinator
+        .persist_team_message(
+            sender,
+            recipient,
+            "/root",
+            "unproven recipient",
+            crate::contract::PromptDelivery::Queue,
+            DeliveryMode::NextTurn,
+            options,
+        )
+        .await;
+    match refusal {
+        Ok(_) => panic!("an unproven recipient must not receive images"),
+        Err(error) => assert!(
+            format!("{error:#}").contains("attachment store"),
+            "unexpected error: {error:#}"
+        ),
+    }
+    assert!(
+        coordinator
+            .unread_messages_for_session(recipient)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a refused image message must leave no durable receipt"
     );
     scratch.discard().await;
 }

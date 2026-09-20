@@ -3058,19 +3058,28 @@ impl SubagentCoordinator {
             format!("participant:{}", actor_binding.participant_id)
         };
         let text = attributed_team_message(actor, &reply_target, message);
-        // Cross-host image forwarding has no byte transfer yet, and the
-        // recipient resolves digests in ITS OWN store, so a relayed message
-        // would arrive with its images unresolvable. Refuse before the append
-        // rather than deliver text that quietly lost its pictures. This asks
-        // the same host-binding evidence the router already uses; it does not
-        // assume a capability record that nothing populates.
+        // Cross-host image forwarding has no byte transfer yet, and a
+        // recipient resolves digests in ITS OWN store, so images must only go
+        // where this host's blob directory is readable.
+        //
+        // The test has to be positive evidence. `session_message_needs_relay`
+        // answers false when either host binding is absent, which means
+        // "nothing recorded a host", not "same host" -- trusting it would let
+        // an unknown recipient through on missing information. A session this
+        // process drives, a live local owner, or two bindings that name the
+        // same host are the three things that actually prove a shared store.
+        let recipient_shares_attachment_store = recipient_is_local_task
+            || crate::local_session_owner_is_active(&self.journal_root, recipient_session_id)
+                .unwrap_or(false)
+            || matches!(
+                (actor_binding.host_id, recipient_binding.host_id),
+                (Some(sender_host), Some(recipient_host)) if sender_host == recipient_host
+            );
         ensure!(
-            attachments.is_empty()
-                || !self
-                    .session_message_needs_relay(actor_session_id, recipient_session_id)
-                    .await?,
-            "forwarding images to a session on another host is not supported yet; \
-             send the message without attachments, or reach a session on this host"
+            attachments.is_empty() || recipient_shares_attachment_store,
+            "forwarding images to a recipient that does not share this host's attachment store \
+             is not supported yet; send the message without attachments, or reach a session on \
+             this host"
         );
         let idempotency_id = Uuid::new_v4();
         let receipt = workspace_store
@@ -5077,16 +5086,6 @@ impl SubagentCoordinator {
         options: TeamMessageOptions,
         mode: DeliveryMode,
     ) -> Result<RoutedTeamMessage> {
-        // Refuse first: this path can create a direct workspace and append a
-        // message, both durable. A participant address carries no evidence
-        // that the recipient resolves digests in this host's store, and there
-        // is no byte transfer yet, so images addressed this way would arrive
-        // unresolvable. Fail before the first durable write rather than after.
-        ensure!(
-            options.attachments.is_empty(),
-            "images can only be forwarded to a session on this host; address the \
-             recipient as session:<UUID> on this machine, or send without attachments"
-        );
         let actor = self
             .store
             .workspace_binding(actor_session_id)
@@ -5124,6 +5123,16 @@ impl SubagentCoordinator {
                 }
             };
         }
+        // Past the local redirect, so this participant has no session in this
+        // installation: it is reached through the workspace rather than a
+        // process here, and nothing resolves an attachment digest for it.
+        // Refuse before ensure_direct_workspace and the append below, both
+        // durable, rather than admit a message whose images cannot arrive.
+        ensure!(
+            options.attachments.is_empty(),
+            "images can only be forwarded to a recipient on this host, and this participant has \
+             no local session here; send without attachments"
+        );
         let roster = store
             .workspace_roster(actor.workspace_id, actor.participant_id)
             .await?;
