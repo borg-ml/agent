@@ -1955,10 +1955,14 @@ impl AgentTurnExecutor for NativeFoldSteerExecutor {
         }) = controls.recv().await
         {
             assert!(admission.accept());
+            // The array shape the harness actually emits: one fold can
+            // capture several steer controls. Emitting the singular form
+            // here would have let the actor read a field the harness never
+            // sends and still pass.
             let marker = |id: Uuid| SessionEventKind::ProviderEvent {
                 provider: CodingProvider::OpenRouter,
                 kind: crate::session::NATIVE_STEER_APPLIED.to_string(),
-                payload: json!({ "message_id": id }),
+                payload: json!({ "message_ids": [id] }),
             };
             if self.marker_first {
                 if self.fold {
@@ -5349,6 +5353,39 @@ async fn a_native_steer_completes_only_once_its_fold_is_journaled() {
     // Accepted, then the turn ends without a fold. Completing here would
     // record input the model never saw and silently lose the human's steer.
     assert_native_steer_settlement(false, false).await;
+}
+
+#[test]
+fn a_fold_marker_is_read_from_the_array_the_harness_emits() {
+    // The protocol is `message_ids`, because one fold can capture several
+    // steer controls. This is pinned separately from the actor tests: a fake
+    // executor that emits whatever the actor happens to read agrees with
+    // itself and proves nothing about the harness.
+    let marker = |payload: Value| SessionEventKind::ProviderEvent {
+        provider: CodingProvider::OpenRouter,
+        kind: NATIVE_STEER_APPLIED.to_string(),
+        payload,
+    };
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    assert_eq!(
+        native_steer_applied_to(&marker(
+            json!({ "message_ids": [first.to_string(), second.to_string()] })
+        )),
+        vec![first, second]
+    );
+    assert_eq!(
+        native_steer_applied_to(&marker(json!({ "message_id": first.to_string() }))),
+        vec![first]
+    );
+    assert!(
+        native_steer_applied_to(&SessionEventKind::ProviderEvent {
+            provider: CodingProvider::OpenRouter,
+            kind: "something_else".to_string(),
+            payload: json!({ "message_ids": [first.to_string()] }),
+        })
+        .is_empty()
+    );
 }
 
 #[tokio::test]
