@@ -4501,6 +4501,13 @@ async fn a_same_host_message_delivers_verified_image_files_and_replays_without_t
 /// SCOPE: this covers the new send_message capture/persist/resolve path plus a
 /// real recipient model turn over the resolved bytes. It does NOT cover
 /// session.rs's TeamPrompt-to-Prompt conversion or two-host routing.
+///
+/// The turn runs on the Claude subscription CLI path, not Borg's native
+/// harness: `uses_native_harness` covers only Kimi, Glm, OpenRouter and
+/// OpenAiCompatible, so a Claude turn goes through `run_borg_provider_turn`
+/// and out to the Claude process. What this proves about image delivery is
+/// therefore what that path does, which is also the path a real recipient
+/// session uses.
 #[tokio::test]
 #[ignore]
 async fn forwarded_image_reaches_the_recipient_model_as_pixels() {
@@ -4580,11 +4587,13 @@ async fn forwarded_image_reaches_the_recipient_model_as_pixels() {
         response_language: crate::ResponseLanguage::Auto,
         permission_mode: PermissionMode::FullAccess,
         conversation: Vec::new(),
-        agent_mcp_server: borg_provider::mcp::ExternalMcpServer {
-            name: "vision-probe".to_string(),
-            command: "true".to_string(),
-            ..Default::default()
-        },
+        // Deliberately nameless. Claude is not a native-harness provider, so
+        // this turn keeps tools enabled and the server is written into the MCP
+        // config handed to the Claude CLI -- which would then try to launch
+        // whatever command it names. prepare_external_provider_mcp skips an
+        // entry with an empty name, so nothing is advertised and nothing is
+        // launched on the probe's behalf.
+        agent_mcp_server: borg_provider::mcp::ExternalMcpServer::default(),
         agent_tools: AgentToolDispatcher::new(
             SessionGoalTools::disconnected(),
             SessionTodoTools::disconnected(),
