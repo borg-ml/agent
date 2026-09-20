@@ -42,22 +42,25 @@ pub fn run_opencode_local_chat_stream(
 /// approvals, provider interactions), so the tool is taken away rather than
 /// left to time out.
 ///
-/// The prompt-level `tools` override is the lever that actually works: a
-/// top-level `tools` key in the config file is ignored by OpenCode (verified
-/// against 1.18.31), so only per-prompt and per-agent overrides bite. This
-/// permission entry is the backstop for the agents Borg does not prompt
-/// directly — `task` subagents inherit config, not our prompt body — where
-/// denying at least fails the call immediately instead of hanging the turn.
+/// OpenCode's `task` tool is its provider-native subagent launcher. Borg owns
+/// delegation through `spawn_agent`, so the tool is denied here too, on both
+/// levers OpenCode 1.18.31 actually honours: the per-prompt `tools` body (the
+/// user message's `tools` map removes the tool and is also folded into session
+/// permissions) and the config `permission` entry (the backstop for agents
+/// that inherit config rather than our prompt body).
+///
+/// A top-level `tools` key in the config file is ignored by OpenCode, so only
+/// per-prompt and per-agent overrides bite.
 fn blocked_tools() -> Value {
-    serde_json::json!({ "question": false })
+    serde_json::json!({ "question": false, "task": false })
 }
 
 fn opencode_base_config(permission: LocalAgentPermission) -> Value {
     let mut config = serde_json::json!({});
     if permission == LocalAgentPermission::FullAccess {
-        config["permission"] = serde_json::json!({"*": "allow", "question": "deny"});
+        config["permission"] = serde_json::json!({"*": "allow", "question": "deny", "task": "deny"});
     } else {
-        config["permission"] = serde_json::json!({"question": "deny"});
+        config["permission"] = serde_json::json!({"question": "deny", "task": "deny"});
     }
     config
 }
@@ -925,7 +928,7 @@ mod tests {
     fn question_tool_is_blocked_in_every_permission_mode() {
         // The prompt body is what actually removes the tool; the config only
         // backstops agents Borg does not prompt directly.
-        assert_eq!(blocked_tools(), json!({"question": false}));
+        assert_eq!(blocked_tools()["question"], json!(false));
         for permission in [
             LocalAgentPermission::Manual,
             LocalAgentPermission::Auto,
@@ -946,6 +949,26 @@ mod tests {
                 .get("*")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn provider_native_subagent_tool_is_blocked_in_every_permission_mode() {
+        // OpenCode's `task` tool launches provider-native subagents. It must be
+        // denied on both honoured levers: the per-prompt `tools` body (which
+        // removes it from the model's tool list and becomes a session
+        // permission) and the config `permission` backstop for agents that
+        // inherit config rather than the prompt body.
+        assert_eq!(blocked_tools()["task"], json!(false));
+        for permission in [
+            LocalAgentPermission::Manual,
+            LocalAgentPermission::Auto,
+            LocalAgentPermission::FullAccess,
+        ] {
+            let config = opencode_base_config(permission);
+            assert_eq!(config["permission"]["task"], json!("deny"));
+            // Denying `task` must not disturb the existing `question` denial.
+            assert_eq!(config["permission"]["question"], json!("deny"));
+        }
     }
 
     #[test]
