@@ -232,6 +232,39 @@ pub async fn open(config: &SessionStoreConfig) -> Result<OpenSessionStore> {
             // and only a process that actually opens the journal should pay
             // for one.
             let cluster = config.cluster();
+            Arc::new(open_managed(&cluster).await?)
+        }
+    };
+    Ok(OpenSessionStore { session })
+}
+
+/// Provision, start, connect to and claim the machine's own cluster, retrying
+/// for as long as the cluster is merely changing state.
+///
+/// A managed cluster is a server this process may have to start, and it is
+/// equally a server that something else can stop underneath it. Between those,
+/// every step below can fail for a reason that resolves on its own: the
+/// provision can find a postmaster shutting down and be told it is running,
+/// the connection can be refused in the gap before anything restarts it, and
+/// the ownership claim can land on a server that has begun shutting down since
+/// the connection succeeded.
+///
+/// So the loop spans all of it rather than any one step. That is not caution,
+/// it is the only arrangement that recovers: waiting and reconnecting alone
+/// finds nothing listening, because once a shutdown completes nobody has
+/// started the cluster again. Re-entering [`ManagedCluster::ensure_running`] is
+/// what starts it, and only a loop around the whole sequence gets back there.
+///
+/// The budget is spent once across every step, so a slow transition cannot be
+/// paid for repeatedly by nesting. Anything that is not a cluster changing
+/// state fails on the spot.
+async fn open_managed(cluster: &super::cluster::ManagedCluster) -> Result<PostgresSessionStore> {
+    let deadline = std::time::Instant::now() + super::cluster::TRANSITION_BUDGET;
+    let mut attempt: u32 = 0;
+    loop {
+        // Annotated so the block's error type is pinned to anyhow rather than
+        // inferred from whichever `?` the compiler reaches first.
+        let outcome: Result<PostgresSessionStore> = async {
             let url = cluster.ensure_running().await?;
             let store = PostgresSessionStore::connect(&url)
                 .await
@@ -240,10 +273,27 @@ pub async fn open(config: &SessionStoreConfig) -> Result<OpenSessionStore> {
             // reaching it is the same accident the configured-URL path guards
             // against.
             store.ensure_single_owner().await?;
-            Arc::new(store)
+            Ok(store)
         }
-    };
-    Ok(OpenSessionStore { session })
+        .await;
+        let error = match outcome {
+            Ok(store) => return Ok(store),
+            Err(error) => error,
+        };
+        if !super::cluster::is_between_states(&error)
+            || std::time::Instant::now() >= deadline
+        {
+            return Err(error);
+        }
+        tracing::warn!(
+            attempt = attempt + 1,
+            "the Borg session cluster is between states; re-opening it"
+        );
+        // Capped early: a transition resolves in seconds, and the budget buys
+        // more by being spent on attempts than on longer sleeps.
+        tokio::time::sleep(std::time::Duration::from_millis(100 << attempt.min(3))).await;
+        attempt += 1;
+    }
 }
 
 /// Open the configured backend and prove every tier in one step.

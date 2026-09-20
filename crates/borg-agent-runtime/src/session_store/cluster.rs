@@ -23,14 +23,16 @@
 //! A cluster is also a thing that starts and stops underneath us. Whoever
 //! stops it -- a crash, a session-scope cleanup, an operator -- leaves a window
 //! in which the postmaster is alive and holds a valid `postmaster.pid` while
-//! refusing every connection. A single pass through this module reads that
-//! window as a permanently unreachable cluster, so [`ManagedCluster::ensure_running`]
-//! is written as a loop over live state instead: see it for why the retry has
-//! to re-run the whole lifecycle rather than just the connection.
+//! refusing every connection. Every step here is a single pass that can lose to
+//! that window; recovering from it means re-running the whole sequence, up to
+//! and including opening the journal, so the retry loop belongs to the one
+//! caller that spans all of it. This module supplies the two things that loop
+//! needs to make its decision -- [`is_between_states`] and [`TRANSITION_BUDGET`]
+//! -- and `session_store::factory::open` owns the loop itself.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
@@ -51,14 +53,16 @@ const ROLE: &str = "borg";
 /// The database holding the journal.
 const DATABASE: &str = "borg_sessions";
 
-/// How long [`ManagedCluster::ensure_running`] keeps working a cluster that is
-/// between states before calling it broken.
+/// How long a caller should keep working a cluster that is between states
+/// before calling it broken.
 ///
 /// This bounds a shutdown plus the start that follows it, not a single
 /// connection: the point of the budget is to outlast a transition, and a
 /// cluster carrying a large journal can take seconds to shut down cleanly and
-/// seconds more to recover on the way back up.
-const TRANSITION_BUDGET: Duration = Duration::from_secs(30);
+/// seconds more to recover on the way back up. It is a single budget spanning
+/// the whole open, so that a process cannot spend it twice over and turn a
+/// bounded wait into a multiple of itself.
+pub(crate) const TRANSITION_BUDGET: Duration = Duration::from_secs(30);
 
 /// Where `initdb` and `pg_ctl` live when they are not on `PATH`.
 ///
@@ -118,46 +122,28 @@ impl ManagedCluster {
 
     /// Provision if necessary, start if necessary, and return the journal URL.
     ///
-    /// The start-then-connect pair is a loop rather than a sequence because
-    /// neither half can settle a cluster that is mid-transition on its own.
-    /// `pg_ctl status` answers from `postmaster.pid`, so a postmaster that is
-    /// shutting down still reports as running and this skips starting it,
-    /// while the connection that follows is refused. Retrying only the
-    /// connection would then wait out the shutdown and find nothing listening,
-    /// because once the shutdown completes nobody has restarted the cluster.
-    /// Re-running both halves is what turns losing the race to a shutdown into
-    /// starting the cluster again, and it is equally what lets a process that
-    /// arrives during someone else's start wait for it instead of failing.
+    /// One pass, and a pass can legitimately lose. `pg_ctl status` answers from
+    /// `postmaster.pid`, so a postmaster that is shutting down is still alive,
+    /// still holds the file, and still reports as running -- this skips
+    /// starting it and hands back a URL that will refuse the next connection.
+    /// That is not a failure worth handling here, because handling it means
+    /// running this whole sequence again: once a shutdown completes, nobody has
+    /// restarted the cluster, so waiting and reconnecting finds nothing
+    /// listening. Only re-entry starts it again.
+    ///
+    /// `session_store::factory::open` is where that re-entry happens, because
+    /// its loop also covers the connection and the ownership claim that follow.
     pub async fn ensure_running(&self) -> Result<String> {
         let pg_ctl = locate_binary("pg_ctl")?;
         if !self.is_initialized() {
             let initdb = locate_binary("initdb")?;
             self.initialize(&initdb).await?;
         }
-        let deadline = Instant::now() + TRANSITION_BUDGET;
-        let mut attempt: u32 = 0;
-        loop {
-            if !self.is_running(&pg_ctl).await? {
-                self.start(&pg_ctl).await?;
-            }
-            let error = match self.ensure_database().await {
-                Ok(()) => return Ok(self.url()),
-                Err(error) => error,
-            };
-            // Anything that is not the cluster changing state is a real
-            // failure, and so is a transition that has outlasted its budget.
-            if !is_between_states(&error) || Instant::now() >= deadline {
-                return Err(error);
-            }
-            tracing::warn!(
-                attempt = attempt + 1,
-                "the Borg session cluster is between states; re-checking it"
-            );
-            // Backoff capped early: a transition resolves in seconds, and the
-            // budget is spent better on more attempts than on longer sleeps.
-            tokio::time::sleep(Duration::from_millis(100 << attempt.min(3))).await;
-            attempt += 1;
+        if !self.is_running(&pg_ctl).await? {
+            self.start(&pg_ctl).await?;
         }
+        self.ensure_database().await?;
+        Ok(self.url())
     }
 
     /// Create the cluster. Only ever called when `PG_VERSION` is absent.
@@ -232,15 +218,6 @@ impl ManagedCluster {
         match self.spawn_postmaster(pg_ctl).await? {
             Ok(()) => Ok(()),
             Err(failure) => {
-                // A crash leaves postmaster.pid behind, and the next start
-                // refuses on the assumption the old server is alive. The
-                // machine this runs on does crash, so recover rather than
-                // requiring the user to know about this file.
-                if self.clear_stale_pid_file()?
-                    && let Ok(()) = self.spawn_postmaster(pg_ctl).await?
-                {
-                    return Ok(());
-                }
                 // Losing the start race to another Borg process is success.
                 if self.is_running(pg_ctl).await? {
                     return Ok(());
@@ -253,6 +230,28 @@ impl ManagedCluster {
             }
         }
     }
+
+    // A crash leaves postmaster.pid behind, and Borg used to unlink it here
+    // when `kill(pid, 0)` said the owner was gone. That is removed rather than
+    // repaired, because it could only ever be weaker than the check PostgreSQL
+    // already makes and it destroyed the file that check depends on.
+    //
+    // The postmaster reads that same file on startup and cross-checks the
+    // shared memory segment named in it before deciding the cluster is
+    // abandoned, so it clears a genuinely stale file by itself. A liveness
+    // probe on the PID alone cannot see that segment, and it is wrong in both
+    // directions: `kill` reports EPERM, not success, for a live process owned
+    // by another user, and a recycled PID belonging to some unrelated program
+    // reads as the server still running.
+    //
+    // Unlinking on a false negative is the damaging half. postmaster.pid is
+    // the interlock that stops a second postmaster attaching to one data
+    // directory, and between the liveness probe and the unlink another Borg
+    // process can legitimately have started a server and written a fresh file.
+    // Deleting it there removes a live cluster's interlock. Nothing is lost by
+    // leaving this to PostgreSQL: a start that fails because the file is
+    // genuinely stale is a transitional failure like any other, and the
+    // factory's recovery loop re-enters and starts the cluster.
 
     /// Run `pg_ctl start`, distinguishing a failed launch from a failed call.
     async fn spawn_postmaster(&self, pg_ctl: &Path) -> Result<std::result::Result<(), String>> {
@@ -281,32 +280,6 @@ impl ManagedCluster {
             return Ok(Ok(()));
         }
         Ok(Err(last_error_line(&output.stderr)))
-    }
-
-    /// Remove a `postmaster.pid` whose process is gone. Returns whether one was
-    /// removed, so the caller only retries when something actually changed.
-    fn clear_stale_pid_file(&self) -> Result<bool> {
-        let pid_file = self.data_dir.join("postmaster.pid");
-        let Ok(contents) = std::fs::read_to_string(&pid_file) else {
-            return Ok(false);
-        };
-        let Some(pid) = contents
-            .lines()
-            .next()
-            .and_then(|line| line.trim().parse::<i32>().ok())
-        else {
-            return Ok(false);
-        };
-        if process_is_alive(pid) {
-            return Ok(false);
-        }
-        tracing::warn!(
-            pid,
-            "removing a stale postmaster.pid left by a crashed session cluster"
-        );
-        std::fs::remove_file(&pid_file)
-            .with_context(|| format!("could not remove {}", pid_file.display()))?;
-        Ok(true)
     }
 
     /// Create the journal database if this is a fresh cluster.
@@ -357,7 +330,7 @@ impl ManagedCluster {
 /// All three resolve on their own or on the caller's next start attempt. A
 /// rejected role, a missing database or a corrupt data directory do not, and
 /// must stay loud.
-fn is_between_states(error: &anyhow::Error) -> bool {
+pub(crate) fn is_between_states(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         let Some(error) = cause.downcast_ref::<sqlx::Error>() else {
             return false;
@@ -395,20 +368,6 @@ fn port_from_env() -> Option<u16> {
     std::env::var(PORT_ENV)
         .ok()
         .and_then(|value| value.trim().parse().ok())
-}
-
-#[cfg(unix)]
-fn process_is_alive(pid: i32) -> bool {
-    // Signal 0 performs the permission and existence checks without delivering
-    // anything, which is exactly the question being asked.
-    unsafe { libc::kill(pid, 0) == 0 }
-}
-
-#[cfg(not(unix))]
-fn process_is_alive(_pid: i32) -> bool {
-    // Without a cheap liveness check, assume the owner is alive rather than
-    // delete a pid file belonging to a running server.
-    true
 }
 
 /// The last meaningful line of a failed command's stderr.
