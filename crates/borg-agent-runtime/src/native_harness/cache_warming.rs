@@ -1,31 +1,23 @@
 //! Keeping a prompt cache entry alive between requests.
 //!
-//! A provider drops a prompt cache entry after a period of inactivity, so the
-//! first request after a long tool run — or after the human went to lunch —
-//! reprocesses the whole conversation at full input price. Warming re-sends
-//! the last request with a minimal output budget shortly before the entry
-//! would expire, which costs a cache read and buys another full lifetime.
+//! A provider drops a cached prefix after a period of inactivity, so the first
+//! request after a long tool run reprocesses the whole conversation at full
+//! input price. Warming re-sends the last request with a minimal output budget
+//! shortly before the entry expires: a cache read buys another lifetime.
 //!
 //! Three rules shape everything here:
 //!
-//! * **Never fake it.** A route that cannot be warmed says so. Borg's native
-//!   client serves only some providers, only some models have a documented
-//!   cache lifetime, and only some models have prices Borg can reason about.
-//!   Where any of those is missing this module reports [`Ineligible`] and arms
-//!   no timer, rather than sending requests it cannot justify to the human
-//!   paying for them.
-//! * **Never touch the conversation.** A refresh replays the previous request
-//!   verbatim and throws the reply away. It emits no model message, so the
-//!   prompt replay prefix is untouched and no tool call it returns is ever
-//!   executed. Its cost is still recorded, because unrecorded spend is worse
-//!   than visible spend.
-//! * **Never outlive its warrant.** Cancellation, a context change, a model
-//!   switch and two fixed horizons (one hour while a run is active, thirty
-//!   minutes while idle) each stop warming. A refresh never extends them.
+//! * **Never fake it.** A route with no documented cache lifetime or no known
+//!   prices reports [`Ineligible`] and arms no timer.
+//! * **Never touch the conversation.** A refresh replays the request verbatim
+//!   and discards the reply, so no message is emitted and no returned tool
+//!   call runs. Its cost is still recorded.
+//! * **Never outlive its warrant.** A context change, a model switch and two
+//!   fixed horizons each stop warming, and a refresh never extends them.
 //!
-//! The economics follow pi's: warm when the expected avoided cache-miss cost
-//! minus the refresh's own cost clears a fixed threshold, at 100% continuation
-//! probability while the agent is still running and a flat 15% while idle.
+//! Economics follow pi's: warm when expected avoided miss cost minus the
+//! refresh's own cost clears a threshold, at 100% continuation while the agent
+//! runs and a flat 15% while idle.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -81,12 +73,9 @@ const WARM_AT_PERCENT_OF_TTL: u32 = 90;
 /// refresh still lands inside the window it is trying to extend.
 const WARM_SAFETY_MARGIN: Duration = Duration::from_secs(10);
 
-/// Why a session is not being warmed.
-///
-/// Every variant is surfaced verbatim through [`CacheWarmingStatus::reason`].
-/// The point of naming them is that "we are not warming this" is a different
-/// statement from "warming is running", and a user looking at a long tool run
-/// deserves to know which one they are getting.
+/// Why a session is not being warmed. Each variant is surfaced verbatim
+/// through [`CacheWarmingStatus::reason`], because "not warming this" and
+/// "warming is running" are different things to be told.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Ineligible {
     /// The operator turned warming off.
@@ -173,7 +162,7 @@ impl Phase {
     }
 }
 
-/// The inputs and outcome of one warm-or-stop decision.
+/// Inputs and outcome of one warm-or-stop decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CacheWarmingDecision {
     pub phase: Phase,
@@ -239,10 +228,8 @@ pub(crate) struct RefreshSupport {
 
 /// The route that can replay one request as a prompt-cache refresh.
 ///
-/// Split out as a trait so the scheduler can be exercised without a provider:
-/// the tests below drive real timers and cancellation against a fake, which is
-/// the only way to check the billing and cancellation boundaries without
-/// spending money to do it.
+/// A trait so the scheduler's billing and cancellation boundaries can be
+/// exercised against a fake instead of a paid provider.
 #[async_trait]
 pub(crate) trait PromptCacheRefreshClient: Send + Sync {
     /// Report whether this route can be warmed at all, before any request is
@@ -307,12 +294,9 @@ impl CacheWarmingStatus {
     }
 }
 
-/// Identity of the conversation a warm run belongs to.
-///
-/// Warming must stop the moment the session stops being the thing that was
-/// warmed. A generation counter bumped on every context change, model switch
-/// and new real turn is enough: the scheduler captures the value it started
-/// with and abandons itself once the shared counter moves past it.
+/// Identity of the conversation a warm run belongs to. A run captures the
+/// counter it started with and abandons itself once the shared value moves
+/// past it, which is how a context change or a newer turn stops it.
 #[derive(Debug, Default)]
 pub(crate) struct WarmGeneration(std::sync::atomic::AtomicU64);
 
@@ -328,11 +312,9 @@ impl WarmGeneration {
     }
 }
 
-/// Keeps one prompt cache entry alive until something says to stop.
-///
-/// Each [`CacheWarmer::start`] supersedes the previous run, so a session only
-/// ever has one refresh timer and it always belongs to the most recent real
-/// request.
+/// Keeps one prompt cache entry alive until something says to stop. Each
+/// [`CacheWarmer::start`] supersedes the previous run, so a session has one
+/// refresh timer and it belongs to the most recent real request.
 pub(crate) struct CacheWarmer {
     /// Owns the lifetime of a detached idle run, which outlives the turn.
     session_id: Uuid,
@@ -352,12 +334,9 @@ pub(crate) struct CacheWarmer {
 }
 
 impl Drop for CacheWarmer {
-    /// A warmer that has not been explicitly detached dies with its turn.
-    ///
-    /// This is the cancellation contract: every way out of a turn -- a normal
-    /// return, an interrupt, a `?` on some unrelated failure -- runs this, so
-    /// there is no path that leaves a refresh armed against a conversation
-    /// nobody is having any more.
+    /// A warmer that has not been detached dies with its turn. Every way out
+    /// of a turn runs this, so no path leaves a refresh armed against a
+    /// conversation nobody is having any more.
     fn drop(&mut self) {
         if !self.detached.load(std::sync::atomic::Ordering::SeqCst) {
             self.stop("the turn ended");
@@ -479,10 +458,8 @@ impl CacheWarmer {
                 // turn, so it is also the one case that has to say so.
                 self.detached
                     .store(true, std::sync::atomic::Ordering::SeqCst);
-                // Handing the run off also hands off the only way to stop it:
-                // this warmer is about to be dropped, and its Drop is now a
-                // no-op. The session keeps the token so the next turn can end
-                // the run instead of leaving it to bill beside its successor.
+                // Handing the run off also hands off the only way to stop
+                // it, since this warmer's Drop is now a no-op.
                 let token = self.cancel.lock().ok().and_then(|cancel| cancel.clone());
                 if let (Some(token), Ok(mut runs)) = (token, DETACHED_IDLE_RUNS.lock()) {
                     runs.insert(self.session_id, token);
@@ -491,11 +468,8 @@ impl CacheWarmer {
         }
     }
 
-    /// Record the current status where a human can find it later.
-    ///
-    /// Warming decides on its own to spend money, so "what is it doing and
-    /// why" has to survive in the session record rather than existing only in
-    /// a live view that may never have been open.
+    /// Record the current status where a human can find it later. Warming
+    /// spends unprompted, so its reasons belong in the session record.
     pub(crate) async fn publish_status(&self, provider: crate::CodingProvider) {
         let status = self.status();
         let _ = self
@@ -700,11 +674,8 @@ impl WarmRun {
         }
     }
 
-    /// Record what warming decided, separately from what it spent.
-    ///
-    /// This is a provider event under its own kind, not a model message, so
-    /// prompt replay and native context rebuilding never see it. It exists so
-    /// a human can audit why their session did or did not spend money here.
+    /// Record what warming decided, separately from what it spent. A provider
+    /// event rather than a model message, so prompt replay never sees it.
     async fn record_decision(&self, decision: &CacheWarmingDecision, outcome: &str) {
         let mut payload = decision.payload();
         payload["outcome"] = json!(outcome);
@@ -721,11 +692,9 @@ impl WarmRun {
             .await;
     }
 
-    /// Record what the refresh billed.
-    ///
-    /// `turn_id` is `None` because a refresh belongs to no turn, and
-    /// `context_tokens` is cleared because a refresh adds nothing to the
-    /// context the model will see — letting it through would move the
+    /// Record what the refresh billed. `turn_id` is `None` because a refresh
+    /// belongs to no turn, and `context_tokens` is cleared because a refresh
+    /// adds nothing to the context: letting it through would move the
     /// auto-compaction trigger on spend that never entered the conversation.
     async fn record_usage(&self, usage: &ProviderCallUsage) {
         let _ = self
@@ -749,12 +718,10 @@ impl WarmRun {
     }
 }
 
-/// When to refresh an entry with the given lifetime.
-///
-/// Ninety percent of the lifetime, but never closer than a ten-second margin
-/// to expiry, so a refresh that takes a moment to reach the provider still
-/// lands inside the window. Lifetimes at or under the margin have no usable
-/// moment at all and return `None` rather than a refresh that races expiry.
+/// When to refresh an entry with the given lifetime: ninety percent of it,
+/// but never closer than a ten-second margin to expiry, so a slow refresh
+/// still lands inside the window. A lifetime at or under the margin has no
+/// usable moment and returns `None` rather than racing expiry.
 fn refresh_delay(lifetime: Duration) -> Option<Duration> {
     if lifetime <= WARM_SAFETY_MARGIN {
         return None;
