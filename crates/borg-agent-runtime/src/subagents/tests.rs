@@ -1769,7 +1769,7 @@ async fn a_human_stopped_worker_is_not_reused_for_a_new_task() {
         root_launch,
         2,
         Arc::new(executor),
-        Arc::clone(&store),
+        store.clone(),
     )
     .unwrap();
 
