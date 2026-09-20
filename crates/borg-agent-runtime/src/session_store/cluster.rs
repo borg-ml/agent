@@ -432,6 +432,36 @@ impl ManagedCluster {
     // and unlinking on a false negative destroys the interlock that stops a
     // second postmaster attaching to one data directory.
 
+    /// Run `pg_ctl start`, distinguishing a failed launch from a failed call.
+    async fn spawn_postmaster(&self, pg_ctl: &Path) -> Result<std::result::Result<(), String>> {
+        tracing::info!(port = self.port, "starting the Borg session cluster");
+        let output = Command::new(pg_ctl)
+            .kill_on_drop(true)
+            .arg("-D")
+            .arg(&self.data_dir)
+            .arg("-l")
+            .arg(&self.log_path)
+            .arg("-o")
+            .arg(format!(
+                "-p {} -k {} -h 127.0.0.1",
+                self.port,
+                self.socket_dir.display()
+            ))
+            // Wait for the server to accept connections rather than returning
+            // the moment the process exists, so the caller's first connection
+            // is not a race against startup.
+            .arg("-w")
+            .arg("start")
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .with_context(|| format!("could not run {}", pg_ctl.display()))?;
+        if output.status.success() {
+            return Ok(Ok(()));
+        }
+        Ok(Err(last_error_line(&output.stderr)))
+    }
+
     /// Create the journal database if this is a fresh cluster.
     async fn ensure_database(&self) -> Result<()> {
         use sqlx::{Connection, Executor, postgres::PgConnection};

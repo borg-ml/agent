@@ -92,7 +92,7 @@ pub(super) fn unit_name(data_dir: &Path) -> String {
         .unwrap_or_else(|_| data_dir.to_path_buf());
     let mut hasher = Sha256::new();
     hasher.update(identity.as_os_str().as_encoded_bytes());
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = hex::encode(hasher.finalize());
     format!("borg-postgres-{}.service", &digest[..16])
 }
 
