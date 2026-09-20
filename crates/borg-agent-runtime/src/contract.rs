@@ -934,6 +934,14 @@ pub struct SessionCapabilities {
     #[serde(skip)]
     #[ts(skip)]
     pub runtime_provider_context: Option<RuntimeProviderContext>,
+    /// Trusted controller-supplied text appended to the provider system
+    /// prompt for every turn of this session. A product controller uses it to
+    /// layer its own operating instructions on top of the runtime's coding
+    /// prompt. It is skipped from serialization because it can be large and is
+    /// re-supplied by the controller at launch.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub system_prompt_appendix: Option<String>,
     /// Effective host limits for this session. This is populated by the
     /// canonical host and is never accepted as authority when supplied by a
     /// remote controller.
@@ -957,6 +965,7 @@ impl Default for SessionCapabilities {
             provider_capabilities: Vec::new(),
             runtime_mcp_context: None,
             runtime_provider_context: None,
+            system_prompt_appendix: None,
             resource_limits: None,
         }
     }

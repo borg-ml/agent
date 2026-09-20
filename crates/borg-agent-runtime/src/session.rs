@@ -2977,7 +2977,11 @@ async fn run_agent_session_store_kernel_inner(
                                         extension_skill_roots: launch.extension_skill_roots.clone(),
                                         extension_workflows: Vec::new(),
                                         extension_api: crate::ExtensionApiSnapshot::default(),
-                                        system_prompt_appendix: String::new(),
+                                        system_prompt_appendix: launch
+                .capabilities
+                .system_prompt_appendix
+                .clone()
+                .unwrap_or_default(),
                                         declaration_base: None,
                                         volatile_system_prompt_appendix:
                                             crate::provider_capabilities_prompt(
@@ -3989,7 +3993,11 @@ async fn run_agent_session_store_kernel_inner(
             extension_skill_roots: launch.extension_skill_roots.clone(),
             extension_workflows: Vec::new(),
             extension_api: crate::ExtensionApiSnapshot::default(),
-            system_prompt_appendix: String::new(),
+            system_prompt_appendix: launch
+                .capabilities
+                .system_prompt_appendix
+                .clone()
+                .unwrap_or_default(),
             declaration_base: native_provider
                 .then(|| native_declarations(journal.context_events()))
                 .flatten(),

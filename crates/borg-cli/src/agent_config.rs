@@ -312,6 +312,7 @@ impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
             provider_capabilities: Vec::new(),
             runtime_mcp_context: None,
             runtime_provider_context: None,
+            system_prompt_appendix: None,
             resource_limits: None,
         }
     }
