@@ -147,8 +147,15 @@ impl PostgresSessionStore {
         .await?;
         let was_existing = existing.is_some();
         if let Some(existing) = existing {
+            // Compared as values, not as text. `metadata_json` is a jsonb
+            // column and jsonb does not preserve object key order, so the row
+            // comes back ordered by key length and then bytewise while the
+            // caller's value carries serde's field order. Serialization is
+            // order-sensitive here because `preserve_order` is enabled in this
+            // graph, so comparing the two strings refused a re-admission of
+            // the identical launch.
             ensure!(
-                serde_json::to_string(&existing)? == metadata_json,
+                existing == *metadata,
                 "session launch metadata already exists for a different launch request"
             );
         } else {

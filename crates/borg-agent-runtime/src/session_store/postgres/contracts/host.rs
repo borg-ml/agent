@@ -47,7 +47,10 @@ async fn host_launch_owner_is_atomic_immutable_and_scoped_across_reopen() {
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
     let origin = "https://relay.invalid";
-    let metadata = serde_json::json!({"request_id": id});
+    // Several keys on purpose: jsonb orders by key length then bytewise, so a
+    // single-key record round-trips in the order it was written and proves
+    // nothing about the ordering contract below.
+    let metadata = serde_json::json!({"request_id": id, "cwd": "/workspace", "provider": "codex"});
     // SQLite injected this failure with `raise(abort, ...)` in a trigger body.
     // Postgres needs the raise to live in a function; the effect on the caller
     // is the same -- the owner insert fails and takes the launch with it.
@@ -198,6 +201,28 @@ async fn host_launch_owner_is_atomic_immutable_and_scoped_across_reopen() {
         "an incoming launch retry alone is not legacy ownership proof"
     );
     assert!(store.host_launch_owner(legacy).await.unwrap().is_none());
+    // A retry that writes the same content in a different key order is the
+    // same launch. The record is jsonb and jsonb does not preserve key order,
+    // so the stored row never comes back in the order it was sent; comparing
+    // the two as serialized text refused the retry. Nothing in the type system
+    // can catch that, because both sides are a `Value` either way.
+    store
+        .persist_host_launch_metadata(
+            legacy,
+            &serde_json::json!({"provider": "codex", "cwd": "/workspace", "request_id": id}),
+        )
+        .await
+        .expect("a retry of the same launch in another key order is the same launch");
+    assert!(
+        store
+            .persist_host_launch_metadata(
+                legacy,
+                &serde_json::json!({"request_id": id, "cwd": "/workspace", "provider": "claude"}),
+            )
+            .await
+            .is_err(),
+        "different content under one id is still a different launch request"
+    );
     assert_eq!(
         store.load_host_launch_metadata(legacy).await.unwrap(),
         Some(metadata)
