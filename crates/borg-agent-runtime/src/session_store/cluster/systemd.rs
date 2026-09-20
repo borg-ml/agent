@@ -12,6 +12,14 @@
 //! The unit is tied to nothing: no `PartOf`, `BindsTo` or `WantedBy`. Being
 //! unreachable from Borg's own lifecycle is the point, and is why the database
 //! is not coupled to host enrollment.
+//!
+//! KNOWN LIMITATION, deliberately not worked around: a user manager stops when
+//! the user's last session ends unless lingering is enabled, so on such a host
+//! the cluster stops at logout. Borg does not enable lingering. That is a
+//! policy decision belonging to the machine's owner, not to a session store,
+//! and the failure it leaves is smaller and far more predictable than the one
+//! this module fixes -- the database stops when the user logs out, rather than
+//! whenever any Borg unit happens to restart.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -102,6 +110,17 @@ pub(super) fn run_args(launch: &Launch<'_>, unit: &str) -> Vec<OsString> {
             description
         },
     ];
+    // Stop semantics copied from the distribution's own postgresql.service,
+    // which pairs `KillMode=mixed` with `KillSignal=SIGINT` over a foreground
+    // `postgres`. Both halves matter. SIGINT is a FAST shutdown, where the
+    // postmaster disconnects clients and shuts its children down in order;
+    // systemd's default SIGTERM is a SMART shutdown, which waits for every
+    // client to leave on its own and would hold the stop open. And `mixed`
+    // sends that signal to the postmaster alone, so it coordinates its own
+    // backends -- `control-group` would signal every backend directly, which
+    // is the postmaster's job and not systemd's.
+    args.push("--property=KillMode=mixed".into());
+    args.push("--property=KillSignal=SIGINT".into());
     // Keep the log the file the rest of this module points operators at; a
     // unit would otherwise send it to the journal and falsify that message.
     for stream in ["StandardOutput", "StandardError"] {
@@ -238,9 +257,12 @@ pub(super) async fn spawn(launch: &Launch<'_>) -> anyhow::Result<std::result::Re
     };
     let unit = unit_name(launch.data_dir);
     tracing::info!(port = launch.port, %unit, "starting the Borg session cluster under its own unit");
+    // The caller's open has the deadline; this only guarantees that if that
+    // deadline drops us mid-launch, no systemd-run is left running behind it.
     let output = tokio::process::Command::new(&systemd_run)
         .args(run_args(launch, &unit))
         .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| format!("could not run {}", systemd_run.display()))?;
@@ -304,6 +326,15 @@ mod tests {
         );
         assert!(rendered.contains(&"/borg/pgdata".to_string()));
         assert!(rendered.contains(&"5433".to_string()));
+        // SIGINT is a fast shutdown; systemd's default SIGTERM is a smart one
+        // that waits for every client to leave and would hold the stop open.
+        // `mixed` leaves the postmaster to shut its own backends down.
+        assert!(rendered.contains(&"--property=KillSignal=SIGINT".to_string()));
+        assert!(rendered.contains(&"--property=KillMode=mixed".to_string()));
+        assert!(
+            !rendered.iter().any(|arg| arg.contains("Restart=")),
+            "ensure_running is the only supervisor; a second one would race it"
+        );
     }
 
     /// The regression this module exists for. In the incident the postmaster
