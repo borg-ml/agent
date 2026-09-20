@@ -3656,7 +3656,7 @@ impl SubagentCoordinator {
                     &assignment_name,
                     previous_name,
                     previous_final_text,
-                    "Stopped by the human; the new task went to a fresh worker".to_string(),
+                    "Not reused; original task retained".to_string(),
                 )
                 .await;
                 // Falls through to the spawn below, which reports reused=false.
