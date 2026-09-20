@@ -28,7 +28,14 @@ runs:
           "--disable-components", "pgAdmin,stackbuilder"
         )
         if ($install.ExitCode -ne 0) {
-          if (Test-Path $trace) { Get-Content $trace -Tail 200 }
+          if (Test-Path $trace) {
+            $readableTrace = (Get-Content $trace -Raw) -replace "(?s)<dump>.*?</dump>", "<dump omitted>"
+            $readableTrace -split "`n" | Select-Object -Last 200
+          }
+          Get-ChildItem $env:TEMP -Filter "install-postgresql*.log" | ForEach-Object {
+            Write-Output "Installer log: $($_.FullName)"
+            Get-Content $_.FullName -Tail 200
+          }
           throw "Postgres installation failed: $($install.ExitCode)"
         }
         & "$prefix/bin/pg_isready.exe" -h 127.0.0.1 -p 5432 -U postgres
