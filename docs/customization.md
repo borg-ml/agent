@@ -13,6 +13,15 @@ The default user configuration directory is `$XDG_CONFIG_HOME/borg`, or
 [`configs/agent.example.toml`](../configs/agent.example.toml). An explicit
 `borg agent --config PATH` replaces the default agent configuration path.
 
+## Shell language diagnostics
+
+Borg already routes shell files to `bash-language-server start`. Install the
+language server and ShellCheck on the host where Borg runs, with their binaries
+on `PATH` (for example, `bun add --global bash-language-server shellcheck`).
+Borg starts the server lazily when a shell file is used with its LSP tools;
+no agent configuration or restart is needed. ShellCheck supplies shell diagnostics
+through `lsp_diagnostics` and `lsp_workspace_diagnostics`.
+
 ## Interactive agent settings
 
 Run `/settings` to open the settings picker. Changes made by agent UI pickers are
