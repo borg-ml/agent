@@ -238,6 +238,14 @@ pub async fn open(config: &SessionStoreConfig) -> Result<OpenSessionStore> {
     Ok(OpenSessionStore { session })
 }
 
+/// Open the configured backend and prove every tier in one step.
+///
+/// For callers with no ownership race to settle first -- tests, tools, and any
+/// process that is going to run regardless.
+pub async fn open_resolved(config: &SessionStoreConfig) -> Result<ResolvedSessionStore> {
+    open(config).await?.resolve().await
+}
+
 /// Provision, start, connect to and claim the machine's own cluster.
 ///
 /// Every step here talks to a server this process may have to start and that
