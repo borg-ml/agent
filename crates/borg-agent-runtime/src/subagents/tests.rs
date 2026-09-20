@@ -3800,15 +3800,15 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
     };
     store.create_session(child_session_id).await.unwrap();
     store
+        .register_child_session(root, child_session_id)
+        .await
+        .unwrap();
+    store
         .append(SessionEvent::new(
             child_session_id,
             0,
             SessionEventKind::SessionStarted,
         ))
-        .await
-        .unwrap();
-    store
-        .register_child_session(root, child_session_id)
         .await
         .unwrap();
     let binding = store
