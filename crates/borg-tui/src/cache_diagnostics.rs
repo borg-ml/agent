@@ -55,10 +55,22 @@ pub(super) struct CacheDiagnostics {
 
 struct PromptSnapshot {
     prompt_tokens: u64,
+    cached_input_tokens: u64,
     reusable_context_tokens: Option<u64>,
     at: DateTime<Utc>,
     signature: CacheSignature,
     cache_telemetry_available: bool,
+}
+
+impl PromptSnapshot {
+    /// Did this snapshot describe a single provider request? A turn that makes
+    /// several model/tool rounds reports the sum of their counters, and a sum
+    /// of cache reads can exceed the turn's real context. Comparing such a
+    /// total with the next request's cached prefix is meaningless.
+    fn single_request(&self) -> bool {
+        self.reusable_context_tokens
+            .is_none_or(|context| self.cached_input_tokens <= context)
+    }
 }
 
 struct LatestCacheUse {
@@ -139,26 +151,44 @@ impl CacheDiagnostics {
             if !(cache_telemetry_available || previous.cache_telemetry_available) {
                 return None;
             }
-            // A healthy pooled subscription context receives only the new
-            // prompt delta. Its provider cache counters describe that native
-            // context, not a fresh replay of the previous full Borg prompt.
-            // Comparing those counters with the prior full snapshot therefore
-            // turns every ordinary follow-up into another loud miss card.
-            // Keep the measured result for the footer, but only announce a
-            // miss when a real boundary (signature change or cache expiry)
-            // remains possible.
+            // A healthy follow-up appends to a stable prefix: its uncached
+            // `input_tokens` are the new tail, not the prior prompt. Comparing
+            // that tail with the previous full snapshot turns every ordinary
+            // follow-up into another loud miss card, so announce only at a real
+            // boundary (signature change, cache expiry, or a measured Borg
+            // replay) or when the cached prefix itself shrank.
             let same_signature = previous.signature == signature;
             let within_cache_window = cache_window(signature.provider)
                 .is_none_or(|window| elapsed(previous.at, at) < window);
-            if usage.provider_context_reused == Some(true) && same_signature && within_cache_window
-            {
-                return None;
-            }
-            let reusable_prefix_tokens = previous.prompt_tokens.min(prompt_tokens);
-            let missed_tokens = reusable_prefix_tokens.saturating_sub(usage.cached_input_tokens);
-            if !material_cache_miss(missed_tokens, reusable_prefix_tokens) {
-                return None;
-            }
+            let boundary = !same_signature
+                || !within_cache_window
+                || usage.provider_context_reused == Some(false);
+            let missed_tokens = if boundary {
+                let reusable_prefix_tokens = previous.prompt_tokens.min(prompt_tokens);
+                let missed = reusable_prefix_tokens.saturating_sub(usage.cached_input_tokens);
+                if !material_cache_miss(missed, reusable_prefix_tokens) {
+                    return None;
+                }
+                missed
+            } else {
+                // No boundary: the prior prefix should still be cached, so a
+                // material drop in cached reads is a real eviction. Only trust
+                // it when both snapshots are single requests; a multi-round
+                // turn reports summed counters that cannot be compared.
+                let single_request = usage
+                    .context_tokens
+                    .is_none_or(|context| usage.cached_input_tokens <= context);
+                if !single_request || !previous.single_request() {
+                    return None;
+                }
+                let lost = previous
+                    .cached_input_tokens
+                    .saturating_sub(usage.cached_input_tokens);
+                if !material_cache_miss(lost, previous.cached_input_tokens) {
+                    return None;
+                }
+                lost
+            };
             Some(CacheMissNotice {
                 missed_tokens,
                 prompt_tokens,
@@ -186,6 +216,7 @@ impl CacheDiagnostics {
         }
         self.previous = Some(PromptSnapshot {
             prompt_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
             // A provider turn can contain several model/tool-loop calls. Its
             // processed-token total grows once per call and can be many times
             // larger than the context that a cold request would resend.
@@ -753,6 +784,68 @@ mod tests {
             diagnostics
                 .observe(at + TimeDelta::minutes(1), codex, usage(50_500, 0))
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_growing_single_request_prefix_does_not_report_the_uncached_tail() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        let signature = signature("gpt-5.6-sol", "high");
+        // Context 100k with a stable 98k cached prefix.
+        let mut first = usage_with_context_reuse(2_000, 98_000, 0, None);
+        first.context_tokens = Some(100_000);
+        assert!(diagnostics.observe(at, signature.clone(), first).is_none());
+
+        // Ordinary follow-up: the same prefix plus a 20k tail. The tail is new
+        // work, not a reprocessed prefix, so no miss card may fire.
+        let mut second = usage_with_context_reuse(20_000, 100_000, 0, None);
+        second.context_tokens = Some(120_000);
+        assert!(
+            diagnostics
+                .observe(at + TimeDelta::minutes(1), signature, second)
+                .is_none(),
+            "an appended uncached tail is not a lost cache prefix"
+        );
+    }
+
+    #[test]
+    fn a_shrinking_cached_prefix_is_reported_without_a_boundary() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        let signature = signature("gpt-5.6-sol", "high");
+        let mut first = usage_with_context_reuse(2_000, 98_000, 0, None);
+        first.context_tokens = Some(100_000);
+        diagnostics.observe(at, signature.clone(), first);
+
+        // Same signature, seconds later, but the cached prefix collapsed to a
+        // single block. That is a real eviction and must still be announced.
+        let mut second = usage_with_cache_creation(100_000, 1_792, 0);
+        second.context_tokens = Some(101_792);
+        let notice = diagnostics
+            .observe(at + TimeDelta::seconds(5), signature, second)
+            .expect("a lost cached prefix is a real miss");
+        assert_eq!(notice.missed_tokens, 96_208);
+    }
+
+    #[test]
+    fn an_aggregated_multi_round_snapshot_is_not_compared_with_one_request() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        let signature = signature("gpt-5.6-sol", "high");
+        // A turn that summed several model rounds: its cached reads far exceed
+        // its real context, so the snapshot is not a single request.
+        let mut aggregate = usage_with_context_reuse(5_000, 5_000_000, 0, None);
+        aggregate.context_tokens = Some(120_000);
+        diagnostics.observe(at, signature.clone(), aggregate);
+
+        let mut next = usage_with_cache_creation(120_000, 1_792, 0);
+        next.context_tokens = Some(121_792);
+        assert!(
+            diagnostics
+                .observe(at + TimeDelta::seconds(5), signature, next)
+                .is_none(),
+            "summed multi-round counters cannot be compared with one request"
         );
     }
 
