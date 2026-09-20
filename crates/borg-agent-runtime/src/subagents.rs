@@ -3534,7 +3534,13 @@ impl SubagentCoordinator {
                 !table.task_names.contains_key(&assignment_name),
                 "subagent task name already exists: {assignment_name}"
             );
-            table
+            // Claim and rename under one lock. The name is what the roster,
+            // `resolve`, and child-report attribution all key on, so a reused
+            // worker that keeps its previous name reports the new task under
+            // the old identity. Holding the lock across both steps also makes
+            // the uniqueness check above authoritative: two concurrent
+            // assignments cannot reserve the same name.
+            let claimed = table
                 .entries
                 .values_mut()
                 .filter(|entry| {
@@ -3547,14 +3553,25 @@ impl SubagentCoordinator {
                 })
                 .min_by_key(|entry| entry.snapshot.updated_at)
                 .map(|entry| {
+                    let previous_name =
+                        std::mem::replace(&mut entry.snapshot.task_name, assignment_name.clone());
+                    // The previous task's answer is not this task's result.
+                    let previous_final_text = entry.snapshot.final_text.take();
                     entry.assignment_claimed = true;
                     entry.snapshot.updated_at = Utc::now();
                     entry.snapshot.detail = Some(format!("Assigned new task {assignment_name}"));
-                    entry.snapshot.clone()
-                })
+                    (entry.snapshot.clone(), previous_name, previous_final_text)
+                });
+            if let Some((snapshot, previous_name, _)) = &claimed {
+                table.task_names.remove(previous_name);
+                table
+                    .task_names
+                    .insert(assignment_name.clone(), snapshot.session_id);
+            }
+            claimed
         };
 
-        if let Some(claimed) = claimed {
+        if let Some((claimed, previous_name, previous_final_text)) = claimed {
             let target = format!("session:{}", claimed.session_id);
             if let Err(error) = self
                 .route_followup_task_with_options_as(
@@ -3568,19 +3585,39 @@ impl SubagentCoordinator {
                 )
                 .await
             {
+                // The worker never received the task, so it must return to
+                // the identity it had before the claim: a half-applied rename
+                // would strand the roster on a task that is not running and
+                // leak the new name out of the index forever.
                 let mut table = self.table.lock().await;
+                let mut restore_previous_name = false;
                 if let Some(entry) = table.entries.get_mut(&claimed.session_id)
                     && entry.assignment_claimed
+                    && entry.snapshot.task_name == assignment_name
                 {
                     entry.assignment_claimed = false;
                     entry.snapshot.updated_at = Utc::now();
+                    entry.snapshot.task_name = previous_name.clone();
+                    entry.snapshot.final_text = previous_final_text;
                     entry.snapshot.detail =
                         Some(format!("Automatic task assignment failed: {error:#}"));
+                    restore_previous_name = true;
+                }
+                if restore_previous_name {
+                    table.task_names.remove(&assignment_name);
+                    table.task_names.insert(previous_name, claimed.session_id);
                 }
                 return Err(error);
             }
-            let mut value =
-                serde_json::to_value(self.get(claimed.session_id).await.unwrap_or(claimed))?;
+            let renamed = self.get(claimed.session_id).await.unwrap_or(claimed);
+            // Journal the rename now. `restore_from_events` rebuilds the
+            // task-name index from the latest durable snapshot, so a reused
+            // worker that is only renamed in memory comes back under its
+            // previous name if the parent dies before the child's next event.
+            let _ = self.activity_tx.send(SubagentActivity::Started {
+                agent: renamed.clone(),
+            });
+            let mut value = serde_json::to_value(renamed)?;
             value["reused"] = Value::Bool(true);
             value["assignment_task_name"] = Value::String(assignment_name);
             return Ok(value);
@@ -4375,14 +4412,20 @@ impl SubagentCoordinator {
         ));
         let table = self.table.clone();
         let activity_tx = self.activity_tx.clone();
-        let task_name = snapshot.task_name.clone();
+        let spawned_task_name = snapshot.task_name.clone();
         let parent_session_id = snapshot.parent_session_id;
         tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
-                update_from_session_event(&table, actor_session_id, &event).await;
+                // Read the name back out of the table instead of the one
+                // captured at spawn: the root projects a child report as
+                // `AgentMessageReceived` under this name, so a reused worker
+                // would otherwise keep answering as its previous task.
+                let task_name = update_from_session_event(&table, actor_session_id, &event)
+                    .await
+                    .unwrap_or_else(|| spawned_task_name.clone());
                 let _ = activity_tx.send(SubagentActivity::SessionEvent {
                     parent_session_id,
-                    task_name: task_name.clone(),
+                    task_name,
                     event,
                 });
             }
@@ -7943,14 +7986,16 @@ async fn send_prompt(
         .map_err(|_| anyhow::anyhow!("subagent command channel closed"))
 }
 
+/// Apply a child event to its snapshot and return the task name the child is
+/// running under now, which a reuse assignment may have changed since spawn.
 async fn update_from_session_event(
     table: &Arc<Mutex<SubagentTable>>,
     session_id: Uuid,
     event: &SessionEvent,
-) {
+) -> Option<String> {
     let mut table = table.lock().await;
     let Some(entry) = table.entries.get_mut(&session_id) else {
-        return;
+        return None;
     };
     match &event.kind {
         SessionEventKind::SessionConfigured {
@@ -8028,6 +8073,7 @@ async fn update_from_session_event(
         _ => {}
     }
     entry.snapshot.updated_at = event.created_at;
+    Some(entry.snapshot.task_name.clone())
 }
 
 fn project_child_state(snapshot: &mut SubagentSnapshot, state: &crate::SessionState) {

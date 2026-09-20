@@ -1659,6 +1659,10 @@ async fn spawn_tool_reuses_a_compatible_ready_worker_for_a_new_task() {
     .await
     .expect("first assignment should complete");
 
+    // Subscribe before the reuse: the first turn's report has already been
+    // broadcast, so the only assistant report this receiver sees belongs to
+    // the second assignment.
+    let mut activity = coordinator.subscribe();
     let second = coordinator
         .call_tool(
             "spawn_agent",
@@ -1673,7 +1677,13 @@ async fn spawn_tool_reuses_a_compatible_ready_worker_for_a_new_task() {
     assert_eq!(second["reused"], true);
     assert_eq!(second["assignment_task_name"], "/root/second_task");
     assert_eq!(second["session_id"], session_id.to_string());
+    // The worker keeps its session, and therefore its conversation, but it
+    // must take the new task's identity with it. The assignment used to
+    // rewrite only `detail`, leaving the first task's name on the snapshot.
+    assert_eq!(second["task_name"], "/root/second_task");
     assert_eq!(coordinator.list(None).await.len(), 1);
+    assert_eq!(coordinator.list(Some("/root/second_task")).await.len(), 1);
+    assert!(coordinator.list(Some("/root/first_task")).await.is_empty());
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -1685,9 +1695,47 @@ async fn spawn_tool_reuses_a_compatible_ready_worker_for_a_new_task() {
     })
     .await
     .expect("reused worker should receive the second assignment");
-    let prompts = prompts.lock().unwrap().clone();
-    assert!(prompts[0].contains("first bounded task"));
-    assert!(prompts[1].contains("second bounded task"));
+    let recorded = prompts.lock().unwrap().clone();
+    assert!(recorded[0].contains("first bounded task"));
+    assert!(recorded[1].contains("second bounded task"));
+
+    // The root projects a child report as `AgentMessageReceived` under the
+    // task name carried on this activity. Capturing it once at spawn made a
+    // reused worker answer the new task under the previous task's name.
+    let reported_name = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match activity.recv().await {
+                Ok(SubagentActivity::SessionEvent {
+                    task_name,
+                    event:
+                        SessionEvent {
+                            kind:
+                                SessionEventKind::Message {
+                                    actor: EventActor::Assistant,
+                                    status: MessageStatus::Complete,
+                                    ..
+                                },
+                            ..
+                        },
+                    ..
+                }) => break task_name,
+                Ok(_) => continue,
+                Err(error) => panic!("subagent activity stream ended: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("reused worker should report its second turn");
+    assert_eq!(reported_name, "/root/second_task");
+    assert_eq!(
+        coordinator.get(session_id).await.unwrap().task_name,
+        "/root/second_task"
+    );
+
+    // The name index moved with the worker: the first task's name is free
+    // again rather than resolving to a worker that stopped running it.
+    assert!(coordinator.stop("/root/first_task").await.is_err());
+    coordinator.stop("/root/second_task").await.unwrap();
 
     coordinator.stop_all().await;
     scratch.discard().await;
