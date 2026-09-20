@@ -450,7 +450,7 @@ impl NativeHarness {
                 continue;
             };
             let message = native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
-            record_native_message(&events, turn.provider, &message).await?;
+            record_folded_steer(&events, turn.provider, None, &message, &steer).await?;
             messages.push(message);
             confirm_steers(acks);
         }
@@ -571,7 +571,14 @@ impl NativeHarness {
                     };
                     let message =
                         native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
-                    record_native_message(&events, turn.provider, &message).await?;
+                    record_folded_steer(
+                        &events,
+                        turn.provider,
+                        Some(model_round),
+                        &message,
+                        &steer,
+                    )
+                    .await?;
                     messages.push(message);
                     canonicalize_native_messages(&mut messages);
                     confirm_steers(acks);
@@ -587,15 +594,6 @@ impl NativeHarness {
                     // retired on both or the outcome depends on scheduling.
                     turn.agent_tools.clear_watcher_yield();
                     assistant_message_id = Uuid::new_v4();
-                    send(
-                        &events,
-                        SessionEventKind::ProviderEvent {
-                            provider: turn.provider,
-                            kind: "native_steer_applied".to_string(),
-                            payload: json!({ "model_round": model_round }),
-                        },
-                    )
-                    .await;
                     continue;
                 }
             };
@@ -701,7 +699,14 @@ impl NativeHarness {
                     // same silent loss in a different place.
                     let message =
                         native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
-                    record_native_message(&events, turn.provider, &message).await?;
+                    record_folded_steer(
+                        &events,
+                        turn.provider,
+                        Some(model_round),
+                        &message,
+                        &steer,
+                    )
+                    .await?;
                     messages.push(message);
                     canonicalize_native_messages(&mut messages);
                     confirm_steers(acks);
@@ -922,10 +927,11 @@ impl NativeHarness {
                     native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
                 trailing_context_tokens =
                     trailing_context_tokens.saturating_add(estimated_message_tokens(&message));
-                record_native_message(&events, turn.provider, &message).await?;
+                record_folded_steer(&events, turn.provider, Some(model_round), &message, &steer)
+                    .await?;
                 messages.push(message);
                 canonicalize_native_messages(&mut messages);
-                // Journaled, so the steer is genuinely consumed now.
+                // Journaled and named to the session, so it is consumed now.
                 confirm_steers(acks);
             }
             tool_round += 1;
@@ -965,7 +971,14 @@ impl NativeHarness {
                             native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
                         trailing_context_tokens = trailing_context_tokens
                             .saturating_add(estimated_message_tokens(&message));
-                        record_native_message(&events, turn.provider, &message).await?;
+                        record_folded_steer(
+                            &events,
+                            turn.provider,
+                            Some(model_round),
+                            &message,
+                            &steer,
+                        )
+                        .await?;
                         messages.push(message);
                         canonicalize_native_messages(&mut messages);
                         confirm_steers(acks);
@@ -1334,6 +1347,9 @@ Return only the internal continuation checkpoint.",
 struct NativeSteer {
     text: String,
     attachments: Vec<PathBuf>,
+    /// The steers this fold stands for, for the marker below. Empty for a
+    /// steer the harness built itself, which no session is waiting on.
+    message_ids: Vec<Uuid>,
 }
 
 enum NativeModelOutcome {
@@ -2007,6 +2023,11 @@ type SteerAck = tokio::sync::oneshot::Sender<std::result::Result<(), String>>;
 /// before the fold leaves the steer unaccepted, which is the state the
 /// session's own retry path looks for.
 struct CapturedSteer {
+    /// The durable message the session queued for this steer. Named back to
+    /// the session once the fold is recorded, so completion is driven by an
+    /// event ordered after the journal write rather than by an admission flag
+    /// on an independent channel.
+    message_id: Uuid,
     text: String,
     attachments: Vec<PathBuf>,
     admission: borg_provider::provider::SteerAdmission,
@@ -2018,12 +2039,14 @@ impl CapturedSteer {
     fn from_control(control: AgentTurnControl) -> Option<Self> {
         match control {
             AgentTurnControl::Steer {
+                message_id,
                 text,
                 attachments,
                 admission,
                 ack,
                 ..
             } => Some(Self {
+                message_id,
                 text,
                 attachments,
                 admission,
@@ -2044,6 +2067,7 @@ impl CapturedSteer {
 fn admit_steers(captured: Vec<CapturedSteer>) -> Option<(NativeSteer, Vec<SteerAck>)> {
     let mut text = String::new();
     let mut attachments = Vec::new();
+    let mut message_ids = Vec::new();
     let mut acks = Vec::new();
     for steer in captured {
         if !steer.admission.accept() {
@@ -2057,9 +2081,47 @@ fn admit_steers(captured: Vec<CapturedSteer>) -> Option<(NativeSteer, Vec<SteerA
         }
         text.push_str(&steer.text);
         attachments.extend(steer.attachments);
+        message_ids.push(steer.message_id);
         acks.push(steer.ack);
     }
-    (!acks.is_empty()).then_some((NativeSteer { text, attachments }, acks))
+    (!acks.is_empty()).then_some((
+        NativeSteer {
+            text,
+            attachments,
+            message_ids,
+        },
+        acks,
+    ))
+}
+
+/// Record a folded steer's message, then name it back to the session.
+///
+/// The marker rides the same channel as the message it follows, so the session
+/// actor journals the fold before it ever sees the marker. That ordering is the
+/// guarantee: a steer cannot be reported delivered ahead of the write that
+/// delivered it. The acknowledgement is a separate channel and cannot carry
+/// this, which is why the marker exists at all.
+async fn record_folded_steer(
+    events: &mpsc::Sender<SessionEventKind>,
+    provider: crate::CodingProvider,
+    model_round: Option<usize>,
+    message: &ModelMessage,
+    steer: &NativeSteer,
+) -> Result<()> {
+    record_native_message(events, provider, message).await?;
+    send(
+        events,
+        SessionEventKind::ProviderEvent {
+            provider,
+            kind: "native_steer_applied".to_string(),
+            payload: json!({
+                "model_round": model_round,
+                "message_ids": steer.message_ids,
+            }),
+        },
+    )
+    .await;
+    Ok(())
 }
 
 /// Acknowledge steers whose message is now durably recorded.
@@ -6235,6 +6297,8 @@ mod tests {
         /// Fail the round instead of delivering the call, to exercise a turn
         /// that dies between capture and fold.
         abort: bool,
+        /// The durable message the marker must name.
+        steer_message_id: Uuid,
         /// Shared so the test can assert admission timing from outside.
         admission: borg_provider::provider::SteerAdmission,
         acked: std::sync::Arc<
@@ -6275,7 +6339,7 @@ mod tests {
             let (ack, acked) = tokio::sync::oneshot::channel();
             self.controls
                 .send(AgentTurnControl::Steer {
-                    message_id: Uuid::new_v4(),
+                    message_id: self.steer_message_id,
                     text: "check the log first".to_string(),
                     attachments: Vec::new(),
                     admission: self.admission.clone(),
@@ -6349,12 +6413,14 @@ mod tests {
             // the harness having captured the steer.
             let (controls_tx, controls_rx) = mpsc::channel(1);
             let admission = borg_provider::provider::SteerAdmission::pending();
+            let steer_message_id = Uuid::new_v4();
             let acked = std::sync::Arc::new(std::sync::Mutex::new(None));
             let client = Arc::new(SteerDuringGenerationHarnessClient {
                 rounds: std::sync::Arc::clone(&rounds),
                 controls: controls_tx,
                 marker: marker.clone(),
                 abort,
+                steer_message_id,
                 admission: admission.clone(),
                 acked: std::sync::Arc::clone(&acked),
             });
@@ -6447,6 +6513,18 @@ mod tests {
                     "",
                     "the aborted round runs no tool"
                 );
+                let mut named = false;
+                while let Ok(event) = events_rx.try_recv() {
+                    if let SessionEventKind::ProviderEvent { kind, .. } = event
+                        && kind == "native_steer_applied"
+                    {
+                        named = true;
+                    }
+                }
+                assert!(
+                    !named,
+                    "a steer that was never folded must not be named as applied"
+                );
                 continue;
             }
             let result = outcome.expect("the turn completes successfully");
@@ -6478,23 +6556,38 @@ mod tests {
 
             let mut journal = Vec::new();
             while let Ok(event) = events_rx.try_recv() {
-                if let SessionEventKind::ProviderEvent { kind, payload, .. } = event
-                    && kind == "native_model_message"
-                {
-                    journal.push(payload.to_string());
+                if let SessionEventKind::ProviderEvent { kind, payload, .. } = event {
+                    journal.push((kind, payload));
                 }
             }
-            let tool_result = journal
+            let recorded = |needle: &str| {
+                journal.iter().position(|(kind, payload)| {
+                    kind == "native_model_message" && payload.to_string().contains(needle)
+                })
+            };
+            let tool_result = recorded("call-1").expect("the tool result has to be journaled");
+            let steer = recorded("check the log first").expect("the steer has to be journaled");
+            let named = journal
                 .iter()
-                .position(|entry| entry.contains("call-1") && entry.contains("tool"))
-                .expect("the tool result has to be journaled");
-            let steer = journal
-                .iter()
-                .position(|entry| entry.contains("check the log first"))
-                .expect("the steer has to be journaled");
+                .position(|(kind, _)| kind == "native_steer_applied")
+                .expect("the fold has to be named back to the session");
             assert!(
                 tool_result < steer,
                 "the tool result must be journaled before the steer is folded"
+            );
+            // The marker is what lets the session complete the steer, so it has
+            // to follow the fold on the same channel. If it could precede the
+            // fold, completion could be written before the message it claims to
+            // have delivered.
+            assert!(
+                steer < named,
+                "the marker must follow the fold it reports, not precede it"
+            );
+            let expected = steer_message_id.to_string();
+            assert_eq!(
+                journal[named].1["message_ids"][0].as_str(),
+                Some(expected.as_str()),
+                "the marker names the durable message the session is waiting on"
             );
         }
     }
