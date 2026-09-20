@@ -28,6 +28,7 @@ use std::path::PathBuf;
 
 /// Everything the postmaster needs, so [`run_args`] stays a pure function of
 /// its inputs and is testable without systemd on the machine.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) struct Launch<'a> {
     pub postgres: &'a Path,
     pub data_dir: &'a Path,
@@ -97,6 +98,7 @@ pub(super) fn unit_name(data_dir: &Path) -> String {
 }
 
 /// The `systemd-run` arguments that start this cluster.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(super) fn run_args(launch: &Launch<'_>, unit: &str) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![
         "--user".into(),
