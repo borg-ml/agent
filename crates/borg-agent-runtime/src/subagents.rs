@@ -2883,6 +2883,42 @@ impl SubagentCoordinator {
         }
     }
 
+    /// Give a child a membership row in the team workspace its binding names.
+    ///
+    /// `register_child_session` re-homes the child's binding from its own
+    /// default workspace onto the owner's, but membership lives in the
+    /// workspace projection and does not move with it. A child that is bound
+    /// without being a member is shown on the roster and then refused by
+    /// `resolve_recipients` as "audience contains a non-member", so every path
+    /// that puts a child on the roster has to pass through here.
+    async fn join_team_workspace(&self, session_id: Uuid, task_name: &str) -> Result<()> {
+        if !self.root_launch.capabilities.multiplayer {
+            return Ok(());
+        }
+        let binding = self
+            .store
+            .workspace_binding(session_id)
+            .await?
+            .with_context(|| format!("subagent session {session_id} has no workspace binding"))?;
+        let human_display_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
+        let human_participant_id = crate::local_human_participant_id(&human_display_name);
+        self.workspace_store()
+            .await?
+            .ensure_execution_workspace(
+                binding.workspace_id,
+                self.root_launch
+                    .cwd
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Borg workspace"),
+                human_participant_id,
+                &human_display_name,
+                binding.participant_id,
+                task_name,
+            )
+            .await
+    }
+
     async fn workspace_store(&self) -> Result<&Arc<dyn WorkspaceStore>> {
         self.workspace_store
             .get_or_try_init(|| async {
@@ -3372,6 +3408,22 @@ impl SubagentCoordinator {
                             Some(format!("child session cannot be recovered: {error:#}"));
                         recovery_failed = true;
                     }
+                }
+                // Restoring the roster is what makes the child addressable
+                // again, so it owes the same workspace membership a live start
+                // writes. Reported on the snapshot rather than raised: one
+                // child that cannot rejoin must not abort recovery of the
+                // rest, and a roster entry that silently cannot be messaged is
+                // the failure this whole path exists to prevent.
+                if !recovery_failed
+                    && !snapshot.status.is_terminal()
+                    && let Err(error) = self
+                        .join_team_workspace(snapshot.session_id, &snapshot.task_name)
+                        .await
+                {
+                    snapshot.detail = Some(format!(
+                        "child cannot be messaged until its team membership is repaired: {error:#}"
+                    ));
                 }
             }
             {
@@ -4357,33 +4409,8 @@ impl SubagentCoordinator {
         self.store
             .register_child_session(snapshot.parent_session_id, actor_session_id)
             .await?;
-        if self.root_launch.capabilities.multiplayer {
-            let binding = self
-                .store
-                .workspace_binding(actor_session_id)
-                .await?
-                .with_context(|| {
-                    format!("subagent session {actor_session_id} has no workspace binding")
-                })?;
-            let workspace_store = self.workspace_store().await?;
-            let human_display_name =
-                std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
-            let human_participant_id = crate::local_human_participant_id(&human_display_name);
-            workspace_store
-                .ensure_execution_workspace(
-                    binding.workspace_id,
-                    self.root_launch
-                        .cwd
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("Borg workspace"),
-                    human_participant_id,
-                    &human_display_name,
-                    binding.participant_id,
-                    &snapshot.task_name,
-                )
-                .await?;
-        }
+        self.join_team_workspace(actor_session_id, &snapshot.task_name)
+            .await?;
         let queued_inbox = {
             let mut table = self.table.lock().await;
             let entry = table

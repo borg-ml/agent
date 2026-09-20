@@ -3634,6 +3634,104 @@ async fn durable_parent_activity_restores_child_topology() {
 }
 
 #[tokio::test]
+async fn a_child_restored_after_a_host_crash_is_still_addressable_in_the_team_workspace() {
+    // A host reboot left 15 workers on the roster as "Paused with the parent
+    // session; follow up to wake" while every message to them was refused with
+    // "audience contains a non-member": recovery re-homed each child's
+    // workspace binding onto the parent's team without giving it the
+    // membership row that binding implies. A roster entry that cannot be
+    // messaged is worse than a missing one, so the two have to be restored
+    // together.
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let child_id = Uuid::new_v4();
+    let now = Utc::now();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let workspace_store = store.workspace_store().await.unwrap().unwrap();
+    let human_display_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
+    let human = crate::local_human_participant_id(&human_display_name);
+    workspace_store
+        .ensure_execution_workspace(root, "workspace", human, &human_display_name, root, "Borg")
+        .await
+        .unwrap();
+
+    // All the restarted parent has of the child is the activity it journaled
+    // before the crash.
+    let started = SessionEvent::new(
+        root,
+        1,
+        SessionEventKind::SubagentActivity {
+            activity: SubagentActivityKind::Started,
+            agent: SubagentSnapshot {
+                session_id: child_id,
+                parent_session_id: root,
+                task_name: "/root/worker".into(),
+                status: SubagentStatus::Running,
+                provider: CodingProvider::Codex,
+                model: Some("gpt-test".into()),
+                effort: Some("high".into()),
+                cwd: PathBuf::from("/workspace"),
+                created_at: now,
+                updated_at: now,
+                detail: None,
+                final_text: None,
+                usage: SubagentUsage::default(),
+            },
+            event: None,
+        },
+    );
+    store.append(started.clone()).await.unwrap();
+    store.create_session(child_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            child_id,
+            0,
+            SessionEventKind::SessionStarted,
+        ))
+        .await
+        .unwrap();
+    let session_store: Arc<dyn SessionStore> = store.clone();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        3,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        session_store,
+    )
+    .unwrap();
+    coordinator.restore_from_events(&[started]).await.unwrap();
+
+    assert_eq!(
+        coordinator
+            .resolve_snapshot("/root/worker")
+            .await
+            .unwrap()
+            .status,
+        SubagentStatus::Ready
+    );
+    coordinator
+        .send_message("/root/worker", "resume the port")
+        .await
+        .unwrap();
+    let binding = store.workspace_binding(child_id).await.unwrap().unwrap();
+    assert_eq!(binding.workspace_id, root);
+    assert_eq!(
+        workspace_store
+            .deliveries_after(binding.workspace_id, binding.participant_id, 0, 10)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|delivery| delivery.sequence > 0)
+            .count(),
+        1
+    );
+    scratch.discard().await;
+}
+
+#[tokio::test]
 async fn restore_mirrors_a_child_stop_journaled_before_the_parent_crashed() {
     let directory = tempdir().unwrap();
     let workspace = directory.path().join("workspace");
