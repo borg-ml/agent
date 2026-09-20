@@ -7935,7 +7935,7 @@ impl BorgTerminal {
                         .map(|row| {
                             let in_thumb = row >= thumb_top && row < thumb_top + thumb_height;
                             Line::from(Span::styled(
-                                " █ ",
+                                " ▊ ",
                                 Style::default().fg(if in_thumb {
                                     if self.focused_child.is_some() {
                                         if self.scrollbar_hovered || self.dragging_scrollbar {
