@@ -3790,12 +3790,16 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
     let child_session_id = {
         let mut table = coordinator.table.lock().await;
         let child = table.reserve("stale_worker", &launch()).unwrap();
-        table
-            .entries
-            .get_mut(&child.session_id)
-            .unwrap()
-            .snapshot
-            .status = SubagentStatus::Ready;
+        let entry = table.entries.get_mut(&child.session_id).unwrap();
+        entry.snapshot.status = SubagentStatus::Ready;
+        // Dormant is what makes this a restored candidate rather than a
+        // half-built live one. `reserve` leaves the entry not dormant with no
+        // command channel, which is the state of a worker whose actor is
+        // mid-launch, so routing to it waits for a start that never happens.
+        // A child brought back from the journal is metadata only until an
+        // explicit child-directed action wakes it, and the wake is the path
+        // this test needs to exercise.
+        entry.dormant = true;
         child.session_id
     };
     store.create_session(child_session_id).await.unwrap();
