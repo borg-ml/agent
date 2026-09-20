@@ -19,9 +19,18 @@
 //! refuses a populated directory, `pg_ctl start` refuses a running cluster, and
 //! both outcomes are re-checked against live state before being treated as
 //! failures.
+//!
+//! A cluster is also a thing that starts and stops underneath us. Whoever
+//! stops it -- a crash, a session-scope cleanup, an operator -- leaves a window
+//! in which the postmaster is alive and holds a valid `postmaster.pid` while
+//! refusing every connection. A single pass through this module reads that
+//! window as a permanently unreachable cluster, so [`ManagedCluster::ensure_running`]
+//! is written as a loop over live state instead: see it for why the retry has
+//! to re-run the whole lifecycle rather than just the connection.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
@@ -41,6 +50,15 @@ const ROLE: &str = "borg";
 
 /// The database holding the journal.
 const DATABASE: &str = "borg_sessions";
+
+/// How long [`ManagedCluster::ensure_running`] keeps working a cluster that is
+/// between states before calling it broken.
+///
+/// This bounds a shutdown plus the start that follows it, not a single
+/// connection: the point of the budget is to outlast a transition, and a
+/// cluster carrying a large journal can take seconds to shut down cleanly and
+/// seconds more to recover on the way back up.
+const TRANSITION_BUDGET: Duration = Duration::from_secs(30);
 
 /// Where `initdb` and `pg_ctl` live when they are not on `PATH`.
 ///
@@ -99,17 +117,47 @@ impl ManagedCluster {
     }
 
     /// Provision if necessary, start if necessary, and return the journal URL.
+    ///
+    /// The start-then-connect pair is a loop rather than a sequence because
+    /// neither half can settle a cluster that is mid-transition on its own.
+    /// `pg_ctl status` answers from `postmaster.pid`, so a postmaster that is
+    /// shutting down still reports as running and this skips starting it,
+    /// while the connection that follows is refused. Retrying only the
+    /// connection would then wait out the shutdown and find nothing listening,
+    /// because once the shutdown completes nobody has restarted the cluster.
+    /// Re-running both halves is what turns losing the race to a shutdown into
+    /// starting the cluster again, and it is equally what lets a process that
+    /// arrives during someone else's start wait for it instead of failing.
     pub async fn ensure_running(&self) -> Result<String> {
         let pg_ctl = locate_binary("pg_ctl")?;
         if !self.is_initialized() {
             let initdb = locate_binary("initdb")?;
             self.initialize(&initdb).await?;
         }
-        if !self.is_running(&pg_ctl).await? {
-            self.start(&pg_ctl).await?;
+        let deadline = Instant::now() + TRANSITION_BUDGET;
+        let mut attempt: u32 = 0;
+        loop {
+            if !self.is_running(&pg_ctl).await? {
+                self.start(&pg_ctl).await?;
+            }
+            let error = match self.ensure_database().await {
+                Ok(()) => return Ok(self.url()),
+                Err(error) => error,
+            };
+            // Anything that is not the cluster changing state is a real
+            // failure, and so is a transition that has outlasted its budget.
+            if !is_between_states(&error) || Instant::now() >= deadline {
+                return Err(error);
+            }
+            tracing::warn!(
+                attempt = attempt + 1,
+                "the Borg session cluster is between states; re-checking it"
+            );
+            // Backoff capped early: a transition resolves in seconds, and the
+            // budget is spent better on more attempts than on longer sleeps.
+            tokio::time::sleep(Duration::from_millis(100 << attempt.min(3))).await;
+            attempt += 1;
         }
-        self.ensure_database().await?;
-        Ok(self.url())
     }
 
     /// Create the cluster. Only ever called when `PG_VERSION` is absent.
@@ -293,6 +341,47 @@ impl ManagedCluster {
     }
 }
 
+/// Whether a failure means the cluster is changing state rather than broken.
+///
+/// Matched on SQLSTATE and error kind rather than message text, so it holds
+/// under a non-English server locale. Three conditions make up the window:
+///
+/// - `57P03` (`cannot_connect_now`) is the live postmaster refusing work, and
+///   covers both "the database system is shutting down" and "the database
+///   system is starting up".
+/// - A refused connection is the gap after a shutdown completes and before
+///   anything has started the cluster again.
+/// - Startup closes the listening socket on clients mid-handshake, which
+///   surfaces as an unexpected end of file rather than a refusal.
+///
+/// All three resolve on their own or on the caller's next start attempt. A
+/// rejected role, a missing database or a corrupt data directory do not, and
+/// must stay loud.
+fn is_between_states(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let Some(error) = cause.downcast_ref::<sqlx::Error>() else {
+            return false;
+        };
+        if error
+            .as_database_error()
+            .and_then(|error| error.code())
+            .is_some_and(|code| code.as_ref() == "57P03")
+        {
+            return true;
+        }
+        matches!(
+            error,
+            sqlx::Error::Io(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::UnexpectedEof
+                )
+        )
+    })
+}
+
 fn is_duplicate_database(error: &sqlx::Error) -> bool {
     // 42P04 is duplicate_database. Matching the code rather than the message
     // keeps this working under a non-English server locale.
@@ -442,6 +531,83 @@ mod tests {
             message.contains("Install PostgreSQL"),
             "the error must say how to get a server, got: {message}"
         );
+    }
+
+    /// A cluster that is merely between states must be waited out, and a
+    /// cluster that is genuinely broken must not be. This classification is
+    /// the whole of the fix for the recurring "could not reach the Borg
+    /// session cluster ... the database system is shutting down" startup
+    /// failure, and it is keyed on SQLSTATE and error kind rather than on
+    /// anything the compiler or the surrounding types can check. If it silently
+    /// stops matching, concurrent CLI opens go back to failing outright during
+    /// every restart, which is exactly the regression this guards.
+    #[test]
+    fn a_cluster_between_states_is_waited_out_and_a_broken_one_is_not() {
+        use std::borrow::Cow;
+        use std::error::Error as StdError;
+
+        #[derive(Debug)]
+        struct Reported(&'static str);
+
+        impl std::fmt::Display for Reported {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.0)
+            }
+        }
+
+        impl StdError for Reported {}
+
+        impl sqlx::error::DatabaseError for Reported {
+            fn message(&self) -> &str {
+                self.0
+            }
+            fn code(&self) -> Option<Cow<'_, str>> {
+                Some(Cow::Borrowed(self.0))
+            }
+            fn as_error(&self) -> &(dyn StdError + Send + Sync + 'static) {
+                self
+            }
+            fn as_error_mut(&mut self) -> &mut (dyn StdError + Send + Sync + 'static) {
+                self
+            }
+            fn into_error(self: Box<Self>) -> Box<dyn StdError + Send + Sync + 'static> {
+                self
+            }
+            fn kind(&self) -> sqlx::error::ErrorKind {
+                sqlx::error::ErrorKind::Other
+            }
+        }
+
+        let reported = |code: &'static str| {
+            anyhow::Error::new(sqlx::Error::Database(Box::new(Reported(code))))
+                .context("could not reach the Borg session cluster")
+        };
+        let refused = |kind: std::io::ErrorKind| {
+            anyhow::Error::new(sqlx::Error::Io(std::io::Error::new(kind, "socket")))
+                .context("could not reach the Borg session cluster")
+        };
+
+        // 57P03 is how a live postmaster says it is shutting down or still
+        // starting up -- the reported failure.
+        assert!(is_between_states(&reported("57P03")));
+        // The gap between a completed shutdown and the next start.
+        assert!(is_between_states(&refused(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        assert!(is_between_states(&refused(
+            std::io::ErrorKind::UnexpectedEof
+        )));
+
+        // A rejected role and a missing database are settled facts about a
+        // running cluster; retrying only delays the report.
+        assert!(!is_between_states(&reported("28P01")));
+        assert!(!is_between_states(&reported("3D000")));
+        assert!(!is_between_states(&refused(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!is_between_states(&anyhow::anyhow!(
+            "pg_ctl is not installed"
+        )));
     }
 
     #[test]
