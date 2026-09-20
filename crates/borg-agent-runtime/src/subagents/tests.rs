@@ -3777,7 +3777,9 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
         root,
         launch(),
         3,
-        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        Arc::new(RecordingPeerExecutor {
+            prompts: Arc::new(StdMutex::new(Vec::new())),
+        }),
         session_store,
     )
     .unwrap();
@@ -3787,7 +3789,7 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
     // not carry.
     let child_session_id = {
         let mut table = coordinator.table.lock().await;
-        let child = table.reserve("stale-worker", &launch()).unwrap();
+        let child = table.reserve("stale_worker", &launch()).unwrap();
         table
             .entries
             .get_mut(&child.session_id)
