@@ -844,6 +844,27 @@ impl RuntimeProviderContext {
     }
 }
 
+/// Controller-supplied identity for a session's local multiplayer workspace.
+///
+/// A host derives these from its own environment (`USER`, the launch cwd). A
+/// product controller that runs the runtime in-process knows the real
+/// authenticated participant and workspace name, so it supplies them here
+/// instead of having the runtime invent host-local identities the product
+/// database cannot resolve. In-memory only, like [`RuntimeMcpContext`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeWorkspaceIdentity {
+    /// The durable participant id for the human in this workspace. Must be the
+    /// identity the controller stores, not a host-local derivation.
+    pub human_participant_id: Uuid,
+    pub human_display_name: String,
+    /// Participant id recorded for the executing agent. Defaults to the
+    /// session's bound participant when unset.
+    pub agent_participant_id: Option<Uuid>,
+    pub agent_display_name: Option<String>,
+    /// Workspace display name. Defaults to the launch directory's basename.
+    pub workspace_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct LaunchSession {
@@ -942,6 +963,11 @@ pub struct SessionCapabilities {
     #[serde(skip)]
     #[ts(skip)]
     pub system_prompt_appendix: Option<String>,
+    /// Controller-supplied identity for this session's local multiplayer
+    /// workspace. Unset keeps the host-local derivation. Never serialized.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub runtime_workspace_identity: Option<RuntimeWorkspaceIdentity>,
     /// Effective host limits for this session. This is populated by the
     /// canonical host and is never accepted as authority when supplied by a
     /// remote controller.
@@ -966,6 +992,7 @@ impl Default for SessionCapabilities {
             runtime_mcp_context: None,
             runtime_provider_context: None,
             system_prompt_appendix: None,
+            runtime_workspace_identity: None,
             resource_limits: None,
         }
     }

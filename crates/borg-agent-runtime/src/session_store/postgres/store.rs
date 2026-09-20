@@ -932,6 +932,9 @@ impl SessionStore for PostgresSessionStore {
     /// degrading, so a backend that cannot supply every tier must fail at
     /// startup instead of at first use.
     async fn workspace_store(&self) -> Result<Option<std::sync::Arc<dyn crate::WorkspaceStore>>> {
+        if let Some(override_store) = self.workspace_override.as_ref() {
+            return Ok(Some(std::sync::Arc::clone(&override_store.0)));
+        }
         Ok(Some(std::sync::Arc::new(
             crate::workspace_postgres::PostgresWorkspaceStore::from_pool(self.pool().clone()),
         )))
