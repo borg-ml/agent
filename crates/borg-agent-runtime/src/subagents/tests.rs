@@ -4513,10 +4513,30 @@ async fn image_routing_fixture(
 async fn forwarding_images_to_a_participant_with_no_local_session_is_refused_before_durable_writes()
 {
     let directory = tempdir().unwrap();
-    let (coordinator, sender, _recipient, _store, scratch) =
+    let (coordinator, sender, _recipient, store, scratch) =
         image_routing_fixture(directory.path()).await;
-    // Discovered elsewhere: no binding here, so the local redirect cannot fire.
+    // Discovered elsewhere: a real participant that was discovered, holding a
+    // workspace of its own so it stays off this sender's roster, and with no
+    // session here so the local redirect cannot fire. That is what "no local
+    // session" means in production. A participant that simply does not exist
+    // fails the direct-workspace path for an unrelated reason, which would
+    // leave the refusal below untested.
     let elsewhere = Uuid::new_v4();
+    store
+        .workspace_store()
+        .await
+        .unwrap()
+        .unwrap()
+        .ensure_execution_workspace(
+            Uuid::new_v4(),
+            "elsewhere project",
+            crate::local_human_participant_id("Human"),
+            "Human",
+            elsewhere,
+            "Elsewhere root",
+        )
+        .await
+        .unwrap();
 
     let source = directory.path().join("screenshot.png");
     std::fs::write(&source, sample_png()).unwrap();
