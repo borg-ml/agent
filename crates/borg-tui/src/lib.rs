@@ -16,7 +16,8 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use ratatui_image::{
-    Resize, StatefulImage, picker::Picker as ImagePicker, picker::ProtocolType,
+    Resize, StatefulImage,
+    picker::{Picker as ImagePicker, ProtocolType, cap_parser::QueryStdioOptions},
     protocol::StatefulProtocol,
 };
 use std::process::Command;
@@ -15533,20 +15534,34 @@ fn image_preview_slots(links: &[LinkRowRange]) -> Vec<ImagePreviewSlot> {
 }
 
 /// Probe the terminal for a graphics protocol. `BORG_IMAGE_PROTOCOL=halfblocks`
-/// (or `off`) skips the probe and keeps glyph previews.
+/// (or `off`) skips the probe and keeps glyph previews; `kitty`, `sixel`, or
+/// `iterm2` force a protocol for a terminal whose reply the probe missed.
 fn detect_image_picker() -> Option<ImagePicker> {
-    if std::env::var("BORG_IMAGE_PROTOCOL")
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "halfblocks" | "off" | "0" | "none"
-            )
-        })
-        .unwrap_or(false)
-    {
+    let requested = std::env::var("BORG_IMAGE_PROTOCOL")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase());
+    if matches!(
+        requested.as_deref(),
+        Some("halfblocks" | "off" | "0" | "none")
+    ) {
         return None;
     }
-    let mut picker = ImagePicker::from_query_stdio().ok()?;
+    // The window only elapses when the terminal does not answer, so a longer
+    // one costs nothing on a healthy terminal and keeps a busy machine from
+    // silently falling back to glyph previews.
+    let options = QueryStdioOptions {
+        timeout: Duration::from_secs(4),
+        ..QueryStdioOptions::default()
+    };
+    let mut picker = ImagePicker::from_query_stdio_with_options(options).ok()?;
+    if let Some(protocol) = requested.as_deref().and_then(|value| match value {
+        "kitty" => Some(ProtocolType::Kitty),
+        "sixel" => Some(ProtocolType::Sixel),
+        "iterm2" | "iterm" => Some(ProtocolType::Iterm2),
+        _ => None,
+    }) {
+        picker.set_protocol_type(protocol);
+    }
     // Opaque padding hides stale half-block glyphs beneath terminal graphics.
     if let Color::Rgb(red, green, blue) = MESSAGE_BG {
         picker.set_background_color(Some(image::Rgba([red, green, blue, 255])));

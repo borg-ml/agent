@@ -104,7 +104,8 @@ Attachments render as real images when the terminal supports a graphics
 protocol (Kitty, Sixel, or iTerm2 — Ghostty, Kitty, WezTerm, iTerm2); Borg
 probes for it once at startup. Other terminals keep the half-block glyph
 preview. Set `BORG_IMAGE_PROTOCOL=halfblocks` to skip the probe and force the
-glyph fallback.
+glyph fallback, or `kitty`, `sixel`, or `iterm2` to force a protocol when the
+probe misses a terminal that does support one.
 
 ## Reasoning effort
 

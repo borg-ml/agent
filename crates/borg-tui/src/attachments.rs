@@ -26,19 +26,29 @@ pub(super) fn preview(
     }
     // Half blocks pack two vertical pixels into one cell (top = foreground,
     // bottom = background), so a tile of `width` columns and `max_rows` rows
-    // can carry `width` × `2 * max_rows` pixels. Downscale to that real
-    // resolution with a quality filter instead of a fixed 24×16 thumbnail,
-    // so wider transcripts render a sharper preview rather than a mush of
-    // oversized blocks.
-    let image = image::ImageReader::open(path)
+    // can carry `width` × `2 * max_rows` pixels. Downscale into that box with
+    // a quality filter, but fit the image inside it rather than stretching
+    // width and height independently: forcing both axes turned a tall
+    // screenshot into a wide box of blocks. The tile then follows the image's
+    // own proportions.
+    let source = image::ImageReader::open(path)
         .ok()?
         .with_guessed_format()
         .ok()?
         .decode()
-        .ok()?
+        .ok()?;
+    let box_width = width as u32;
+    let box_height = (max_rows * 2) as u32;
+    let scale = f64::min(
+        f64::from(box_width) / f64::from(source.width().max(1)),
+        f64::from(box_height) / f64::from(source.height().max(1)),
+    );
+    let fitted_width = ((f64::from(source.width()) * scale).round() as u32).max(1);
+    let fitted_height = ((f64::from(source.height()) * scale).round() as u32).max(1);
+    let image = source
         .resize(
-            width as u32,
-            (max_rows * 2) as u32,
+            fitted_width,
+            fitted_height,
             image::imageops::FilterType::Lanczos3,
         )
         .to_rgb8();
