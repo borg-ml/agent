@@ -256,25 +256,41 @@ fn pool() -> &'static LspPool {
     })
 }
 
-/// Start the one idle reaper, once.
-///
-/// Latched only on a successful spawn: a service constructed outside a Tokio
-/// runtime still starts nothing, exactly as before, and a later service
-/// constructed inside one still gets the sweep going.
-fn ensure_idle_reaper(pool: &'static LspPool) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static STARTED: AtomicBool = AtomicBool::new(false);
+static IDLE_REAPER: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
 
-    if STARTED.load(Ordering::Acquire) {
-        return;
-    }
+/// Whether the pool still has a reaper that can actually run.
+///
+/// A reaper belongs to the Tokio runtime that spawned it and dies with it, and
+/// a handle whose runtime is gone reports finished. That is precisely what a
+/// "started once" flag cannot see: it would stay true over a dead task and the
+/// pool would never sweep again.
+fn reaper_is_live(existing: Option<&tokio::task::JoinHandle<()>>) -> bool {
+    existing.is_some_and(|handle| !handle.is_finished())
+}
+
+/// Keep exactly one live idle reaper for the pool.
+///
+/// Re-spawned whenever the one we hold has stopped, because runtimes do not
+/// always outlive the process: every `#[tokio::test]` builds and drops its
+/// own, and an embedded host that restarts its runtime would otherwise be left
+/// with a pool nothing ever sweeps. A service constructed outside a runtime
+/// still starts nothing, exactly as before.
+fn ensure_idle_reaper(pool: &'static LspPool) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    if STARTED.swap(true, Ordering::AcqRel) {
+    // The guard covers an Option<JoinHandle> and is never held across an
+    // await, so a poisoned lock is recoverable rather than a reason to leave
+    // the pool unswept.
+    let mut reaper = match IDLE_REAPER.lock() {
+        Ok(reaper) => reaper,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if reaper_is_live(reaper.as_ref()) {
         return;
     }
-    spawn_idle_reaper(runtime, &pool.clients, &pool.reaped);
+    *reaper = Some(spawn_idle_reaper(runtime, &pool.clients, &pool.reaped));
 }
 
 impl LspService {
@@ -373,6 +389,10 @@ impl LspService {
     /// Find or create the slot for `(spec, root)` under the map lock, without
     /// starting the server there.
     async fn lease_client(&self, spec: &'static ServerSpec, root: &Path) -> SharedLspClient {
+        // Revive the sweep on use, not only on construction: a service built
+        // under a runtime that later went away would otherwise keep leasing
+        // servers into a pool nothing reaps.
+        ensure_idle_reaper(pool());
         let session_root = tokio::fs::canonicalize(&self.root)
             .await
             .unwrap_or_else(|_| self.root.clone());
@@ -400,16 +420,26 @@ impl LspService {
     /// workspace pass must not leave its own servers looking idle.
     async fn active_clients(&self) -> Vec<(LspClientKey, SharedLspClient)> {
         let leased = self.leased.lock().await.clone();
-        let mut clients = self.clients.lock().await;
-        let now = Instant::now();
-        clients
-            .iter_mut()
-            .filter(|(key, _)| leased.contains(*key))
-            .map(|(key, slot)| {
-                slot.last_used = now;
-                (key.clone(), slot.client.clone())
-            })
-            .collect()
+        let snapshot = {
+            let mut clients = self.clients.lock().await;
+            let now = Instant::now();
+            clients
+                .iter_mut()
+                .filter(|(key, _)| leased.contains(*key))
+                .map(|(key, slot)| {
+                    slot.last_used = now;
+                    (key.clone(), slot.client.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        // A slot that says `Ready` is not evidence the process behind it is
+        // still running. Reconcile before anyone reads the state, so `status`
+        // and workspace passes report a killed server as stopped instead of
+        // presenting it as one answering with no diagnostics.
+        for (_, client) in &snapshot {
+            discard_dead_client(client).await;
+        }
+        snapshot
     }
 
     /// Why a workspace-wide request has nothing to talk to. Distinguishes
@@ -1031,7 +1061,7 @@ fn spawn_idle_reaper(
     runtime: tokio::runtime::Handle,
     clients: &std::sync::Arc<Mutex<HashMap<LspClientKey, LspClientSlot>>>,
     reaped: &std::sync::Arc<Mutex<Vec<ReapRecord>>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let clients = std::sync::Arc::downgrade(clients);
     let reaped = std::sync::Arc::downgrade(reaped);
     runtime.spawn(async move {
@@ -1067,7 +1097,7 @@ fn spawn_idle_reaper(
             let overflow = reaped.len().saturating_sub(MAX_REMEMBERED_REAPS);
             reaped.drain(..overflow);
         }
-    });
+    })
 }
 
 fn lsp_client_is_expired(idle_for: Duration) -> bool {
@@ -1835,15 +1865,53 @@ mod tests {
         );
     }
 
+    /// A reaper belongs to the runtime that spawned it. The first cut of this
+    /// pool latched a "started" flag on success, which stayed true after that
+    /// runtime went away: every `#[tokio::test]` after the first, and any host
+    /// that restarts an embedded runtime, would have been left with a pool
+    /// nothing ever swept. Deliberately exercises the decision rather than the
+    /// shared slot, so it is deterministic and cannot pass by happening to
+    /// observe another test's live reaper.
+    #[test]
+    fn a_reaper_whose_runtime_is_gone_is_not_live() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = runtime.spawn(std::future::pending::<()>());
+        runtime.block_on(async { tokio::task::yield_now().await });
+        assert!(
+            reaper_is_live(Some(&handle)),
+            "a task on a running runtime is a live reaper"
+        );
+
+        drop(runtime);
+        assert!(
+            !reaper_is_live(Some(&handle)),
+            "a reaper whose runtime is gone must be respawned, not counted as running"
+        );
+        assert!(!reaper_is_live(None), "no reaper is not a live reaper");
+    }
+
     /// The child is spawned `kill_on_drop`, so a server killed from outside
     /// stayed in its slot as a `Ready` client over a closed pipe while the
-    /// process sat as a zombie nobody waited on. The next request wrote into
-    /// the dead pipe instead of starting a replacement. `cat` stands in for a
-    /// language server here: this test needs a process with piped stdio that
-    /// exits when killed, and nothing about rust-analyzer in particular.
+    /// process sat as a zombie nobody waited on. Two things had to be wrong at
+    /// once: the next request wrote into the dead pipe, and `status` -- which
+    /// only reads -- presented the corpse as a server answering with no
+    /// diagnostics. `cat` stands in for a language server here: this needs a
+    /// process with piped stdio that exits when killed, and nothing about
+    /// rust-analyzer in particular.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_killed_server_is_reaped_and_the_slot_reopened() {
+    async fn a_killed_server_is_reaped_and_stops_being_reported_as_active() {
+        let root = tempfile::tempdir().expect("workspace");
+        let service = LspService::new(root.path());
+        let key = LspClientKey {
+            server_id: "rust-analyzer",
+            workspace_root: root.path().to_path_buf(),
+            scope: LspScopeKey::Unrestricted,
+        };
+
         let mut child = Command::new("cat")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1861,11 +1929,19 @@ mod tests {
                 opened_versions: HashMap::new(),
                 published_diagnostics: HashMap::new(),
             }))));
+        service.leased.lock().await.insert(key.clone());
+        service.clients.lock().await.insert(
+            key,
+            LspClientSlot {
+                client: std::sync::Arc::clone(&shared),
+                last_used: Instant::now(),
+            },
+        );
 
-        discard_dead_client(&shared).await;
-        assert!(
-            matches!(&*shared.lock().await, LspClientState::Ready(_)),
-            "a running server is left alone"
+        assert_eq!(
+            service.status().await["active_servers"],
+            json!(["rust-analyzer"]),
+            "a running server is reported and left alone"
         );
 
         shared
@@ -1877,17 +1953,27 @@ mod tests {
             .start_kill()
             .expect("kill the server the way an outside process would");
 
-        // Exit is observed, not assumed: poll rather than sleep a fixed time.
+        // The exit is observed, not assumed after a fixed sleep.
+        let mut status = service.status().await;
         for _ in 0..200 {
-            discard_dead_client(&shared).await;
-            if matches!(&*shared.lock().await, LspClientState::NotStarted) {
+            if status["active_servers"] == json!([]) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
+            status = service.status().await;
         }
+        assert_eq!(
+            status["active_servers"],
+            json!([]),
+            "a read-only status must not present a killed server as one answering"
+        );
+        assert_eq!(
+            status["active_workspaces"][0]["state"],
+            json!("not_started")
+        );
         assert!(
             matches!(&*shared.lock().await, LspClientState::NotStarted),
-            "a dead server must return to NotStarted so the next request restarts it"
+            "the slot returns to NotStarted so the next request restarts it"
         );
     }
 
