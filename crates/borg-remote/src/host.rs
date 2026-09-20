@@ -1964,6 +1964,22 @@ pub async fn run_host_with_executor_factory(
     config_path: &Path,
     executor_factory: HostExecutorFactory,
 ) -> Result<()> {
+    run_host_with_resolved_store(config_path, executor_factory, None).await
+}
+
+/// The host loop with the journal it runs against made explicit.
+///
+/// The public entry keeps environment selection, which is the production
+/// contract for a relay. A caller that already holds one specific backend
+/// passes it here instead: a test driving a scratch database needs the host to
+/// run against that database, because a host that resolved its own would poll
+/// a different journal than the test seeded and every fault the test injected
+/// would be invisible to it -- the test would pass while proving nothing.
+pub(crate) async fn run_host_with_resolved_store(
+    config_path: &Path,
+    executor_factory: HostExecutorFactory,
+    injected_store: Option<crate::session_store::factory::ResolvedSessionStore>,
+) -> Result<()> {
     let config: HostConfig = serde_json::from_slice(
         &fs::read(config_path)
             .with_context(|| format!("failed to read {}", config_path.display()))?,
@@ -1990,10 +2006,15 @@ pub async fn run_host_with_executor_factory(
     // entry point, and resolves every tier before starting any loop -- this
     // process is long-running by definition, so there is no ownership race to
     // settle first and nothing to defer.
-    let resolved = crate::session_store::factory::open_resolved(
-        &crate::session_store::factory::SessionStoreConfig::from_env(),
-    )
-    .await?;
+    let resolved = match injected_store {
+        Some(resolved) => resolved,
+        None => {
+            crate::session_store::factory::open_resolved(
+                &crate::session_store::factory::SessionStoreConfig::from_env(),
+            )
+            .await?
+        }
+    };
     let session_store = Arc::clone(resolved.session());
     let receipts = Arc::clone(resolved.receipts());
     let mut capabilities =
@@ -6417,6 +6438,15 @@ mod tests {
             });
             let worker_config = config_path.clone();
             let worker_store: Arc<dyn SessionStore> = store.clone();
+            // The mirrored branch is handed this test's journal explicitly.
+            // The host branch has to be handed the same one, or it resolves a
+            // different journal from the environment and the cursor this test
+            // is asserting about belongs to a database it never seeded.
+            let worker_resolved = crate::session_store::factory::open_resolved(
+                &crate::session_store::factory::SessionStoreConfig::with_url(scratch.url.clone()),
+            )
+            .await
+            .unwrap();
             let (commands, mut received) = mpsc::channel(4);
             let (shutdown, stopped) = watch::channel(false);
             let mut worker = AbortTask(tokio::spawn(async move {
@@ -6431,7 +6461,8 @@ mod tests {
                     )
                     .await
                 } else {
-                    run_host_with_executor_factory(&worker_config, factory).await
+                    run_host_with_resolved_store(&worker_config, factory, Some(worker_resolved))
+                        .await
                 }
             }));
             for expected in [0, 0, 0, 2] {
@@ -9875,8 +9906,17 @@ mod tests {
             seen.fetch_add(1, Ordering::SeqCst);
             bail!("test launch must fail cwd validation before provider construction")
         });
+        // The host has to run against this test's scratch database. Resolving
+        // from the environment would point it at a different journal, and the
+        // scan fault injected below would never reach it -- the test would
+        // pass while proving nothing.
+        let resolved = crate::session_store::factory::open_resolved(
+            &crate::session_store::factory::SessionStoreConfig::with_url(scratch.url.clone()),
+        )
+        .await
+        .unwrap();
         let mut host = AbortTask(tokio::spawn(async move {
-            run_host_with_executor_factory(&config_path, factory).await
+            run_host_with_resolved_store(&config_path, factory, Some(resolved)).await
         }));
         let first = tokio::time::timeout(Duration::from_secs(30), gates.recv())
             .await
@@ -9890,13 +9930,23 @@ mod tests {
             .unwrap();
         store.begin_host_bootstrap(id).await.unwrap();
         let metadata = store.load_host_launch_metadata(id).await.unwrap().unwrap();
-        // Corrupt only the disposable recovery row after the host is already
-        // polling. The value is jsonb the column accepts but not launch
-        // metadata, so recovery faults on decode rather than on the column.
+        // The recovery row is left undecodable so the repair below has
+        // something to fix. It is not what faults the scan: `metadata_json` is
+        // jsonb and the scan reads it as an untyped Value, so any valid json
+        // decodes there and the typed reading only happens later, in the
+        // consumer.
         let corrupted = serde_json::json!({"not": "launch metadata"});
         sqlx::query("update host_launches set metadata_json=$1 where session_id=$2")
             .bind(&corrupted)
             .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        // The scan fault itself. The query joins host_launch_owners, so the
+        // table being absent fails it outright. Renamed rather than dropped,
+        // so the owner rows come back untouched, and only ever in this test's
+        // disposable database.
+        sqlx::query("alter table host_launch_owners rename to host_launch_owners_faulted")
             .execute(store.pool())
             .await
             .unwrap();
@@ -9928,6 +9978,12 @@ mod tests {
             retained, corrupted,
             "failed recovery must not rewrite or discard the faulted row"
         );
+        // The scan fault is over; what is left is the undecodable row, which
+        // is what the repair below fixes.
+        sqlx::query("alter table host_launch_owners_faulted rename to host_launch_owners")
+            .execute(store.pool())
+            .await
+            .unwrap();
         sqlx::query("update host_launches set metadata_json=$1 where session_id=$2")
             .bind(serde_json::to_value(&metadata).unwrap())
             .bind(id)
