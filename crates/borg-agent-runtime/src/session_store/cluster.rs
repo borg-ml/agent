@@ -37,6 +37,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
+mod systemd;
+
 /// The port the managed cluster listens on.
 ///
 /// Deliberately not 5432: a developer machine frequently already runs a system
@@ -215,11 +217,46 @@ impl ManagedCluster {
                 self.socket_dir.display()
             )
         })?;
+        // Under a unit of its own where the host allows it, so that stopping
+        // whichever Borg unit or session scope happened to start the cluster
+        // no longer takes the database down with it. See the `systemd` module
+        // for the measurement behind that. Everything else -- and any host
+        // where it does not apply -- keeps the `pg_ctl` path.
+        if systemd::available()
+            && let Some(systemd_run) = find_binary("systemd-run")
+            && let Some(postgres) = find_binary("postgres")
+        {
+            match self.spawn_under_unit(&systemd_run, &postgres).await? {
+                Ok(()) => {
+                    self.report_supervision();
+                    return Ok(());
+                }
+                Err(failure) => {
+                    // Losing the race to another Borg process leaves the unit
+                    // already present, which is the outcome we wanted.
+                    if self.is_running(pg_ctl).await? {
+                        self.report_supervision();
+                        return Ok(());
+                    }
+                    // A host that has systemd-run but refuses this unit is not
+                    // a reason to leave the machine without a journal.
+                    tracing::warn!(
+                        %failure,
+                        "could not start the Borg session cluster under its own unit; \
+                         falling back to pg_ctl, where a Borg restart can stop the database"
+                    );
+                }
+            }
+        }
         match self.spawn_postmaster(pg_ctl).await? {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.report_supervision();
+                Ok(())
+            }
             Err(failure) => {
                 // Losing the start race to another Borg process is success.
                 if self.is_running(pg_ctl).await? {
+                    self.report_supervision();
                     return Ok(());
                 }
                 bail!(
@@ -229,6 +266,74 @@ impl ManagedCluster {
                 )
             }
         }
+    }
+
+    /// Run the postmaster as the main process of its own transient unit.
+    ///
+    /// `systemd-run` returns once the unit has been started, not once the
+    /// server accepts connections, so this deliberately does not wait. The
+    /// factory's recovery loop already treats a cluster that is still starting
+    /// as transitional, which is the same path a crash recovery takes.
+    async fn spawn_under_unit(
+        &self,
+        systemd_run: &Path,
+        postgres: &Path,
+    ) -> Result<std::result::Result<(), String>> {
+        let unit = systemd::unit_name(&self.data_dir);
+        tracing::info!(port = self.port, %unit, "starting the Borg session cluster");
+        let output = Command::new(systemd_run)
+            .args(systemd::run_args(
+                &systemd::Launch {
+                    postgres,
+                    data_dir: &self.data_dir,
+                    socket_dir: &self.socket_dir,
+                    log_path: &self.log_path,
+                    port: self.port,
+                },
+                &unit,
+            ))
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .with_context(|| format!("could not run {}", systemd_run.display()))?;
+        if output.status.success() {
+            return Ok(Ok(()));
+        }
+        Ok(Err(last_error_line(&output.stderr)))
+    }
+
+    /// Say so when the cluster is running somewhere Borg's own teardown
+    /// reaches, and do nothing else about it.
+    ///
+    /// Reported from the postmaster's cgroup rather than from what we just
+    /// tried to do, because a cluster that was already running when this
+    /// process arrived is exactly the case that matters and we did not start
+    /// it. Restarting it to improve its supervision would cause the outage
+    /// this avoids, so a warning is the whole of the response; it moves to its
+    /// own unit the next time something starts it.
+    fn report_supervision(&self) {
+        let Some(pid) = self.postmaster_pid() else {
+            return;
+        };
+        let supervision = systemd::classify(
+            systemd::cgroup_of(pid).as_deref(),
+            systemd::cgroup_of(std::process::id() as i32).as_deref(),
+            &systemd::unit_name(&self.data_dir),
+        );
+        if let Some(warning) = supervision.warning() {
+            tracing::warn!("{warning}");
+        }
+    }
+
+    /// The PID the running postmaster recorded, if there is one.
+    fn postmaster_pid(&self) -> Option<i32> {
+        std::fs::read_to_string(self.data_dir.join("postmaster.pid"))
+            .ok()?
+            .lines()
+            .next()?
+            .trim()
+            .parse()
+            .ok()
     }
 
     // A crash leaves postmaster.pid behind, and Borg used to unlink it here
@@ -380,9 +485,14 @@ fn last_error_line(stderr: &[u8]) -> String {
         .to_string()
 }
 
+/// Find a binary without requiring one, for the paths that have a fallback.
+fn find_binary(name: &str) -> Option<PathBuf> {
+    search_path(name).or_else(|| search_prefixes(name))
+}
+
 /// Find a PostgreSQL server binary, or explain how to install one.
 fn locate_binary(name: &str) -> Result<PathBuf> {
-    if let Some(found) = search_path(name).or_else(|| search_prefixes(name)) {
+    if let Some(found) = find_binary(name) {
         return Ok(found);
     }
     bail!(
