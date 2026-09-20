@@ -40,6 +40,7 @@ include:
 borg resume
 borg gui
 borg capabilities
+borg bug
 borg extensions list
 ```
 
@@ -177,6 +178,31 @@ version, OS, model, session, prompt, path, or device data. Set
 `usage_count.enabled = false` in `agent.toml` or export
 `BORG_DISABLE_USAGE_COUNT=1` to disable it. The receiver must discard network
 metadata and raw request logs and retain only aggregate daily/monthly counts.
+
+## Diagnostic bundles
+
+`borg bug` collects a diagnostic bundle to attach to a bug report. It is local
+only: it opens no socket, calls no model, and uploads nothing. The bundle is a
+file you read and decide about.
+
+```sh
+borg bug                                            # summary only
+borg bug --output bundle.json                       # write the full bundle
+borg bug --output bundle.json --include-transcript  # add conversation text
+```
+
+What it collects is an allowlist: build identification, durable store
+readiness, provider runtime readiness, and session metadata. Credentials,
+environment variables, request headers, and configuration file contents have no
+code path into the bundle, and the working directory is deliberately left out.
+Failures are recorded as a fixed class — `connection_refused`,
+`permission_denied` — rather than as their original message, because an error
+message is the field most likely to carry a URL or a password.
+
+Conversation text is excluded unless you pass `--include-transcript`, which
+requires `--output`: a transcript may only be written to a file, created
+readable by you alone, never to a terminal or a pipe where permissions mean
+nothing. Read the bundle before you share it.
 
 ## Blu extensions
 

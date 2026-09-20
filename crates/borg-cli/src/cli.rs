@@ -13,6 +13,7 @@ Quickstart:
   borg resume                pick up the latest session; `borg resume <id>` for a specific one
   borg config init           write a commented agent.toml; `borg config path` shows where
   borg doctor                check durable storage and provider readiness
+  borg bug --output b.json   collect a local-only diagnostic bundle to attach to a report
 
 Inside a session: type a request, `/help` lists controls, Ctrl-C twice exits (the session stays resumable).";
 
@@ -66,6 +67,7 @@ impl Cli {
                 | "acp"
                 | "collab"
                 | "doctor"
+                | "bug"
                 | "limits"
                 | "help"
                 | "__agent-mcp"
@@ -176,6 +178,8 @@ pub(crate) enum Command {
         #[arg(long)]
         deep: bool,
     },
+    /// Collect a local-only diagnostic bundle to attach to a bug report.
+    Bug(BugArgs),
     /// Keep local agent workloads within a generous machine-wide budget.
     Limits(LimitsArgs),
     #[command(name = "__agent-mcp", hide = true)]
@@ -208,6 +212,31 @@ pub(crate) enum CustomizeCommand {
         #[arg(long)]
         force: bool,
     },
+}
+
+/// `borg bug` collects diagnostics and stops there.
+///
+/// There is no `--upload` and no relay flag by design: the bundle is a local
+/// file the user reads and decides about. The transcript flag can only be used
+/// together with `--output`, because conversation text must land in a file
+/// whose permissions can be restricted, never on a terminal or a pipe.
+#[derive(Debug, Args)]
+pub(crate) struct BugArgs {
+    /// Write the bundle here. Omit to print a summary without collecting a file.
+    #[arg(long, short)]
+    pub(crate) output: Option<PathBuf>,
+    /// Describe this session; omit for the most recent local session.
+    #[arg(long)]
+    pub(crate) session: Option<Uuid>,
+    /// Include recent conversation text. Off by default: this is your conversation.
+    #[arg(long, requires = "output")]
+    pub(crate) include_transcript: bool,
+    /// Replace an existing bundle file.
+    #[arg(long)]
+    pub(crate) force: bool,
+    /// Emit machine-readable JSON output.
+    #[arg(long)]
+    pub(crate) json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -963,6 +992,30 @@ mod tests {
                 deep: true
             }
         ));
+        assert!(matches!(
+            Cli::try_parse_from(["borg", "bug", "--output", "bundle.json"])
+                .unwrap()
+                .command_or_agent(),
+            Command::Bug(_)
+        ));
+    }
+
+    /// A transcript may only be written somewhere its permissions can be set.
+    /// Enforced by the parser so there is no path through the command that
+    /// prints conversation text to a terminal or a pipe.
+    #[test]
+    fn a_transcript_cannot_be_collected_without_a_file_to_restrict() {
+        assert!(Cli::try_parse_from(["borg", "bug", "--include-transcript"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "borg",
+                "bug",
+                "--include-transcript",
+                "--output",
+                "bundle.json"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]

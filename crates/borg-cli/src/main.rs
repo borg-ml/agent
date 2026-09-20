@@ -1,6 +1,7 @@
 mod acp;
 mod agent_config;
 mod agent_mcp;
+mod bug;
 mod cli;
 mod collab;
 mod customization;
@@ -77,6 +78,7 @@ async fn main() -> Result<()> {
         Command::Acp(args) => acp::run(args).await,
         Command::Collab { command } => collab::run(command).await,
         Command::Doctor { json, deep } => doctor(json, deep).await,
+        Command::Bug(args) => bug::run(args).await,
         Command::Limits(args) => limits::run(args).await,
         Command::AgentMcp => agent_mcp::run().await,
     }
