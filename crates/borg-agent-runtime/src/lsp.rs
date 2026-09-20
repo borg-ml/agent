@@ -46,6 +46,14 @@ pub struct LspService {
     path_policy: LspPathPolicy,
     clients: std::sync::Arc<Mutex<HashMap<LspClientKey, LspClientSlot>>>,
     reaped: std::sync::Arc<Mutex<Vec<ReapRecord>>>,
+    /// Keys this service has leased.
+    ///
+    /// The pool behind `clients` belongs to the whole process, so without this
+    /// a session's `status` and workspace-wide passes would report every
+    /// server the host happens to be running, including workspaces this
+    /// session never opened. Sharing the process is the point; sharing the
+    /// view is not.
+    leased: std::sync::Arc<Mutex<std::collections::BTreeSet<LspClientKey>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -92,12 +100,44 @@ impl LspPathPolicy {
                 .cloned(),
         }
     }
+
+    /// This policy's identity for pooling. Two services share a server only
+    /// when these are equal, which means their access rules are the same rule
+    /// and not merely similar.
+    fn scope_key(&self, session_root: &Path) -> LspScopeKey {
+        match self {
+            Self::Unrestricted => LspScopeKey::Unrestricted,
+            Self::SessionWorkspace => LspScopeKey::SessionWorkspace(session_root.to_path_buf()),
+            Self::AuthorizedRoots(roots) => {
+                let mut roots = roots.clone();
+                roots.sort();
+                roots.dedup();
+                LspScopeKey::AuthorizedRoots(roots)
+            }
+        }
+    }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+/// The access rules a pooled server was started for.
+///
+/// Part of the pool key, because a shared server shares more than a process:
+/// the documents opened in it and the diagnostics it has already published
+/// live on the client. Without this, a session restricted to one workspace
+/// would receive results for files a broader session opened in the same
+/// server. The per-request `allows` check cannot catch that -- it guards the
+/// path a caller names, not the state the server already holds.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum LspScopeKey {
+    Unrestricted,
+    SessionWorkspace(PathBuf),
+    AuthorizedRoots(Vec<PathBuf>),
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct LspClientKey {
     server_id: &'static str,
     workspace_root: PathBuf,
+    scope: LspScopeKey,
 }
 
 struct ServerSpec {
@@ -180,8 +220,7 @@ type SharedLspClient = std::sync::Arc<Mutex<LspClientState>>;
 
 #[derive(Clone)]
 struct ReapRecord {
-    server_id: &'static str,
-    workspace_root: PathBuf,
+    key: LspClientKey,
     reason: &'static str,
 }
 
@@ -189,11 +228,53 @@ impl ReapRecord {
     fn describe(&self) -> String {
         format!(
             "{} for {} ({})",
-            self.server_id,
-            self.workspace_root.display(),
+            self.key.server_id,
+            self.key.workspace_root.display(),
             self.reason
         )
     }
+}
+
+/// One client pool for the process.
+///
+/// A language server is identified by the workspace it indexes, so two
+/// sessions looking at the same workspace want the same server. Before this,
+/// each `LspService` owned its own pool and every session -- root and subagent
+/// alike -- started its own rust-analyzer for the same repository. That is not
+/// a small inefficiency: seven parallel workers on one Cargo workspace ran
+/// seven copies of the same index and tens of gigabytes of resident memory.
+struct LspPool {
+    clients: std::sync::Arc<Mutex<HashMap<LspClientKey, LspClientSlot>>>,
+    reaped: std::sync::Arc<Mutex<Vec<ReapRecord>>>,
+}
+
+fn pool() -> &'static LspPool {
+    static POOL: std::sync::OnceLock<LspPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| LspPool {
+        clients: std::sync::Arc::new(Mutex::new(HashMap::new())),
+        reaped: std::sync::Arc::new(Mutex::new(Vec::new())),
+    })
+}
+
+/// Start the one idle reaper, once.
+///
+/// Latched only on a successful spawn: a service constructed outside a Tokio
+/// runtime still starts nothing, exactly as before, and a later service
+/// constructed inside one still gets the sweep going.
+fn ensure_idle_reaper(pool: &'static LspPool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STARTED: AtomicBool = AtomicBool::new(false);
+
+    if STARTED.load(Ordering::Acquire) {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    if STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    spawn_idle_reaper(runtime, &pool.clients, &pool.reaped);
 }
 
 impl LspService {
@@ -202,14 +283,14 @@ impl LspService {
     }
 
     pub(crate) fn with_path_policy(root: impl Into<PathBuf>, path_policy: LspPathPolicy) -> Self {
-        let clients = std::sync::Arc::new(Mutex::new(HashMap::new()));
-        let reaped = std::sync::Arc::new(Mutex::new(Vec::new()));
-        spawn_idle_reaper(&clients, &reaped);
+        let pool = pool();
+        ensure_idle_reaper(pool);
         Self {
             root: root.into(),
             path_policy,
-            clients,
-            reaped,
+            clients: std::sync::Arc::clone(&pool.clients),
+            reaped: std::sync::Arc::clone(&pool.reaped),
+            leased: std::sync::Arc::new(Mutex::new(std::collections::BTreeSet::new())),
         }
     }
 
@@ -247,20 +328,23 @@ impl LspService {
             "active_workspaces": active_workspaces,
             "supported_servers": supported_server_status()
         });
+        // This session's own reaps only: the list is process-wide, and another
+        // session's workspace path is not this session's to report.
+        let leased = self.leased.lock().await.clone();
         let reaped = self.reaped.lock().await;
-        if !reaped.is_empty() {
-            status["recently_stopped"] = Value::Array(
-                reaped
-                    .iter()
-                    .map(|record| {
-                        json!({
-                            "server": record.server_id,
-                            "root": record.workspace_root,
-                            "reason": record.reason
-                        })
-                    })
-                    .collect(),
-            );
+        let recently_stopped = reaped
+            .iter()
+            .filter(|record| leased.contains(&record.key))
+            .map(|record| {
+                json!({
+                    "server": record.key.server_id,
+                    "root": record.key.workspace_root,
+                    "reason": record.reason
+                })
+            })
+            .collect::<Vec<_>>();
+        if !recently_stopped.is_empty() {
+            status["recently_stopped"] = Value::Array(recently_stopped);
         }
         status
     }
@@ -289,27 +373,38 @@ impl LspService {
     /// Find or create the slot for `(spec, root)` under the map lock, without
     /// starting the server there.
     async fn lease_client(&self, spec: &'static ServerSpec, root: &Path) -> SharedLspClient {
+        let session_root = tokio::fs::canonicalize(&self.root)
+            .await
+            .unwrap_or_else(|_| self.root.clone());
         let key = LspClientKey {
             server_id: spec.id,
             workspace_root: root.to_path_buf(),
+            scope: self.path_policy.scope_key(&session_root),
         };
-        let mut clients = self.clients.lock().await;
-        let slot = clients.entry(key).or_insert_with(|| LspClientSlot {
-            client: std::sync::Arc::new(Mutex::new(LspClientState::NotStarted)),
-            last_used: Instant::now(),
-        });
-        slot.last_used = Instant::now();
-        slot.client.clone()
+        self.leased.lock().await.insert(key.clone());
+        let client = {
+            let mut clients = self.clients.lock().await;
+            let slot = clients.entry(key).or_insert_with(|| LspClientSlot {
+                client: std::sync::Arc::new(Mutex::new(LspClientState::NotStarted)),
+                last_used: Instant::now(),
+            });
+            slot.last_used = Instant::now();
+            slot.client.clone()
+        };
+        discard_dead_client(&client).await;
+        client
     }
 
     /// Snapshot of every slot, taken under the map lock and released before
     /// any server is spoken to. Taking the snapshot counts as use: a long
     /// workspace pass must not leave its own servers looking idle.
     async fn active_clients(&self) -> Vec<(LspClientKey, SharedLspClient)> {
+        let leased = self.leased.lock().await.clone();
         let mut clients = self.clients.lock().await;
         let now = Instant::now();
         clients
             .iter_mut()
+            .filter(|(key, _)| leased.contains(*key))
             .map(|(key, slot)| {
                 slot.last_used = now;
                 (key.clone(), slot.client.clone())
@@ -320,21 +415,28 @@ impl LspService {
     /// Why a workspace-wide request has nothing to talk to. Distinguishes
     /// "never started one" from "started one and stopped it while idle".
     async fn no_active_server_error(&self) -> anyhow::Error {
+        let leased = self.leased.lock().await.clone();
         let reaped = self.reaped.lock().await;
-        let Some(last) = reaped.last() else {
+        // Only this session's own reaps. The list is process-wide now, and
+        // another session's workspace path is not this session's to report.
+        let mine = reaped
+            .iter()
+            .filter(|record| leased.contains(&record.key))
+            .collect::<Vec<_>>();
+        let Some(last) = mine.last() else {
             return anyhow::anyhow!(
                 "no language server is active; provide a representative source path to initialize one"
             );
         };
-        let stopped = reaped
+        let stopped = mine
             .iter()
-            .map(ReapRecord::describe)
+            .map(|record| record.describe())
             .collect::<Vec<_>>()
             .join(", ");
         anyhow::anyhow!(
             "no language server is active; {stopped} stopped earlier in this session. \
              Provide a representative source path (for example one under {}) to start it again",
-            last.workspace_root.display()
+            last.key.workspace_root.display()
         )
     }
 
@@ -869,6 +971,31 @@ impl LspClient {
     }
 }
 
+/// Forget a server that is no longer running, so the next request starts a
+/// fresh one instead of writing into a closed pipe.
+///
+/// The child is spawned `kill_on_drop`, so a server killed from outside stays
+/// in its slot as a `Ready` client over a dead pipe, and the process stays a
+/// zombie because nobody ever waits on it. `try_wait` reaps it and returns the
+/// slot to `NotStarted`, which is the state `ready_client` restarts from.
+///
+/// Non-blocking on purpose: a slot that is already locked is mid-request, and
+/// that is itself proof the server is alive.
+async fn discard_dead_client(client: &SharedLspClient) {
+    let Ok(mut state) = client.try_lock() else {
+        return;
+    };
+    // An error from `try_wait` means the handle can no longer answer for the
+    // child, which is not a state to keep serving requests from either.
+    let exited = match &mut *state {
+        LspClientState::Ready(running) => !matches!(running.child.try_wait(), Ok(None)),
+        _ => return,
+    };
+    if exited {
+        *state = LspClientState::NotStarted;
+    }
+}
+
 /// Start the server for a slot on first use. Runs under the slot lock, so
 /// concurrent callers for the same workspace wait for one start instead of
 /// racing, while other servers stay reachable.
@@ -901,14 +1028,12 @@ fn utf16_column(line: &str, character_column: u32) -> u32 {
 }
 
 fn spawn_idle_reaper(
+    runtime: tokio::runtime::Handle,
     clients: &std::sync::Arc<Mutex<HashMap<LspClientKey, LspClientSlot>>>,
     reaped: &std::sync::Arc<Mutex<Vec<ReapRecord>>>,
 ) {
     let clients = std::sync::Arc::downgrade(clients);
     let reaped = std::sync::Arc::downgrade(reaped);
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
     runtime.spawn(async move {
         let mut interval = tokio::time::interval(LSP_REAPER_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -929,8 +1054,7 @@ fn spawn_idle_reaper(
                     return true;
                 }
                 records.push(ReapRecord {
-                    server_id: key.server_id,
-                    workspace_root: key.workspace_root.clone(),
+                    key: key.clone(),
                     reason,
                 });
                 false
@@ -1259,7 +1383,7 @@ async fn discover_project_root(path: &Path, boundary: Option<&Path>, fallback: P
     let mut current = path.parent().unwrap_or(path).to_path_buf();
     loop {
         if has_project_marker(&current).await {
-            return current;
+            return cargo_workspace_root(current, boundary).await;
         }
         if boundary.is_some_and(|boundary| current == boundary) {
             break;
@@ -1273,6 +1397,74 @@ async fn discover_project_root(path: &Path, boundary: Option<&Path>, fallback: P
         current = parent.to_path_buf();
     }
     boundary.map(Path::to_path_buf).unwrap_or(fallback)
+}
+
+/// Widen a Cargo member crate to the workspace that owns it.
+///
+/// `Cargo.toml` is a project marker, so the upward walk stops at the first
+/// member crate it meets. rust-analyzer started there indexes the whole
+/// workspace anyway, so touching three member crates of one workspace started
+/// three servers that each held the same index. One workspace is one root.
+///
+/// The walk never rises above `boundary`, which is the path policy's scope
+/// root. Widening a root is a read-scope decision: a restricted session must
+/// not end up with a server rooted somewhere it is not allowed to read, so the
+/// boundary is checked before each step up rather than after.
+async fn cargo_workspace_root(start: PathBuf, boundary: Option<&Path>) -> PathBuf {
+    if !declares_cargo_package_only(&start).await {
+        return start;
+    }
+    let mut current = start.clone();
+    loop {
+        if boundary.is_some_and(|boundary| current == boundary) {
+            return start;
+        }
+        let Some(parent) = current.parent() else {
+            return start;
+        };
+        if parent == current {
+            return start;
+        }
+        current = parent.to_path_buf();
+        if declares_cargo_workspace(&current).await {
+            return current;
+        }
+    }
+}
+
+/// A manifest that declares a package and no workspace: a member crate, or a
+/// standalone crate that is its own root.
+async fn declares_cargo_package_only(directory: &Path) -> bool {
+    read_cargo_manifest(directory)
+        .await
+        .is_some_and(|manifest| {
+            manifest.get("package").is_some() && manifest.get("workspace").is_none()
+        })
+}
+
+async fn declares_cargo_workspace(directory: &Path) -> bool {
+    read_cargo_manifest(directory)
+        .await
+        .is_some_and(|manifest| manifest.get("workspace").is_some())
+}
+
+/// Read `Cargo.toml`, bounded in size and tolerant of failure.
+///
+/// A manifest that cannot be read or parsed simply does not widen anything:
+/// the narrower root still works, there are just more of them. Guessing from
+/// an unparsable file would be the worse answer.
+async fn read_cargo_manifest(directory: &Path) -> Option<toml::Table> {
+    const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+    let path = directory.join("Cargo.toml");
+    let metadata = tokio::fs::metadata(&path).await.ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES {
+        return None;
+    }
+    tokio::fs::read_to_string(&path)
+        .await
+        .ok()?
+        .parse::<toml::Table>()
+        .ok()
 }
 
 async fn has_project_marker(path: &Path) -> bool {
@@ -1527,11 +1719,176 @@ mod tests {
         let key = LspClientKey {
             server_id: "rust-analyzer",
             workspace_root: workspace.path().to_path_buf(),
+            scope: LspScopeKey::Unrestricted,
         };
         assert!(lsp_client_reap_reason(&key, Duration::ZERO).is_none());
 
         drop(workspace);
         assert!(lsp_client_reap_reason(&key, Duration::ZERO).is_some());
+    }
+
+    /// Each member crate of a Cargo workspace used to resolve as its own
+    /// project root, because `Cargo.toml` is a project marker and the walk
+    /// stopped at the first one. Every member crate touched therefore started
+    /// its own rust-analyzer, and each of those indexed the whole workspace
+    /// anyway -- the observed seven processes holding tens of gigabytes. This
+    /// spawns nothing; it pins the root arithmetic that decides how many
+    /// servers exist.
+    #[tokio::test]
+    async fn one_cargo_workspace_resolves_to_one_root() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let root = workspace.path();
+        tokio::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        )
+        .await
+        .expect("workspace manifest");
+
+        let mut sources = Vec::new();
+        for member in ["alpha", "beta"] {
+            let crate_dir = root.join("crates").join(member);
+            tokio::fs::create_dir_all(crate_dir.join("src"))
+                .await
+                .expect("member tree");
+            tokio::fs::write(
+                crate_dir.join("Cargo.toml"),
+                format!("[package]\nname = \"{member}\"\n"),
+            )
+            .await
+            .expect("member manifest");
+            let source = crate_dir.join("src").join("lib.rs");
+            tokio::fs::write(&source, "").await.expect("member source");
+            sources.push(source);
+        }
+
+        let alpha = discover_project_root(&sources[0], None, root.to_path_buf()).await;
+        let beta = discover_project_root(&sources[1], None, root.to_path_buf()).await;
+        assert_eq!(alpha, root);
+        assert_eq!(
+            alpha, beta,
+            "two member crates of one workspace are one language server, not two"
+        );
+
+        // Widening is a read-scope decision, so it stops at the policy scope
+        // root. A session confined to one member crate must not end up with a
+        // server rooted above it.
+        let member = root.join("crates").join("alpha");
+        assert_eq!(
+            discover_project_root(&sources[0], Some(&member), root.to_path_buf()).await,
+            member,
+            "a policy boundary outranks the workspace it sits inside"
+        );
+
+        // A crate that belongs to no workspace is still its own root.
+        let solo = tempfile::tempdir().expect("solo");
+        tokio::fs::write(
+            solo.path().join("Cargo.toml"),
+            "[package]\nname = \"solo\"\n",
+        )
+        .await
+        .expect("solo manifest");
+        tokio::fs::create_dir_all(solo.path().join("src"))
+            .await
+            .expect("solo tree");
+        let solo_source = solo.path().join("src").join("main.rs");
+        tokio::fs::write(&solo_source, "")
+            .await
+            .expect("solo source");
+        assert_eq!(
+            discover_project_root(&solo_source, None, solo.path().to_path_buf()).await,
+            solo.path()
+        );
+    }
+
+    /// The pool is process-wide, which is the whole memory fix, so the thing
+    /// worth pinning is what it refuses to share. A shared client also shares
+    /// the documents opened in it and the diagnostics it has published, so two
+    /// sessions may only share a server when their access rules are the same
+    /// rule. Leasing starts no server: the slot is created `NotStarted`.
+    #[tokio::test]
+    async fn one_workspace_shares_one_server_unless_the_rules_differ() {
+        let root = tempfile::tempdir().expect("workspace");
+        let spec = spec_for_id("rust-analyzer").expect("rust-analyzer spec");
+
+        let first = LspService::new(root.path());
+        let second = LspService::new(root.path());
+        let shared = first.lease_client(spec, root.path()).await;
+        let reused = second.lease_client(spec, root.path()).await;
+        assert!(
+            std::sync::Arc::ptr_eq(&shared, &reused),
+            "a second session on the same workspace must reuse the running server"
+        );
+
+        let restricted =
+            LspService::with_path_policy(root.path(), LspPathPolicy::session_workspace());
+        let separate = restricted.lease_client(spec, root.path()).await;
+        assert!(
+            !std::sync::Arc::ptr_eq(&shared, &separate),
+            "a session with narrower access must not inherit a broader session's server"
+        );
+
+        assert_eq!(
+            restricted.active_clients().await.len(),
+            1,
+            "a session reports the servers it leased, not every server on the host"
+        );
+    }
+
+    /// The child is spawned `kill_on_drop`, so a server killed from outside
+    /// stayed in its slot as a `Ready` client over a closed pipe while the
+    /// process sat as a zombie nobody waited on. The next request wrote into
+    /// the dead pipe instead of starting a replacement. `cat` stands in for a
+    /// language server here: this test needs a process with piped stdio that
+    /// exits when killed, and nothing about rust-analyzer in particular.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_killed_server_is_reaped_and_the_slot_reopened() {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("cat");
+        let stdin = child.stdin.take().expect("stdin");
+        let stdout = child.stdout.take().expect("stdout");
+        let shared: SharedLspClient =
+            std::sync::Arc::new(Mutex::new(LspClientState::Ready(Box::new(LspClient {
+                child,
+                stdin,
+                stdout: BufReader::new(stdout),
+                next_id: 1,
+                opened_versions: HashMap::new(),
+                published_diagnostics: HashMap::new(),
+            }))));
+
+        discard_dead_client(&shared).await;
+        assert!(
+            matches!(&*shared.lock().await, LspClientState::Ready(_)),
+            "a running server is left alone"
+        );
+
+        shared
+            .lock()
+            .await
+            .ready_mut()
+            .expect("ready")
+            .child
+            .start_kill()
+            .expect("kill the server the way an outside process would");
+
+        // Exit is observed, not assumed: poll rather than sleep a fixed time.
+        for _ in 0..200 {
+            discard_dead_client(&shared).await;
+            if matches!(&*shared.lock().await, LspClientState::NotStarted) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            matches!(&*shared.lock().await, LspClientState::NotStarted),
+            "a dead server must return to NotStarted so the next request restarts it"
+        );
     }
 
     #[test]
@@ -1705,7 +2062,10 @@ mod tests {
         let key = LspClientKey {
             server_id: "clangd",
             workspace_root: root.path().to_path_buf(),
+            scope: LspScopeKey::Unrestricted,
         };
+        // The pool is process-wide, so a service reports the slots it leased.
+        service.leased.lock().await.insert(key.clone());
         service.clients.lock().await.insert(
             key,
             LspClientSlot {
