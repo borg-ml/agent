@@ -4049,7 +4049,9 @@ mod tests {
 
     #[tokio::test]
     async fn shell_command_is_cancelled_by_interrupt_but_not_by_steering() {
-        let (control_tx, control_rx) = mpsc::channel(2);
+        // Capacity one: the second send is the happens-before that the
+        // acknowledgement used to provide before admission was deferred.
+        let (control_tx, control_rx) = mpsc::channel(1);
         let (_finish_tx, finish_rx) = tokio::sync::oneshot::channel::<Value>();
         let cancel = CancellationToken::new();
         let call_cancel = cancel.clone();
@@ -4062,26 +4064,42 @@ mod tests {
             )
             .await
         });
-        let (ack, acknowledged) = tokio::sync::oneshot::channel();
+        let (ack, mut acknowledged) = tokio::sync::oneshot::channel();
+        let admission = borg_provider::provider::SteerAdmission::pending();
         control_tx
             .send(AgentTurnControl::Steer {
                 message_id: Uuid::new_v4(),
                 text: "also run the linter".into(),
                 attachments: Vec::new(),
-                admission: borg_provider::provider::SteerAdmission::pending(),
+                admission: admission.clone(),
                 preempt: true,
                 ack,
             })
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), acknowledged)
-            .await
-            .expect("steering must not wait for the running command")
-            .unwrap()
-            .unwrap();
+        // Returning proves the steer was taken off the channel, which is what
+        // the acknowledgement used to prove before the fold started owning it.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            control_tx.send(AgentTurnControl::Approval {
+                approval_id: "capture-sync".to_string(),
+                decision: ApprovalDecision::Deny,
+            }),
+        )
+        .await
+        .expect("steering must not wait for the running command")
+        .unwrap();
         assert!(
             !cancel.is_cancelled(),
             "a steer must not kill the running shell command"
+        );
+        assert!(
+            !admission.is_accepted()
+                && matches!(
+                    acknowledged.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+            "a captured steer is neither admitted nor acknowledged until it folds"
         );
         control_tx.send(AgentTurnControl::Interrupt).await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(3), task)
@@ -4653,7 +4671,7 @@ mod tests {
                 next_live_commentary(&mut events_rx, message_id).await,
                 "The"
             );
-            let (ack, received) = tokio::sync::oneshot::channel();
+            let (ack, mut received) = tokio::sync::oneshot::channel();
             controls_tx
                 .send(AgentTurnControl::Steer {
                     message_id: Uuid::new_v4(),
@@ -4665,10 +4683,19 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            received.await.unwrap().unwrap();
+            // The acknowledgement now waits for a fold that this direct call
+            // never performs. The drained tail below, and the Steered outcome
+            // asserted after the join, are what prove the steer was applied.
             assert_eq!(
                 next_live_commentary(&mut events_rx, message_id).await,
                 "The lifecycle regression passed."
+            );
+            assert!(
+                matches!(
+                    received.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "capture must not acknowledge; only a fold may"
             );
         };
         let (result, ()) = tokio::time::timeout(Duration::from_secs(2), async {
@@ -6139,7 +6166,9 @@ mod tests {
             resume: std::sync::Mutex::new(Some(resume_rx)),
         };
         let (events_tx, mut events_rx) = mpsc::channel(32);
-        let (controls_tx, controls_rx) = mpsc::channel(4);
+        // Capacity one, so the second send below completes only once the
+        // harness has taken the steer off the channel.
+        let (controls_tx, controls_rx) = mpsc::channel(1);
         let mut controls = Some(controls_rx);
         let mut queued_steer = Vec::new();
         let call = call_model_streaming(
@@ -6165,7 +6194,7 @@ mod tests {
             },
         );
         let steer = async {
-            let (ack, received) = tokio::sync::oneshot::channel();
+            let (ack, mut received) = tokio::sync::oneshot::channel();
             controls_tx
                 .send(AgentTurnControl::Steer {
                     message_id: Uuid::new_v4(),
@@ -6179,7 +6208,24 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            received.await.unwrap().unwrap();
+            // The acknowledgement is withheld until the fold, and nothing here
+            // folds, so waiting on it would deadlock. A non-preempting steer
+            // leaves the control branch live, so this second send returning is
+            // proof the steer was captured.
+            controls_tx
+                .send(AgentTurnControl::Approval {
+                    approval_id: "capture-sync".to_string(),
+                    decision: ApprovalDecision::Deny,
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    received.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "capture must not acknowledge; only a fold may"
+            );
             // Only now may the model finish, so the steer provably arrived
             // while the call was still being generated.
             let _ = resume_tx.send(());
