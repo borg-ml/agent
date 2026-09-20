@@ -11854,6 +11854,52 @@ fn a_collapsed_plan_card_shows_the_update_not_the_first_rows() {
         replayed.contains("+ 19 more · click to expand"),
         "{replayed}"
     );
+
+    // The reported card: one step finishes while seven are still open. The
+    // change log alone showed the finished step and a count, so a plan with
+    // most of the work left read as though there were nothing left to do.
+    let mut mixed = (0..18)
+        .map(|index| PlanItem {
+            id: Uuid::new_v4(),
+            content: format!("Task {index}"),
+            status: if index < 10 {
+                PlanItemStatus::Completed
+            } else {
+                PlanItemStatus::Pending
+            },
+        })
+        .collect::<Vec<_>>();
+    transcript.upsert_plan(mixed.clone(), "12:11".to_string());
+    mixed[10].status = PlanItemStatus::Completed;
+    transcript.upsert_plan(mixed.clone(), "12:12".to_string());
+    let progressed = render(&transcript);
+    assert!(progressed.contains("11/18 completed"), "{progressed}");
+    // The step that just finished still leads: it is why the card updated.
+    assert!(progressed.contains("Task 10"), "{progressed}");
+    // And the work that is actually left now follows it, bounded.
+    for open in ["Task 11", "Task 12", "Task 13"] {
+        assert!(
+            progressed.contains(open),
+            "{open} missing from {progressed}"
+        );
+    }
+    assert!(!progressed.contains("Task 14"), "{progressed}");
+    assert!(
+        progressed.contains("+ 14 more · click to expand"),
+        "{progressed}"
+    );
+
+    // When the changed step is itself open it leads and is not repeated among
+    // the open rows that follow it.
+    mixed[11].status = PlanItemStatus::InProgress;
+    transcript.upsert_plan(mixed, "12:13".to_string());
+    let started = render(&transcript);
+    assert_eq!(started.matches("Task 11").count(), 1, "{started}");
+    for open in ["Task 12", "Task 13", "Task 14"] {
+        assert!(started.contains(open), "{open} missing from {started}");
+    }
+    assert!(!started.contains("Task 15"), "{started}");
+    assert!(started.contains("+ 14 more · click to expand"), "{started}");
 }
 
 #[test]

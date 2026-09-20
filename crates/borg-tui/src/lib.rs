@@ -115,6 +115,10 @@ const NESTED_WHEEL_SCROLL_FULL_HEIGHT_ROWS: usize = 72;
 const MAX_PENDING_WHEEL_SCROLL_LINES: isize = 160;
 const TOOL_RUN_BOX_THRESHOLD: usize = 8;
 const MAX_COLLAPSED_PLAN_ITEMS: usize = 5;
+/// How many still-open steps a collapsed plan card shows under its change log.
+/// The change says what just happened; on its own it does not say what is
+/// left, so a plan with seven open steps read as one crossed-off line.
+const MAX_COLLAPSED_PLAN_OPEN_ITEMS: usize = 3;
 #[cfg(test)]
 const LARGE_PASTE_CHAR_THRESHOLD: usize = 1000;
 
@@ -2334,6 +2338,21 @@ fn plan_card_rows<'a>(
     };
     if collapsed {
         rows.truncate(MAX_COLLAPSED_PLAN_ITEMS);
+        // The changed row stays on top: it is why the card updated, and that
+        // holds when the change is a step being completed. What it cannot say
+        // is what remains, so follow it with the work that is still open.
+        // Rows already shown keep their place rather than repeating.
+        let shown = rows.iter().map(|item| item.id).collect::<Vec<_>>();
+        let room = MAX_COLLAPSED_PLAN_ITEMS
+            .saturating_sub(rows.len())
+            .min(MAX_COLLAPSED_PLAN_OPEN_ITEMS);
+        rows.extend(
+            ordered_plan_items(items)
+                .into_iter()
+                .filter(|item| item.status != PlanItemStatus::Completed)
+                .filter(|item| !shown.contains(&item.id))
+                .take(room),
+        );
     }
     let hidden = items.len().saturating_sub(rows.len());
     (rows, hidden)
