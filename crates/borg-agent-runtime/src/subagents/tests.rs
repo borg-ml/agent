@@ -3772,13 +3772,19 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
         .unwrap();
 
     let session_store: Arc<dyn SessionStore> = store.clone();
+    let prompts = Arc::new(StdMutex::new(Vec::new()));
+    // One launch for the root and for the candidate. The shared fixture points
+    // at /workspace, which does not exist, and a woken child validates its cwd
+    // before it can run.
+    let mut root_launch = launch();
+    root_launch.cwd = directory.path().to_path_buf();
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
         root,
-        launch(),
+        root_launch.clone(),
         3,
         Arc::new(RecordingPeerExecutor {
-            prompts: Arc::new(StdMutex::new(Vec::new())),
+            prompts: Arc::clone(&prompts),
         }),
         session_store,
     )
@@ -3789,7 +3795,7 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
     // not carry.
     let child_session_id = {
         let mut table = coordinator.table.lock().await;
-        let child = table.reserve("stale_worker", &launch()).unwrap();
+        let child = table.reserve("stale_worker", &root_launch).unwrap();
         let entry = table.entries.get_mut(&child.session_id).unwrap();
         entry.snapshot.status = SubagentStatus::Ready;
         // Dormant is what makes this a restored candidate rather than a
@@ -3846,7 +3852,7 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
         "the candidate is reused, so this exercises the repair and not the spawn"
     );
 
-    // The assertion that matters: the task actually reached the child.
+    // The task reached the child durably.
     assert_eq!(
         workspace_store
             .deliveries_after(binding.workspace_id, binding.participant_id, 0, 10)
@@ -3858,6 +3864,26 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
         1,
         "a repaired worker must receive the task it was assigned"
     );
+
+    // And the child actually ran it. A durable delivery on its own would still
+    // pass if the woken worker never executed, which is the half of the
+    // workflow the repair exists to restore.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if prompts.lock().expect("peer prompt lock").len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the repaired worker must execute the task it was assigned");
+    assert!(
+        prompts.lock().expect("peer prompt lock")[0].contains("describe the material set"),
+        "the executed turn must carry the assigned task"
+    );
+
+    coordinator.stop_all().await;
     scratch.discard().await;
 }
 
