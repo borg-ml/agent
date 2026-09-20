@@ -4610,7 +4610,9 @@ async fn resume_pending_host_sessions(
         0
     };
     for (session_id, value) in pending {
-        if let Err(error) = validate_stored_host_identity(config, session_store, session_id).await {
+        if let Err(error) =
+            validate_stored_host_identity(config, session_store.as_ref(), session_id).await
+        {
             tracing::warn!(%error, %session_id, "skipping recovery for incompatible stored host identity");
             continue;
         }
@@ -4621,7 +4623,7 @@ async fn resume_pending_host_sessions(
         if sessions.lock().await.contains_key(&session_id) {
             continue;
         }
-        let state = match stored_host_session_state(session_store, session_id).await {
+        let state = match stored_host_session_state(session_store.as_ref(), session_id).await {
             Ok(state) => state,
             Err(error) => {
                 tracing::warn!(%error, %session_id, "cannot read recovering session; deferring it");
@@ -4642,7 +4644,7 @@ async fn resume_pending_host_sessions(
                 client,
                 config,
                 session_root,
-                session_store,
+                session_store.as_ref(),
                 session_id,
                 "launch already rejected",
                 false,
@@ -4663,12 +4665,13 @@ async fn resume_pending_host_sessions(
                     session_store.host_launch_owner(session_id).await?.is_some(),
                     "unverified session cannot expire offline"
                 );
-                let state = stored_host_session_state(session_store, session_id).await?;
+                let state = stored_host_session_state(session_store.as_ref(), session_id).await?;
                 if state.as_ref().is_some_and(|state| {
                     state.started_at.is_some()
                         && remaining_host_session_duration(config, Some(state)).is_zero()
                 }) {
-                    expire_host_session(config, session_store, session_id, &writer).await?;
+                    expire_host_session(config, session_store.as_ref(), session_id, &writer)
+                        .await?;
                 }
                 Ok(())
             }
@@ -4685,7 +4688,7 @@ async fn resume_pending_host_sessions(
                     client,
                     config,
                     session_root,
-                    session_store,
+                    session_store.as_ref(),
                     session_id,
                     &rejected_launch.reason,
                     false,
@@ -4709,7 +4712,7 @@ async fn resume_pending_host_sessions(
                     client,
                     config,
                     session_root,
-                    session_store,
+                    session_store.as_ref(),
                     session_id,
                     &error.to_string(),
                     false,
