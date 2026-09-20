@@ -521,6 +521,10 @@ impl NativeHarness {
         let mut tool_round = 0_usize;
         let mut length_continuations = 0_usize;
         let mut truncated_text = String::new();
+        // A steer that lands while the model is still streaming is parked here
+        // rather than ending the request, so a tool call in mid-generation
+        // still reaches execution. It is folded at the next safe boundary.
+        let mut queued_steer: Option<NativeSteer> = None;
         loop {
             model_round += 1;
             let request = ModelTurnRequest {
@@ -547,6 +551,7 @@ impl NativeHarness {
                         assistant_message_id,
                         events: &events,
                         controls: &mut controls,
+                        queued_steer: &mut queued_steer,
                     },
                 )
                 .await?
@@ -677,6 +682,20 @@ impl NativeHarness {
                     },
                 )
                 .await;
+                if let Some(steer) = queued_steer.take() {
+                    // The answer above is already recorded and on screen, so
+                    // nothing the model wrote is lost. Ending the turn here
+                    // would drop the human's message instead, which is the
+                    // same silent loss in a different place.
+                    let message =
+                        native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
+                    record_native_message(&events, turn.provider, &message).await?;
+                    messages.push(message);
+                    canonicalize_native_messages(&mut messages);
+                    truncated_text.clear();
+                    assistant_message_id = Uuid::new_v4();
+                    continue;
+                }
                 send_usage(&events, &usage, Some(turn.message_id)).await;
                 send(
                     &events,
@@ -720,7 +739,9 @@ impl NativeHarness {
             }
             assistant_message_id = Uuid::new_v4();
 
-            let mut pending_steer = None;
+            // A steer queued during generation is already waiting; the tool
+            // round below can add more, and both are folded together.
+            let mut pending_steer = queued_steer.take();
             let inputs = tool_calls
                 .iter()
                 .map(parse_tool_arguments)
@@ -1905,6 +1926,39 @@ struct ModelStreamContext<'a> {
     assistant_message_id: Uuid,
     events: &'a mpsc::Sender<SessionEventKind>,
     controls: &'a mut Option<mpsc::Receiver<AgentTurnControl>>,
+    /// Where a steer that arrives mid-stream is parked. Queuing it here keeps
+    /// the request alive so the tool call the model is still writing reaches
+    /// execution; the caller folds it at the next safe boundary.
+    queued_steer: &'a mut Option<NativeSteer>,
+}
+
+/// Close every tool-call row this stream opened but will not execute.
+///
+/// `action/preparing` opens a row in the UI that is normally closed by the
+/// call running. A stream that ends between those two points has to say so, or
+/// the row stays live forever -- which is what a cancelled steer looked like.
+async fn cancel_preparing_tool_calls(
+    events: &mpsc::Sender<SessionEventKind>,
+    provider: crate::CodingProvider,
+    preparing: &mut Vec<Option<String>>,
+) {
+    for tool_call_id in preparing.drain(..) {
+        send(
+            events,
+            SessionEventKind::ProviderEvent {
+                provider,
+                kind: "action/preparing_cancelled".to_string(),
+                payload: json!({ "tool_call_id": tool_call_id }),
+            },
+        )
+        .await;
+    }
+}
+
+fn note_preparing(preparing: &mut Vec<Option<String>>, id: Option<String>) {
+    if !preparing.contains(&id) {
+        preparing.push(id);
+    }
 }
 
 async fn call_model_streaming(
@@ -1930,6 +1984,7 @@ async fn call_model_streaming(
     // foreground result become a Ready status until that event stream closes.
     let mut completed = None;
     let mut control_applied = false;
+    let mut preparing: Vec<Option<String>> = Vec::new();
     loop {
         // Live assistant text is rate limited, so the tail of a burst is often
         // still unpublished when the model moves on. Give that tail its own
@@ -2027,6 +2082,7 @@ async fn call_model_streaming(
                     }).await;
                 }
                 Some(ProviderProgress::ToolCallGenerating { id }) => {
+                    note_preparing(&mut preparing, id.clone());
                     send(
                         context.events,
                         SessionEventKind::ProviderEvent {
@@ -2045,6 +2101,7 @@ async fn call_model_streaming(
                     }).await;
                 }
                 Some(ProviderProgress::ToolCallStarted { id, .. }) => {
+                    note_preparing(&mut preparing, Some(id.clone()));
                     send(
                         context.events,
                         SessionEventKind::ProviderEvent {
@@ -2056,6 +2113,7 @@ async fn call_model_streaming(
                     .await;
                 }
                 Some(ProviderProgress::ToolCallAction { id, action }) => {
+                    note_preparing(&mut preparing, id.clone());
                     send(
                         context.events,
                         SessionEventKind::ProviderEvent {
@@ -2072,6 +2130,14 @@ async fn call_model_streaming(
             },
             control = next_control(context.controls), if !control_applied => match control {
                 Some(AgentTurnControl::Interrupt) => {
+                    // Escape still cancels immediately. It just no longer
+                    // leaves a half-written tool call as a live row.
+                    cancel_preparing_tool_calls(
+                        context.events,
+                        context.coding_provider,
+                        &mut preparing,
+                    )
+                    .await;
                     completed = Some(Err(anyhow::anyhow!("native provider turn interrupted")));
                     control_applied = true;
                     progress_rx.close();
@@ -2080,6 +2146,7 @@ async fn call_model_streaming(
                     text,
                     attachments,
                     admission,
+                    preempt,
                     ack,
                     ..
                 }) => {
@@ -2088,6 +2155,31 @@ async fn call_model_streaming(
                         continue;
                     }
                     let _ = ack.send(Ok(()));
+                    if !preempt {
+                        // The human asked for this to be folded into the
+                        // current task, which is what an ordinary steer sends.
+                        // Ending the request here would discard a tool call the
+                        // model is still writing: the call never runs, no result
+                        // is journaled, and the row opened for it never closes.
+                        // Queue it and let the round finish -- the tool boundary
+                        // is the safe point, and the caller folds it there.
+                        if let Some(queued) = context.queued_steer.as_mut() {
+                            queued.text.push('\n');
+                            queued.text.push_str(&text);
+                            queued.attachments.extend(attachments);
+                        } else {
+                            *context.queued_steer = Some(NativeSteer { text, attachments });
+                        }
+                        continue;
+                    }
+                    // An explicit preempt may end the stream, but it still owes
+                    // a terminal event for anything it was part way through.
+                    cancel_preparing_tool_calls(
+                        context.events,
+                        context.coding_provider,
+                        &mut preparing,
+                    )
+                    .await;
                     completed = Some(Ok(NativeModelOutcome::Steered(NativeSteer {
                         text,
                         attachments,
@@ -2119,9 +2211,28 @@ async fn call_model_streaming(
             if text.len() != emitted_text_len {
                 send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
             }
-            return completed
+            let outcome = completed
                 .take()
                 .expect("completed native model result is present");
+            // A provider that announced a call and then delivered none would
+            // otherwise leave the row it opened with nothing to close it.
+            let delivered_tool_calls = matches!(
+                &outcome,
+                Ok(NativeModelOutcome::Completed(result))
+                    if matches!(
+                        &result.message,
+                        ModelMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty()
+                    )
+            );
+            if !delivered_tool_calls {
+                cancel_preparing_tool_calls(
+                    context.events,
+                    context.coding_provider,
+                    &mut preparing,
+                )
+                .await;
+            }
+            return outcome;
         }
     }
 }
@@ -4183,6 +4294,7 @@ mod tests {
             let (events_tx, mut events_rx) = mpsc::channel(16);
             let message_id = Uuid::new_v4();
             let mut controls = None;
+            let mut queued_steer = None;
             let call = call_model_streaming(
                 &client,
                 crate::CodingProvider::Codex,
@@ -4202,6 +4314,7 @@ mod tests {
                     assistant_message_id: message_id,
                     events: &events_tx,
                     controls: &mut controls,
+                    queued_steer: &mut queued_steer,
                 },
             );
             tokio::pin!(call);
@@ -4302,6 +4415,7 @@ mod tests {
         let (events_tx, mut events_rx) = mpsc::channel(16);
         let message_id = Uuid::new_v4();
         let mut controls = None;
+        let mut queued_steer = None;
         let call = call_model_streaming(
             &client,
             crate::CodingProvider::Codex,
@@ -4321,6 +4435,7 @@ mod tests {
                 assistant_message_id: message_id,
                 events: &events_tx,
                 controls: &mut controls,
+                queued_steer: &mut queued_steer,
             },
         );
         tokio::pin!(call);
@@ -4340,6 +4455,7 @@ mod tests {
         let (controls_tx, controls_rx) = mpsc::channel(1);
         let message_id = Uuid::new_v4();
         let mut controls = Some(controls_rx);
+        let mut queued_steer = None;
         let call = call_model_streaming(
             &client,
             crate::CodingProvider::Codex,
@@ -4359,6 +4475,7 @@ mod tests {
                 assistant_message_id: message_id,
                 events: &events_tx,
                 controls: &mut controls,
+                queued_steer: &mut queued_steer,
             },
         );
         let observe = async {
@@ -4461,6 +4578,7 @@ mod tests {
         let (events_tx, mut events_rx) = mpsc::channel(16);
         let message_id = Uuid::new_v4();
         let mut controls = None;
+        let mut queued_steer = None;
         let call = call_model_streaming(
             &client,
             crate::CodingProvider::Codex,
@@ -4480,6 +4598,7 @@ mod tests {
                 assistant_message_id: message_id,
                 events: &events_tx,
                 controls: &mut controls,
+                queued_steer: &mut queued_steer,
             },
         );
         tokio::pin!(call);
@@ -4585,6 +4704,7 @@ mod tests {
         let (events_tx, mut events_rx) = mpsc::channel(8);
         let mut task = tokio::spawn(async move {
             let mut controls = None;
+            let mut queued_steer = None;
             call_model_streaming(
                 &client,
                 crate::CodingProvider::OpenRouter,
@@ -4604,6 +4724,7 @@ mod tests {
                     assistant_message_id: Uuid::new_v4(),
                     events: &events_tx,
                     controls: &mut controls,
+                    queued_steer: &mut queued_steer,
                 },
             )
             .await
@@ -5791,5 +5912,208 @@ mod tests {
             }
             watches.cancel.cancel();
         }
+    }
+
+    /// Emits a tool call the way a provider does -- announce generation first,
+    /// deliver the call afterwards -- with a gate in between so a steer can be
+    /// shown to land while the call is still being written.
+    struct SteerDuringToolGenerationClient {
+        resume: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl NativeModelClient for SteerDuringToolGenerationClient {
+        async fn model_turn(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+            _request: ModelTurnRequest,
+            progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+        ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+            let progress = progress.unwrap();
+            progress
+                .send(ProviderProgress::ToolCallGenerating {
+                    id: Some("call-1".into()),
+                })
+                .unwrap();
+            let resume = self.resume.lock().unwrap().take().unwrap();
+            let _ = resume.await;
+            Ok(ModelTurnResult {
+                message: ModelMessage::assistant(
+                    None,
+                    None,
+                    None,
+                    vec![ModelToolCall::function(
+                        "call-1".to_string(),
+                        "exec".to_string(),
+                        json!({"action": "look", "cmd": "true"}).to_string(),
+                    )],
+                ),
+                finish_reason: "tool_calls".to_string(),
+                usage: ProviderCallUsage::default(),
+                raw_response: Value::Null,
+                trace: ProviderAttemptTrace::default(),
+            })
+        }
+    }
+
+    /// The release contract: an ordinary human steer queues, it does not
+    /// cancel. A steer that lands while the model is still writing a tool call
+    /// used to end the request, so the call never ran, no result was journaled,
+    /// and the row the UI had opened for it stayed live forever.
+    #[tokio::test]
+    async fn a_queued_steer_keeps_the_tool_call_the_model_was_generating() {
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+        let client = SteerDuringToolGenerationClient {
+            resume: std::sync::Mutex::new(Some(resume_rx)),
+        };
+        let (events_tx, mut events_rx) = mpsc::channel(32);
+        let (controls_tx, controls_rx) = mpsc::channel(4);
+        let mut controls = Some(controls_rx);
+        let mut queued_steer = None;
+        let call = call_model_streaming(
+            &client,
+            crate::CodingProvider::Codex,
+            "test-model",
+            None,
+            ModelTurnRequest {
+                fast: false,
+                request_id: None,
+                session_id: None,
+                prompt_cache_key: None,
+                messages: vec![ModelMessage::user("build it")],
+                tools: Vec::new(),
+                output_schema: None,
+            },
+            ModelStreamContext {
+                coding_provider: crate::CodingProvider::Codex,
+                assistant_message_id: Uuid::new_v4(),
+                events: &events_tx,
+                controls: &mut controls,
+                queued_steer: &mut queued_steer,
+            },
+        );
+        let steer = async {
+            let (ack, received) = tokio::sync::oneshot::channel();
+            controls_tx
+                .send(AgentTurnControl::Steer {
+                    message_id: Uuid::new_v4(),
+                    text: "check the log first".into(),
+                    attachments: Vec::new(),
+                    admission: borg_provider::provider::SteerAdmission::pending(),
+                    // What a human steer actually sends: fold this in, do not
+                    // replace what is running.
+                    preempt: false,
+                    ack,
+                })
+                .await
+                .unwrap();
+            received.await.unwrap().unwrap();
+            // Only now may the model finish, so the steer provably arrived
+            // while the call was still being generated.
+            let _ = resume_tx.send(());
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(call, steer);
+            result
+        })
+        .await
+        .expect("a queued steer must not stall the request")
+        .expect("the model call completes");
+
+        let NativeModelOutcome::Completed(result) = outcome else {
+            panic!("a non-preempting steer must not end the request")
+        };
+        let ModelMessage::Assistant { tool_calls, .. } = &result.message else {
+            panic!("expected an assistant message")
+        };
+        assert_eq!(
+            tool_calls.len(),
+            1,
+            "the tool call the model was writing has to survive the steer"
+        );
+        assert!(
+            queued_steer.is_some(),
+            "the steer has to be queued for the tool boundary, not dropped"
+        );
+        drop(events_tx);
+        while let Some(event) = events_rx.recv().await {
+            if let SessionEventKind::ProviderEvent { kind, .. } = event {
+                assert_ne!(
+                    kind, "action/preparing_cancelled",
+                    "nothing was abandoned, so no row should have been closed"
+                );
+            }
+        }
+    }
+
+    /// Escape still cancels. It just owes the row it abandoned a terminal
+    /// event, or the UI shows a tool call generating forever.
+    #[tokio::test]
+    async fn an_interrupt_closes_the_tool_call_row_it_abandons() {
+        let client = CommentaryBoundaryClient { boundary: 0 };
+        let (events_tx, mut events_rx) = mpsc::channel(32);
+        let (controls_tx, controls_rx) = mpsc::channel(4);
+        let mut controls = Some(controls_rx);
+        let mut queued_steer = None;
+        let call = call_model_streaming(
+            &client,
+            crate::CodingProvider::Codex,
+            "test-model",
+            None,
+            ModelTurnRequest {
+                fast: false,
+                request_id: None,
+                session_id: None,
+                prompt_cache_key: None,
+                messages: vec![ModelMessage::user("build it")],
+                tools: Vec::new(),
+                output_schema: None,
+            },
+            ModelStreamContext {
+                coding_provider: crate::CodingProvider::Codex,
+                assistant_message_id: Uuid::new_v4(),
+                events: &events_tx,
+                controls: &mut controls,
+                queued_steer: &mut queued_steer,
+            },
+        );
+        let interrupt = async {
+            // Wait until the row is actually open before interrupting.
+            // Otherwise the select could take the interrupt first and this
+            // would pass for the wrong reason.
+            loop {
+                let event = events_rx.recv().await.expect("the stream is live");
+                if let SessionEventKind::ProviderEvent { kind, .. } = &event
+                    && kind == "action/preparing"
+                {
+                    break;
+                }
+            }
+            controls_tx.send(AgentTurnControl::Interrupt).await.unwrap();
+        };
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            let (result, ()) = tokio::join!(call, interrupt);
+            result
+        })
+        .await
+        .expect("an interrupt must not stall");
+        assert!(result.is_err(), "an interrupt still ends the turn");
+
+        drop(events_tx);
+        let mut cancelled = Vec::new();
+        while let Some(event) = events_rx.recv().await {
+            if let SessionEventKind::ProviderEvent { kind, payload, .. } = event
+                && kind == "action/preparing_cancelled"
+            {
+                cancelled.push(payload["tool_call_id"].clone());
+            }
+        }
+        assert_eq!(
+            cancelled,
+            vec![json!("call")],
+            "the abandoned tool call row has to be closed exactly once"
+        );
     }
 }
