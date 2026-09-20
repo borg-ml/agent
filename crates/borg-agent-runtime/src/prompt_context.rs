@@ -1,52 +1,36 @@
 //! Durable instruction and tool-declaration replay.
 //!
 //! The native harness assembles the leading `System` message and the tool
-//! catalog from scratch on every turn. Most of those inputs are fixed for the
-//! life of a context generation, but three genuinely vary mid-conversation:
-//! the skills appendix (`native_context::prompt_appendix`, which also adds a
-//! tool), MCP startup failures (which both append a warning and withdraw that
-//! server's tools), and tools surfaced on demand by `ToolSearch`.
+//! catalog from scratch every turn. Three inputs genuinely vary
+//! mid-conversation: the skills appendix, which also contributes a tool; MCP
+//! startup failures, which append a warning and withdraw that server's tools;
+//! and tools surfaced on demand by `ToolSearch`. Rebuilding silently means the
+//! replayed head stops matching the head the model was shown, and nothing
+//! durable records that the declarations moved.
 //!
-//! Rebuilding silently is wrong in two ways. The replayed request head stops
-//! matching the head the model was actually shown earlier in the same
-//! conversation, so a later turn rewrites its prefix instead of extending it;
-//! and nothing durable records that the declarations ever changed, so a
-//! resumed or forked session cannot reconstruct what the model knew.
+//! So: an immutable base per context generation, typed ordered deltas against
+//! it, and a fold to current state plus at most [`MAX_REPLAYED_DELTAS`]
+//! positional markers. The bound is the point. Without it a long session
+//! carries one marker per turn, which is a log rather than a replay contract.
 //!
-//! The contract here is an immutable base plus typed, ordered, bounded
-//! changes:
+//! What this record is NOT: a replayable copy of historical tool definitions.
+//! [`ToolDecl`] keeps a digest instead of the input schema, so an earlier
+//! tool's schema cannot be reconstructed from it. That is sufficient only
+//! because declarations are never sent to a provider as tool definitions --
+//! the live catalog is. This answers "what was declared, and when did it
+//! change", not "what exactly did that schema look like".
 //!
-//! * The first turn of a context generation records a [`Declarations`] base.
-//!   Later turns replay that base verbatim rather than rebuilding it.
-//! * Each later turn records only a [`DeclarationDelta`] against the previous
-//!   effective state.
-//! * Replay folds base + deltas into the effective state and re-emits at most
-//!   [`MAX_REPLAYED_DELTAS`] positional markers. The bound is what makes this
-//!   a replay contract rather than an unbounded log: without it a long session
-//!   carries one marker per turn and the request grows without limit.
+//! The same property is the security one: carrying no schema and no dispatcher
+//! handle, a replayed declaration cannot authorize a call. Admission stays
+//! with the live dispatcher.
 //!
-//! Declarations are presentation only. [`ToolDecl`] holds a digest instead of
-//! the input schema and carries no dispatcher handle, so a replayed
-//! declaration is structurally incapable of authorizing a call. Admission
-//! stays with the live dispatcher, and a replayed declaration for a tool that
-//! no longer exists still fails admission.
-//!
-//! # Provider transport
-//!
-//! Measured from the encoders, not assumed:
-//!
-//! * `NativeRoute::ChatCompletions` serializes `ModelMessage` directly, and
-//!   the enum is `#[serde(tag = "role")]`, so a `System` message keeps its
-//!   conversation position. Instruction changes ride in place.
-//! * `NativeRoute::CodexAccount` targets the Responses API, whose encoder
-//!   collects every `System` into one `instructions` field regardless of
-//!   position, so an instruction change necessarily rewrites the head.
-//! * Subscription CLI lanes take `system_prompt` as a scalar request field and
-//!   have no in-conversation representation at all.
-//!
-//! No lane in tree accepts a tool-declaration delta; `tools` is one flat array
-//! per request everywhere. Lanes that cannot carry a change in position use
-//! [`DeclarationTransport::Collapsed`], which rewrites the head and makes no
+//! Transport, measured from the encoders rather than assumed: a
+//! chat-completions route keeps `System` in conversation position; the Codex
+//! Responses encoder collects every `System` into one `instructions` field
+//! regardless of position; subscription lanes take `system_prompt` as a scalar
+//! field. No lane accepts a tool-declaration delta, because `tools` is one
+//! flat array per request everywhere. Lanes that cannot carry a change in
+//! position use [`DeclarationTransport::Collapsed`] and make no
 //! cache-preservation claim.
 
 use std::collections::BTreeMap;
@@ -84,9 +68,11 @@ pub(crate) enum InstructionSlot {
 
 /// One tool as the model was told about it.
 ///
-/// The input schema is reduced to a digest: the journal would otherwise carry
-/// a copy of every tool's full JSON schema on every change, and replay only
-/// needs to know *that* a declaration differs, not to re-derive it.
+/// The input schema is reduced to a digest, which is lossy on purpose: the
+/// journal would otherwise carry a copy of every tool's full JSON schema on
+/// every change. The consequence is explicit -- this cannot reproduce a
+/// historical tool definition, only detect that one differs. Nothing needs to:
+/// a provider is always sent the live catalog, never a reconstruction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ToolDecl {
     pub name: String,
@@ -189,7 +175,7 @@ impl Declarations {
         (!delta.is_empty()).then_some(delta)
     }
 
-    fn apply(&mut self, delta: &DeclarationDelta) {
+    pub(crate) fn apply(&mut self, delta: &DeclarationDelta) {
         for (slot, text) in &delta.instructions {
             match text {
                 Some(text) => {
@@ -365,4 +351,74 @@ async fn record<T: Serialize>(
         })
         .await
         .map_err(|_| anyhow::anyhow!("session actor stopped while recording declarations"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use serde_json::json;
+
+    fn tool(name: &str, description: &str) -> ModelToolDefinition {
+        ModelToolDefinition::new(name, description, json!({"type": "object"})).unwrap()
+    }
+
+    fn skills(text: &str) -> [(InstructionSlot, String); 1] {
+        [(InstructionSlot::Skills, text.to_string())]
+    }
+
+    /// The durability rule the whole contract rests on: a session rebuilt from
+    /// its base and recorded changes has to arrive at the same declarations a
+    /// session that never restarted would hold. If these diverge, a resumed or
+    /// forked turn tells the model something the live turn never did, which is
+    /// exactly the silent drift the base exists to prevent.
+    #[test]
+    fn folding_recorded_changes_lands_where_a_fresh_capture_does() {
+        let base = Declarations::capture(skills("no skills"), &[tool("exec", "run")]);
+
+        // A skill appears: it rewrites an instruction slot and adds a tool in
+        // the same turn, which is why one delta carries both.
+        let with_skill = Declarations::capture(
+            skills("skill: deploy"),
+            &[tool("exec", "run"), tool("Skill", "invoke a skill")],
+        );
+        // Then an MCP server withdraws its tool.
+        let after_mcp = Declarations::capture(
+            [
+                (InstructionSlot::Skills, "skill: deploy".to_string()),
+                (InstructionSlot::McpUnavailable, "linear".to_string()),
+            ],
+            &[tool("exec", "run"), tool("Skill", "invoke a skill")],
+        );
+
+        let deltas = vec![
+            with_skill.diff(&base).expect("the skill changed something"),
+            after_mcp
+                .diff(&with_skill)
+                .expect("the server outage changed something"),
+        ];
+
+        assert_eq!(plan_replay(&base, &deltas).effective, after_mcp);
+    }
+
+    /// Without a bound this is a log, not a replay contract: one marker per
+    /// turn means the request grows for as long as the session runs. A session
+    /// that changes its declarations far more often than the bound must still
+    /// replay a bounded number of markers, and must still end at the correct
+    /// effective state.
+    #[test]
+    fn a_long_run_of_changes_still_replays_a_bounded_number_of_markers() {
+        let base = Declarations::capture(skills("start"), &[]);
+        let mut previous = base.clone();
+        let mut deltas = Vec::new();
+        for turn in 0..MAX_REPLAYED_DELTAS * 5 {
+            let current = Declarations::capture(skills(&format!("skill set {turn}")), &[]);
+            deltas.push(current.diff(&previous).expect("each turn changed the slot"));
+            previous = current;
+        }
+
+        let plan = plan_replay(&base, &deltas);
+        assert_eq!(plan.markers.len(), MAX_REPLAYED_DELTAS);
+        assert_eq!(plan.effective, previous);
+    }
 }

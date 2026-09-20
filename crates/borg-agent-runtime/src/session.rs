@@ -2955,6 +2955,7 @@ async fn run_agent_session_store_kernel_inner(
                                         extension_workflows: Vec::new(),
                                         extension_api: crate::ExtensionApiSnapshot::default(),
                                         system_prompt_appendix: String::new(),
+                                        declaration_base: None,
                                         volatile_system_prompt_appendix:
                                             crate::provider_capabilities_prompt(
                                                 &launch.capabilities.provider_capabilities,
@@ -3024,6 +3025,11 @@ async fn run_agent_session_store_kernel_inner(
                                     .unwrap_or_else(|| {
                                         "Conversation context compacted on request".to_string()
                                     });
+                                // Read before `record` borrows the journal
+                                // mutably, and before the boundary event this
+                                // call writes joins the log.
+                                let retained_declarations =
+                                    native_declarations(journal.context_events());
                                 record(
                                     &mut journal,
                                     &events,
@@ -3040,6 +3046,8 @@ async fn run_agent_session_store_kernel_inner(
                                                 provider_context_preserved,
                                             "retained_messages": retained_tail.len(),
                                             COMPACTION_RETAINED_TAIL_FIELD: &retained_tail,
+                                            COMPACTION_RETAINED_DECLARATIONS_FIELD:
+                                                &retained_declarations,
                                         }),
                                     },
                                 )
@@ -3547,6 +3555,8 @@ async fn run_agent_session_store_kernel_inner(
                         native_usage_event(&compaction.usage, None),
                     )
                     .await?;
+                    let retained_declarations =
+                        native_declarations(journal.context_events());
                     record(
                         &mut journal,
                         &events,
@@ -3561,6 +3571,7 @@ async fn run_agent_session_store_kernel_inner(
                                 "trigger": "provider_input_size",
                                 "retained_messages": retained_tail.len(),
                                 COMPACTION_RETAINED_TAIL_FIELD: &retained_tail,
+                                COMPACTION_RETAINED_DECLARATIONS_FIELD: &retained_declarations,
                             }),
                         },
                     )
@@ -3939,6 +3950,9 @@ async fn run_agent_session_store_kernel_inner(
             extension_workflows: Vec::new(),
             extension_api: crate::ExtensionApiSnapshot::default(),
             system_prompt_appendix: String::new(),
+            declaration_base: native_provider
+                .then(|| native_declarations(journal.context_events()))
+                .flatten(),
             volatile_system_prompt_appendix: crate::provider_capabilities_prompt(
                 &launch.capabilities.provider_capabilities,
             ),
@@ -6421,6 +6435,60 @@ fn compaction_restarts_replay(payload: &Value) -> bool {
             == Some(true)
 }
 
+/// Field on a completed `context_compaction` event carrying the declarations
+/// in force at the boundary. The boundary arm clears the conversation and a
+/// resumed session rebuilds from the boundary forward, so a base recorded on
+/// an earlier turn is unreachable unless it rides this event -- the same rule
+/// that makes the verbatim tail durable. A boundary written before this field
+/// carries no declarations and leaves none, so the next turn records a fresh
+/// base rather than inheriting one from a generation that has ended.
+const COMPACTION_RETAINED_DECLARATIONS_FIELD: &str = "retained_declarations";
+
+/// Declarations in force at the end of the journal: the base for the current
+/// context generation, folded with every change recorded after it.
+///
+/// A separate pass over the same events rather than another output of
+/// `native_conversation`, because declarations are not messages; folding them
+/// into the message stream is the thing this contract exists to avoid.
+fn native_declarations(events: &[SessionEvent]) -> Option<crate::prompt_context::Declarations> {
+    let mut base: Option<crate::prompt_context::Declarations> = None;
+    for event in events {
+        match &event.kind {
+            SessionEventKind::ContextCleared => base = None,
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction" && compaction_restarts_replay(payload) =>
+            {
+                // A completed compaction advances the context generation, so
+                // the previous generation's base does not carry forward. What
+                // survives is whatever the boundary itself recorded -- and a
+                // boundary written before that field simply leaves no base,
+                // so the next turn records a fresh one.
+                base = payload
+                    .get(COMPACTION_RETAINED_DECLARATIONS_FIELD)
+                    .and_then(|value| serde_json::from_value(value.clone()).ok());
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == crate::prompt_context::DECLARATION_BASE_EVENT =>
+            {
+                base = serde_json::from_value(payload.clone()).ok();
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == crate::prompt_context::DECLARATION_DELTA_EVENT =>
+            {
+                // A delta with no base cannot be placed, and guessing one
+                // would invent a state the model was never shown.
+                if let Some(base) = base.as_mut()
+                    && let Ok(delta) = serde_json::from_value(payload.clone())
+                {
+                    base.apply(&delta);
+                }
+            }
+            _ => {}
+        }
+    }
+    base
+}
+
 /// Field on a completed `context_compaction` event carrying the verbatim tail
 /// kept across the boundary. Older events have no such field and replay as a
 /// summary alone, so adding it does not invalidate any journal already written.
@@ -6891,6 +6959,7 @@ async fn run_retained_compaction(
             extension_workflows: Vec::new(),
             extension_api: crate::ExtensionApiSnapshot::default(),
             system_prompt_appendix: RETAINED_COMPACTION_SYSTEM_PROMPT.to_string(),
+            declaration_base: None,
             volatile_system_prompt_appendix: crate::provider_capabilities_prompt(
                 &launch.capabilities.provider_capabilities,
             ),

@@ -16186,3 +16186,78 @@ async fn a_watcher_that_finishes_while_yielded_resumes_the_goal_without_ending_t
     let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
     scratch.discard().await;
 }
+
+/// A completed compaction starts a new context generation, so the declarations
+/// the previous generation recorded must not leak past the boundary -- and the
+/// ones still in force must survive it. Both halves matter: leaking replays a
+/// tool the model can no longer call, and losing them makes a resumed session
+/// re-announce a catalog the model was already given.
+///
+/// This is the durability rule commit bb0dc16 established for the verbatim
+/// tail, applied to declarations: read from the boundary event itself, because
+/// a resumed session rebuilds from the boundary forward.
+#[test]
+fn declarations_cross_a_compaction_boundary_only_through_the_boundary_event() {
+    use crate::prompt_context::{Declarations, InstructionSlot};
+
+    fn tool(name: &str) -> borg_provider::provider::ModelToolDefinition {
+        borg_provider::provider::ModelToolDefinition::new(
+            name,
+            "",
+            serde_json::json!({"type": "object"}),
+        )
+        .unwrap()
+    }
+
+    let session = Uuid::new_v4();
+    let before = Declarations::capture(
+        [(InstructionSlot::Skills, "deploy".to_string())],
+        &[tool("exec"), tool("retired_tool")],
+    );
+    let carried = Declarations::capture(
+        [(InstructionSlot::Skills, "deploy".to_string())],
+        &[tool("exec")],
+    );
+
+    let boundary = |payload: serde_json::Value| {
+        vec![
+            SessionEvent::new(
+                session,
+                1,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::OpenRouter,
+                    kind: "native_declaration_base".to_string(),
+                    payload: serde_json::to_value(&before).unwrap(),
+                },
+            ),
+            SessionEvent::new(
+                session,
+                2,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::OpenRouter,
+                    kind: "context_compaction".to_string(),
+                    payload,
+                },
+            ),
+        ]
+    };
+
+    // The boundary carries declarations: those are what survives, not the
+    // pre-boundary base, even though its event is still in the slice.
+    let events = boundary(serde_json::json!({
+        "status": "completed",
+        "summary": "earlier work",
+        "native": true,
+        "retained_declarations": &carried,
+    }));
+    assert_eq!(native_declarations(&events), Some(carried));
+
+    // A boundary from before the field leaves no base at all, so the next turn
+    // records a fresh one rather than inheriting a generation that has ended.
+    let legacy = boundary(serde_json::json!({
+        "status": "completed",
+        "summary": "earlier work",
+        "native": true,
+    }));
+    assert_eq!(native_declarations(&legacy), None);
+}

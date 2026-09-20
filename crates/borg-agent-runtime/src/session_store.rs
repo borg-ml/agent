@@ -416,10 +416,19 @@ impl SessionEventKind {
             {
                 true
             }
+            // Declarations are the one provider event that is durable rather
+            // than rebuilt. `native_prompt_context` is deliberately absent:
+            // it is volatile and reassembled every turn, so retaining it
+            // would replay a stale snapshot. A declaration base or delta is
+            // the opposite -- dropping it loses what the model was told it
+            // could do, with no way to recover it.
             Self::ProviderEvent { kind, .. } => {
                 matches!(
                     kind.as_str(),
-                    "native_model_message" | "native_tool_round_completed"
+                    "native_model_message"
+                        | "native_tool_round_completed"
+                        | "native_declaration_base"
+                        | "native_declaration_delta"
                 )
             }
             _ => false,

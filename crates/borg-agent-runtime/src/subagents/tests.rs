@@ -4667,6 +4667,7 @@ async fn forwarded_image_reaches_the_recipient_model_as_pixels() {
         extension_workflows: Vec::new(),
         extension_api: Default::default(),
         system_prompt_appendix: String::new(),
+        declaration_base: None,
         volatile_system_prompt_appendix: String::new(),
     };
 

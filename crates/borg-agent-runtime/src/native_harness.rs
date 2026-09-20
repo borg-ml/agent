@@ -3846,6 +3846,7 @@ mod tests {
                 extension_workflows: Vec::new(),
                 extension_api: Default::default(),
                 system_prompt_appendix: String::new(),
+                declaration_base: None,
                 volatile_system_prompt_appendix: String::new(),
             };
             // One event of backpressure makes the first result a deterministic control boundary.
@@ -5066,6 +5067,7 @@ mod tests {
             extension_workflows: Vec::new(),
             extension_api: Default::default(),
             system_prompt_appendix: String::new(),
+            declaration_base: None,
             volatile_system_prompt_appendix: volatile.to_string(),
         };
         let (events_tx, mut events_rx) = mpsc::channel(256);
@@ -5329,6 +5331,7 @@ mod tests {
                 extension_workflows: Vec::new(),
                 extension_api: Default::default(),
                 system_prompt_appendix: String::new(),
+                declaration_base: None,
                 volatile_system_prompt_appendix: String::new(),
             };
 
@@ -5560,6 +5563,7 @@ mod tests {
                 extension_workflows: Vec::new(),
                 extension_api: Default::default(),
                 system_prompt_appendix: String::new(),
+                declaration_base: None,
                 volatile_system_prompt_appendix: String::new(),
             };
 

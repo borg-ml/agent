@@ -182,6 +182,14 @@ pub struct AgentTurn {
     /// reused process keeps the snapshot it started with; the prompt already
     /// directs the model to `get_provider_capabilities` for fresh numbers.
     pub volatile_system_prompt_appendix: String,
+    /// Declarations in force at the end of the replayed journal: the base for
+    /// this context generation folded with every recorded change.
+    ///
+    /// `None` means the generation has no base yet, so this turn records one.
+    /// Threaded rather than rebuilt because the harness cannot see the journal
+    /// and a rebuilt base would silently differ from the one the model was
+    /// shown.
+    pub(crate) declaration_base: Option<crate::prompt_context::Declarations>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -2426,6 +2434,7 @@ mod tests {
             extension_workflows: Vec::new(),
             extension_api: Default::default(),
             system_prompt_appendix: "extension context".to_string(),
+            declaration_base: None,
             volatile_system_prompt_appendix: "usage: 5-hour 65% left".to_string(),
         }
     }
