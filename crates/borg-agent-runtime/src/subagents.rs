@@ -3624,55 +3624,79 @@ impl SubagentCoordinator {
         };
 
         if let Some((claimed, previous_name, previous_final_text)) = claimed {
-            let target = format!("session:{}", claimed.session_id);
-            if let Err(error) = self
-                .route_followup_task_with_options_as(
-                    actor_session_id,
-                    &target,
-                    launch
-                        .initial_prompt
-                        .as_deref()
-                        .expect("subagent launch has an initial prompt"),
-                    TeamMessageOptions::default(),
+            // A human stop belongs to the task the human stopped, not to the
+            // next one. A stopped worker still reports `Ready`, because the
+            // stop journals that status in the same breath it latches the
+            // gate, so it is claimed here like any idle worker -- and then
+            // the assignment, which arrives as a team message and therefore
+            // as `System`, is held by the user-stop gate and never runs. The
+            // roster shows the new task name on a worker that silently does
+            // nothing.
+            //
+            // Clearing the gate here is not the answer. `Ready` is set the
+            // instant the human interrupts, so a worker stopped seconds ago
+            // is indistinguishable from one retired long ago, and an agent
+            // claim must never overrule a live human stop. Leave the stop
+            // exactly as it is and spawn a fresh worker instead.
+            let reusable = match self.store.state(claimed.session_id).await {
+                Ok(state) => !state.user_stopped,
+                Err(error) => {
+                    // A gate that cannot be read is not a gate that is open.
+                    tracing::warn!(
+                        %error,
+                        session_id = %claimed.session_id,
+                        "could not read the user-stop gate of a reuse candidate; spawning instead"
+                    );
+                    false
+                }
+            };
+            if !reusable {
+                self.release_assignment_claim(
+                    claimed.session_id,
+                    &assignment_name,
+                    previous_name,
+                    previous_final_text,
+                    "Stopped by the human; the new task went to a fresh worker".to_string(),
                 )
-                .await
-            {
-                // The worker never received the task, so it must return to
-                // the identity it had before the claim: a half-applied rename
-                // would strand the roster on a task that is not running and
-                // leak the new name out of the index forever.
-                let mut table = self.table.lock().await;
-                let mut restore_previous_name = false;
-                if let Some(entry) = table.entries.get_mut(&claimed.session_id)
-                    && entry.assignment_claimed
-                    && entry.snapshot.task_name == assignment_name
+                .await;
+                // Falls through to the spawn below, which reports reused=false.
+            } else {
+                let target = format!("session:{}", claimed.session_id);
+                if let Err(error) = self
+                    .route_followup_task_with_options_as(
+                        actor_session_id,
+                        &target,
+                        launch
+                            .initial_prompt
+                            .as_deref()
+                            .expect("subagent launch has an initial prompt"),
+                        TeamMessageOptions::default(),
+                    )
+                    .await
                 {
-                    entry.assignment_claimed = false;
-                    entry.snapshot.updated_at = Utc::now();
-                    entry.snapshot.task_name = previous_name.clone();
-                    entry.snapshot.final_text = previous_final_text;
-                    entry.snapshot.detail =
-                        Some(format!("Automatic task assignment failed: {error:#}"));
-                    restore_previous_name = true;
+                    self.release_assignment_claim(
+                        claimed.session_id,
+                        &assignment_name,
+                        previous_name,
+                        previous_final_text,
+                        format!("Automatic task assignment failed: {error:#}"),
+                    )
+                    .await;
+                    return Err(error);
                 }
-                if restore_previous_name {
-                    table.task_names.remove(&assignment_name);
-                    table.task_names.insert(previous_name, claimed.session_id);
-                }
-                return Err(error);
+                let renamed = self.get(claimed.session_id).await.unwrap_or(claimed);
+                // Journal the rename now. `restore_from_events` rebuilds the
+                // task-name index from the latest durable snapshot, so a reused
+                // worker that is only renamed in memory comes back under its
+                // previous name if the parent dies before the child's next event.
+                let _ = self.activity_tx.send(SubagentActivity::Started {
+                    agent: renamed.clone(),
+                });
+                let mut value = serde_json::to_value(renamed)?;
+                value["reused"] = Value::Bool(true);
+                value["assignment_task_name"] = Value::String(assignment_name);
+                return Ok(value);
             }
-            let renamed = self.get(claimed.session_id).await.unwrap_or(claimed);
-            // Journal the rename now. `restore_from_events` rebuilds the
-            // task-name index from the latest durable snapshot, so a reused
-            // worker that is only renamed in memory comes back under its
-            // previous name if the parent dies before the child's next event.
-            let _ = self.activity_tx.send(SubagentActivity::Started {
-                agent: renamed.clone(),
-            });
-            let mut value = serde_json::to_value(renamed)?;
-            value["reused"] = Value::Bool(true);
-            value["assignment_task_name"] = Value::String(assignment_name);
-            return Ok(value);
         }
 
         let agent = self.spawn_with_launch(&request.task_name, launch).await?;
@@ -3680,6 +3704,40 @@ impl SubagentCoordinator {
         value["reused"] = Value::Bool(false);
         value["assignment_task_name"] = Value::String(assignment_name);
         Ok(value)
+    }
+
+    /// Return a claimed worker to the identity it had before the claim.
+    ///
+    /// A half-applied rename would strand the roster on a task that is not
+    /// running and leak the new name out of the index forever, so the claim
+    /// flag, the task name, the previous answer and the name index are all
+    /// unwound together. Shared by every path that claims a worker and then
+    /// declines to hand it the task.
+    async fn release_assignment_claim(
+        &self,
+        session_id: Uuid,
+        assignment_name: &str,
+        previous_name: String,
+        previous_final_text: Option<String>,
+        detail: String,
+    ) {
+        let mut table = self.table.lock().await;
+        let mut restore_previous_name = false;
+        if let Some(entry) = table.entries.get_mut(&session_id)
+            && entry.assignment_claimed
+            && entry.snapshot.task_name == assignment_name
+        {
+            entry.assignment_claimed = false;
+            entry.snapshot.updated_at = Utc::now();
+            entry.snapshot.task_name = previous_name.clone();
+            entry.snapshot.final_text = previous_final_text;
+            entry.snapshot.detail = Some(detail);
+            restore_previous_name = true;
+        }
+        if restore_previous_name {
+            table.task_names.remove(assignment_name);
+            table.task_names.insert(previous_name, session_id);
+        }
     }
 
     /// Return the durable child for a provider-specific sidecar, creating it

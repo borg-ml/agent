@@ -1742,6 +1742,115 @@ async fn spawn_tool_reuses_a_compatible_ready_worker_for_a_new_task() {
 }
 
 #[tokio::test]
+async fn a_human_stopped_worker_is_not_reused_for_a_new_task() {
+    // A human stop journals `Ready` in the same breath it latches the gate,
+    // so a stopped worker was claimed here like any idle one. The assignment
+    // then arrived as a team message -- and therefore as `System` -- which
+    // the user-stop gate holds: the roster showed the new task name on a
+    // worker that silently never ran it. Both halves matter. The stop must
+    // survive untouched, and the new task must still get done.
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let prompts = Arc::new(StdMutex::new(Vec::new()));
+    let executor = RecordingPeerExecutor {
+        prompts: Arc::clone(&prompts),
+    };
+    let mut root_launch = launch();
+    root_launch.capabilities.multiplayer = false;
+    root_launch.cwd = directory.path().to_path_buf();
+    // Two slots, so declining to reuse can actually spawn instead of being
+    // refused by the concurrency cap and passing for the wrong reason.
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        root_launch,
+        2,
+        Arc::new(executor),
+        Arc::clone(&store),
+    )
+    .unwrap();
+
+    let first = coordinator
+        .call_tool(
+            "spawn_agent",
+            json!({
+                "action": "delegate task",
+                "task_name": "first_task",
+                "message": "Complete the first bounded task."
+            }),
+        )
+        .await
+        .unwrap();
+    let stopped_session = Uuid::parse_str(first["session_id"].as_str().unwrap()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if coordinator.get(stopped_session).await.unwrap().status == SubagentStatus::Ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first assignment should complete");
+
+    // The human interrupts this worker. Only the durable gate is engaged;
+    // the roster status stays `Ready`, which is precisely what made the
+    // worker claimable for someone else's task.
+    store
+        .append(SessionEvent::new(
+            stopped_session,
+            0,
+            SessionEventKind::UserStopChanged { engaged: true },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        coordinator.get(stopped_session).await.unwrap().status,
+        SubagentStatus::Ready,
+        "the stop leaves the worker Ready; the reuse gate cannot rely on status"
+    );
+
+    let second = coordinator
+        .call_tool(
+            "spawn_agent",
+            json!({
+                "action": "delegate task",
+                "task_name": "second_task",
+                "message": "Complete the second bounded task."
+            }),
+        )
+        .await
+        .unwrap();
+
+    // The approved assignment is not swallowed: it runs on a fresh worker.
+    assert_eq!(second["reused"], false);
+    let second_session = Uuid::parse_str(second["session_id"].as_str().unwrap()).unwrap();
+    assert_ne!(second_session, stopped_session);
+    assert_eq!(second["assignment_task_name"], "/root/second_task");
+
+    // The stop is not contaminated into the new task: the stopped worker
+    // keeps its own identity, and the new name resolves to the new worker.
+    assert_eq!(
+        coordinator.get(stopped_session).await.unwrap().task_name,
+        "/root/first_task"
+    );
+    assert_eq!(
+        coordinator.get(second_session).await.unwrap().task_name,
+        "/root/second_task"
+    );
+    assert!(
+        store.state(stopped_session).await.unwrap().user_stopped,
+        "the human stop must survive the handoff untouched"
+    );
+
+    coordinator.stop_all().await;
+    scratch.discard().await;
+}
+
+#[tokio::test]
 async fn ensuring_a_sidecar_reuses_one_idle_provider_session() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
