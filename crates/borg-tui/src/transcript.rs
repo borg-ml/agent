@@ -2870,6 +2870,7 @@ impl Transcript {
                 complete,
                 completed_at: stored_completed_at,
                 backgrounded,
+                user_interrupted,
                 ..
             } = entry
             else {
@@ -2881,6 +2882,10 @@ impl Transcript {
             *complete = true;
             *stored_completed_at = Some(completed_at);
             *backgrounded = false;
+            // Terminal, but not a success. This sweep only reaches a
+            // preparation whose tool call never ran, and leaving it to read
+            // as a finished action is how a lost call would go unnoticed.
+            *user_interrupted = true;
             if foreground_index == Some(index) {
                 self.foreground_tool = None;
             }

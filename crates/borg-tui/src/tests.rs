@@ -8697,6 +8697,24 @@ fn redirected_reply_is_marked_as_redirected_not_user_interrupted() {
             },
         ));
     }
+    // A real tool that is genuinely running across the boundary. The sweep
+    // retires preparations, and must leave work that actually started alone.
+    transcript.order.push(TranscriptEntry::Tool {
+        source_name: "Run".to_string(),
+        name: "Run command".to_string(),
+        detail: "cargo test".to_string(),
+        code_view: None,
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:00".to_string(),
+        started_at: Utc::now(),
+        completed_at: None,
+        complete: false,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: false,
+    });
     transcript.apply(&SessionEvent::new(
         session_id,
         4,
@@ -8722,10 +8740,51 @@ fn redirected_reply_is_marked_as_redirected_not_user_interrupted() {
         .join("\n");
     assert!(rendered.contains("I can see"), "{rendered}");
     assert!(rendered.contains("redirected by follow-up"), "{rendered}");
-    assert!(!rendered.contains("user interrupted"), "{rendered}");
     assert!(
         !rendered.contains("Awaiting tool-call arguments…"),
         "{rendered}"
+    );
+    // The reply itself was redirected, which is not an interrupt. This is
+    // asserted on the message rather than the whole render, because the
+    // preparation retired below carries the interrupted lifecycle by design.
+    assert!(
+        transcript.order.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Message {
+                redirected: true,
+                user_interrupted: false,
+                ..
+            }
+        )),
+        "the redirected reply must not be reported as interrupted"
+    );
+    // The tool call the stream was writing never ran. Its row is terminal, but
+    // retiring it as a plain completion would draw abandoned work exactly like
+    // an action that finished.
+    assert!(
+        transcript.order.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Tool {
+                source_name,
+                complete: true,
+                user_interrupted: true,
+                ..
+            } if source_name == "action_preparing"
+        )),
+        "a swept preparation must read as not run, not as a finished action"
+    );
+    // The tool that really started is untouched by the sweep.
+    assert!(
+        transcript.order.iter().any(|entry| matches!(
+            entry,
+            TranscriptEntry::Tool {
+                source_name,
+                complete: false,
+                user_interrupted: false,
+                ..
+            } if source_name == "Run"
+        )),
+        "a running tool must survive a sweep that only retires preparations"
     );
 }
 
