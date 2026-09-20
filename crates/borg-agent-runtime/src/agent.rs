@@ -164,6 +164,12 @@ pub struct AgentTurn {
     /// session actor keeps it in memory and provider setup consumes it only
     /// for the current request.
     pub runtime_mcp_context: crate::RuntimeMcpContext,
+    /// Controller-supplied provider access for this turn (per-session provider
+    /// auth, git credentials, enterprise gateway). Never serialized; the
+    /// session actor threads it from the launch contract into the executor so
+    /// an embedding product's own subscription is used instead of host-local
+    /// credentials.
+    pub runtime_provider_context: Option<crate::RuntimeProviderContext>,
     /// Trusted extension-owned skill roots supplied by the launch contract.
     pub extension_skill_roots: Vec<PathBuf>,
     /// Executable workflows from the same atomic extension snapshot as the
@@ -392,6 +398,9 @@ pub struct LocalAgentTurnExecutor {
     runtime_extension_loader: Option<RuntimeExtensionLoader>,
     subscription_pools: Arc<SubscriptionPoolRegistry>,
     web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
+    /// Controller-supplied provider access for this session. Empty for
+    /// host-local execution, where credentials come from the host environment.
+    provider_context: crate::RuntimeProviderContext,
     #[cfg(feature = "profiling")]
     profiler: Option<Arc<crate::RuntimeProfiler>>,
 }
@@ -414,6 +423,7 @@ impl Default for LocalAgentTurnExecutor {
             runtime_extension_loader: None,
             subscription_pools: Arc::new(SubscriptionPoolRegistry::default()),
             web_search,
+            provider_context: crate::RuntimeProviderContext::default(),
             #[cfg(feature = "profiling")]
             profiler: None,
         }
@@ -665,6 +675,13 @@ impl LocalAgentTurnExecutor {
         provider: Arc<dyn borg_search::WebSearchProvider>,
     ) -> Self {
         self.web_search = Some(provider);
+        self
+    }
+
+    /// Supply controller-prepared provider access for this session. The
+    /// context is held in memory and never serialized into durable state.
+    pub fn with_provider_context(mut self, context: crate::RuntimeProviderContext) -> Self {
+        self.provider_context = context;
         self
     }
 
@@ -964,6 +981,15 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 return Err(error);
             }
         }
+        // The controller's per-session provider context wins over host-local
+        // executor defaults for this turn.
+        let provider_context = turn
+            .runtime_provider_context
+            .clone()
+            .unwrap_or_else(|| self.provider_context.clone());
+        // Holds a restored per-session ChatGPT auth home for the duration of
+        // the turn; dropping it removes the ephemeral credentials.
+        let mut _codex_auth_home: Option<tempfile::TempDir> = None;
         #[cfg(feature = "profiling")]
         let profile_provider = turn.provider;
         #[cfg(feature = "profiling")]
@@ -971,10 +997,32 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             profiler.set_phase("provider_start");
         }
         if self.uses_native_harness(turn.provider) {
-            let result = self
-                .native_harness
-                .run(turn.clone(), events, controls)
-                .await;
+            // A controller-supplied provider context applies to this session's
+            // native turns: a per-session ChatGPT subscription for Codex, and a
+            // gateway for an enterprise policy route. Without one the
+            // host-local harness configuration stands.
+            let mut harness = self.native_harness.clone();
+            if turn.provider == CodingProvider::Codex
+                && let Some(auth) = provider_context.provider_auth.as_ref()
+                && auth.provider == borg_provider::ProviderAuthProvider::Openai
+            {
+                let home =
+                    tempfile::TempDir::new().context("create per-session Codex auth home")?;
+                borg_provider::provider_auth::restore_bundle(
+                    auth.provider,
+                    &auth.bundle,
+                    home.path(),
+                )
+                .context("restore per-session ChatGPT subscription")?;
+                harness = harness.with_codex_auth_file(
+                    borg_provider::provider_auth::codex_credentials_path(home.path()),
+                );
+                _codex_auth_home = Some(home);
+            }
+            if let Some(gateway) = provider_context.model_gateway.clone() {
+                harness = harness.with_turn_gateway(gateway);
+            }
+            let result = harness.run(turn.clone(), events, controls).await;
             #[cfg(feature = "profiling")]
             if let Some((profiler, started)) = self.profiler.as_ref().zip(profile_started) {
                 profiler.finish_turn(profile_provider, started, result.is_ok());
@@ -997,12 +1045,14 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             | CodingProvider::OpenCode
             | CodingProvider::Grok
             | CodingProvider::Muse => {
+                let request_template = (!provider_context.is_empty())
+                    .then(|| provider_context_request_template(&turn, &provider_context));
                 run_borg_provider_turn(
                     turn,
                     events,
                     controls,
                     BorgProviderTurnRuntime {
-                        request_template: None,
+                        request_template,
                         local: true,
                         subscription_pools: Some(Arc::clone(&self.subscription_pools)),
                         #[cfg(feature = "profiling")]
@@ -1256,6 +1306,26 @@ fn direct_chat_stream_request(
         web_search_allowed: true,
         resume_unavailable_prompt: None,
     }
+}
+
+/// Build the per-session provider request template from controller-supplied
+/// access. `run_borg_provider_turn` overlays the live turn fields (prompt,
+/// attachments, model, MCP servers) on top, so only credential material and
+/// routing that the turn itself cannot express belongs here.
+fn provider_context_request_template(
+    turn: &AgentTurn,
+    context: &crate::RuntimeProviderContext,
+) -> ChatStreamRequest {
+    let mut request = direct_chat_stream_request(turn, false, "");
+    request.provider_auth = context.provider_auth.clone();
+    request.git_credentials = context.git_credentials.clone();
+    if let Some(channel) = context.provider_channel {
+        request.provider_channel = channel;
+    }
+    if let Some(persist) = context.persist_session {
+        request.persist_session = Some(persist);
+    }
+    request
 }
 
 fn append_prompt_context(prompt: &str, context: &str) -> String {
@@ -2457,6 +2527,7 @@ mod tests {
             ),
             external_mcp_servers: Vec::new(),
             runtime_mcp_context: Default::default(),
+            runtime_provider_context: None,
             extension_skill_roots: Vec::new(),
             extension_workflows: Vec::new(),
             extension_api: Default::default(),
@@ -2464,6 +2535,27 @@ mod tests {
             declaration_base: None,
             volatile_system_prompt_appendix: "usage: 5-hour 65% left".to_string(),
         }
+    }
+
+    #[test]
+    fn controller_provider_context_reaches_the_subscription_request_template() {
+        use super::provider_context_request_template;
+        let cwd = std::env::temp_dir();
+        let turn = lifecycle_test_turn(&cwd);
+        let context = crate::RuntimeProviderContext {
+            provider_channel: Some(borg_provider::ProviderChannel::Vertex),
+            persist_session: Some(false),
+            ..Default::default()
+        };
+        assert!(!context.is_empty());
+
+        let request = provider_context_request_template(&turn, &context);
+        assert_eq!(
+            request.provider_channel,
+            borg_provider::ProviderChannel::Vertex
+        );
+        assert_eq!(request.persist_session, Some(false));
+        assert!(request.provider_auth.is_none());
     }
 
     #[tokio::test]

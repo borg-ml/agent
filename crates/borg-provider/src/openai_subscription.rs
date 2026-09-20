@@ -89,7 +89,21 @@ pub fn account() -> Result<Option<SubscriptionAccount>> {
 /// `rejected_token` distinguishes a forced 401 recovery from an ordinary read.
 /// Another Borg process may already have rotated the rejected access token.
 pub async fn access(rejected_token: Option<String>) -> Result<SubscriptionAccess> {
-    let path = auth_path()?;
+    access_from(None, rejected_token).await
+}
+
+/// Read credentials from an explicit auth file rather than the host-local
+/// selection. A controller embedding the runtime restores a per-session
+/// subscription bundle and points the turn at it, so concurrent sessions on
+/// one host never share or clobber each other's rotating refresh token.
+pub async fn access_from(
+    auth_file: Option<PathBuf>,
+    rejected_token: Option<String>,
+) -> Result<SubscriptionAccess> {
+    let path = match auth_file {
+        Some(path) => path,
+        None => auth_path()?,
+    };
     // A caller interrupt must not cancel the refresh between token rotation and persistence.
     tokio::spawn(async move { access_at(path, rejected_token, TOKEN_ENDPOINT).await })
         .await

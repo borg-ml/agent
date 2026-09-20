@@ -97,6 +97,10 @@ struct CachedModels {
 struct SubscriptionAccess {
     token: String,
     account_id: String,
+    /// The auth file these credentials were read from. Refresh writes back to
+    /// this same file, so a controller-restored per-session bundle rotates in
+    /// place instead of falling back to the host-local selection.
+    auth_file: Option<std::path::PathBuf>,
 }
 
 impl SubscriptionAccess {
@@ -190,6 +194,7 @@ impl SubscriptionAccess {
             // Keep Borg identified by originator; no installed executable is needed.
             let version = "0.154.0";
             let rejected_token = self.token.clone();
+            let auth_file = self.auth_file.clone();
             let response = self
                 .send_with_recovery(
                     client
@@ -198,7 +203,7 @@ impl SubscriptionAccess {
                         .header("originator", "borg")
                         .timeout(Duration::from_secs(30)),
                     &account,
-                    Self::read(Some(rejected_token)),
+                    Self::read_with(auth_file, Some(rejected_token)),
                 )
                 .await?;
             let response = check_subscription_response(response).await?;
@@ -231,7 +236,10 @@ impl SubscriptionAccess {
             .context("selected model is not available in this Codex account's catalog")
     }
 
-    async fn read(rejected_token: Option<String>) -> Result<Self> {
+    async fn read_with(
+        auth_file: Option<std::path::PathBuf>,
+        rejected_token: Option<String>,
+    ) -> Result<Self> {
         use crate::credentials::{openai_api_key, openai_auth_mode, openai_uses_api_key};
         openai_auth_mode()?;
         if openai_uses_api_key() {
@@ -239,12 +247,15 @@ impl SubscriptionAccess {
                 token: openai_api_key()
                     .context("OpenAI API key missing; add one with borg login codex --api-key")?,
                 account_id: String::new(),
+                auth_file,
             });
         }
-        let access = crate::openai_subscription::access(rejected_token).await?;
+        let access =
+            crate::openai_subscription::access_from(auth_file.clone(), rejected_token).await?;
         Ok(Self {
             token: access.token,
             account_id: access.account_id,
+            auth_file,
         })
     }
 }
@@ -252,7 +263,16 @@ impl SubscriptionAccess {
 impl CodexModelProvider {
     /// Non-secret access identity, captured by Borg for this turn only.
     pub async fn account_identity() -> Result<String> {
-        Ok(SubscriptionAccess::read(None).await?.identity())
+        Ok(SubscriptionAccess::read_with(None, None).await?.identity())
+    }
+
+    /// Non-secret access identity for a controller-restored per-session auth
+    /// file, so a managed session records the identity of the subscription it
+    /// actually used rather than the host-local one.
+    pub async fn account_identity_from(auth_file: Option<std::path::PathBuf>) -> Result<String> {
+        Ok(SubscriptionAccess::read_with(auth_file, None)
+            .await?
+            .identity())
     }
 
     /// Keep the credentials selected at turn admission stable while this turn runs.
@@ -262,7 +282,20 @@ impl CodexModelProvider {
         progress: Option<UnboundedSender<ProviderProgress>>,
         expected_account: &str,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
-        self.model_turn_capped(request, progress, expected_account, None)
+        self.model_turn_for_account_with_auth(request, progress, expected_account, None)
+            .await
+    }
+
+    /// As `model_turn_for_account`, but read ChatGPT credentials from an
+    /// explicit per-session auth file restored by the controller.
+    pub async fn model_turn_for_account_with_auth(
+        &self,
+        request: ModelTurnRequest,
+        progress: Option<UnboundedSender<ProviderProgress>>,
+        expected_account: &str,
+        auth_file: Option<std::path::PathBuf>,
+    ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        self.model_turn_capped(request, progress, expected_account, None, auth_file)
             .await
     }
 
@@ -280,7 +313,18 @@ impl CodexModelProvider {
         expected_account: &str,
         refresh: PromptCacheRefresh,
     ) -> std::result::Result<ProviderCallUsage, ProviderCallError> {
-        self.model_turn_capped(request, None, expected_account, Some(refresh))
+        self.refresh_prompt_cache_for_account_with_auth(request, expected_account, refresh, None)
+            .await
+    }
+
+    pub async fn refresh_prompt_cache_for_account_with_auth(
+        &self,
+        request: ModelTurnRequest,
+        expected_account: &str,
+        refresh: PromptCacheRefresh,
+        auth_file: Option<std::path::PathBuf>,
+    ) -> std::result::Result<ProviderCallUsage, ProviderCallError> {
+        self.model_turn_capped(request, None, expected_account, Some(refresh), auth_file)
             .await
             .map(|result| result.usage)
     }
@@ -291,6 +335,7 @@ impl CodexModelProvider {
         progress: Option<UnboundedSender<ProviderProgress>>,
         expected_account: &str,
         refresh: Option<PromptCacheRefresh>,
+        auth_file: Option<std::path::PathBuf>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
         // See the same guard in `openai_compatible`: a refresh gets its own
         // client request id so an upstream cannot deduplicate it against the
@@ -319,7 +364,7 @@ impl CodexModelProvider {
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(30))
                 .build()?;
-            let mut access = SubscriptionAccess::read(None).await?;
+            let mut access = SubscriptionAccess::read_with(auth_file, None).await?;
             trace.invocation.executable = access.endpoint().into();
             ensure!(access.identity() == expected_account,
                 "OpenAI credentials changed during this turn; retry to use the currently selected account");
@@ -564,11 +609,12 @@ impl CodexModelProvider {
             http = http.header("X-Client-Request-Id", id);
         }
         let rejected_token = access.token.clone();
+        let auth_file = access.auth_file.clone();
         access
             .send_with_recovery(
                 apply_provider_request_timeout(http),
                 expected_account,
-                SubscriptionAccess::read(Some(rejected_token)),
+                SubscriptionAccess::read_with(auth_file, Some(rejected_token)),
             )
             .await
     }
@@ -1146,6 +1192,7 @@ mod tests {
         let mut access = SubscriptionAccess {
             token: "test-api-key".into(),
             account_id: String::new(),
+            auth_file: None,
         };
         assert_eq!(access.endpoint(), "https://api.openai.com/v1/responses");
         let identity = access.identity();
@@ -1220,7 +1267,7 @@ mod tests {
                     }
                     listener
                 });
-                let mut access = SubscriptionAccess { token: "old-token".into(), account_id: "account-a".into() };
+                let mut access = SubscriptionAccess { token: "old-token".into(), account_id: "account-a".into(), auth_file: None };
                 let account = access.identity();
                 let refreshes = std::sync::atomic::AtomicUsize::new(0);
                 let result = access.send_with_recovery(
@@ -1232,6 +1279,7 @@ mod tests {
                         Ok(SubscriptionAccess {
                             token: "new-token".into(),
                             account_id: if recovery == "changed" { "account-b" } else { "account-a" }.into(),
+                            auth_file: None,
                         })
                     },
                 ).await;
@@ -1497,14 +1545,17 @@ mod tests {
         let original = SubscriptionAccess {
             token: "old-token".into(),
             account_id: "account-a".into(),
+            auth_file: None,
         };
         let mut changed = SubscriptionAccess {
             token: "new-token".into(),
             account_id: "account-b".into(),
+            auth_file: None,
         };
         let refreshed = SubscriptionAccess {
             token: "refreshed-token".into(),
             account_id: "account-a".into(),
+            auth_file: None,
         };
         assert_eq!(original.identity(), refreshed.identity());
         let request = ModelTurnRequest {
@@ -1618,7 +1669,7 @@ mod tests {
             let mut request = ModelTurnRequest { fast: true, request_id: Some("request".into()), session_id: Some("session".into()),
                 prompt_cache_key: Some("cache".into()), messages: vec![ModelMessage::user("Inspect.")],
                 tools: vec![super::super::ModelToolDefinition::new("inspect", "Inspect", json!({"type":"object"})).unwrap()], output_schema: None };
-            let mut access = SubscriptionAccess { token: "test-token".into(), account_id: "test-account".into() };
+            let mut access = SubscriptionAccess { token: "test-token".into(), account_id: "test-account".into(), auth_file: None };
             let account = access.identity();
             let response = provider.send(&reqwest::Client::new(), &endpoint,
                 &mut access, &account,

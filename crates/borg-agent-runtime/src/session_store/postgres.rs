@@ -73,6 +73,24 @@ pub struct PostgresSessionStore {
     /// Dictionaries are append-only and immutable, so caching one is safe for
     /// the life of the process and saves a fetch per cold read.
     dictionaries: cold::DictionaryCache,
+    /// Controller-supplied workspace projection. A product that already owns a
+    /// durable workspace store (for example Borg Web's participant and shared
+    /// work tables) supplies it here so the runtime projects into that
+    /// authority instead of a second workspace schema.
+    workspace_override: Option<WorkspaceStoreOverride>,
+}
+
+/// A workspace projection supplied by the embedding controller.
+///
+/// Wrapped so [`PostgresSessionStore`] keeps its `Debug` derive; the trait
+/// object itself is not `Debug`.
+#[derive(Clone)]
+pub struct WorkspaceStoreOverride(pub std::sync::Arc<dyn crate::WorkspaceStore>);
+
+impl std::fmt::Debug for WorkspaceStoreOverride {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WorkspaceStoreOverride(<controller>)")
+    }
 }
 
 impl PostgresSessionStore {
@@ -112,10 +130,26 @@ impl PostgresSessionStore {
         let store = Self {
             pool,
             dictionaries: cold::DictionaryCache::default(),
+            workspace_override: None,
         };
         store.ensure_schema().await?;
         store.clear_stranded_turn_live_state().await?;
         Ok(store)
+    }
+
+    /// Project this session's multiplayer state into a controller-owned
+    /// workspace store instead of the runtime's own workspace schema.
+    ///
+    /// The journal and every other tier still live in this store's PostgreSQL
+    /// database; only the workspace projection is redirected. This is how an
+    /// embedding product (Borg Web) keeps one authority for participants,
+    /// shared work and presence.
+    pub fn with_workspace_store(
+        mut self,
+        workspace: std::sync::Arc<dyn crate::WorkspaceStore>,
+    ) -> Self {
+        self.workspace_override = Some(WorkspaceStoreOverride(workspace));
+        self
     }
 
     /// Erase turn live state belonging to sessions that are not running.

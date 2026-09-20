@@ -1621,23 +1621,48 @@ async fn run_agent_session_store_kernel_inner(
         let workspace_store = store.workspace_store().await?.with_context(
             || "multiplayer requires a workspace projection on the canonical session database",
         )?;
-        let human_display_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
-        let human_participant_id = crate::local_human_participant_id(&human_display_name);
-        let workspace_name = launch
-            .cwd
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("Borg workspace");
-        let agent_display_name = launch.name.as_deref().unwrap_or("Borg");
+        // A product controller that runs the runtime in-process supplies the
+        // real authenticated identities; a host derives them locally.
+        let identity = launch.capabilities.runtime_workspace_identity.clone();
+        let trusted_human_participant_id = identity
+            .as_ref()
+            .map(|identity| identity.human_participant_id);
+        let local_human_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
+        let human_display_name = identity
+            .as_ref()
+            .map(|identity| identity.human_display_name.clone())
+            .unwrap_or_else(|| local_human_name.clone());
+        let human_participant_id = trusted_human_participant_id
+            .unwrap_or_else(|| crate::local_human_participant_id(&local_human_name));
+        let workspace_name = identity
+            .as_ref()
+            .and_then(|identity| identity.workspace_name.clone())
+            .or_else(|| {
+                launch
+                    .cwd
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "Borg workspace".to_string());
+        let agent_participant_id = identity
+            .as_ref()
+            .and_then(|identity| identity.agent_participant_id)
+            .unwrap_or(binding.participant_id);
+        let agent_display_name = identity
+            .as_ref()
+            .and_then(|identity| identity.agent_display_name.clone())
+            .or_else(|| launch.name.clone())
+            .unwrap_or_else(|| "Borg".to_string());
         workspace_store
             .ensure_execution_workspace(
                 binding.workspace_id,
-                workspace_name,
+                &workspace_name,
                 human_participant_id,
                 &human_display_name,
-                binding.participant_id,
-                agent_display_name,
+                agent_participant_id,
+                &agent_display_name,
             )
             .await?;
         // Record the launch identity discovery needs. The workspace name above
@@ -1646,7 +1671,7 @@ async fn run_agent_session_store_kernel_inner(
         // and owning pid are known right here and were previously dropped.
         if let Err(error) = workspace_store
             .register_local_instance(
-                binding.participant_id,
+                agent_participant_id,
                 Some(binding.workspace_id),
                 &launch.cwd,
                 std::process::id(),
@@ -1667,7 +1692,7 @@ async fn run_agent_session_store_kernel_inner(
         let projection = WorkspaceProjection::new(
             workspace_store,
             binding.workspace_id,
-            binding.participant_id,
+            agent_participant_id,
             human_participant_id,
             inherited,
             projected,
@@ -3047,10 +3072,18 @@ async fn run_agent_session_store_kernel_inner(
                                         agent_tools: dispatcher.clone(),
                                         external_mcp_servers: runtime_mcp_servers.clone(),
                                         runtime_mcp_context: runtime_mcp_context.clone(),
+                                        runtime_provider_context: launch
+                                            .capabilities
+                                            .runtime_provider_context
+                                            .clone(),
                                         extension_skill_roots: launch.extension_skill_roots.clone(),
                                         extension_workflows: Vec::new(),
                                         extension_api: crate::ExtensionApiSnapshot::default(),
-                                        system_prompt_appendix: String::new(),
+                                        system_prompt_appendix: launch
+                                            .capabilities
+                                            .system_prompt_appendix
+                                            .clone()
+                                            .unwrap_or_default(),
                                         declaration_base: None,
                                         volatile_system_prompt_appendix:
                                             crate::provider_capabilities_prompt(
@@ -4059,10 +4092,15 @@ async fn run_agent_session_store_kernel_inner(
             agent_tools: dispatcher.clone(),
             external_mcp_servers: runtime_mcp_servers.clone(),
             runtime_mcp_context: runtime_mcp_context.clone(),
+            runtime_provider_context: launch.capabilities.runtime_provider_context.clone(),
             extension_skill_roots: launch.extension_skill_roots.clone(),
             extension_workflows: Vec::new(),
             extension_api: crate::ExtensionApiSnapshot::default(),
-            system_prompt_appendix: String::new(),
+            system_prompt_appendix: launch
+                .capabilities
+                .system_prompt_appendix
+                .clone()
+                .unwrap_or_default(),
             declaration_base: native_provider
                 .then(|| native_declarations(journal.context_events()))
                 .flatten(),
@@ -6953,6 +6991,7 @@ async fn run_retained_compaction(
                 .runtime_mcp_context
                 .clone()
                 .unwrap_or_default(),
+            runtime_provider_context: launch.capabilities.runtime_provider_context.clone(),
             extension_skill_roots: Vec::new(),
             extension_workflows: Vec::new(),
             extension_api: crate::ExtensionApiSnapshot::default(),
