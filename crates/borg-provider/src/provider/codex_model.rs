@@ -543,6 +543,20 @@ impl CodexModelProvider {
             .header("x-codex-routing-hint", routing_hint)
             .header("Accept", "text/event-stream")
             .json(body);
+        // ChatGPT derives Responses cache affinity from `session-id`, and the
+        // upstream client sets that header to the prompt cache key rather than
+        // to the session's own identity (openai/codex#44862, and
+        // `build_session_headers` in codex-rs). Sending a different spelling
+        // routes the turn by something the backend does not key on, so the
+        // prefix a previous turn cached is not necessarily the one this turn is
+        // matched against. The session's real identity still travels below.
+        if let Some(affinity) = request
+            .prompt_cache_key
+            .as_ref()
+            .or(request.session_id.as_ref())
+        {
+            http = http.header("session-id", affinity);
+        }
         if let Some(id) = &request.session_id {
             http = http.header("session_id", id);
         }
@@ -1552,6 +1566,13 @@ mod tests {
                         let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
                         assert!(headers.contains("authorization: bearer test-token"));
                         assert!(headers.contains("chatgpt-account-id: test-account"));
+                        // Wire names are strings the compiler cannot check,
+                        // and the cost of getting this one wrong is silent:
+                        // the turn still succeeds, it just may not be routed
+                        // to the cache its prefix lives in. `session-id`
+                        // carries the prompt cache key, per upstream; the
+                        // session's own identity rides `session_id`.
+                        assert!(headers.contains("session-id: cache"));
                         assert!(headers.contains("session_id: session"));
                         assert!(headers.contains("x-codex-routing-hint: model=gpt-6-astra;tier=priority"));
                         let len: usize = headers.lines().find_map(|line| line.strip_prefix("content-length: ")).unwrap().parse().unwrap();
