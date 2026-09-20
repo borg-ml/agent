@@ -163,6 +163,12 @@ pub struct AgentTurn {
     /// session actor keeps it in memory and provider setup consumes it only
     /// for the current request.
     pub runtime_mcp_context: crate::RuntimeMcpContext,
+    /// Controller-supplied provider access for this turn (per-session provider
+    /// auth, git credentials, enterprise gateway). Never serialized; the
+    /// session actor threads it from the launch contract into the executor so
+    /// an embedding product's own subscription is used instead of host-local
+    /// credentials.
+    pub runtime_provider_context: Option<crate::RuntimeProviderContext>,
     /// Trusted extension-owned skill roots supplied by the launch contract.
     pub extension_skill_roots: Vec<PathBuf>,
     /// Executable workflows from the same atomic extension snapshot as the
@@ -974,6 +980,15 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 return Err(error);
             }
         }
+        // The controller's per-session provider context wins over host-local
+        // executor defaults for this turn.
+        let provider_context = turn
+            .runtime_provider_context
+            .clone()
+            .unwrap_or_else(|| self.provider_context.clone());
+        // Holds a restored per-session ChatGPT auth home for the duration of
+        // the turn; dropping it removes the ephemeral credentials.
+        let mut _codex_auth_home: Option<tempfile::TempDir> = None;
         #[cfg(feature = "profiling")]
         let profile_provider = turn.provider;
         #[cfg(feature = "profiling")]
@@ -981,13 +996,31 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             profiler.set_phase("provider_start");
         }
         if self.uses_native_harness(turn.provider) {
-            // A controller-supplied gateway (for example an enterprise policy
-            // route) applies to this session's native turns. Without one the
+            // A controller-supplied provider context applies to this session's
+            // native turns: a per-session ChatGPT subscription for Codex, and a
+            // gateway for an enterprise policy route. Without one the
             // host-local harness configuration stands.
-            let harness = match self.provider_context.model_gateway.clone() {
-                Some(gateway) => self.native_harness.with_turn_gateway(gateway),
-                None => self.native_harness.clone(),
-            };
+            let mut harness = self.native_harness.clone();
+            if turn.provider == CodingProvider::Codex
+                && let Some(auth) = provider_context.provider_auth.as_ref()
+                && auth.provider == borg_provider::ProviderAuthProvider::Openai
+            {
+                let home = tempfile::TempDir::new()
+                    .context("create per-session Codex auth home")?;
+                borg_provider::provider_auth::restore_bundle(
+                    auth.provider,
+                    &auth.bundle,
+                    home.path(),
+                )
+                .context("restore per-session ChatGPT subscription")?;
+                harness = harness.with_codex_auth_file(
+                    borg_provider::provider_auth::codex_credentials_path(home.path()),
+                );
+                _codex_auth_home = Some(home);
+            }
+            if let Some(gateway) = provider_context.model_gateway.clone() {
+                harness = harness.with_turn_gateway(gateway);
+            }
             let result = harness.run(turn.clone(), events, controls).await;
             #[cfg(feature = "profiling")]
             if let Some((profiler, started)) = self.profiler.as_ref().zip(profile_started) {
@@ -1008,8 +1041,8 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         let completed_hook_turn = turn.clone();
         let result = match turn.provider {
             CodingProvider::Claude | CodingProvider::OpenCode => {
-                let request_template = (!self.provider_context.is_empty())
-                    .then(|| provider_context_request_template(&turn, &self.provider_context));
+                let request_template = (!provider_context.is_empty())
+                    .then(|| provider_context_request_template(&turn, &provider_context));
                 run_borg_provider_turn(
                     turn,
                     events,
@@ -2481,6 +2514,7 @@ mod tests {
             ),
             external_mcp_servers: Vec::new(),
             runtime_mcp_context: Default::default(),
+            runtime_provider_context: None,
             extension_skill_roots: Vec::new(),
             extension_workflows: Vec::new(),
             extension_api: Default::default(),

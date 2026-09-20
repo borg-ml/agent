@@ -75,6 +75,8 @@ pub(crate) struct NativeHarness {
     configured_model_aliases: std::collections::BTreeSet<String>,
     /// `[warming] mode`, unless `BORG_CACHE_WARMING` overrides it.
     warming: CacheWarmingMode,
+    /// Controller-restored per-session ChatGPT auth file for Codex turns.
+    codex_auth_file: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for NativeHarness {
@@ -103,6 +105,7 @@ impl Default for NativeHarness {
             compaction: CompactionBudgetPolicy::default(),
             configured_model_aliases: std::collections::BTreeSet::new(),
             warming: CacheWarmingMode::default(),
+            codex_auth_file: None,
         }
     }
 }
@@ -167,6 +170,8 @@ impl NativeHarness {
                 configured_model_gateways: settings.configured_model_gateways.clone(),
                 #[cfg(feature = "subscription-adapters")]
                 codex_account: None,
+                #[cfg(feature = "subscription-adapters")]
+                codex_auth_file: None,
             }),
             reviewer_model: settings.approval_reviewer_model.clone(),
             reviewer_effort: settings.approval_reviewer_effort.clone(),
@@ -176,6 +181,7 @@ impl NativeHarness {
             compaction: settings.compaction.clone(),
             configured_model_aliases: settings.configured_model_gateways.keys().cloned().collect(),
             warming: settings.warming,
+            codex_auth_file: None,
         }
     }
 
@@ -189,6 +195,8 @@ impl NativeHarness {
                 configured_model_gateways: settings.configured_model_gateways.clone(),
                 #[cfg(feature = "subscription-adapters")]
                 codex_account: None,
+                #[cfg(feature = "subscription-adapters")]
+                codex_auth_file: None,
             }),
             ..Self::with_settings(settings)
         }
@@ -209,6 +217,23 @@ impl NativeHarness {
             configured_model_gateways: Default::default(),
             #[cfg(feature = "subscription-adapters")]
             codex_account: None,
+            #[cfg(feature = "subscription-adapters")]
+            codex_auth_file: next.codex_auth_file.clone(),
+        });
+        next
+    }
+
+    /// Clone this harness with a controller-restored per-session Codex auth
+    /// file bound for the next turns. Used by an embedding product so a
+    /// managed Codex session reads the user's own subscription instead of the
+    /// host-local credential selection.
+    pub(crate) fn with_codex_auth_file(&self, auth_file: std::path::PathBuf) -> Self {
+        let mut next = self.clone();
+        next.codex_auth_file = Some(auth_file.clone());
+        next.model_client = Arc::new(ProviderModelClient {
+            #[cfg(feature = "subscription-adapters")]
+            codex_auth_file: Some(auth_file),
+            ..ProviderModelClient::default()
         });
         next
     }
@@ -254,13 +279,18 @@ impl NativeHarness {
                 .store
                 .as_ref()
                 .context("subscription model access requires durable Borg session storage")?;
-            let identity = borg_provider::provider::CodexModelProvider::account_identity().await?;
+            let identity = borg_provider::provider::CodexModelProvider::account_identity_from(
+                self.codex_auth_file.clone(),
+            )
+            .await?;
             store
                 .record_model_access(access.session_id, provider, &identity)
                 .await?;
             let scoped = Self {
                 model_client: Arc::new(ProviderModelClient {
                     codex_account: Some(identity),
+                    #[cfg(feature = "subscription-adapters")]
+                    codex_auth_file: self.codex_auth_file.clone(),
                     ..ProviderModelClient::default()
                 }),
                 ..self.clone()
@@ -302,6 +332,8 @@ impl NativeHarness {
                 configured_model_gateways: Default::default(),
                 #[cfg(feature = "subscription-adapters")]
                 codex_account: None,
+                #[cfg(feature = "subscription-adapters")]
+                codex_auth_file: None,
             }),
             ..self.clone()
         })
@@ -1409,6 +1441,10 @@ struct ProviderModelClient {
     configured_model_gateways: std::collections::BTreeMap<String, ModelGateway>,
     #[cfg(feature = "subscription-adapters")]
     codex_account: Option<String>,
+    /// Controller-restored per-session ChatGPT auth file. `None` uses the
+    /// host-local selection.
+    #[cfg(feature = "subscription-adapters")]
+    codex_auth_file: Option<std::path::PathBuf>,
 }
 
 /// The route one request takes to a provider.
@@ -1522,7 +1558,12 @@ impl NativeModelClient for ProviderModelClient {
                         .unwrap_or(borg_provider::codex_default_effort())
                         .to_string(),
                 }
-                .model_turn_for_account(request, progress, account)
+                .model_turn_for_account_with_auth(
+                    request,
+                    progress,
+                    account,
+                    self.codex_auth_file.clone(),
+                )
                 .await;
             }
             NativeRoute::ChatCompletions { profile, gateway } => (profile, gateway),
@@ -1673,7 +1714,12 @@ impl PromptCacheRefreshClient for ProviderModelClient {
                         .unwrap_or(borg_provider::codex_default_effort())
                         .to_string(),
                 }
-                .refresh_prompt_cache_for_account(request, account, refresh)
+                .refresh_prompt_cache_for_account_with_auth(
+                    request,
+                    account,
+                    refresh,
+                    self.codex_auth_file.clone(),
+                )
                 .await
             }
             // The OpenCode context-window resolution the real turn performs is
@@ -4350,6 +4396,7 @@ mod tests {
                     ..Default::default()
                 }],
                 runtime_mcp_context: Default::default(),
+            runtime_provider_context: None,
                 extension_skill_roots: Vec::new(),
                 extension_workflows: Vec::new(),
                 extension_api: Default::default(),
@@ -5602,6 +5649,7 @@ mod tests {
             ),
             external_mcp_servers: Vec::new(),
             runtime_mcp_context: Default::default(),
+            runtime_provider_context: None,
             extension_skill_roots: Vec::new(),
             extension_workflows: Vec::new(),
             extension_api: Default::default(),
@@ -5909,6 +5957,7 @@ mod tests {
                 .with_watches(watches.clone()),
                 external_mcp_servers: Vec::new(),
                 runtime_mcp_context: Default::default(),
+            runtime_provider_context: None,
                 extension_skill_roots: Vec::new(),
                 extension_workflows: Vec::new(),
                 extension_api: Default::default(),
@@ -6143,6 +6192,7 @@ mod tests {
                 .with_watches(watches.clone()),
                 external_mcp_servers: Vec::new(),
                 runtime_mcp_context: Default::default(),
+            runtime_provider_context: None,
                 extension_skill_roots: Vec::new(),
                 extension_workflows: Vec::new(),
                 extension_api: Default::default(),
@@ -6597,6 +6647,7 @@ mod tests {
                 ),
                 external_mcp_servers: Vec::new(),
                 runtime_mcp_context: Default::default(),
+            runtime_provider_context: None,
                 extension_skill_roots: Vec::new(),
                 extension_workflows: Vec::new(),
                 extension_api: Default::default(),

@@ -2998,6 +2998,10 @@ async fn run_agent_session_store_kernel_inner(
                                         agent_tools: dispatcher.clone(),
                                         external_mcp_servers: runtime_mcp_servers.clone(),
                                         runtime_mcp_context: runtime_mcp_context.clone(),
+                                        runtime_provider_context: launch
+                                            .capabilities
+                                            .runtime_provider_context
+                                            .clone(),
                                         extension_skill_roots: launch.extension_skill_roots.clone(),
                                         extension_workflows: Vec::new(),
                                         extension_api: crate::ExtensionApiSnapshot::default(),
@@ -4014,6 +4018,7 @@ async fn run_agent_session_store_kernel_inner(
             agent_tools: dispatcher.clone(),
             external_mcp_servers: runtime_mcp_servers.clone(),
             runtime_mcp_context: runtime_mcp_context.clone(),
+            runtime_provider_context: launch.capabilities.runtime_provider_context.clone(),
             extension_skill_roots: launch.extension_skill_roots.clone(),
             extension_workflows: Vec::new(),
             extension_api: crate::ExtensionApiSnapshot::default(),
@@ -6911,6 +6916,7 @@ async fn run_retained_compaction(
                 .runtime_mcp_context
                 .clone()
                 .unwrap_or_default(),
+            runtime_provider_context: launch.capabilities.runtime_provider_context.clone(),
             extension_skill_roots: Vec::new(),
             extension_workflows: Vec::new(),
             extension_api: crate::ExtensionApiSnapshot::default(),
