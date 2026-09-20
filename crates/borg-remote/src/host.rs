@@ -9342,6 +9342,12 @@ mod tests {
             .execute(store.pool())
             .await
             .unwrap();
+        // The dropped table only comes back if the database also stops
+        // claiming this schema is already applied.
+        sqlx::query("update borg_session_schema set definition_hash = null")
+            .execute(store.pool())
+            .await
+            .unwrap();
         drop(store);
         let store: Arc<dyn SessionStore> = Arc::new(
             PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
@@ -11537,6 +11543,12 @@ connection: close
             .execute(store.pool())
             .await
             .unwrap();
+        // The dropped table only comes back if the database also stops
+        // claiming this schema is already applied.
+        sqlx::query("update borg_session_schema set definition_hash = null")
+            .execute(store.pool())
+            .await
+            .unwrap();
         drop(store);
         let store: Arc<dyn SessionStore> = Arc::new(
             PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
@@ -12674,6 +12686,15 @@ connection: close
             .await
             .unwrap();
         sqlx::query("drop table host_bootstraps")
+            .execute(store.pool())
+            .await
+            .unwrap();
+        // Part of the simulation, not a workaround: a database that predates
+        // this schema has not recorded it either. `ensure_schema` returns
+        // early when the stored fingerprint matches the current one, so
+        // dropping a table alone leaves a database that still claims to be
+        // current and therefore never acquires the table back.
+        sqlx::query("update borg_session_schema set definition_hash = null")
             .execute(store.pool())
             .await
             .unwrap();
