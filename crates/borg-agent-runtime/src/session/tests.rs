@@ -11136,8 +11136,13 @@ fn a_clean_compaction_boundary_bounds_context_without_changing_replay() {
         "the bounded generation must rebuild the same conversation"
     );
 
-    let mut failed: Vec<SessionEvent> =
-        turn(Uuid::new_v4(), "owed to the model", Some("turn interrupted"), 1).into();
+    let mut failed: Vec<SessionEvent> = turn(
+        Uuid::new_v4(),
+        "owed to the model",
+        Some("turn interrupted"),
+        1,
+    )
+    .into();
     bound_context_at_compaction(&mut failed, &boundary);
     assert_eq!(failed.len(), 3, "a failed boundary keeps its carry");
 }

@@ -282,7 +282,9 @@ impl CodingProvider {
             Self::OpenCode => "opencode",
             Self::Grok => "grok",
             Self::Muse => "muse",
-            Self::Kimi | Self::Glm | Self::Qwen | Self::OpenRouter | Self::OpenAiCompatible => "borg",
+            Self::Kimi | Self::Glm | Self::Qwen | Self::OpenRouter | Self::OpenAiCompatible => {
+                "borg"
+            }
         }
     }
 

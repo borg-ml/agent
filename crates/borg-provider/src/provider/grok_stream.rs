@@ -67,7 +67,12 @@ async fn run(
     // A background updater would rewrite the binary mid-turn and is pointless
     // in a supervised process.
     command.arg("--no-auto-update");
-    if let Some(model) = request.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+    if let Some(model) = request
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
         command.arg("-m").arg(model);
     }
     if permission == LocalAgentPermission::FullAccess {
@@ -90,10 +95,7 @@ async fn run(
         .arg("streaming-json");
 
     let mut child = command.spawn().context("failed to start Grok Build")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("Grok Build stdout missing")?;
+    let stdout = child.stdout.take().context("Grok Build stdout missing")?;
     let stderr = child.stderr.take();
     // Drain stderr concurrently: a full pipe would deadlock the child.
     let stderr_task = tokio::spawn(async move {
@@ -204,7 +206,10 @@ async fn run(
         }
     }
 
-    let status = child.wait().await.context("failed to wait for Grok Build")?;
+    let status = child
+        .wait()
+        .await
+        .context("failed to wait for Grok Build")?;
     let stderr = stderr_task.await.unwrap_or_default();
     if !status.success() && text.trim().is_empty() {
         let detail = stderr.trim();
@@ -388,9 +393,7 @@ mod tests {
             Some(GrokEvent::Thought("hmm".to_string()))
         );
         assert_eq!(
-            parse_stream_line(
-                r#"{"type":"end","stopReason":"EndTurn","sessionId":"s-1"}"#
-            ),
+            parse_stream_line(r#"{"type":"end","stopReason":"EndTurn","sessionId":"s-1"}"#),
             Some(GrokEvent::End {
                 session_id: Some("s-1".to_string()),
                 usage: None,
@@ -457,6 +460,9 @@ mod tests {
         assert_eq!(usage.total_tokens, 17);
 
         let mut empty = ProviderCallUsage::default();
-        assert!(!apply_usage(&mut empty, &serde_json::json!({"note": "none"})));
+        assert!(!apply_usage(
+            &mut empty,
+            &serde_json::json!({"note": "none"})
+        ));
     }
 }

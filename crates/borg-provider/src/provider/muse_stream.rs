@@ -75,7 +75,12 @@ async fn run(
         .arg("--json")
         .arg("--session-id")
         .arg(&session_id);
-    if let Some(model) = request.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+    if let Some(model) = request
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
         command.arg("--model").arg(model);
     }
     match permission {
@@ -122,11 +127,7 @@ async fn run(
         match event {
             MuseEvent::Delta(chunk) => {
                 text.push_str(&chunk);
-                if events
-                    .send(ChatStreamEvent::Delta(chunk))
-                    .await
-                    .is_err()
-                {
+                if events.send(ChatStreamEvent::Delta(chunk)).await.is_err() {
                     let _ = child.kill().await;
                     return Ok(());
                 }
@@ -194,7 +195,9 @@ async fn run(
 
     let status = child.wait().await.context("failed to wait for Muse Code")?;
     let stderr = stderr_task.await.unwrap_or_default();
-    let failed = terminal.as_deref().is_some_and(|state| state != "completed")
+    let failed = terminal
+        .as_deref()
+        .is_some_and(|state| state != "completed")
         || (!status.success() && text.trim().is_empty());
     if failed {
         let detail = reason
@@ -283,7 +286,10 @@ fn parse_muse_line(line: &str) -> Option<MuseEvent> {
             .or_else(|| payload.get("kind").and_then(Value::as_str))
             .unwrap_or("tool")
             .to_string();
-        let text = payload.get("text").and_then(Value::as_str).unwrap_or_default();
+        let text = payload
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let failed = matches!(
             payload
                 .pointer("/correlation_facts/outcome")

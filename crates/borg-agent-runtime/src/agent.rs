@@ -9,8 +9,8 @@ use borg_provider::provider::{
     ChatApprovalDecision, ChatStreamControl, ChatStreamEvent, ChatStreamRequest,
     ClaudeSubscriptionPool, LocalAgentPermission, ProviderStreamError, SteerAdmission,
     run_claude_chat_stream_with_control, run_claude_local_chat_stream,
-    run_claude_local_chat_stream_pooled, run_grok_local_chat_stream,
-    run_muse_local_chat_stream, run_opencode_local_chat_stream,
+    run_claude_local_chat_stream_pooled, run_grok_local_chat_stream, run_muse_local_chat_stream,
+    run_opencode_local_chat_stream,
 };
 use borg_provider::{ProviderCallUsage, ProviderChannel};
 use serde_json::Value;

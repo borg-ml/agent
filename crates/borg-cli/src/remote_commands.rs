@@ -7557,7 +7557,8 @@ fn coding_plan_for(provider: CodingProvider) -> Option<borg_provider::Plan> {
 }
 
 /// One line telling a user how a provider gets its credentials.
-fn credential_guidance(provider: CodingProvider) -> &'static str {    match provider {
+fn credential_guidance(provider: CodingProvider) -> &'static str {
+    match provider {
         CodingProvider::Codex => {
             "`borg login codex` (ChatGPT) or `borg login codex --api-key` (API billing); /login switches saved credentials"
         }
