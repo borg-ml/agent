@@ -9,9 +9,9 @@
 //! durable records that the declarations moved.
 //!
 //! So: an immutable base per context generation, typed ordered deltas against
-//! it, and a fold to current state plus at most [`MAX_REPLAYED_DELTAS`]
-//! positional markers. The bound is the point. Without it a long session
-//! carries one marker per turn, which is a log rather than a replay contract.
+//! it, and a fold back to the effective declarations when a session resumes.
+//! That fold is the contract -- a resumed or forked turn has to hold the same
+//! declarations a turn that never restarted would.
 //!
 //! What this record is NOT: a replayable copy of historical tool definitions.
 //! [`ToolDecl`] keeps a digest instead of the input schema, so an earlier
@@ -25,13 +25,14 @@
 //! with the live dispatcher.
 //!
 //! Transport, measured from the encoders rather than assumed: a
-//! chat-completions route keeps `System` in conversation position; the Codex
-//! Responses encoder collects every `System` into one `instructions` field
-//! regardless of position; subscription lanes take `system_prompt` as a scalar
-//! field. No lane accepts a tool-declaration delta, because `tools` is one
-//! flat array per request everywhere. Lanes that cannot carry a change in
-//! position use [`DeclarationTransport::Collapsed`] and make no
-//! cache-preservation claim.
+//! chat-completions route keeps `System` in conversation position, so the
+//! harness can hold that head immutable and deliver the varying slots as
+//! trailing context. The Codex Responses encoder collects every `System` into
+//! one `instructions` field regardless of position, and subscription lanes
+//! take `system_prompt` as a scalar field; those rewrite the head whatever the
+//! caller does, so they use [`DeclarationTransport::Collapsed`] and make no
+//! cache-preservation claim. No lane accepts a tool-declaration delta, because
+//! `tools` is one flat array per request everywhere.
 
 use std::collections::BTreeMap;
 
@@ -45,11 +46,6 @@ use crate::{CodingProvider, SessionEventKind};
 
 pub(crate) const DECLARATION_BASE_EVENT: &str = "native_declaration_base";
 pub(crate) const DECLARATION_DELTA_EVENT: &str = "native_declaration_delta";
-
-/// How many declaration changes keep a positional marker in the replayed
-/// conversation. Older changes are folded into the base instead, so replay
-/// stays bounded no matter how long the session runs.
-pub(crate) const MAX_REPLAYED_DELTAS: usize = 8;
 
 /// The parts of the leading instructions that can change mid-conversation.
 ///
@@ -254,28 +250,6 @@ impl DeclarationTransport {
     }
 }
 
-/// The bounded result of replaying a base and its recorded changes.
-pub(crate) struct ReplayPlan<'a> {
-    /// Declarations in force now, for lanes that must collapse to current.
-    pub effective: Declarations,
-    /// The most recent changes, oldest first, capped at [`MAX_REPLAYED_DELTAS`].
-    pub markers: &'a [DeclarationDelta],
-}
-
-/// Fold a base and its ordered changes into current state plus a bounded tail
-/// of positional markers.
-pub(crate) fn plan_replay<'a>(
-    base: &Declarations,
-    deltas: &'a [DeclarationDelta],
-) -> ReplayPlan<'a> {
-    let mut effective = base.clone();
-    for delta in deltas {
-        effective.apply(delta);
-    }
-    let markers = &deltas[deltas.len().saturating_sub(MAX_REPLAYED_DELTAS)..];
-    ReplayPlan { effective, markers }
-}
-
 /// Journal one turn's contribution, base or delta, under the matching kind.
 pub(crate) async fn record_declaration_change(
     events: &mpsc::Sender<SessionEventKind>,
@@ -366,27 +340,12 @@ mod tests {
                 .expect("the server outage changed something"),
         ];
 
-        assert_eq!(plan_replay(&base, &deltas).effective, after_mcp);
-    }
-
-    /// Without a bound this is a log, not a replay contract: one marker per
-    /// turn means the request grows for as long as the session runs. A session
-    /// that changes its declarations far more often than the bound must still
-    /// replay a bounded number of markers, and must still end at the correct
-    /// effective state.
-    #[test]
-    fn a_long_run_of_changes_still_replays_a_bounded_number_of_markers() {
-        let base = Declarations::capture(skills("start"), &[]);
-        let mut previous = base.clone();
-        let mut deltas = Vec::new();
-        for turn in 0..MAX_REPLAYED_DELTAS * 5 {
-            let current = Declarations::capture(skills(&format!("skill set {turn}")), &[]);
-            deltas.push(current.diff(&previous).expect("each turn changed the slot"));
-            previous = current;
+        // Folded exactly as `native_declarations` folds a journal: apply each
+        // recorded delta to the base in order.
+        let mut replayed = base.clone();
+        for delta in &deltas {
+            replayed.apply(delta);
         }
-
-        let plan = plan_replay(&base, &deltas);
-        assert_eq!(plan.markers.len(), MAX_REPLAYED_DELTAS);
-        assert_eq!(plan.effective, previous);
+        assert_eq!(replayed, after_mcp);
     }
 }
