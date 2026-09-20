@@ -29,8 +29,8 @@ runs:
         )
         if ($install.ExitCode -ne 0) {
           if (Test-Path $trace) {
-            $readableTrace = (Get-Content $trace -Raw) -replace "(?s)<dump>.*?</dump>", "<dump omitted>"
-            $readableTrace -split "`n" | Select-Object -Last 200
+            $readableTrace = (Get-Content $trace -Raw) -replace "(?s)<(?:context|dump)>.*?</(?:context|dump)>", "<dump omitted>"
+            $readableTrace -split "`n" | Select-Object -First 200
           }
           Get-ChildItem $env:TEMP -Filter "install-postgresql*.log" | ForEach-Object {
             Write-Output "Installer log: $($_.FullName)"
@@ -40,3 +40,9 @@ runs:
         }
         & "$prefix/bin/pg_isready.exe" -h 127.0.0.1 -p 5432 -U postgres
         if ($LASTEXITCODE -ne 0) { throw "Test Postgres is not ready" }
+    - name: Preserve Windows ARM installer diagnostics
+      if: failure() && runner.os == 'Windows' && runner.arch == 'ARM64'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: windows-arm-postgres-installer
+        path: ${{ runner.temp }}/postgres-installer.log
