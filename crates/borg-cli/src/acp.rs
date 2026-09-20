@@ -561,6 +561,11 @@ impl AcpRuntime {
         };
         let actor_session_root = self.sessions_dir.clone();
         let actor_store = Arc::clone(&self.store);
+        // Only the context policy. An ACP session keeps the default
+        // capabilities it has always had; compaction and warming are numbers,
+        // not permissions, and ignoring them runs the turn on budgets the
+        // operator replaced.
+        let context_settings = self.config.native_context_settings()?;
         tokio::spawn(async move {
             if let Err(error) = run_agent_session_with_store_and_writer(
                 &actor_session_root,
@@ -568,7 +573,7 @@ impl AcpRuntime {
                 launch,
                 command_rx,
                 event_tx,
-                Arc::new(LocalAgentTurnExecutor::default()),
+                Arc::new(LocalAgentTurnExecutor::with_settings(context_settings)),
                 actor_store,
                 writer,
             )
@@ -634,6 +639,11 @@ impl AcpRuntime {
         };
         let actor_session_root = self.sessions_dir.clone();
         let actor_store = Arc::clone(&self.store);
+        // Only the context policy. An ACP session keeps the default
+        // capabilities it has always had; compaction and warming are numbers,
+        // not permissions, and ignoring them runs the turn on budgets the
+        // operator replaced.
+        let context_settings = self.config.native_context_settings()?;
         tokio::spawn(async move {
             if let Err(error) = run_agent_session_with_store_and_writer(
                 &actor_session_root,
@@ -641,7 +651,7 @@ impl AcpRuntime {
                 launch,
                 command_rx,
                 event_tx,
-                Arc::new(LocalAgentTurnExecutor::default()),
+                Arc::new(LocalAgentTurnExecutor::with_settings(context_settings)),
                 actor_store,
                 writer,
             )

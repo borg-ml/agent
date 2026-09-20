@@ -859,6 +859,24 @@ impl AgentConfig {
         })
     }
 
+    /// Only the context policy: how compaction is sized and how the prompt
+    /// cache is kept warm.
+    ///
+    /// Deliberately not [`Self::local_agent_settings`]. A caller that runs a
+    /// session on default capabilities must keep doing exactly that, so the
+    /// harness mode, the approval reviewer, and the configured gateways stay
+    /// at their defaults here. These two are different in kind: they are not
+    /// capability or credential decisions, they are the numbers a turn is
+    /// measured against, and a session that ignores them silently runs on
+    /// values the operator already replaced.
+    pub(crate) fn native_context_settings(&self) -> Result<borg_remote::LocalAgentSettings> {
+        Ok(borg_remote::LocalAgentSettings {
+            compaction: self.compaction_budget_policy()?,
+            warming: self.warming.mode,
+            ..Default::default()
+        })
+    }
+
     /// The validated per-model compaction budgets. An empty policy resolves
     /// every model to the percentage defaults.
     pub(crate) fn compaction_budget_policy(&self) -> Result<CompactionBudgetPolicy> {
@@ -1271,6 +1289,76 @@ keep_recent_tokens = 250000
             .resolve("claude", "claude-sonnet-5", WINDOW);
         assert_eq!(untouched.reserve_tokens, defaults.reserve_tokens);
         assert_eq!(untouched.keep_recent_tokens, defaults.keep_recent_tokens);
+    }
+
+    /// ACP deliberately runs a session on default capabilities. The tempting
+    /// cleanup is to make the narrow builder delegate to the full one: it
+    /// compiles, it reads like deduplication, and it quietly hands every ACP
+    /// session the harness mode, the approval reviewer, and the configured
+    /// gateways -- endpoints and credentials included -- out of the operator's
+    /// file. Nothing about that failure is visible in a diff. So this pins the
+    /// narrowness itself: the two context numbers cross, and nothing else does.
+    #[test]
+    fn context_settings_carry_the_budget_and_leave_capabilities_alone() {
+        let config: AgentConfig = toml::from_str(
+            r#"
+[capabilities]
+harness = "native"
+
+[approvals]
+reviewer_model = "openai/gpt-5-mini"
+
+[warming]
+mode = "idle"
+
+[compaction.budgets."claude/claude-opus-5"]
+reserve_tokens = 40000
+
+[providers.acme]
+base_url = "https://acme.example/v1"
+
+[providers.acme.models.fast]
+"#,
+        )
+        .expect("config parses");
+        config.validate().expect("config is valid");
+
+        let defaults = borg_remote::LocalAgentSettings::default();
+        let narrow = config
+            .native_context_settings()
+            .expect("narrow settings build");
+
+        // The two that are supposed to cross.
+        assert_eq!(narrow.warming, CacheWarmingMode::Idle);
+        assert_eq!(
+            narrow
+                .compaction
+                .resolve("claude", "claude-opus-5", 1_000_000)
+                .reserve_tokens,
+            40_000
+        );
+
+        // Everything an ACP session had already decided stays where it was.
+        assert_eq!(narrow.harness, defaults.harness);
+        assert_eq!(
+            narrow.approval_reviewer_model,
+            defaults.approval_reviewer_model
+        );
+        assert_eq!(
+            narrow.approval_reviewer_effort,
+            defaults.approval_reviewer_effort
+        );
+        assert!(narrow.configured_model_gateways.is_empty());
+
+        // The full builder does carry them, so the narrowing is a decision and
+        // not an accident of a config that happened to be empty.
+        let full = config.local_agent_settings().expect("full settings build");
+        assert_ne!(full.harness, defaults.harness);
+        assert_eq!(
+            full.approval_reviewer_model.as_deref(),
+            Some("openai/gpt-5-mini")
+        );
+        assert!(full.configured_model_gateways.contains_key("acme/fast"));
     }
 
     /// `[warming] mode` has to arrive in the payload the harness reads, or the
