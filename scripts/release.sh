@@ -88,7 +88,7 @@ replace_workspace_version() {
   local current="$1"
   local target="$2"
   local manifest_tmp
-  manifest_tmp="$(mktemp "${TMPDIR:-/tmp}/borg-release-manifest.XXXXXX")"
+  manifest_tmp="$(mktemp "$repo_root/.borg-release-manifest-new.XXXXXX")"
 
   if ! awk -v current="$current" -v target="$target" '
     /^\[workspace\.package\][[:space:]]*$/ {
@@ -189,6 +189,39 @@ prebumped_release_commit() {
   return 1
 }
 
+require_disk_space() {
+  local minimum_kib="$1" path available
+  for path in "$repo_root" "${CARGO_TARGET_DIR:-$repo_root/target}" "${TMPDIR:-/tmp}"; do
+    while [[ ! -d "$path" ]]; do path="$(dirname "$path")"; done
+    available="$(df -Pk "$path" | awk "NR == 2 {print \$4}")"
+    if [[ ! "$available" =~ ^[0-9]+$ ]] || ((available < minimum_kib)); then
+      die "insufficient free space at $path: need at least $((minimum_kib / 1024 / 1024)) GiB; release stopped to protect session storage"
+    fi
+  done
+}
+
+run_build() (
+  # A separate job process group lets us stop Cargo and its compiler children.
+  set -m
+  "$@" &
+  build_pid=$!
+  stop_build() {
+    if kill -TERM -- "-$build_pid" 2>/dev/null; then
+      sleep 1
+      kill -KILL -- "-$build_pid" 2>/dev/null || true
+    fi
+    wait "$build_pid" 2>/dev/null || true
+  }
+  trap stop_build EXIT
+  trap "exit 130" INT
+  trap "exit 143" TERM
+  while kill -0 "$build_pid" 2>/dev/null; do
+    require_disk_space 5242880
+    sleep 1
+  done
+  wait "$build_pid"
+)
+
 # Never inherit the interactive session journal as a release test database.
 prepare_test_environment() {
   if [[ -n "$(printf "%s" "${BORG_TEST_SESSIONS_URL:-}" | tr -d "[:space:]")" ]]; then
@@ -258,7 +291,7 @@ run_release_checks() (
   test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/b.XXXXXX")"
   trap 'rm -rf -- "$test_tmp"' EXIT
   cargo fmt --all -- --check
-  TMPDIR="$test_tmp" cargo test --workspace --exclude borg-gui --locked -- --test-threads=1
+  TMPDIR="$test_tmp" run_build cargo test --workspace --exclude borg-gui --locked -- --test-threads=1
   git diff --check -- Cargo.toml Cargo.lock
 )
 
@@ -310,6 +343,8 @@ if [[ "$mode" == "verify-tag" ]]; then
   exit 0
 fi
 
+require_disk_space 20971520
+export CARGO_INCREMENTAL=0
 prepare_test_environment "${release_args[@]}"
 
 requested_version="${1:-}"
@@ -424,8 +459,8 @@ if [[ "$recovered" -eq 1 ]]; then
   exit 0
 fi
 
-manifest_backup="$(mktemp "${TMPDIR:-/tmp}/borg-release-cargo-toml.XXXXXX")"
-lock_backup="$(mktemp "${TMPDIR:-/tmp}/borg-release-cargo-lock.XXXXXX")"
+manifest_backup="$(mktemp "$repo_root/.borg-release-cargo-toml.XXXXXX")"
+lock_backup="$(mktemp "$repo_root/.borg-release-cargo-lock.XXXXXX")"
 cp Cargo.toml "$manifest_backup"
 cp Cargo.lock "$lock_backup"
 committed=0
@@ -434,8 +469,8 @@ cleanup() {
   local status="$?"
   trap - EXIT
   if [[ "$status" -ne 0 && "$committed" -eq 0 ]]; then
-    cp "$manifest_backup" Cargo.toml
-    cp "$lock_backup" Cargo.lock
+    mv -f -- "$manifest_backup" Cargo.toml
+    mv -f -- "$lock_backup" Cargo.lock
     echo "release: restored Cargo.toml and Cargo.lock after failure" >&2
   elif [[ "$status" -ne 0 ]]; then
     echo "release: the release commit was retained; inspect it before retrying the atomic push" >&2
@@ -448,7 +483,7 @@ trap cleanup EXIT
 replace_workspace_version "$current_version" "$target_version"
 
 # Refresh workspace package versions in Cargo.lock before enforcing --locked.
-cargo check --workspace --exclude borg-gui --all-targets
+run_build cargo check --workspace --exclude borg-gui --all-targets
 
 changed_files=()
 while IFS= read -r changed_file; do

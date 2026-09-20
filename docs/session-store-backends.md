@@ -211,7 +211,15 @@ database it never touched:
 
 `just release`, `just release-minor`, and `just release-check` automatically
 start an isolated temporary PostgreSQL server and stop/remove it afterward,
-including on failure. They use locally installed `initdb` and `pg_ctl` (also
+including on failure. Releases require at least 20 GiB free on the checkout,
+build-output, and temporary filesystems before starting. Builds disable Cargo
+incremental caching and stop their own process group if available space falls
+below a 5 GiB reserve. Manifest backups live beside the originals and rollback
+uses rename, avoiding an in-place copy that could truncate a manifest on a full
+disk. These guards reduce release-induced disk exhaustion; they cannot reserve
+space against unrelated writers or replace filesystem quotas.
+
+They use locally installed `initdb` and `pg_ctl` (also
 discovered through `pg_config`), so no database URL setup is needed. An explicit
 `BORG_TEST_SESSIONS_URL` opts into an existing disposable server; release tests
 always set `BORG_SESSIONS_URL` to that same test URL, never the inherited

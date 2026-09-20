@@ -208,6 +208,27 @@ make_fixture() {
 
 fake_bin="$test_root/bin"
 mkdir -p "$fake_bin"
+REAL_CP="$(command -v cp)"
+export REAL_CP
+cat >"$fake_bin/cp" <<"FAKE_CP"
+#!/usr/bin/env bash
+# Simulate ENOSPC truncating an in-place rollback destination.
+if [[ "${FAKE_CARGO_FAIL:-}" == test && ( "${!#}" == Cargo.toml || "${!#}" == Cargo.lock ) ]]; then
+  : >"${!#}"
+  exit 1
+fi
+exec "$REAL_CP" "$@"
+FAKE_CP
+chmod +x "$fake_bin/cp"
+
+cat >"$fake_bin/df" <<"FAKE_DF"
+#!/usr/bin/env bash
+available="${FAKE_DF_AVAILABLE_KB:-999999999}"
+if [[ -n "${FAKE_DISK_TRIGGER:-}" && -e "$FAKE_DISK_TRIGGER" ]]; then available=1; fi
+printf "%s\n" "Filesystem 1024-blocks Used Available Capacity Mounted" "fixture 999999999 1 $available 1% /"
+FAKE_DF
+chmod +x "$fake_bin/df"
+
 {
   echo '#!/usr/bin/env bash'
   echo 'set -euo pipefail'
@@ -216,6 +237,12 @@ mkdir -p "$fake_bin"
   echo 'case "${1:-}" in'
   echo '  check)'
   cat <<'FAKE_CARGO'
+    if [[ -n "${FAKE_DISK_TRIGGER:-}" ]]; then
+      touch "$FAKE_DISK_TRIGGER"
+      sleep 30 &
+      echo "$!" >"$FAKE_DISK_TRIGGER.pid"
+      wait
+    fi
     version="$(
       awk '
         /^\[workspace\.package\]$/ {
@@ -441,6 +468,38 @@ if git -C "$rollback_fixture" rev-parse --verify 'refs/tags/v1.2.4^{commit}' \
   >/dev/null 2>&1; then
   fail "failed release created a tag"
 fi
+
+# Refuse low headroom before mutation, and stop compiler descendants when the
+# disk crosses the runtime reserve. Both paths must leave manifests intact.
+for disk_phase in preflight build; do
+  disk_fixture="$(make_fixture "disk-$disk_phase")"
+  disk_log="$test_root/disk-$disk_phase-cargo.log"
+  trigger="$test_root/disk-$disk_phase-trigger"
+  before="$SECONDS"
+  if (
+    cd "$disk_fixture"
+    export PATH="$fake_bin:$PATH" FAKE_CARGO_LOG="$disk_log"
+    export BORG_TEST_SESSIONS_URL="$FIXTURE_SESSIONS_URL"
+    if [[ "$disk_phase" == preflight ]]; then
+      export FAKE_DF_AVAILABLE_KB=1
+    else
+      export FAKE_DISK_TRIGGER="$trigger"
+    fi
+    ./scripts/release.sh
+  ) >"$test_root/disk-$disk_phase.log" 2>&1; then
+    fail "release ignored $disk_phase disk exhaustion"
+  fi
+  ((SECONDS - before < 10)) || fail "low-space cancellation waited for the build"
+  git -C "$disk_fixture" diff --exit-code -- Cargo.toml Cargo.lock || fail "low-space rollback changed manifests"
+  [[ -z "$(git -C "$disk_fixture" status --porcelain)" ]] || fail "low-space release left temporary files"
+  if [[ "$disk_phase" == preflight ]]; then
+    [[ ! -s "$disk_log" ]] || fail "low-space preflight reached Cargo"
+  else
+    child="$(cat "$trigger.pid")"
+    child_state="$(ps -o stat= -p "$child" || true)"
+    [[ -z "$child_state" || "$child_state" == *Z* ]] || fail "compiler descendant survived disk guard"
+  fi
+done
 
 # Automatic provisioning must never reuse an inherited production journal,
 # must preserve patch/minor arguments, and must clean up even on test failure.
