@@ -4859,6 +4859,148 @@ async fn an_unresponsive_cleanup_answers_escape_on_a_human_bound() {
     scratch.discard().await;
 }
 
+/// Queue batching, end to end over the queue itself.
+///
+/// Failure mode this pins: with an active goal the actor admits one queued
+/// prompt per model turn, so a backlog of team notifications is serviced one
+/// note per provider turn. A 419-note backlog measured 191 system turns against
+/// 16 human ones, with notes waiting hours. Nothing was lost or duplicated --
+/// it is a service rate problem.
+///
+/// One test rather than a fixture per property, because the properties are only
+/// meaningful together: batching is worthless if it drops a note, and dangerous
+/// if it borrows human priority or swallows a class it should not.
+#[test]
+fn queued_team_notifications_batch_without_borrowing_priority_or_losing_members() {
+    fn note(text: &str, attachment: &str) -> QueuedPrompt {
+        QueuedPrompt {
+            message_id: Uuid::new_v4(),
+            text: text.into(),
+            actor: EventActor::System,
+            attachments: vec![std::path::PathBuf::from(attachment)],
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+            visible: true,
+            interrupt_batch: false,
+            batch: Vec::new(),
+        }
+    }
+
+    let human = QueuedPrompt {
+        actor: EventActor::User,
+        ..note("a person is talking", "human.png")
+    };
+    let watcher_steer = QueuedPrompt {
+        delivery: PromptDelivery::Steer,
+        ..note("watcher output", "watch.png")
+    };
+    // Autonomy prompts and goal continuations are System but not visible.
+    let autonomy = QueuedPrompt {
+        visible: false,
+        ..note("autonomy job", "job.png")
+    };
+    let continuation = note("usage limit continuation", "limit.png");
+    let notes: Vec<QueuedPrompt> = (0..40)
+        .map(|i| note(&format!("note {i}"), "note.png"))
+        .collect();
+    let note_ids: Vec<Uuid> = notes.iter().map(|prompt| prompt.message_id).collect();
+
+    let mut pending = VecDeque::new();
+    pending.push_back(human.clone());
+    pending.push_back(watcher_steer.clone());
+    pending.push_back(autonomy.clone());
+    pending.push_back(continuation.clone());
+    for prompt in notes {
+        pending.push_back(prompt);
+    }
+
+    let mut autonomy_ids = HashSet::new();
+    autonomy_ids.insert(autonomy.message_id);
+    coalesce_pending_team_notifications(&mut pending, &autonomy_ids, Some(continuation.message_id));
+
+    // The member cap bounds one turn: 32 of the 40 notes merge, 8 remain queued
+    // in order for the next turn. Nothing is expired.
+    let merged = pending
+        .iter()
+        .find(|prompt| prompt.batch.len() > 1)
+        .expect("the backlog batches");
+    assert_eq!(merged.batch.len(), TEAM_BATCH_MAX_MEMBERS);
+    assert_eq!(
+        merged
+            .batch
+            .iter()
+            .map(|entry| entry.message_id)
+            .collect::<Vec<_>>(),
+        note_ids[..TEAM_BATCH_MAX_MEMBERS].to_vec(),
+        "members settle in arrival order, so every note keeps its durable identity"
+    );
+    assert_eq!(
+        merged.attachments.len(),
+        TEAM_BATCH_MAX_MEMBERS,
+        "every member's attachments survive the merge"
+    );
+    for index in 0..TEAM_BATCH_MAX_MEMBERS {
+        assert!(merged.text.contains(&format!("note {index}")));
+    }
+
+    // The batch never borrows human standing.
+    assert_eq!(merged.actor, EventActor::System);
+    assert_eq!(merged.delivery, PromptDelivery::Queue);
+    assert!(!merged.interrupt_batch);
+
+    // Human priority is untouched: the person is still admitted first.
+    let admitted = pop_next_pending_prompt(&mut pending, true).expect("a prompt is admitted");
+    assert_eq!(admitted.message_id, human.message_id);
+
+    // Excluded classes kept their places rather than being absorbed.
+    for excluded in [&watcher_steer, &autonomy, &continuation] {
+        assert!(
+            pending
+                .iter()
+                .any(|prompt| prompt.message_id == excluded.message_id && prompt.batch.is_empty()),
+            "an excluded prompt must stay queued on its own"
+        );
+    }
+    let remaining = pending
+        .iter()
+        .filter(|prompt| note_ids[TEAM_BATCH_MAX_MEMBERS..].contains(&prompt.message_id))
+        .count();
+    assert_eq!(remaining, note_ids.len() - TEAM_BATCH_MAX_MEMBERS);
+
+    // A note too large for the byte cap still progresses instead of starving.
+    let mut oversized = VecDeque::new();
+    let huge = note(&"x".repeat(TEAM_BATCH_MAX_TEXT_BYTES + 1), "huge.png");
+    let huge_id = huge.message_id;
+    oversized.push_back(huge);
+    oversized.push_back(note("small", "small.png"));
+    coalesce_pending_team_notifications(&mut oversized, &HashSet::new(), None);
+    let first = oversized
+        .front()
+        .expect("the oversized note is still queued");
+    assert_eq!(first.message_id, huge_id);
+    assert!(
+        first.batch.is_empty(),
+        "an oversized note is admitted alone rather than dragging another in"
+    );
+
+    // Re-running cannot grow an existing batch past the cap.
+    let before = pending.clone();
+    coalesce_pending_team_notifications(&mut pending, &autonomy_ids, Some(continuation.message_id));
+    let rebatched = pending
+        .iter()
+        .find(|prompt| prompt.batch.len() > 1)
+        .expect("the batch survives");
+    assert!(
+        rebatched.batch.len() <= TEAM_BATCH_MAX_MEMBERS,
+        "counting members across an existing batch keeps re-entry bounded"
+    );
+    assert_eq!(
+        before.len(),
+        pending.len(),
+        "re-entry neither drops nor invents prompts"
+    );
+}
+
 #[tokio::test]
 async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
     let root = tempdir().unwrap();
@@ -7385,7 +7527,9 @@ async fn resuming_an_idle_goal_emits_starting_before_running() {
         .send(HostCommand::Stop { session_id })
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), actor)
+    // Stopping settles goal time and records the stop, both journal writes, so
+    // the wait is bounded by Postgres rather than by the actor's own work.
+    tokio::time::timeout(Duration::from_secs(30), actor)
         .await
         .expect("session stops after the lifecycle assertion")
         .unwrap()
@@ -12604,7 +12748,12 @@ async fn interrupt_is_honoured_while_a_stalled_observer_backs_up_the_event_strea
     while sent.load(std::sync::atomic::Ordering::Relaxed) < SATURATION_EVENTS {
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(
-            saturate.elapsed() < Duration::from_secs(20),
+            // A guard on the loop, not the measurement. Every flooded event is
+            // journaled, so on Postgres reaching the saturation count is bound
+            // by database round trips rather than by the actor. The count is
+            // what keeps the run comparable; this only has to be long enough
+            // that a loaded database does not look like a hang.
+            saturate.elapsed() < Duration::from_secs(120),
             "the flood never reached {SATURATION_EVENTS} events"
         );
     }

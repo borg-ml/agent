@@ -781,8 +781,14 @@ impl RuntimeSessionStore {
 const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_millis(1_000);
 #[cfg(not(test))]
 const PROVIDER_SETUP_LIVENESS_TIMEOUT: Duration = Duration::from_secs(120);
+// Sized for a real database, not an in-memory one. The actor journals the turn
+// start and its prompt statuses before the provider can emit anything, so on
+// Postgres the AwaitingProvider phase legitimately spans several round trips.
+// At 200ms the watchdog terminalized healthy turns under load. Still far below
+// any budget a genuinely stalled provider would need, and distinct from the
+// Active budgets so a test cannot pass by conflating them.
 #[cfg(test)]
-const PROVIDER_SETUP_LIVENESS_TIMEOUT: Duration = Duration::from_millis(200);
+const PROVIDER_SETUP_LIVENESS_TIMEOUT: Duration = Duration::from_secs(3);
 /// Ceiling for an `Active` turn that is silent because a tool call is running.
 /// Long builds and test suites emit nothing for a long time, so they get a far
 /// larger budget than a silent model, still bounded so a tool that died with
@@ -2106,6 +2112,14 @@ async fn run_agent_session_store_kernel_inner(
         }
         let usage_limit_retry_waiting =
             retry_not_before.is_some_and(|deadline| deadline > Instant::now());
+        // Before admitting, fold any queued team notifications into one prompt.
+        // This runs ahead of `pop_next_pending_prompt`, which still prefers a
+        // human prompt, so batching can never take a turn from a person.
+        coalesce_pending_team_notifications(
+            &mut pending,
+            &autonomy_prompt_ids,
+            usage_limit_continuation_id,
+        );
         let next = if !usage_limit_retry_waiting
             && let Some(prompt) = pop_next_pending_prompt(
                 &mut pending,
@@ -7710,6 +7724,112 @@ fn watch_prompt(mut text: String, receiver: &mut mpsc::Receiver<String>) -> Queu
         interrupt_batch: false,
         batch: Vec::new(),
     }
+}
+
+/// How many team notifications one turn may absorb, and how much text they may
+/// carry. The member cap keeps a turn's growth bounded; the byte cap keeps a
+/// few large notes from producing an enormous prompt. Both are counted across
+/// an already-merged prompt's members, so re-running this cannot grow a batch
+/// past the cap one note at a time.
+const TEAM_BATCH_MAX_MEMBERS: usize = 32;
+const TEAM_BATCH_MAX_TEXT_BYTES: usize = 48 * 1024;
+
+/// Merge queued team notifications so a backlog costs turns proportional to its
+/// size rather than one turn per note.
+///
+/// With an active goal the actor admits one queued prompt per model turn, so a
+/// backlog of notes is serviced one at a time and each note costs a full
+/// provider turn. That is a service-rate problem, not a delivery problem: the
+/// notes arrive once and in order, they just wait. Merging an eligible run into
+/// one prompt keeps every member's identity, because `record_prompt_status`
+/// settles `batch_entries()` individually, so each note still gets its own
+/// journal record, acknowledgement and attachments.
+///
+/// Deliberately narrow. Only `System`, visible, `Queue`-delivery prompts are
+/// eligible, which is what a team notification is: autonomy prompts and goal
+/// continuations are `System` but not visible, and watcher steers, explicit
+/// wakes and follow-ups are `Steer`, so none of them can be absorbed. The
+/// usage-limit continuation is excluded by id. Nothing is expired or dropped --
+/// an ineligible note keeps its place, and a single note larger than the byte
+/// cap is still admitted on its own rather than being starved.
+fn coalesce_pending_team_notifications(
+    pending: &mut VecDeque<QueuedPrompt>,
+    autonomy_prompt_ids: &HashSet<Uuid>,
+    usage_limit_continuation_id: Option<Uuid>,
+) {
+    let eligible = |prompt: &QueuedPrompt| {
+        prompt.actor == EventActor::System
+            && prompt.visible
+            && prompt.delivery == PromptDelivery::Queue
+            && !autonomy_prompt_ids.contains(&prompt.message_id)
+            && Some(prompt.message_id) != usage_limit_continuation_id
+    };
+    let candidates: Vec<usize> = pending
+        .iter()
+        .enumerate()
+        .filter(|(_, prompt)| eligible(prompt))
+        .map(|(index, _)| index)
+        .collect();
+    if candidates.len() < 2 {
+        return;
+    }
+    // The first candidate is always taken, whatever its size: a note too large
+    // for the byte cap must still make progress on its own.
+    let mut members = 0usize;
+    let mut bytes = 0usize;
+    let mut take = Vec::new();
+    for &index in &candidates {
+        let prompt = &pending[index];
+        let prompt_members = prompt.batch_entries().len();
+        let prompt_bytes = prompt.text.len();
+        if !take.is_empty()
+            && (members + prompt_members > TEAM_BATCH_MAX_MEMBERS
+                || bytes + prompt_bytes > TEAM_BATCH_MAX_TEXT_BYTES)
+        {
+            break;
+        }
+        members += prompt_members;
+        bytes += prompt_bytes;
+        take.push(index);
+    }
+    if take.len() < 2 {
+        return;
+    }
+    let first = take[0];
+    let mut merged: Vec<QueuedPrompt> = Vec::with_capacity(take.len());
+    for &index in take.iter().rev() {
+        merged.push(pending.remove(index).expect("candidate index is in range"));
+    }
+    merged.reverse();
+    let mut combined = merged
+        .first()
+        .cloned()
+        .expect("at least two candidates were taken");
+    let mut text = String::new();
+    let mut attachments = Vec::new();
+    let mut batch = Vec::new();
+    let mut visible = false;
+    for prompt in &merged {
+        if !prompt.text.is_empty() {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&prompt.text);
+        }
+        attachments.extend(prompt.attachments.iter().cloned());
+        visible |= prompt.visible;
+        batch.extend(prompt.batch_entries());
+    }
+    // The merged prompt stays in the class it came from: still System, still
+    // Queue, so it cannot inherit human priority or pass the user-stop gate.
+    combined.text = text;
+    combined.attachments = attachments;
+    combined.batch = batch;
+    combined.visible = visible;
+    combined.actor = EventActor::System;
+    combined.delivery = PromptDelivery::Queue;
+    combined.interrupt_batch = false;
+    pending.insert(first, combined);
 }
 
 fn pop_next_pending_prompt(
