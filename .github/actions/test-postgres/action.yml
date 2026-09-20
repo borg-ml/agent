@@ -12,37 +12,26 @@ runs:
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       shell: pwsh
       run: |
-        $installer = Join-Path $env:RUNNER_TEMP "postgres-installer.exe"
-        Invoke-WebRequest "https://get.enterprisedb.com/postgresql/postgresql-17.9-3-windows-x64.exe" -OutFile $installer
-        if ((Get-FileHash $installer -Algorithm SHA256).Hash -ne "99FCB47132698D8CC715AFF197DBD23EADF828B3F3524AA279C538F6948FA194") {
-          throw "Postgres installer checksum mismatch"
+        $archive = Join-Path $env:RUNNER_TEMP "postgres-binaries.zip"
+        Invoke-WebRequest "https://get.enterprisedb.com/postgresql/postgresql-17.9-3-windows-x64-binaries.zip" -OutFile $archive
+        if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne "2E92B4CF07DFE29DBBBC26D5347B0BCAE18E5B3C0822BFAFF0BBC7F13B93D9AC") {
+          throw "Postgres archive checksum mismatch"
         }
         $prefix = Join-Path $env:RUNNER_TEMP "postgres"
-        $trace = Join-Path $env:RUNNER_TEMP "postgres-installer.log"
-        $install = Start-Process $installer -Wait -PassThru -ArgumentList @(
-          "--mode", "unattended", "--unattendedmodeui", "none",
-          "--debugtrace", $trace,
-          "--prefix", $prefix, "--datadir", "$prefix/data",
-          "--superpassword", "postgres", "--serverport", "5432",
-          "--servicename", "borg-test-postgres",
-          "--disable-components", "pgAdmin,stackbuilder"
-        )
-        if ($install.ExitCode -ne 0) {
-          if (Test-Path $trace) {
-            $readableTrace = (Get-Content $trace -Raw) -replace "(?s)<(?:context|dump)>.*?</(?:context|dump)>", "<dump omitted>"
-            $readableTrace -split "`n" | Select-Object -First 200
-          }
-          Get-ChildItem $env:TEMP -Filter "install-postgresql*.log" | ForEach-Object {
-            Write-Output "Installer log: $($_.FullName)"
-            Get-Content $_.FullName -Tail 200
-          }
-          throw "Postgres installation failed: $($install.ExitCode)"
+        Expand-Archive -Path $archive -DestinationPath $prefix
+        $bin = Join-Path $prefix "pgsql/bin"
+        $data = Join-Path $prefix "data"
+        $passwordFile = Join-Path $prefix "password.txt"
+        Set-Content -Path $passwordFile -Value "postgres" -Encoding ascii
+        & "$bin/initdb.exe" -D $data -U postgres --encoding=UTF8 -A scram-sha-256 --pwfile=$passwordFile
+        if ($LASTEXITCODE -ne 0) { throw "Test Postgres initialization failed" }
+        Remove-Item $passwordFile
+        $log = Join-Path $prefix "server.log"
+        & "$bin/pg_ctl.exe" -D $data -l $log -o "-h 127.0.0.1 -p 5432" -w start
+        if ($LASTEXITCODE -ne 0) {
+          if (Test-Path $log) { Get-Content $log -Tail 100 }
+          throw "Test Postgres startup failed"
         }
-        & "$prefix/bin/pg_isready.exe" -h 127.0.0.1 -p 5432 -U postgres
-        if ($LASTEXITCODE -ne 0) { throw "Test Postgres is not ready" }
-    - name: Preserve Windows ARM installer diagnostics
-      if: failure() && runner.os == 'Windows' && runner.arch == 'ARM64'
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-      with:
-        name: windows-arm-postgres-installer
-        path: ${{ runner.temp }}/postgres-installer.log
+        $env:PGPASSWORD = "postgres"
+        & "$bin/psql.exe" -h 127.0.0.1 -p 5432 -U postgres -d postgres -v ON_ERROR_STOP=1 -c "SELECT version();"
+        if ($LASTEXITCODE -ne 0) { throw "Test Postgres connection failed" }
