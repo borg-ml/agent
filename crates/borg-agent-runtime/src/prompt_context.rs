@@ -96,7 +96,11 @@ impl ToolDecl {
 fn digest_of(schema: &serde_json::Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(schema.to_string().as_bytes());
-    format!("{:x}", hasher.finalize())[..32].to_string()
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The effective instruction slots and tool catalog at one point in a context
@@ -121,7 +125,12 @@ impl Declarations {
                 .collect(),
             tools: tools
                 .iter()
-                .map(|definition| (definition.name.clone(), ToolDecl::from_definition(definition)))
+                .map(|definition| {
+                    (
+                        definition.name.clone(),
+                        ToolDecl::from_definition(definition),
+                    )
+                })
                 .collect(),
         }
     }
@@ -132,10 +141,7 @@ impl Declarations {
     /// Taking `Option` rather than requiring the caller to branch keeps the
     /// harness hook to one call, and keeps the "first turn of a generation"
     /// rule in one place instead of at every call site.
-    pub(crate) fn change_against(
-        &self,
-        previous: Option<&Self>,
-    ) -> Option<DeclarationChange> {
+    pub(crate) fn change_against(&self, previous: Option<&Self>) -> Option<DeclarationChange> {
         match previous {
             None => Some(DeclarationChange::Base(self.clone())),
             Some(previous) => self.diff(previous).map(DeclarationChange::Delta),
@@ -302,10 +308,7 @@ pub(crate) fn plan_replay<'a>(
         effective.apply(delta);
     }
     let markers = &deltas[deltas.len().saturating_sub(MAX_REPLAYED_DELTAS)..];
-    ReplayPlan {
-        effective,
-        markers,
-    }
+    ReplayPlan { effective, markers }
 }
 
 /// Journal one turn's contribution, base or delta, under the matching kind.
