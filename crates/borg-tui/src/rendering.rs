@@ -73,7 +73,12 @@ pub(super) fn code_block_lines(language: &str, source: &str, width: usize) -> Ve
         "reasoning" => reasoning_lines(source, width),
         "command" => plain_lines(source, width),
         "subagent" => colored_plain_lines(source, width, super::SUBAGENT_PINK),
-        _ => syntax_lines(language, source, width, false),
+        // Code blocks wrap rather than clip. A clipped row replaces the rest
+        // of the line with an ellipsis, and that ellipsis is all any copy can
+        // ever recover: neither this TUI's selection nor the terminal's own
+        // selection can read bytes that were never drawn. Wrapping is what
+        // keeps a command in the transcript copyable verbatim.
+        _ => syntax_lines(language, source, width, true),
     }
 }
 
@@ -1052,6 +1057,41 @@ mod tests {
         let lines = syntax_lines("rust", "fn main() {\n    println!(\"hi\");\n}", 80, false);
         assert_eq!(lines.len(), 3);
         assert!(lines[0].to_string().contains("fn main"));
+    }
+
+    #[test]
+    fn a_long_command_in_a_code_block_survives_a_copy_verbatim() {
+        // A sudo command in the transcript was clipped to fit the width, and
+        // the copy carried the drawn ellipsis into the path, so the pasted
+        // command wrote to `/etc/systemd/zram-generator.conf.d/20-memory-g…`
+        // and failed. Every source byte has to reach the screen for any copy
+        // path to be able to reproduce it.
+        let command =
+            "sudo tee /etc/systemd/zram-generator.conf.d/20-memory-guard.conf > /dev/null";
+        let source = format!("{command}\n[zram0]\nzram-size = min(ram / 2, 8192)");
+        let rendered = code_block_lines("bash", &source, 40)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+
+        assert!(
+            !rendered.iter().any(|line| line.contains('\u{2026}')),
+            "a code row must not hide source behind an ellipsis: {rendered:#?}"
+        );
+
+        // Strip the line-number gutter and rejoin: wrapping may split a line
+        // across rows, but it must not add, drop, or reorder a byte.
+        let gutter = rendered
+            .first()
+            .and_then(|line| line.find('\u{2502}'))
+            .map(|index| rendered[0][..index].chars().count() + 2)
+            .expect("a code row carries a numbered gutter");
+        let recovered = rendered
+            .iter()
+            .map(|line| line.chars().skip(gutter).collect::<String>())
+            .collect::<String>();
+        assert_eq!(recovered, source.replace('\n', ""));
+        assert!(recovered.contains(command));
     }
 
     #[test]
