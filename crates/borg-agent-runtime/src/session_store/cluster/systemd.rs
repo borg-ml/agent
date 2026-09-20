@@ -200,19 +200,25 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// exactly the processes this module protects down the unsupervised path; and
 /// its presence would still not prove a manager is listening. Asking
 /// `systemctl --user` removes both guesses at once, because it locates the bus
-/// itself.
+/// itself. `show` reads one property and starts nothing, so probing never has
+/// the side effect the probe is asking about.
 ///
-/// `show` reads one property and starts nothing, so probing never has the side
-/// effect the probe is asking about. The timeout bounds it and `kill_on_drop`
-/// reaps the child when the timeout wins, so a wedged manager cannot leave a
-/// process behind.
+/// THREE OUTCOMES, and the middle one is the whole reason this returns a
+/// `Result`. `Ok(true)` is a manager that answered. `Ok(false)` is a host with
+/// no systemd to ask, which falls back to `pg_ctl` exactly as before. But a
+/// probe that times out or is refused on a host that HAS systemd is neither:
+/// falling back there would put the postmaster in this process's own cgroup,
+/// which is the defect this module exists to remove, and it would do it
+/// precisely on the machines it was written for. When that happens inside a
+/// Borg-owned unit or scope it is an error with a way out, not a quiet
+/// downgrade.
 #[cfg(target_os = "linux")]
-pub(super) async fn available() -> bool {
+pub(super) async fn available() -> anyhow::Result<bool> {
     if which("systemd-run").is_none() {
-        return false;
+        return Ok(false);
     }
     let Some(systemctl) = which("systemctl") else {
-        return false;
+        return Ok(false);
     };
     let mut probe = tokio::process::Command::new(systemctl);
     probe
@@ -223,15 +229,46 @@ pub(super) async fn available() -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    matches!(
+    if matches!(
         tokio::time::timeout(PROBE_TIMEOUT, probe.status()).await,
         Ok(Ok(status)) if status.success()
-    )
+    ) {
+        return Ok(true);
+    }
+    let caller = cgroup_of(std::process::id() as i32);
+    if caller.as_deref().is_some_and(|cgroup| in_borg_scope(cgroup)) {
+        anyhow::bail!(
+            "this machine runs systemd but its user manager did not answer within \
+             {PROBE_TIMEOUT:?}, and Borg is running inside {}. Starting the cluster \
+             with pg_ctl here would put the database in that same cgroup, so stopping \
+             this unit would shut it down -- the failure the unit exists to prevent. \
+             Restore the user bus (`systemctl --user status`), or point Borg at a \
+             server you already run: BORG_SESSIONS_URL=postgres://user@host/db",
+            caller.unwrap_or_default()
+        );
+    }
+    // Systemd is installed but unreachable, and nothing Borg owns is holding
+    // the cluster's fate. `pg_ctl` is then no worse than it ever was.
+    Ok(false)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(super) async fn available() -> bool {
-    false
+pub(super) async fn available() -> anyhow::Result<bool> {
+    Ok(false)
+}
+
+/// Whether a cgroup path belongs to a unit or scope Borg's own lifecycle tears
+/// down.
+///
+/// Matched on any `borg-*` leaf rather than the two names observed in the
+/// incident, so a unit added later is covered by default. A Borg process
+/// somewhere unrecognised falls through to `Ok(false)` and the pre-existing
+/// `pg_ctl` behaviour, which is the old risk rather than a new one.
+#[cfg(any(target_os = "linux", test))]
+fn in_borg_scope(cgroup: &str) -> bool {
+    cgroup.split('/').any(|leaf| {
+        leaf.starts_with("borg-") && (leaf.ends_with(".service") || leaf.ends_with(".scope"))
+    })
 }
 
 /// Distributions put these in `/usr/bin`; a split-usr host keeps `/bin`.
@@ -368,6 +405,27 @@ mod tests {
         assert_eq!(classify(Some(&own), Some(caller), unit), Supervision::OwnUnit);
         assert!(classify(Some(&own), Some(caller), unit).warning().is_none());
         assert_eq!(classify(None, Some(caller), unit), Supervision::Unknown);
+    }
+
+    /// The guard that stops a manager timeout from silently reinstating the
+    /// bug: inside anything Borg owns, an unreachable manager must be an error
+    /// rather than a fallback, because falling back puts the postmaster in
+    /// this very cgroup.
+    #[test]
+    fn a_borg_owned_cgroup_is_recognised_whatever_the_unit_is_called() {
+        assert!(in_borg_scope(
+            "/user.slice/user@1000.service/app.slice/borg-remote.service"
+        ));
+        assert!(in_borg_scope(
+            "/user.slice/user@1000.service/app.slice/app-borg.slice/borg-session-1a2b.scope"
+        ));
+        // A unit Borg grows later is covered without being listed.
+        assert!(in_borg_scope("/user.slice/app.slice/borg-workflow-7.service"));
+
+        // Somewhere Borg does not own, where pg_ctl is no worse than before.
+        assert!(!in_borg_scope("/user.slice/user@1000.service/app.slice/ghostty.scope"));
+        assert!(!in_borg_scope("/system.slice/postgresql.service"));
+        assert!(!in_borg_scope(""));
     }
 
     #[test]
