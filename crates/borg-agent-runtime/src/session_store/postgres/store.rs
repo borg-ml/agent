@@ -651,8 +651,7 @@ impl PostgresSessionStore {
                 // superseded or in-progress compactions must not hide the
                 // completed one beneath it.
                 let floor = i64::try_from(session.inherited_event_count).unwrap_or(i64::MAX);
-                let mut before =
-                    i64::try_from(logical_limit.saturating_add(1)).unwrap_or(i64::MAX);
+                let mut before = i64::try_from(logical_limit.saturating_add(1)).unwrap_or(i64::MAX);
                 loop {
                     let rows = sqlx::query(
                         "select sequence, event_json, event_body, dict_id from session_events \
