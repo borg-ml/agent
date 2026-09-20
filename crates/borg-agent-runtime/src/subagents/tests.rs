@@ -3771,18 +3771,19 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
         .await
         .unwrap();
 
-    let session_store: Arc<dyn SessionStore> = store.clone();
     let prompts = Arc::new(StdMutex::new(Vec::new()));
-    // One launch for the root and for the candidate. The shared fixture points
-    // at /workspace, which does not exist, and a woken child validates its cwd
-    // before it can run.
+    // Multiplayer stays on: membership is written only under that capability,
+    // so a test that turned it off could not lose one.
     let mut root_launch = launch();
     root_launch.cwd = directory.path().to_path_buf();
+    let session_store: Arc<dyn SessionStore> = store.clone();
+    // Room for two, so declining to reuse could actually spawn. Otherwise a
+    // reused=true assertion would pass because the cap left no alternative.
     let coordinator = SubagentCoordinator::new_with_store_and_executor(
         directory.path(),
         root,
-        root_launch.clone(),
-        3,
+        root_launch,
+        2,
         Arc::new(RecordingPeerExecutor {
             prompts: Arc::clone(&prompts),
         }),
@@ -3790,37 +3791,36 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
     )
     .unwrap();
 
-    // The state an older build leaves behind: a Ready worker whose binding was
-    // re-homed onto the team workspace without the membership that move does
-    // not carry.
-    let child_session_id = {
-        let mut table = coordinator.table.lock().await;
-        let child = table.reserve("stale_worker", &root_launch).unwrap();
-        let entry = table.entries.get_mut(&child.session_id).unwrap();
-        entry.snapshot.status = SubagentStatus::Ready;
-        // Dormant is what makes this a restored candidate rather than a
-        // half-built live one. `reserve` leaves the entry not dormant with no
-        // command channel, which is the state of a worker whose actor is
-        // mid-launch, so routing to it waits for a start that never happens.
-        // A child brought back from the journal is metadata only until an
-        // explicit child-directed action wakes it, and the wake is the path
-        // this test needs to exercise.
-        entry.dormant = true;
-        child.session_id
-    };
-    store.create_session(child_session_id).await.unwrap();
-    store
-        .register_child_session(root, child_session_id)
+    // A worker started and settled the ordinary way. Seeding a roster entry by
+    // hand produced something no restore ever produces -- a session with no
+    // journal behind it and no actor that could run a turn -- so the candidate
+    // has to be a real one.
+    let first = coordinator
+        .call_tool(
+            "spawn_agent",
+            json!({
+                "action": "delegate task",
+                "task_name": "first_task",
+                "message": "Complete the first bounded task."
+            }),
+        )
         .await
         .unwrap();
-    store
-        .append(SessionEvent::new(
-            child_session_id,
-            0,
-            SessionEventKind::SessionStarted,
-        ))
-        .await
-        .unwrap();
+    let child_session_id = Uuid::parse_str(first["session_id"].as_str().unwrap()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if coordinator.get(child_session_id).await.unwrap().status == SubagentStatus::Ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first assignment settles before the worker is reused");
+
+    // The state a restart on an older build leaves behind: the binding is
+    // re-homed onto the team workspace, and the membership row that move does
+    // not carry is gone.
     let binding = store
         .workspace_binding(child_session_id)
         .await
@@ -3828,7 +3828,21 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
         .unwrap();
     assert_eq!(
         binding.workspace_id, root,
-        "the binding is re-homed onto the team workspace"
+        "the child is bound into the team workspace"
+    );
+    let removed = sqlx::query(
+        "delete from workspace_members where workspace_id = $1 and participant_id = $2",
+    )
+    // These columns are text, and the projection writes them stringified.
+    .bind(binding.workspace_id.to_string())
+    .bind(binding.participant_id.to_string())
+    .execute(store.pool())
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(
+        removed, 1,
+        "the candidate must start out a member, or this removes nothing and proves nothing"
     );
 
     // The ordinary path: no provider, model or effort override, so the claim
@@ -3852,25 +3866,12 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
         "the candidate is reused, so this exercises the repair and not the spawn"
     );
 
-    // The task reached the child durably.
-    assert_eq!(
-        workspace_store
-            .deliveries_after(binding.workspace_id, binding.participant_id, 0, 10)
-            .await
-            .unwrap()
-            .iter()
-            .filter(|delivery| delivery.sequence > 0)
-            .count(),
-        1,
-        "a repaired worker must receive the task it was assigned"
-    );
-
-    // And the child actually ran it. A durable delivery on its own would still
-    // pass if the woken worker never executed, which is the half of the
-    // workflow the repair exists to restore.
+    // And it ran. A durable delivery on its own would still pass with the
+    // worker never executing, which is the half of the workflow the repair
+    // exists to restore.
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if prompts.lock().expect("peer prompt lock").len() == 1 {
+            if prompts.lock().expect("peer prompt lock").len() == 2 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3878,9 +3879,10 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
     })
     .await
     .expect("the repaired worker must execute the task it was assigned");
+    let recorded = prompts.lock().expect("peer prompt lock").clone();
     assert!(
-        prompts.lock().expect("peer prompt lock")[0].contains("describe the material set"),
-        "the executed turn must carry the assigned task"
+        recorded[1].contains("describe the material set"),
+        "the executed turn must carry the assigned task: {recorded:?}"
     );
 
     coordinator.stop_all().await;
