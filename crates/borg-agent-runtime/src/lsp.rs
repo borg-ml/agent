@@ -2123,8 +2123,9 @@ mod tests {
             .clients
             .lock()
             .await
-            .values()
-            .next()
+            .iter()
+            .find(|(key, _)| key.server_id == "clangd" && key.workspace_root == root.path())
+            .map(|(_, slot)| slot)
             .expect("active clangd client")
             .client
             .clone();
@@ -2273,8 +2274,9 @@ mod tests {
             .clients
             .lock()
             .await
-            .values()
-            .next()
+            .iter()
+            .find(|(key, _)| key.server_id == "clangd" && key.workspace_root == root.path())
+            .map(|(_, slot)| slot)
             .expect("active clangd client")
             .client
             .clone();
