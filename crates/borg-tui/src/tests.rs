@@ -3260,6 +3260,69 @@ fn committed_snapshot_freezes_the_timer_after_an_order_shift() {
 }
 
 #[test]
+fn cancelling_a_labeled_preparation_by_id_retires_only_that_row_as_not_run() {
+    // A cancel used to read the unkeyed list alone, so a preparation that had
+    // been given a provider tool_call_id could not be cancelled at all and its
+    // spinner outlived the turn. Retiring it as a plain completion would be
+    // wrong in the other direction: the tool call never ran, and a row that
+    // reads as finished hides work that was lost rather than done.
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    let event = |sequence, kind: &str, payload| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: kind.to_string(),
+                payload,
+            },
+        )
+    };
+
+    transcript.apply(&event(
+        1,
+        "action/preparing",
+        serde_json::json!({"label": "command", "tool_call_id": "call-a"}),
+    ));
+    transcript.apply(&event(
+        2,
+        "action/preparing",
+        serde_json::json!({"label": "edit retry policy", "tool_call_id": "call-b"}),
+    ));
+    assert_eq!(transcript.order.len(), 2);
+
+    transcript.apply(&event(
+        3,
+        "action/preparing_cancelled",
+        serde_json::json!({"tool_call_id": "call-a"}),
+    ));
+
+    assert!(
+        matches!(
+            &transcript.order[0],
+            TranscriptEntry::Tool {
+                complete: true,
+                user_interrupted: true,
+                error: false,
+                ..
+            }
+        ),
+        "the named preparation must retire as cancelled, not as a finished action"
+    );
+    assert!(
+        matches!(
+            &transcript.order[1],
+            TranscriptEntry::Tool {
+                complete: false,
+                ..
+            }
+        ),
+        "cancelling one preparation must not retire the other"
+    );
+}
+
+#[test]
 fn action_status_updates_refresh_cached_transcript_text() {
     let session_id = Uuid::new_v4();
     let render_time = Utc::now();

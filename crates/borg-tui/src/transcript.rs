@@ -1593,10 +1593,24 @@ impl Transcript {
                     label,
                 );
             }
-            SessionEventKind::ProviderEvent { kind, .. }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "action/preparing_cancelled" =>
             {
-                if let Some(preparing_id) = self.unkeyed_preparing_tools.pop()
+                // A cancel that names its tool call has to reach that exact
+                // preparation. Reading only the unkeyed list left every
+                // labeled preparation uncancellable, and popping a single
+                // entry could never retire concurrent ones.
+                let preparing_id = match payload
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some(tool_call_id) => self.preparing_tools.remove(tool_call_id).or_else(|| {
+                        (!self.unkeyed_preparing_tools.is_empty())
+                            .then(|| self.unkeyed_preparing_tools.remove(0))
+                    }),
+                    None => self.unkeyed_preparing_tools.pop(),
+                };
+                if let Some(preparing_id) = preparing_id
                     && let Some(index) = self.tools.get(&preparing_id).copied()
                 {
                     if self.foreground_tool.as_deref() == Some(preparing_id.as_str()) {
@@ -1606,7 +1620,7 @@ impl Transcript {
                         self.tools.remove(&preparing_id);
                         self.order.pop();
                     } else {
-                        self.finish_preparing_tool(&preparing_id, event.created_at);
+                        self.cancel_preparing_tool(&preparing_id, event.created_at);
                     }
                 }
             }
@@ -2870,6 +2884,22 @@ impl Transcript {
             if foreground_index == Some(index) {
                 self.foreground_tool = None;
             }
+        }
+    }
+
+    /// Retire a preparation whose tool call was cancelled before it ran. The
+    /// row is terminal but it is not a success: the work never executed, so it
+    /// keeps the interrupted lifecycle rather than the tick a finished action
+    /// gets. Closing it as complete would turn a lost tool call into something
+    /// that reads as having worked.
+    fn cancel_preparing_tool(&mut self, preparing_id: &str, completed_at: DateTime<Utc>) {
+        self.finish_preparing_tool(preparing_id, completed_at);
+        if let Some(index) = self.tools.get(preparing_id).copied()
+            && let Some(TranscriptEntry::Tool {
+                user_interrupted, ..
+            }) = self.order.get_mut(index)
+        {
+            *user_interrupted = true;
         }
     }
 
