@@ -101,11 +101,11 @@ impl NativeMcpRuntime {
                 Err(error) => {
                     let error = truncate(&format!("{error:#}"), 2048).to_string();
                     tracing::warn!(server = %server.name, %error, "external MCP server unavailable; continuing without its tools");
-                    remember_startup_failure(session_id, &server, &error);
+                    let notify = remember_startup_failure(session_id, &server, &error);
                     startup_failures.push(McpStartupFailure {
                         server: server.name,
                         error,
-                        notify: true,
+                        notify,
                     });
                     continue;
                 }
@@ -700,13 +700,12 @@ fn startup_key(session_id: uuid::Uuid, server: &ExternalMcpServer) -> u64 {
 /// The recorded cause when this exact server failed recently, annotated so the
 /// report says it is a remembered failure rather than a fresh launch attempt.
 fn recent_startup_failure(session_id: uuid::Uuid, server: &ExternalMcpServer) -> Option<String> {
-    let mut failures = STARTUP_FAILURES.lock().ok()?;
+    let failures = STARTUP_FAILURES.lock().ok()?;
     let key = startup_key(session_id, server);
     let (recorded, error) = failures.get(&key)?;
     let age = recorded.elapsed();
     let cooldown = STARTUP_FAILURE_COOLDOWN;
     if age >= cooldown {
-        failures.remove(&key);
         return None;
     }
     let retry_in = (cooldown - age).as_secs();
@@ -716,15 +715,19 @@ fn recent_startup_failure(session_id: uuid::Uuid, server: &ExternalMcpServer) ->
     ))
 }
 
-fn remember_startup_failure(session_id: uuid::Uuid, server: &ExternalMcpServer, error: &str) {
+fn remember_startup_failure(
+    session_id: uuid::Uuid,
+    server: &ExternalMcpServer,
+    error: &str,
+) -> bool {
     let Ok(mut failures) = STARTUP_FAILURES.lock() else {
-        return;
+        return true;
     };
-    // Every edit to a server's configuration produces a new key, so prune on
-    // insert instead of waiting for the stale key to be queried again, and cap
-    // the map so a long session cannot accumulate entries without bound.
-    let cooldown = STARTUP_FAILURE_COOLDOWN;
-    failures.retain(|_, (recorded, _)| recorded.elapsed() < cooldown);
+    let key = startup_key(session_id, server);
+    let notify = failures
+        .remove(&key)
+        .is_none_or(|(_, previous)| previous != error);
+    // Keep the previous cause across cooldowns, but bound configuration history.
     while failures.len() >= MAX_REMEMBERED_STARTUP_FAILURES {
         let Some(oldest) = failures
             .iter()
@@ -735,10 +738,8 @@ fn remember_startup_failure(session_id: uuid::Uuid, server: &ExternalMcpServer, 
         };
         failures.remove(&oldest);
     }
-    failures.insert(
-        startup_key(session_id, server),
-        (std::time::Instant::now(), error.to_string()),
-    );
+    failures.insert(key, (std::time::Instant::now(), error.to_string()));
+    notify
 }
 
 fn clear_startup_failure(session_id: uuid::Uuid, server: &ExternalMcpServer) {
@@ -978,14 +979,34 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
             .get_mut(&startup_key(session, &server(original.clone())))
             .expect("the original failure remains cached")
             .0 = std::time::Instant::now() - STARTUP_FAILURE_COOLDOWN;
-        let fourth = NativeMcpRuntime::start(session, vec![server(original)])
+        let fourth = NativeMcpRuntime::start(session, vec![server(original.clone())])
             .await
             .unwrap();
         assert!(
             launch_count(directory.path(), "launches") > after_change,
             "an expired cooldown retries"
         );
-        assert!(fourth.startup_failures[0].notify, "a real retry warns");
+        assert!(
+            !fourth.startup_failures[0].notify,
+            "an unchanged cause must not warn again"
+        );
+        let server = server(original);
+        assert!(remember_startup_failure(
+            session,
+            &server,
+            "different cause"
+        ));
+        assert!(!remember_startup_failure(
+            session,
+            &server,
+            "different cause"
+        ));
+        clear_startup_failure(session, &server);
+        assert!(remember_startup_failure(
+            session,
+            &server,
+            "different cause"
+        ));
     }
 
     #[tokio::test]
