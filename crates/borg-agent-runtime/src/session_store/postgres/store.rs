@@ -548,7 +548,6 @@ fn provider_event_kind(kind: &SessionEventKind) -> Option<String> {
     }
 }
 
-#[async_trait]
 /// Lineage-aware message lookup.
 ///
 /// A session does not only contain the events it appended: a fork contains the
@@ -709,6 +708,7 @@ impl PostgresSessionStore {
     }
 }
 
+#[async_trait]
 impl SessionStore for PostgresSessionStore {
     async fn create_session(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now();
