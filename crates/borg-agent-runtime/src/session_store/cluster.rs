@@ -149,8 +149,7 @@ impl ManagedCluster {
     pub async fn ensure_running(&self) -> Result<String> {
         let pg_ctl = locate_binary("pg_ctl")?;
         {
-            // Held across the check-and-provision and the check-and-start,
-            // and dropped before the journal is touched. `initdb` writes
+            // Serialize cluster and database provisioning. `initdb` writes
             // `PG_VERSION` before it has finished, so without this a second
             // process can read a half-built cluster as a built one and start
             // a postmaster on it.
@@ -162,8 +161,8 @@ impl ManagedCluster {
             if !self.is_running(&pg_ctl).await? {
                 self.start(&pg_ctl).await?;
             }
+            self.ensure_database().await?;
         }
-        self.ensure_database().await?;
         // Here rather than in `start`, so it covers the cluster that was
         // already running when we arrived -- the case we did not create and
         // the one most likely to be supervised wrongly -- and so it reports
@@ -540,12 +539,16 @@ pub(crate) fn is_between_states(error: &anyhow::Error) -> bool {
 }
 
 fn is_duplicate_database(error: &sqlx::Error) -> bool {
-    // 42P04 is duplicate_database. Matching the code rather than the message
-    // keeps this working under a non-English server locale.
-    matches!(
-        error.as_database_error().and_then(|error| error.code()),
-        Some(code) if code == "42P04"
-    )
+    // Concurrent CREATE DATABASE can also report the catalog name collision.
+    // Older Borg processes do not hold our startup lock, so accept that exact
+    // constraint, not arbitrary unique violations.
+    error
+        .as_database_error()
+        .is_some_and(|error| match error.code().as_deref() {
+            Some("42P04") => true,
+            Some("23505") => error.constraint() == Some("pg_database_datname_index"),
+            _ => false,
+        })
 }
 
 /// Open the cluster, waiting out one that is merely changing state.
