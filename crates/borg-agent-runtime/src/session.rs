@@ -1636,6 +1636,10 @@ async fn run_agent_session_store_kernel_inner(
     };
     let subagent_store = Arc::clone(&store);
     let autonomy_store = store.autonomy_store().await?;
+    // Read before the context slice is handed to the journal: the turn
+    // boundaries live only in that bucket, and this is the last point they
+    // are still borrowable.
+    let mut resumed_turn_message_id = interrupted_turn_prompt(&recovery.context_events);
     let mut journal = RuntimeSessionStore::new(
         Arc::clone(&store),
         recovery.context_events,
@@ -3306,7 +3310,14 @@ async fn run_agent_session_store_kernel_inner(
             autonomy_job_id.and_then(|job_id| autonomy_completions.remove(&job_id));
         let mut autonomy_result: Option<Result<Value>> = None;
         next_ready_detail = None;
-        if prompt.visible {
+        // A prompt resumed after a crash was already admitted, at its own
+        // timestamp, by the run that died. Recording admission again would
+        // enter it in the transcript a second time and date it to the
+        // restart, which is what made an answered question look like a new
+        // one. Only the re-announcement is skipped; every terminal status
+        // below still fires, so the message lifecycle still closes.
+        let resuming_interrupted_turn = resumed_turn_message_id == Some(prompt.message_id);
+        if prompt.visible && !resuming_interrupted_turn {
             record_prompt_status(
                 &mut journal,
                 &events,
@@ -3880,7 +3891,19 @@ async fn run_agent_session_store_kernel_inner(
         } else {
             format_subscription_frame(&format_subscription_actor_value(prompt.actor, &prompt.text))
         };
-        if network_retry_message_id == Some(prompt.message_id) {
+        if resumed_turn_message_id == Some(prompt.message_id) {
+            // Same durable id, so cancelling, recovery and the message
+            // lifecycle keep working -- and the same reason the network path
+            // spells this out applies harder here. The turn this prompt
+            // opened may have run for minutes and finished real work before
+            // the host died; re-delivering the text alone reads as "do this
+            // again", which re-answers a question the human already has an
+            // answer to and re-runs side effects that already landed.
+            let resumed = "\n\nThe previous attempt was cut off when this host restarted, after it may already have answered and made progress. Treat the request above as work already in progress, not as a new instruction to carry out from the start. The conversation above records what was actually done: continue from where it stopped, do not repeat completed actions, and do not answer again anything already answered there. Before re-running any command that was interrupted, check whether it already took effect. If everything it asked for is already done, say so briefly instead of redoing it.";
+            provider_prompt.push_str(resumed);
+            prompt_delta.push_str(resumed);
+            resumed_turn_message_id = None;
+        } else if network_retry_message_id == Some(prompt.message_id) {
             // The request above is re-delivered under its original id so that
             // cancelling, crash recovery and the message lifecycle all keep
             // working. That makes the wording load-bearing: without explicitly
@@ -7628,6 +7651,37 @@ fn retained_fold_compaction_prompt(previous_summary: &str, context: &str) -> Str
     format!(
         "{COMPACTION_SUMMARY_PROMPT}\n\n<prior_summary>\n{previous_summary}\n</prior_summary>\n\n<prior_provider_conversation>\n{context}\n</prior_provider_conversation>"
     )
+}
+
+/// The prompt of a turn that started and never reached a terminal boundary.
+///
+/// Every way a turn can end -- success, failure, interrupt, pending input --
+/// journals `TurnCompleted`. So if the newest boundary in the recovered
+/// context is still a `TurnStarted`, the process did not end that turn; it
+/// died inside it. `codex_checkpoint_is_acknowledged` already reads the
+/// journal this way for provider checkpoints.
+///
+/// This is the fact `MessageStatus` cannot express. A prompt that was
+/// answered mid-turn and one that was never delivered both sit at
+/// `InProgress`, because `Complete` is only written when the turn ends.
+/// Recovery replays both as pending input, which is how 7119d36f was
+/// answered at 02:08 on 2026-09-20, lost its turn to a host OOM at 02:16,
+/// and was asked again as a fresh turn at 02:21.
+///
+/// Answering that with a drop would be worse than the repeat: that turn kept
+/// working for seven minutes after it answered, and unfinished work is not
+/// something recovery may discard. The prompt is resumed instead, under its
+/// original id, without re-announcing its admission and with the dispatch
+/// demoted from instruction to continuation.
+fn interrupted_turn_prompt(context_events: &[SessionEvent]) -> Option<Uuid> {
+    context_events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.kind {
+            SessionEventKind::TurnStarted { message_id, .. } => Some(Some(*message_id)),
+            SessionEventKind::TurnCompleted { .. } => Some(None),
+            _ => None,
+        })?
 }
 
 fn recover_prompts_on_resume(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {

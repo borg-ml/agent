@@ -9041,6 +9041,127 @@ fn in_progress_prompt_recovery_preserves_input_after_a_host_crash() {
     assert_eq!(recovered[0].delivery, PromptDelivery::Queue);
 }
 
+fn crashed_turn_events(session_id: Uuid, message_id: Uuid) -> Vec<SessionEventKind> {
+    vec![
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "how often does it send them".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Queued,
+            delivery: Some(PromptDelivery::Steer),
+        },
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "how often does it send them".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::TurnStarted {
+            message_id,
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+        },
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "every 90% of the cache lifetime".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+        SessionEventKind::ToolStarted {
+            tool_call_id: format!("call-{session_id}"),
+            name: "Bash".to_string(),
+            input: json!({}),
+            input_ref: None,
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_turn_cut_off_by_a_crash_resumes_its_prompt_instead_of_re_asking_it() {
+    // A host OOM killed a605872f mid-turn on 2026-09-20. The prompt that
+    // opened that turn had already been answered, but `Complete` is only
+    // written when a turn ends, so it stayed at `InProgress` and resume
+    // re-dispatched it as a brand new turn: the same question answered
+    // twice, 13 minutes apart.
+    //
+    // Both halves of the contract are asserted here, because either one
+    // alone is a different bug. The prompt must STILL be recovered -- that
+    // turn went on working for seven minutes after it answered, and dropping
+    // it would silently discard unfinished work. And it must be recognisable
+    // as interrupted, so dispatch can resume it rather than ask again.
+    //
+    // Driven through the real recovery projection on purpose: the turn
+    // boundaries this depends on live only in `context_events`, and a
+    // hand-built slice would let a scan that can never fire in production
+    // look correct here.
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in crashed_turn_events(session_id, message_id) {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let recovery = store.recovery(session_id).await.unwrap();
+    assert_eq!(
+        interrupted_turn_prompt(&recovery.context_events),
+        Some(message_id),
+        "an unmatched TurnStarted is the only durable evidence that the turn was cut off"
+    );
+    assert_eq!(
+        recover_prompts_on_resume(&recovery.queue_events)
+            .iter()
+            .map(|prompt| prompt.message_id)
+            .collect::<Vec<_>>(),
+        vec![message_id],
+        "the interrupted prompt is resumed, not dropped: its turn had unfinished work"
+    );
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn a_turn_that_reached_its_boundary_is_not_resumed_as_a_continuation() {
+    // The other half. Once `TurnCompleted` is durable the turn ended on its
+    // own terms, so nothing about it is interrupted and a later prompt with
+    // the same id is an ordinary new request.
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in crashed_turn_events(session_id, message_id)
+        .into_iter()
+        .chain([SessionEventKind::TurnCompleted {
+            message_id,
+            provider_session_id: None,
+            final_text: "every 90% of the cache lifetime".to_string(),
+            error: None,
+        }])
+    {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let recovery = store.recovery(session_id).await.unwrap();
+    assert_eq!(
+        interrupted_turn_prompt(&recovery.context_events),
+        None,
+        "a turn that journaled its own boundary was not cut off"
+    );
+    scratch.discard().await;
+}
+
 #[test]
 fn prompt_recovery_updates_delivery_and_ignores_stale_terminal_snapshots() {
     let session_id = Uuid::new_v4();
