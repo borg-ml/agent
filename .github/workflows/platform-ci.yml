@@ -9,6 +9,7 @@ on:
 
 env:
   BORG_TEST_SESSIONS_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+  BORG_SESSIONS_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
 
 permissions:
   contents: read
