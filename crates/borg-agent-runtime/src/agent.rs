@@ -391,6 +391,9 @@ pub struct LocalAgentTurnExecutor {
     runtime_extension_loader: Option<RuntimeExtensionLoader>,
     subscription_pools: Arc<SubscriptionPoolRegistry>,
     web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
+    /// Controller-supplied provider access for this session. Empty for
+    /// host-local execution, where credentials come from the host environment.
+    provider_context: crate::RuntimeProviderContext,
     #[cfg(feature = "profiling")]
     profiler: Option<Arc<crate::RuntimeProfiler>>,
 }
@@ -413,6 +416,7 @@ impl Default for LocalAgentTurnExecutor {
             runtime_extension_loader: None,
             subscription_pools: Arc::new(SubscriptionPoolRegistry::default()),
             web_search,
+            provider_context: crate::RuntimeProviderContext::default(),
             #[cfg(feature = "profiling")]
             profiler: None,
         }
@@ -664,6 +668,13 @@ impl LocalAgentTurnExecutor {
         provider: Arc<dyn borg_search::WebSearchProvider>,
     ) -> Self {
         self.web_search = Some(provider);
+        self
+    }
+
+    /// Supply controller-prepared provider access for this session. The
+    /// context is held in memory and never serialized into durable state.
+    pub fn with_provider_context(mut self, context: crate::RuntimeProviderContext) -> Self {
+        self.provider_context = context;
         self
     }
 
@@ -970,10 +981,14 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             profiler.set_phase("provider_start");
         }
         if self.uses_native_harness(turn.provider) {
-            let result = self
-                .native_harness
-                .run(turn.clone(), events, controls)
-                .await;
+            // A controller-supplied gateway (for example an enterprise policy
+            // route) applies to this session's native turns. Without one the
+            // host-local harness configuration stands.
+            let harness = match self.provider_context.model_gateway.clone() {
+                Some(gateway) => self.native_harness.with_turn_gateway(gateway),
+                None => self.native_harness.clone(),
+            };
+            let result = harness.run(turn.clone(), events, controls).await;
             #[cfg(feature = "profiling")]
             if let Some((profiler, started)) = self.profiler.as_ref().zip(profile_started) {
                 profiler.finish_turn(profile_provider, started, result.is_ok());
@@ -993,12 +1008,14 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         let completed_hook_turn = turn.clone();
         let result = match turn.provider {
             CodingProvider::Claude | CodingProvider::OpenCode => {
+                let request_template = (!self.provider_context.is_empty())
+                    .then(|| provider_context_request_template(&turn, &self.provider_context));
                 run_borg_provider_turn(
                     turn,
                     events,
                     controls,
                     BorgProviderTurnRuntime {
-                        request_template: None,
+                        request_template,
                         local: true,
                         subscription_pools: Some(Arc::clone(&self.subscription_pools)),
                         #[cfg(feature = "profiling")]
@@ -1251,6 +1268,26 @@ fn direct_chat_stream_request(
         web_search_allowed: true,
         resume_unavailable_prompt: None,
     }
+}
+
+/// Build the per-session provider request template from controller-supplied
+/// access. `run_borg_provider_turn` overlays the live turn fields (prompt,
+/// attachments, model, MCP servers) on top, so only credential material and
+/// routing that the turn itself cannot express belongs here.
+fn provider_context_request_template(
+    turn: &AgentTurn,
+    context: &crate::RuntimeProviderContext,
+) -> ChatStreamRequest {
+    let mut request = direct_chat_stream_request(turn, false, "");
+    request.provider_auth = context.provider_auth.clone();
+    request.git_credentials = context.git_credentials.clone();
+    if let Some(channel) = context.provider_channel {
+        request.provider_channel = channel;
+    }
+    if let Some(persist) = context.persist_session {
+        request.persist_session = Some(persist);
+    }
+    request
 }
 
 fn append_prompt_context(prompt: &str, context: &str) -> String {
@@ -2451,6 +2488,27 @@ mod tests {
             declaration_base: None,
             volatile_system_prompt_appendix: "usage: 5-hour 65% left".to_string(),
         }
+    }
+
+    #[test]
+    fn controller_provider_context_reaches_the_subscription_request_template() {
+        use super::provider_context_request_template;
+        let cwd = std::env::temp_dir();
+        let turn = lifecycle_test_turn(&cwd);
+        let context = crate::RuntimeProviderContext {
+            provider_channel: Some(borg_provider::ProviderChannel::Vertex),
+            persist_session: Some(false),
+            ..Default::default()
+        };
+        assert!(!context.is_empty());
+
+        let request = provider_context_request_template(&turn, &context);
+        assert_eq!(
+            request.provider_channel,
+            borg_provider::ProviderChannel::Vertex
+        );
+        assert_eq!(request.persist_session, Some(false));
+        assert_eq!(request.provider_auth.is_none(), true);
     }
 
     #[tokio::test]

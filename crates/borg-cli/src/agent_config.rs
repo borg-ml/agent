@@ -311,6 +311,7 @@ impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
             steer_reply_prompt: value.steer_reply_prompt.clone(),
             provider_capabilities: Vec::new(),
             runtime_mcp_context: None,
+            runtime_provider_context: None,
             resource_limits: None,
         }
     }

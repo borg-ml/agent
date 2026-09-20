@@ -808,6 +808,42 @@ pub struct RuntimeMcpContext {
     pub api_token_ref: Option<String>,
 }
 
+/// Controller-supplied provider access for one session.
+///
+/// This mirrors [`RuntimeMcpContext`]: it is in-memory launch state that can
+/// carry short-lived credentials, so it is never serialized into the relay
+/// journal and enrolled hosts derive their own provider access. It lets a
+/// product controller (for example Borg Web) hand a session its provider
+/// authentication, git credentials, and an OpenAI-compatible model gateway
+/// without turning provider secrets into durable session state.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeProviderContext {
+    /// Provider authentication bundle (Claude/OpenAI subscription files or
+    /// API-key homes) prepared for this session.
+    pub provider_auth: Option<borg_provider::provider::ChatProviderAuth>,
+    /// Host-scoped git credentials for provider shell commands.
+    pub git_credentials: Vec<borg_provider::provider::ChatGitCredential>,
+    /// Server-selected OpenAI-compatible gateway (for example an enterprise
+    /// policy route). The bearer token must never reach prompts or traces.
+    pub model_gateway: Option<borg_provider::provider::ModelGateway>,
+    /// Provider channel (Vertex, Bedrock, Azure OpenAI) for cloud-routed
+    /// providers. `None` keeps the direct route.
+    pub provider_channel: Option<borg_provider::ProviderChannel>,
+    /// Overrides whether provider-native session history is persisted.
+    pub persist_session: Option<bool>,
+}
+
+impl RuntimeProviderContext {
+    /// True when the context carries nothing that changes provider access.
+    pub fn is_empty(&self) -> bool {
+        self.provider_auth.is_none()
+            && self.git_credentials.is_empty()
+            && self.model_gateway.is_none()
+            && self.provider_channel.is_none()
+            && self.persist_session.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct LaunchSession {
@@ -890,6 +926,14 @@ pub struct SessionCapabilities {
     /// state so short-lived credentials never enter the relay journal.
     #[serde(default, skip_serializing)]
     pub runtime_mcp_context: Option<RuntimeMcpContext>,
+    /// Controller-supplied provider access for this session. Like
+    /// `runtime_mcp_context`, it is omitted from serialized launch state so
+    /// short-lived provider credentials never enter the relay journal. It is
+    /// skipped rather than merely defaulted because it holds provider types
+    /// that are intentionally not serializable.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub runtime_provider_context: Option<RuntimeProviderContext>,
     /// Effective host limits for this session. This is populated by the
     /// canonical host and is never accepted as authority when supplied by a
     /// remote controller.
@@ -912,6 +956,7 @@ impl Default for SessionCapabilities {
             steer_reply_prompt: SteerReplyPrompt::default(),
             provider_capabilities: Vec::new(),
             runtime_mcp_context: None,
+            runtime_provider_context: None,
             resource_limits: None,
         }
     }

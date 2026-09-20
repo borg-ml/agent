@@ -199,6 +199,20 @@ impl NativeHarness {
         self
     }
 
+    /// Clone this harness with a controller-supplied gateway bound for the
+    /// next turns. Used when a session carries a per-session provider context
+    /// (for example an enterprise policy route) instead of host-local routes.
+    pub(crate) fn with_turn_gateway(&self, model_gateway: ModelGateway) -> Self {
+        let mut next = self.clone();
+        next.model_client = Arc::new(ProviderModelClient {
+            gateway: Some(model_gateway),
+            configured_model_gateways: Default::default(),
+            #[cfg(feature = "subscription-adapters")]
+            codex_account: None,
+        });
+        next
+    }
+
     pub(crate) async fn run(
         &self,
         turn: AgentTurn,
