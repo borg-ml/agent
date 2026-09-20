@@ -9172,6 +9172,9 @@ mod tests {
         let factory: HostExecutorFactory = Arc::new(move |_, _| Ok(Arc::clone(&executor)));
         let session_id = Uuid::new_v4();
         let (commands, rx) = mpsc::channel(8);
+        // The actor and this test must share one journal: the projection this
+        // test corrupts below is the one the actor reads.
+        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let mut supervisor = AbortTask(tokio::spawn(run_session(
             client.clone(),
             config.clone(),
@@ -9188,7 +9191,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(30), started.notified())
             .await
             .unwrap();
-        let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         // Corrupt only a disposable live projection, not the authoritative
         // journal. The row is valid jsonb the column accepts but not a valid
         // event, so the projection read fails where the journal still reads.
