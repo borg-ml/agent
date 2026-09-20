@@ -61,6 +61,12 @@ const SUBSCRIPTION_CONTEXT_HEADER: &str = "Borg canonical provider context v2. T
 // remains complete; this is only the input shape sent on a full replay.
 const SUBSCRIPTION_INPUT_BUDGET_CHARS: usize = 1 << 20;
 const SUBSCRIPTION_REPLAY_BUDGET_QUANTUM_CHARS: usize = 64 * 1024;
+/// Share of the subscription input budget kept verbatim after a compaction
+/// summary, so the model keeps the evidence it was just reasoning about rather
+/// than only a prose recollection of it. The native harness keeps the same
+/// share of the context window (`NATIVE_COMPACT_RETAIN_PERCENT`); this is the
+/// character-budgeted equivalent for providers Borg turns around itself.
+const SUBSCRIPTION_COMPACT_RETAIN_PERCENT: usize = 10;
 const SUBSCRIPTION_CONTEXT_SEPARATOR_CHARS: usize = 1;
 const COMPACTION_CONTEXT_ELISION: &str =
     "\n\n[... middle of retained context elided for compaction ...]\n\n";
@@ -2875,7 +2881,16 @@ async fn run_agent_session_store_kernel_inner(
                         {
                             journal.ensure_complete_context(session_id).await?;
                         }
-                        let result: Result<Option<crate::AgentCompaction>> = async {
+                        // The verbatim tail rides along with the summary: only
+                        // the subscription fold produces one, but every arm
+                        // has to answer with the same shape so the boundary
+                        // event is written in one place.
+                        let result: Result<
+                            Option<(
+                                crate::AgentCompaction,
+                                Vec<borg_provider::provider::ModelMessage>,
+                            )>,
+                        > = async {
                             if executor.uses_native_harness(launch.provider) {
                                 let model = launch
                                     .model
@@ -2904,7 +2919,7 @@ async fn run_agent_session_store_kernel_inner(
                                         conversation,
                                     )
                                     .await
-                                    .map(Some)
+                                    .map(|compaction| Some((compaction, Vec::new())))
                             } else if provider_context_compaction {
                                 let provider_session_id = provider_session_id.as_deref().context(
                                     "Codex native compaction requires a provider thread",
@@ -2947,12 +2962,15 @@ async fn run_agent_session_store_kernel_inner(
                                     })
                                     .await?
                                     .unwrap_or_default();
-                                Ok(Some(crate::AgentCompaction {
-                                    summary: "Codex provider thread compacted on request"
-                                        .to_string(),
-                                    usage,
-                                    provider_session_id: Some(provider_session_id.to_string()),
-                                }))
+                                Ok(Some((
+                                    crate::AgentCompaction {
+                                        summary: "Codex provider thread compacted on request"
+                                            .to_string(),
+                                        usage,
+                                        provider_session_id: Some(provider_session_id.to_string()),
+                                    },
+                                    Vec::new(),
+                                )))
                             } else {
                                 compact_subscription_context_for_budget(
                                     SubscriptionCompactionRequest {
@@ -2964,15 +2982,25 @@ async fn run_agent_session_store_kernel_inner(
                                         events: journal.context_events(),
                                         actor: EventActor::User,
                                         current_prompt: "",
+                                        retained_tail_budget_chars:
+                                            subscription_retained_tail_budget_chars(
+                                                SUBSCRIPTION_INPUT_BUDGET_CHARS,
+                                            ),
                                     },
                                 )
                                 .await
-                                .map(Some)
+                                .map(|compaction| {
+                                    Some((compaction.compaction, compaction.retained_tail))
+                                })
                             }
                         }
                         .await;
                         match result {
-                            Ok(native) => {
+                            Ok(compacted) => {
+                                let (native, retained_tail) = match compacted {
+                                    Some((native, retained_tail)) => (Some(native), retained_tail),
+                                    None => (None, Vec::new()),
+                                };
                                 if let Some(native) = native.as_ref() {
                                     record(
                                         &mut journal,
@@ -3010,6 +3038,8 @@ async fn run_agent_session_store_kernel_inner(
                                                 || provider_context_preserved,
                                             "provider_context_preserved":
                                                 provider_context_preserved,
+                                            "retained_messages": retained_tail.len(),
+                                            COMPACTION_RETAINED_TAIL_FIELD: &retained_tail,
                                         }),
                                     },
                                 )
@@ -3500,10 +3530,16 @@ async fn run_agent_session_store_kernel_inner(
                 events: journal.context_events(),
                 actor: prompt.actor,
                 current_prompt: &prompt.text,
+                retained_tail_budget_chars: subscription_retained_tail_budget_chars(
+                    SUBSCRIPTION_INPUT_BUDGET_CHARS,
+                ),
             })
             .await;
             match result {
-                Ok(compaction) => {
+                Ok(SubscriptionCompaction {
+                    compaction,
+                    retained_tail,
+                }) => {
                     record(
                         &mut journal,
                         &events,
@@ -3523,6 +3559,8 @@ async fn run_agent_session_store_kernel_inner(
                                 "summary": compaction.summary,
                                 "automatic": true,
                                 "trigger": "provider_input_size",
+                                "retained_messages": retained_tail.len(),
+                                COMPACTION_RETAINED_TAIL_FIELD: &retained_tail,
                             }),
                         },
                     )
@@ -6044,6 +6082,14 @@ fn native_conversation(
                         "Previous conversation summary:\n\n{summary}"
                     )));
                 }
+                // The bounded verbatim tail the compaction kept, replayed from
+                // the boundary event itself. Reading it here rather than from
+                // the pre-boundary events is what makes it survive: a resumed
+                // or forked session loads its context from this event onward,
+                // so the messages it was distilled from are no longer present.
+                let retained_tail = retained_compaction_tail(payload);
+                unresolved_prompts.retain(|prompt| !retained_tail.contains(prompt));
+                conversation.extend(retained_tail);
                 conversation.extend(unresolved_prompts);
                 native_structured_in_turn = false;
             }
@@ -6375,6 +6421,24 @@ fn compaction_restarts_replay(payload: &Value) -> bool {
             == Some(true)
 }
 
+/// Field on a completed `context_compaction` event carrying the verbatim tail
+/// kept across the boundary. Older events have no such field and replay as a
+/// summary alone, so adding it does not invalidate any journal already written.
+const COMPACTION_RETAINED_TAIL_FIELD: &str = "retained_tail";
+
+/// The verbatim tail a compaction boundary kept, or nothing when the event
+/// predates the field or carries a payload that is not the model-turn
+/// contract. A tail that cannot be read is dropped rather than failing the
+/// replay: the summary alone is a correct, if poorer, context.
+fn retained_compaction_tail(payload: &Value) -> Vec<borg_provider::provider::ModelMessage> {
+    payload
+        .get(COMPACTION_RETAINED_TAIL_FIELD)
+        .and_then(|tail| {
+            serde_json::from_value::<Vec<borg_provider::provider::ModelMessage>>(tail.clone()).ok()
+        })
+        .unwrap_or_default()
+}
+
 fn is_context_prompt(message: &borg_provider::provider::ModelMessage) -> bool {
     matches!(
         message,
@@ -6513,6 +6577,21 @@ struct SubscriptionCompactionRequest<'a> {
     events: &'a [SessionEvent],
     actor: EventActor,
     current_prompt: &'a str,
+    /// Characters of the most recent conversation kept verbatim alongside the
+    /// summary. A field rather than a constant read inside the fold so a
+    /// per-model budget can be supplied without changing the fold.
+    retained_tail_budget_chars: usize,
+}
+
+/// A subscription compaction: the folded summary, plus the bounded verbatim
+/// tail that is journaled with it.
+///
+/// Separate from [`crate::AgentCompaction`], which is the provider-facing
+/// result of one summarization call. The tail is Borg's own replay policy and
+/// never reaches a provider as a compaction output.
+struct SubscriptionCompaction {
+    compaction: AgentCompaction,
+    retained_tail: Vec<borg_provider::provider::ModelMessage>,
 }
 
 /// Compact an oversized subscription replay without omitting whole messages.
@@ -6523,9 +6602,14 @@ struct SubscriptionCompactionRequest<'a> {
 /// oldest-first: each pass updates a running summary with the next bounded
 /// chunk. Every message reaches the summarizer and every provider request stays
 /// inside the hard input budget.
+///
+/// The most recent messages are also returned verbatim, so the post-boundary
+/// context is not summary-only. The caller journals that tail on the durable
+/// `context_compaction` event, which is what makes it survive a resume or a
+/// fork.
 async fn compact_subscription_context_for_budget(
     request: SubscriptionCompactionRequest<'_>,
-) -> Result<AgentCompaction> {
+) -> Result<SubscriptionCompaction> {
     let SubscriptionCompactionRequest {
         executor,
         session_id,
@@ -6535,6 +6619,7 @@ async fn compact_subscription_context_for_budget(
         events,
         actor,
         current_prompt,
+        retained_tail_budget_chars,
     } = request;
     anyhow::ensure!(
         subscription_prompt_chars(None, actor, current_prompt) <= SUBSCRIPTION_INPUT_BUDGET_CHARS,
@@ -6591,11 +6676,173 @@ async fn compact_subscription_context_for_budget(
         "subscription context compaction summary exceeds the {}-character provider input budget",
         SUBSCRIPTION_INPUT_BUDGET_CHARS
     );
-    Ok(AgentCompaction {
-        summary,
-        usage,
-        provider_session_id,
+    // The summary is the floor; whatever verbatim tail still fits under the
+    // hard input budget is kept on top of it. Trimming the tail rather than the
+    // summary keeps the lossy step the one the summarizer already made. The fit
+    // is measured against the replay this boundary will actually rebuild, not
+    // against the raw summary, because framing and JSON escaping are part of
+    // what the provider receives.
+    let mut retained_tail = retain_recent_subscription_messages(
+        &conversation,
+        retained_tail_budget_chars,
+        current_prompt,
+    );
+    fit_retained_tail_to_budget(&summary, &mut retained_tail, actor, current_prompt);
+    Ok(SubscriptionCompaction {
+        compaction: AgentCompaction {
+            summary,
+            usage,
+            provider_session_id,
+        },
+        retained_tail,
     })
+}
+
+/// Drop the oldest tail messages until the replay this boundary rebuilds fits
+/// the provider input budget.
+///
+/// The summary is never trimmed here: it is the one part of the context that
+/// cannot be recovered from anywhere else once the boundary is written, while
+/// every tail message is still in the durable journal.
+fn fit_retained_tail_to_budget(
+    summary: &str,
+    retained_tail: &mut Vec<borg_provider::provider::ModelMessage>,
+    actor: EventActor,
+    current_prompt: &str,
+) {
+    while !retained_tail.is_empty()
+        && subscription_prompt_chars(
+            Some(&compacted_replay_context(summary, retained_tail)),
+            actor,
+            current_prompt,
+        ) > SUBSCRIPTION_INPUT_BUDGET_CHARS
+    {
+        retained_tail.remove(0);
+        drop_leading_orphan_tool_results(retained_tail);
+    }
+}
+
+/// Characters of verbatim recent conversation kept after a compaction summary.
+fn subscription_retained_tail_budget_chars(input_budget_chars: usize) -> usize {
+    input_budget_chars / 100 * SUBSCRIPTION_COMPACT_RETAIN_PERCENT
+}
+
+/// The replay a compaction boundary rebuilds: the summary message this fold
+/// produced, followed by the verbatim tail kept with it. Must stay in step with
+/// the boundary arm of [`native_conversation`], which is what actually
+/// reconstructs it on resume.
+fn compacted_replay_context(
+    summary: &str,
+    retained_tail: &[borg_provider::provider::ModelMessage],
+) -> String {
+    let mut conversation = vec![borg_provider::provider::ModelMessage::user(format!(
+        "Previous conversation summary:\n\n{summary}"
+    ))];
+    conversation.extend_from_slice(retained_tail);
+    format_subscription_conversation_with_tool_limit(&conversation, None)
+}
+
+/// Drop tool results whose originating call is no longer in the window, so a
+/// trimmed tail never opens with an answer to a question the model cannot see.
+fn drop_leading_orphan_tool_results(tail: &mut Vec<borg_provider::provider::ModelMessage>) {
+    while matches!(
+        tail.first(),
+        Some(borg_provider::provider::ModelMessage::Tool { .. })
+    ) {
+        tail.remove(0);
+    }
+}
+
+/// The most recent whole messages that render within `budget_chars`.
+///
+/// Three rules make the result safe to replay rather than merely small:
+/// selection is a suffix, so no message is reordered; a tool result whose call
+/// falls outside the window is dropped, so a tool call and its result are never
+/// separated; and `current_prompt` is excluded, because the prompt this turn is
+/// about to send can already be journaled as an admitted message and would
+/// otherwise reach the provider twice.
+///
+/// Attachments and provider-native state are not carried. The subscription
+/// replay renders this tail to text (`format_subscription_message`), which
+/// reads neither, so keeping them would make the journaled payload unbounded
+/// while buying the provider nothing.
+fn retain_recent_subscription_messages(
+    conversation: &[borg_provider::provider::ModelMessage],
+    budget_chars: usize,
+    current_prompt: &str,
+) -> Vec<borg_provider::provider::ModelMessage> {
+    use borg_provider::provider::ModelMessage;
+
+    let mut start = conversation.len();
+    let mut used = 0usize;
+    while start > 0 {
+        let message = &conversation[start - 1];
+        if is_context_prompt(message) && message_content_is(message, current_prompt) {
+            start -= 1;
+            continue;
+        }
+        let chars = format_subscription_frame(&format_subscription_message(message))
+            .chars()
+            .count()
+            .saturating_add(1);
+        if used.saturating_add(chars) > budget_chars {
+            break;
+        }
+        used = used.saturating_add(chars);
+        start -= 1;
+    }
+    let mut tail = conversation[start..]
+        .iter()
+        .filter(|message| {
+            !(is_context_prompt(message) && message_content_is(message, current_prompt))
+        })
+        .map(retained_tail_message)
+        .collect::<Vec<ModelMessage>>();
+    drop_leading_orphan_tool_results(&mut tail);
+    tail
+}
+
+/// Strip everything the subscription replay does not render, so a journaled
+/// tail stays bounded by the character budget that selected it.
+fn retained_tail_message(
+    message: &borg_provider::provider::ModelMessage,
+) -> borg_provider::provider::ModelMessage {
+    use borg_provider::provider::ModelMessage;
+
+    match message {
+        ModelMessage::User { content, .. } => ModelMessage::user(content.clone()),
+        ModelMessage::Tool {
+            tool_call_id,
+            content,
+            ..
+        } => ModelMessage::tool(tool_call_id.clone(), content.clone()),
+        ModelMessage::Assistant {
+            content,
+            reasoning_content,
+            tool_calls,
+            ..
+        } => ModelMessage::assistant(
+            content.clone(),
+            reasoning_content.clone(),
+            None,
+            tool_calls.clone(),
+        ),
+        ModelMessage::System { content } => ModelMessage::System {
+            content: content.clone(),
+        },
+    }
+}
+
+fn message_content_is(message: &borg_provider::provider::ModelMessage, text: &str) -> bool {
+    use borg_provider::provider::ModelMessage;
+
+    if text.is_empty() {
+        return false;
+    }
+    match message {
+        ModelMessage::User { content, .. } | ModelMessage::System { content } => content == text,
+        _ => false,
+    }
 }
 
 /// Run one internal compaction provider turn and return its summary.

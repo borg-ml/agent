@@ -10668,13 +10668,188 @@ async fn subscription_compaction_truncates_provider_summary_before_replay() {
         events: &events,
         actor: EventActor::User,
         current_prompt: "continue",
+        retained_tail_budget_chars: subscription_retained_tail_budget_chars(
+            SUBSCRIPTION_INPUT_BUDGET_CHARS,
+        ),
     })
     .await
-    .unwrap();
+    .unwrap()
+    .compaction;
 
     assert!(compaction.summary.chars().count() <= SUBSCRIPTION_INPUT_BUDGET_CHARS);
     assert!(compaction.summary.starts_with("summary-start"));
     assert!(compaction.summary.ends_with("summary-end"));
+}
+
+/// A resumed or forked session loads its context from the compaction boundary
+/// forward, so the messages a verbatim tail was taken from are no longer there
+/// to take it from again. Rebuilding the tail from the boundary event itself is
+/// the whole of its durability: derive it from the pre-boundary events instead
+/// and the live turn keeps it while every resume silently drops back to a
+/// summary-only context.
+#[test]
+fn subscription_compaction_tail_replays_from_the_boundary_event_alone() {
+    use borg_provider::provider::{ModelMessage, ModelToolCall};
+
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let tail = vec![
+        ModelMessage::assistant(
+            None,
+            None,
+            None,
+            vec![ModelToolCall::function(
+                "call-1".to_string(),
+                "read_file".to_string(),
+                r#"{"path":"src/main.rs"}"#.to_string(),
+            )],
+        ),
+        ModelMessage::tool("call-1", "fn main() {}"),
+        ModelMessage::user("keep the exact identifier BORG-4821"),
+    ];
+    let events = vec![
+        SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Claude,
+                kind: "context_compaction".to_string(),
+                payload: json!({
+                    "status": "completed",
+                    "summary": "preserved decisions",
+                    "retained_tail": tail,
+                }),
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::TurnStarted {
+                message_id,
+                provider: CodingProvider::Claude,
+                model: Some("claude-sonnet-5".to_string()),
+                effort: None,
+                fast: false,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            3,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: "continue".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            4,
+            SessionEventKind::TurnCompleted {
+                message_id,
+                provider_session_id: None,
+                final_text: "done".to_string(),
+                error: None,
+            },
+        ),
+    ];
+
+    let mut expected = vec![ModelMessage::user(
+        "Previous conversation summary:\n\npreserved decisions",
+    )];
+    expected.extend(tail);
+    expected.push(ModelMessage::user("continue"));
+    assert_eq!(
+        native_conversation(&events, CodingProvider::Claude).unwrap(),
+        expected
+    );
+}
+
+/// Two ways a bounded tail turns into a corrupt one: it can open on a tool
+/// result whose call fell outside the window, which asks the model to trust an
+/// answer to a question it cannot see, and it can carry the prompt this turn is
+/// about to send, which delivers that prompt to the provider twice.
+#[test]
+fn a_retained_tail_keeps_whole_tool_units_and_excludes_the_current_prompt() {
+    use borg_provider::provider::{ModelMessage, ModelToolCall};
+
+    let conversation = vec![
+        ModelMessage::user("old request"),
+        ModelMessage::assistant(
+            None,
+            None,
+            None,
+            vec![ModelToolCall::function(
+                "call-1".to_string(),
+                "read_file".to_string(),
+                "{}".to_string(),
+            )],
+        ),
+        ModelMessage::tool("call-1", "file contents"),
+        ModelMessage::assistant(Some("done".to_string()), None, None, Vec::new()),
+        ModelMessage::user("current prompt"),
+    ];
+    let frame_chars = |message: &ModelMessage| {
+        format_subscription_frame(&format_subscription_message(message))
+            .chars()
+            .count()
+            + 1
+    };
+
+    // A window that reaches the tool result but not the call that produced it.
+    let orphaned = retain_recent_subscription_messages(
+        &conversation,
+        frame_chars(&conversation[2]) + frame_chars(&conversation[3]),
+        "current prompt",
+    );
+    assert_eq!(
+        orphaned,
+        vec![ModelMessage::assistant(
+            Some("done".to_string()),
+            None,
+            None,
+            Vec::new()
+        )]
+    );
+
+    let whole = retain_recent_subscription_messages(
+        &conversation,
+        SUBSCRIPTION_INPUT_BUDGET_CHARS,
+        "current prompt",
+    );
+    assert_eq!(whole, &conversation[..4]);
+}
+
+/// The provider input budget is a hard limit: a replay that exceeds it fails
+/// the turn outright. Compaction runs precisely when the conversation is large,
+/// so a large prompt can leave less headroom than the tail budget, and the tail
+/// has to give way rather than the summary that replaced the history.
+#[test]
+fn a_retained_tail_is_trimmed_until_the_compacted_replay_fits_the_budget() {
+    use borg_provider::provider::ModelMessage;
+
+    let summary = "s".repeat(COMPACTION_RUNNING_SUMMARY_BUDGET_CHARS);
+    let prompt = "p".repeat(
+        SUBSCRIPTION_INPUT_BUDGET_CHARS - COMPACTION_RUNNING_SUMMARY_BUDGET_CHARS - 16 * 1024,
+    );
+    let mut tail = vec![ModelMessage::user("x".repeat(8 * 1024)); 4];
+
+    fit_retained_tail_to_budget(&summary, &mut tail, EventActor::User, &prompt);
+
+    assert!(
+        !tail.is_empty(),
+        "the tail must give way message by message, not all at once"
+    );
+    assert!(tail.len() < 4);
+    assert!(
+        subscription_prompt_chars(
+            Some(&compacted_replay_context(&summary, &tail)),
+            EventActor::User,
+            &prompt,
+        ) <= SUBSCRIPTION_INPUT_BUDGET_CHARS
+    );
 }
 
 #[test]
