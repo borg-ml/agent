@@ -189,23 +189,66 @@ prebumped_release_commit() {
   return 1
 }
 
-# The release suite runs the session-journal tests, and those require a real
-# PostgreSQL server. Check for one here, before the fetch and long before the
-# version bump: without this check the first signal an operator gets is a
-# mutated manifest followed by a wall of connection panics, which reads like a
-# code regression rather than an unconfigured environment.
-require_test_environment() {
-  local variable
-  local value
-  for variable in BORG_TEST_SESSIONS_URL BORG_SESSIONS_URL; do
-    value="$(printf '%s' "${!variable-}" | tr -d '[:space:]')"
-    [[ -n "$value" ]] ||
-      die "$variable is not set, so the release tests have no session journal to run against.
-  Set both BORG_TEST_SESSIONS_URL and BORG_SESSIONS_URL to an isolated test server
-  whose role may create databases. The tests create and drop their own scratch
-  databases, so neither variable may name a production journal.
-  See docs/session-store-backends.md."
-  done
+# Never inherit the interactive session journal as a release test database.
+prepare_test_environment() {
+  if [[ -n "$(printf "%s" "${BORG_TEST_SESSIONS_URL:-}" | tr -d "[:space:]")" ]]; then
+    export BORG_SESSIONS_URL="$BORG_TEST_SESSIONS_URL"
+    return
+  fi
+  (
+    if ! command -v initdb >/dev/null || ! command -v pg_ctl >/dev/null; then
+      if command -v pg_config >/dev/null; then
+        PATH="$(pg_config --bindir):$PATH"
+        export PATH
+      fi
+    fi
+    if ! command -v initdb >/dev/null || ! command -v pg_ctl >/dev/null; then
+      die "PostgreSQL server binaries (initdb and pg_ctl) are required for automatic release tests"
+    fi
+    local test_home port password _attempt started=0
+    test_home="$(mktemp -d "${TMPDIR:-/tmp}/borg-release-pg.XXXXXX")"
+    # shellcheck disable=SC2329 # Called by the EXIT trap.
+    cleanup_test_database() {
+      local status="$?"
+      trap - EXIT
+      if [[ -f "$test_home/data/postmaster.pid" ]]; then
+        if ! pg_ctl -D "$test_home/data" -m immediate -w stop >>"$test_home/server.log" 2>&1; then
+          echo "release: test database cleanup failed; retained $test_home" >&2
+          exit 1
+        fi
+      fi
+      rm -rf -- "$test_home"
+      exit "$status"
+    }
+    trap cleanup_test_database EXIT
+    trap "exit 130" INT
+    trap "exit 143" TERM
+    password="$(od -An -N24 -tx1 /dev/urandom | tr -d "[:space:]")"
+    printf "%s\n" "$password" >"$test_home/password"
+    if ! initdb -D "$test_home/data" -U postgres --encoding=UTF8 -A scram-sha-256 \
+      --pwfile="$test_home/password" >"$test_home/init.log" 2>&1; then
+      cat "$test_home/init.log" >&2
+      die "could not initialize the isolated release test database"
+    fi
+    rm -- "$test_home/password"
+    for _attempt in 1 2 3 4 5; do
+      port=$((49152 + RANDOM % 16384))
+      if pg_ctl -D "$test_home/data" -l "$test_home/server.log" \
+        -o "-h 127.0.0.1 -p $port -k \"$test_home\"" -w start >"$test_home/start.log" 2>&1; then
+        started=1
+        break
+      fi
+    done
+    if [[ "$started" -ne 1 ]]; then
+      cat "$test_home/start.log" "$test_home/server.log" >&2
+      die "could not start the isolated release test database"
+    fi
+    export BORG_TEST_SESSIONS_URL="postgres://postgres:$password@127.0.0.1:$port/postgres"
+    export BORG_SESSIONS_URL="$BORG_TEST_SESSIONS_URL"
+    echo "Release tests: using an automatically provisioned isolated PostgreSQL server."
+    "$BASH" "$script_dir/release.sh" "$@"
+  )
+  exit "$?"
 }
 
 run_release_checks() (
@@ -219,6 +262,7 @@ run_release_checks() (
   git diff --check -- Cargo.toml Cargo.lock
 )
 
+release_args=("$@")
 mode="release"
 release_kind="patch"
 if [[ "${1:-}" == "--next-version" ]]; then
@@ -266,7 +310,7 @@ if [[ "$mode" == "verify-tag" ]]; then
   exit 0
 fi
 
-require_test_environment
+prepare_test_environment "${release_args[@]}"
 
 requested_version="${1:-}"
 requested_version="${requested_version#v}"

@@ -209,6 +209,14 @@ contract tests fail with an actionable message rather than skipping, because a
 suite that silently skips its own storage contracts reports green for a
 database it never touched:
 
+`just release`, `just release-minor`, and `just release-check` automatically
+start an isolated temporary PostgreSQL server and stop/remove it afterward,
+including on failure. They use locally installed `initdb` and `pg_ctl` (also
+discovered through `pg_config`), so no database URL setup is needed. An explicit
+`BORG_TEST_SESSIONS_URL` opts into an existing disposable server; release tests
+always set `BORG_SESSIONS_URL` to that same test URL, never the inherited
+interactive journal.
+
 Use a disposable test server. For a full workspace run, also pin the runtime
 URL to a disposable database: entrypoints that resolve configuration must not
 fall back to your normal journal. Neither URL should name a production journal.

@@ -194,8 +194,9 @@ make_fixture() {
   git -C "$fixture" tag -a "v$version" -m "Borg Agent $version"
 
   cp "$release_script" "$fixture/scripts/release.sh"
+  cp "$repo_root/Justfile" "$fixture/Justfile"
   chmod +x "$fixture/scripts/release.sh"
-  git -C "$fixture" add scripts/release.sh
+  git -C "$fixture" add scripts/release.sh Justfile
   git -C "$fixture" commit --quiet -m "Add release tooling"
 
   git init --quiet --bare "$origin"
@@ -211,6 +212,7 @@ mkdir -p "$fake_bin"
   echo '#!/usr/bin/env bash'
   echo 'set -euo pipefail'
   echo 'printf "%s\n" "$*" >>"${FAKE_CARGO_LOG:?}"'
+  echo '[[ "${BORG_TEST_SESSIONS_URL:?}" == "${BORG_SESSIONS_URL:?}" ]]'
   echo 'case "${1:-}" in'
   echo '  check)'
   cat <<'FAKE_CARGO'
@@ -257,6 +259,9 @@ FAKE_CARGO
   echo '    ;;'
   echo '  test)'
   echo '    [[ "${FAKE_CARGO_FAIL:-}" != "test" ]] || exit 42'
+  echo '    if [[ -n "${REAL_PG_CTL:-}" && -n "${FAKE_PG_LOG:-}" ]]; then'
+  echo '      psql "$BORG_TEST_SESSIONS_URL" -X -v ON_ERROR_STOP=1 -c "CREATE DATABASE release_smoke" -c "DROP DATABASE release_smoke" >/dev/null'
+  echo '    fi'
   echo '    ;;'
   echo '  *)'
   echo '    echo "unexpected fake cargo invocation: $*" >&2'
@@ -266,21 +271,20 @@ FAKE_CARGO
 } >"$fake_bin/cargo"
 chmod +x "$fake_bin/cargo"
 
-# release.sh refuses to start without a configured session-journal test server.
-# The fixtures never reach a real test run -- cargo is faked -- so this URL is
-# only ever read by that check and is never connected to.
+# Most fixtures use an explicit test URL and fake Cargo; no server is contacted.
 readonly FIXTURE_SESSIONS_URL="postgres://release-test@127.0.0.1:5432/postgres"
 
 run_release() {
   local fixture="$1"
   shift
-  local cargo_log="$test_root/$(basename "$fixture")-fake-cargo.log"
+  local cargo_log
+  cargo_log="$test_root/$(basename "$fixture")-fake-cargo.log"
   : >"$cargo_log"
   (
     cd "$fixture"
     PATH="$fake_bin:$PATH" FAKE_CARGO_LOG="$cargo_log" \
       BORG_TEST_SESSIONS_URL="$FIXTURE_SESSIONS_URL" \
-      BORG_SESSIONS_URL="$FIXTURE_SESSIONS_URL" \
+      BORG_SESSIONS_URL="postgres://must-not-use-production.invalid/journal" \
       ./scripts/release.sh "$@"
   )
 }
@@ -289,13 +293,14 @@ run_release_with_touch() {
   local fixture="$1"
   local touch_file="$2"
   shift 2
-  local cargo_log="$test_root/$(basename "$fixture")-fake-cargo.log"
+  local cargo_log
+  cargo_log="$test_root/$(basename "$fixture")-fake-cargo.log"
   : >"$cargo_log"
   (
     cd "$fixture"
     PATH="$fake_bin:$PATH" FAKE_CARGO_LOG="$cargo_log" \
       BORG_TEST_SESSIONS_URL="$FIXTURE_SESSIONS_URL" \
-      BORG_SESSIONS_URL="$FIXTURE_SESSIONS_URL" \
+      BORG_SESSIONS_URL="postgres://must-not-use-production.invalid/journal" \
       FAKE_CARGO_TOUCH_FILE="$touch_file" ./scripts/release.sh "$@"
   )
 }
@@ -419,7 +424,7 @@ if (
   cd "$rollback_fixture"
   PATH="$fake_bin:$PATH" FAKE_CARGO_LOG="$rollback_log" FAKE_CARGO_FAIL=test \
     BORG_TEST_SESSIONS_URL="$FIXTURE_SESSIONS_URL" \
-    BORG_SESSIONS_URL="$FIXTURE_SESSIONS_URL" \
+    BORG_SESSIONS_URL="postgres://must-not-use-production.invalid/journal" \
     ./scripts/release.sh
 ) >/dev/null 2>&1; then
   fail "a failing release unexpectedly succeeded"
@@ -437,60 +442,63 @@ if git -C "$rollback_fixture" rev-parse --verify 'refs/tags/v1.2.4^{commit}' \
   fail "failed release created a tag"
 fi
 
-# The release suite needs a PostgreSQL server, and release.sh must refuse
-# before it fetches, bumps the version or runs anything. The rollback case
-# above only proves the manifest is restored AFTER a failed test run; it cannot
-# catch a preflight that runs too late or not at all, which is what turned a
-# missing variable into a wall of storage failures on a mutated manifest. Each
-# variable is checked on its own, blank as well as unset, because a half
-# configured environment is the one that reaches a production journal.
-preflight_fixture="$(make_fixture preflight)"
-preflight_manifest="$(sha256sum "$preflight_fixture/Cargo.toml")"
-preflight_lock="$(sha256sum "$preflight_fixture/Cargo.lock")"
-preflight_head="$(git -C "$preflight_fixture" rev-parse HEAD)"
-preflight_origin="$test_root/preflight-origin.git"
-preflight_remote_head="$(git --git-dir="$preflight_origin" rev-parse refs/heads/main)"
-preflight_log="$test_root/preflight-fake-cargo.log"
-
-for preflight_variable in BORG_TEST_SESSIONS_URL BORG_SESSIONS_URL; do
-  for preflight_value in "" "   " "$(printf '\t')"; do
-    for preflight_mode in "" "--check"; do
-      label="$preflight_variable='$preflight_value' ${preflight_mode:-release}"
-      : >"$preflight_log"
-      if (
-        cd "$preflight_fixture"
-        export PATH="$fake_bin:$PATH"
-        export FAKE_CARGO_LOG="$preflight_log"
-        export BORG_TEST_SESSIONS_URL="$FIXTURE_SESSIONS_URL"
-        export BORG_SESSIONS_URL="$FIXTURE_SESSIONS_URL"
-        export "$preflight_variable=$preflight_value"
-        ./scripts/release.sh ${preflight_mode:+"$preflight_mode"}
-      ) >/dev/null 2>&1; then
-        fail "release ran without a configured test journal ($label)"
-      fi
-      [[ ! -s "$preflight_log" ]] ||
-        fail "release invoked cargo without a configured test journal ($label)"
-      assert_equal "$preflight_manifest" \
-        "$(sha256sum "$preflight_fixture/Cargo.toml")" \
-        "Cargo.toml after refused release ($label)"
-      assert_equal "$preflight_lock" \
-        "$(sha256sum "$preflight_fixture/Cargo.lock")" \
-        "Cargo.lock after refused release ($label)"
-      assert_equal "$preflight_head" \
-        "$(git -C "$preflight_fixture" rev-parse HEAD)" \
-        "HEAD after refused release ($label)"
-      assert_equal "$preflight_remote_head" \
-        "$(git --git-dir="$preflight_origin" rev-parse refs/heads/main)" \
-        "remote main after refused release ($label)"
-      [[ -z "$(git -C "$preflight_fixture" status --porcelain)" ]] ||
-        fail "refused release left a dirty fixture ($label)"
-      if git -C "$preflight_fixture" rev-parse --verify 'refs/tags/v1.2.4^{commit}' \
-        >/dev/null 2>&1; then
-        fail "refused release created a tag ($label)"
-      fi
-    done
-  done
+# Automatic provisioning must never reuse an inherited production journal,
+# must preserve patch/minor arguments, and must clean up even on test failure.
+cat >"$fake_bin/initdb" <<"FAKE_INITDB"
+#!/usr/bin/env bash
+set -euo pipefail
+printf "init:%s\n" "$2" >>"${FAKE_PG_LOG:?}"
+[[ "${FAKE_PG_FAIL:-}" != "init" ]] || exit 1
+if [[ "${REAL_INITDB:-}" != "" ]]; then exec "$REAL_INITDB" "$@"; fi
+mkdir -p "$2"
+FAKE_INITDB
+cat >"$fake_bin/pg_ctl" <<"FAKE_PG_CTL"
+#!/usr/bin/env bash
+set -euo pipefail
+printf "%s:%s\n" "${!#}" "$2" >>"${FAKE_PG_LOG:?}"
+if [[ "${REAL_PG_CTL:-}" != "" ]]; then exec "$REAL_PG_CTL" "$@"; fi
+case "${!#}" in
+  start) touch "$2/postmaster.pid" ;;
+  stop) rm "$2/postmaster.pid" ;;
+  *) exit 1 ;;
+esac
+FAKE_PG_CTL
+chmod +x "$fake_bin/initdb" "$fake_bin/pg_ctl"
+for auto_mode in patch minor check failure init-failure; do
+  auto_fixture="$(make_fixture "auto-$auto_mode")"
+  auto_log="$test_root/auto-$auto_mode-pg.log"
+  status=0
+  (
+    cd "$auto_fixture"
+    export PATH="$fake_bin:$PATH" FAKE_PG_LOG="$auto_log"
+    export FAKE_CARGO_LOG="$test_root/auto-$auto_mode-cargo.log"
+    unset BORG_TEST_SESSIONS_URL
+    export BORG_SESSIONS_URL="postgres://must-not-use-production.invalid/journal"
+    [[ "$auto_mode" != failure ]] || export FAKE_CARGO_FAIL=test
+    [[ "$auto_mode" != init-failure ]] || export FAKE_PG_FAIL=init
+    case "$auto_mode" in
+      minor) just release-minor ;;
+      check) just release-check ;;
+      *) just release ;;
+    esac
+  ) >"$test_root/auto-$auto_mode.log" 2>&1 || status="$?"
+  expected=1.2.3
+  case "$auto_mode" in
+    patch) expected=1.2.4; assert_equal 0 "$status" "automatic patch release" ;;
+    minor) expected=1.3.0; assert_equal 0 "$status" "automatic minor release" ;;
+    check) assert_equal 0 "$status" "automatic release check" ;;
+    *) [[ "$status" -ne 0 ]] || fail "automatic failed release succeeded" ;;
+  esac
+  assert_equal "$expected" "$(fixture_version "$auto_fixture")" "automatic $auto_mode version"
+  auto_data="$(sed -n "s/^init://p" "$auto_log")"
+  [[ ! -e "$(dirname "$auto_data")" ]] || fail "automatic $auto_mode leaked its database directory"
+  if [[ "$auto_mode" != init-failure ]]; then
+    grep -Fxq "stop:$auto_data" "$auto_log" || fail "automatic $auto_mode did not stop PostgreSQL"
+  else
+    [[ ! -s "$test_root/auto-$auto_mode-cargo.log" ]] || fail "failed database initialization reached cargo"
+  fi
 done
+preflight_fixture="$(make_fixture preflight)"
 
 # Tag verification compares two strings and runs no tests, so it must stay
 # usable without a journal; the release workflow calls it on a runner before
@@ -501,8 +509,7 @@ done
     ./scripts/release.sh --verify-tag v1.2.3
 ) >/dev/null || fail "tag verification requires a test journal it never uses"
 
-# A fully configured environment still reaches the version bump, so the check
-# above is proving ordering rather than simply blocking every release.
+# An explicit test URL also overrides an inherited interactive session URL.
 run_release "$preflight_fixture"
 assert_equal "1.2.4" "$(fixture_version "$preflight_fixture")" \
   "release version once the test journal is configured"
