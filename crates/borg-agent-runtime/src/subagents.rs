@@ -8152,6 +8152,15 @@ async fn update_from_session_event(
                 SessionStatus::Stopped => SubagentStatus::Stopped,
             };
             entry.snapshot.detail = detail.clone();
+            // An idle child stays reusable for the life of the parent, so its
+            // actor would otherwise retain the whole conversation between
+            // turns. Release that in-memory context: the actor stays live and
+            // addressable, and the durable journal is untouched.
+            if entry.snapshot.status == SubagentStatus::Ready
+                && let Some(commands) = &entry.commands
+            {
+                let _ = commands.try_send(HostCommand::ReleaseRetainedContext { session_id });
+            }
         }
         SessionEventKind::Message {
             actor: EventActor::Assistant,

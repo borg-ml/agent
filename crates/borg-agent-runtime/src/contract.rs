@@ -1409,6 +1409,12 @@ pub enum HostCommand {
     ClearContext {
         session_id: Uuid,
     },
+    /// Drop an idle actor's retained in-memory context while keeping the
+    /// session live. The durable journal is untouched; the next turn reloads
+    /// it from the store.
+    ReleaseRetainedContext {
+        session_id: Uuid,
+    },
     Stop {
         session_id: Uuid,
     },
@@ -1453,6 +1459,7 @@ impl HostCommand {
             | Self::StopWatch { session_id, .. }
             | Self::Compact { session_id }
             | Self::ClearContext { session_id }
+            | Self::ReleaseRetainedContext { session_id }
             | Self::Stop { session_id } => Some(*session_id),
             Self::WorkspaceFilesystem { .. }
             | Self::CancelWorkspaceFilesystem { .. }

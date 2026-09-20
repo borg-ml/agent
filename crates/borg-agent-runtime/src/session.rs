@@ -3289,6 +3289,17 @@ async fn run_agent_session_store_kernel_inner(
                         )
                         .await?;
                     }
+                    Some(HostCommand::ReleaseRetainedContext {
+                        session_id: command_session_id,
+                    }) if command_session_id == session_id => {
+                        // An idle child is kept reusable for the life of the
+                        // parent, so its retained replay would otherwise pin the
+                        // whole conversation. Trim the in-memory projection and
+                        // mark it incomplete; the durable journal is untouched
+                        // and the next turn reloads it from the store.
+                        journal.retain_latest_turn_checkpoint();
+                        retained_context = None;
+                    }
                     Some(HostCommand::Stop {
                         session_id: command_session_id,
                     }) if command_session_id == session_id => {
@@ -5553,7 +5564,8 @@ async fn run_agent_session_store_kernel_inner(
                             stop(&mut journal, &events, session_id).await?;
                             return Ok(());
                         }
-                        HostCommand::Launch { .. }
+                        HostCommand::ReleaseRetainedContext { .. }
+                        | HostCommand::Launch { .. }
                         | HostCommand::Approve { .. }
                         | HostCommand::RespondToProviderInteraction { .. }
                         | HostCommand::WorkspaceFilesystem { .. }

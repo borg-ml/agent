@@ -2369,6 +2369,76 @@ fn ready_children_do_not_consume_live_child_limit() {
 }
 
 #[tokio::test]
+async fn an_idle_child_releases_retained_context_and_a_stop_still_stops() {
+    let table = Arc::new(Mutex::new(SubagentTable {
+        root_session_id: Uuid::new_v4(),
+        max_children: 4,
+        entries: HashMap::new(),
+        task_names: HashMap::new(),
+    }));
+    let (child_id, mut released_rx) = {
+        let mut table = table.lock().await;
+        let child = table.reserve("worker", &launch()).unwrap();
+        let (commands, released_rx) = mpsc::channel(4);
+        let entry = table.entries.get_mut(&child.session_id).unwrap();
+        entry.snapshot.status = SubagentStatus::Running;
+        entry.commands = Some(commands);
+        (child.session_id, released_rx)
+    };
+
+    update_from_session_event(
+        &table,
+        child_id,
+        &SessionEvent::new(
+            child_id,
+            1,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                detail: None,
+            },
+        ),
+    )
+    .await;
+
+    {
+        let table = table.lock().await;
+        let entry = table.entries.get(&child_id).unwrap();
+        assert_eq!(entry.snapshot.status, SubagentStatus::Ready);
+        assert!(
+            entry.commands.is_some(),
+            "an idle child must stay addressable and wakeable"
+        );
+        assert!(!entry.dormant);
+    }
+    assert!(matches!(
+        released_rx.try_recv(),
+        Ok(HostCommand::ReleaseRetainedContext { session_id }) if session_id == child_id
+    ));
+
+    update_from_session_event(
+        &table,
+        child_id,
+        &SessionEvent::new(
+            child_id,
+            2,
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Stopped,
+                detail: None,
+            },
+        ),
+    )
+    .await;
+    assert!(matches!(
+        finish_agent(&table, child_id, None).await,
+        Some(SubagentActivity::Stopped { .. })
+    ));
+    assert_eq!(
+        table.lock().await.entries[&child_id].snapshot.status,
+        SubagentStatus::Stopped
+    );
+}
+
+#[tokio::test]
 async fn child_messages_are_team_scoped_and_can_report_to_root() {
     let directory = tempdir().unwrap();
     let root = Uuid::new_v4();
