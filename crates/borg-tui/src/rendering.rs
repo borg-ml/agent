@@ -277,8 +277,12 @@ fn syntax_lines(language: &str, source: &str, width: usize, wrap: bool) -> Vec<L
                     if row == 0 {
                         spans[0].clone()
                     } else {
+                        // A dashed gutter marks a row that continues the
+                        // previous source line. Copying reads this back to
+                        // rejoin the line, so the wrap never reaches the
+                        // clipboard as a line break inside a command.
                         Span::styled(
-                            " ".repeat(gutter_width),
+                            format!("{:>digits$} \u{250a} ", ""),
                             Style::default().fg(Color::DarkGray),
                         )
                     },
@@ -1060,12 +1064,15 @@ mod tests {
     }
 
     #[test]
-    fn a_long_command_in_a_code_block_survives_a_copy_verbatim() {
-        // A sudo command in the transcript was clipped to fit the width, and
-        // the copy carried the drawn ellipsis into the path, so the pasted
-        // command wrote to `/etc/systemd/zram-generator.conf.d/20-memory-g…`
-        // and failed. Every source byte has to reach the screen for any copy
-        // path to be able to reproduce it.
+    fn code_block_rows_rejoin_into_the_exact_source() {
+        // A sudo command was clipped to fit the width, and the copy carried
+        // the drawn ellipsis into the path, so the pasted command wrote to
+        // `/etc/systemd/zram-generator.conf.d/20-memory-g\u{2026}` and failed.
+        // Wrapping keeps every byte on screen, but only the gutter tells a
+        // reader of these rows which ones resume a line, so this pins both:
+        // nothing hidden, and the rows rejoin into the source exactly. A wrap
+        // that turned into a newline inside the path would break the command
+        // just as badly as the ellipsis did.
         let command =
             "sudo tee /etc/systemd/zram-generator.conf.d/20-memory-guard.conf > /dev/null";
         let source = format!("{command}\n[zram0]\nzram-size = min(ram / 2, 8192)");
@@ -1075,23 +1082,30 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(
-            !rendered.iter().any(|line| line.contains('\u{2026}')),
+            !rendered.iter().any(|row| row.contains('\u{2026}')),
             "a code row must not hide source behind an ellipsis: {rendered:#?}"
         );
+        assert!(
+            rendered.len() > source.lines().count(),
+            "the long command has to wrap at width 40 for this to prove anything"
+        );
 
-        // Strip the line-number gutter and rejoin: wrapping may split a line
-        // across rows, but it must not add, drop, or reorder a byte.
-        let gutter = rendered
-            .first()
-            .and_then(|line| line.find('\u{2502}'))
-            .map(|index| rendered[0][..index].chars().count() + 2)
-            .expect("a code row carries a numbered gutter");
-        let recovered = rendered
-            .iter()
-            .map(|line| line.chars().skip(gutter).collect::<String>())
-            .collect::<String>();
-        assert_eq!(recovered, source.replace('\n', ""));
-        assert!(recovered.contains(command));
+        let mut lines: Vec<String> = Vec::new();
+        for row in &rendered {
+            let continuation = row.contains('\u{250a}');
+            let separator = if continuation { '\u{250a}' } else { '\u{2502}' };
+            let (_, content) = row
+                .split_once(separator)
+                .expect("every code row carries a gutter");
+            let content = content.strip_prefix(' ').unwrap_or(content);
+            match lines.last_mut() {
+                Some(previous) if continuation => previous.push_str(content),
+                _ => lines.push(content.to_string()),
+            }
+        }
+
+        assert_eq!(lines.join("\n"), source);
+        assert_eq!(lines[0], command);
     }
 
     #[test]

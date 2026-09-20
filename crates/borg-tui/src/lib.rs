@@ -12592,6 +12592,16 @@ fn apply_composer_selection(
     }
 }
 
+/// A code row carrying the dashed gutter continues the previous row's source
+/// line. `syntax_lines` wraps a long line across rows to keep every byte on
+/// screen, and that wrap is a display artefact: copying has to rejoin the rows
+/// or the clipboard gets a line break in the middle of a path.
+fn is_wrapped_code_continuation(line: &Line<'static>) -> bool {
+    line.spans
+        .first()
+        .is_some_and(|span| span.content.contains('┊'))
+}
+
 fn selection_line_ranges(line: &Line<'static>) -> Vec<(usize, usize)> {
     let width = line.width();
     if width == 0 || line.spans.iter().all(|span| span.content.trim().is_empty()) {
@@ -12620,6 +12630,9 @@ fn selection_line_ranges(line: &Line<'static>) -> Vec<(usize, usize)> {
     }
     if let Some(ranges) = diff_selection_ranges(line) {
         return ranges;
+    }
+    if is_wrapped_code_continuation(line) {
+        return vec![(first.width(), width)];
     }
     if first.contains('│')
         && first[..first.find('│').unwrap_or(0)]
@@ -12865,6 +12878,10 @@ fn selected_transcript_text(
             line_width
         };
         let selectable = selection_line_ranges(line);
+        // A following row that resumes this source line means this row is not
+        // the end of a line, so it must not be trimmed or newline-separated.
+        let continues =
+            row < last_row && lines.get(row + 1).is_some_and(is_wrapped_code_continuation);
         let mut chunks = Vec::new();
         for (selectable_start, selectable_end) in selectable {
             let chunk_start = from.max(selectable_start);
@@ -12883,8 +12900,15 @@ fn selected_transcript_text(
                     column = column.saturating_add(grapheme_width);
                 }
             }
-            let chunk = chunk.trim_end().to_string();
-            if !chunk.trim().is_empty() {
+            // The wrap point keeps its space on this row. Trimming it here
+            // is what would splice two arguments of a command together, so
+            // the trailing run survives whenever the next row resumes it.
+            let chunk = if continues {
+                chunk
+            } else {
+                chunk.trim_end().to_string()
+            };
+            if continues || !chunk.trim().is_empty() {
                 chunks.push(chunk);
             }
         }
@@ -12892,7 +12916,15 @@ fn selected_transcript_text(
             if chunks.len() == 2 && chunks[0] == chunks[1] {
                 chunks.truncate(1);
             }
-            selected.push(chunks.join("\n"));
+            let joined = chunks.join("\n");
+            match selected.last_mut() {
+                // Rejoin a wrapped row onto the line it came from. Pushing it
+                // separately is what put a newline inside a copied path.
+                Some(previous) if is_wrapped_code_continuation(line) => {
+                    previous.push_str(&joined);
+                }
+                _ => selected.push(joined),
+            }
         }
     }
     let text = selected.join("\n").trim().to_string();

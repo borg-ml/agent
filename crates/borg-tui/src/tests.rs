@@ -11989,6 +11989,40 @@ fn transcript_text_selection_uses_stable_document_rows() {
 }
 
 #[test]
+fn copying_a_wrapped_command_keeps_the_whole_path_on_one_line() {
+    // The reported failure, end to end at the copy action. A sudo command
+    // wider than the transcript was copied out and pasted back broken, so it
+    // wrote somewhere else and failed. Clipping was the first cause: the tail
+    // of the path was replaced by an ellipsis and never drawn, so no copy
+    // could recover it. Wrapping draws every byte, but a wrap is still only a
+    // display break -- copying it as a newline splits the path and breaks the
+    // command exactly as badly. Both have to stay fixed.
+    let command = "sudo tee /etc/systemd/zram-generator.conf.d/20-memory-guard.conf > /dev/null";
+    let source = format!("{command}\n[zram0]");
+    let lines = rendering::code_block_lines("bash", &source, 40);
+    assert!(
+        lines.len() > source.lines().count(),
+        "the command has to wrap at width 40 for this to prove anything"
+    );
+
+    let copied = selected_transcript_text(
+        &lines,
+        TranscriptPoint { row: 0, column: 0 },
+        TranscriptPoint {
+            row: lines.len() - 1,
+            column: usize::MAX,
+        },
+    )
+    .expect("selecting the whole block copies its source");
+
+    // Exact, including where the newlines are and where they are not.
+    assert_eq!(copied, source);
+    assert_eq!(copied.lines().next(), Some(command));
+    assert!(!copied.contains('\u{2026}'));
+    assert!(!copied.contains('\u{250a}'));
+}
+
+#[test]
 fn transcript_selection_skips_headers_and_diff_line_number_gutters() {
     let header = Line::from(vec![
         Span::raw("  ▌ borg"),
