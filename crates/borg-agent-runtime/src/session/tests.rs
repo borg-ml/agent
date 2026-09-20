@@ -4758,7 +4758,22 @@ async fn assert_interrupt_waits_for_cleanup(cooperative: bool) {
         .await
         .expect("interrupt enters provider cleanup");
 
-    let before_cleanup = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+    let mut before_cleanup = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("cancelling is visible while cleanup remains blocked")
+            .expect("session remains open");
+        let cancelling = matches!(
+            &event.kind,
+            SessionEventKind::StatusChanged { detail: Some(detail), .. }
+                if detail == "turn phase: cancelling"
+        );
+        before_cleanup.push(event);
+        if cancelling {
+            break;
+        }
+    }
     assert!(before_cleanup.iter().any(|event| matches!(
         &event.kind,
         SessionEventKind::StatusChanged {
@@ -6256,15 +6271,26 @@ async fn compaction_defers_steers_preserves_next_attachments_and_respects_stop()
                     .await;
                 }
             }
-            active.events.send(completed).await.unwrap();
-            active.events.send(tool_boundary()).await.unwrap();
+            if stop {
+                // Cancellation can close the turn before these late provider events.
+                let _ = active.events.send(completed).await;
+                let _ = active.events.send(tool_boundary()).await;
+            } else {
+                active.events.send(completed).await.unwrap();
+                active.events.send(tool_boundary()).await.unwrap();
+            }
             assert!(
-                tokio::time::timeout(Duration::from_millis(50), active.controls.recv())
-                    .await
-                    .is_err(),
+                !matches!(
+                    tokio::time::timeout(Duration::from_millis(50), active.controls.recv()).await,
+                    Ok(Some(_))
+                ),
                 "stop, accepted steers, and Next input must not be retried on later boundaries"
             );
-            active.finish.send(()).unwrap();
+            if stop {
+                let _ = active.finish.send(());
+            } else {
+                active.finish.send(()).unwrap();
+            }
             // Escape cancels the active turn, not already-queued human input.
             // Rejected steers join that input without clearing the stop gate.
             let queued = next(&mut turns).await;
@@ -17151,4 +17177,236 @@ fn declarations_cross_a_compaction_boundary_only_through_the_boundary_event() {
         "native": true,
     }));
     assert_eq!(native_declarations(&legacy), None);
+}
+
+struct DropNotify(Arc<Notify>);
+
+impl Drop for DropNotify {
+    fn drop(&mut self) {
+        self.0.notify_one();
+    }
+}
+
+struct SilentProviderExecutor {
+    started: Arc<Notify>,
+    dropped: Arc<Notify>,
+    cleanup_calls: Arc<AtomicUsize>,
+    saturated: Option<Arc<Notify>>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for SilentProviderExecutor {
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        let _dropped = DropNotify(Arc::clone(&self.dropped));
+        self.started.notify_one();
+        if let Some(saturated) = &self.saturated {
+            let controls = _controls.as_ref().unwrap();
+            while controls.len() < controls.max_capacity() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            saturated.notify_one();
+        }
+        std::future::pending().await
+    }
+
+    async fn stop_session(&self, _session_id: Uuid) -> Result<()> {
+        self.cleanup_calls.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn immediate_interrupt_cancels_a_silent_provider() {
+    assert_immediate_interrupt(0).await;
+}
+
+#[tokio::test]
+async fn immediate_interrupt_cancels_with_a_full_control_queue() {
+    assert_immediate_interrupt(33).await;
+}
+
+async fn assert_immediate_interrupt(control_backlog: usize) {
+    const ESCAPE_BOUND: Duration = Duration::from_millis(750);
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let started = Arc::new(Notify::new());
+    let dropped = Arc::new(Notify::new());
+    let cleanup_calls = Arc::new(AtomicUsize::new(0));
+    let saturated = Arc::new(Notify::new());
+    let executor = Arc::new(SilentProviderExecutor {
+        started: Arc::clone(&started),
+        dropped: Arc::clone(&dropped),
+        cleanup_calls: Arc::clone(&cleanup_calls),
+        saturated: (control_backlog > 0).then(|| Arc::clone(&saturated)),
+    });
+    let actor_store = Arc::clone(&store);
+    let actor = tokio::spawn(async move {
+        run_session_actor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+            actor_store,
+        )
+        .await
+    });
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id,
+            text: "run until interrupted".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), started.notified())
+        .await
+        .expect("the silent turn starts");
+
+    if control_backlog > 0 {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let full = saturated.notified();
+            tokio::pin!(full);
+            for i in 0..128 {
+                let command = HostCommand::TeamPrompt {
+                    session_id,
+                    message_id: Uuid::new_v4(),
+                    text: format!("pending steer {i}"),
+                    attachments: Vec::new(),
+                    output_schema: None,
+                    delivery: PromptDelivery::Steer,
+                };
+                tokio::select! {
+                    biased;
+                    _ = &mut full => return,
+                    result = command_tx.send(command) => result.unwrap(),
+                }
+            }
+            full.await;
+        })
+        .await
+        .expect("the provider control queue is actually full");
+    }
+
+    let escape_at = std::time::Instant::now();
+    tokio::time::timeout(
+        Duration::from_millis(250),
+        command_tx.send(HostCommand::Interrupt { session_id }),
+    )
+    .await
+    .expect("Escape is not blocked by the command backlog")
+    .unwrap();
+
+    let dropped_promptly = tokio::time::timeout(Duration::from_millis(250), dropped.notified())
+        .await
+        .is_ok();
+    let cancelled_after = escape_at.elapsed();
+
+    let mut boundary_at = None;
+    let mut saw_turn_completed = false;
+    let mut saw_failed_prompt = false;
+    while boundary_at.is_none() {
+        let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("a silent provider still reaches a terminal boundary")
+            .expect("session remains open");
+        match &event.kind {
+            SessionEventKind::Message {
+                message_id: event_message_id,
+                status: MessageStatus::Failed,
+                ..
+            } if *event_message_id == message_id => saw_failed_prompt = true,
+            SessionEventKind::TurnCompleted {
+                message_id: event_message_id,
+                error: Some(error),
+                final_text,
+                ..
+            } if *event_message_id == message_id => {
+                assert_eq!(error, "turn interrupted");
+                assert!(
+                    final_text.is_empty(),
+                    "an interrupted silent turn has no final text to report"
+                );
+                saw_turn_completed = true;
+            }
+            SessionEventKind::StatusChanged {
+                status: SessionStatus::Ready,
+                detail: Some(detail),
+            } if detail == "Interrupted" => {
+                assert!(
+                    saw_turn_completed,
+                    "Ready must still follow TurnCompleted: the terminal ordering \
+                     is not what this test relaxes"
+                );
+                boundary_at = Some(std::time::Instant::now());
+            }
+            _ => {}
+        }
+    }
+    let waited = boundary_at.expect("terminal boundary observed") - escape_at;
+
+    assert!(
+        saw_failed_prompt,
+        "the interrupted prompt must still be marked failed"
+    );
+    assert_eq!(
+        cleanup_calls.load(Ordering::Acquire),
+        1,
+        "provider cleanup still runs exactly once before the boundary"
+    );
+    assert!(
+        store.state(session_id).await.unwrap().user_stopped,
+        "the human's stop stays durably latched after the turn is cancelled"
+    );
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
+    scratch.discard().await;
+    eprintln!(
+        "interrupt cancellation observed after {cancelled_after:?}; terminal after {waited:?}"
+    );
+    assert!(
+        dropped_promptly,
+        "the running turn must actually be dropped promptly"
+    );
+    assert!(
+        waited < ESCAPE_BOUND,
+        "a turn that produced nothing must not pay the cooperative grace before \
+         reaching a terminal boundary: waited {waited:?}"
+    );
 }

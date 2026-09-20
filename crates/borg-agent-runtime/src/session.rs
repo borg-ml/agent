@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,7 +8,6 @@ use borg_provider::provider::SteerAdmission;
 use chrono::Utc;
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
-use tokio::time::Sleep;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -779,12 +777,6 @@ impl RuntimeSessionStore {
     }
 }
 
-// A cooperative interrupt usually ends the turn in under a second; this is
-// only the cap before a hard abort. Keep it short so a provider that ignores
-// the cooperative signal cannot make Escape feel unresponsive. Aborting drops
-// the provider session, and the next turn replays the durable journal either
-// way, so a shorter grace changes no durable outcome.
-const INTERRUPT_GRACE_PERIOD: Duration = Duration::from_millis(1_000);
 #[cfg(not(test))]
 const PROVIDER_SETUP_LIVENESS_TIMEOUT: Duration = Duration::from_secs(120);
 // Sized for a real database, not an in-memory one. The actor journals the turn
@@ -4047,7 +4039,7 @@ async fn run_agent_session_store_kernel_inner(
         let mut retryable_provider_errors = Vec::new();
         let mut turn_reported_error = false;
         let mut batch_pending_after_interrupt = false;
-        let mut interrupt_deadline: Option<Pin<Box<Sleep>>> = None;
+        let mut interrupted_result = None;
         let mut generation = crate::generation_activity::GenerationActivity::new(launch.provider);
         let mut watchdog = TurnWatchdog::new(TurnPhase::AwaitingProvider);
         let mut watchdog_poll = tokio::time::interval(TURN_WATCHDOG_POLL_INTERVAL);
@@ -4090,23 +4082,22 @@ async fn run_agent_session_store_kernel_inner(
                     }).await?;
                     watchdog.note_output();
                 }
-                result = &mut running.0 => {
+                result = async {
+                    match interrupted_result.take() {
+                        Some(result) => result,
+                        None => (&mut running.0).await,
+                    }
+                } => {
+                    let cancelled = result.as_ref().err().is_some_and(|error| error.is_cancelled());
                     let result = match result {
                         Ok(result) => result,
                         Err(error) => Err(anyhow::anyhow!("agent turn task failed: {error}")),
                     };
-                    let result = if interrupted && executor.uses_native_harness(launch.provider) {
-                        // Cooperative turn cancellation does not stop session-owned processes.
-                        // Reap them before publishing the interrupted terminal boundary, but
-                        // never let an unresponsive process hold that boundary hostage.
-                        let _ = stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT).await;
-                        Ok(crate::AgentTurnResult {
-                            provider_session_id: None,
-                            final_text: String::new(),
-                        })
-                    } else if interrupted && result.as_ref().err().is_some_and(|error| {
-                        provider_error_is_expected_interrupt(launch.provider, &format!("{error:#}"))
-                    }) {
+                    let result = if interrupted && (cancelled
+                        || executor.uses_native_harness(launch.provider)
+                        || result.as_ref().err().is_some_and(|error| {
+                            provider_error_is_expected_interrupt(launch.provider, &format!("{error:#}"))
+                        })) {
                         Ok(crate::AgentTurnResult {
                             provider_session_id: None,
                             final_text: String::new(),
@@ -4575,76 +4566,6 @@ async fn run_agent_session_store_kernel_inner(
                         session_id,
                         subagents.as_ref().expect("team inbox requires coordinator"),
                     ).await?;
-                }
-                _ = async {
-                    if let Some(deadline) = interrupt_deadline.as_mut() {
-                        deadline.as_mut().await;
-                    }
-                }, if interrupt_deadline.is_some() => {
-                    subscription_context_reusable = false;
-                    provider_session_id = None;
-                    provider_fork_turn_id = None;
-                    running.0.abort();
-                    let _ = (&mut running.0).await;
-                    let _ = stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT).await;
-                    deny_pending_approval(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        &mut pending_approval,
-                    )
-                    .await?;
-                    cancel_pending_provider_interaction(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        &mut pending_provider_interaction,
-                    )
-                    .await?;
-                    if autonomy_result_sender.is_some() {
-                        autonomy_result = Some(Err(anyhow::anyhow!("autonomy turn interrupted")));
-                    }
-                    if prompt.visible {
-                        record_prompt_status(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            &prompt,
-                            MessageStatus::Failed,
-                            prompt.delivery,
-                        )
-                        .await?;
-                    }
-                    record(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        SessionEventKind::TurnCompleted {
-                            message_id: prompt.message_id,
-                            provider_session_id: None,
-                            final_text: String::new(),
-                            error: Some("turn interrupted".to_string()),
-                        },
-                    ).await?;
-                    flush_awaiting_steers(
-                        &mut steers_awaiting_consumption,
-                        interrupted,
-                        &mut journal,
-                        &events,
-                        session_id,
-                    )
-                    .await?;
-                    promote_uncommitted_steers(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        &mut pending,
-                        &mut pending_steers,
-                        executor.uses_native_harness(launch.provider),
-                    )
-                    .await?;
-                    next_ready_detail = Some("Interrupted".to_string());
-                    break;
                 }
                 // Suspended while a human owns the turn: an operator may sit on
                 // an approval or a provider question indefinitely without the
@@ -5345,64 +5266,60 @@ async fn run_agent_session_store_kernel_inner(
                             .await?;
                         }
                         HostCommand::Interrupt { .. } if interrupted => {}
-                        HostCommand::Interrupt { .. }
-                            if provider_supports_active_turn_control(
-                                launch.provider,
-                                executor.uses_native_harness(launch.provider),
-                            ) =>
-                        {
-                            // Ask the turn to stop before doing any durable work.
-                            // Pausing the goal and latching the stop gate are both
-                            // journal round trips, and `record` can additionally
-                            // spend a live-delivery window on a lagging observer --
-                            // exactly the state a flood of subagent notes puts the
-                            // session in. Paying that before signalling put journal
-                            // I/O inside the human's Escape latency, which is the
-                            // one interval a human actually feels.
-                            //
-                            // The snapshot stays ahead of the signal: it is pure
-                            // in-memory bookkeeping that must describe the instant
-                            // Escape was received, and `pending` is owned by this
-                            // task, so no await below can change it. Both records
-                            // still happen before any successor can be admitted, so
-                            // the stop gate is as durable as it was.
+                        HostCommand::Interrupt { .. } => {
                             snapshot_stale_user_prompts(&mut stale_user_prompts, &pending);
                             stale_user_prompts.extend(
                                 pending_steers.iter().map(|steer| steer.prompt.message_id),
                             );
                             retry_not_before = None;
-                            control_tx.send(AgentTurnControl::Interrupt).await.ok();
-                            pause_active_goal(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                &mut goal,
-                                &mut goal_active_since,
-                            ).await?;
-                            set_user_stop(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                &mut user_stop,
-                                true,
-                            ).await?;
-                            if pending_approval.as_ref().is_some_and(|pending| pending.response.is_some()) {
-                                deny_pending_approval(&mut journal, &events, session_id, &mut pending_approval).await?;
-                            }
-                            watchdog.set_phase(TurnPhase::Cancelling);
-                            interrupt_deadline =
-                                Some(Box::pin(tokio::time::sleep(INTERRUPT_GRACE_PERIOD)));
-                            record(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                SessionEventKind::StatusChanged {
-                                    status: SessionStatus::Running,
-                                    detail: Some(TurnPhase::Cancelling.detail().to_string()),
-                                },
-                            ).await?;
+                            // Let a responsive turn flush its tail and continuation within
+                            // one frame, never behind journal I/O or a full control queue.
+                            let cooperative = if control_tx.try_send(AgentTurnControl::Interrupt).is_ok() {
+                                tokio::time::timeout(Duration::from_millis(10), &mut running.0).await.ok()
+                            } else {
+                                None
+                            };
+                            interrupted_result = Some(match cooperative {
+                                Some(result) => result,
+                                None => {
+                                    running.0.abort();
+                                    (&mut running.0).await
+                                }
+                            });
                             interrupted = true;
                             batch_pending_after_interrupt = true;
+                            provider_session_id = None;
+                            provider_fork_turn_id = None;
+                            watchdog.set_phase(TurnPhase::Cancelling);
+                            // Start cleanup without placing journal I/O in its way.
+                            // Neither future is detached: terminal settlement follows both.
+                            let (cleanup, recorded) = tokio::join!(
+                                stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT),
+                                async {
+                                    pause_active_goal(
+                                        &mut journal, &events, session_id, &mut goal,
+                                        &mut goal_active_since,
+                                    ).await?;
+                                    set_user_stop(
+                                        &mut journal, &events, session_id, &mut user_stop, true,
+                                    ).await?;
+                                    record(
+                                        &mut journal, &events, session_id,
+                                        SessionEventKind::StatusChanged {
+                                            status: SessionStatus::Running,
+                                            detail: Some(TurnPhase::Cancelling.detail().to_string()),
+                                        },
+                                    ).await?;
+                                    Ok::<(), anyhow::Error>(())
+                                }
+                            );
+                            recorded?;
+                            if let Some(error) = cleanup {
+                                record(
+                                    &mut journal, &events, session_id,
+                                    SessionEventKind::Error { message: error },
+                                ).await?;
+                            }
                         }
                         HostCommand::StopWatch { watch_id, .. } => {
                             stop_watch_for_frontend(
@@ -5433,91 +5350,6 @@ async fn run_agent_session_store_kernel_inner(
                                 text,
                             )
                             .await?;
-                        }
-                        HostCommand::Interrupt { .. } => {
-                            pause_active_goal(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                &mut goal,
-                                &mut goal_active_since,
-                            ).await?;
-                            snapshot_stale_user_prompts(&mut stale_user_prompts, &pending);
-                            stale_user_prompts.extend(
-                                pending_steers.iter().map(|steer| steer.prompt.message_id),
-                            );
-                            set_user_stop(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                &mut user_stop,
-                                true,
-                            ).await?;
-                            retry_not_before = None;
-                            running.0.abort();
-                            let _ = (&mut running.0).await;
-                            let _ = stop_session_bounded(&executor, session_id, INTERRUPT_CLEANUP_TIMEOUT).await;
-                            subscription_context_reusable = false;
-                            provider_session_id = None;
-                            provider_fork_turn_id = None;
-                            deny_pending_approval(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                &mut pending_approval,
-                            )
-                            .await?;
-                            cancel_pending_provider_interaction(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                &mut pending_provider_interaction,
-                            )
-                            .await?;
-                            interrupted = true;
-                            if prompt.visible {
-                                record_prompt_status(
-                                    &mut journal,
-                                    &events,
-                                    session_id,
-                                    &prompt,
-                                    MessageStatus::Failed,
-                                    prompt.delivery,
-                                )
-                                .await?;
-                            }
-                            record(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                SessionEventKind::TurnCompleted {
-                                    message_id: prompt.message_id,
-                                    provider_session_id: None,
-                                    final_text: String::new(),
-                                    error: Some("turn interrupted".to_string()),
-                                },
-                            )
-                            .await?;
-                            flush_awaiting_steers(
-                                &mut steers_awaiting_consumption,
-                                interrupted,
-                                &mut journal,
-                                &events,
-                                session_id,
-                            )
-                            .await?;
-                            promote_uncommitted_steers(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                &mut pending,
-                                &mut pending_steers,
-                                executor.uses_native_harness(launch.provider),
-                            )
-                            .await?;
-                            next_ready_detail = Some("Interrupted".to_string());
-                            batch_pending_after_interrupt = true;
-                            break;
                         }
                         HostCommand::Compact { .. } => {
                             record(
@@ -8766,8 +8598,9 @@ async fn dispatch_steer(
     } else {
         prompt.text.clone()
     };
+    // Backpressure retains the steer for retry; it must not block Escape.
     if control_tx
-        .send(AgentTurnControl::Steer {
+        .try_send(AgentTurnControl::Steer {
             message_id: prompt.message_id,
             text,
             attachments: prompt.attachments.clone(),
@@ -8781,7 +8614,6 @@ async fn dispatch_steer(
             preempt: false,
             ack,
         })
-        .await
         .is_err()
     {
         return false;
