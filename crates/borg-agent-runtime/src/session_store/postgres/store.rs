@@ -679,6 +679,29 @@ impl PostgresSessionStore {
                 }
             }
 
+            // A cut that lands INSIDE the inherited prefix cannot be expressed
+            // as a bound in the parent's sequence space: the parent numbers its
+            // own events, and this session renumbers what it inherited. Asking
+            // the parent for its latest checkpoint up to the FULL cut can
+            // therefore only answer with one that lies beyond this bound, and
+            // the older checkpoint that IS visible here would be discarded as
+            // out of range -- reporting no boundary at all, so a resume replays
+            // a conversation that was already compacted.
+            //
+            // Resolve the bounded prefix through the composed view instead. It
+            // is already projected into this session's numbering and already
+            // truncated to the bound, so the newest completed checkpoint left in
+            // it is the answer. This is the same fallback `contains_message_in`
+            // uses, for the same reason.
+            if logical_limit < session.inherited_event_count {
+                return Ok(self
+                    .composed_events(session_id, Some(logical_limit))
+                    .await?
+                    .into_iter()
+                    .rev()
+                    .find(|event| event.kind.is_completed_context_compaction()));
+            }
+
             let (Some(parent_session_id), Some(parent_cut_sequence)) =
                 (session.parent_session_id, session.parent_cut_sequence)
             else {

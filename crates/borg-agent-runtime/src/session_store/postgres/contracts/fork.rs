@@ -444,3 +444,88 @@ async fn a_rewind_does_not_inherit_the_queue_entry_of_the_discarded_prompt() {
     );
     scratch.discard().await;
 }
+
+/// A fork of a fork, cut between two checkpoints, sees the EARLIER one.
+///
+/// WHY THIS IS NOT COVERED BY THE SINGLE-FORK TEST ABOVE: that fork inherits
+/// its whole visible prefix, so asking its parent for the latest checkpoint up
+/// to the cut and asking for the latest checkpoint the fork can see are the
+/// same question. They stop being the same question the moment a cut lands
+/// INSIDE an inherited prefix, which needs two generations to construct.
+///
+/// The parent numbers its own events and each fork renumbers what it inherited,
+/// so the bound "up to sequence 4 of mine" cannot be handed to the parent as a
+/// sequence at all. A lookup that hands over the full cut instead gets the
+/// parent's LATEST checkpoint, finds it lies beyond the bound, and reports no
+/// checkpoint -- discarding an older one that is genuinely visible. The
+/// consequence is not a missing field: a resume with no boundary replays a
+/// conversation that was already compacted.
+#[tokio::test]
+async fn a_fork_cut_between_two_checkpoints_inherits_the_earlier_one() {
+    let (scratch, store) = super::support::store().await;
+    let root = Uuid::new_v4();
+    store.create_session(root).await.unwrap();
+
+    let compaction = |summary: &str| SessionEventKind::ProviderEvent {
+        provider: CodingProvider::Codex,
+        kind: "context_compaction".to_string(),
+        payload: serde_json::json!({"status": "completed", "summary": summary}),
+    };
+    for kind in [
+        SessionEventKind::SessionStarted,
+        configured(std::path::Path::new("/tmp")),
+        compaction("earlier checkpoint"),
+        message(Uuid::new_v4(), "after the earlier checkpoint"),
+        compaction("later checkpoint"),
+        message(Uuid::new_v4(), "after the later checkpoint"),
+    ] {
+        store.append(SessionEvent::new(root, 0, kind)).await.unwrap();
+    }
+
+    // The first fork inherits everything, so both checkpoints are visible to it
+    // at its own sequences 3 and 5.
+    let middle = Uuid::new_v4();
+    store.fork_before(root, middle, 7).await.unwrap();
+    let inherited = store
+        .latest_completed_context_compaction(middle)
+        .await
+        .unwrap()
+        .expect("a fork inheriting both checkpoints sees the later one");
+    assert!(matches!(
+        &inherited.kind,
+        SessionEventKind::ProviderEvent { payload, .. }
+            if payload.get("summary").and_then(serde_json::Value::as_str)
+                == Some("later checkpoint")
+    ));
+
+    // The second fork cuts between them: it inherits the earlier checkpoint and
+    // not the later one.
+    let leaf = Uuid::new_v4();
+    store.fork_before(middle, leaf, 5).await.unwrap();
+    let checkpoint = store
+        .latest_completed_context_compaction(leaf)
+        .await
+        .unwrap()
+        .expect("the earlier checkpoint is inside the cut and must not be hidden");
+    assert!(
+        matches!(
+            &checkpoint.kind,
+            SessionEventKind::ProviderEvent { payload, .. }
+                if payload.get("summary").and_then(serde_json::Value::as_str)
+                    == Some("earlier checkpoint")
+        ),
+        "expected the earlier checkpoint, got {:?}",
+        checkpoint.kind
+    );
+    assert_eq!(
+        checkpoint.session_id, leaf,
+        "an inherited checkpoint is reported in the reading session's identity"
+    );
+    assert!(
+        checkpoint.sequence <= 4,
+        "the checkpoint must sit inside the cut, got sequence {}",
+        checkpoint.sequence
+    );
+
+    scratch.discard().await;
+}
