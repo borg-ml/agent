@@ -479,7 +479,10 @@ async fn a_fork_cut_between_two_checkpoints_inherits_the_earlier_one() {
         compaction("later checkpoint"),
         message(Uuid::new_v4(), "after the later checkpoint"),
     ] {
-        store.append(SessionEvent::new(root, 0, kind)).await.unwrap();
+        store
+            .append(SessionEvent::new(root, 0, kind))
+            .await
+            .unwrap();
     }
 
     // The first fork inherits everything, so both checkpoints are visible to it
