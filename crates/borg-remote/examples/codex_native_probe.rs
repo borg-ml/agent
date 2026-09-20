@@ -7,7 +7,7 @@ use anyhow::{Context, Result, ensure};
 use borg_remote::{
     AgentTurnExecutor, ApprovalDecision, CodingProvider, ConsultationRequest, HostCommand,
     LaunchSession, LocalAgentTurnExecutor, MessageStatus, ModelAccessContext, PermissionMode,
-    PromptDelivery, ResponseLanguage, SessionEventKind, SessionStore, SessionWriterLease,
+    PromptDelivery, ResponseLanguage, SessionEventKind, SessionWriterLease,
     run_agent_session_with_store_and_writer,
 };
 use tokio::sync::mpsc;
