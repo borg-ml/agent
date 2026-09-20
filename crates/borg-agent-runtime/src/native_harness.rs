@@ -4119,7 +4119,9 @@ mod tests {
     #[tokio::test]
     async fn running_tool_keeps_controls_live_after_steering() {
         for interrupt in [false, true] {
-            let (control_tx, control_rx) = mpsc::channel(2);
+            // Capacity one, so each follow-up send below completes only once
+            // the steer before it has been taken off the channel.
+            let (control_tx, control_rx) = mpsc::channel(1);
             let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
             let cancel = CancellationToken::new();
             let call_cancel = cancel.clone();
@@ -4146,12 +4148,26 @@ mod tests {
                     })
                     .await
                     .unwrap();
-                // The acknowledgement is deliberately withheld until the steer
-                // is journaled, so responsiveness is observed through the
-                // cancellation the capture performs instead.
-                tokio::time::timeout(Duration::from_secs(1), cancel.cancelled())
-                    .await
-                    .expect("steering must not wait for the running tool");
+                // The acknowledgement is withheld until the fold, so it can no
+                // longer order these two sends. `cancel.cancelled()` cannot
+                // either: it resolves once, so after the first steer it returns
+                // immediately and the second would race the call's completion.
+                // A follow-up send is per-steer, because it cannot return until
+                // the steer ahead of it has been taken off the channel.
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    control_tx.send(AgentTurnControl::Approval {
+                        approval_id: "capture-sync".to_string(),
+                        decision: ApprovalDecision::Deny,
+                    }),
+                )
+                .await
+                .expect("steering must not wait for the running tool")
+                .unwrap();
+                assert!(
+                    cancel.is_cancelled(),
+                    "this call cancels on steer, so capture must have cancelled it"
+                );
                 acknowledgements.push(acknowledged);
             }
             if interrupt {
