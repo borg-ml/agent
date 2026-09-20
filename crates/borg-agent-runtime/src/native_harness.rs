@@ -425,13 +425,14 @@ impl NativeHarness {
             )
             .await;
         }
-        // A lane that rewrites the head anyway gains nothing from moving these
-        // out of it, and moving them would change what that lane sends for no
-        // benefit. A lane that keeps `System` in position keeps it immutable
-        // and takes the varying text as trailing context below.
-        if !transport.prefix_preserved() {
-            system_prompt.push_str(&varying_instructions);
-        }
+        // Keep the immutable head byte-stable for the whole context generation.
+        // On the Responses lane `instructions` is a scalar, so splicing the
+        // skills/MCP text into it rewrites the head every turn that text
+        // changes -- an MCP server coming or going is enough -- and the provider
+        // then re-reads the entire conversation instead of extending the cached
+        // prefix. The text is carried as trailing user context below, where a
+        // change only extends the tail; the volatile appendix already works
+        // this way.
         if let Some(instruction) = turn.response_language.instruction() {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(instruction);
@@ -454,12 +455,10 @@ impl NativeHarness {
             messages.push(message);
             confirm_steers(acks);
         }
-        // Same reasoning as the volatile appendix below: ahead of the
-        // conversation this invalidated the provider's prefix cache on every
-        // change, and after it the previous turn's copy simply stays in
-        // history. Recorded as prompt context, which replay rebuilds per turn
-        // rather than retaining, because it is derived from the live runtime.
-        if transport.prefix_preserved() && !varying_instructions.trim().is_empty() {
+        // This is the head the previous turn was shown. Recorded as prompt
+        // context, which replay rebuilds per turn rather than retaining,
+        // because it is derived from the live runtime.
+        if !varying_instructions.trim().is_empty() {
             let context_message = ModelMessage::user(varying_instructions);
             record_native_prompt_context(&events, turn.provider, &context_message).await?;
             messages.push(context_message);
@@ -5530,6 +5529,7 @@ mod tests {
         prompt: &str,
         volatile: &str,
         truncate_forever: bool,
+        system_prompt_appendix: &str,
     ) -> PrefixTurn {
         let client = Arc::new(PrefixClient {
             rounds: Mutex::new(Vec::new()),
@@ -5591,7 +5591,7 @@ mod tests {
             extension_skill_roots: Vec::new(),
             extension_workflows: Vec::new(),
             extension_api: Default::default(),
-            system_prompt_appendix: String::new(),
+            system_prompt_appendix: system_prompt_appendix.to_string(),
             declaration_base: None,
             volatile_system_prompt_appendix: volatile.to_string(),
         };
@@ -5640,6 +5640,7 @@ mod tests {
             "check status",
             "usage available: 5-hour 65% left (resets 2026-01-01T00:00:00Z)",
             false,
+            "",
         )
         .await;
         assert!(first.completed, "the first turn completes");
@@ -5652,6 +5653,7 @@ mod tests {
             "still checking",
             "usage available: 5-hour 12% left (resets 2026-01-02T00:00:00Z)",
             false,
+            "",
         )
         .await;
         assert!(second.completed, "the replayed turn completes");
@@ -5681,6 +5683,44 @@ mod tests {
         assert!(!tail(second_messages).contains("65% left"));
     }
 
+    /// The skills/MCP text is not part of the immutable instructions head. On a
+    /// lane that reports `Collapsed` -- the Responses encoder, and this fake
+    /// client's default -- appending it to the head rewrote every earlier
+    /// turn's cached prefix whenever the skills catalog or an MCP server's
+    /// availability changed. It rides as trailing user context instead, so a
+    /// change only extends the tail.
+    #[tokio::test]
+    async fn varying_instructions_ride_in_conversation_position_not_the_system_head() {
+        let root = tempfile::tempdir().unwrap();
+        const SENTINEL: &str = "SKILLS-APPENDIX-SENTINEL";
+        let turn = run_prefix_turn(
+            root.path().to_path_buf(),
+            Uuid::new_v4(),
+            Vec::new(),
+            "task",
+            "",
+            false,
+            SENTINEL,
+        )
+        .await;
+        assert!(turn.completed, "the turn completes");
+        let messages = turn.rounds.first().expect("a first model round");
+        match messages.first() {
+            Some(ModelMessage::System { content }) => assert!(
+                !content.contains(SENTINEL),
+                "the immutable head must not carry the varying text: {content}"
+            ),
+            other => panic!("expected a leading system message, got {other:?}"),
+        }
+        assert!(
+            messages.iter().any(|message| matches!(
+                message,
+                ModelMessage::User { content, .. } if content.contains(SENTINEL)
+            )),
+            "the varying text must ride in conversation position: {messages:?}"
+        );
+    }
+
     /// A reply that keeps stopping at the output-token limit must terminate and
     /// report, rather than continue forever and hide the failure.
     #[tokio::test]
@@ -5693,6 +5733,7 @@ mod tests {
             "write it all",
             "",
             true,
+            "",
         )
         .await;
         assert!(
