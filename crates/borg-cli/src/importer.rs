@@ -276,7 +276,11 @@ async fn copy_thread(
     warnings: &mut Vec<String>,
 ) -> Result<bool> {
     use base64::Engine;
-    if store.state(id).await.is_ok() {
+    // Ask whether the session exists, rather than inferring it from `state`
+    // returning an error. `state` is specified to return the session's state,
+    // not to fail on an absent one, and a store that answers an unknown id
+    // with a default state made every import look like a duplicate.
+    if store.contains_session(id).await? {
         return Ok(false);
     }
     ensure!(
