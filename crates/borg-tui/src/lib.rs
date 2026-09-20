@@ -124,7 +124,7 @@ const MIN_TOOL_RUN_VIEWPORT_HEIGHT: usize = 6;
 const MAX_TOOL_RUN_VIEWPORT_HEIGHT: usize = 30;
 const TOOL_RUN_CHROME_HEIGHT: usize = 2;
 const MIN_SCROLLBAR_THUMB_ROWS: u16 = 5;
-const TRANSCRIPT_SCROLLBAR_GUTTER_WIDTH: u16 = 3;
+const TRANSCRIPT_SCROLLBAR_GUTTER_WIDTH: u16 = 4;
 const DICTATION_BUTTON_WIDTH: u16 = 6;
 const DICTATION_EMOJI_ICON: &str = "🎤";
 const DICTATION_NERD_FONT_ICON: &str = "󰍬";
@@ -7935,7 +7935,7 @@ impl BorgTerminal {
                         .map(|row| {
                             let in_thumb = row >= thumb_top && row < thumb_top + thumb_height;
                             Line::from(Span::styled(
-                                " ▊ ",
+                                " 🮈▍ ",
                                 Style::default().fg(if in_thumb {
                                     if self.focused_child.is_some() {
                                         if self.scrollbar_hovered || self.dragging_scrollbar {
