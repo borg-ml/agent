@@ -739,9 +739,12 @@ impl NativeHarness {
             }
             assistant_message_id = Uuid::new_v4();
 
-            // A steer queued during generation is already waiting; the tool
-            // round below can add more, and both are folded together.
-            let mut pending_steer = queued_steer.take();
+            // Deliberately NOT seeded from `queued_steer`. Both branches below
+            // treat a waiting steer as "preempt the calls that have not started
+            // yet", so seeding it here would skip the very batch the model just
+            // generated -- the same silent loss, moved from generation to
+            // execution. The queued steer is folded after the batch completes.
+            let mut pending_steer = None;
             let inputs = tool_calls
                 .iter()
                 .map(parse_tool_arguments)
@@ -788,35 +791,48 @@ impl NativeHarness {
             if parallel_reads {
                 let pairs = tool_calls.iter().zip(&inputs).collect::<Vec<_>>();
                 for chunk in pairs.chunks(4) {
-                    let reads =
-                        futures::future::join_all(chunk.iter().map(|(tool_call, input)| async {
-                            match runtime
-                                .call(
-                                    &tool_call.function.name,
-                                    input.as_ref().expect("validated input").clone(),
-                                    false,
-                                    None,
-                                )
-                                .await
-                            {
-                                Ok(value) => (value.to_string(), false),
-                                Err(error) => {
-                                    (json!({ "error": format!("{error:#}") }).to_string(), true)
+                    // A steer collected from an earlier chunk preempts the
+                    // chunks that have not started. This one has not started
+                    // yet, so it is the boundary the steer was waiting for.
+                    let outcomes = if pending_steer.is_some() {
+                        None
+                    } else {
+                        let reads = futures::future::join_all(chunk.iter().map(
+                            |(tool_call, input)| async {
+                                match runtime
+                                    .call(
+                                        &tool_call.function.name,
+                                        input.as_ref().expect("validated input").clone(),
+                                        false,
+                                        None,
+                                    )
+                                    .await
+                                {
+                                    Ok(value) => (value.to_string(), false),
+                                    Err(error) => {
+                                        (json!({ "error": format!("{error:#}") }).to_string(), true)
+                                    }
+                                }
+                            },
+                        ));
+                        tokio::pin!(reads);
+                        // Once these are in flight they always run to
+                        // completion. Dropping the join here cancelled reads
+                        // that were already doing work and reported them as
+                        // "cancelled after user steering", which is the same
+                        // silent loss the tool-execution path already avoids.
+                        // An Interrupt still cancels: it leaves through `?`.
+                        Some(loop {
+                            tokio::select! {
+                                biased;
+                                outcomes = &mut reads => break outcomes,
+                                Some(control) = next_control(&mut controls) => {
+                                    if let Some(steer) = accept_tool_boundary_control(control)? {
+                                        merge_steer(&mut pending_steer, steer);
+                                    }
                                 }
                             }
-                        }));
-                    tokio::pin!(reads);
-                    let outcomes = loop {
-                        if pending_steer.is_some() {
-                            break None;
-                        }
-                        tokio::select! {
-                            biased;
-                            Some(control) = next_control(&mut controls) => {
-                                pending_steer = accept_tool_boundary_control(control)?;
-                            }
-                            outcomes = &mut reads => break Some(outcomes),
-                        }
+                        })
                     };
                     for (index, (tool_call, _)) in chunk.iter().enumerate() {
                         let (output, is_error) = outcomes
@@ -866,7 +882,9 @@ impl NativeHarness {
                             Err(error) => (json!({ "error": error }).to_string(), true, None),
                         }
                     };
-                    pending_steer = pending_steer.or(steer);
+                    if let Some(steer) = steer {
+                        merge_steer(&mut pending_steer, steer);
+                    }
                     trailing_context_tokens = trailing_context_tokens.saturating_add(
                         record_native_tool_result(
                             &events,
@@ -881,6 +899,16 @@ impl NativeHarness {
                 }
             }
 
+            // The batch the model generated has now run. A steer queued
+            // during that generation arrived before anything collected above,
+            // so it leads the folded message.
+            if let Some(queued) = queued_steer.take() {
+                let collected = pending_steer.take();
+                pending_steer = Some(queued);
+                if let Some(collected) = collected {
+                    merge_steer(&mut pending_steer, collected);
+                }
+            }
             let mut folded_steer = pending_steer.is_some();
             if let Some(steer) = pending_steer {
                 let message =
@@ -1955,6 +1983,21 @@ async fn cancel_preparing_tool_calls(
     }
 }
 
+/// Append `steer` to whatever is already waiting, oldest first.
+///
+/// Overwriting would silently drop the earlier message, which is the failure
+/// this whole path exists to prevent.
+fn merge_steer(slot: &mut Option<NativeSteer>, steer: NativeSteer) {
+    match slot {
+        Some(waiting) => {
+            waiting.text.push('\n');
+            waiting.text.push_str(&steer.text);
+            waiting.attachments.extend(steer.attachments);
+        }
+        None => *slot = Some(steer),
+    }
+}
+
 fn note_preparing(preparing: &mut Vec<Option<String>>, id: Option<String>) {
     if !preparing.contains(&id) {
         preparing.push(id);
@@ -2163,13 +2206,7 @@ async fn call_model_streaming(
                         // is journaled, and the row opened for it never closes.
                         // Queue it and let the round finish -- the tool boundary
                         // is the safe point, and the caller folds it there.
-                        if let Some(queued) = context.queued_steer.as_mut() {
-                            queued.text.push('\n');
-                            queued.text.push_str(&text);
-                            queued.attachments.extend(attachments);
-                        } else {
-                            *context.queued_steer = Some(NativeSteer { text, attachments });
-                        }
+                        merge_steer(context.queued_steer, NativeSteer { text, attachments });
                         continue;
                     }
                     // An explicit preempt may end the stream, but it still owes
@@ -6114,6 +6151,209 @@ mod tests {
             cancelled,
             vec![json!("call")],
             "the abandoned tool call row has to be closed exactly once"
+        );
+    }
+
+    /// Round 0 writes a tool call and steers itself while doing so; round 1
+    /// answers. The steer is admitted before the call is delivered, so it
+    /// provably lands during generation.
+    struct SteerDuringGenerationHarnessClient {
+        rounds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        controls: mpsc::Sender<AgentTurnControl>,
+        marker: PathBuf,
+    }
+
+    #[async_trait]
+    impl NativeModelClient for SteerDuringGenerationHarnessClient {
+        async fn model_turn(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+            _request: ModelTurnRequest,
+            progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+        ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+            let round = self
+                .rounds
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if round > 0 {
+                return Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(Some("done".to_string()), None, None, vec![]),
+                    finish_reason: "stop".to_string(),
+                    usage: ProviderCallUsage::default(),
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                });
+            }
+            progress
+                .unwrap()
+                .send(ProviderProgress::ToolCallGenerating {
+                    id: Some("call-1".into()),
+                })
+                .unwrap();
+            let (ack, acked) = tokio::sync::oneshot::channel();
+            self.controls
+                .send(AgentTurnControl::Steer {
+                    message_id: Uuid::new_v4(),
+                    text: "check the log first".to_string(),
+                    attachments: Vec::new(),
+                    admission: borg_provider::provider::SteerAdmission::pending(),
+                    preempt: false,
+                    ack,
+                })
+                .await
+                .unwrap();
+            // Returning only after the steer is admitted is what makes this a
+            // test of generation-time steering rather than a race.
+            acked.await.unwrap().unwrap();
+            Ok(ModelTurnResult {
+                message: ModelMessage::assistant(
+                    None,
+                    None,
+                    None,
+                    vec![ModelToolCall::function(
+                        "call-1".to_string(),
+                        "exec".to_string(),
+                        json!({
+                            "action": "record the run",
+                            "cmd": format!("echo ran >> {}", self.marker.display()),
+                            "timeout_ms": 30000,
+                        })
+                        .to_string(),
+                    )],
+                ),
+                finish_reason: "tool_calls".to_string(),
+                usage: ProviderCallUsage::default(),
+                raw_response: Value::Null,
+                trace: ProviderAttemptTrace::default(),
+            })
+        }
+    }
+
+    /// The release contract, end to end through the real harness: a steer that
+    /// lands while the model is writing a tool call must not cancel it. The
+    /// tool runs exactly once, its result is journaled, and only then is the
+    /// human's message folded in.
+    #[tokio::test]
+    async fn a_steer_during_generation_still_runs_the_tool_once_before_folding() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().to_path_buf();
+        let marker = cwd.join("ran.txt");
+        let session_id = Uuid::new_v4();
+        let processes = crate::native_process::ProcessManager::default();
+        let rounds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (controls_tx, controls_rx) = mpsc::channel(4);
+        let client = Arc::new(SteerDuringGenerationHarnessClient {
+            rounds: std::sync::Arc::clone(&rounds),
+            controls: controls_tx,
+            marker: marker.clone(),
+        });
+        let harness = NativeHarness {
+            model_client: client.clone(),
+            // `exec` is the Borg catalog's tool; the native catalog spells it
+            // `exec_command`, and this test needs the command to really run.
+            harness: HarnessMode::Borg,
+            ..NativeHarness::default()
+        };
+        let turn = AgentTurn {
+            session_id,
+            prompt_cache_session_id: Some(Uuid::new_v4()),
+            message_id: Uuid::new_v4(),
+            context_generation: 0,
+            provider: crate::CodingProvider::OpenRouter,
+            provider_session_id: None,
+            provider_fork_turn_id: None,
+            cwd: cwd.clone(),
+            prompt_delta: "build it".to_string(),
+            prompt: "build it".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            model: Some("test-model".to_string()),
+            effort: None,
+            fast: Some(true),
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+            conversation: Vec::new(),
+            agent_mcp_server: borg_provider::mcp::ExternalMcpServer {
+                name: "test".to_string(),
+                command: "test".to_string(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                allowed_tools: Vec::new(),
+            },
+            agent_tools: crate::AgentToolDispatcher::new(
+                crate::session::SessionGoalTools::disconnected(),
+                crate::session::SessionTodoTools::disconnected(),
+                None,
+                crate::LspService::new(&cwd),
+                crate::CodingProvider::OpenRouter,
+                session_id,
+                false,
+                None,
+                None,
+                cwd.clone(),
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                processes.clone(),
+                PermissionMode::FullAccess,
+            ),
+            external_mcp_servers: Vec::new(),
+            runtime_mcp_context: Default::default(),
+            extension_skill_roots: Vec::new(),
+            extension_workflows: Vec::new(),
+            extension_api: Default::default(),
+            system_prompt_appendix: String::new(),
+            declaration_base: None,
+            volatile_system_prompt_appendix: String::new(),
+        };
+
+        let (events_tx, mut events_rx) = mpsc::channel(512);
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            harness.run(turn, events_tx, Some(controls_rx)),
+        )
+        .await
+        .expect("a queued steer must not stall the turn")
+        .expect("the turn completes successfully");
+
+        assert_eq!(result.final_text, "done");
+        assert_eq!(
+            rounds.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the steer is answered in a second round, not by replacing the first"
+        );
+
+        // Externally visible: the command really ran, and exactly once. A
+        // skipped or cancelled call would leave this empty.
+        let ran = std::fs::read_to_string(&marker).unwrap_or_default();
+        assert_eq!(
+            ran.lines().filter(|line| line.trim() == "ran").count(),
+            1,
+            "the generated tool call must execute exactly once, not be skipped"
+        );
+
+        let mut journal = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            if let SessionEventKind::ProviderEvent { kind, payload, .. } = event
+                && kind == "native_model_message"
+            {
+                journal.push(payload.to_string());
+            }
+        }
+        let tool_result = journal
+            .iter()
+            .position(|entry| entry.contains("call-1") && entry.contains("tool"))
+            .expect("the tool result has to be journaled");
+        let steer = journal
+            .iter()
+            .position(|entry| entry.contains("check the log first"))
+            .expect("the steer has to be journaled");
+        assert!(
+            tool_result < steer,
+            "the tool result must be journaled before the steer is folded"
         );
     }
 }
