@@ -3566,8 +3566,7 @@ async fn run_agent_session_store_kernel_inner(
                         native_usage_event(&compaction.usage, None),
                     )
                     .await?;
-                    let retained_declarations =
-                        native_declarations(journal.context_events());
+                    let retained_declarations = native_declarations(journal.context_events());
                     record(
                         &mut journal,
                         &events,
@@ -3899,9 +3898,8 @@ async fn run_agent_session_store_kernel_inner(
             // the host died; re-delivering the text alone reads as "do this
             // again", which re-answers a question the human already has an
             // answer to and re-runs side effects that already landed.
-            let resumed = "\n\nThe previous attempt was cut off when this host restarted, after it may already have answered and made progress. Treat the request above as work already in progress, not as a new instruction to carry out from the start. The conversation above records what was actually done: continue from where it stopped, do not repeat completed actions, and do not answer again anything already answered there. Before re-running any command that was interrupted, check whether it already took effect. If everything it asked for is already done, say so briefly instead of redoing it.";
-            provider_prompt.push_str(resumed);
-            prompt_delta.push_str(resumed);
+            provider_prompt.push_str(RESUMED_TURN_CONTINUATION);
+            prompt_delta.push_str(RESUMED_TURN_CONTINUATION);
             resumed_turn_message_id = None;
         } else if network_retry_message_id == Some(prompt.message_id) {
             // The request above is re-delivered under its original id so that
@@ -4391,7 +4389,16 @@ async fn run_agent_session_store_kernel_inner(
                                             retry
                                         }),
                                         replaced_message_ids: prompt.batch_entries().iter().map(|entry| entry.message_id).collect(),
-                                        continuation: usage_limit_continue || !prompt.visible,
+                                        // A resumed turn that then hits a
+                                        // usage limit is still a continuation.
+                                        // Without this the checkpoint comes
+                                        // back as an ordinary prompt: its
+                                        // originals never settle and it is
+                                        // re-announced and re-asked, undoing
+                                        // the resume it was in the middle of.
+                                        continuation: usage_limit_continue
+                                            || !prompt.visible
+                                            || resuming_interrupted_turn,
                                         in_progress: false,
                                     })?,
                                 }).await?;
@@ -7652,6 +7659,11 @@ fn retained_fold_compaction_prompt(previous_summary: &str, context: &str) -> Str
         "{COMPACTION_SUMMARY_PROMPT}\n\n<prior_summary>\n{previous_summary}\n</prior_summary>\n\n<prior_provider_conversation>\n{context}\n</prior_provider_conversation>"
     )
 }
+
+/// Appended, under the original message id, when a turn the host killed is
+/// resumed. Named rather than inlined so a test can assert the dispatch
+/// really carries it without restating the wording.
+pub(crate) const RESUMED_TURN_CONTINUATION: &str = "\n\nThe previous attempt was cut off when this host restarted, after it may already have answered and made progress. Treat the request above as work already in progress, not as a new instruction to carry out from the start. The conversation above records what was actually done: continue from where it stopped, do not repeat completed actions, and do not answer again anything already answered there. Before re-running any command that was interrupted, check whether it already took effect. If everything it asked for is already done, say so briefly instead of redoing it.";
 
 /// The prompt of a turn that started and never reached a terminal boundary.
 ///

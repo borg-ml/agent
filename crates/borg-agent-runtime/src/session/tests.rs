@@ -9130,6 +9130,211 @@ async fn a_turn_cut_off_by_a_crash_resumes_its_prompt_instead_of_re_asking_it() 
 }
 
 #[tokio::test]
+async fn a_resumed_turn_continues_the_original_prompt_and_settles_it_once() {
+    // The runtime half of the crash-resume contract. The classifier test
+    // above would still pass if the dispatch and admission wiring were
+    // deleted, so this drives a real actor over a journal that ends inside a
+    // turn and checks what the provider was actually handed.
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        SessionEventKind::SessionConfigured {
+            cwd: root.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-5.6-luna".to_string()),
+            effort: Some("max".to_string()),
+            fast: false,
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::Manual,
+        },
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "how often does it send them".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::TurnStarted {
+            message_id,
+            provider: CodingProvider::Codex,
+            model: Some("gpt-5.6-luna".to_string()),
+            effort: Some("max".to_string()),
+            fast: false,
+        },
+        // The answer the human already read, and a side effect that already
+        // landed. Both must reach the resumed turn as history.
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "every 90% of the cache lifetime".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+        SessionEventKind::ToolStarted {
+            tool_call_id: "call-1".to_string(),
+            name: "Bash".to_string(),
+            input: json!({}),
+            input_ref: None,
+        },
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "call-1".to_string(),
+            output: "worker spawned".to_string(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+        },
+        // No TurnCompleted: this is the host dying mid-turn.
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    let admissions_before = in_progress_admissions(store.as_ref(), session_id, message_id).await;
+    assert_eq!(admissions_before, 1, "the crashed run admitted it once");
+
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, _event_rx) = mpsc::channel(256);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let called = Arc::new(Notify::new());
+    let compaction_calls = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(DurableResumeExecutor {
+        seen: Arc::clone(&seen),
+        called: Arc::clone(&called),
+        compaction_calls: Arc::clone(&compaction_calls),
+    });
+    let actor_store = Arc::clone(&store);
+    let actor_cwd = root.path().to_path_buf();
+    let actor = tokio::spawn(async move {
+        run_session_actor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: actor_cwd,
+                provider: CodingProvider::Codex,
+                model: Some("gpt-5.6-luna".to_string()),
+                effort: Some("max".to_string()),
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+            actor_store,
+        )
+        .await
+    });
+
+    // Nothing is sent: recovery alone must resume the interrupted turn.
+    tokio::time::timeout(Duration::from_secs(10), called.notified())
+        .await
+        .expect("the interrupted turn is resumed without a new prompt");
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+
+    let dispatched = {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "resumed exactly once");
+        seen[0].clone()
+    };
+    let (sent_prompt, _, _, conversation_len) = dispatched;
+    assert!(
+        sent_prompt.contains("how often does it send them"),
+        "the original request is re-delivered verbatim, not paraphrased"
+    );
+    assert!(
+        sent_prompt.ends_with(RESUMED_TURN_CONTINUATION),
+        "the dispatch is demoted to a continuation rather than repeated as an instruction"
+    );
+    assert!(
+        conversation_len > 0,
+        "the resumed turn is handed the progress the crashed turn already made"
+    );
+
+    let events = store.read(session_id).await.unwrap();
+    assert_eq!(
+        in_progress_admissions(store.as_ref(), session_id, message_id).await,
+        admissions_before,
+        "a resumed prompt is not admitted a second time: its original admission, \
+         and its original timestamp, are already durable"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::Message {
+                message_id: id,
+                status: MessageStatus::Complete,
+                actor: EventActor::User,
+                ..
+            } if *id == message_id
+        )),
+        "the resumed turn still settles the message, so it cannot be recovered again"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TurnCompleted { message_id: id, .. } if *id == message_id
+        )),
+        "the resumed turn reaches a durable boundary"
+    );
+
+    let recovery = store.recovery(session_id).await.unwrap();
+    assert_eq!(
+        interrupted_turn_prompt(&recovery.context_events),
+        None,
+        "the turn is no longer interrupted once it completed"
+    );
+    assert!(
+        recover_prompts_on_resume(&recovery.queue_events).is_empty(),
+        "a second resume has nothing left to replay"
+    );
+    scratch.discard().await;
+}
+
+async fn in_progress_admissions(
+    store: &dyn SessionStore,
+    session_id: Uuid,
+    message_id: Uuid,
+) -> usize {
+    store
+        .read(session_id)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::Message {
+                    message_id: id,
+                    status: MessageStatus::InProgress,
+                    ..
+                } if *id == message_id
+            )
+        })
+        .count()
+}
+
+#[tokio::test]
 async fn a_turn_that_reached_its_boundary_is_not_resumed_as_a_continuation() {
     // The other half. Once `TurnCompleted` is durable the turn ended on its
     // own terms, so nothing about it is interrupted and a later prompt with
