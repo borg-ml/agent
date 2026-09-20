@@ -263,6 +263,15 @@ impl SessionEventKind {
             Self::ProviderEvent { kind, .. } if kind == crate::PROVIDER_PROMPT_EVENT_KIND => {
                 EventPersistence::Durable
             }
+            // A native steer is completed only on this marker, so the marker
+            // is the evidence for that completion and has to outlive the turn
+            // that wrote it. Ephemeral -- the default for a provider event --
+            // meant it was never journaled at all: the ordering guarantee
+            // rested on a row that did not exist, and a resumed session could
+            // not tell a folded steer from one the model never saw.
+            Self::ProviderEvent { kind, .. } if kind == crate::session::NATIVE_STEER_APPLIED => {
+                EventPersistence::Durable
+            }
             Self::ProviderEvent { kind, .. }
                 if kind == "action/preparing"
                     || kind == "action/preparing_cancelled"
