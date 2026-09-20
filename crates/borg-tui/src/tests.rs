@@ -16,6 +16,18 @@ fn watcher_yield_labels_ready_as_waiting_until_resumed_or_restarted() {
         )
     };
     assert_eq!(transcript.status_label(SessionStatus::Ready), "ready");
+    // The durable Ready detail alone must park the label: the ephemeral
+    // `goal_yielded` can be dropped under load or missed on reconnect.
+    let mut durable_only = Transcript::default();
+    durable_only.apply(&SessionEvent::new(
+        session,
+        4,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: Some("Waiting on 2 watcher(s)".to_string()),
+        },
+    ));
+    assert_eq!(durable_only.status_label(SessionStatus::Ready), "waiting");
     transcript.apply(&event("goal_yielded"));
     transcript.apply(&SessionEvent::new(
         session,

@@ -48,6 +48,12 @@ fn goal_status_label(status: GoalStatus) -> &'static str {
     }
 }
 
+/// Is this Ready detail the durable form of an explicit watcher yield? The
+/// runtime writes `Waiting on {n} watcher(s)` when the goal parks on watchers.
+fn ready_detail_is_waiting_on_watchers(detail: &str) -> bool {
+    detail.starts_with("Waiting on ")
+}
+
 fn line_is_blank(line: &Line<'static>) -> bool {
     line.spans.iter().all(|span| span.content.trim().is_empty())
 }
@@ -1104,8 +1110,12 @@ impl Transcript {
             SessionEventKind::TurnStarted { .. } | SessionEventKind::SessionStarted => {
                 self.waiting_on_watchers = false;
             }
-            SessionEventKind::StatusChanged { status, .. } if *status != SessionStatus::Ready => {
-                self.waiting_on_watchers = false;
+            // The durable Ready boundary carries the wait in its detail. Unlike
+            // the ephemeral `goal_yielded`, it survives both a dropped live
+            // event and a reconnect replay, so the label stays truthful there.
+            SessionEventKind::StatusChanged { status, detail } => {
+                self.waiting_on_watchers = *status == SessionStatus::Ready
+                    && detail.as_deref().is_some_and(ready_detail_is_waiting_on_watchers);
             }
             _ => {}
         }
