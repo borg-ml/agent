@@ -4216,6 +4216,7 @@ async fn run_agent_session_store_kernel_inner(
                         session_id,
                         &mut pending,
                         &mut pending_steers,
+                        executor.uses_native_harness(launch.provider),
                     )
                     .await?;
                         match result {
@@ -4639,6 +4640,7 @@ async fn run_agent_session_store_kernel_inner(
                         session_id,
                         &mut pending,
                         &mut pending_steers,
+                        executor.uses_native_harness(launch.provider),
                     )
                     .await?;
                     next_ready_detail = Some("Interrupted".to_string());
@@ -4707,6 +4709,7 @@ async fn run_agent_session_store_kernel_inner(
                         session_id,
                         &mut pending,
                         &mut pending_steers,
+                        executor.uses_native_harness(launch.provider),
                     )
                     .await?;
                     record(
@@ -4762,7 +4765,15 @@ async fn run_agent_session_store_kernel_inner(
                     else {
                         continue;
                     };
-                    if pending_steers[index].admission.is_accepted() {
+                    // An admission receipt says the provider took the text,
+                    // not that the model was given it. Under the native
+                    // harness the steer stays pending until the fold is
+                    // journaled; `retry_pending_steers` already skips an
+                    // accepted admission, so it is not re-dispatched while it
+                    // waits. Claude keeps reporting consumption its own way.
+                    if pending_steers[index].admission.is_accepted()
+                        && !executor.uses_native_harness(launch.provider)
+                    {
                         for steer in pending_steers.iter_mut().filter(|steer| steer.acknowledgement_id == acknowledgement_id) {
                             steer.state = PendingSteerState::Accepted;
                         }
@@ -5496,6 +5507,7 @@ async fn run_agent_session_store_kernel_inner(
                                 session_id,
                                 &mut pending,
                                 &mut pending_steers,
+                                executor.uses_native_harness(launch.provider),
                             )
                             .await?;
                             next_ready_detail = Some("Interrupted".to_string());
@@ -5804,7 +5816,23 @@ async fn run_agent_session_store_kernel_inner(
                         session_id,
                     )
                     .await?;
+                    let native_steer_marker = native_steer_applied_to(&kind);
                     record(&mut journal, &events, session_id, kind).await?;
+                    // Deliberately after the marker is journaled: completing
+                    // first would order the steer's terminal status ahead of
+                    // the evidence for it, which is the ordering this whole
+                    // mechanism exists to provide.
+                    if let Some(applied) = native_steer_marker {
+                        settle_marked_native_steers(
+                            applied,
+                            &mut pending_steers,
+                            &mut journal,
+                            &events,
+                            session_id,
+                            &mut steers_awaiting_consumption,
+                        )
+                        .await?;
+                    }
                     if retry_steers && !context_compaction_in_progress && !user_stop && !interrupted {
                         steer_boundary_generation = steer_boundary_generation.saturating_add(1);
                         retry_pending_steers(
@@ -8941,10 +8969,16 @@ async fn promote_uncommitted_steers(
     session_id: Uuid,
     pending: &mut VecDeque<QueuedPrompt>,
     pending_steers: &mut VecDeque<PendingSteer>,
+    native_harness: bool,
 ) -> Result<()> {
     let mut promoted = Vec::new();
     while let Some(steer) = pending_steers.pop_front() {
-        if steer.admission.is_accepted() {
+        // Under the native harness an accepted admission is not delivery. A
+        // steer still sitting here never had a fold journaled for it, so
+        // completing it would record input the model was never given and the
+        // human's steer would be silently lost. Send it back as pending
+        // input instead; a marked one was already settled and popped.
+        if steer.admission.is_accepted() && !native_harness {
             record_prompt_status(
                 journal,
                 events,
@@ -9033,6 +9067,60 @@ async fn complete_consumed_steers(
         return Ok(());
     };
     record_steer_entry_status(journal, events, session_id, entry, status).await
+}
+
+/// The event the native harness journals when it folds a steer into the model
+/// input. Written on the same path as the fold, so the two cannot reorder,
+/// and durable, so a resumed session can tell a steer the model was actually
+/// given from one that only reached the provider.
+pub(crate) const NATIVE_STEER_APPLIED: &str = "native_steer_applied";
+
+fn native_steer_applied_to(kind: &SessionEventKind) -> Option<Uuid> {
+    let SessionEventKind::ProviderEvent { kind, payload, .. } = kind else {
+        return None;
+    };
+    if kind != NATIVE_STEER_APPLIED {
+        return None;
+    }
+    payload
+        .get("message_id")
+        .and_then(Value::as_str)
+        .and_then(|id| Uuid::parse_str(id).ok())
+}
+
+/// Complete the steers a persisted fold marker accounts for.
+///
+/// Only this settles a native steer. An acknowledgement says the provider
+/// accepted the text for admission; the marker says the model was handed it.
+/// Ordering between the two stops mattering once the marker is the only thing
+/// that completes: whichever arrives first, nothing is recorded as delivered
+/// until the fold is durable.
+async fn settle_marked_native_steers(
+    applied: Uuid,
+    pending_steers: &mut VecDeque<PendingSteer>,
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    awaiting: &mut HashMap<Uuid, PromptBatchEntry>,
+) -> Result<()> {
+    // Grouped dispatch folds several steers into one request under a single
+    // acknowledgement id, and the marker can only name the representative the
+    // combined text was built from. Settling that one alone strands the rest
+    // in `pending_steers` to be re-delivered at teardown.
+    let Some(group) = pending_steers
+        .iter()
+        .find(|steer| steer.prompt.message_id == applied)
+        .map(|steer| steer.acknowledgement_id)
+    else {
+        return Ok(());
+    };
+    for steer in pending_steers
+        .iter_mut()
+        .filter(|steer| steer.acknowledgement_id == group)
+    {
+        steer.state = PendingSteerState::Accepted;
+    }
+    settle_accepted_steers(journal, events, session_id, pending_steers, false, awaiting).await
 }
 
 /// A turn is over: nothing can consume a steer any more, so settle whatever is

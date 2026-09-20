@@ -1924,6 +1924,66 @@ impl AgentTurnExecutor for CommittingSteerExecutor {
     }
 }
 
+struct NativeFoldSteerExecutor {
+    turn_started: Arc<Notify>,
+    steer_handled: Arc<Notify>,
+    /// Journal the fold marker before acknowledging, rather than after.
+    marker_first: bool,
+    /// Whether the steer is folded into the model input at all.
+    fold: bool,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for NativeFoldSteerExecutor {
+    fn uses_native_harness(&self, _provider: CodingProvider) -> bool {
+        true
+    }
+
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        events: mpsc::Sender<SessionEventKind>,
+        controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        self.turn_started.notify_one();
+        let mut controls = controls.expect("active turn has controls");
+        if let Some(AgentTurnControl::Steer {
+            message_id,
+            admission,
+            ack,
+            ..
+        }) = controls.recv().await
+        {
+            assert!(admission.accept());
+            let marker = |id: Uuid| SessionEventKind::ProviderEvent {
+                provider: CodingProvider::OpenRouter,
+                kind: crate::session::NATIVE_STEER_APPLIED.to_string(),
+                payload: json!({ "message_id": id }),
+            };
+            if self.marker_first {
+                if self.fold {
+                    let _ = events.send(marker(message_id)).await;
+                }
+                let _ = ack.send(Ok(()));
+            } else {
+                let _ = ack.send(Ok(()));
+                if self.fold {
+                    let _ = events.send(marker(message_id)).await;
+                }
+            }
+            self.steer_handled.notify_one();
+        }
+        while !matches!(
+            controls.recv().await,
+            Some(AgentTurnControl::Interrupt) | None
+        ) {}
+        Ok(AgentTurnResult {
+            provider_session_id: None,
+            final_text: String::new(),
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentTurnExecutor for FlushingQueueExecutor {
     async fn execute(
@@ -5133,6 +5193,224 @@ async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
             "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"inspect this [Image 1]\",\"role\":\"user\"}</borg-message>"
         );
         assert_eq!(turns[1].1, [image]);
+    }
+    scratch.discard().await;
+}
+
+async fn assert_native_steer_settlement(marker_first: bool, fold: bool) {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let steer_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, _event_rx) = mpsc::channel(256);
+    let turn_started = Arc::new(Notify::new());
+    let steer_handled = Arc::new(Notify::new());
+    let executor = Arc::new(NativeFoldSteerExecutor {
+        turn_started: Arc::clone(&turn_started),
+        steer_handled: Arc::clone(&steer_handled),
+        marker_first,
+        fold,
+    });
+    let actor_store = Arc::clone(&store);
+    let actor = tokio::spawn({
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd,
+                    provider: CodingProvider::OpenRouter,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                actor_store,
+            )
+            .await
+        }
+    });
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "start the turn".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
+        .await
+        .expect("first turn starts");
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: steer_id,
+            text: "fold this in".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), steer_handled.notified())
+        .await
+        .expect("provider handles the steer");
+    command_tx
+        .send(HostCommand::Interrupt { session_id })
+        .await
+        .unwrap();
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(30), actor)
+        .await
+        .expect("session stops");
+
+    let journal = store.read(session_id).await.unwrap();
+    let completions = journal
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::Message {
+                    message_id,
+                    status: MessageStatus::Complete,
+                    ..
+                } if *message_id == steer_id
+            )
+        })
+        .collect::<Vec<_>>();
+    if fold {
+        let marker = journal
+            .iter()
+            .find(|event| {
+                matches!(
+                    &event.kind,
+                    SessionEventKind::ProviderEvent { kind, .. }
+                        if kind == NATIVE_STEER_APPLIED
+                )
+            })
+            .expect("the fold marker is durable");
+        assert_eq!(
+            completions.len(),
+            1,
+            "a folded steer completes exactly once"
+        );
+        assert!(
+            marker.sequence < completions[0].sequence,
+            "the marker is persisted before the completion it justifies, whichever \
+             order the provider acknowledged and folded in"
+        );
+    } else {
+        assert!(
+            completions.is_empty(),
+            "an accepted steer the model was never handed must not be recorded as delivered"
+        );
+        let recovery = store.recovery(session_id).await.unwrap();
+        assert!(
+            recover_prompts_on_resume(&recovery.queue_events)
+                .iter()
+                .any(|prompt| prompt.message_id == steer_id),
+            "it comes back as pending input instead"
+        );
+    }
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn a_native_steer_completes_only_once_its_fold_is_journaled() {
+    // An acknowledgement says the provider accepted the text for admission.
+    // Only the journaled fold says the model was handed it, so it is the only
+    // thing that may complete a native steer -- and the two can arrive in
+    // either order without changing the outcome.
+    assert_native_steer_settlement(false, true).await;
+    assert_native_steer_settlement(true, true).await;
+    // Accepted, then the turn ends without a fold. Completing here would
+    // record input the model never saw and silently lose the human's steer.
+    assert_native_steer_settlement(false, false).await;
+}
+
+#[tokio::test]
+async fn a_fold_marker_settles_every_steer_batched_under_one_acknowledgement() {
+    // Grouped dispatch folds several steers into one request under a single
+    // acknowledgement id, and the marker can only name the representative the
+    // combined text was built from. Settling that one alone would strand the
+    // rest and re-deliver them at teardown.
+    let session_id = Uuid::new_v4();
+    let (scratch, store, mut journal) = runtime_store(session_id).await;
+    let (events, _events_rx) = mpsc::channel::<SessionEvent>(64);
+    let representative = Uuid::new_v4();
+    let folded_in = Uuid::new_v4();
+    let acknowledgement_id = Uuid::new_v4();
+    let steer = |message_id: Uuid| PendingSteer {
+        prompt: QueuedPrompt {
+            message_id,
+            text: "batched".to_string(),
+            actor: EventActor::User,
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+            visible: true,
+            interrupt_batch: false,
+            batch: Vec::new(),
+        },
+        acknowledgement_id,
+        admission: SteerAdmission::pending(),
+        state: PendingSteerState::AwaitingAcknowledgement,
+        attempt_boundary: 0,
+    };
+    let mut pending_steers = VecDeque::from(vec![steer(representative), steer(folded_in)]);
+    let mut awaiting = HashMap::new();
+
+    settle_marked_native_steers(
+        representative,
+        &mut pending_steers,
+        &mut journal,
+        &events,
+        session_id,
+        &mut awaiting,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        pending_steers.is_empty(),
+        "the whole batch settles, not only the prompt the marker names"
+    );
+    let settled = store.read(session_id).await.unwrap();
+    for message_id in [representative, folded_in] {
+        assert!(
+            settled.iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::Message {
+                    message_id: id,
+                    status: MessageStatus::Complete,
+                    ..
+                } if *id == message_id
+            )),
+            "every batched steer reaches Complete"
+        );
     }
     scratch.discard().await;
 }
