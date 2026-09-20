@@ -124,8 +124,9 @@ pub struct WorkspaceMessageBody {
     #[serde(default)]
     pub mentions: Vec<StructuredMention>,
     /// Defaulted so journals written before image forwarding replay unchanged
-    /// rather than failing to deserialize.
-    #[serde(default)]
+    /// rather than failing to deserialize, and skipped when empty so a plain
+    /// text message serializes exactly as it did before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<MessageAttachment>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,7 +159,7 @@ pub struct NewWorkspaceMessage {
     pub text: String,
     #[serde(default)]
     pub mentions: Vec<StructuredMention>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<MessageAttachment>,
     pub audience: Audience,
     pub mode: DeliveryMode,

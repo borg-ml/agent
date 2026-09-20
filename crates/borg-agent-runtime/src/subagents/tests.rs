@@ -4816,29 +4816,37 @@ async fn images_reach_a_same_host_peer_through_ordinary_participant_addressing()
 
 /// Absent host bindings mean "nothing recorded a host", which is not the same
 /// as "same host". Treating missing information as local would forward images
-/// to a recipient whose store cannot resolve them, and the refusal must leave
-/// no durable trace behind.
+/// to a recipient whose store cannot resolve them.
+///
+/// The sessions are deliberately in DIFFERENT workspaces, so admitting this
+/// message would first create a direct workspace and give it members. That is
+/// why the refusal has to precede it: the assertion here is not merely that no
+/// message arrived, but that no workspace was brought into being for one.
 #[tokio::test]
 async fn images_are_refused_when_nothing_proves_the_recipient_shares_this_host() {
     let directory = tempdir().unwrap();
-    let workspace_id = Uuid::new_v4();
     let sender = Uuid::new_v4();
     let recipient = Uuid::new_v4();
     let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
     let store = Arc::new(store);
-    for session in [sender, recipient] {
+    let human = crate::local_human_participant_id("Human");
+    let workspace = {
         store
-            .create_session_in_workspace(session, workspace_id)
+            .create_session_in_workspace(sender, Uuid::new_v4())
             .await
             .unwrap();
-    }
-    let workspace = store.workspace_store().await.unwrap().unwrap();
-    let human = crate::local_human_participant_id("Human");
+        store
+            .create_session_in_workspace(recipient, Uuid::new_v4())
+            .await
+            .unwrap();
+        store.workspace_store().await.unwrap().unwrap()
+    };
     for (session, label) in [(sender, "Sender root"), (recipient, "Recipient root")] {
+        let binding = store.workspace_binding(session).await.unwrap().unwrap();
         workspace
             .ensure_execution_workspace(
-                workspace_id,
-                "shared project",
+                binding.workspace_id,
+                "separate project",
                 human,
                 "Human",
                 session,
@@ -4858,6 +4866,18 @@ async fn images_are_refused_when_nothing_proves_the_recipient_shares_this_host()
         store.clone(),
     )
     .unwrap();
+
+    let sender_participant = store
+        .workspace_binding(sender)
+        .await
+        .unwrap()
+        .unwrap()
+        .participant_id;
+    let workspaces_before = workspace
+        .list_workspaces_for_participant(sender_participant)
+        .await
+        .unwrap()
+        .len();
 
     let source = directory.path().join("frame.png");
     std::fs::write(&source, sample_png()).unwrap();
@@ -4886,6 +4906,15 @@ async fn images_are_refused_when_nothing_proves_the_recipient_shares_this_host()
             "unexpected error: {error:#}"
         ),
     }
+    assert_eq!(
+        workspace
+            .list_workspaces_for_participant(sender_participant)
+            .await
+            .unwrap()
+            .len(),
+        workspaces_before,
+        "a refused image message must not leave a direct workspace behind"
+    );
     assert!(
         coordinator
             .unread_messages_for_session(recipient)
@@ -4895,4 +4924,21 @@ async fn images_are_refused_when_nothing_proves_the_recipient_shares_this_host()
         "a refused image message must leave no durable receipt"
     );
     scratch.discard().await;
+}
+
+/// A message with no images must serialize exactly as it did before the field
+/// existed, so adding image forwarding does not rewrite every existing journal
+/// row's shape.
+#[test]
+fn a_message_without_images_serializes_without_an_attachments_field() {
+    let body = crate::WorkspaceMessageBody {
+        text: "no images here".to_string(),
+        mentions: Vec::new(),
+        attachments: Vec::new(),
+    };
+    let encoded = serde_json::to_string(&body).expect("serialize body");
+    assert!(
+        !encoded.contains("attachments"),
+        "an empty attachment list must not be written: {encoded}"
+    );
 }

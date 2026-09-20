@@ -3028,17 +3028,6 @@ impl SubagentCoordinator {
             .with_context(|| {
                 format!("team recipient session {recipient_session_id} has no workspace")
             })?;
-        let workspace_store = self.workspace_store().await?;
-        let workspace_id = if actor_binding.workspace_id == recipient_binding.workspace_id {
-            actor_binding.workspace_id
-        } else {
-            workspace_store
-                .ensure_direct_workspace(
-                    actor_binding.participant_id,
-                    recipient_binding.participant_id,
-                )
-                .await?
-        };
         // The sender's task name ("/root", "/root/worker") only means
         // something inside the sender's own process: every session resolves
         // "/root" to ITSELF. Telling a peer in another process to reply to
@@ -3052,35 +3041,51 @@ impl SubagentCoordinator {
             recipient_session_id == table.root_session_id
                 || table.entries.contains_key(&recipient_session_id)
         };
+        // Settle whether images may travel BEFORE the workspace below, which
+        // is created and given members durably: a refusal afterwards would
+        // leave a workspace behind for a message that was never admitted.
+        //
+        // The test has to be positive evidence. `session_message_needs_relay`
+        // answers false when either host binding is absent, which means
+        // "nothing recorded a host", not "same host" -- trusting it would let
+        // an unknown recipient through on missing information. A session this
+        // process drives, two bindings naming the same host, or a live local
+        // owner are the three things that actually prove a shared store.
+        if !attachments.is_empty() {
+            // Only a message that really carries images pays for the owner
+            // probe, and it is ordered last so the in-memory answers settle it
+            // first. A text message touches no new filesystem state at all.
+            let recipient_shares_attachment_store = recipient_is_local_task
+                || matches!(
+                    (actor_binding.host_id, recipient_binding.host_id),
+                    (Some(sender_host), Some(recipient_host)) if sender_host == recipient_host
+                )
+                || crate::local_session_owner_is_active(&self.journal_root, recipient_session_id)
+                    .unwrap_or(false);
+            ensure!(
+                recipient_shares_attachment_store,
+                "forwarding images to a recipient that does not share this host's attachment \
+                 store is not supported yet; send the message without attachments, or reach a \
+                 session on this host"
+            );
+        }
+        let workspace_store = self.workspace_store().await?;
+        let workspace_id = if actor_binding.workspace_id == recipient_binding.workspace_id {
+            actor_binding.workspace_id
+        } else {
+            workspace_store
+                .ensure_direct_workspace(
+                    actor_binding.participant_id,
+                    recipient_binding.participant_id,
+                )
+                .await?
+        };
         let reply_target = if recipient_is_local_task {
             actor.to_string()
         } else {
             format!("participant:{}", actor_binding.participant_id)
         };
         let text = attributed_team_message(actor, &reply_target, message);
-        // Cross-host image forwarding has no byte transfer yet, and a
-        // recipient resolves digests in ITS OWN store, so images must only go
-        // where this host's blob directory is readable.
-        //
-        // The test has to be positive evidence. `session_message_needs_relay`
-        // answers false when either host binding is absent, which means
-        // "nothing recorded a host", not "same host" -- trusting it would let
-        // an unknown recipient through on missing information. A session this
-        // process drives, a live local owner, or two bindings that name the
-        // same host are the three things that actually prove a shared store.
-        let recipient_shares_attachment_store = recipient_is_local_task
-            || crate::local_session_owner_is_active(&self.journal_root, recipient_session_id)
-                .unwrap_or(false)
-            || matches!(
-                (actor_binding.host_id, recipient_binding.host_id),
-                (Some(sender_host), Some(recipient_host)) if sender_host == recipient_host
-            );
-        ensure!(
-            attachments.is_empty() || recipient_shares_attachment_store,
-            "forwarding images to a recipient that does not share this host's attachment store \
-             is not supported yet; send the message without attachments, or reach a session on \
-             this host"
-        );
         let idempotency_id = Uuid::new_v4();
         let receipt = workspace_store
             .append_message(NewWorkspaceMessage {
