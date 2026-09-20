@@ -12023,6 +12023,61 @@ fn copying_a_wrapped_command_keeps_the_whole_path_on_one_line() {
 }
 
 #[test]
+fn a_line_that_merely_contains_the_continuation_glyph_is_not_spliced() {
+    // The dashed gutter marks a wrapped code row, and copying joins such a
+    // row onto the line above it. Recognising the character anywhere in the
+    // first span would let ordinary text that contains it be read as a
+    // continuation: its first span would be treated as a gutter and dropped,
+    // and what remained would be spliced onto the previous line. The user
+    // would simply lose text, with nothing on screen to explain it.
+    let lines = vec![
+        Line::from("first line"),
+        Line::from(vec![Span::raw("\u{250a} art \u{250a}"), Span::raw(" kept")]),
+    ];
+
+    assert!(!is_wrapped_code_continuation(&lines[1]));
+
+    let copied = selected_transcript_text(
+        &lines,
+        TranscriptPoint { row: 0, column: 0 },
+        TranscriptPoint {
+            row: 1,
+            column: usize::MAX,
+        },
+    )
+    .expect("both rows copy");
+
+    assert_eq!(copied, "first line\n\u{250a} art \u{250a} kept");
+}
+
+#[test]
+fn copying_code_keeps_its_trailing_whitespace_and_drops_hover_padding() {
+    // Trailing whitespace inside a code block belongs to the source and can be
+    // significant, so the copy has to keep it. A hovered row is padded out to
+    // the viewport with a background-only span, and trimming the row cannot
+    // tell that padding from the source's own spaces -- it would take both.
+    // The blank line is source too: dropping its row closes the gap and
+    // merges the lines around it.
+    let source = "value = 1   \n\nnext";
+    let mut lines = rendering::code_block_lines("python", source, 40);
+    for line in &mut lines {
+        apply_line_background(line, 40, MESSAGE_HOVER_BG);
+    }
+
+    let copied = selected_transcript_text(
+        &lines,
+        TranscriptPoint { row: 0, column: 0 },
+        TranscriptPoint {
+            row: lines.len() - 1,
+            column: usize::MAX,
+        },
+    )
+    .expect("the block copies");
+
+    assert_eq!(copied, source);
+}
+
+#[test]
 fn transcript_selection_skips_headers_and_diff_line_number_gutters() {
     let header = Line::from(vec![
         Span::raw("  ▌ borg"),

@@ -12596,10 +12596,59 @@ fn apply_composer_selection(
 /// line. `syntax_lines` wraps a long line across rows to keep every byte on
 /// screen, and that wrap is a display artefact: copying has to rejoin the rows
 /// or the clipboard gets a line break in the middle of a path.
+///
+/// Only the gutter `syntax_lines` actually draws counts: blanks, then the
+/// dashed bar, then one space, in the gutter's own colour. Matching the
+/// character anywhere in the first span would let a message that merely
+/// contains it be read as a continuation, which drops that span from the
+/// selection and splices the line onto the one above it.
 fn is_wrapped_code_continuation(line: &Line<'static>) -> bool {
-    line.spans
-        .first()
-        .is_some_and(|span| span.content.contains('┊'))
+    let Some(span) = line.spans.first() else {
+        return false;
+    };
+    if span.style.fg != Some(Color::DarkGray) {
+        return false;
+    }
+    let Some(indent) = span.content.strip_suffix("┊ ") else {
+        return false;
+    };
+    !indent.is_empty() && indent.chars().all(|character| character == ' ')
+}
+
+/// The first row of a code line, carrying its source line number.
+fn is_numbered_code_row(line: &Line<'static>) -> bool {
+    let Some(span) = line.spans.first() else {
+        return false;
+    };
+    let content = span.content.as_ref();
+    let Some(bar) = content.find('│') else {
+        return false;
+    };
+    content[..bar]
+        .chars()
+        .any(|character| character.is_ascii_digit())
+}
+
+fn is_code_gutter_row(line: &Line<'static>) -> bool {
+    is_numbered_code_row(line) || is_wrapped_code_continuation(line)
+}
+
+/// The column after the last span that carries content. A hovered row is
+/// padded out to the viewport with a background-only span, and that padding
+/// must never reach the clipboard -- but a code line's own trailing
+/// whitespace must, and trimming the row cannot tell the two apart. Padding
+/// has no foreground colour; rendered source always does.
+fn selection_content_columns(line: &Line<'static>) -> usize {
+    let mut content_end = 0usize;
+    let mut column = 0usize;
+    for span in &line.spans {
+        column = column.saturating_add(span.content.width());
+        let padding = span.style.fg.is_none() && span.content.chars().all(|c| c == ' ');
+        if !padding {
+            content_end = column;
+        }
+    }
+    content_end
 }
 
 fn selection_line_ranges(line: &Line<'static>) -> Vec<(usize, usize)> {
@@ -12631,15 +12680,13 @@ fn selection_line_ranges(line: &Line<'static>) -> Vec<(usize, usize)> {
     if let Some(ranges) = diff_selection_ranges(line) {
         return ranges;
     }
-    if is_wrapped_code_continuation(line) {
-        return vec![(first.width(), width)];
-    }
-    if first.contains('│')
-        && first[..first.find('│').unwrap_or(0)]
-            .chars()
-            .any(|character| character.is_ascii_digit())
-    {
-        return vec![(first.width(), width)];
+    if is_code_gutter_row(line) {
+        let gutter = first.width();
+        let content_end = selection_content_columns(line);
+        return (gutter < content_end)
+            .then_some((gutter, content_end))
+            .into_iter()
+            .collect();
     }
     let prefix = if first == "  " {
         2
@@ -12882,6 +12929,9 @@ fn selected_transcript_text(
         // the end of a line, so it must not be trimmed or newline-separated.
         let continues =
             row < last_row && lines.get(row + 1).is_some_and(is_wrapped_code_continuation);
+        // Code keeps its own trailing whitespace: it can be significant, and
+        // the selectable range already stops before any hover padding.
+        let code_row = is_code_gutter_row(line);
         let mut chunks = Vec::new();
         for (selectable_start, selectable_end) in selectable {
             let chunk_start = from.max(selectable_start);
@@ -12903,14 +12953,20 @@ fn selected_transcript_text(
             // The wrap point keeps its space on this row. Trimming it here
             // is what would splice two arguments of a command together, so
             // the trailing run survives whenever the next row resumes it.
-            let chunk = if continues {
+            let chunk = if continues || code_row {
                 chunk
             } else {
                 chunk.trim_end().to_string()
             };
-            if continues || !chunk.trim().is_empty() {
+            if continues || code_row || !chunk.trim().is_empty() {
                 chunks.push(chunk);
             }
+        }
+        if chunks.is_empty() && code_row {
+            // A blank line inside a code block is source. Skipping the row
+            // would close the gap and merge the lines on either side of it.
+            selected.push(String::new());
+            continue;
         }
         if !chunks.is_empty() {
             if chunks.len() == 2 && chunks[0] == chunks[1] {
