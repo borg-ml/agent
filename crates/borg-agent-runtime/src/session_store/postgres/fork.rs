@@ -23,7 +23,7 @@ use crate::session_store::{SessionState, SessionStoreFork};
 
 /// A forked session renumbers its inherited prefix, so an inherited event needs
 /// a stable id of its own rather than reusing the parent's.
-fn inherited_event_id(session_id: Uuid, source_event_id: Uuid) -> Uuid {
+pub(super) fn inherited_event_id(session_id: Uuid, source_event_id: Uuid) -> Uuid {
     Uuid::new_v5(&session_id, source_event_id.as_bytes())
 }
 
@@ -150,7 +150,7 @@ impl PostgresSessionStore {
         // A fork inherits the parent's transcript, so it inherits whichever
         // harness owns that transcript; an undecided parent leaves the fork
         // undecided too.
-        Self::inherit_harness_routes(&mut transaction, parent_session_id, session_id).await?;
+        Self::copy_harness_routes(&mut transaction, parent_session_id, session_id).await?;
 
         let parent_workspace: Option<Uuid> = sqlx::query_scalar(
             "select workspace_id from session_workspace_bindings where session_id = $1",

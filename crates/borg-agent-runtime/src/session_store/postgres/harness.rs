@@ -312,6 +312,49 @@ impl PostgresSessionStore {
     /// Used when a fork or child adopts an existing conversation: the inherited
     /// route is passed to the resolver rather than copied, so a conflicting
     /// pinned route is refused instead of silently overwritten.
+    /// Give a fork the route its parent's transcript already belongs to.
+    ///
+    /// A fork COPIES the parent's decision rather than re-deriving its own, and
+    /// the distinction is not cosmetic. Resolution answers "what route does this
+    /// session's own shape imply", and a fork's shape implies the CLI: it has a
+    /// parent, so it is not an empty root, and the events it inherited belong to
+    /// rows another session owns. Re-deriving therefore returns `false` for a
+    /// fork of a native session, and comparing that against the parent then
+    /// fails a fork that is behaving exactly as intended -- which is what
+    /// `inherit_harness_routes` would do here.
+    ///
+    /// An undecided parent leaves the fork undecided: pinning a route the parent
+    /// has not chosen would strand the fork on it before its model is known.
+    pub(super) async fn copy_harness_routes(
+        transaction: &mut Transaction<'_, Postgres>,
+        parent_session_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<()> {
+        let parent_codex =
+            Self::resolve_codex_harness(transaction, parent_session_id, None).await?;
+        sqlx::query(
+            "insert into session_harness_routes (session_id, provider, native) \
+             values ($1, 'codex', $2) on conflict (session_id, provider) do nothing",
+        )
+        .bind(session_id)
+        .bind(parent_codex)
+        .execute(&mut **transaction)
+        .await?;
+        if let Some(parent_opencode) =
+            Self::resolve_opencode_harness(transaction, parent_session_id, None, None).await?
+        {
+            sqlx::query(
+                "insert into session_harness_routes (session_id, provider, native) \
+                 values ($1, 'open_code', $2) on conflict (session_id, provider) do nothing",
+            )
+            .bind(session_id)
+            .bind(parent_opencode)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        Ok(())
+    }
+
     pub(super) async fn inherit_harness_routes(
         transaction: &mut Transaction<'_, Postgres>,
         source_session_id: Uuid,

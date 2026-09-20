@@ -455,7 +455,13 @@ impl PostgresSessionStore {
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await?;
-        Ok(event)
+        // The COALESCED snapshot, not the frame that was passed in. A
+        // continuation keeps the identity and start time of the key it extends,
+        // so returning the caller's fresh event would hand back an id and a
+        // timestamp that exist nowhere in the store -- and a client rendering
+        // the return value would see the turn's timer restart on every frame,
+        // which is the exact effect the coalescing above exists to prevent.
+        Ok(stored_event)
     }
 
     /// Decode one `session_events` row into an event, hot or cold.
@@ -543,6 +549,166 @@ fn provider_event_kind(kind: &SessionEventKind) -> Option<String> {
 }
 
 #[async_trait]
+/// Lineage-aware message lookup.
+///
+/// A session does not only contain the events it appended: a fork contains the
+/// prefix it inherited, whose rows belong to the parent. Answering from one
+/// session's rows therefore tells a fork that a message it demonstrably carries
+/// is absent, and the callers that ask are deciding whether a prompt has already
+/// been admitted -- so a false negative admits it twice.
+impl PostgresSessionStore {
+    /// `inherited_only` restricts the search to what a descendant actually
+    /// inherits. A session owns every event it appended, but a fork inherits
+    /// only the fork-inheritable ones, so a queue entry left below the cut is
+    /// not part of the fork's history.
+    fn contains_message_in<'a>(
+        &'a self,
+        session_id: Uuid,
+        message_id: Uuid,
+        before_or_at: Option<u64>,
+        inherited_only: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            let session = self.session_row(session_id).await?;
+            let limit = before_or_at.unwrap_or(session.next_sequence.saturating_sub(1));
+            let found: bool = sqlx::query_scalar(
+                "select exists(select 1 from session_events \
+                 where session_id = $1 and message_id = $2 and sequence <= $3 \
+                   and (not $4 or fork_inheritable))",
+            )
+            .bind(session_id)
+            .bind(message_id)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .bind(inherited_only)
+            .fetch_one(self.pool())
+            .await?;
+            if found {
+                return Ok(true);
+            }
+            let inherited_limit = limit.min(session.inherited_event_count);
+            if inherited_limit == 0 {
+                return Ok(false);
+            }
+            let (Some(parent), Some(cut)) =
+                (session.parent_session_id, session.parent_cut_sequence)
+            else {
+                return Ok(false);
+            };
+            // A cut inside the inherited prefix is uncommon; resolve that
+            // bounded prefix through the composed view rather than guessing a
+            // sequence bound in the parent's space, which is a different
+            // numbering from this session's.
+            if inherited_limit < session.inherited_event_count {
+                return Ok(self
+                    .composed_events(session_id, Some(inherited_limit))
+                    .await?
+                    .iter()
+                    .any(|event| {
+                        matches!(
+                            event.kind,
+                            SessionEventKind::Message {
+                                message_id: existing,
+                                ..
+                            } if existing == message_id
+                        )
+                    }));
+            }
+            self.contains_message_in(parent, message_id, Some(cut), true)
+                .await
+        })
+    }
+}
+
+impl PostgresSessionStore {
+    /// The newest completed compaction visible to this session, including one
+    /// it inherited.
+    ///
+    /// A fork's context boundary is usually its PARENT's: forking does not
+    /// re-compact, it carries the prefix across. Reading only this session's own
+    /// rows therefore reports no boundary at all for a fresh fork, and a caller
+    /// that resumes it replays from the beginning of a conversation that was
+    /// already compacted.
+    ///
+    /// The inherited event is re-projected into this session's identity --
+    /// derived id, this session_id, the sequence the fork gave it -- because a
+    /// caller comparing the checkpoint against this session's own events must
+    /// see one numbering, not the parent's.
+    fn latest_completed_context_compaction_before<'a>(
+        &'a self,
+        session_id: Uuid,
+        before_or_at: Option<u64>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<SessionEvent>>> + Send + 'a>> {
+        Box::pin(async move {
+            let session = self.session_row(session_id).await?;
+            let logical_limit = before_or_at.unwrap_or(session.next_sequence.saturating_sub(1));
+            if logical_limit > session.inherited_event_count {
+                // Candidates are narrowed by the lifted `provider_event_kind`
+                // column, served by idx_session_events_context_compaction. The
+                // remaining predicate is evaluated in Rust rather than as a
+                // jsonb expression, because a cold row's body is opaque to SQL
+                // and a jsonb filter would silently skip aged history.
+                //
+                // Paged rather than limited to a fixed window: a run of
+                // superseded or in-progress compactions must not hide the
+                // completed one beneath it.
+                let floor = i64::try_from(session.inherited_event_count).unwrap_or(i64::MAX);
+                let mut before =
+                    i64::try_from(logical_limit.saturating_add(1)).unwrap_or(i64::MAX);
+                loop {
+                    let rows = sqlx::query(
+                        "select sequence, event_json, event_body, dict_id from session_events \
+                         where session_id = $1 and sequence > $2 and sequence < $3 \
+                           and event_kind = 'provider_event' \
+                           and provider_event_kind = 'context_compaction' \
+                         order by sequence desc limit 32",
+                    )
+                    .bind(session_id)
+                    .bind(floor)
+                    .bind(before)
+                    .fetch_all(self.pool())
+                    .await?;
+                    if rows.is_empty() {
+                        break;
+                    }
+                    for row in &rows {
+                        let sequence: i64 = row.try_get("sequence")?;
+                        before = before.min(sequence);
+                        let event = self.event_from_row(row).await?;
+                        if event.kind.is_completed_context_compaction() {
+                            return Ok(Some(event));
+                        }
+                    }
+                }
+            }
+
+            let (Some(parent_session_id), Some(parent_cut_sequence)) =
+                (session.parent_session_id, session.parent_cut_sequence)
+            else {
+                return Ok(None);
+            };
+            let Some(mut event) = self
+                .latest_completed_context_compaction_before(
+                    parent_session_id,
+                    Some(parent_cut_sequence),
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            let (sequence, _) = self
+                .fork_projection(parent_session_id, event.sequence.saturating_add(1))
+                .await?;
+            if sequence == 0 || sequence > logical_limit.min(session.inherited_event_count) {
+                return Ok(None);
+            }
+            event.id = super::fork::inherited_event_id(session_id, event.id);
+            event.session_id = session_id;
+            event.sequence = sequence;
+            Ok(Some(event))
+        })
+    }
+}
+
 impl SessionStore for PostgresSessionStore {
     async fn create_session(&self, session_id: Uuid) -> Result<()> {
         let now = Utc::now();
@@ -627,39 +793,8 @@ impl SessionStore for PostgresSessionStore {
         &self,
         session_id: Uuid,
     ) -> Result<Option<SessionEvent>> {
-        // Candidates are narrowed by the lifted `provider_event_kind` column,
-        // served by idx_session_events_context_compaction. The remaining
-        // predicate (status, provider_context_preserved) is evaluated in Rust
-        // rather than as a jsonb expression, because a cold row's body is
-        // opaque to SQL and a jsonb filter would silently skip aged history.
-        //
-        // Paged rather than limited to a fixed window: a run of superseded or
-        // in-progress compactions must not hide the completed one beneath it.
-        let mut before = i64::MAX;
-        loop {
-            let rows = sqlx::query(
-                "select sequence, event_json, event_body, dict_id from session_events \
-                 where session_id = $1 and sequence < $2 \
-                   and event_kind = 'provider_event' \
-                   and provider_event_kind = 'context_compaction' \
-                 order by sequence desc limit 32",
-            )
-            .bind(session_id)
-            .bind(before)
-            .fetch_all(self.pool())
-            .await?;
-            if rows.is_empty() {
-                return Ok(None);
-            }
-            for row in &rows {
-                let sequence: i64 = row.try_get("sequence")?;
-                before = before.min(sequence);
-                let event = self.event_from_row(row).await?;
-                if event.kind.is_completed_context_compaction() {
-                    return Ok(Some(event));
-                }
-            }
-        }
+        self.latest_completed_context_compaction_before(session_id, None)
+            .await
     }
 
     async fn state(&self, session_id: Uuid) -> Result<SessionState> {
@@ -718,15 +853,8 @@ impl SessionStore for PostgresSessionStore {
     }
 
     async fn contains_message(&self, session_id: Uuid, message_id: Uuid) -> Result<bool> {
-        let found: bool = sqlx::query_scalar(
-            "select exists(select 1 from session_events \
-             where session_id = $1 and message_id = $2)",
-        )
-        .bind(session_id)
-        .bind(message_id)
-        .fetch_one(self.pool())
-        .await?;
-        Ok(found)
+        self.contains_message_in(session_id, message_id, None, false)
+            .await
     }
 
     async fn list_sessions(&self, limit: usize) -> Result<Vec<SessionSummary>> {
@@ -740,13 +868,31 @@ impl SessionStore for PostgresSessionStore {
         let mut sessions = Vec::with_capacity(rows.len());
         for row in rows {
             let state_json: String = row.try_get("state_json")?;
-            // A single unreadable projection must not hide every other
-            // session from a listing; it is reported as an empty state.
-            let state = serde_json::from_str(&state_json).unwrap_or_default();
+            let session_id: Uuid = row.try_get("id")?;
+            let state = match serde_json::from_str(&state_json) {
+                Ok(state) => state,
+                Err(error) => {
+                    // A provider removed from the runtime can still be present
+                    // in an older session projection. It is not resumable by
+                    // this binary, but it must not make `/resume` take down the
+                    // entire TUI. Keep the row intact for explicit inspection.
+                    //
+                    // Skipped rather than listed with an empty state: an empty
+                    // state renders as a resumable session, so offering it hands
+                    // the user a session that cannot open. Skipping one row
+                    // still lists every other, which is the part that matters.
+                    tracing::warn!(
+                        %session_id,
+                        %error,
+                        "skipping session with incompatible stored provider state"
+                    );
+                    continue;
+                }
+            };
             let parent_cut_sequence: Option<i64> = row.try_get("parent_cut_sequence")?;
             let inherited: i64 = row.try_get("inherited_event_count")?;
             sessions.push(SessionSummary {
-                session_id: row.try_get("id")?,
+                session_id,
                 parent_session_id: row.try_get("parent_session_id")?,
                 parent_cut_sequence: parent_cut_sequence
                     .map(|sequence| u64::try_from(sequence).unwrap_or(0)),

@@ -648,7 +648,12 @@ impl PostgresSessionStore {
                     "select payload_kind, byte_len, substring(payload from 1 for $1) as payload \
                      from session_payloads where id = $2",
                 )
-                .bind(i64::try_from(take).unwrap_or(i64::MAX))
+                // `substring(bytea from int for int)` is the only bytea
+                // overload Postgres has: passing a bigint here resolves to no
+                // function at all and fails the whole read. The cap is a byte
+                // budget that never approaches i32::MAX, so the clamp is a
+                // formality rather than a silent truncation.
+                .bind(i32::try_from(take).unwrap_or(i32::MAX))
                 .bind(reference.id)
                 .fetch_optional(self.pool())
                 .await?

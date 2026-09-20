@@ -238,22 +238,25 @@ impl PostgresSessionStore {
         // The update matches only the default self-binding written by
         // `create_session`, so re-homing a session that is already attached
         // elsewhere fails instead of moving its history.
-        let moved = sqlx::query(
+        // `returning` rather than reusing the value that was bound: Postgres
+        // stores `timestamptz` to microseconds and chrono carries nanoseconds,
+        // so the value handed back would never equal the one a later read
+        // produces. A caller that holds this binding and compares it against a
+        // fresh read is entitled to find them identical.
+        let attached_at: Option<DateTime<Utc>> = sqlx::query_scalar(
             "update session_workspace_bindings \
              set workspace_id = $1, participant_id = $2, host_id = null, attached_at = $3 \
-             where session_id = $4 and workspace_id = $4 and participant_id = $4",
+             where session_id = $4 and workspace_id = $4 and participant_id = $4 \
+             returning attached_at",
         )
         .bind(workspace_id)
         .bind(participant_id)
         .bind(attached_at)
         .bind(session_id)
-        .execute(self.pool())
-        .await?
-        .rows_affected();
-        ensure!(
-            moved == 1,
-            "new session workspace binding was not in its default state"
-        );
+        .fetch_optional(self.pool())
+        .await?;
+        let attached_at =
+            attached_at.context("new session workspace binding was not in its default state")?;
         Ok(SessionWorkspaceBinding {
             session_id,
             workspace_id,

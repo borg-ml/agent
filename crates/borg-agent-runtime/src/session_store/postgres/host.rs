@@ -501,22 +501,29 @@ impl PostgresSessionStore {
                 participant_id
             );
         }
-        sqlx::query(
+        // See `create_session_in_workspace_as`: the stored timestamp is
+        // returned rather than the one bound, because Postgres keeps
+        // microseconds and chrono carries nanoseconds.
+        let attached_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
             "insert into session_workspace_bindings \
              (session_id, workspace_id, participant_id, host_id, attached_at) \
              values ($1, $2, $3, $4, $5) \
              on conflict (session_id) do update set \
-             host_id = excluded.host_id, attached_at = excluded.attached_at",
+             host_id = excluded.host_id, attached_at = excluded.attached_at \
+             returning attached_at",
         )
         .bind(binding.session_id)
         .bind(binding.workspace_id)
         .bind(binding.participant_id)
         .bind(binding.host_id)
         .bind(binding.attached_at)
-        .execute(&mut *transaction)
+        .fetch_one(&mut *transaction)
         .await?;
         transaction.commit().await?;
-        Ok(binding)
+        Ok(SessionWorkspaceBinding {
+            attached_at,
+            ..binding
+        })
     }
 
     pub async fn session_workspace_binding(
@@ -589,10 +596,29 @@ impl PostgresSessionStore {
         .fetch_optional(&mut *transaction)
         .await?;
         if let Some(workspace_id) = owner_workspace {
+            // A child is created with a binding to its OWN workspace, so
+            // `do nothing` here would always lose: the row it conflicts with is
+            // the default this is meant to replace, and the child would sit in
+            // a workspace of one while believing it had joined the team.
+            //
+            // The update is therefore conditional on the binding still BEING
+            // that default -- workspace and participant both the session's own
+            // id. A child that deliberately attached somewhere else keeps its
+            // attachment, which is the same rule the owner check above applies
+            // to ownership: inherit what was never chosen, never re-home what
+            // was.
             sqlx::query(
                 "insert into session_workspace_bindings \
                  (session_id, workspace_id, participant_id, attached_at) \
-                 values ($1, $2, $1, $3) on conflict (session_id) do nothing",
+                 values ($1, $2, $1, $3) \
+                 on conflict (session_id) do update set \
+                   workspace_id = excluded.workspace_id, \
+                   participant_id = excluded.participant_id, \
+                   attached_at = excluded.attached_at \
+                 where session_workspace_bindings.workspace_id \
+                         = session_workspace_bindings.session_id \
+                   and session_workspace_bindings.participant_id \
+                         = session_workspace_bindings.session_id",
             )
             .bind(session_id)
             .bind(workspace_id)
