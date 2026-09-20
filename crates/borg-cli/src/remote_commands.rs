@@ -7809,8 +7809,7 @@ fn relaunch_prompt(
 
 fn local_resume_error_is_retryable(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}").to_ascii_lowercase();
-    message.contains("pool timed out")
-        || message.contains("no space left on device")
+    message.contains("pool timed out") || message.contains("no space left on device")
 }
 
 fn next_local_resume_retry_delay(delay: std::time::Duration) -> std::time::Duration {

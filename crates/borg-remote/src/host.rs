@@ -6202,10 +6202,10 @@ fn platform() -> String {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Duration as ChronoDuration;
-    use borg_agent_runtime::receipt_postgres::PostgresReceiptStore;
     use crate::session_store::postgres::PostgresSessionStore;
     use crate::session_store::postgres::testing::ScratchDatabase;
+    use borg_agent_runtime::receipt_postgres::PostgresReceiptStore;
+    use chrono::Duration as ChronoDuration;
     use sqlx::postgres::PgPoolOptions;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -6315,7 +6315,8 @@ mod tests {
             config.server = format!("http://{}", listener.local_addr().unwrap());
             let config_path = root.path().join("host.json");
             write_config(&config_path, &config).unwrap();
-            let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+            let (scratch, postgres) =
+                crate::session_store::postgres::testing::session_store().await;
             let store: Arc<dyn SessionStore> = Arc::new(postgres);
             let id = Uuid::new_v4();
             let launch = bootstrap_test_launch(root.path());
@@ -10143,7 +10144,8 @@ mod tests {
             let mut config = test_config(root.path());
             config.server = format!("http://{}", listener.local_addr().unwrap());
             config.resource_limits.max_concurrent_sessions = capacity;
-            let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+            let (scratch, postgres) =
+                crate::session_store::postgres::testing::session_store().await;
             let store: Arc<dyn SessionStore> = Arc::new(postgres);
             let session_id = Uuid::new_v4();
             let active_id = Uuid::new_v4();
@@ -11061,9 +11063,7 @@ connection: close
         drop(store);
 
         let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
-
             .await
-
             .unwrap();
         // Same authority as the journal, obtained the way production does.
         let receipts = store.receipt_store().await.unwrap();
@@ -12146,9 +12146,7 @@ connection: close
         drop(store);
 
         let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
-
             .await
-
             .unwrap();
         recover_host_journal(&client, &config, &store, session_id)
             .await
@@ -12826,7 +12824,8 @@ connection: close
                 }),
                 _ => None,
             };
-            let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+            let (scratch, postgres) =
+                crate::session_store::postgres::testing::session_store().await;
             let session_store: Arc<dyn SessionStore> = Arc::new(postgres);
             let sessions = Arc::new(Mutex::new(HashMap::new()));
             let (active_tx, mut active_rx) = mpsc::channel(1);

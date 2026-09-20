@@ -220,15 +220,13 @@ async fn probe() -> Result<()> {
         )), "native tool-round boundary was not persisted");
         if resumed {
             let consultation = LocalAgentTurnExecutor::default()
-                .for_session(session_id, &store, None)
+                .for_session(session_id, store.as_ref(), None)
                 .await?
                 .context("local executor did not resolve the session route")?
                 .consult(ConsultationRequest {
                     access: ModelAccessContext {
                         session_id,
-                        store: Some(
-                            std::sync::Arc::new(store.clone()) as std::sync::Arc<dyn SessionStore>
-                        ),
+                        store: Some(Arc::clone(&store)),
                     },
                     message_id: Uuid::new_v4(),
                     provider: CodingProvider::Codex,

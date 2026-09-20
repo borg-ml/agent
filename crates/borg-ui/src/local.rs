@@ -359,10 +359,6 @@ async fn ensure_session_owner(
 
 async fn launch_new_session_owner() -> Result<(LocalSessionClient, Option<tokio::process::Child>)> {
     let borg = borg_executable()?;
-    let sessions_dir = default_host_config_path()
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("sessions");
     let store = Arc::clone(
         borg_remote::session_store::factory::open(
             &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
