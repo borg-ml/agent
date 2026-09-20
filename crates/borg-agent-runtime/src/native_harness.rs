@@ -2613,7 +2613,7 @@ async fn execute_tool(
                     json!({ "error": "tool execution was denied by the approval policy" })
                         .to_string(),
                     true,
-                    None,
+                    Vec::new(),
                 ));
             }
             ApprovalDecision::AllowOnce | ApprovalDecision::AllowSession => {}
@@ -2625,7 +2625,7 @@ async fn execute_tool(
         {
             if let Some(steer) = accept_tool_boundary_control(control)? {
                 let (output, is_error) = skipped_tool_result();
-                return Ok((output, is_error, Some(steer)));
+                return Ok((output, is_error, vec![steer]));
             }
         }
     }
@@ -3941,7 +3941,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), client.started.notified())
                 .await
                 .unwrap();
-            let (ack, acknowledged) = tokio::sync::oneshot::channel();
+            let (ack, mut acknowledged) = tokio::sync::oneshot::channel();
             control_tx
                 .send(if interrupt {
                     AgentTurnControl::Interrupt
