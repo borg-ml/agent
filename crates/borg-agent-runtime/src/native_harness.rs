@@ -702,9 +702,7 @@ impl NativeHarness {
                 // A control queued during the round decides this. An interrupt
                 // is an explicit stop and must surface as one rather than be
                 // reported as a successful yield, so it propagates out of
-                // `accept_tool_boundary_control`. A steer is real human input
-                // the model still owes an answer, so it suppresses the exit and
-                // the loop continues.
+                // `accept_tool_boundary_control`.
                 while let Some(control) = controls
                     .as_mut()
                     .and_then(|controls| controls.try_recv().ok())
@@ -720,7 +718,17 @@ impl NativeHarness {
                         folded_steer = true;
                     }
                 }
-                if !folded_steer {
+                if folded_steer {
+                    // A human spoke after the model parked, so the wait is
+                    // obsolete and is discarded rather than skipped for one
+                    // round. Merely skipping would leave the flag set, and the
+                    // next tool round -- with no second steer to suppress it --
+                    // would end the turn in the middle of the work the human
+                    // just asked for. Clearing also keeps the model honest: if
+                    // it still needs to wait once it has answered, it parks
+                    // again and that fresh yield ends the turn here as usual.
+                    turn.agent_tools.clear_watcher_yield();
+                } else {
                     // Settle exactly as the ordinary completion below does, but
                     // without an assistant message: the model wrote no answer
                     // and inventing one would put words in its mouth. Any text
@@ -5138,6 +5146,223 @@ mod tests {
                 );
                 assert_eq!(result.final_text, "done");
                 assert_eq!(assistant_messages, vec!["done".to_string()]);
+            }
+            watches.cancel.cancel();
+        }
+    }
+
+    /// A human steer retires the wait instead of deferring it one round.
+    ///
+    /// Suppressing the exit for the steer's own round is not enough: the flag
+    /// would still be set, so the very next tool round -- with no second steer
+    /// to suppress it -- would end the turn in the middle of the work the human
+    /// just asked for. The steer is delivered from inside the round, the way a
+    /// person typing during a tool call delivers one, because a control queued
+    /// before the turn starts is drained at model admission and never reaches
+    /// this boundary.
+    struct SteerAfterYieldClient {
+        rounds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        watches: crate::watch::Watches,
+        watch_id: Uuid,
+        controls: mpsc::Sender<AgentTurnControl>,
+        /// Park again on the round after the steer, to prove a fresh wait still
+        /// ends the turn once the human's request has been answered.
+        reyield_after_steer: bool,
+    }
+
+    #[async_trait]
+    impl NativeModelClient for SteerAfterYieldClient {
+        async fn model_turn(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+            _request: ModelTurnRequest,
+            _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+        ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+            let round = self
+                .rounds
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if round == 0 {
+                self.watches
+                    .begin_yield(&[self.watch_id], "waiting on the build")
+                    .await
+                    .expect("the watcher is live, so the yield is established");
+                // The acknowledgement receiver is dropped on purpose: the
+                // harness sends into it with `let _`, and nothing in this test
+                // depends on the reply.
+                let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
+                self.controls
+                    .send(AgentTurnControl::Steer {
+                        message_id: Uuid::new_v4(),
+                        text: "check the log first".to_string(),
+                        attachments: Vec::new(),
+                        admission: borg_provider::provider::SteerAdmission::pending(),
+                        preempt: false,
+                        ack: ack_tx,
+                    })
+                    .await
+                    .expect("the control channel accepts the steer");
+            } else if round == 1 && self.reyield_after_steer {
+                self.watches
+                    .begin_yield(&[self.watch_id], "still waiting on the build")
+                    .await
+                    .expect("the watcher is still live");
+            }
+            let calls = if round <= 1 {
+                vec![ModelToolCall::function(
+                    format!("call-{round}"),
+                    "exec".to_string(),
+                    json!({"action": "look", "cmd": "true"}).to_string(),
+                )]
+            } else {
+                Vec::new()
+            };
+            let finish_reason = if calls.is_empty() {
+                "stop"
+            } else {
+                "tool_calls"
+            }
+            .to_string();
+            Ok(ModelTurnResult {
+                message: ModelMessage::assistant(
+                    calls.is_empty().then(|| "done".to_string()),
+                    None,
+                    None,
+                    calls,
+                ),
+                finish_reason,
+                usage: ProviderCallUsage::default(),
+                raw_response: Value::Null,
+                trace: ProviderAttemptTrace::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_human_steer_retires_the_yield_for_the_rest_of_the_turn() {
+        for reyield_after_steer in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let cwd = root.path().to_path_buf();
+            let session_id = Uuid::new_v4();
+            let processes = crate::native_process::ProcessManager::default();
+            let (watch_events_tx, _watch_events_rx) = mpsc::channel(16);
+            let watches =
+                crate::watch::Watches::new(processes.clone(), watch_events_tx, session_id);
+            let info = watches
+                .start(
+                    session_id,
+                    root.path(),
+                    crate::watch::WatchArgs {
+                        command: "sleep 30".to_string(),
+                        label: "Build".to_string(),
+                        workdir: None,
+                    },
+                    None,
+                    60_000,
+                )
+                .await
+                .expect("the watcher starts");
+
+            let rounds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (controls_tx, controls_rx) = mpsc::channel(4);
+            let client = Arc::new(SteerAfterYieldClient {
+                rounds: std::sync::Arc::clone(&rounds),
+                watches: watches.clone(),
+                watch_id: info.watch_id,
+                controls: controls_tx,
+                reyield_after_steer,
+            });
+            let harness = NativeHarness {
+                model_client: client.clone(),
+                harness: HarnessMode::Native,
+                ..NativeHarness::default()
+            };
+            let turn = AgentTurn {
+                session_id,
+                prompt_cache_session_id: Some(Uuid::new_v4()),
+                message_id: Uuid::new_v4(),
+                context_generation: 0,
+                provider: crate::CodingProvider::OpenRouter,
+                provider_session_id: None,
+                provider_fork_turn_id: None,
+                cwd: cwd.clone(),
+                prompt_delta: "build it".to_string(),
+                prompt: "build it".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                model: Some("test-model".to_string()),
+                effort: None,
+                fast: Some(true),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::FullAccess,
+                conversation: Vec::new(),
+                agent_mcp_server: borg_provider::mcp::ExternalMcpServer {
+                    name: "test".to_string(),
+                    command: "test".to_string(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                    allowed_tools: Vec::new(),
+                },
+                agent_tools: crate::AgentToolDispatcher::new(
+                    crate::session::SessionGoalTools::disconnected(),
+                    crate::session::SessionTodoTools::disconnected(),
+                    None,
+                    crate::LspService::new(&cwd),
+                    crate::CodingProvider::OpenRouter,
+                    session_id,
+                    false,
+                    None,
+                    None,
+                    cwd.clone(),
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    processes.clone(),
+                    PermissionMode::FullAccess,
+                )
+                .with_watches(watches.clone()),
+                external_mcp_servers: Vec::new(),
+                runtime_mcp_context: Default::default(),
+                extension_skill_roots: Vec::new(),
+                extension_workflows: Vec::new(),
+                extension_api: Default::default(),
+                system_prompt_appendix: String::new(),
+                volatile_system_prompt_appendix: String::new(),
+            };
+
+            let (events_tx, _events_rx) = mpsc::channel(256);
+            let result = harness
+                .run(turn, events_tx, Some(controls_rx))
+                .await
+                .expect("the turn completes successfully");
+            let rounds = rounds.load(std::sync::atomic::Ordering::SeqCst);
+
+            if reyield_after_steer {
+                // The model answered the human and then parked again. That
+                // fresh wait is not obsolete, so it ends the turn exactly as an
+                // unsteered yield would.
+                assert_eq!(rounds, 2, "a fresh yield after the steer ends the turn");
+                assert!(result.final_text.is_empty());
+                assert!(
+                    watches.yielded().is_some(),
+                    "the fresh wait must survive for the session to resume"
+                );
+            } else {
+                // Round 1 runs the steered tool and round 2 delivers the answer.
+                // Stopping at 2 would mean the retired yield ended the turn
+                // underneath the human's request.
+                assert_eq!(
+                    rounds, 3,
+                    "a retired yield must not end the turn on the next tool round"
+                );
+                assert_eq!(result.final_text, "done");
+                assert!(
+                    watches.yielded().is_none(),
+                    "the superseded wait must be cleared, not merely skipped"
+                );
             }
             watches.cancel.cancel();
         }

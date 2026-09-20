@@ -1000,6 +1000,20 @@ impl AgentToolDispatcher {
             .is_some_and(|watches| watches.yielded().is_some())
     }
 
+    /// Discard a wait that real input has already superseded.
+    ///
+    /// The session's standing contract is that any real input ends a wait, but
+    /// a steer is delivered inside a running turn and so never reaches the
+    /// boundary where the session applies that rule. The harness applies it on
+    /// the session's behalf. Nothing durable is orphaned: `goal_yielded` is
+    /// only journalled once the session parks at an idle boundary, which a
+    /// running turn has not reached.
+    pub(crate) fn clear_watcher_yield(&self) {
+        if let Some(watches) = self.watches.as_ref() {
+            watches.resume();
+        }
+    }
+
     pub(crate) async fn harness_prompt_appendix(&self) -> Result<String> {
         let store = self.session_store();
         let mut appendix = crate::harness::prompt_appendix(
@@ -2999,6 +3013,11 @@ impl SubagentCoordinator {
         Ok(options)
     }
 
+    // Sender, recipient, actor, body, both delivery axes and the option bag
+    // are each independently meaningful here, and the option bag already
+    // absorbs the optional ones. Grouping the rest into another struct would
+    // only move the argument list behind a name.
+    #[allow(clippy::too_many_arguments)]
     async fn persist_team_message(
         &self,
         actor_session_id: Uuid,
