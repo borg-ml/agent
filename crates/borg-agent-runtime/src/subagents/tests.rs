@@ -4162,7 +4162,7 @@ async fn a_forwarded_image_replays_from_captured_bytes_after_the_original_is_del
     let original = sample_png();
     std::fs::write(&source, &original).expect("write source image");
 
-    let captured = capture_message_attachments(root.path(), &[source.clone()])
+    let captured = capture_message_attachments(root.path(), std::slice::from_ref(&source))
         .await
         .expect("capture image");
     assert_eq!(captured.len(), 1);
@@ -4429,7 +4429,7 @@ async fn a_same_host_message_delivers_verified_image_files_and_replays_without_t
     let original = sample_png();
     std::fs::write(&source, &original).unwrap();
     let options = TeamMessageOptions {
-        attachments: capture_message_attachments(directory.path(), &[source.clone()])
+        attachments: capture_message_attachments(directory.path(), std::slice::from_ref(&source))
             .await
             .unwrap(),
         ..TeamMessageOptions::default()
@@ -4537,7 +4537,7 @@ async fn forwarded_image_reaches_the_recipient_model_as_pixels() {
     std::fs::copy(&source, &owned).expect("copy the probe image into the test's own temp path");
 
     let options = TeamMessageOptions {
-        attachments: capture_message_attachments(directory.path(), &[owned.clone()])
+        attachments: capture_message_attachments(directory.path(), std::slice::from_ref(&owned))
             .await
             .expect("capture the image through the send_message path"),
         ..TeamMessageOptions::default()
