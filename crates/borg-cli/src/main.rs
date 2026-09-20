@@ -36,8 +36,65 @@ use crate::cli::{
 };
 use crate::remote_commands::{print_local_workspaces, run_local_agent, run_remote_command};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    configure_allocator();
+    spawn_allocator_trim();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("could not start the Borg async runtime")?
+        .block_on(run())
+}
+
+/// Cap glibc's per-thread allocator arenas before any worker thread exists.
+///
+/// WHY: glibc creates up to eight arenas per core and, once a transient large
+/// allocation raises its dynamic mmap threshold, absorbs later large blocks
+/// into arena heaps that grow toward the 64 MiB heap limit and are never
+/// returned to the OS. A long-running host is allocation-heavy across its
+/// worker pool, so on a 24-core machine this was observed as hundreds of
+/// 64 MiB-aligned anonymous regions: ~16 GiB of RSS on a host whose durable
+/// journal is under 4 GiB, which is what turned into system-wide swap thrash.
+/// Setting this from `main`, before the runtime spawns its threads, bounds the
+/// number of arenas for the life of the process.
+#[cfg(target_env = "gnu")]
+fn configure_allocator() {
+    // SAFETY: called before any thread is spawned, and `mallopt` has no
+    // memory-safety preconditions.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 8);
+    }
+}
+
+#[cfg(not(target_env = "gnu"))]
+fn configure_allocator() {}
+
+/// Return free allocator pages to the OS on a slow timer.
+///
+/// The arena cap bounds how many heaps exist; this bounds how much freed heap
+/// stays resident in them, so a host that peaks during a large turn gives the
+/// memory back instead of holding it until exit. A dedicated thread keeps the
+/// (arena-locking) trim off the async runtime's tasks.
+#[cfg(target_env = "gnu")]
+fn spawn_allocator_trim() {
+    let _ = std::thread::Builder::new()
+        .name("allocator-trim".to_string())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                // SAFETY: `malloc_trim` only walks the allocator's own free
+                // lists and is safe to call from any thread.
+                unsafe {
+                    libc::malloc_trim(0);
+                }
+            }
+        });
+}
+
+#[cfg(not(target_env = "gnu"))]
+fn spawn_allocator_trim() {}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse_borg();
     let no_limits = cli.no_limits;
     let command = cli.command_or_agent();
