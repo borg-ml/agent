@@ -17,12 +17,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const MAX_BATCH_SIZE: u32 = 256;
-const MAX_CHECKPOINTS_PER_LIST: u32 = 512;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const MAX_KIND_BYTES: usize = 128;
 const MAX_OWNER_BYTES: usize = 256;
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
-const MAX_ERROR_BYTES: usize = 16 * 1024;
 const MAX_CHECKPOINT_KEY_BYTES: usize = 256;
 const MAX_CHECKPOINT_KIND_BYTES: usize = 128;
 const MAX_CHECKPOINT_JSON_BYTES: usize = 2 * 1024 * 1024;

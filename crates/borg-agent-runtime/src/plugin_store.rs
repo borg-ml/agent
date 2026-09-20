@@ -20,7 +20,6 @@ const MAX_EXTENSION_ID_BYTES: usize = 64;
 const MAX_SCOPE_BYTES: usize = 16;
 const MAX_KEY_BYTES: usize = 256;
 const MAX_PREFIX_BYTES: usize = 256;
-const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const MAX_PLUGIN_VALUE_BYTES: usize = 512 * 1024;
 const MAX_PLUGIN_BATCH_ITEMS: usize = 64;
 const MAX_PLUGIN_METADATA_BYTES: usize = 32 * 1024;
@@ -271,13 +270,6 @@ fn mutation_request_hash(
     ))
 }
 
-fn escape_like_prefix(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 fn validate_extension_id(value: &str) -> Result<()> {
     ensure!(
         !value.is_empty()
@@ -303,10 +295,6 @@ fn validate_key(value: &str, label: &str) -> Result<()> {
         "{label} contains an invalid path component"
     );
     Ok(())
-}
-
-fn validate_idempotency_key(value: &str) -> Result<()> {
-    validate_text(value, MAX_IDEMPOTENCY_KEY_BYTES, "idempotency_key")
 }
 
 fn validate_value(value: &Value) -> Result<()> {
