@@ -209,12 +209,17 @@ contract tests fail with an actionable message rather than skipping, because a
 suite that silently skips its own storage contracts reports green for a
 database it never touched:
 
+Use a disposable test server. For a full workspace run, also pin the runtime
+URL to a disposable database: entrypoints that resolve configuration must not
+fall back to your normal journal. Neither URL should name a production journal.
+
 ```sh
 BORG_TEST_SESSIONS_URL="postgres://borg@localhost:5432/postgres" \
-  cargo test --workspace -- --test-threads=4
+BORG_SESSIONS_URL="postgres://borg@localhost:5432/postgres" \
+  cargo test --workspace --exclude borg-gui -- --test-threads=4
 ```
 
-Every test creates and drops its own scratch database, so the server named by
+Storage fixtures create and drop their own scratch databases, so the server named by
 the URL needs `CREATEDB`. A handful of older optional Postgres tests still skip
 when the variable is unset; that convention is being retired, and a full suite
 run is not meaningful without a configured server.
