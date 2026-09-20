@@ -3650,6 +3650,42 @@ impl SubagentCoordinator {
                     false
                 }
             };
+            // Membership is repaired here, before the hand-off, and never
+            // after one fails.
+            //
+            // A child restored from the journal is bound into the team
+            // workspace but carries no membership row, so `resolve_recipients`
+            // refuses its assignment as "audience contains a non-member".
+            // Startup repair covers a child this process restored; a worker
+            // that was already on the roster is only met again here, on the
+            // ordinary reuse path, which is where the gap surfaces.
+            //
+            // The order is the safety property. This runs while nothing has
+            // been persisted, so a failure can release the claim and fall
+            // through to a fresh spawn with no risk of the task running twice.
+            // Once the hand-off starts, a failure may follow a durable enqueue
+            // and must not be retried -- which is why the repair is a
+            // precondition and not a recovery.
+            //
+            // Idempotent by construction: `ensure_execution_workspace` inserts
+            // on conflict do nothing and refreshes the display name, so a
+            // worker that already belongs is unchanged apart from taking the
+            // name of the task it was just given.
+            let reusable = reusable
+                && match self
+                    .join_team_workspace(claimed.session_id, &assignment_name)
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error,
+                            session_id = %claimed.session_id,
+                            "could not give a reuse candidate its team membership; spawning instead"
+                        );
+                        false
+                    }
+                };
             if !reusable {
                 self.release_assignment_claim(
                     claimed.session_id,

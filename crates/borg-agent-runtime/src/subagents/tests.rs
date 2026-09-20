@@ -3742,6 +3742,119 @@ async fn durable_parent_activity_restores_child_topology() {
     scratch.discard().await;
 }
 
+/// A worker restored by a build that predated the startup repair sits on the
+/// roster as Ready, bound into the team workspace, and with no membership row:
+/// `register_child_session` re-homes the binding and membership does not travel
+/// with it. The ordinary assignment path claims exactly that worker first --
+/// the filter takes the oldest Ready match of the same profile -- and handing
+/// it the task was refused by `resolve_recipients` as "audience contains a
+/// non-member". The assignment then returned that error instead of spawning, so
+/// a default-profile task could not be given to anyone while such a worker sat
+/// on the roster. Forcing a different profile avoided the candidate; it did not
+/// fix the default path.
+///
+/// The repair runs before the hand-off rather than after it fails, and that
+/// ordering is the point: a hand-off that fails may already have enqueued the
+/// task durably, so retrying it as a fresh spawn would run the work twice.
+#[tokio::test]
+async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membership() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let workspace_store = store.workspace_store().await.unwrap().unwrap();
+    let human_display_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
+    let human = crate::local_human_participant_id(&human_display_name);
+    workspace_store
+        .ensure_execution_workspace(root, "workspace", human, &human_display_name, root, "Borg")
+        .await
+        .unwrap();
+
+    let session_store: Arc<dyn SessionStore> = store.clone();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        3,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        session_store,
+    )
+    .unwrap();
+
+    // The state an older build leaves behind: a Ready worker whose binding was
+    // re-homed onto the team workspace without the membership that move does
+    // not carry.
+    let child_session_id = {
+        let mut table = coordinator.table.lock().await;
+        let child = table.reserve("stale-worker", &launch()).unwrap();
+        table
+            .entries
+            .get_mut(&child.session_id)
+            .unwrap()
+            .snapshot
+            .status = SubagentStatus::Ready;
+        child.session_id
+    };
+    store.create_session(child_session_id).await.unwrap();
+    store
+        .append(SessionEvent::new(
+            child_session_id,
+            0,
+            SessionEventKind::SessionStarted,
+        ))
+        .await
+        .unwrap();
+    store
+        .register_child_session(root, child_session_id)
+        .await
+        .unwrap();
+    let binding = store
+        .workspace_binding(child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        binding.workspace_id, root,
+        "the binding is re-homed onto the team workspace"
+    );
+
+    // The ordinary path: no provider, model or effort override, so the claim
+    // filter selects this worker instead of spawning a fresh one.
+    let assigned = coordinator
+        .assign_task_as(
+            root,
+            SpawnSubagent {
+                task_name: "materials".to_string(),
+                message: "describe the material set".to_string(),
+                provider: None,
+                model: None,
+                effort: None,
+            },
+        )
+        .await
+        .expect("a default-profile assignment must not fail on a stale reuse candidate");
+    assert_eq!(
+        assigned["reused"],
+        serde_json::json!(true),
+        "the candidate is reused, so this exercises the repair and not the spawn"
+    );
+
+    // The assertion that matters: the task actually reached the child.
+    assert_eq!(
+        workspace_store
+            .deliveries_after(binding.workspace_id, binding.participant_id, 0, 10)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|delivery| delivery.sequence > 0)
+            .count(),
+        1,
+        "a repaired worker must receive the task it was assigned"
+    );
+    scratch.discard().await;
+}
+
 #[tokio::test]
 async fn a_child_restored_after_a_host_crash_is_still_addressable_in_the_team_workspace() {
     // A host reboot left 15 workers on the roster as "Paused with the parent
