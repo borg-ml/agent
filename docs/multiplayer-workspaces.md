@@ -390,6 +390,16 @@ keys; previously accepted messages are not duplicated. Default sync receives onl
 `send_message` delivers an attributed agent notification by default, including
 child reports to `/root`. It does not start an idle recipient. Use
 `send_message` with `wake: true`, or `followup_task`, to request a new turn.
+
+`send_message` also accepts `attachments`, an array of sender-local PNG/JPEG
+paths (at most four, each at most 4.5 MiB). Borg captures the image bytes when
+sending and journals content-addressed references; recipients receive verified
+image files, so replay does not depend on the original sender path. This is
+supported only when local delivery can be established. Cross-host image byte
+transfer is not implemented: unsupported routes fail before queuing a message
+rather than reporting successful image delivery. A delivery receipt proves
+admission, not that a recipient model has inspected the pixels.
+
 An explicit user stop takes precedence over background wake requests until a
 human sends new input or explicitly resumes the session. This stop state is
 durable across session reloads and is separate from goal status.

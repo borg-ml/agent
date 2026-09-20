@@ -1611,7 +1611,7 @@ mod tests {
             } else {
                 Some({
                     let mut transaction = store.pool().begin().await.unwrap();
-                    sqlx::query("lock table session_events in access exclusive mode")
+                    sqlx::query("lock table session_events in share mode")
                         .execute(&mut *transaction)
                         .await
                         .unwrap();
@@ -1739,7 +1739,7 @@ mod tests {
         store.create_session(owner).await.unwrap();
         let transaction = {
             let mut transaction = store.pool().begin().await.unwrap();
-            sqlx::query("lock table session_events in access exclusive mode")
+            sqlx::query("lock table session_events in share mode")
                 .execute(&mut *transaction)
                 .await
                 .unwrap();
@@ -2019,7 +2019,7 @@ mod tests {
             } else {
                 Some({
                     let mut transaction = store.pool().begin().await.unwrap();
-                    sqlx::query("lock table session_events in access exclusive mode")
+                    sqlx::query("lock table session_events in share mode")
                         .execute(&mut *transaction)
                         .await
                         .unwrap();

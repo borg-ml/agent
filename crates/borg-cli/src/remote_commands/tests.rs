@@ -142,7 +142,7 @@ async fn prompt_dispatch_does_not_block_input_while_the_journal_is_blocked() {
     // on the event table -- rather than by taking any one backend's writer
     // lock. What is under test is the input path, not the database.
     let mut blocked = store.pool().begin().await.expect("writer transaction");
-    sqlx::query("lock table session_events in access exclusive mode")
+    sqlx::query("lock table session_events in share mode")
         .execute(&mut *blocked)
         .await
         .expect("hold the journal against appends");
