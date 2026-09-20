@@ -1266,6 +1266,7 @@ pub(crate) async fn run_local_agent(args: LocalAgentCliArgs) -> Result<()> {
             ephemeral_sessions.as_ref().map(tempfile::TempDir::path),
             Arc::clone(&crash_context),
             reusable_terminal.take(),
+            None,
         ))
         .catch_unwind()
         .await;
@@ -1983,6 +1984,11 @@ async fn run_local_agent_session(
     session_root_override: Option<&Path>,
     crash_context: Arc<TuiCrashContext>,
     reusable_terminal: Option<BorgTerminal>,
+    // A caller that already owns a journal passes it; everything else resolves
+    // the configured one. Tests need this because a session root no longer
+    // implies a store, so without it they would drive a different database
+    // than the one they seeded.
+    store_override: Option<Arc<dyn SessionStore>>,
 ) -> Result<Option<(Uuid, Option<(String, Vec<PathBuf>)>, Option<BorgTerminal>)>> {
     let startup_started = std::time::Instant::now();
     let mut agent_config = AgentConfig::load(args.config.as_deref())?;
@@ -2012,11 +2018,16 @@ async fn run_local_agent_session(
     // The backend is chosen once, here, from BORG_SESSIONS_URL. The factory
     // resolves every satellite tier up front and fails if one is missing, so a
     // misconfigured backend is a startup error rather than a stall later on.
-    let opened = borg_remote::session_store::factory::open(
-        &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
-    )
-    .await?;
-    let durable_store = Arc::clone(opened.session());
+    let (durable_store, opened) = match store_override {
+        Some(store) => (store, None),
+        None => {
+            let opened = borg_remote::session_store::factory::open(
+                &borg_remote::session_store::factory::SessionStoreConfig::from_env(),
+            )
+            .await?;
+            (Arc::clone(opened.session()), Some(opened))
+        }
+    };
     let store_open_ms = store_open_started.elapsed().as_millis() as u64;
     let session_id = if let Some(session_id) =
         selected_session.or(args.resume).or(args.session_host)
@@ -2070,7 +2081,12 @@ async fn run_local_agent_session(
     // present before entering any loop that would otherwise retry a missing one
     // forever. A host that exited above never reaches here, and so never pays
     // to build tiers it would not have used.
-    let resolved = opened.resolve().await?;
+    let resolved = match opened {
+        Some(opened) => opened.resolve().await?,
+        None => {
+            borg_remote::session_store::factory::resolve_tiers(Arc::clone(&durable_store)).await?
+        }
+    };
     let store: Arc<dyn SessionStore> = Arc::clone(resolved.session());
     let mut session_state = store.state(session_id).await?;
     let suppress_terminal_live_tail = interactive_store_open

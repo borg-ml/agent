@@ -241,42 +241,65 @@ async fn prompt_dispatch_does_not_block_input_while_the_journal_is_blocked() {
     scratch.discard().await;
 }
 
-/// A second launcher for a session that already has an owner must stand down.
+/// A second launcher for a session that already has an owner must stand down,
+/// and must not wait on a busy journal to discover that.
 ///
-/// The ownership decision is the writer lease, not the journal: a host that
-/// loses the race takes the attached path and returns without touching the
-/// owner. This pins the lease half directly, because the launcher it guards
-/// resolves its store from the process environment and cannot be pointed at a
-/// scratch database in-process.
-#[test]
-fn competing_detached_host_cannot_take_ownership_from_the_legitimate_owner() {
+/// The journal is held against writers for the duration, the way a working
+/// host holds it. Readers are deliberately left free: the contract is that a
+/// losing launcher exits promptly without stopping the winner, not that it
+/// never reads. A launcher that waited on the writer would hang here rather
+/// than fail, so the timeout is the assertion.
+#[tokio::test]
+#[cfg(unix)]
+async fn competing_detached_host_exits_without_waiting_for_the_journal_or_stopping_owner() {
     let root = short_socket_tempdir();
     let session_id = Uuid::new_v4();
+    let (scratch, store) = borg_remote::session_store::postgres::testing::session_store().await;
+    store.create_session(session_id).await.unwrap();
     let lock_path = root.path().join(format!("{session_id}.lock"));
+    let writer = SessionWriterLease::try_acquire(&lock_path)
+        .unwrap()
+        .unwrap();
+    let mut blocked = store.pool().begin().await.unwrap();
+    sqlx::query("lock table sessions in exclusive mode")
+        .execute(&mut *blocked)
+        .await
+        .unwrap();
 
-    let owner = SessionWriterLease::try_acquire(&lock_path)
-        .expect("acquire the owner lease")
-        .expect("an unheld lease is available");
-
-    let competitor = SessionWriterLease::try_acquire(&lock_path).expect("probe the held lease");
-    assert!(
-        competitor.is_none(),
-        "a competing host must not be handed a second writer lease"
+    let mut args = LocalAgentCliArgs::resume(Some(session_id));
+    args.session_host = Some(session_id);
+    args.local_only = true;
+    let competitor: Arc<dyn SessionStore> = Arc::new(
+        PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+            .await
+            .unwrap(),
     );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_local_agent_session(
+            &args,
+            None,
+            None,
+            Some(root.path()),
+            Arc::new(TuiCrashContext::default()),
+            None,
+            Some(competitor),
+        ),
+    )
+    .await
+    .expect("competing host blocked on journal maintenance")
+    .expect("competing host must exit successfully");
+    assert!(result.is_none());
     assert!(
         SessionWriterLease::try_acquire(&lock_path)
-            .expect("probe the held lease again")
+            .unwrap()
             .is_none(),
-        "a failed competing attempt must not release the owner's lease"
+        "the losing launcher must leave the owner's lease intact"
     );
-
-    drop(owner);
-    assert!(
-        SessionWriterLease::try_acquire(&lock_path)
-            .expect("acquire after the owner exits")
-            .is_some(),
-        "the lease must be reclaimable once the owner is gone"
-    );
+    blocked.rollback().await.unwrap();
+    drop(writer);
+    scratch.discard().await;
 }
 
 #[test]
