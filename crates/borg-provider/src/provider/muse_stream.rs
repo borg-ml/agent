@@ -6,8 +6,9 @@
 //!
 //! Headless mode is the integration surface: `muse exec --json` emits one
 //! journal-envelope JSON object per stdout line. The envelope carries a
-//! `payload_type` discriminator; `run.output.delta` streams output text and
-//! `run.terminal.*` reports the final text and terminal state.
+//! `payload_type` discriminator; `run.output.delta` streams output text,
+//! `tool.result` reports each finished tool invocation and `run.terminal.*`
+//! reports the final text and terminal state.
 //!
 //! Multi-turn continuity comes from `--session-id`: each turn is its own
 //! process, and passing the same id continues that session instead of starting
@@ -130,6 +131,39 @@ async fn run(
                     return Ok(());
                 }
             }
+            MuseEvent::ToolResult {
+                id,
+                name,
+                input,
+                output,
+                is_error,
+            } => {
+                if events
+                    .send(ChatStreamEvent::ToolCall {
+                        id: id.clone(),
+                        name,
+                        input: input.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    let _ = child.kill().await;
+                    return Ok(());
+                }
+                if events
+                    .send(ChatStreamEvent::ToolResult {
+                        tool_use_id: id,
+                        output,
+                        is_error,
+                        input: Some(input),
+                    })
+                    .await
+                    .is_err()
+                {
+                    let _ = child.kill().await;
+                    return Ok(());
+                }
+            }
             MuseEvent::Terminal {
                 terminal: state,
                 text: final_text,
@@ -212,6 +246,13 @@ fn prompt_with_context(request: &ChatStreamRequest) -> String {
 
 enum MuseEvent {
     Delta(String),
+    ToolResult {
+        id: String,
+        name: String,
+        input: Value,
+        output: String,
+        is_error: bool,
+    },
     Terminal {
         terminal: String,
         text: Option<String>,
@@ -234,6 +275,31 @@ fn parse_muse_line(line: &str) -> Option<MuseEvent> {
         let text = payload.get("text").and_then(Value::as_str)?.to_string();
         return Some(MuseEvent::Delta(text));
     }
+    if payload_type == "tool.result" {
+        let id = payload.get("call_id").and_then(Value::as_str)?.to_string();
+        let name = payload
+            .pointer("/correlation_facts/tool_name")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("kind").and_then(Value::as_str))
+            .unwrap_or("tool")
+            .to_string();
+        let text = payload.get("text").and_then(Value::as_str).unwrap_or_default();
+        let failed = matches!(
+            payload
+                .pointer("/correlation_facts/outcome")
+                .and_then(Value::as_str),
+            Some("failure" | "failed" | "error")
+        );
+        let (input, output, is_error) =
+            project_tool_result(text, payload.get("edit_facts"), failed);
+        return Some(MuseEvent::ToolResult {
+            id,
+            name,
+            input,
+            output,
+            is_error,
+        });
+    }
     if payload_type.starts_with("run.terminal.") {
         let terminal = payload
             .get("terminal")
@@ -253,6 +319,45 @@ fn parse_muse_line(line: &str) -> Option<MuseEvent> {
         });
     }
     None
+}
+
+/// Turn one `tool.result` into the `(input, output, is_error)` a tool row needs.
+///
+/// The `bash`/`command` tool packs a structured `CommandResult` into `text`;
+/// rendering that JSON verbatim would hide the command behind its own result,
+/// so the command line and description become the row's input. Other tools
+/// expose their arguments, when at all, through `edit_facts`.
+fn project_tool_result(
+    text: &str,
+    edit_facts: Option<&Value>,
+    failed: bool,
+) -> (Value, String, bool) {
+    if let Ok(command) = serde_json::from_str::<Value>(text)
+        && command.get("command").and_then(Value::as_str).is_some()
+    {
+        let mut input = serde_json::Map::new();
+        for key in ["command", "description"] {
+            if let Some(value) = command.get(key).cloned() {
+                input.insert(key.to_string(), value);
+            }
+        }
+        let output = command
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let is_error = failed
+            || command
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .is_some_and(|code| code != 0);
+        return (Value::Object(input), output, is_error);
+    }
+    let input = edit_facts
+        .filter(|facts| facts.as_object().is_some_and(|map| !map.is_empty()))
+        .cloned()
+        .unwrap_or(Value::Null);
+    (input, text.to_string(), failed)
 }
 
 #[cfg(test)]
@@ -302,7 +407,65 @@ mod tests {
     fn unknown_payloads_and_junk_are_ignored() {
         assert!(parse_muse_line("not json").is_none());
         assert!(parse_muse_line("").is_none());
-        let line = envelope("tool.result", serde_json::json!({"tool_name": "bash"}));
+        let line = envelope(
+            "run.model.configured",
+            serde_json::json!({"model": "muse-spark-1.2"}),
+        );
         assert!(parse_muse_line(&line).is_none());
+    }
+
+    #[test]
+    fn tool_results_render_the_command_and_its_output() {
+        let line = envelope(
+            "tool.result",
+            serde_json::json!({
+                "kind": "tool",
+                "call_id": "call_9",
+                "text": "{\"chunk_id\":\"exec-1\",\"command\":\"ls -la\",\"description\":\"list files\",\"exit_code\":0,\"terminal_status\":\"completed\",\"output\":\"total 0\",\"truncated\":false}",
+                "correlation_facts": {"tool_name": "bash", "outcome": "success"},
+            }),
+        );
+        match parse_muse_line(&line) {
+            Some(MuseEvent::ToolResult {
+                id,
+                name,
+                input,
+                output,
+                is_error,
+            }) => {
+                assert_eq!(id, "call_9");
+                assert_eq!(name, "bash");
+                assert_eq!(input["command"], "ls -la");
+                assert_eq!(output, "total 0");
+                assert!(!is_error);
+            }
+            _ => panic!("a tool.result must parse into a tool row"),
+        }
+    }
+
+    #[test]
+    fn prose_tool_results_keep_their_text_and_failure() {
+        let line = envelope(
+            "tool.result",
+            serde_json::json!({
+                "kind": "tool",
+                "call_id": "call_10",
+                "text": "wrote 6 bytes to src/main.rs",
+                "correlation_facts": {"tool_name": "write_file", "outcome": "failure"},
+            }),
+        );
+        match parse_muse_line(&line) {
+            Some(MuseEvent::ToolResult {
+                name,
+                output,
+                is_error,
+                ..
+            }) => {
+                assert_eq!(name, "write_file");
+                assert_eq!(output, "wrote 6 bytes to src/main.rs");
+                assert!(is_error);
+            }
+            _ => panic!("a prose tool.result must parse into a tool row"),
+        }
     }
 }

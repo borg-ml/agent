@@ -7,9 +7,12 @@
 //!
 //! Headless mode is the integration surface: `grok -p <prompt>
 //! --output-format streaming-json` emits newline-delimited events
-//! (`thought`, `text`, `end`), and the `end` event carries the session id that
-//! makes the next Borg turn a continuation instead of a fresh conversation.
+//! (`thought`, `text`, `tool_call`, `end`). `tool_call` carries the tool
+//! identity, raw input and result content that Borg renders as a tool row, and
+//! the `end` event carries the session id that makes the next Borg turn a
+//! continuation instead of a fresh conversation.
 
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -106,6 +109,18 @@ async fn run(
     let mut session_id: Option<String> = None;
     let mut usage = ProviderCallUsage::default();
     let mut saw_usage = false;
+    let mut started_tools: HashSet<String> = HashSet::new();
+    let mut completed_tools: HashSet<String> = HashSet::new();
+    let mut open_output: HashMap<String, String> = HashMap::new();
+    // A failed send means the session dropped the stream, so reap the child.
+    macro_rules! send_event {
+        ($event:expr) => {
+            if events.send($event).await.is_err() {
+                let _ = child.kill().await;
+                return Ok(());
+            }
+        };
+    }
     loop {
         let line = tokio::select! {
             _ = events.closed() => {
@@ -115,49 +130,77 @@ async fn run(
             line = lines.next_line() => line?,
         };
         let Some(line) = line else { break };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(event) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        match event.get("type").and_then(Value::as_str) {
-            Some("text") => {
-                if let Some(chunk) = event.get("data").and_then(Value::as_str) {
-                    text.push_str(chunk);
-                    if events
-                        .send(ChatStreamEvent::Delta(chunk.to_string()))
-                        .await
-                        .is_err()
-                    {
-                        let _ = child.kill().await;
-                        return Ok(());
-                    }
+        match parse_stream_line(&line) {
+            Some(GrokEvent::Text(chunk)) => {
+                text.push_str(&chunk);
+                send_event!(ChatStreamEvent::Delta(chunk));
+            }
+            Some(GrokEvent::Thought(chunk)) => {
+                send_event!(ChatStreamEvent::ReasoningDelta(chunk));
+            }
+            Some(GrokEvent::ToolCall {
+                id,
+                name,
+                input,
+                status,
+                output,
+                is_error,
+            }) => {
+                if started_tools.insert(id.clone()) {
+                    send_event!(ChatStreamEvent::ToolCall {
+                        id: id.clone(),
+                        name,
+                        input: input.clone(),
+                    });
+                }
+                if !output.is_empty() {
+                    open_output.insert(id.clone(), output);
+                }
+                if terminal_tool_status(status.as_deref()) && completed_tools.insert(id.clone()) {
+                    let output = open_output.remove(&id).unwrap_or_default();
+                    send_event!(ChatStreamEvent::ToolResult {
+                        tool_use_id: id,
+                        output,
+                        is_error,
+                        input: Some(input),
+                    });
                 }
             }
-            Some("thought") => {
-                if let Some(chunk) = event.get("data").and_then(Value::as_str)
-                    && events
-                        .send(ChatStreamEvent::ReasoningDelta(chunk.to_string()))
-                        .await
-                        .is_err()
-                {
-                    let _ = child.kill().await;
-                    return Ok(());
+            Some(GrokEvent::End {
+                session_id: id,
+                usage: value,
+            }) => {
+                if let Some(id) = id {
+                    session_id = Some(id);
                 }
-            }
-            Some("end") => {
-                if let Some(id) = event.get("sessionId").and_then(Value::as_str) {
-                    session_id = Some(id.to_string());
-                }
-                if let Some(value) = event.get("usage")
-                    && apply_usage(&mut usage, value)
+                if let Some(value) = value
+                    && apply_usage(&mut usage, &value)
                 {
                     saw_usage = true;
                 }
             }
-            _ => {}
+            None => {}
+        }
+    }
+    // A tool row the stream never closed would render as still running. Close
+    // any that are left with whatever output was streamed for them.
+    let open: Vec<String> = started_tools
+        .difference(&completed_tools)
+        .cloned()
+        .collect();
+    for id in open {
+        let output = open_output.remove(&id).unwrap_or_default();
+        if events
+            .send(ChatStreamEvent::ToolResult {
+                tool_use_id: id,
+                output,
+                is_error: false,
+                input: None,
+            })
+            .await
+            .is_err()
+        {
+            break;
         }
     }
 
@@ -241,8 +284,7 @@ fn apply_usage(usage: &mut ProviderCallUsage, value: &Value) -> bool {
 
 /// Grok's `streaming-json` events are one JSON object per line. Kept separate
 /// so the parser is testable without spawning a process.
-#[cfg(test)]
-pub(crate) fn parse_stream_line(line: &str) -> Option<GrokEvent> {
+fn parse_stream_line(line: &str) -> Option<GrokEvent> {
     let event: Value = serde_json::from_str(line.trim()).ok()?;
     match event.get("type").and_then(Value::as_str)? {
         "text" => Some(GrokEvent::Text(
@@ -251,6 +293,28 @@ pub(crate) fn parse_stream_line(line: &str) -> Option<GrokEvent> {
         "thought" => Some(GrokEvent::Thought(
             event.get("data").and_then(Value::as_str)?.to_string(),
         )),
+        "tool_call" => {
+            let id = event.get("toolCallId").and_then(Value::as_str)?.to_string();
+            let name = event
+                .get("toolName")
+                .and_then(Value::as_str)
+                .or_else(|| event.get("title").and_then(Value::as_str))
+                .or_else(|| event.get("kind").and_then(Value::as_str))
+                .unwrap_or("tool")
+                .to_string();
+            let status = event
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Some(GrokEvent::ToolCall {
+                id,
+                name,
+                input: event.get("rawInput").cloned().unwrap_or(Value::Null),
+                output: tool_content_text(event.get("content")),
+                is_error: matches!(status.as_deref(), Some("failed" | "error" | "cancelled")),
+                status,
+            })
+        }
         "end" => Some(GrokEvent::End {
             session_id: event
                 .get("sessionId")
@@ -262,11 +326,47 @@ pub(crate) fn parse_stream_line(line: &str) -> Option<GrokEvent> {
     }
 }
 
-#[cfg(test)]
+/// A tool call is done once Grok reports a terminal status for it. Anything
+/// else (`pending`, `in_progress`, or a status this build does not know) leaves
+/// the row running.
+fn terminal_tool_status(status: Option<&str>) -> bool {
+    matches!(status, Some("completed" | "failed" | "error" | "cancelled"))
+}
+
+/// Join the text of Grok's tool-call content blocks. They follow the ACP shape
+/// (`{content: {type: "text", text}}`), but a bare `{text}` block is accepted
+/// so a wire simplification does not silently drop the output.
+fn tool_content_text(content: Option<&Value>) -> String {
+    fn block_text(block: &Value) -> Option<&str> {
+        block
+            .get("text")
+            .and_then(Value::as_str)
+            .or_else(|| block.pointer("/content/text").and_then(Value::as_str))
+    }
+    match content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(block_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(block) => block_text(block).unwrap_or_default().to_string(),
+        None => String::new(),
+    }
+}
+
 #[derive(Debug, PartialEq)]
-pub(crate) enum GrokEvent {
+enum GrokEvent {
     Text(String),
     Thought(String),
+    ToolCall {
+        id: String,
+        name: String,
+        input: Value,
+        status: Option<String>,
+        output: String,
+        is_error: bool,
+    },
     End {
         session_id: Option<String>,
         usage: Option<Value>,
@@ -295,6 +395,45 @@ mod tests {
                 session_id: Some("s-1".to_string()),
                 usage: None,
             })
+        );
+    }
+
+    #[test]
+    fn tool_call_events_carry_identity_input_and_content() {
+        assert_eq!(
+            parse_stream_line(
+                r#"{"type":"tool_call","toolCallId":"call_1","title":"Read","kind":"read","status":"in_progress","toolName":"read_file","rawInput":{"path":"src/main.rs"},"content":[{"type":"content","content":{"type":"text","text":"hello"}}]}"#
+            ),
+            Some(GrokEvent::ToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "src/main.rs"}),
+                status: Some("in_progress".to_string()),
+                output: "hello".to_string(),
+                is_error: false,
+            })
+        );
+        // A terminal status marks the row failed without a content block.
+        assert_eq!(
+            parse_stream_line(
+                r#"{"type":"tool_call","toolCallId":"call_2","toolName":"bash","status":"failed"}"#
+            ),
+            Some(GrokEvent::ToolCall {
+                id: "call_2".to_string(),
+                name: "bash".to_string(),
+                input: Value::Null,
+                status: Some("failed".to_string()),
+                output: String::new(),
+                is_error: true,
+            })
+        );
+    }
+
+    #[test]
+    fn tool_call_without_an_id_is_ignored() {
+        assert_eq!(
+            parse_stream_line(r#"{"type":"tool_call","title":"Read"}"#),
+            None
         );
     }
 
