@@ -4557,6 +4557,7 @@ fn authorize_workspace_command(
         HostCommand::ClearContext { .. } => crate::ParticipantCommandKind::ClearContext,
         HostCommand::Stop { .. } => crate::ParticipantCommandKind::Stop,
         HostCommand::Launch { .. }
+        | HostCommand::ReleaseRetainedContext { .. }
         | HostCommand::WorkspaceFilesystem { .. }
         | HostCommand::CancelWorkspaceFilesystem { .. }
         | HostCommand::WorkspaceCommand { .. }

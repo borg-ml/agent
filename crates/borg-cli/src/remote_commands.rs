@@ -10044,6 +10044,7 @@ fn remote_command_name(command: &HostCommand) -> &'static str {
         HostCommand::StopWatch { .. } => "stop watch",
         HostCommand::Compact { .. } => "compact",
         HostCommand::ClearContext { .. } => "clear context",
+        HostCommand::ReleaseRetainedContext { .. } => "release retained context",
         HostCommand::Stop { .. } => "stop",
         HostCommand::WorkspaceFilesystem { .. } => "workspace filesystem",
         HostCommand::CancelWorkspaceFilesystem { .. } => "cancel workspace filesystem",
