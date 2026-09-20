@@ -6415,12 +6415,14 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         ),
         tool(
             "watch",
-            "Start a session-scoped background command that watches logs, files, or external status. Each stdout line is delivered to you automatically in bounded batches, including when idle. Use a command that emits only meaningful changes. Do not poll or wait for it. Requires shell approval; runs until stopped, session exit, or 24 hours. Use list_watchers and stop_watcher to manage watchers.",
+            "Start a session-scoped background command that watches logs, files, or external status. By default output wakes you in bounded batches. Set notify_on=exit for terminal events only, or notify_on=match with notify_pattern (Rust regex) for error/milestone lines. Matching is per line (oversized lines split at 16KiB); exit and stop always notify. Filtering affects model notifications only, not process output capture/journaling. Use a command that emits only meaningful changes. Do not poll or wait for it. Requires shell approval; runs until stopped, session exit, or 24 hours. Use list_watchers and stop_watcher to manage watchers.",
             json!({
                 "type": "object", "properties": {
                     "command": {"type": "string", "minLength": 1},
                     "label": {"type": "string", "minLength": 1, "maxLength": 100},
-                    "workdir": {"type": "string"}
+                    "workdir": {"type": "string"},
+                    "notify_on": {"type": "string", "enum": ["output", "match", "exit"], "default": "output"},
+                    "notify_pattern": {"type": "string", "maxLength": 4096, "description": "Required only with notify_on=match; Rust regex selecting error/milestone output lines. Terminal events always notify."}
                 }, "required": ["command", "label"], "additionalProperties": false
             }),
         ),
