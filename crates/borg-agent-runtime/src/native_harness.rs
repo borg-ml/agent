@@ -667,6 +667,7 @@ impl NativeHarness {
                 }
             }
 
+            let mut folded_steer = pending_steer.is_some();
             if let Some(steer) = pending_steer {
                 let message =
                     native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
@@ -686,6 +687,60 @@ impl NativeHarness {
                 },
             )
             .await;
+            // The model parked this turn on a watcher. Asking it for another
+            // response is what produced the empty-answer failures: it has
+            // nothing left to say, so Codex returns a completed response with
+            // an empty message and the turn dies on the provider's empty-output
+            // guard. End here instead, after the tool results and the round
+            // boundary above are already durable.
+            //
+            // This reads shared watch state rather than matching a tool name
+            // because the observed path is `exec` running
+            // `borg call await_watchers`, which re-enters the session over the
+            // agent MCP transport and never appears as a local tool call.
+            if turn.agent_tools.watcher_yield_active() {
+                // A control queued during the round decides this. An interrupt
+                // is an explicit stop and must surface as one rather than be
+                // reported as a successful yield, so it propagates out of
+                // `accept_tool_boundary_control`. A steer is real human input
+                // the model still owes an answer, so it suppresses the exit and
+                // the loop continues.
+                while let Some(control) = controls
+                    .as_mut()
+                    .and_then(|controls| controls.try_recv().ok())
+                {
+                    if let Some(steer) = accept_tool_boundary_control(control)? {
+                        let message =
+                            native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
+                        trailing_context_tokens = trailing_context_tokens
+                            .saturating_add(estimated_message_tokens(&message));
+                        record_native_message(&events, turn.provider, &message).await?;
+                        messages.push(message);
+                        canonicalize_native_messages(&mut messages);
+                        folded_steer = true;
+                    }
+                }
+                if !folded_steer {
+                    // Settle exactly as the ordinary completion below does, but
+                    // without an assistant message: the model wrote no answer
+                    // and inventing one would put words in its mouth. Any text
+                    // it did emit before parking is preserved in
+                    // `truncated_text`.
+                    send_usage(&events, &usage, Some(turn.message_id)).await;
+                    send(
+                        &events,
+                        SessionEventKind::StatusChanged {
+                            status: SessionStatus::Ready,
+                            detail: None,
+                        },
+                    )
+                    .await;
+                    return Ok(AgentTurnResult {
+                        provider_session_id: None,
+                        final_text: truncated_text,
+                    });
+                }
+            }
             let budget = native_context_budget(&result.usage, &messages, trailing_context_tokens);
             if budget.needs_auto_compaction() {
                 let context_tokens = budget.context_tokens;
@@ -4880,5 +4935,211 @@ mod tests {
             "an unresolvable truncation surfaces as an error"
         );
         assert_eq!(turn.rounds.len(), MAX_LENGTH_CONTINUATIONS + 1);
+    }
+
+    /// A watcher yield ends the turn at the tool-round boundary, and the model
+    /// is never asked for another response.
+    ///
+    /// Shaped after the production incident rather than the tidy case: there
+    /// the model called `exec` running `borg call await_watchers`, which
+    /// re-enters the session over the agent MCP transport, so the harness never
+    /// sees a local `await_watchers` call. The tool driven here is therefore
+    /// `exec`, and the yield appears only as shared `Watches` state, exactly as
+    /// the out-of-process call leaves it. Asking for another response once the
+    /// model has parked is what made Codex return a completed-but-empty message
+    /// and kill the turn on the provider's empty-output guard.
+    struct YieldAtRoundBoundaryClient {
+        rounds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// `Some` establishes the yield out of band, the way the subprocess
+        /// would. `None` is the negative control: an ordinary tool round.
+        yield_on_first_round: Option<(crate::watch::Watches, Uuid)>,
+    }
+
+    #[async_trait]
+    impl NativeModelClient for YieldAtRoundBoundaryClient {
+        async fn model_turn(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+            _request: ModelTurnRequest,
+            _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+        ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+            let round = self
+                .rounds
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let calls = if round == 0 {
+                if let Some((watches, watch_id)) = &self.yield_on_first_round {
+                    watches
+                        .begin_yield(&[*watch_id], "waiting on the build")
+                        .await
+                        .expect("the watcher is live, so the yield is established");
+                }
+                vec![ModelToolCall::function(
+                    "call-1".to_string(),
+                    "exec".to_string(),
+                    json!({"action": "await build", "cmd": "true"}).to_string(),
+                )]
+            } else {
+                Vec::new()
+            };
+            let finish_reason = if calls.is_empty() {
+                "stop"
+            } else {
+                "tool_calls"
+            }
+            .to_string();
+            Ok(ModelTurnResult {
+                message: ModelMessage::assistant(
+                    calls.is_empty().then(|| "done".to_string()),
+                    None,
+                    None,
+                    calls,
+                ),
+                finish_reason,
+                usage: ProviderCallUsage::default(),
+                raw_response: Value::Null,
+                trace: ProviderAttemptTrace::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_watcher_yield_ends_the_turn_without_another_model_request() {
+        for yielded in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let cwd = root.path().to_path_buf();
+            let session_id = Uuid::new_v4();
+            let processes = crate::native_process::ProcessManager::default();
+            let (watch_events_tx, _watch_events_rx) = mpsc::channel(16);
+            let watches =
+                crate::watch::Watches::new(processes.clone(), watch_events_tx, session_id);
+            let info = watches
+                .start(
+                    session_id,
+                    root.path(),
+                    crate::watch::WatchArgs {
+                        command: "sleep 30".to_string(),
+                        label: "Build".to_string(),
+                        workdir: None,
+                    },
+                    None,
+                    60_000,
+                )
+                .await
+                .expect("the watcher starts");
+
+            let rounds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let client = Arc::new(YieldAtRoundBoundaryClient {
+                rounds: std::sync::Arc::clone(&rounds),
+                yield_on_first_round: yielded.then(|| (watches.clone(), info.watch_id)),
+            });
+            let harness = NativeHarness {
+                model_client: client.clone(),
+                harness: HarnessMode::Native,
+                ..NativeHarness::default()
+            };
+            let turn = AgentTurn {
+                session_id,
+                prompt_cache_session_id: Some(Uuid::new_v4()),
+                message_id: Uuid::new_v4(),
+                context_generation: 0,
+                provider: crate::CodingProvider::OpenRouter,
+                provider_session_id: None,
+                provider_fork_turn_id: None,
+                cwd: cwd.clone(),
+                prompt_delta: "build it".to_string(),
+                prompt: "build it".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                model: Some("test-model".to_string()),
+                effort: None,
+                fast: Some(true),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::FullAccess,
+                conversation: Vec::new(),
+                agent_mcp_server: borg_provider::mcp::ExternalMcpServer {
+                    name: "test".to_string(),
+                    command: "test".to_string(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                    allowed_tools: Vec::new(),
+                },
+                agent_tools: crate::AgentToolDispatcher::new(
+                    crate::session::SessionGoalTools::disconnected(),
+                    crate::session::SessionTodoTools::disconnected(),
+                    None,
+                    crate::LspService::new(&cwd),
+                    crate::CodingProvider::OpenRouter,
+                    session_id,
+                    false,
+                    None,
+                    None,
+                    cwd.clone(),
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    None,
+                    processes.clone(),
+                    PermissionMode::FullAccess,
+                )
+                .with_watches(watches.clone()),
+                external_mcp_servers: Vec::new(),
+                runtime_mcp_context: Default::default(),
+                extension_skill_roots: Vec::new(),
+                extension_workflows: Vec::new(),
+                extension_api: Default::default(),
+                system_prompt_appendix: String::new(),
+                volatile_system_prompt_appendix: String::new(),
+            };
+
+            let (events_tx, mut events_rx) = mpsc::channel(256);
+            let result = harness
+                .run(turn, events_tx, None)
+                .await
+                .expect("the turn completes successfully");
+
+            let mut assistant_messages = Vec::new();
+            while let Ok(event) = events_rx.try_recv() {
+                if let SessionEventKind::Message {
+                    actor: EventActor::Assistant,
+                    text,
+                    ..
+                } = event
+                {
+                    assistant_messages.push(text);
+                }
+            }
+
+            if yielded {
+                assert_eq!(
+                    rounds.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "a parked turn must not spend another model request"
+                );
+                assert!(
+                    result.final_text.is_empty(),
+                    "the model wrote no answer, so none may be invented: {:?}",
+                    result.final_text
+                );
+                assert!(
+                    assistant_messages.is_empty(),
+                    "no assistant text may be fabricated for a yield: {assistant_messages:?}"
+                );
+            } else {
+                // Negative control: without a yield the ordinary tool loop must
+                // still come back for the answer, or this fix would silently
+                // truncate every tool round.
+                assert_eq!(
+                    rounds.load(std::sync::atomic::Ordering::SeqCst),
+                    2,
+                    "an ordinary tool round still asks the model for its answer"
+                );
+                assert_eq!(result.final_text, "done");
+                assert_eq!(assistant_messages, vec!["done".to_string()]);
+            }
+            watches.cancel.cancel();
+        }
     }
 }

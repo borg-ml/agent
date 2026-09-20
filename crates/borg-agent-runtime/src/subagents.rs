@@ -987,6 +987,19 @@ impl AgentToolDispatcher {
         self.journal.clone()
     }
 
+    /// Whether this session is currently parked on a watcher yield.
+    ///
+    /// Read by the native harness at a tool-round boundary to decide that the
+    /// turn is over. It deliberately reports shared state rather than naming a
+    /// tool: a yield is just as often established by `exec` running
+    /// `borg call await_watchers`, which re-enters the session over the agent
+    /// MCP transport and never appears as a local tool call.
+    pub(crate) fn watcher_yield_active(&self) -> bool {
+        self.watches
+            .as_ref()
+            .is_some_and(|watches| watches.yielded().is_some())
+    }
+
     pub(crate) async fn harness_prompt_appendix(&self) -> Result<String> {
         let store = self.session_store();
         let mut appendix = crate::harness::prompt_appendix(
