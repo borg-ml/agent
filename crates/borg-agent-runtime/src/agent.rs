@@ -875,6 +875,14 @@ fn completed_hook_arguments(turn: &AgentTurn, result: &Result<AgentTurnResult>) 
     })
 }
 
+/// Providers whose local CLI turn can summarize a durable transcript for the
+/// retained-context fold. Claude has its pooled/local CLI turn and OpenCode a
+/// local CLI turn; every other provider is expected to compact through
+/// `compact_native` on its own harness.
+fn supports_retained_context_compaction(provider: CodingProvider) -> bool {
+    matches!(provider, CodingProvider::Claude | CodingProvider::OpenCode)
+}
+
 #[async_trait::async_trait]
 impl AgentTurnExecutor for LocalAgentTurnExecutor {
     #[cfg(feature = "subscription-adapters")]
@@ -1082,7 +1090,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
 
     async fn compact_retained_context(&self, turn: AgentTurn) -> Result<AgentCompaction> {
         anyhow::ensure!(
-            turn.provider == CodingProvider::Claude,
+            supports_retained_context_compaction(turn.provider),
             "{:?} does not support subscription context compaction",
             turn.provider
         );
@@ -2608,6 +2616,32 @@ mod tests {
             .unwrap();
         assert!(!cli_executor.uses_native_harness(CodingProvider::OpenCode));
         scratch.discard().await;
+    }
+
+    /// A legacy OpenCode CLI session is non-native and has no native model
+    /// route, so its only way to compact is the retained-context fold driving a
+    /// local OpenCode turn. Refusing OpenCode here made `/compact` fail with
+    /// "OpenCode does not support subscription context compaction".
+    #[test]
+    fn retained_context_compaction_admits_the_local_cli_turns() {
+        assert!(super::supports_retained_context_compaction(
+            CodingProvider::Claude
+        ));
+        assert!(super::supports_retained_context_compaction(
+            CodingProvider::OpenCode
+        ));
+        for provider in [
+            CodingProvider::Codex,
+            CodingProvider::Kimi,
+            CodingProvider::Glm,
+            CodingProvider::OpenRouter,
+            CodingProvider::OpenAiCompatible,
+        ] {
+            assert!(
+                !super::supports_retained_context_compaction(provider),
+                "{provider:?} must keep compacting through its native route"
+            );
+        }
     }
 
     #[tokio::test]
