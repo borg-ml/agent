@@ -242,10 +242,7 @@ pub(super) async fn available() -> anyhow::Result<bool> {
         return Ok(true);
     }
     let caller = cgroup_of(std::process::id() as i32);
-    if caller
-        .as_deref()
-        .is_some_and(|cgroup| in_borg_scope(cgroup))
-    {
+    if caller.as_deref().is_some_and(in_borg_scope) {
         anyhow::bail!(
             "this machine runs systemd but its user manager did not answer within \
              {PROBE_TIMEOUT:?}, and Borg is running inside {}. Starting the cluster \

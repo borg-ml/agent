@@ -8115,9 +8115,7 @@ async fn update_from_session_event(
     event: &SessionEvent,
 ) -> Option<String> {
     let mut table = table.lock().await;
-    let Some(entry) = table.entries.get_mut(&session_id) else {
-        return None;
-    };
+    let entry = table.entries.get_mut(&session_id)?;
     match &event.kind {
         SessionEventKind::SessionConfigured {
             provider,
