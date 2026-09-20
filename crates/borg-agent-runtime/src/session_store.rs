@@ -12,9 +12,8 @@ use uuid::Uuid;
 
 use crate::session_action::{SessionAction, SessionActionState, SessionActionTransition};
 use crate::{
-    CodingProvider, MessageStatus, PermissionMode, PlanItem, ResponseLanguage,
-    SessionEvent, SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef,
-    SessionStatus,
+    CodingProvider, MessageStatus, PermissionMode, PlanItem, ResponseLanguage, SessionEvent,
+    SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef, SessionStatus,
 };
 
 pub const INLINE_SESSION_PAYLOAD_BYTES: usize = 64 * 1024;
@@ -1257,11 +1256,7 @@ pub trait SessionStore: Send + Sync {
         session_id: Uuid,
         cursors: &HashMap<Uuid, u64>,
     ) -> Result<()>;
-    async fn register_child_session(
-        &self,
-        owner_session_id: Uuid,
-        session_id: Uuid,
-    ) -> Result<()>;
+    async fn register_child_session(&self, owner_session_id: Uuid, session_id: Uuid) -> Result<()>;
     async fn append(&self, event: SessionEvent) -> Result<SessionEvent>;
     /// Durably accept a user prompt exactly once before any in-memory routing
     /// or caller acknowledgement. Repeating the same admission is a no-op;
@@ -1405,10 +1400,7 @@ pub trait SessionStore: Send + Sync {
         &self,
         binding: SessionWorkspaceBinding,
     ) -> Result<SessionWorkspaceBinding>;
-    async fn workspace_binding(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Option<SessionWorkspaceBinding>>;
+    async fn workspace_binding(&self, session_id: Uuid) -> Result<Option<SessionWorkspaceBinding>>;
     /// Return the durable autonomous runtime journal on the same authority as
     /// this store, when it has one. Optional so the trait keeps a small
     /// in-memory test seam; the store factory refuses a production backend that
@@ -2049,4 +2041,3 @@ pub mod postgres;
 
 #[cfg(test)]
 mod conformance;
-

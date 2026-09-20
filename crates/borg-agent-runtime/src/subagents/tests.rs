@@ -4600,7 +4600,7 @@ async fn forwarded_image_reaches_the_recipient_model_as_pixels() {
             directory.path().to_path_buf(),
             None,
             autonomy,
-            Some(std::sync::Arc::new(store.clone()) as std::sync::Arc<dyn crate::SessionStore>),
+            Some(store.clone() as std::sync::Arc<dyn crate::SessionStore>),
             Vec::new(),
             None,
             crate::native_process::ProcessManager::default(),

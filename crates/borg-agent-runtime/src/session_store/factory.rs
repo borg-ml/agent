@@ -26,8 +26,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use super::postgres::{PostgresSessionStore, SESSIONS_URL_ENV};
 use super::SessionStore;
+use super::postgres::{PostgresSessionStore, SESSIONS_URL_ENV};
 
 /// Which journal a process was told to use.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,7 +315,10 @@ mod tests {
     #[test]
     fn an_explicit_url_outranks_the_managed_cluster() {
         let url = "postgres://borg@localhost:5433/borg_sessions";
-        assert_eq!(select(Some(url.to_string())), Selection::Url(url.to_string()));
+        assert_eq!(
+            select(Some(url.to_string())),
+            Selection::Url(url.to_string())
+        );
     }
 
     /// `describe` is what an operator reads in a startup error, so each

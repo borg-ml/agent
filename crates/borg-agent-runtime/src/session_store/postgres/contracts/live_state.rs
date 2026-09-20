@@ -508,10 +508,12 @@ async fn reopening_repairs_turn_live_state_left_on_a_terminal_session() {
         "the fixture must actually strand a row, or this proves nothing"
     );
 
-    let reopened =
-        crate::session_store::postgres::PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
-            .await
-            .unwrap();
+    let reopened = crate::session_store::postgres::PostgresSessionStore::connect_with_pool_size(
+        &scratch.url,
+        4,
+    )
+    .await
+    .unwrap();
     assert!(
         reopened
             .live_events_after(session_id, 0)
@@ -577,10 +579,12 @@ async fn reopening_leaves_the_live_state_of_a_running_session_alone() {
         "a running turn must publish live state for this to mean anything"
     );
 
-    let reopened =
-        crate::session_store::postgres::PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
-            .await
-            .unwrap();
+    let reopened = crate::session_store::postgres::PostgresSessionStore::connect_with_pool_size(
+        &scratch.url,
+        4,
+    )
+    .await
+    .unwrap();
     let after = reopened.live_events_after(session_id, 0).await.unwrap();
     assert_eq!(
         after.len(),
