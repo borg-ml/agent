@@ -304,6 +304,17 @@ impl ManagedCluster {
     }
 
     async fn start(&self, pg_ctl: &Path) -> Result<()> {
+        let log_start = match std::fs::metadata(&self.log_path) {
+            Ok(metadata) => Some(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(0),
+            Err(_) => None,
+        };
+        self.start_once(pg_ctl)
+            .await
+            .map_err(|error| startup_error(error, &self.log_path, log_start))
+    }
+
+    async fn start_once(&self, pg_ctl: &Path) -> Result<()> {
         if let Some(parent) = self.log_path.parent() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!("could not create {} for the cluster log", parent.display())
@@ -510,18 +521,24 @@ impl ManagedCluster {
 /// - Startup closes the listening socket on clients mid-handshake, which
 ///   surfaces as an unexpected end of file rather than a refusal.
 ///
-/// All three resolve on their own or on the caller's next start attempt. A
-/// rejected role, a missing database or a corrupt data directory do not, and
-/// must stay loud.
+/// Disk-full errors (53100 or StorageFull) can recover after space is reclaimed.
+/// These conditions permit another bounded startup attempt, not replay of writes.
+/// A rejected role, missing database or corrupt data directory must stay loud.
 pub(crate) fn is_between_states(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
+        if cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::StorageFull)
+        {
+            return true;
+        }
         let Some(error) = cause.downcast_ref::<sqlx::Error>() else {
             return false;
         };
         if error
             .as_database_error()
             .and_then(|error| error.code())
-            .is_some_and(|code| matches!(code.as_ref(), "57P01" | "57P02" | "57P03"))
+            .is_some_and(|code| matches!(code.as_ref(), "57P01" | "57P02" | "57P03" | "53100"))
         {
             return true;
         }
@@ -536,6 +553,30 @@ pub(crate) fn is_between_states(error: &anyhow::Error) -> bool {
                 )
         )
     })
+}
+
+// pg_ctl/systemd report launch failures as text. Only bytes appended during
+// this attempt may identify a storage outage; historical errors are not evidence.
+fn startup_error(error: anyhow::Error, log_path: &Path, log_start: Option<u64>) -> anyhow::Error {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let fresh_log = || -> std::io::Result<String> {
+        let start = log_start.ok_or_else(|| std::io::Error::other("unknown log offset"))?;
+        let mut file = std::fs::File::open(log_path)?;
+        let end = file.metadata()?.len();
+        file.seek(SeekFrom::Start(start.max(end.saturating_sub(64 * 1024))))?;
+        let mut bytes = Vec::new();
+        file.take(64 * 1024).read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    if fresh_log().is_ok_and(|log| log.contains("No space left on device")) {
+        return std::io::Error::new(
+            std::io::ErrorKind::StorageFull,
+            error.context("PostgreSQL startup ran out of disk space"),
+        )
+        .into();
+    }
+    error
 }
 
 fn is_duplicate_database(error: &sqlx::Error) -> bool {
@@ -752,7 +793,7 @@ mod tests {
 
         // A live postmaster refusing work, and a shutdown or backend crash
         // reaching a connection that was already open.
-        for code in ["57P01", "57P02", "57P03"] {
+        for code in ["57P01", "57P02", "57P03", "53100"] {
             assert!(is_between_states(&reported(code)), "{code} is transitional");
         }
         // The gap before anything restarts it, and a socket closed on a
@@ -804,6 +845,45 @@ mod tests {
             3,
             "the open must be re-entered, not merely retried at the connection"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disk_full_launch_failure_is_retried_but_old_log_errors_are_not() {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("postgres.log");
+        std::fs::write(
+            &log,
+            "old failure: No space left on device
+",
+        )
+        .unwrap();
+        let offset = std::fs::metadata(&log).unwrap().len();
+        let settled = startup_error(anyhow::anyhow!("invalid configuration"), &log, Some(offset));
+        assert!(!is_between_states(&settled));
+        let attempts = AtomicU32::new(0);
+        let opened = recover_transitional(|| async {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+                writeln!(
+                    file,
+                    "could not write postmaster.pid: No space left on device"
+                )
+                .unwrap();
+                return Err(startup_error(
+                    anyhow::anyhow!("pg_ctl failed"),
+                    &log,
+                    Some(offset),
+                ));
+            }
+            Ok("journal")
+        })
+        .await
+        .unwrap();
+        assert_eq!(opened, "journal");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     /// The other half of the contract: waiting is bounded, and what the
