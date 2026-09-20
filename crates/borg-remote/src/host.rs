@@ -12563,25 +12563,36 @@ connection: close
                 "503 Service Unavailable",
                 "200 OK",
             ] {
-                if status == "200 OK" {
+                // The host reloads its sync cursor from more than one place --
+                // starting a session, recovering a journal, and the legacy
+                // ownership check each fetch it -- and nothing promises which
+                // of them runs between two uploads. Answering a sync wherever
+                // it arrives keeps this test pinned to what the uploads
+                // contain, which is its subject, instead of to the order the
+                // host happened to ask in, which it never guaranteed.
+                let (mut stream, body) = loop {
                     let (mut stream, _) = listener.accept().await.unwrap();
-                    let (path, _) = read_http_request(&mut stream).await;
-                    assert_eq!(path, format!("/api/remote/host/sessions/{session_id}/sync"));
-                    let body = r#"{"event_cursor":0,"live_revision":0}"#;
-                    stream
-                        .write_all(
-                            format!(
-                                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                                body.len()
+                    let (path, body) = read_http_request(&mut stream).await;
+                    if path == format!("/api/remote/host/sessions/{session_id}/sync") {
+                        let cursor = r#"{"event_cursor":0,"live_revision":0}"#;
+                        stream
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{cursor}",
+                                    cursor.len()
+                                )
+                                .as_bytes(),
                             )
-                            .as_bytes(),
-                        )
-                        .await
-                        .unwrap();
-                }
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let (path, body) = read_http_request(&mut stream).await;
-                assert!(path.starts_with("/api/remote/host/events"));
+                            .await
+                            .unwrap();
+                        continue;
+                    }
+                    assert!(
+                        path.starts_with("/api/remote/host/events"),
+                        "unexpected host request while awaiting an upload: {path}"
+                    );
+                    break (stream, body);
+                };
                 uploads.push(serde_json::from_slice::<serde_json::Value>(&body).unwrap());
                 stream
                     .write_all(
