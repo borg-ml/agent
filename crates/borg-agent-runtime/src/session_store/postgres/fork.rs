@@ -99,7 +99,7 @@ impl PostgresSessionStore {
 
     /// The parent's state at the cut, and how many of its events the fork
     /// inherits.
-    async fn fork_projection(
+    pub(super) async fn fork_projection(
         &self,
         parent_session_id: Uuid,
         sequence: u64,
