@@ -6349,6 +6349,8 @@ mod tests {
         );
     }
 
+    type SteerAckReceiver = tokio::sync::oneshot::Receiver<std::result::Result<(), String>>;
+
     /// Round 0 writes a tool call and steers itself while doing so; round 1
     /// answers. The steer is admitted before the call is delivered, so it
     /// provably lands during generation.
@@ -6363,11 +6365,7 @@ mod tests {
         steer_message_id: Uuid,
         /// Shared so the test can assert admission timing from outside.
         admission: borg_provider::provider::SteerAdmission,
-        acked: std::sync::Arc<
-            std::sync::Mutex<
-                Option<tokio::sync::oneshot::Receiver<std::result::Result<(), String>>>,
-            >,
-        >,
+        acked: std::sync::Arc<std::sync::Mutex<Option<SteerAckReceiver>>>,
     }
 
     #[async_trait]
