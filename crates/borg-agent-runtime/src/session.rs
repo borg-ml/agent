@@ -7733,25 +7733,23 @@ fn watch_prompt(mut text: String, receiver: &mut mpsc::Receiver<String>) -> Queu
 /// past the cap one note at a time.
 const TEAM_BATCH_MAX_MEMBERS: usize = 32;
 const TEAM_BATCH_MAX_TEXT_BYTES: usize = 48 * 1024;
+const TEAM_BATCH_TEXT_SEPARATOR: &str = "\n\n";
 
 /// Merge queued team notifications so a backlog costs turns proportional to its
 /// size rather than one turn per note.
 ///
-/// With an active goal the actor admits one queued prompt per model turn, so a
-/// backlog of notes is serviced one at a time and each note costs a full
-/// provider turn. That is a service-rate problem, not a delivery problem: the
-/// notes arrive once and in order, they just wait. Merging an eligible run into
-/// one prompt keeps every member's identity, because `record_prompt_status`
-/// settles `batch_entries()` individually, so each note still gets its own
-/// journal record, acknowledgement and attachments.
+/// Eligible: `System`, visible, `Queue` delivery. Autonomy prompts and goal
+/// continuations are `System` but not visible; watcher steers, wakes and
+/// follow-ups are `Steer`; the usage-limit continuation is excluded by id.
 ///
-/// Deliberately narrow. Only `System`, visible, `Queue`-delivery prompts are
-/// eligible, which is what a team notification is: autonomy prompts and goal
-/// continuations are `System` but not visible, and watcher steers, explicit
-/// wakes and follow-ups are `Steer`, so none of them can be absorbed. The
-/// usage-limit continuation is excluded by id. Nothing is expired or dropped --
-/// an ineligible note keeps its place, and a single note larger than the byte
-/// cap is still admitted on its own rather than being starved.
+/// Members keep their durable identity -- `record_prompt_status` settles
+/// `batch_entries()` individually, so each note still gets its own journal
+/// record, acknowledgement and attachments. Nothing is expired or dropped.
+///
+/// Bounded by member count and by merged text size, both counted across an
+/// already-merged prompt so re-entry cannot grow a batch past the cap. The
+/// first candidate is always taken, so a note larger than the byte cap is
+/// admitted alone rather than starved.
 fn coalesce_pending_team_notifications(
     pending: &mut VecDeque<QueuedPrompt>,
     autonomy_prompt_ids: &HashSet<Uuid>,
@@ -7780,16 +7778,29 @@ fn coalesce_pending_team_notifications(
     let mut take = Vec::new();
     for &index in &candidates {
         let prompt = &pending[index];
-        let prompt_members = prompt.batch_entries().len();
+        // Count members without materialising them: `batch_entries` clones the
+        // text and attachments of every member just to report a length.
+        let prompt_members = if prompt.batch.is_empty() {
+            1
+        } else {
+            prompt.batch.len()
+        };
         let prompt_bytes = prompt.text.len();
+        // The merge joins non-empty texts with a blank line, so the separators
+        // are part of what the byte bound is bounding.
+        let separator = if bytes > 0 && prompt_bytes > 0 {
+            TEAM_BATCH_TEXT_SEPARATOR.len()
+        } else {
+            0
+        };
         if !take.is_empty()
             && (members + prompt_members > TEAM_BATCH_MAX_MEMBERS
-                || bytes + prompt_bytes > TEAM_BATCH_MAX_TEXT_BYTES)
+                || bytes + separator + prompt_bytes > TEAM_BATCH_MAX_TEXT_BYTES)
         {
             break;
         }
         members += prompt_members;
-        bytes += prompt_bytes;
+        bytes += separator + prompt_bytes;
         take.push(index);
     }
     if take.len() < 2 {
@@ -7812,7 +7823,7 @@ fn coalesce_pending_team_notifications(
     for prompt in &merged {
         if !prompt.text.is_empty() {
             if !text.is_empty() {
-                text.push_str("\n\n");
+                text.push_str(TEAM_BATCH_TEXT_SEPARATOR);
             }
             text.push_str(&prompt.text);
         }

@@ -3018,10 +3018,16 @@ async fn provider_setup_stall_has_a_durable_terminal_boundary() {
 
     let mut observed = Vec::new();
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
-            .await
-            .expect("liveness timeout is bounded")
-            .expect("actor remains attached");
+        // The event this waits for IS the setup-liveness timeout firing, so the
+        // wait has to outlast that budget plus the watchdog's poll, not be a
+        // flat two seconds. Derived from the constant so the two cannot drift.
+        let event = tokio::time::timeout(
+            PROVIDER_SETUP_LIVENESS_TIMEOUT + Duration::from_secs(2),
+            event_rx.recv(),
+        )
+        .await
+        .expect("liveness timeout is bounded")
+        .expect("actor remains attached");
         let ready = matches!(
             event.kind,
             SessionEventKind::StatusChanged {
