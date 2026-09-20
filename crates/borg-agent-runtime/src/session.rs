@@ -2158,6 +2158,17 @@ async fn run_agent_session_store_kernel_inner(
             Some(watch_prompt(text, &mut watch_events_rx))
         } else if !usage_limit_retry_waiting
             && !user_stop
+            // A host command is already waiting. Automatic goal work is the
+            // lowest-priority reason to open a turn, and it is the only one
+            // that regenerates itself, so letting it win here is not a delay
+            // but a livelock: `collect_input_at_turn_boundary` defers every
+            // command it does not itself handle -- Stop among them -- and the
+            // only place deferred commands are read is the idle boundary
+            // below, which a goal that always supplies the next turn never
+            // reaches. A session driven by a goal then cannot be stopped at
+            // all; it ran 274 turns in 30 seconds ignoring Stop. Going idle
+            // for one pass costs a Ready and hands the command its boundary.
+            && deferred_commands.is_empty()
             && watches.yielded().is_none()
             && let Some(active_goal) = goal
                 .as_ref()
