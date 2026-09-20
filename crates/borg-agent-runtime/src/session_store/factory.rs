@@ -50,6 +50,9 @@ pub struct SessionStoreConfig {
     selection: Selection,
     /// The Borg home directory that hosts the managed cluster.
     home: PathBuf,
+    /// Controller-supplied workspace projection. The journal always lives in
+    /// this config's database; only the workspace tier is redirected.
+    workspace_override: Option<crate::session_store::postgres::WorkspaceStoreOverride>,
 }
 
 /// The Borg home that hosts the managed cluster.
@@ -79,6 +82,7 @@ impl SessionStoreConfig {
         Self {
             selection: select(PostgresSessionStore::url_from_env()),
             home: default_home(),
+            workspace_override: None,
         }
     }
 
@@ -87,6 +91,7 @@ impl SessionStoreConfig {
         Self {
             selection: Selection::Url(url.into()),
             home: default_home(),
+            workspace_override: None,
         }
     }
 
@@ -95,7 +100,22 @@ impl SessionStoreConfig {
         Self {
             selection: Selection::Managed,
             home: home.into(),
+            workspace_override: None,
         }
+    }
+
+    /// Project the workspace tier into a controller-owned store.
+    ///
+    /// The journal and every other tier stay in this config's database; only
+    /// the workspace projection is redirected to the supplied authority.
+    pub fn with_workspace_store(
+        mut self,
+        workspace: std::sync::Arc<dyn crate::WorkspaceStore>,
+    ) -> Self {
+        self.workspace_override = Some(crate::session_store::postgres::WorkspaceStoreOverride(
+            workspace,
+        ));
+        self
     }
 
     /// Where this configuration points, for diagnostics and for telling two
@@ -214,7 +234,11 @@ impl OpenSessionStore {
 /// process has committed to running. See that type for why the two steps are
 /// separate.
 pub async fn open(config: &SessionStoreConfig) -> Result<OpenSessionStore> {
-    let session: Arc<dyn SessionStore> = match &config.selection {
+    let workspace_override = config
+        .workspace_override
+        .as_ref()
+        .map(|override_store| std::sync::Arc::clone(&override_store.0));
+    let store: PostgresSessionStore = match &config.selection {
         Selection::Url(url) => {
             let store = PostgresSessionStore::connect(url).await.with_context(|| {
                 format!("{SESSIONS_URL_ENV} is set, so Borg requires PostgreSQL")
@@ -224,7 +248,7 @@ pub async fn open(config: &SessionStoreConfig) -> Result<OpenSessionStore> {
             // user without anyone noticing, and what would be shared is a
             // trust boundary. Sharing stays possible, but only deliberately.
             store.ensure_single_owner().await?;
-            Arc::new(store)
+            store
         }
         Selection::Managed => {
             // Provisioning happens here rather than in `from_env` because it
@@ -232,9 +256,14 @@ pub async fn open(config: &SessionStoreConfig) -> Result<OpenSessionStore> {
             // and only a process that actually opens the journal should pay
             // for one.
             let cluster = config.cluster();
-            Arc::new(open_managed(&cluster).await?)
+            open_managed(&cluster).await?
         }
     };
+    let store = match workspace_override {
+        Some(workspace) => store.with_workspace_store(workspace),
+        None => store,
+    };
+    let session: Arc<dyn SessionStore> = Arc::new(store);
     Ok(OpenSessionStore { session })
 }
 
