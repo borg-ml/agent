@@ -14,9 +14,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::{
-    ModelMessage, ModelToolCall, ModelTurnRequest, ModelTurnResult, ProviderAttemptTrace,
-    ProviderCallError, ProviderInvocation, ProviderProgress, ProviderProgressStream,
-    StreamedToolAction, apply_provider_request_timeout,
+    ModelMessage, ModelToolCall, ModelTurnRequest, ModelTurnResult, PromptCacheRefresh,
+    ProviderAttemptTrace, ProviderCallError, ProviderInvocation, ProviderProgress,
+    ProviderProgressStream, StreamedToolAction, apply_provider_request_timeout,
 };
 
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -258,9 +258,39 @@ impl CodexModelProvider {
     /// Keep the credentials selected at turn admission stable while this turn runs.
     pub async fn model_turn_for_account(
         &self,
+        request: ModelTurnRequest,
+        progress: Option<UnboundedSender<ProviderProgress>>,
+        expected_account: &str,
+    ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        self.model_turn_capped(request, progress, expected_account, None)
+            .await
+    }
+
+    /// Re-send `request` with a minimal output budget so OpenAI resets the
+    /// expiry on the prompt cache entry this account already holds.
+    ///
+    /// The refresh goes to the same endpoint under the same account identity,
+    /// carrying the same `prompt_cache_key`, because a refresh sent on any
+    /// other route would warm a cache the next real turn never reads. Only the
+    /// usage is returned: the assistant message, its reasoning and any tool
+    /// calls it produced are dropped without ever reaching the conversation.
+    pub async fn refresh_prompt_cache_for_account(
+        &self,
+        request: ModelTurnRequest,
+        expected_account: &str,
+        refresh: PromptCacheRefresh,
+    ) -> std::result::Result<ProviderCallUsage, ProviderCallError> {
+        self.model_turn_capped(request, None, expected_account, Some(refresh))
+            .await
+            .map(|result| result.usage)
+    }
+
+    async fn model_turn_capped(
+        &self,
         mut request: ModelTurnRequest,
         progress: Option<UnboundedSender<ProviderProgress>>,
         expected_account: &str,
+        refresh: Option<PromptCacheRefresh>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
         let started = Instant::now();
         let mut trace = ProviderAttemptTrace {
@@ -295,7 +325,13 @@ impl CodexModelProvider {
                     "fast mode is not supported by this Codex model");
                 Some(capabilities.usable_context_window()?)
             };
-            let body = self.request_body_for_account(&mut request, expected_account)?;
+            let mut body = self.request_body_for_account(&mut request, expected_account)?;
+            // Reasoning tokens count against `max_output_tokens` on the
+            // Responses API, so this cap bounds the whole refresh, not just
+            // its visible text.
+            if let Some(refresh) = refresh {
+                body["max_output_tokens"] = json!(refresh.max_output_tokens);
+            }
             let endpoint = access.endpoint();
             let response = self
                 .send(

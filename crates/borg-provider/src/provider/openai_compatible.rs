@@ -11,9 +11,9 @@ use crate::runtime::elapsed_millis_u64;
 
 use super::{
     ChatCompletionResponseFormat, ModelMessage, ModelToolCall, ModelTurnRequest, ModelTurnResult,
-    Provider, ProviderAttemptTrace, ProviderCallError, ProviderCallResult, ProviderErrorKind,
-    ProviderInvocation, ProviderProgress, StreamedToolAction, StructuredOutputDialect,
-    apply_provider_request_timeout, chat_completion_response_format,
+    PromptCacheRefresh, Provider, ProviderAttemptTrace, ProviderCallError, ProviderCallResult,
+    ProviderCallUsage, ProviderErrorKind, ProviderInvocation, ProviderProgress, StreamedToolAction,
+    StructuredOutputDialect, apply_provider_request_timeout, chat_completion_response_format,
     extract_chat_completions_usage, nonempty_env, parse_chat_completion_json_text,
     provider_cost_usd_to_microusd, read_provider_error_response_text,
     read_provider_success_response_text, truncate_provider_text,
@@ -207,6 +207,39 @@ impl OpenAiCompatibleProvider {
         progress: Option<UnboundedSender<ProviderProgress>>,
         gateway: Option<&ModelGateway>,
         profile: OpenAiCompatibleProfile,
+    ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        self.model_turn_capped(request, progress, gateway, profile, None)
+            .await
+    }
+
+    /// Re-send `request` with a minimal output budget so the provider resets
+    /// the expiry on the prompt cache entry it already holds.
+    ///
+    /// This goes out over the same authenticated route as the real turn — the
+    /// same endpoint, key, gateway headers and `prompt_cache_key` — because a
+    /// refresh sent anywhere else would warm a cache the next real request
+    /// never reads. The assistant message is discarded: only the usage is
+    /// returned, so a refresh can be billed and shown without any chance of
+    /// its content reaching the conversation or its tool calls being run.
+    pub async fn refresh_prompt_cache_via_profile(
+        &self,
+        request: ModelTurnRequest,
+        gateway: Option<&ModelGateway>,
+        profile: OpenAiCompatibleProfile,
+        refresh: PromptCacheRefresh,
+    ) -> std::result::Result<ProviderCallUsage, ProviderCallError> {
+        self.model_turn_capped(request, None, gateway, profile, Some(refresh))
+            .await
+            .map(|result| result.usage)
+    }
+
+    async fn model_turn_capped(
+        &self,
+        request: ModelTurnRequest,
+        progress: Option<UnboundedSender<ProviderProgress>>,
+        gateway: Option<&ModelGateway>,
+        profile: OpenAiCompatibleProfile,
+        refresh: Option<PromptCacheRefresh>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
         let started_at = Instant::now();
         let endpoint = gateway
@@ -409,8 +442,23 @@ impl OpenAiCompatibleProvider {
             body["provider"] = provider;
         }
 
+        // Applied last so it overrides every profile, env and gateway budget
+        // above. Both spellings are set because a gateway may have merged in
+        // whichever one its upstream honours, and a refresh that silently kept
+        // a full output budget would bill like a real turn.
+        if let Some(refresh) = refresh {
+            let cap = json!(refresh.max_output_tokens);
+            if body.get("max_completion_tokens").is_some() {
+                body["max_completion_tokens"] = cap.clone();
+            }
+            body["max_tokens"] = cap;
+        }
+
         let client = compatible_http_client();
-        let max_attempts = 3;
+        // A refresh is best-effort and must never queue retries behind the
+        // agent's real traffic: if the first attempt fails the cache entry is
+        // lost, and the next real request pays for it once.
+        let max_attempts = if refresh.is_some() { 1 } else { 3 };
         let mut attempt = 0_u32;
         let response = loop {
             attempt += 1;

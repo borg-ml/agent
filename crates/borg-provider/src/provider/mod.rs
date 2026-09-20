@@ -706,6 +706,38 @@ pub(crate) fn extract_chat_completions_usage(
     }
 }
 
+/// The output budget one prompt-cache refresh asks for.
+///
+/// A refresh re-sends the previous request unchanged except for this cap, so
+/// the provider recognises the same cached prefix and resets its expiry while
+/// billing a cache read instead of a full prompt. The cap is per route rather
+/// than a constant because "one output token" is not universally accepted: a
+/// chat-completions route takes `max_tokens: 1`, while OpenAI's Responses API
+/// rejects a cap below [`RESPONSES_MIN_OUTPUT_TOKENS`] for reasoning models.
+/// Routes that cannot express a minimal budget at all must report themselves
+/// ineligible rather than send a full-budget request and call it warming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PromptCacheRefresh {
+    pub max_output_tokens: u64,
+}
+
+impl PromptCacheRefresh {
+    /// A chat-completions route honours a literal one-token budget.
+    pub const ONE_TOKEN: Self = Self {
+        max_output_tokens: 1,
+    };
+
+    /// The smallest budget OpenAI's Responses API accepts for a reasoning
+    /// model. Reasoning tokens count against `max_output_tokens`, so the cap
+    /// still bounds what a refresh can spend.
+    pub const RESPONSES_MINIMUM: Self = Self {
+        max_output_tokens: RESPONSES_MIN_OUTPUT_TOKENS,
+    };
+}
+
+/// OpenAI rejects `max_output_tokens` below this on the Responses API.
+pub const RESPONSES_MIN_OUTPUT_TOKENS: u64 = 16;
+
 /// Estimate the extra API-equivalent cost of reprocessing tokens that would
 /// otherwise have been served from OpenAI's prompt cache.
 pub fn estimate_openai_cache_miss_microusd(
@@ -729,6 +761,59 @@ pub fn estimate_openai_cache_miss_microusd(
         input_rate.saturating_sub(cached_rate),
     ))
 }
+
+/// Estimate what re-reading a cached prompt of `prompt_tokens` costs, plus an
+/// upper bound on `output_tokens` of generated output.
+///
+/// This is the price of one prompt-cache refresh. The output allowance is
+/// charged at the *input* rate because the catalog above carries no output
+/// price: a refresh emits at most a handful of tokens, and over-charging them
+/// can only make Borg warm less often than the true economics justify, never
+/// more. Returns `None` when the model's prices are unknown, which is what
+/// makes a route report honestly ineligible instead of guessing.
+pub fn estimate_prompt_cache_refresh_microusd(
+    model: &str,
+    prompt_tokens: u64,
+    output_tokens: u64,
+) -> Option<u64> {
+    let pricing = openai_model_pricing(model)?;
+    let long_context_pricing = pricing
+        .long_context_input_threshold
+        .is_some_and(|threshold| prompt_tokens > threshold);
+    let multiplier = if long_context_pricing { 2 } else { 1 };
+    let cached_rate = pricing
+        .cached_input_microusd_per_million
+        .saturating_mul(multiplier);
+    let input_rate = pricing
+        .input_microusd_per_million
+        .saturating_mul(multiplier);
+    Some(
+        microusd_for_tokens(prompt_tokens, cached_rate)
+            .saturating_add(microusd_for_tokens(output_tokens, input_rate)),
+    )
+}
+
+/// How long the provider keeps the prompt cache entry a request writes.
+///
+/// Only models whose vendor documents a lifetime appear here, because this
+/// value decides when Borg spends a user's money on a refresh. Anthropic sells
+/// an explicit retention. OpenAI only describes its cache as clearing after
+/// "5-10 minutes of inactivity", which reports observed behaviour rather than
+/// promising a window, so its models return `None` and warming reports itself
+/// ineligible instead of guessing.
+pub fn prompt_cache_lifetime(model: &str) -> Option<Duration> {
+    let normalized = model.trim().to_ascii_lowercase();
+    // Matched by prefix because Anthropic ships both the bare id and dated
+    // snapshots of the same model, which share a retention policy.
+    normalized
+        .starts_with("claude-")
+        .then(|| Duration::from_secs(ANTHROPIC_PROMPT_CACHE_SECONDS))
+}
+
+/// Anthropic's default prompt cache retention. The one-hour tier has to be
+/// bought per request, and Borg never asks for it, so the short tier is the
+/// only one a Borg request can actually write.
+const ANTHROPIC_PROMPT_CACHE_SECONDS: u64 = 300;
 
 fn microusd_for_tokens(tokens: u64, microusd_per_million: u64) -> u64 {
     let numerator = u128::from(tokens).saturating_mul(u128::from(microusd_per_million));

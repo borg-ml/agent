@@ -9,8 +9,8 @@ use base64::Engine as _;
 use borg_provider::provider::{
     ModelGateway, ModelInputAttachment, ModelMessage, ModelToolCall, ModelToolDefinition,
     ModelTurnRequest, ModelTurnResult, OpenAiCompatibleProfile, OpenAiCompatibleProvider,
-    ProviderAttemptTrace, ProviderCallError, ProviderInvocation, ProviderProgress,
-    ProviderProgressStream,
+    PromptCacheRefresh, ProviderAttemptTrace, ProviderCallError, ProviderInvocation,
+    ProviderProgress, ProviderProgressStream,
 };
 use borg_provider::{CostBasis, ProviderCallUsage};
 use serde::Deserialize;
@@ -23,6 +23,13 @@ use crate::{
     AgentTurn, AgentTurnControl, AgentTurnResult, ApprovalDecision, EventActor,
     ExecutionCommandRequest, ExecutionProvider, ExecutionStdinRequest, HarnessMode, MessageStatus,
     PermissionMode, SessionEventKind, SessionStatus,
+};
+
+mod cache_warming;
+
+use cache_warming::{
+    CacheWarmRequest, CacheWarmer, CacheWarmingMode, Economics, Ineligible,
+    PromptCacheRefreshClient, RefreshSupport,
 };
 
 const MAX_TOOL_RESULT_BYTES: usize = 1024 * 1024;
@@ -356,6 +363,29 @@ impl NativeHarness {
             &tools,
         );
 
+        // Turn-scoped on purpose: every way out of `run_bound` drops the
+        // warmer, and dropping it cancels any refresh it had armed. Idle
+        // warming detaches in `on_agent_settled` to outlive the turn.
+        let warming_mode = cache_warming_mode();
+        let warmer = Arc::clone(&self.model_client)
+            .prompt_cache_refresh()
+            .map(|client| CacheWarmer::new(turn.session_id, warming_mode, client, events.clone()));
+        // A route with no documented cache lifetime, or no prices to justify a
+        // refresh, never sends one. Settle that once so an ineligible session
+        // does not clone its whole request on every model round to find out.
+        let warming_armed = match warmer.as_ref() {
+            Some(warmer) => {
+                let armed = warmer.arm(turn.provider, &model);
+                // Say why a session that asked to be warmed will not be.
+                // Warming that is simply switched off needs no explanation.
+                if !armed && warming_mode != CacheWarmingMode::Off {
+                    warmer.publish_status(turn.provider).await;
+                }
+                armed
+            }
+            None => false,
+        };
+
         let mut usage = ProviderCallUsage::default();
         let mut assistant_message_id = Uuid::new_v4();
         let mut model_round = 0_usize;
@@ -364,20 +394,25 @@ impl NativeHarness {
         let mut truncated_text = String::new();
         loop {
             model_round += 1;
+            let request = ModelTurnRequest {
+                fast: turn.fast.unwrap_or(false),
+                request_id: Some(format!("{}:{model_round}", turn.message_id)),
+                session_id: Some(provider_session_id.clone()),
+                prompt_cache_key: Some(prompt_cache_key.clone()),
+                messages: messages.clone(),
+                tools: tools.clone(),
+                output_schema: turn.output_schema.clone(),
+            };
+            // Kept verbatim, `prompt_cache_key` included: a refresh that
+            // differed in any field would extend a different cache entry from
+            // the one the next real request reads.
+            let warm_request = warming_armed.then(|| request.clone());
             let result = match self
                 .call_model(
                     turn.provider,
                     &model,
                     turn.effort.as_deref(),
-                    ModelTurnRequest {
-                        fast: turn.fast.unwrap_or(false),
-                        request_id: Some(format!("{}:{model_round}", turn.message_id)),
-                        session_id: Some(provider_session_id.clone()),
-                        prompt_cache_key: Some(prompt_cache_key.clone()),
-                        messages: messages.clone(),
-                        tools: tools.clone(),
-                        output_schema: turn.output_schema.clone(),
-                    },
+                    request,
                     ModelStreamContext {
                         coding_provider: turn.provider,
                         assistant_message_id,
@@ -408,6 +443,21 @@ impl NativeHarness {
                 }
             };
             absorb_usage(&mut usage, &result.usage);
+            if let (Some(warmer), Some(request)) = (warmer.as_ref(), warm_request) {
+                warmer.start(CacheWarmRequest {
+                    provider: turn.provider,
+                    model: model.clone(),
+                    effort: turn.effort.clone(),
+                    request,
+                    // The provider's own count of the prompt it just read,
+                    // which is what a lost entry would have to reprocess.
+                    prompt_tokens: result
+                        .usage
+                        .input_tokens
+                        .saturating_add(result.usage.cached_input_tokens)
+                        .saturating_add(result.usage.cache_creation_input_tokens),
+                });
+            }
             let ModelMessage::Assistant {
                 content,
                 reasoning_content: _,
@@ -496,6 +546,9 @@ impl NativeHarness {
                     },
                 )
                 .await;
+                if let Some(warmer) = warmer.as_ref() {
+                    warmer.on_agent_settled();
+                }
                 return Ok(AgentTurnResult {
                     provider_session_id: None,
                     final_text: if truncated_text.is_empty() {
@@ -864,6 +917,12 @@ impl NativeHarness {
                         (summary, retained, true)
                     }
                 };
+                // The prefix that was being kept warm no longer exists, so
+                // any armed refresh would pay to extend an entry that nothing
+                // will read again.
+                if let Some(warmer) = warmer.as_ref() {
+                    warmer.on_context_changed();
+                }
                 messages.truncate(1);
                 messages.push(ModelMessage::user(format!(
                     "Previous conversation summary:\n\n{summary}"
@@ -954,6 +1013,9 @@ impl NativeHarness {
     }
 
     pub(crate) async fn stop_session(&self, session_id: Uuid) -> Result<()> {
+        // A detached idle run is owned by the session, not by any turn, so
+        // this is the only place that can stop one when the session ends.
+        cache_warming::cancel_detached_idle_run(session_id);
         let (commands, workflows) = tokio::join!(
             self.execution_provider.terminate_session(session_id),
             self.workflow_process_manager.terminate_session(session_id),
@@ -1074,6 +1136,14 @@ trait NativeModelClient: Send + Sync {
         request: ModelTurnRequest,
         progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError>;
+
+    /// This client seen as a prompt-cache refresh route, when it has one.
+    ///
+    /// Defaults to `None` so a client that cannot faithfully replay a request
+    /// -- every test double, and the compaction client -- never warms.
+    fn prompt_cache_refresh(self: Arc<Self>) -> Option<Arc<dyn PromptCacheRefreshClient>> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1084,28 +1154,41 @@ struct ProviderModelClient {
     codex_account: Option<String>,
 }
 
-#[async_trait]
-impl NativeModelClient for ProviderModelClient {
-    async fn model_turn(
+/// The route one request takes to a provider.
+///
+/// Resolved in a single place so a cache-warming refresh travels the route of
+/// the turn it refreshes: same account or key, same gateway, same wire model.
+/// A refresh that chose its own route could warm an entry the next real
+/// request never reads, or bill against credentials nobody chose.
+enum NativeRoute<'a> {
+    #[cfg(feature = "subscription-adapters")]
+    CodexAccount(&'a str),
+    ChatCompletions {
+        profile: OpenAiCompatibleProfile,
+        gateway: Option<&'a ModelGateway>,
+    },
+}
+
+/// This provider keeps its conversation inside its own process, so Borg has no
+/// request of its own to send.
+struct NotNative;
+
+impl ProviderModelClient {
+    /// Choose credentials and endpoint without touching the network.
+    ///
+    /// Synchronous so warming can test eligibility before building a request.
+    /// The one awaiting step, asking the OpenCode gateway for its context
+    /// window, only feeds the context meter, which a refresh never reports.
+    fn route(
         &self,
         provider: crate::CodingProvider,
         model: &str,
-        effort: Option<&str>,
-        request: ModelTurnRequest,
-        progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
-    ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+    ) -> std::result::Result<NativeRoute<'_>, NotNative> {
         #[cfg(feature = "subscription-adapters")]
         if provider == crate::CodingProvider::Codex
             && let Some(account) = self.codex_account.as_deref()
         {
-            return borg_provider::provider::CodexModelProvider {
-                model: model.to_string(),
-                effort: effort
-                    .unwrap_or(borg_provider::codex_default_effort())
-                    .to_string(),
-            }
-            .model_turn_for_account(request, progress, account)
-            .await;
+            return Ok(NativeRoute::CodexAccount(account));
         }
         let configured_gateway = (provider == crate::CodingProvider::OpenAiCompatible)
             .then(|| self.configured_model_gateways.get(model))
@@ -1128,27 +1211,64 @@ impl NativeModelClient for ProviderModelClient {
             }
             crate::CodingProvider::Codex
             | crate::CodingProvider::Claude
-            | crate::CodingProvider::OpenCode => {
-                return Err(ProviderCallError {
-                    message: format!("{provider:?} does not use Borg's native model client"),
-                    trace: Box::new(ProviderAttemptTrace {
-                        invocation: ProviderInvocation {
-                            provider_label: "native".to_string(),
-                            executable: String::new(),
-                            args: Vec::new(),
-                            cwd: None,
-                            model: Some(model.to_string()),
-                            effort: effort.map(str::to_string),
-                        },
-                        exit_status: Some(1),
-                        stdout: String::new(),
-                        stderr: "invalid native provider".to_string(),
-                    }),
-                    session_id: None,
-                    // A misconfigured route will not fix itself on a retry.
-                    kind: borg_provider::provider::ProviderErrorKind::Fatal,
-                });
+            | crate::CodingProvider::OpenCode => return Err(NotNative),
+        };
+        Ok(NativeRoute::ChatCompletions { profile, gateway })
+    }
+}
+
+fn not_native_error(
+    provider: crate::CodingProvider,
+    model: &str,
+    effort: Option<&str>,
+) -> ProviderCallError {
+    ProviderCallError {
+        message: format!("{provider:?} does not use Borg's native model client"),
+        trace: Box::new(ProviderAttemptTrace {
+            invocation: ProviderInvocation {
+                provider_label: "native".to_string(),
+                executable: String::new(),
+                args: Vec::new(),
+                cwd: None,
+                model: Some(model.to_string()),
+                effort: effort.map(str::to_string),
+            },
+            exit_status: Some(1),
+            stdout: String::new(),
+            stderr: "invalid native provider".to_string(),
+        }),
+        session_id: None,
+        // A misconfigured route will not fix itself on a retry.
+        kind: borg_provider::provider::ProviderErrorKind::Fatal,
+    }
+}
+
+#[async_trait]
+impl NativeModelClient for ProviderModelClient {
+    async fn model_turn(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+        effort: Option<&str>,
+        request: ModelTurnRequest,
+        progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+    ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        let route = self
+            .route(provider, model)
+            .map_err(|NotNative| not_native_error(provider, model, effort))?;
+        let (profile, gateway) = match route {
+            #[cfg(feature = "subscription-adapters")]
+            NativeRoute::CodexAccount(account) => {
+                return borg_provider::provider::CodexModelProvider {
+                    model: model.to_string(),
+                    effort: effort
+                        .unwrap_or(borg_provider::codex_default_effort())
+                        .to_string(),
+                }
+                .model_turn_for_account(request, progress, account)
+                .await;
             }
+            NativeRoute::ChatCompletions { profile, gateway } => (profile, gateway),
         };
         // The Go gateway advertises no context window, and the chat-completions
         // payload carries none. Without it the context meter stays blank and
@@ -1168,16 +1288,126 @@ impl NativeModelClient for ProviderModelClient {
             _ => None,
         };
         let gateway = resolved_gateway.as_ref().or(gateway);
-        let wire_model = gateway
-            .and_then(|gateway| gateway.model.as_deref())
-            .unwrap_or(model);
         OpenAiCompatibleProvider {
-            model: wire_model.to_string(),
+            model: wire_model(gateway, model).to_string(),
             effort: effort.map(str::to_string),
             system_prompt: "",
         }
         .model_turn_via_profile(request, progress, gateway, profile)
         .await
+    }
+
+    /// This client does reach a real provider, so it can replay a request.
+    fn prompt_cache_refresh(self: Arc<Self>) -> Option<Arc<dyn PromptCacheRefreshClient>> {
+        Some(self)
+    }
+}
+
+/// How aggressively this process keeps prompt cache entries alive. Interim
+/// source, and the single seam `[warming] mode` in AgentConfig replaces:
+/// active warming is on by default, idle warming stays opt-in.
+fn cache_warming_mode() -> CacheWarmingMode {
+    std::env::var("BORG_CACHE_WARMING")
+        .ok()
+        .and_then(|value| CacheWarmingMode::parse(&value))
+        .unwrap_or_default()
+}
+
+/// The model id the wire actually carries, which a gateway may rename.
+fn wire_model<'a>(gateway: Option<&'a ModelGateway>, model: &'a str) -> &'a str {
+    gateway
+        .and_then(|gateway| gateway.model.as_deref())
+        .unwrap_or(model)
+}
+
+#[async_trait]
+impl PromptCacheRefreshClient for ProviderModelClient {
+    fn refresh_support(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+    ) -> std::result::Result<RefreshSupport, Ineligible> {
+        let route = self
+            .route(provider, model)
+            .map_err(|NotNative| Ineligible::RouteNotNative)?;
+        let cache_lifetime = borg_provider::provider::prompt_cache_lifetime(model)
+            .ok_or(Ineligible::CacheLifetimeUnknown)?;
+        // Each route gets the smallest output budget it will actually accept,
+        // so the refresh bills for what it asked for rather than for whatever
+        // the route silently substituted.
+        let refresh = match route {
+            #[cfg(feature = "subscription-adapters")]
+            NativeRoute::CodexAccount(_) => PromptCacheRefresh::RESPONSES_MINIMUM,
+            NativeRoute::ChatCompletions { .. } => PromptCacheRefresh::ONE_TOKEN,
+        };
+        Ok(RefreshSupport {
+            cache_lifetime,
+            max_output_tokens: refresh.max_output_tokens,
+        })
+    }
+
+    fn refresh_economics(
+        &self,
+        _provider: crate::CodingProvider,
+        model: &str,
+        prompt_tokens: u64,
+        max_output_tokens: u64,
+    ) -> Option<Economics> {
+        Some(Economics {
+            warm_microusd: borg_provider::provider::estimate_prompt_cache_refresh_microusd(
+                model,
+                prompt_tokens,
+                max_output_tokens,
+            )?,
+            // A lost entry has to reprocess the whole prompt, so the tokens
+            // missed and the prompt size are the same number here.
+            miss_microusd: borg_provider::provider::estimate_openai_cache_miss_microusd(
+                model,
+                prompt_tokens,
+                prompt_tokens,
+            )?,
+        })
+    }
+
+    async fn refresh(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+        effort: Option<&str>,
+        request: ModelTurnRequest,
+        support: &RefreshSupport,
+    ) -> std::result::Result<ProviderCallUsage, ProviderCallError> {
+        let refresh = PromptCacheRefresh {
+            max_output_tokens: support.max_output_tokens,
+        };
+        match self
+            .route(provider, model)
+            .map_err(|NotNative| not_native_error(provider, model, effort))?
+        {
+            #[cfg(feature = "subscription-adapters")]
+            NativeRoute::CodexAccount(account) => {
+                borg_provider::provider::CodexModelProvider {
+                    model: model.to_string(),
+                    effort: effort
+                        .unwrap_or(borg_provider::codex_default_effort())
+                        .to_string(),
+                }
+                .refresh_prompt_cache_for_account(request, account, refresh)
+                .await
+            }
+            // The OpenCode context-window resolution the real turn performs is
+            // skipped on purpose: it only fills the context meter, and a
+            // refresh reports no context.
+            NativeRoute::ChatCompletions { profile, gateway } => {
+                OpenAiCompatibleProvider {
+                    model: wire_model(gateway, model).to_string(),
+                    effort: effort.map(str::to_string),
+                    system_prompt: "",
+                }
+                .refresh_prompt_cache_via_profile(request, gateway, profile, refresh)
+                .await
+            }
+        }
     }
 }
 
