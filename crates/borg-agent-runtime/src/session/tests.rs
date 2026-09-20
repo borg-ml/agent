@@ -5283,6 +5283,14 @@ async fn assert_native_steer_settlement(marker_first: bool, fold: bool) {
         .send(HostCommand::Interrupt { session_id })
         .await
         .unwrap();
+    if !fold {
+        // The requeued steer opens the next turn on its own. Waiting for that
+        // turn rather than stopping into it is what makes "delivered, not
+        // lost" an observation instead of a race.
+        tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
+            .await
+            .expect("the requeued steer is delivered on the next turn");
+    }
     command_tx
         .send(HostCommand::Stop { session_id })
         .await
@@ -5327,16 +5335,42 @@ async fn assert_native_steer_settlement(marker_first: bool, fold: bool) {
              order the provider acknowledged and folded in"
         );
     } else {
+        // Never settled as consumed: that is what the marker is for, and
+        // there was no marker.
         assert!(
-            completions.is_empty(),
-            "an accepted steer the model was never handed must not be recorded as delivered"
+            !journal.iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::Message {
+                    message_id,
+                    status: MessageStatus::Complete,
+                    delivery: Some(PromptDelivery::Steer),
+                    ..
+                } if *message_id == steer_id
+            )),
+            "an accepted steer the model was never handed must not be settled as consumed"
         );
-        let recovery = store.recovery(session_id).await.unwrap();
+        // Returned to the input queue rather than dropped...
         assert!(
-            recover_prompts_on_resume(&recovery.queue_events)
-                .iter()
-                .any(|prompt| prompt.message_id == steer_id),
-            "it comes back as pending input instead"
+            journal.iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::Message {
+                    message_id,
+                    status: MessageStatus::Queued,
+                    delivery: Some(PromptDelivery::Queue),
+                    ..
+                } if *message_id == steer_id
+            )),
+            "it is requeued as ordinary input"
+        );
+        // ...and actually handed to the model on the next turn. Asserting the
+        // queue still held it was wrong: by then it has been taken off the
+        // queue and delivered, which is the outcome this is here to require.
+        assert!(
+            journal.iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::TurnStarted { message_id, .. } if *message_id == steer_id
+            )),
+            "and a turn is opened for it, so it is delivered rather than lost"
         );
     }
     scratch.discard().await;
