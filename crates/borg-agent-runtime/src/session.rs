@@ -6424,7 +6424,16 @@ fn native_conversation(
         close_interrupted_native_round(&mut pending_native, &mut pending_generic);
         conversation.append(&mut pending_native);
     } else {
-        conversation.extend(pending_generic.into_iter().filter(is_context_prompt));
+        // Anything still here was journaled after the last turn boundary, so
+        // for a journal that ends inside a turn this is that turn's work: the
+        // answer the human already read, and the tools that already ran.
+        // Keeping only the prompts dropped exactly the evidence a resumed
+        // turn is told to continue from -- the continuation says the
+        // conversation above records what was done, and without this it did
+        // not, so the model answered again. Dangling calls are closed first
+        // because the crash can land between a tool call and its result.
+        close_dangling_tool_calls(&mut pending_generic);
+        conversation.append(&mut pending_generic);
     }
     Ok(conversation)
 }

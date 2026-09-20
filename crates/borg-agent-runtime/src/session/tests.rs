@@ -9257,7 +9257,7 @@ async fn a_resumed_turn_continues_the_original_prompt_and_settles_it_once() {
         assert_eq!(seen.len(), 1, "resumed exactly once");
         seen[0].clone()
     };
-    let (sent_prompt, _, _, conversation_len) = dispatched;
+    let (sent_prompt, _, _, _) = dispatched;
     assert!(
         sent_prompt.contains("how often does it send them"),
         "the original request is re-delivered verbatim, not paraphrased"
@@ -9266,9 +9266,20 @@ async fn a_resumed_turn_continues_the_original_prompt_and_settles_it_once() {
         sent_prompt.ends_with(RESUMED_TURN_CONTINUATION),
         "the dispatch is demoted to a continuation rather than repeated as an instruction"
     );
+    // On the channel that actually carries it. A subscription provider is
+    // handed its history inside the prompt, as the canonical replay
+    // `retained_conversation_context` builds; `turn.conversation` is
+    // structurally empty for every non-native provider, so counting it here
+    // would have tested nothing. Asserting the answer text is also stricter
+    // than a count: the continuation tells the model the conversation above
+    // records what was done, and this is what makes that true.
     assert!(
-        conversation_len > 0,
-        "the resumed turn is handed the progress the crashed turn already made"
+        sent_prompt.contains("every 90% of the cache lifetime"),
+        "the resumed turn is handed the answer the crashed turn already gave"
+    );
+    assert!(
+        sent_prompt.contains("worker spawned"),
+        "and the side effect that already landed, so it does not run it twice"
     );
 
     let events = store.read(session_id).await.unwrap();
