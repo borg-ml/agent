@@ -2447,11 +2447,15 @@ async fn usage_limit_after_side_effects_continues_instead_of_replaying_the_promp
     assert!(checkpoint.retry_at.is_some());
     assert_eq!(Some(checkpoint.prompt.message_id), continuation_message_id);
     assert_eq!(checkpoint.replaced_message_ids, vec![message_id]);
-    let prompts = prompts.lock().unwrap();
-    assert!(prompts[1].contains(&serde_json::to_string(&checkpoint.prompt.text).unwrap()));
-    assert!(prompts[0].contains("finish this task"));
-    assert!(prompts[1].contains("Continue from exactly where it left off"));
-    assert!(prompts[1].contains("finish this task"));
+    // Drop the guard before the scratch database is discarded: the
+    // assertions need it, the teardown await must not hold it.
+    {
+        let prompts = prompts.lock().unwrap();
+        assert!(prompts[1].contains(&serde_json::to_string(&checkpoint.prompt.text).unwrap()));
+        assert!(prompts[0].contains("finish this task"));
+        assert!(prompts[1].contains("Continue from exactly where it left off"));
+        assert!(prompts[1].contains("finish this task"));
+    }
     scratch.discard().await;
 }
 
@@ -2690,10 +2694,14 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
                     .is_empty()
             );
         }
-        let prompts = prompts.lock().unwrap();
-        assert_eq!(prompts.len(), usize::from(!cancel));
-        if !cancel {
-            assert!(prompts[0].contains(&serde_json::to_string(&prompt.text).unwrap()));
+        // Drop the guard before the scratch database is discarded: the
+        // assertions need it, the teardown await must not hold it.
+        {
+            let prompts = prompts.lock().unwrap();
+            assert_eq!(prompts.len(), usize::from(!cancel));
+            if !cancel {
+                assert!(prompts[0].contains(&serde_json::to_string(&prompt.text).unwrap()));
+            }
         }
         scratch.discard().await;
     }
@@ -4200,42 +4208,46 @@ async fn assert_interrupted_fifo(
             SessionEventKind::UserStopChanged { engaged: true, .. }
         )));
     }
-    let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 2);
-    assert_eq!(
-            seen[0],
-            (
-                "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>".to_string(),
-                Vec::new()
-            )
-        );
-    if provider == CodingProvider::Codex {
+    // Drop the guard before the scratch database is discarded: the
+    // assertions need it, the teardown await must not hold it.
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
         assert_eq!(
-            seen[1].0,
-            format_subscription_frame(&format_subscription_actor_value(
-                EventActor::User,
-                "second [Image 1]\n\nthird"
-            ))
-        );
-    } else {
-        assert!(subscription_prompt_ends_with(
-            &seen[1].0,
-            "second [Image 1]
+                seen[0],
+                (
+                    "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>".to_string(),
+                    Vec::new()
+                )
+            );
+        if provider == CodingProvider::Codex {
+            assert_eq!(
+                seen[1].0,
+                format_subscription_frame(&format_subscription_actor_value(
+                    EventActor::User,
+                    "second [Image 1]\n\nthird"
+                ))
+            );
+        } else {
+            assert!(subscription_prompt_ends_with(
+                &seen[1].0,
+                "second [Image 1]
 
-third"
-        ));
-    }
-    assert_eq!(
-        seen[1].1,
-        [PathBuf::from("/tmp/queued-image.png")],
-        "queued image attachments must stay on their FIFO prompt"
-    );
-    if provider == CodingProvider::Codex {
+    third"
+            ));
+        }
         assert_eq!(
-            provider_sessions.lock().unwrap().as_slice(),
-            [None, Some("provider-session".to_string())],
-            "interrupting a Codex turn must preserve its provider thread"
+            seen[1].1,
+            [PathBuf::from("/tmp/queued-image.png")],
+            "queued image attachments must stay on their FIFO prompt"
         );
+        if provider == CodingProvider::Codex {
+            assert_eq!(
+                provider_sessions.lock().unwrap().as_slice(),
+                [None, Some("provider-session".to_string())],
+                "interrupting a Codex turn must preserve its provider thread"
+            );
+        }
     }
     scratch.discard().await;
 }
@@ -4373,65 +4385,69 @@ async fn user_stop_gate_holds_background_turns_until_a_human_prompt() {
         .unwrap();
     actor.await.unwrap().unwrap();
 
-    let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 3);
-    assert!(seen[1].0.contains("queued-before-escape"));
-    assert!(seen[2].0.contains("second"));
-    assert!(
-        !seen.iter().any(|turn| turn.0.contains("background report")),
-        "the held team report never became a provider turn"
-    );
+    // Drop the guard before the scratch database is discarded: the
+    // assertions need it, the teardown await must not hold it.
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3);
+        assert!(seen[1].0.contains("queued-before-escape"));
+        assert!(seen[2].0.contains("second"));
+        assert!(
+            !seen.iter().any(|turn| turn.0.contains("background report")),
+            "the held team report never became a provider turn"
+        );
 
-    let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
-    assert_eq!(
-        events
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::UserStopChanged { engaged: true }
+                ))
+                .count(),
+            1,
+            "Escape engages the durable gate exactly once"
+        );
+        let stop_index = events
             .iter()
-            .filter(|event| matches!(
-                &event.kind,
-                SessionEventKind::UserStopChanged { engaged: true }
-            ))
-            .count(),
-        1,
-        "Escape engages the durable gate exactly once"
-    );
-    let stop_index = events
-        .iter()
-        .position(|event| {
-            matches!(
-                &event.kind,
-                SessionEventKind::UserStopChanged { engaged: true }
-            )
-        })
-        .expect("stop engaged");
-    let clear_index = events
-        .iter()
-        .position(|event| {
-            matches!(
-                &event.kind,
-                SessionEventKind::UserStopChanged { engaged: false }
-            )
-        })
-        .expect("stop cleared by the fresh human prompt");
-    assert!(stop_index < clear_index);
-    let between = &events[stop_index..clear_index];
-    assert!(
-        between
+            .position(|event| {
+                matches!(
+                    &event.kind,
+                    SessionEventKind::UserStopChanged { engaged: true }
+                )
+            })
+            .expect("stop engaged");
+        let clear_index = events
             .iter()
-            .any(|event| matches!(&event.kind, SessionEventKind::TurnStarted { .. })),
-        "the prompt queued before Escape runs while the gate is still latched"
-    );
-    assert!(
-        events[..clear_index].iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::Message {
-                actor: EventActor::System,
-                status: MessageStatus::Complete,
-                text,
-                ..
-            } if text.contains("background report")
-        )),
-        "the held team report is settled visible before the human resumes"
-    );
+            .position(|event| {
+                matches!(
+                    &event.kind,
+                    SessionEventKind::UserStopChanged { engaged: false }
+                )
+            })
+            .expect("stop cleared by the fresh human prompt");
+        assert!(stop_index < clear_index);
+        let between = &events[stop_index..clear_index];
+        assert!(
+            between
+                .iter()
+                .any(|event| matches!(&event.kind, SessionEventKind::TurnStarted { .. })),
+            "the prompt queued before Escape runs while the gate is still latched"
+        );
+        assert!(
+            events[..clear_index].iter().any(|event| matches!(
+                &event.kind,
+                SessionEventKind::Message {
+                    actor: EventActor::System,
+                    status: MessageStatus::Complete,
+                    text,
+                    ..
+                } if text.contains("background report")
+            )),
+            "the held team report is settled visible before the human resumes"
+        );
+    }
     scratch.discard().await;
 }
 
@@ -5098,20 +5114,24 @@ async fn rejected_multimodal_steer_falls_back_to_the_front_of_the_fifo() {
         steers.lock().unwrap().as_slice(),
         [("inspect this [Image 1]".to_string(), vec![image.clone()])]
     );
-    let turns = turns.lock().unwrap();
-    assert_eq!(turns.len(), 2);
-    assert_eq!(
-            turns[0],
-            (
-                "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>".to_string(),
-                Vec::new()
-            )
+    // Drop the guard before the scratch database is discarded: the
+    // assertions need it, the teardown await must not hold it.
+    {
+        let turns = turns.lock().unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(
+                turns[0],
+                (
+                    "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>".to_string(),
+                    Vec::new()
+                )
+            );
+        assert_eq!(
+            turns[1].0,
+            "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"inspect this [Image 1]\",\"role\":\"user\"}</borg-message>"
         );
-    assert_eq!(
-        turns[1].0,
-        "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n<borg-message>{\"content\":\"first\",\"role\":\"user\"}</borg-message>\n<borg-message>{\"content\":\"inspect this [Image 1]\",\"role\":\"user\"}</borg-message>"
-    );
-    assert_eq!(turns[1].1, [image]);
+        assert_eq!(turns[1].1, [image]);
+    }
     scratch.discard().await;
 }
 
@@ -11567,18 +11587,22 @@ async fn resumed_codex_checkpoint_avoids_large_replay_compaction_after_actor_res
     actor.await.unwrap().unwrap();
 
     assert_eq!(compaction_calls.load(Ordering::Acquire), 0);
-    let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(
-        seen[0].0,
-        format_subscription_frame(&format_subscription_actor_value(
-            EventActor::User,
-            "continue after restart"
-        ))
-    );
-    assert_eq!(seen[0].1.as_deref(), Some("resumed-codex-thread"));
-    assert_eq!(seen[0].2, None);
-    assert_eq!(seen[0].3, 0);
+    // Drop the guard before the scratch database is discarded: the
+    // assertions need it, the teardown await must not hold it.
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].0,
+            format_subscription_frame(&format_subscription_actor_value(
+                EventActor::User,
+                "continue after restart"
+            ))
+        );
+        assert_eq!(seen[0].1.as_deref(), Some("resumed-codex-thread"));
+        assert_eq!(seen[0].2, None);
+        assert_eq!(seen[0].3, 0);
+    }
     scratch.discard().await;
 }
 
@@ -11722,18 +11746,22 @@ async fn crash_resume_forks_the_last_completed_codex_turn_before_replaying_input
     actor.await.unwrap().unwrap();
 
     assert_eq!(compaction_calls.load(Ordering::Acquire), 0);
-    let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(
-        seen[0].0,
-        format_subscription_frame(&format_subscription_actor_value(
-            EventActor::User,
-            "recover this exact input"
-        ))
-    );
-    assert_eq!(seen[0].1.as_deref(), Some("codex-thread-before-crash"));
-    assert_eq!(seen[0].2.as_deref(), Some("codex-turn-before-crash"));
-    assert_eq!(seen[0].3, 0);
+    // Drop the guard before the scratch database is discarded: the
+    // assertions need it, the teardown await must not hold it.
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].0,
+            format_subscription_frame(&format_subscription_actor_value(
+                EventActor::User,
+                "recover this exact input"
+            ))
+        );
+        assert_eq!(seen[0].1.as_deref(), Some("codex-thread-before-crash"));
+        assert_eq!(seen[0].2.as_deref(), Some("codex-turn-before-crash"));
+        assert_eq!(seen[0].3, 0);
+    }
     scratch.discard().await;
 }
 
@@ -11915,23 +11943,27 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
     actor.await.unwrap().unwrap();
 
     assert_eq!(compaction_calls.load(Ordering::Acquire), 0);
-    let seen = seen.lock().unwrap();
-    assert_eq!(seen.len(), 1);
-    // The interrupted prompt is part of the durable branch, but the recovered
-    // turn re-issues it as the live request, so it must appear exactly once:
-    // as the current request at the end, never duplicated in the history.
-    let recovered = &seen[0].0;
-    assert_eq!(recovered.matches("recover the active request").count(), 1);
-    assert!(recovered.starts_with(SUBSCRIPTION_CONTEXT_HEADER));
-    assert!(recovered.contains("Previous conversation summary"));
-    assert!(!recovered.contains("old-user-context"));
-    assert!(!recovered.contains("historical agent"));
-    assert!(recovered.ends_with(&format_subscription_frame(
-        &format_subscription_actor_value(EventActor::User, "recover the active request")
-    )));
-    assert_eq!(seen[0].1, None);
-    assert_eq!(seen[0].2, None);
-    assert_eq!(seen[0].3, 0);
+    // Drop the guard before the scratch database is discarded: the
+    // assertions need it, the teardown await must not hold it.
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        // The interrupted prompt is part of the durable branch, but the recovered
+        // turn re-issues it as the live request, so it must appear exactly once:
+        // as the current request at the end, never duplicated in the history.
+        let recovered = &seen[0].0;
+        assert_eq!(recovered.matches("recover the active request").count(), 1);
+        assert!(recovered.starts_with(SUBSCRIPTION_CONTEXT_HEADER));
+        assert!(recovered.contains("Previous conversation summary"));
+        assert!(!recovered.contains("old-user-context"));
+        assert!(!recovered.contains("historical agent"));
+        assert!(recovered.ends_with(&format_subscription_frame(
+            &format_subscription_actor_value(EventActor::User, "recover the active request")
+        )));
+        assert_eq!(seen[0].1, None);
+        assert_eq!(seen[0].2, None);
+        assert_eq!(seen[0].3, 0);
+    }
     scratch.discard().await;
 }
 
