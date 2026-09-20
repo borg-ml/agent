@@ -140,8 +140,24 @@ impl Declarations {
         }
     }
 
+    /// What to journal for this turn: the base when the context generation has
+    /// none yet, a delta when something moved, nothing when it did not.
+    ///
+    /// Taking `Option` rather than requiring the caller to branch keeps the
+    /// harness hook to one call, and keeps the "first turn of a generation"
+    /// rule in one place instead of at every call site.
+    pub(crate) fn change_against(
+        &self,
+        previous: Option<&Self>,
+    ) -> Option<DeclarationChange> {
+        match previous {
+            None => Some(DeclarationChange::Base(self.clone())),
+            Some(previous) => self.diff(previous).map(DeclarationChange::Delta),
+        }
+    }
+
     /// The change that takes `previous` to `self`, or `None` when nothing moved.
-    pub(crate) fn diff(&self, previous: &Self) -> Option<DeclarationDelta> {
+    fn diff(&self, previous: &Self) -> Option<DeclarationDelta> {
         let mut instructions = BTreeMap::new();
         for (slot, text) in &self.instructions {
             if previous.instructions.get(slot) != Some(text) {
@@ -250,6 +266,18 @@ impl DeclarationDelta {
     }
 }
 
+/// What one turn contributes to the durable declaration record.
+///
+/// Each arm is journaled under its own event kind and serialized from the
+/// value it holds, so this enum itself never reaches the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeclarationChange {
+    /// First turn of a context generation: the immutable base itself.
+    Base(Declarations),
+    /// A later turn: only what moved since the previous effective state.
+    Delta(DeclarationDelta),
+}
+
 /// How a lane carries a declaration change.
 ///
 /// Chosen by the caller, which knows its own route; this module does not guess
@@ -291,6 +319,18 @@ pub(crate) fn plan_replay<'a>(
     ReplayPlan {
         effective,
         markers,
+    }
+}
+
+/// Journal one turn's contribution, base or delta, under the matching kind.
+pub(crate) async fn record_declaration_change(
+    events: &mpsc::Sender<SessionEventKind>,
+    provider: CodingProvider,
+    change: &DeclarationChange,
+) -> Result<()> {
+    match change {
+        DeclarationChange::Base(base) => record_declaration_base(events, provider, base).await,
+        DeclarationChange::Delta(delta) => record_declaration_delta(events, provider, delta).await,
     }
 }
 
