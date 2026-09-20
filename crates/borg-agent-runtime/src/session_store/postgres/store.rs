@@ -32,7 +32,8 @@ use crate::session_store::{
     SessionLineage, SessionLiveEvent, SessionPayloadKind, SessionPayloadRef, SessionRecovery,
     SessionState, SessionStatus, SessionStore, SessionStoreCompaction, SessionStoreFork,
     SessionStoreHealth, SessionSummary, SessionWorkspaceBinding, deferred_json_payload,
-    deferred_text_payload, event_kind, historical_projection_json,
+    deferred_provider_payload, deferred_text_payload, event_kind, historical_projection_json,
+    oversized_provider_payload_bytes,
 };
 
 impl PostgresSessionStore {
@@ -121,6 +122,20 @@ impl PostgresSessionStore {
                             serde_json::Value::String(deferred_text_payload(&prompt, &reference));
                         payload[crate::PROVIDER_PROMPT_REF_FIELD] =
                             serde_json::to_value(&reference)?;
+                    }
+                }
+                SessionEventKind::ProviderEvent { kind, payload, .. }
+                    if kind == crate::NATIVE_MODEL_MESSAGE_EVENT_KIND =>
+                {
+                    if let Some(bytes) = oversized_provider_payload_bytes(payload)? {
+                        let reference = store_payload(
+                            transaction,
+                            event,
+                            SessionPayloadKind::ProviderModelMessage,
+                            &bytes,
+                        )
+                        .await?;
+                        *payload = deferred_provider_payload(&reference);
                     }
                 }
                 SessionEventKind::SubagentActivity {

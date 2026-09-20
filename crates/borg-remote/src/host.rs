@@ -606,6 +606,15 @@ fn rekey_event_payloads(event: &mut SessionEvent, target_session_id: Uuid) {
             event: Some(child_event),
             ..
         } => rekey_event_payloads(child_event, target_session_id),
+        crate::SessionEventKind::ProviderEvent { payload, .. } => {
+            if let Some(mut reference) =
+                crate::session_store::deferred_provider_payload_ref(payload)
+            {
+                reference.id = Uuid::new_v5(&target_session_id, reference.id.as_bytes());
+                payload[crate::PROVIDER_PAYLOAD_REF_FIELD] =
+                    serde_json::to_value(reference).expect("a payload reference serializes");
+            }
+        }
         _ => {}
     }
 }
@@ -624,7 +633,7 @@ fn scoped_payload_refs(
         .kind
         .payload_refs()
         .into_iter()
-        .map(|payload| (target_session_id, payload.clone()))
+        .map(|payload| (target_session_id, payload))
         .collect::<Vec<_>>();
     if let crate::SessionEventKind::SubagentActivity {
         event: Some(child_event),

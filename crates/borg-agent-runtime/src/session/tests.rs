@@ -10386,6 +10386,78 @@ fn native_replay_preserves_an_interrupted_incomplete_tool_round() {
 }
 
 #[test]
+fn an_oversized_native_model_message_is_deferred_and_replays_identically() {
+    use crate::session_store::{
+        INLINE_SESSION_PAYLOAD_BYTES, deferred_provider_payload, deferred_provider_payload_ref,
+        oversized_provider_payload_bytes, resolve_provider_payload,
+    };
+    use crate::{SessionPayloadKind, SessionPayloadRef};
+    use borg_provider::provider::ModelMessage;
+
+    let session_id = Uuid::new_v4();
+    let message = ModelMessage::user("x".repeat(INLINE_SESSION_PAYLOAD_BYTES + 1024));
+    let payload = serde_json::to_value(&message).unwrap();
+    let event = |payload| {
+        SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "native_model_message".to_string(),
+                payload,
+            },
+        )
+    };
+
+    // The store defers a payload above the inline limit and keeps only a
+    // reference behind.
+    let bytes = oversized_provider_payload_bytes(&payload)
+        .unwrap()
+        .expect("a payload above the inline limit must be deferred");
+    let reference = SessionPayloadRef {
+        id: Uuid::new_v4(),
+        kind: SessionPayloadKind::ProviderModelMessage,
+        byte_len: bytes.len() as u64,
+    };
+    let deferred = event(deferred_provider_payload(&reference));
+    assert_eq!(
+        deferred.kind.deferred_provider_payload_ref(),
+        Some(reference.clone())
+    );
+    // The reference is what a relay transfer moves, so it must be visible
+    // through the same accessor tool payloads use.
+    assert_eq!(deferred.kind.payload_refs(), vec![reference]);
+    assert!(
+        serde_json::to_vec(&deferred.kind).unwrap().len()
+            < serde_json::to_vec(&payload).unwrap().len()
+    );
+
+    // A legacy inline event still replays unchanged.
+    let inline = event(payload);
+    let expected =
+        native_conversation(std::slice::from_ref(&inline), CodingProvider::Codex).unwrap();
+    assert_eq!(expected, vec![message]);
+
+    // Resolving the reference reconstructs the identical model message.
+    let mut resolved = deferred.clone();
+    {
+        let SessionEventKind::ProviderEvent { payload, .. } = &mut resolved.kind else {
+            unreachable!("provider event");
+        };
+        resolve_provider_payload(payload, &bytes).unwrap();
+        assert_eq!(
+            deferred_provider_payload_ref(payload),
+            None,
+            "a resolved payload is no longer deferred"
+        );
+    }
+    assert_eq!(
+        native_conversation(std::slice::from_ref(&resolved), CodingProvider::Codex).unwrap(),
+        expected
+    );
+}
+
+#[test]
 fn native_replay_keeps_completed_batch_results_after_failure_or_crash() {
     use borg_provider::provider::{ModelMessage, ModelToolCall};
 

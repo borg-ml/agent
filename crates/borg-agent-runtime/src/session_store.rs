@@ -628,15 +628,32 @@ impl SessionEventKind {
         )
     }
 
-    pub fn payload_refs(&self) -> Vec<&SessionPayloadRef> {
-        match self {
-            Self::ToolStarted { input_ref, .. } => input_ref.iter().collect(),
+    /// Every deferred payload reference this event owns, in the order a
+    /// transfer must move them. Owned because a native provider payload keeps
+    /// its reference nested inside the `payload` value rather than in a field
+    /// of its own.
+    pub fn payload_refs(&self) -> Vec<SessionPayloadRef> {
+        let mut refs = match self {
+            Self::ToolStarted { input_ref, .. } => input_ref.iter().cloned().collect(),
             Self::ToolCompleted {
                 output_ref,
                 input_ref,
                 ..
-            } => output_ref.iter().chain(input_ref.iter()).collect(),
+            } => output_ref.iter().chain(input_ref.iter()).cloned().collect(),
             _ => Vec::new(),
+        };
+        if let Some(reference) = self.deferred_provider_payload_ref() {
+            refs.push(reference);
+        }
+        refs
+    }
+
+    /// The reference a deferred native provider payload carries inside its own
+    /// `payload`.
+    pub fn deferred_provider_payload_ref(&self) -> Option<SessionPayloadRef> {
+        match self {
+            Self::ProviderEvent { payload, .. } => deferred_provider_payload_ref(payload),
+            _ => None,
         }
     }
 }
@@ -1901,6 +1918,46 @@ pub fn deferred_text_payload(value: &str, payload: &SessionPayloadRef) -> String
     )
 }
 
+/// The inline marker left where a native provider payload used to be. The
+/// reference rides inside the marker because a `ProviderEvent` has no
+/// reference field of its own, so this is the only place replay can find it.
+pub fn deferred_provider_payload(reference: &SessionPayloadRef) -> serde_json::Value {
+    let mut marker = deferred_json_payload(reference);
+    if let serde_json::Value::Object(fields) = &mut marker {
+        fields.insert(
+            crate::PROVIDER_PAYLOAD_REF_FIELD.to_string(),
+            serde_json::to_value(reference).expect("a payload reference serializes"),
+        );
+    }
+    marker
+}
+
+pub fn deferred_provider_payload_ref(payload: &serde_json::Value) -> Option<SessionPayloadRef> {
+    payload
+        .get(crate::PROVIDER_PAYLOAD_REF_FIELD)
+        .and_then(|reference| serde_json::from_value(reference.clone()).ok())
+}
+
+/// The bytes to defer for a native provider payload, or `None` when it is
+/// already deferred or still fits inline.
+pub fn oversized_provider_payload_bytes(payload: &serde_json::Value) -> Result<Option<Vec<u8>>> {
+    if deferred_provider_payload_ref(payload).is_some() {
+        return Ok(None);
+    }
+    let bytes = serde_json::to_vec(payload)?;
+    Ok((bytes.len() > INLINE_SESSION_PAYLOAD_BYTES).then_some(bytes))
+}
+
+/// Restore a deferred native provider payload from its stored bytes. A payload
+/// that was never deferred is left exactly as it was.
+pub fn resolve_provider_payload(payload: &mut serde_json::Value, bytes: &[u8]) -> Result<()> {
+    if deferred_provider_payload_ref(payload).is_none() {
+        return Ok(());
+    }
+    *payload = serde_json::from_slice(bytes)?;
+    Ok(())
+}
+
 fn event_kind(kind: &SessionEventKind) -> Result<String> {
     serde_json::to_value(kind)?
         .get("type")
@@ -2030,11 +2087,15 @@ fn history_payload_refs(kind: &SessionEventKind, references: &mut Vec<SessionPay
         }
         SessionEventKind::ProviderEvent { payload, .. } => {
             // A deferred provider prompt carries its reference beside the
-            // preview inside the event payload.
+            // preview inside the event payload; a deferred native model message
+            // carries one the same way.
             if let Some(reference) = payload.get(crate::PROVIDER_PROMPT_REF_FIELD)
                 && let Ok(reference) =
                     serde_json::from_value::<SessionPayloadRef>(reference.clone())
             {
+                references.push(reference);
+            }
+            if let Some(reference) = deferred_provider_payload_ref(payload) {
                 references.push(reference);
             }
         }

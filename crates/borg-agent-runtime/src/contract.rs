@@ -2024,6 +2024,10 @@ pub enum SessionPayloadKind {
     /// journaled so a later reader can audit what the model actually received
     /// instead of re-deriving the framing and projection in code.
     ProviderPrompt,
+    /// One native-harness provider model message, deferred out of the event
+    /// body when it exceeds the inline limit. It is replayed verbatim, so the
+    /// exact bytes must survive the move to the side table.
+    ProviderModelMessage,
 }
 
 impl SessionPayloadKind {
@@ -2033,6 +2037,7 @@ impl SessionPayloadKind {
             Self::ToolOutput => "tool_output",
             Self::ToolResultInput => "tool_result_input",
             Self::ProviderPrompt => "provider_prompt",
+            Self::ProviderModelMessage => "provider_model_message",
         }
     }
 }
@@ -2043,6 +2048,13 @@ impl SessionPayloadKind {
 pub const PROVIDER_PROMPT_EVENT_KIND: &str = "provider_prompt";
 pub const PROVIDER_PROMPT_FIELD: &str = "prompt";
 pub const PROVIDER_PROMPT_REF_FIELD: &str = "prompt_ref";
+
+/// Provider-event kind carrying one native-harness model message. Its whole
+/// `payload` is deferred to a [`SessionPayloadKind::ProviderModelMessage`]
+/// payload when it exceeds the inline limit; the reference rides inside the
+/// deferred marker so replay can resolve it.
+pub const NATIVE_MODEL_MESSAGE_EVENT_KIND: &str = "native_model_message";
+pub const PROVIDER_PAYLOAD_REF_FIELD: &str = "provider_ref";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]

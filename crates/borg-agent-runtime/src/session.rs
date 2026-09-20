@@ -676,6 +676,25 @@ impl RuntimeSessionStore {
             self.context_events = self.store.recovery(session_id).await?.context_events;
             self.context_complete = true;
         }
+        self.resolve_deferred_provider_payloads().await
+    }
+
+    /// Restore native provider payloads the store deferred out of the event
+    /// body, so replay sees the exact model message that was journaled. A
+    /// payload that still fits inline is left untouched, which is what keeps
+    /// sessions written before externalization replaying unchanged.
+    async fn resolve_deferred_provider_payloads(&mut self) -> Result<()> {
+        for event in &mut self.context_events {
+            let SessionEventKind::ProviderEvent { payload, .. } = &mut event.kind else {
+                continue;
+            };
+            let Some(reference) = crate::session_store::deferred_provider_payload_ref(payload)
+            else {
+                continue;
+            };
+            let bytes = self.store.load_payload(&reference).await?;
+            crate::session_store::resolve_provider_payload(payload, &bytes)?;
+        }
         Ok(())
     }
 
@@ -772,7 +791,15 @@ impl RuntimeSessionStore {
         }
         bound_context_at_compaction(&mut self.context_events, &event);
         if event.kind.is_context_relevant() {
-            self.context_events.push(event.clone());
+            let mut context_event = event.clone();
+            if let SessionEventKind::ProviderEvent { payload, .. } = &mut context_event.kind
+                && let Some(reference) =
+                    crate::session_store::deferred_provider_payload_ref(payload)
+            {
+                let bytes = self.store.load_payload(&reference).await?;
+                crate::session_store::resolve_provider_payload(payload, &bytes)?;
+            }
+            self.context_events.push(context_event);
         }
         Ok(event)
     }
@@ -1685,6 +1712,7 @@ async fn run_agent_session_store_kernel_inner(
     if let Some(projection) = workspace_projection.clone() {
         journal = journal.with_workspace_projection(projection);
     }
+    journal.resolve_deferred_provider_payloads().await?;
     if fresh {
         record(
             &mut journal,
