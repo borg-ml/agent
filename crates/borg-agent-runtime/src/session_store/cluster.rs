@@ -315,7 +315,7 @@ impl ManagedCluster {
         // process started it, which is the defect the unit exists to fix, so
         // falling back to it here would quietly reintroduce that defect on
         // exactly the machines the fix was written for.
-        if systemd::available() {
+        if systemd::available().await {
             return self.start_under_unit(pg_ctl).await;
         }
         match self.spawn_postmaster(pg_ctl).await? {
