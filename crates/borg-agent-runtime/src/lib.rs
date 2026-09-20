@@ -28,6 +28,7 @@ mod persistent_runtime;
 mod plugin_store;
 pub mod process_environment;
 mod profiling;
+mod prompt_context;
 pub mod provider_usage;
 pub mod receipt;
 mod runtime_protocol;
