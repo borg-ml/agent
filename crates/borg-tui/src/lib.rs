@@ -2469,6 +2469,14 @@ fn model_picker_options_with_configured(
                 options.push(PickerOption::new(model, model));
             }
         }
+        Some(CodingProvider::Qwen) => {
+            // The Alibaba Coding Plan's recommended models; the plan also
+            // serves GLM, Kimi and MiniMax under its own quota, which the
+            // vendor's list covers and older ids route to.
+            for model in ["qwen3.7-plus", "qwen3.6-plus", "qwen3-coder-plus", "qwen3-coder-next"] {
+                options.push(PickerOption::new(model, model));
+            }
+        }
         provider @ (Some(CodingProvider::OpenAiCompatible)
         | Some(CodingProvider::OpenCode)
         | None) => {

@@ -435,6 +435,7 @@ fn cache_window(provider: CodingProvider) -> Option<Duration> {
         CodingProvider::OpenCode
         | CodingProvider::Kimi
         | CodingProvider::Glm
+        | CodingProvider::Qwen
         | CodingProvider::OpenRouter
         | CodingProvider::OpenAiCompatible => None,
     }

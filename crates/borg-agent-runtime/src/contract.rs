@@ -20,6 +20,10 @@ pub enum CodingProvider {
     /// Z.ai GLM. Like Kimi, driven by Borg's native model client over the
     /// OpenAI-compatible wire format — no vendor CLI is involved.
     Glm,
+    /// Alibaba Cloud Model Studio (Qwen), including its Coding Plan. Like GLM,
+    /// driven by Borg's native model client over the OpenAI-compatible wire
+    /// format — no vendor CLI is involved.
+    Qwen,
     OpenRouter,
     OpenAiCompatible,
 }
@@ -181,6 +185,7 @@ impl CodingProvider {
             Self::OpenCode => "open-code",
             Self::Kimi => "kimi",
             Self::Glm => "glm",
+            Self::Qwen => "qwen",
             Self::OpenRouter => "openrouter",
             Self::OpenAiCompatible => "openai-compatible",
         }
@@ -197,6 +202,7 @@ impl CodingProvider {
             Self::OpenCode => "OpenCode",
             Self::Kimi => "Kimi",
             Self::Glm => "GLM",
+            Self::Qwen => "Qwen",
             Self::OpenRouter => "OpenRouter",
             Self::OpenAiCompatible => "OpenAI-compatible",
         }
@@ -220,6 +226,7 @@ impl CodingProvider {
             .or_else(|| (model == borg_provider::kimi_product_model()).then_some(Self::Kimi))
             .or_else(|| model.starts_with("gpt-").then_some(Self::Codex))
             .or_else(|| (model == borg_provider::glm_product_model()).then_some(Self::Glm))
+            .or_else(|| (model == borg_provider::qwen_product_model()).then_some(Self::Qwen))
             .or_else(|| {
                 model
                     .strip_prefix("opencode/")
@@ -247,6 +254,7 @@ impl CodingProvider {
             Self::OpenCode => "open_code",
             Self::Kimi => "kimi",
             Self::Glm => "glm",
+            Self::Qwen => "qwen",
             Self::OpenRouter => "open_router",
             Self::OpenAiCompatible => "open_ai_compatible",
         }
@@ -257,7 +265,7 @@ impl CodingProvider {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
-            Self::Kimi | Self::Glm | Self::OpenRouter | Self::OpenAiCompatible => "borg",
+            Self::Kimi | Self::Glm | Self::Qwen | Self::OpenRouter | Self::OpenAiCompatible => "borg",
         }
     }
 
@@ -268,7 +276,7 @@ impl CodingProvider {
     pub fn uses_native_harness(self) -> bool {
         matches!(
             self,
-            Self::Kimi | Self::Glm | Self::OpenRouter | Self::OpenAiCompatible
+            Self::Kimi | Self::Glm | Self::Qwen | Self::OpenRouter | Self::OpenAiCompatible
         )
     }
 }

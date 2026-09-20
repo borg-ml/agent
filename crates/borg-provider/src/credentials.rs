@@ -33,6 +33,8 @@ pub enum ApiKeyCredential {
     Zai,
     /// Moonshot key, for Kimi Code.
     Kimi,
+    /// Alibaba Cloud Model Studio key, for the Qwen Coding Plan.
+    Qwen,
 }
 
 impl ApiKeyCredential {
@@ -46,6 +48,10 @@ impl ApiKeyCredential {
             // it onto whichever token header the hosting CLI expects.
             Self::Zai => "ZAI_API_KEY",
             Self::Kimi => "KIMI_API_KEY",
+            // The Coding Plan's own key. The pay-as-you-go key is a different
+            // credential (`DASHSCOPE_API_KEY`) and is read as a fallback by the
+            // Qwen profile, never stored under this one.
+            Self::Qwen => "BAILIAN_CODING_PLAN_API_KEY",
         }
     }
 
@@ -57,6 +63,7 @@ impl ApiKeyCredential {
             Self::OpenRouter => "openrouter_api_key",
             Self::Zai => "zai_api_key",
             Self::Kimi => "kimi_api_key",
+            Self::Qwen => "qwen_api_key",
         }
     }
 }
@@ -118,6 +125,23 @@ pub fn api_key(credential: ApiKeyCredential) -> Option<String> {
 /// Persists `key` for `credential`, replacing any previously stored value.
 pub fn store_api_key(credential: ApiKeyCredential, key: &str) -> Result<PathBuf> {
     store_value(credential.storage_key(), key)
+}
+
+/// The coding plan persisted on this machine, if any. Written by
+/// `borg login <plan>`; the `BORG_SUBSCRIPTION` environment variable still
+/// takes precedence so an operator can override a saved selection.
+pub fn stored_active_subscription() -> Option<String> {
+    let path = credentials_path()?;
+    let file = read_credentials(&path).ok()?;
+    file.keys
+        .get("active_subscription")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Records the active coding plan so the choice survives across sessions.
+pub fn set_active_subscription(plan: &str) -> Result<PathBuf> {
+    store_value("active_subscription", plan)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

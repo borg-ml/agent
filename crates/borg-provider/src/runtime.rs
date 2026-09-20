@@ -119,6 +119,17 @@ pub fn kimi_default_effort() -> &'static str {
     "high"
 }
 
+/// Borg's directly managed Qwen route. The Alibaba Coding Plan's recommended
+/// vision model is `qwen3.7-plus`; the plan also serves `qwen3-coder-plus` and
+/// other vendors' models, which remain explicit overrides.
+pub fn qwen_product_model() -> &'static str {
+    "qwen3.7-plus"
+}
+
+pub fn qwen_default_effort() -> &'static str {
+    "high"
+}
+
 /// A runtime-discovered model entry for the /model picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicModelEntry {

@@ -1274,6 +1274,7 @@ async fn probe_provider(
                             | CodingProvider::OpenCode => provider_auth_status(provider).await.ok(),
                             CodingProvider::Kimi
                             | CodingProvider::Glm
+                            | CodingProvider::Qwen
                             | CodingProvider::OpenRouter
                             | CodingProvider::OpenAiCompatible => None,
                         }
@@ -1291,6 +1292,7 @@ async fn probe_provider(
                         .is_some_and(opencode_auth_status_authenticated),
                     CodingProvider::Kimi
                     | CodingProvider::Glm
+                    | CodingProvider::Qwen
                     | CodingProvider::OpenRouter
                     | CodingProvider::OpenAiCompatible => false,
                 };
@@ -1414,6 +1416,26 @@ async fn probe_provider(
                 None
             }
         }
+        CodingProvider::Qwen => {
+            // A selected Qwen Coding Plan supplies its own `sk-sp-` key; a
+            // pay-as-you-go DashScope key is the fallback.
+            if borg_provider::subscription::active_for(borg_provider::Plan::QwenCoding)
+                .and_then(|plan| plan.api_key())
+                .is_some()
+            {
+                auth_methods.push(ProviderAuthMethod::Subscription);
+                detail.push("Qwen Coding Plan key configured");
+                Some(BillingLane::Subscription)
+            } else if nonempty_env("BORG_QWEN_API_KEY").is_some()
+                || nonempty_env("DASHSCOPE_API_KEY").is_some()
+            {
+                auth_methods.push(ProviderAuthMethod::ApiKey);
+                detail.push("Qwen API key configured");
+                Some(BillingLane::ApiKey)
+            } else {
+                None
+            }
+        }
         CodingProvider::OpenRouter => {
             if borg_provider::credentials::api_key(
                 borg_provider::credentials::ApiKeyCredential::OpenRouter,
@@ -1467,6 +1489,7 @@ async fn probe_provider(
         CodingProvider::Codex
         | CodingProvider::Kimi
         | CodingProvider::Glm
+        | CodingProvider::Qwen
         | CodingProvider::OpenRouter
         | CodingProvider::OpenAiCompatible => true,
         CodingProvider::OpenCode if native_go => true,
@@ -1510,6 +1533,7 @@ fn provider_subscription_credentials_present(provider: CodingProvider) -> bool {
             .is_some_and(opencode_auth_json_authenticated),
         CodingProvider::Kimi
         | CodingProvider::Glm
+        | CodingProvider::Qwen
         | CodingProvider::OpenRouter
         | CodingProvider::OpenAiCompatible => false,
     }
@@ -1775,7 +1799,10 @@ pub fn provider_credentials_present(provider: CodingProvider) -> bool {
                 || provider_subscription_credentials_present(provider)
         }
         CodingProvider::Kimi => {
-            nonempty_env("BORG_KIMI_API_KEY").is_some()
+            borg_provider::subscription::active_for(borg_provider::Plan::KimiCode)
+                .and_then(|plan| plan.api_key())
+                .is_some()
+                || nonempty_env("BORG_KIMI_API_KEY").is_some()
                 || nonempty_env("MOONSHOT_API_KEY").is_some()
         }
         CodingProvider::Glm => {
@@ -1783,6 +1810,13 @@ pub fn provider_credentials_present(provider: CodingProvider) -> bool {
                 .and_then(|plan| plan.api_key())
                 .is_some()
                 || nonempty_env("BORG_GLM_API_KEY").is_some()
+        }
+        CodingProvider::Qwen => {
+            borg_provider::subscription::active_for(borg_provider::Plan::QwenCoding)
+                .and_then(|plan| plan.api_key())
+                .is_some()
+                || nonempty_env("BORG_QWEN_API_KEY").is_some()
+                || nonempty_env("DASHSCOPE_API_KEY").is_some()
         }
         CodingProvider::OpenRouter => borg_provider::credentials::api_key(
             borg_provider::credentials::ApiKeyCredential::OpenRouter,
@@ -1811,6 +1845,7 @@ fn provider_login_command(provider: CodingProvider, mut command: Command) -> Res
         }
         CodingProvider::Kimi
         | CodingProvider::Glm
+        | CodingProvider::Qwen
         | CodingProvider::OpenRouter
         | CodingProvider::OpenAiCompatible => {
             unreachable!("handled above")
@@ -4152,6 +4187,7 @@ fn provider_arg(provider: CodingProvider) -> &'static str {
         CodingProvider::OpenCode => "open-code",
         CodingProvider::Kimi => "kimi",
         CodingProvider::Glm => "glm",
+        CodingProvider::Qwen => "qwen",
         CodingProvider::OpenRouter => "open-router",
         CodingProvider::OpenAiCompatible => "open-ai-compatible",
     }

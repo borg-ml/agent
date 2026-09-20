@@ -1643,6 +1643,7 @@ fn provider_argument(provider: crate::cli::RemoteProviderArg) -> &'static str {
         RemoteProviderArg::OpenCode => "open-code",
         RemoteProviderArg::Kimi => "kimi",
         RemoteProviderArg::Glm => "glm",
+        RemoteProviderArg::Qwen => "qwen",
         RemoteProviderArg::OpenRouter => "open-router",
         RemoteProviderArg::OpenAiCompatible => "open-ai-compatible",
     }
@@ -2164,6 +2165,7 @@ async fn run_local_agent_session(
         CodingProvider::Kimi | CodingProvider::Glm => {
             Some(borg_provider::kimi_default_effort().to_string())
         }
+        CodingProvider::Qwen => Some(borg_provider::qwen_default_effort().to_string()),
     });
     let (
         recorded_cwd,
@@ -7459,6 +7461,7 @@ pub(crate) async fn login_command(
             CodingProvider::OpenRouter,
             CodingProvider::Kimi,
             CodingProvider::Glm,
+            CodingProvider::Qwen,
             CodingProvider::OpenAiCompatible,
         ] {
             let state = if provider_connection_ready(provider).await {
@@ -7497,7 +7500,37 @@ pub(crate) async fn login_command(
                 authenticate_provider(provider, ProviderAuthChoice::ReconnectSubscription).await?
             );
         }
-        CodingProvider::Kimi | CodingProvider::Glm | CodingProvider::OpenAiCompatible => {
+        CodingProvider::Kimi | CodingProvider::Glm | CodingProvider::Qwen => {
+            let plan = match provider {
+                CodingProvider::Kimi => borg_provider::Plan::KimiCode,
+                CodingProvider::Glm => borg_provider::Plan::GlmCoding,
+                CodingProvider::Qwen => borg_provider::Plan::QwenCoding,
+                _ => unreachable!("matched above"),
+            };
+            println!(
+                "Paste your {} key (input hidden), then press Enter:",
+                plan.label()
+            );
+            io::stdout().flush().ok();
+            let key = if io::stdin().is_terminal() {
+                read_hidden_line().context("failed to read API key")?
+            } else {
+                use std::io::Read;
+                let mut key = String::new();
+                io::stdin().take(16 * 1024).read_to_string(&mut key)?;
+                key
+            };
+            let key = key.trim();
+            anyhow::ensure!(!key.is_empty(), "no key entered; nothing was saved");
+            let path = borg_provider::credentials::store_api_key(plan.credential(), key)?;
+            borg_provider::credentials::set_active_subscription(plan.id())?;
+            println!(
+                "{} connected · key saved to {} · served directly by Borg, no CLI required",
+                plan.label(),
+                path.display()
+            );
+        }
+        CodingProvider::OpenAiCompatible => {
             anyhow::bail!(
                 "{} has no sign-in flow; {}",
                 provider.label(),
@@ -7521,8 +7554,11 @@ fn credential_guidance(provider: CodingProvider) -> &'static str {
             "`borg login opencode --api-key` (Go subscription key), then /model → OpenCode Go"
         }
         CodingProvider::OpenRouter => "`borg login openrouter` stores an OpenRouter API key",
-        CodingProvider::Kimi => "set BORG_KIMI_API_KEY (or MOONSHOT_API_KEY)",
-        CodingProvider::Glm => "set BORG_GLM_API_KEY, or select the GLM Coding Plan",
+        CodingProvider::Kimi => "`borg login kimi` selects the Kimi Code plan and stores its key",
+        CodingProvider::Glm => "`borg login glm` selects the GLM Coding Plan and stores its key",
+        CodingProvider::Qwen => {
+            "`borg login qwen` selects the Alibaba Cloud Coding Plan and stores its key"
+        }
         CodingProvider::OpenAiCompatible => {
             "set BORG_OPENAI_COMPATIBLE_BASE_URL (and BORG_OPENAI_COMPATIBLE_API_KEY if required)"
         }
@@ -7535,6 +7571,7 @@ fn prompt_and_store_api_key(provider: CodingProvider) -> Result<PathBuf> {
         CodingProvider::OpenCode => borg_provider::credentials::ApiKeyCredential::OpenCodeGo,
         CodingProvider::Kimi => borg_provider::credentials::ApiKeyCredential::Kimi,
         CodingProvider::Glm => borg_provider::credentials::ApiKeyCredential::Zai,
+        CodingProvider::Qwen => borg_provider::credentials::ApiKeyCredential::Qwen,
         CodingProvider::Claude => borg_provider::credentials::ApiKeyCredential::Anthropic,
         CodingProvider::OpenRouter => borg_provider::credentials::ApiKeyCredential::OpenRouter,
         other => anyhow::bail!("{} does not use a borg-managed API key", other.label()),
@@ -7903,6 +7940,7 @@ fn default_model_for_provider(provider: CodingProvider) -> Option<String> {
         CodingProvider::Claude => Some(borg_provider::claude_product_model().to_string()),
         CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
         CodingProvider::Glm => Some(borg_provider::glm_product_model().to_string()),
+        CodingProvider::Qwen => Some(borg_provider::qwen_product_model().to_string()),
         CodingProvider::OpenRouter => Some(borg_provider::openrouter_product_model().to_string()),
         CodingProvider::OpenAiCompatible => std::env::var("BORG_OPENAI_COMPATIBLE_MODEL")
             .ok()
@@ -9691,6 +9729,7 @@ fn provider_name(provider: CodingProvider) -> &'static str {
         CodingProvider::OpenCode => "open-code",
         CodingProvider::Kimi => "kimi",
         CodingProvider::Glm => "glm",
+        CodingProvider::Qwen => "qwen",
         CodingProvider::OpenRouter => "openrouter",
         CodingProvider::OpenAiCompatible => "openai-compatible",
     }

@@ -1011,6 +1011,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             CodingProvider::Codex
             | CodingProvider::Kimi
             | CodingProvider::Glm
+            | CodingProvider::Qwen
             | CodingProvider::OpenRouter
             | CodingProvider::OpenAiCompatible => unreachable!("native provider handled above"),
         };

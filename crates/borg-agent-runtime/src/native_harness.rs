@@ -1440,6 +1440,7 @@ impl ProviderModelClient {
         let profile = match provider {
             crate::CodingProvider::Kimi => OpenAiCompatibleProfile::Kimi,
             crate::CodingProvider::Glm => OpenAiCompatibleProfile::Glm,
+            crate::CodingProvider::Qwen => OpenAiCompatibleProfile::Qwen,
             crate::CodingProvider::OpenRouter => OpenAiCompatibleProfile::OpenRouter,
             crate::CodingProvider::OpenAiCompatible => OpenAiCompatibleProfile::Generic,
             // OpenCode reaches the native client only through the Go access

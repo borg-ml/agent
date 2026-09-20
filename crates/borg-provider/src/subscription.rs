@@ -32,16 +32,20 @@ pub enum Plan {
     GlmCoding,
     /// Moonshot Kimi Code.
     KimiCode,
+    /// Alibaba Cloud Model Studio Coding Plan (Qwen, and the plan's other
+    /// models such as GLM, Kimi and MiniMax).
+    QwenCoding,
 }
 
 impl Plan {
-    pub const ALL: [Plan; 2] = [Plan::GlmCoding, Plan::KimiCode];
+    pub const ALL: [Plan; 3] = [Plan::GlmCoding, Plan::KimiCode, Plan::QwenCoding];
 
     /// Short identifier accepted by [`PLAN_ENV`].
     pub fn id(self) -> &'static str {
         match self {
             Plan::GlmCoding => "glm",
             Plan::KimiCode => "kimi",
+            Plan::QwenCoding => "qwen",
         }
     }
 
@@ -49,20 +53,24 @@ impl Plan {
         match self {
             Plan::GlmCoding => "GLM Coding Plan",
             Plan::KimiCode => "Kimi Code",
+            Plan::QwenCoding => "Qwen Coding Plan",
         }
     }
 
     /// OpenAI Chat Completions base URL for the plan's quota.
     ///
     /// These are deliberately not the vendors' pay-as-you-go hosts: Moonshot
-    /// serves the plan from `api.kimi.com/coding`, not `api.moonshot.ai`, and
+    /// serves the plan from `api.kimi.com/coding`, not `api.moonshot.ai`,
     /// Z.ai bills plan quota on the `coding/` path rather than the general
-    /// `paas/v4` one. Pointing at the wrong host silently spends credits
-    /// instead of plan quota.
+    /// `paas/v4` one, and Alibaba's Coding Plan is served from
+    /// `coding.dashscope.aliyuncs.com`, not the `compatible-mode` host.
+    /// Pointing at the wrong host silently spends credits instead of plan
+    /// quota.
     pub fn base_url(self) -> &'static str {
         match self {
             Plan::GlmCoding => "https://api.z.ai/api/coding/paas/v4",
             Plan::KimiCode => "https://api.kimi.com/coding/v1",
+            Plan::QwenCoding => qwen_coding_base_url(),
         }
     }
 
@@ -71,6 +79,7 @@ impl Plan {
         match self {
             Plan::GlmCoding => ApiKeyCredential::Zai,
             Plan::KimiCode => ApiKeyCredential::Kimi,
+            Plan::QwenCoding => ApiKeyCredential::Qwen,
         }
     }
 
@@ -79,6 +88,9 @@ impl Plan {
         match self {
             Plan::GlmCoding => "https://z.ai/manage-apikey/apikey-list",
             Plan::KimiCode => "the Kimi Code console at https://www.kimi.com/code",
+            Plan::QwenCoding => {
+                "the Model Studio Coding Plan console at https://bailian.console.alibabacloud.com"
+            }
         }
     }
 
@@ -94,11 +106,22 @@ impl Plan {
 }
 
 /// The plan the user has selected, if any.
+///
+/// `BORG_SUBSCRIPTION` wins so an operator can override a saved choice. With
+/// no environment value, the plan persisted by `borg login <plan>` is used, so
+/// selecting a plan in the UI survives restarts instead of requiring an
+/// environment variable.
 pub fn active() -> Result<Option<Plan>> {
-    let Some(value) = crate::env::nonempty_var(PLAN_ENV) else {
-        return Ok(None);
-    };
-    let trimmed = value.trim();
+    if let Some(value) = crate::env::nonempty_var(PLAN_ENV) {
+        return parse_selection(value.trim());
+    }
+    if let Some(value) = crate::credentials::stored_active_subscription() {
+        return parse_selection(value.trim());
+    }
+    Ok(None)
+}
+
+fn parse_selection(trimmed: &str) -> Result<Option<Plan>> {
     if matches!(trimmed.to_ascii_lowercase().as_str(), "none" | "off") {
         return Ok(None);
     }
@@ -112,6 +135,25 @@ pub fn active() -> Result<Option<Plan>> {
                 known.join(", ")
             )
         }
+    }
+}
+
+/// The Alibaba Coding Plan is served from a regional host. The international
+/// endpoint is the default; a China account selects its own with
+/// `BORG_QWEN_REGION=china` (aliases `cn` and `beijing`).
+fn qwen_coding_base_url() -> &'static str {
+    let china = crate::env::nonempty_var("BORG_QWEN_REGION")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "china" | "cn" | "beijing"
+            )
+        })
+        .unwrap_or(false);
+    if china {
+        "https://coding.dashscope.aliyuncs.com/v1"
+    } else {
+        "https://coding-intl.dashscope.aliyuncs.com/v1"
     }
 }
 
@@ -183,6 +225,10 @@ mod tests {
         );
         assert!(!Plan::KimiCode.base_url().contains("moonshot"));
         assert!(Plan::GlmCoding.base_url().contains("/coding/"));
+        // Alibaba's plan host is `coding.`, never the pay-as-you-go
+        // `compatible-mode` host, which would bill credits instead of quota.
+        assert!(Plan::QwenCoding.base_url().contains("coding"));
+        assert!(!Plan::QwenCoding.base_url().contains("compatible-mode"));
     }
 
     #[test]

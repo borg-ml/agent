@@ -28,6 +28,14 @@ fn clear() {
         std::env::remove_var(PLAN_ENV);
         std::env::remove_var("ZAI_API_KEY");
         std::env::remove_var("KIMI_API_KEY");
+        std::env::remove_var("BAILIAN_CODING_PLAN_API_KEY");
+        // `active()` also consults the plan persisted by `borg login`, so point
+        // the credential store at a path that does not exist: otherwise a
+        // developer who selected a plan would fail these env-only cases.
+        std::env::set_var(
+            "BORG_HOME",
+            std::env::temp_dir().join(format!("borg-plan-routing-test-{}", std::process::id())),
+        );
     }
 }
 
@@ -83,6 +91,12 @@ fn plans_point_at_subscription_hosts_not_payg_hosts() {
         Plan::GlmCoding.base_url(),
         "https://api.z.ai/api/coding/paas/v4"
     );
+    // Alibaba's Coding Plan is served from a `coding.` host; the pay-as-you-go
+    // `compatible-mode` host would spend credits instead of plan quota.
+    let qwen = Plan::QwenCoding.base_url();
+    assert!(qwen.starts_with("https://coding"), "{qwen}");
+    assert!(qwen.contains("dashscope.aliyuncs.com/v1"), "{qwen}");
+    assert!(!qwen.contains("compatible-mode"), "{qwen}");
 }
 
 #[test]
