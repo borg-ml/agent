@@ -260,20 +260,27 @@ async fn competing_detached_host_exits_without_waiting_for_the_journal_or_stoppi
     let writer = SessionWriterLease::try_acquire(&lock_path)
         .unwrap()
         .unwrap();
-    let mut blocked = store.pool().begin().await.unwrap();
-    sqlx::query("lock table sessions in exclusive mode")
-        .execute(&mut *blocked)
-        .await
-        .unwrap();
-
     let mut args = LocalAgentCliArgs::resume(Some(session_id));
     args.session_host = Some(session_id);
     args.local_only = true;
+    // Connected before the journal is locked, and the order is the point.
+    // Opening a store runs schema bootstrap and then a stranded-live-state
+    // sweep whose `select ... for update` takes ROW SHARE on `sessions`, which
+    // conflicts with the exclusive lock taken below. Connecting after the lock
+    // blocked here in setup -- outside the timeout that is this test's only
+    // assertion -- so the suite hung instead of failing. What is under test is
+    // the launcher, and it still runs entirely under the lock.
     let competitor: Arc<dyn SessionStore> = Arc::new(
         PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
             .await
             .unwrap(),
     );
+
+    let mut blocked = store.pool().begin().await.unwrap();
+    sqlx::query("lock table sessions in exclusive mode")
+        .execute(&mut *blocked)
+        .await
+        .unwrap();
 
     let result = tokio::time::timeout(
         Duration::from_secs(5),
