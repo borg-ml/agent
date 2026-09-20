@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use borg_core::compaction::{CompactionBudgetOverride, CompactionBudgetPolicy};
+use borg_core::warming::CacheWarmingMode;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -18,6 +20,8 @@ pub(crate) struct AgentConfig {
     pub(crate) approvals: ApprovalConfig,
     pub(crate) updates: UpdateConfig,
     pub(crate) usage_count: UsageCountConfig,
+    pub(crate) compaction: CompactionConfig,
+    pub(crate) warming: WarmingConfig,
     pub(crate) local: LocalProviderConfig,
     /// Named OpenAI-compatible routes. The durable session keeps the generic
     /// native provider kind and records the stable `provider/model` alias.
@@ -315,6 +319,29 @@ pub(crate) struct UpdateConfig {
     pub(crate) auto_install: bool,
     /// Minimum interval between release checks.
     pub(crate) check_interval_hours: u64,
+}
+
+/// Per-model compaction budgets.
+///
+/// Borg sizes automatic compaction as a share of the context window, which is
+/// the right default across wildly different models. It is the wrong number
+/// for a specific model whose economics are known: the default reserve of a
+/// 1M-token window holds back 150k tokens from every turn. A budget here
+/// overrides either number in absolute tokens for one exact `provider/model`
+/// pair, leaving the other on its percentage default.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct CompactionConfig {
+    /// Keyed by the same `provider/model` alias Borg uses everywhere else,
+    /// for example `claude/claude-opus-5` or
+    /// `open_router/anthropic/claude-opus-5`.
+    pub(crate) budgets: BTreeMap<String, CompactionBudgetOverride>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct WarmingConfig {
+    pub(crate) mode: CacheWarmingMode,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -796,7 +823,33 @@ impl AgentConfig {
                 "local.reasoning_format must not contain NUL bytes"
             );
         }
+        self.compaction_budget_policy()?;
         Ok(())
+    }
+
+    /// Context windows Borg already knows from configuration, so a budget that
+    /// cannot fit its model is rejected at load rather than silently clamped
+    /// on the first long turn.
+    fn configured_context_windows(&self) -> BTreeMap<String, u64> {
+        let mut windows = BTreeMap::new();
+        for (provider_id, provider) in &self.providers {
+            for (model_id, model) in &provider.models {
+                if let Some(tokens) = model.context_window_tokens {
+                    windows.insert(format_configured_model_alias(provider_id, model_id), tokens);
+                }
+            }
+        }
+        windows
+    }
+
+    /// The validated per-model compaction budgets. An empty policy resolves
+    /// every model to the percentage defaults.
+    pub(crate) fn compaction_budget_policy(&self) -> Result<CompactionBudgetPolicy> {
+        CompactionBudgetPolicy::new(
+            self.compaction.budgets.clone(),
+            &self.configured_context_windows(),
+        )
+        .map_err(anyhow::Error::from)
     }
 
     /// Export `[local]` settings into the process environment so the

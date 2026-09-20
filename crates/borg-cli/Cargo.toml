@@ -34,6 +34,7 @@ agent-client-protocol.workspace = true
 aes-gcm = "0.11.1"
 anyhow.workspace = true
 base64.workspace = true
+borg-core.workspace = true
 borg-provider = { path = "../borg-provider", default-features = false }
 borg-dictation.workspace = true
 borg-remote = { path = "../borg-remote", default-features = false }
