@@ -58,7 +58,8 @@ fn blocked_tools() -> Value {
 fn opencode_base_config(permission: LocalAgentPermission) -> Value {
     let mut config = serde_json::json!({});
     if permission == LocalAgentPermission::FullAccess {
-        config["permission"] = serde_json::json!({"*": "allow", "question": "deny", "task": "deny"});
+        config["permission"] =
+            serde_json::json!({"*": "allow", "question": "deny", "task": "deny"});
     } else {
         config["permission"] = serde_json::json!({"question": "deny", "task": "deny"});
     }

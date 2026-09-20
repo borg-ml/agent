@@ -16,10 +16,21 @@ pub enum CodingProvider {
     Codex,
     Claude,
     OpenCode,
+    /// xAI Grok Build. The SuperGrok/X Premium subscription is reachable only
+    /// through xAI's own CLI, so Borg drives it as a compatibility route.
+    Grok,
+    /// Meta Muse Code. The subscription only works through Meta's own CLI,
+    /// signed in with a Meta Model API account, so Borg drives it as a
+    /// compatibility route.
+    Muse,
     Kimi,
     /// Z.ai GLM. Like Kimi, driven by Borg's native model client over the
     /// OpenAI-compatible wire format — no vendor CLI is involved.
     Glm,
+    /// Alibaba Cloud Model Studio (Qwen), including its Coding Plan. Like GLM,
+    /// driven by Borg's native model client over the OpenAI-compatible wire
+    /// format — no vendor CLI is involved.
+    Qwen,
     OpenRouter,
     OpenAiCompatible,
 }
@@ -179,8 +190,11 @@ impl CodingProvider {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::OpenCode => "open-code",
+            Self::Grok => "grok",
+            Self::Muse => "muse",
             Self::Kimi => "kimi",
             Self::Glm => "glm",
+            Self::Qwen => "qwen",
             Self::OpenRouter => "openrouter",
             Self::OpenAiCompatible => "openai-compatible",
         }
@@ -195,8 +209,11 @@ impl CodingProvider {
             Self::Codex => "Codex",
             Self::Claude => "Claude",
             Self::OpenCode => "OpenCode",
+            Self::Grok => "Grok",
+            Self::Muse => "Muse",
             Self::Kimi => "Kimi",
             Self::Glm => "GLM",
+            Self::Qwen => "Qwen",
             Self::OpenRouter => "OpenRouter",
             Self::OpenAiCompatible => "OpenAI-compatible",
         }
@@ -220,6 +237,9 @@ impl CodingProvider {
             .or_else(|| (model == borg_provider::kimi_product_model()).then_some(Self::Kimi))
             .or_else(|| model.starts_with("gpt-").then_some(Self::Codex))
             .or_else(|| (model == borg_provider::glm_product_model()).then_some(Self::Glm))
+            .or_else(|| (model == borg_provider::qwen_product_model()).then_some(Self::Qwen))
+            .or_else(|| (model == borg_provider::grok_product_model()).then_some(Self::Grok))
+            .or_else(|| (model == borg_provider::muse_product_model()).then_some(Self::Muse))
             .or_else(|| {
                 model
                     .strip_prefix("opencode/")
@@ -245,8 +265,11 @@ impl CodingProvider {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::OpenCode => "open_code",
+            Self::Grok => "grok",
+            Self::Muse => "muse",
             Self::Kimi => "kimi",
             Self::Glm => "glm",
+            Self::Qwen => "qwen",
             Self::OpenRouter => "open_router",
             Self::OpenAiCompatible => "open_ai_compatible",
         }
@@ -257,7 +280,11 @@ impl CodingProvider {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
-            Self::Kimi | Self::Glm | Self::OpenRouter | Self::OpenAiCompatible => "borg",
+            Self::Grok => "grok",
+            Self::Muse => "muse",
+            Self::Kimi | Self::Glm | Self::Qwen | Self::OpenRouter | Self::OpenAiCompatible => {
+                "borg"
+            }
         }
     }
 
@@ -268,7 +295,7 @@ impl CodingProvider {
     pub fn uses_native_harness(self) -> bool {
         matches!(
             self,
-            Self::Kimi | Self::Glm | Self::OpenRouter | Self::OpenAiCompatible
+            Self::Kimi | Self::Glm | Self::Qwen | Self::OpenRouter | Self::OpenAiCompatible
         )
     }
 }
@@ -2105,6 +2132,10 @@ pub enum SessionPayloadKind {
     /// journaled so a later reader can audit what the model actually received
     /// instead of re-deriving the framing and projection in code.
     ProviderPrompt,
+    /// One native-harness provider model message, deferred out of the event
+    /// body when it exceeds the inline limit. It is replayed verbatim, so the
+    /// exact bytes must survive the move to the side table.
+    ProviderModelMessage,
 }
 
 impl SessionPayloadKind {
@@ -2114,6 +2145,7 @@ impl SessionPayloadKind {
             Self::ToolOutput => "tool_output",
             Self::ToolResultInput => "tool_result_input",
             Self::ProviderPrompt => "provider_prompt",
+            Self::ProviderModelMessage => "provider_model_message",
         }
     }
 }
@@ -2124,6 +2156,13 @@ impl SessionPayloadKind {
 pub const PROVIDER_PROMPT_EVENT_KIND: &str = "provider_prompt";
 pub const PROVIDER_PROMPT_FIELD: &str = "prompt";
 pub const PROVIDER_PROMPT_REF_FIELD: &str = "prompt_ref";
+
+/// Provider-event kind carrying one native-harness model message. Its whole
+/// `payload` is deferred to a [`SessionPayloadKind::ProviderModelMessage`]
+/// payload when it exceeds the inline limit; the reference rides inside the
+/// deferred marker so replay can resolve it.
+pub const NATIVE_MODEL_MESSAGE_EVENT_KIND: &str = "native_model_message";
+pub const PROVIDER_PAYLOAD_REF_FIELD: &str = "provider_ref";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]

@@ -81,10 +81,12 @@ sequenceDiagram
     Note over C,S: Controls are handled during the turn, not only at completion.
 ```
 
-**D2:** Kimi, GLM, OpenRouter and OpenAI-compatible use `NativeHarness`.
-Codex can use it via model-only/session routing. Other Codex, Claude and
-OpenCode turns use `run_borg_provider_turn`; Codex/Claude warm pools retain
-subscription continuity. The compatibility route still delegates inner-loop
+**D2:** Kimi, GLM, Qwen, OpenRouter and OpenAI-compatible use `NativeHarness`.
+Codex can use it via model-only/session routing. Other Codex, Claude, OpenCode,
+Grok and Muse turns use `run_borg_provider_turn`; Codex/Claude warm pools retain
+subscription continuity. Grok Build and Muse Code reach their subscription only
+through their own CLI, so they are compatibility routes like Claude/OpenCode.
+The compatibility route still delegates inner-loop
 behavior upstream. Borg manages outer-session recovery and usage-limit waits;
 there is no automatic subscription-to-API billing fallback. Continuation is
 account-scoped, not the authority for session identity.

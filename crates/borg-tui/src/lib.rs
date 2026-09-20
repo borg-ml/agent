@@ -2462,10 +2462,35 @@ fn model_picker_options_with_configured(
                 borg_provider::kimi_product_model(),
             ));
         }
+        Some(CodingProvider::Grok) => {
+            options.push(PickerOption::new(
+                borg_provider::grok_product_model(),
+                borg_provider::grok_product_model(),
+            ));
+        }
+        Some(CodingProvider::Muse) => {
+            options.push(PickerOption::new(
+                borg_provider::muse_product_model(),
+                borg_provider::muse_product_model(),
+            ));
+        }
         Some(CodingProvider::Glm) => {
             // The Coding Plan serves these two; older ids are silently routed
             // to them by the vendor, so offering them would mislead.
             for model in ["glm-5.3", "glm-5.3-flash"] {
+                options.push(PickerOption::new(model, model));
+            }
+        }
+        Some(CodingProvider::Qwen) => {
+            // The Alibaba Coding Plan's recommended models; the plan also
+            // serves GLM, Kimi and MiniMax under its own quota, which the
+            // vendor's list covers and older ids route to.
+            for model in [
+                "qwen3.7-plus",
+                "qwen3.6-plus",
+                "qwen3-coder-plus",
+                "qwen3-coder-next",
+            ] {
                 options.push(PickerOption::new(model, model));
             }
         }
@@ -4512,6 +4537,14 @@ impl BorgTerminal {
                 PickerOption::new("Connect Claude subscription…", "subscription"),
                 PickerOption::new("Add Anthropic API key · pay per use", "api-key"),
             ],
+            CodingProvider::Grok => vec![PickerOption::new(
+                "Connect Grok Build subscription…",
+                "reconnect-subscription",
+            )],
+            CodingProvider::Muse => vec![PickerOption::new(
+                "Connect Muse Code subscription…",
+                "reconnect-subscription",
+            )],
             _ => vec![PickerOption::new(
                 format!("Add {} API key…", provider.label()),
                 "api-key",
@@ -4522,6 +4555,8 @@ impl BorgTerminal {
                 "subscription" if provider == CodingProvider::Codex => "Use your saved ChatGPT login. If needed, Borg opens the subscription sign-in flow.",
                 "api-key" if provider == CodingProvider::Codex => "Use your saved OpenAI key, or enter one privately. Requests are billed to your OpenAI API account. Your ChatGPT login is kept.",
                 "api-key" | "replace-api-key" if provider == CodingProvider::OpenCode => "Get your subscription key at opencode.ai/auth. Go models use your Go allowance; select one in /model.",
+                "reconnect-subscription" if provider == CodingProvider::Grok => "Opens the Grok Build sign-in. SuperGrok and X Premium Plus plans are supported; set XAI_API_KEY to use the API instead.",
+                "reconnect-subscription" if provider == CodingProvider::Muse => "Opens the Muse Code sign-in with your Meta Model API account; set META_API_KEY for CI.",
                 _ => "Credentials are entered privately and are never added to the conversation.",
             }.to_string());
         }

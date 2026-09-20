@@ -5037,7 +5037,7 @@ async fn forwarded_image_reaches_the_recipient_model_as_pixels() {
         ),
         external_mcp_servers: Vec::new(),
         runtime_mcp_context: Default::default(),
-            runtime_provider_context: None,
+        runtime_provider_context: None,
         extension_skill_roots: Vec::new(),
         extension_workflows: Vec::new(),
         extension_api: Default::default(),

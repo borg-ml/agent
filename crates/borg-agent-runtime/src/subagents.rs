@@ -5869,8 +5869,11 @@ fn default_model_for_cross_provider_peer(provider: CodingProvider) -> Option<Str
         CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
         CodingProvider::Claude => None,
         CodingProvider::OpenCode => None,
+        CodingProvider::Grok => Some(borg_provider::grok_product_model().to_string()),
+        CodingProvider::Muse => Some(borg_provider::muse_product_model().to_string()),
         CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
         CodingProvider::Glm => Some(borg_provider::glm_product_model().to_string()),
+        CodingProvider::Qwen => Some(borg_provider::qwen_product_model().to_string()),
         CodingProvider::OpenRouter => Some(borg_provider::openrouter_product_model().to_string()),
         CodingProvider::OpenAiCompatible => None,
     }
@@ -5881,8 +5884,11 @@ fn default_effort_for_cross_provider_peer(provider: CodingProvider) -> Option<St
         CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
         CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
         CodingProvider::Glm => Some(borg_provider::kimi_default_effort().to_string()),
+        CodingProvider::Qwen => Some(borg_provider::qwen_default_effort().to_string()),
         CodingProvider::Claude => Some(borg_provider::claude_default_effort().to_string()),
         CodingProvider::OpenCode
+        | CodingProvider::Grok
+        | CodingProvider::Muse
         | CodingProvider::OpenRouter
         | CodingProvider::OpenAiCompatible => None,
     }

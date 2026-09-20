@@ -89,7 +89,7 @@ pub struct WorkspaceStoreOverride(pub std::sync::Arc<dyn crate::WorkspaceStore>)
 
 impl std::fmt::Debug for WorkspaceStoreOverride {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("WorkspaceStoreOverride(<controller>)" )
+        formatter.write_str("WorkspaceStoreOverride(<controller>)")
     }
 }
 

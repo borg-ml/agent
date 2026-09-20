@@ -676,6 +676,25 @@ impl RuntimeSessionStore {
             self.context_events = self.store.recovery(session_id).await?.context_events;
             self.context_complete = true;
         }
+        self.resolve_deferred_provider_payloads().await
+    }
+
+    /// Restore native provider payloads the store deferred out of the event
+    /// body, so replay sees the exact model message that was journaled. A
+    /// payload that still fits inline is left untouched, which is what keeps
+    /// sessions written before externalization replaying unchanged.
+    async fn resolve_deferred_provider_payloads(&mut self) -> Result<()> {
+        for event in &mut self.context_events {
+            let SessionEventKind::ProviderEvent { payload, .. } = &mut event.kind else {
+                continue;
+            };
+            let Some(reference) = crate::session_store::deferred_provider_payload_ref(payload)
+            else {
+                continue;
+            };
+            let bytes = self.store.load_payload(&reference).await?;
+            crate::session_store::resolve_provider_payload(payload, &bytes)?;
+        }
         Ok(())
     }
 
@@ -770,10 +789,63 @@ impl RuntimeSessionStore {
             self.context_events.clear();
             self.context_complete = true;
         }
+        bound_context_at_compaction(&mut self.context_events, &event);
         if event.kind.is_context_relevant() {
-            self.context_events.push(event.clone());
+            let mut context_event = event.clone();
+            if let SessionEventKind::ProviderEvent { payload, .. } = &mut context_event.kind
+                && let Some(reference) =
+                    crate::session_store::deferred_provider_payload_ref(payload)
+            {
+                let bytes = self.store.load_payload(&reference).await?;
+                crate::session_store::resolve_provider_payload(payload, &bytes)?;
+            }
+            self.context_events.push(context_event);
         }
         Ok(event)
+    }
+}
+
+/// A completed `context_compaction` that `native_conversation` treats as the
+/// start of a fresh context generation: it clears the conversation at the
+/// boundary and rebuilds it from the summary plus the verbatim tail carried on
+/// the event itself. Matches the boundary arm exactly so the in-memory
+/// projection and the rebuilt conversation can never disagree about where a
+/// generation begins.
+fn starts_context_generation(kind: &SessionEventKind) -> bool {
+    matches!(
+        kind,
+        SessionEventKind::ProviderEvent { kind, payload, .. }
+            if kind == "context_compaction"
+                && compaction_restarts_replay(payload)
+                && matches!(
+                    payload.get("status").and_then(Value::as_str),
+                    None | Some("completed")
+                )
+    )
+}
+
+/// Bound the in-memory context projection at a completed compaction boundary.
+///
+/// Every event before such a boundary is superseded for replay, so a long
+/// session would otherwise retain its whole history for its whole life. They
+/// can be dropped only when the boundary directly follows a successful
+/// `TurnCompleted`: at that instant no failed and no in-flight prompt is
+/// pending, so nothing crosses the boundary, and the retained slice rebuilds
+/// the identical conversation (and the reverse scans over it --
+/// `native_declarations`, `codex_checkpoint_is_acknowledged`,
+/// `interrupted_turn_prompt` -- see the same trailing state). A boundary that
+/// follows a failed or unfinished turn is deliberately left whole: its
+/// unresolved-prompt carry lives in those pre-boundary events, and dropping
+/// them would erase a prompt the model is still owed.
+fn bound_context_at_compaction(events: &mut Vec<SessionEvent>, boundary: &SessionEvent) {
+    if !starts_context_generation(&boundary.kind) {
+        return;
+    }
+    if matches!(
+        events.last().map(|event| &event.kind),
+        Some(SessionEventKind::TurnCompleted { error: None, .. })
+    ) {
+        events.clear();
     }
 }
 
@@ -1552,9 +1624,10 @@ async fn run_agent_session_store_kernel_inner(
         // A product controller that runs the runtime in-process supplies the
         // real authenticated identities; a host derives them locally.
         let identity = launch.capabilities.runtime_workspace_identity.clone();
-        let trusted_human_participant_id = identity.as_ref().map(|identity| identity.human_participant_id);
-        let local_human_name =
-            std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
+        let trusted_human_participant_id = identity
+            .as_ref()
+            .map(|identity| identity.human_participant_id);
+        let local_human_name = std::env::var("USER").unwrap_or_else(|_| "Local user".to_string());
         let human_display_name = identity
             .as_ref()
             .map(|identity| identity.human_display_name.clone())
@@ -1664,6 +1737,7 @@ async fn run_agent_session_store_kernel_inner(
     if let Some(projection) = workspace_projection.clone() {
         journal = journal.with_workspace_projection(projection);
     }
+    journal.resolve_deferred_provider_payloads().await?;
     if fresh {
         record(
             &mut journal,
@@ -3006,10 +3080,10 @@ async fn run_agent_session_store_kernel_inner(
                                         extension_workflows: Vec::new(),
                                         extension_api: crate::ExtensionApiSnapshot::default(),
                                         system_prompt_appendix: launch
-                .capabilities
-                .system_prompt_appendix
-                .clone()
-                .unwrap_or_default(),
+                                            .capabilities
+                                            .system_prompt_appendix
+                                            .clone()
+                                            .unwrap_or_default(),
                                         declaration_base: None,
                                         volatile_system_prompt_appendix:
                                             crate::provider_capabilities_prompt(
@@ -5862,9 +5936,10 @@ fn default_consultation_effort(provider: CodingProvider) -> Option<String> {
         CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
         CodingProvider::Kimi => Some(borg_provider::kimi_default_effort().to_string()),
         CodingProvider::Glm => Some(borg_provider::kimi_default_effort().to_string()),
+        CodingProvider::Qwen => Some(borg_provider::qwen_default_effort().to_string()),
         CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => Some("medium".to_string()),
         CodingProvider::Claude => Some(borg_provider::claude_default_effort().to_string()),
-        CodingProvider::OpenCode => None,
+        CodingProvider::OpenCode | CodingProvider::Grok | CodingProvider::Muse => None,
     }
 }
 

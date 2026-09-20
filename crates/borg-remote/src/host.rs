@@ -606,6 +606,15 @@ fn rekey_event_payloads(event: &mut SessionEvent, target_session_id: Uuid) {
             event: Some(child_event),
             ..
         } => rekey_event_payloads(child_event, target_session_id),
+        crate::SessionEventKind::ProviderEvent { payload, .. } => {
+            if let Some(mut reference) =
+                crate::session_store::deferred_provider_payload_ref(payload)
+            {
+                reference.id = Uuid::new_v5(&target_session_id, reference.id.as_bytes());
+                payload[crate::PROVIDER_PAYLOAD_REF_FIELD] =
+                    serde_json::to_value(reference).expect("a payload reference serializes");
+            }
+        }
         _ => {}
     }
 }
@@ -624,7 +633,7 @@ fn scoped_payload_refs(
         .kind
         .payload_refs()
         .into_iter()
-        .map(|payload| (target_session_id, payload.clone()))
+        .map(|payload| (target_session_id, payload))
         .collect::<Vec<_>>();
     if let crate::SessionEventKind::SubagentActivity {
         event: Some(child_event),
@@ -1262,9 +1271,12 @@ async fn probe_provider(
                         match provider {
                             CodingProvider::Codex
                             | CodingProvider::Claude
-                            | CodingProvider::OpenCode => provider_auth_status(provider).await.ok(),
+                            | CodingProvider::OpenCode
+                            | CodingProvider::Grok
+                            | CodingProvider::Muse => provider_auth_status(provider).await.ok(),
                             CodingProvider::Kimi
                             | CodingProvider::Glm
+                            | CodingProvider::Qwen
                             | CodingProvider::OpenRouter
                             | CodingProvider::OpenAiCompatible => None,
                         }
@@ -1280,8 +1292,14 @@ async fn probe_provider(
                     CodingProvider::OpenCode => auth_status
                         .as_deref()
                         .is_some_and(opencode_auth_status_authenticated),
+                    // Grok Build and Muse Code keep their subscription session
+                    // in their own credential file; presence of that session or
+                    // an API key is the signal.
+                    CodingProvider::Grok => grok_credentials_present(),
+                    CodingProvider::Muse => muse_credentials_present(),
                     CodingProvider::Kimi
                     | CodingProvider::Glm
+                    | CodingProvider::Qwen
                     | CodingProvider::OpenRouter
                     | CodingProvider::OpenAiCompatible => false,
                 };
@@ -1372,6 +1390,32 @@ async fn probe_provider(
             }
             (!auth_methods.is_empty()).then_some(BillingLane::Subscription)
         }
+        CodingProvider::Grok => {
+            if subscription_authenticated {
+                auth_methods.push(ProviderAuthMethod::Subscription);
+                detail.push("Grok Build subscription authenticated");
+                Some(BillingLane::Subscription)
+            } else if nonempty_env("XAI_API_KEY").is_some() {
+                auth_methods.push(ProviderAuthMethod::ApiKey);
+                detail.push("xAI API key configured");
+                Some(BillingLane::ApiKey)
+            } else {
+                None
+            }
+        }
+        CodingProvider::Muse => {
+            if subscription_authenticated {
+                auth_methods.push(ProviderAuthMethod::Subscription);
+                detail.push("Muse Code subscription authenticated");
+                Some(BillingLane::Subscription)
+            } else if nonempty_env("META_API_KEY").is_some() {
+                auth_methods.push(ProviderAuthMethod::ApiKey);
+                detail.push("Meta API key configured");
+                Some(BillingLane::ApiKey)
+            } else {
+                None
+            }
+        }
         CodingProvider::Kimi => {
             if managed_kimi {
                 auth_methods.push(ProviderAuthMethod::Endpoint);
@@ -1400,6 +1444,26 @@ async fn probe_provider(
             } else if nonempty_env("BORG_GLM_API_KEY").is_some() {
                 auth_methods.push(ProviderAuthMethod::ApiKey);
                 detail.push("GLM API key configured");
+                Some(BillingLane::ApiKey)
+            } else {
+                None
+            }
+        }
+        CodingProvider::Qwen => {
+            // A selected Qwen Coding Plan supplies its own `sk-sp-` key; a
+            // pay-as-you-go DashScope key is the fallback.
+            if borg_provider::subscription::active_for(borg_provider::Plan::QwenCoding)
+                .and_then(|plan| plan.api_key())
+                .is_some()
+            {
+                auth_methods.push(ProviderAuthMethod::Subscription);
+                detail.push("Qwen Coding Plan key configured");
+                Some(BillingLane::Subscription)
+            } else if nonempty_env("BORG_QWEN_API_KEY").is_some()
+                || nonempty_env("DASHSCOPE_API_KEY").is_some()
+            {
+                auth_methods.push(ProviderAuthMethod::ApiKey);
+                detail.push("Qwen API key configured");
                 Some(BillingLane::ApiKey)
             } else {
                 None
@@ -1458,10 +1522,14 @@ async fn probe_provider(
         CodingProvider::Codex
         | CodingProvider::Kimi
         | CodingProvider::Glm
+        | CodingProvider::Qwen
         | CodingProvider::OpenRouter
         | CodingProvider::OpenAiCompatible => true,
         CodingProvider::OpenCode if native_go => true,
-        CodingProvider::Claude | CodingProvider::OpenCode => match mode {
+        CodingProvider::Claude
+        | CodingProvider::OpenCode
+        | CodingProvider::Grok
+        | CodingProvider::Muse => match mode {
             ProviderProbeMode::Admission => {
                 executable_in_path(Path::new(provider.executable())).is_some()
             }
@@ -1499,11 +1567,34 @@ fn provider_subscription_credentials_present(provider: CodingProvider) -> bool {
         CodingProvider::OpenCode => opencode_auth_json()
             .as_ref()
             .is_some_and(opencode_auth_json_authenticated),
+        CodingProvider::Grok => grok_credentials_present(),
+        CodingProvider::Muse => muse_credentials_present(),
         CodingProvider::Kimi
         | CodingProvider::Glm
+        | CodingProvider::Qwen
         | CodingProvider::OpenRouter
         | CodingProvider::OpenAiCompatible => false,
     }
+}
+
+/// Grok Build caches its subscription session in `~/.grok/auth.json`; an
+/// `XAI_API_KEY` is the pay-as-you-go alternative.
+fn grok_credentials_present() -> bool {
+    nonempty_env("XAI_API_KEY").is_some()
+        || std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(|home| PathBuf::from(home).join(".grok").join("auth.json"))
+            .is_some_and(|path| path.is_file())
+}
+
+/// Muse Code stores the credential `muse auth set` / browser sign-in writes
+/// under `~/.muse`; `META_API_KEY` is the CI alternative.
+fn muse_credentials_present() -> bool {
+    nonempty_env("META_API_KEY").is_some()
+        || std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(|home| PathBuf::from(home).join(".muse"))
+            .is_some_and(|path| path.is_dir())
 }
 
 /// On macOS the Claude CLI keeps its OAuth session in the login Keychain and
@@ -1657,6 +1748,18 @@ async fn provider_auth_status(provider: CodingProvider) -> Result<String> {
         CodingProvider::OpenCode => {
             runtime_output(borg_provider::Runtime::OpenCode, &["providers", "list"]).await
         }
+        CodingProvider::Grok => Ok(if grok_credentials_present() {
+            "Logged in"
+        } else {
+            "Not logged in"
+        }
+        .to_string()),
+        CodingProvider::Muse => Ok(if muse_credentials_present() {
+            "Logged in"
+        } else {
+            "Not logged in"
+        }
+        .to_string()),
         _ => bail!("{provider:?} does not use an interactive provider login"),
     }
 }
@@ -1765,8 +1868,13 @@ pub fn provider_credentials_present(provider: CodingProvider) -> bool {
             borg_provider::credentials::opencode_go_api_key().is_some()
                 || provider_subscription_credentials_present(provider)
         }
+        CodingProvider::Grok => grok_credentials_present(),
+        CodingProvider::Muse => muse_credentials_present(),
         CodingProvider::Kimi => {
-            nonempty_env("BORG_KIMI_API_KEY").is_some()
+            borg_provider::subscription::active_for(borg_provider::Plan::KimiCode)
+                .and_then(|plan| plan.api_key())
+                .is_some()
+                || nonempty_env("BORG_KIMI_API_KEY").is_some()
                 || nonempty_env("MOONSHOT_API_KEY").is_some()
         }
         CodingProvider::Glm => {
@@ -1774,6 +1882,13 @@ pub fn provider_credentials_present(provider: CodingProvider) -> bool {
                 .and_then(|plan| plan.api_key())
                 .is_some()
                 || nonempty_env("BORG_GLM_API_KEY").is_some()
+        }
+        CodingProvider::Qwen => {
+            borg_provider::subscription::active_for(borg_provider::Plan::QwenCoding)
+                .and_then(|plan| plan.api_key())
+                .is_some()
+                || nonempty_env("BORG_QWEN_API_KEY").is_some()
+                || nonempty_env("DASHSCOPE_API_KEY").is_some()
         }
         CodingProvider::OpenRouter => borg_provider::credentials::api_key(
             borg_provider::credentials::ApiKeyCredential::OpenRouter,
@@ -1800,8 +1915,15 @@ fn provider_login_command(provider: CodingProvider, mut command: Command) -> Res
         CodingProvider::OpenCode => {
             command.args(["providers", "login"]);
         }
+        CodingProvider::Grok => {
+            command.args(["login"]);
+        }
+        CodingProvider::Muse => {
+            command.args(["login"]);
+        }
         CodingProvider::Kimi
         | CodingProvider::Glm
+        | CodingProvider::Qwen
         | CodingProvider::OpenRouter
         | CodingProvider::OpenAiCompatible => {
             unreachable!("handled above")
@@ -4141,8 +4263,11 @@ fn provider_arg(provider: CodingProvider) -> &'static str {
         CodingProvider::Codex => "codex",
         CodingProvider::Claude => "claude",
         CodingProvider::OpenCode => "open-code",
+        CodingProvider::Grok => "grok",
+        CodingProvider::Muse => "muse",
         CodingProvider::Kimi => "kimi",
         CodingProvider::Glm => "glm",
+        CodingProvider::Qwen => "qwen",
         CodingProvider::OpenRouter => "open-router",
         CodingProvider::OpenAiCompatible => "open-ai-compatible",
     }

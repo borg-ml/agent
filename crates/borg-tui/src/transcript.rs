@@ -1012,9 +1012,10 @@ impl Transcript {
                     *detail = format!("“{}”", compact_text(&query, 120));
                 }
             }
-            // Provider prompts are attached to their own provider event, never
-            // to a tool row, so there is nothing to hydrate here.
-            SessionPayloadKind::ProviderPrompt => {}
+            // Provider prompts and native provider model messages are attached
+            // to their own provider event, never to a tool row, so there is
+            // nothing to hydrate here.
+            SessionPayloadKind::ProviderPrompt | SessionPayloadKind::ProviderModelMessage => {}
         }
         payload_refs.retain(|candidate| candidate.id != payload.id);
         Ok(())

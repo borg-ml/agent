@@ -433,8 +433,11 @@ fn cache_window(provider: CodingProvider) -> Option<Duration> {
         CodingProvider::Codex => Some(CODEX_CACHE_WINDOW),
         CodingProvider::Claude => Some(CLAUDE_CACHE_WINDOW),
         CodingProvider::OpenCode
+        | CodingProvider::Grok
+        | CodingProvider::Muse
         | CodingProvider::Kimi
         | CodingProvider::Glm
+        | CodingProvider::Qwen
         | CodingProvider::OpenRouter
         | CodingProvider::OpenAiCompatible => None,
     }

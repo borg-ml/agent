@@ -270,7 +270,9 @@ impl CodexModelProvider {
     /// file, so a managed session records the identity of the subscription it
     /// actually used rather than the host-local one.
     pub async fn account_identity_from(auth_file: Option<std::path::PathBuf>) -> Result<String> {
-        Ok(SubscriptionAccess::read_with(auth_file, None).await?.identity())
+        Ok(SubscriptionAccess::read_with(auth_file, None)
+            .await?
+            .identity())
     }
 
     /// Keep the credentials selected at turn admission stable while this turn runs.
@@ -1190,6 +1192,7 @@ mod tests {
         let mut access = SubscriptionAccess {
             token: "test-api-key".into(),
             account_id: String::new(),
+            auth_file: None,
         };
         assert_eq!(access.endpoint(), "https://api.openai.com/v1/responses");
         let identity = access.identity();
@@ -1264,7 +1267,7 @@ mod tests {
                     }
                     listener
                 });
-                let mut access = SubscriptionAccess { token: "old-token".into(), account_id: "account-a".into() };
+                let mut access = SubscriptionAccess { token: "old-token".into(), account_id: "account-a".into(), auth_file: None };
                 let account = access.identity();
                 let refreshes = std::sync::atomic::AtomicUsize::new(0);
                 let result = access.send_with_recovery(
@@ -1276,6 +1279,7 @@ mod tests {
                         Ok(SubscriptionAccess {
                             token: "new-token".into(),
                             account_id: if recovery == "changed" { "account-b" } else { "account-a" }.into(),
+                            auth_file: None,
                         })
                     },
                 ).await;
@@ -1541,14 +1545,17 @@ mod tests {
         let original = SubscriptionAccess {
             token: "old-token".into(),
             account_id: "account-a".into(),
+            auth_file: None,
         };
         let mut changed = SubscriptionAccess {
             token: "new-token".into(),
             account_id: "account-b".into(),
+            auth_file: None,
         };
         let refreshed = SubscriptionAccess {
             token: "refreshed-token".into(),
             account_id: "account-a".into(),
+            auth_file: None,
         };
         assert_eq!(original.identity(), refreshed.identity());
         let request = ModelTurnRequest {
@@ -1662,7 +1669,7 @@ mod tests {
             let mut request = ModelTurnRequest { fast: true, request_id: Some("request".into()), session_id: Some("session".into()),
                 prompt_cache_key: Some("cache".into()), messages: vec![ModelMessage::user("Inspect.")],
                 tools: vec![super::super::ModelToolDefinition::new("inspect", "Inspect", json!({"type":"object"})).unwrap()], output_schema: None };
-            let mut access = SubscriptionAccess { token: "test-token".into(), account_id: "test-account".into() };
+            let mut access = SubscriptionAccess { token: "test-token".into(), account_id: "test-account".into(), auth_file: None };
             let account = access.identity();
             let response = provider.send(&reqwest::Client::new(), &endpoint,
                 &mut access, &account,

@@ -77,6 +77,9 @@ pub enum OpenAiCompatibleProfile {
     Kimi,
     /// Z.ai GLM, reached over the same OpenAI-compatible wire format.
     Glm,
+    /// Alibaba Cloud Model Studio (Qwen), reached over the same
+    /// OpenAI-compatible wire format.
+    Qwen,
     OpenRouter,
     Generic,
 }
@@ -86,6 +89,7 @@ impl OpenAiCompatibleProfile {
         match self {
             Self::Kimi => "kimi",
             Self::Glm => "glm",
+            Self::Qwen => "qwen",
             Self::OpenRouter => "openrouter",
             Self::Generic => "openai-compatible",
         }
@@ -95,6 +99,7 @@ impl OpenAiCompatibleProfile {
         match self {
             Self::Kimi => kimi_chat_completions_endpoint(),
             Self::Glm => glm_chat_completions_endpoint(),
+            Self::Qwen => qwen_chat_completions_endpoint(),
             Self::OpenRouter => openrouter_chat_completions_endpoint(),
             Self::Generic => chat_completions_endpoint(),
         }
@@ -112,6 +117,13 @@ impl OpenAiCompatibleProfile {
             Self::Glm => subscription_key(crate::subscription::Plan::GlmCoding)
                 .or_else(|| nonempty_env("BORG_GLM_API_KEY"))
                 .or_else(|| nonempty_env("ZHIPUAI_API_KEY")),
+            Self::Qwen => {
+                // A selected Coding Plan supplies its own `sk-sp-` key; the
+                // pay-as-you-go DashScope key remains the fallback.
+                subscription_key(crate::subscription::Plan::QwenCoding)
+                    .or_else(|| nonempty_env("BORG_QWEN_API_KEY"))
+                    .or_else(|| nonempty_env("DASHSCOPE_API_KEY"))
+            }
             Self::OpenRouter => {
                 crate::credentials::api_key(crate::credentials::ApiKeyCredential::OpenRouter)
             }
@@ -308,6 +320,12 @@ impl OpenAiCompatibleProvider {
                          GLM Coding Plan, or BORG_GLM_API_KEY for the pay-as-you-go API"
                             .to_string()
                     }
+                    OpenAiCompatibleProfile::Qwen => {
+                        "no Qwen key: select the Qwen Coding Plan with `borg login qwen` \
+                         (BAILIAN_CODING_PLAN_API_KEY), or set DASHSCOPE_API_KEY for the \
+                         pay-as-you-go Model Studio API"
+                            .to_string()
+                    }
                     OpenAiCompatibleProfile::OpenRouter => {
                         "OPENROUTER_API_KEY is not set".to_string()
                     }
@@ -365,6 +383,13 @@ impl OpenAiCompatibleProvider {
                 // separate completion-token knob to set here.
                 body["reasoning_effort"] = json!(glm_reasoning_effort(self.effort.as_deref()));
             }
+            OpenAiCompatibleProfile::Qwen => {
+                // Alibaba's OpenAI-compatible route gates reasoning with
+                // `enable_thinking` rather than the OpenAI `reasoning_effort`
+                // spelling. Thinking is on by default; a caller asking for no
+                // effort turns it off so a cheap turn stays cheap.
+                body["enable_thinking"] = json!(qwen_thinking_enabled(self.effort.as_deref()));
+            }
             OpenAiCompatibleProfile::OpenRouter => {
                 if let Some(reasoning) = compatible_reasoning(self.effort.as_deref()) {
                     body["reasoning"] = reasoning;
@@ -421,9 +446,9 @@ impl OpenAiCompatibleProvider {
         }
         if let Some(schema) = request.output_schema.as_ref() {
             let format = match profile {
-                OpenAiCompatibleProfile::Kimi | OpenAiCompatibleProfile::Glm => {
-                    Some("json_schema".to_string())
-                }
+                OpenAiCompatibleProfile::Kimi
+                | OpenAiCompatibleProfile::Glm
+                | OpenAiCompatibleProfile::Qwen => Some("json_schema".to_string()),
                 OpenAiCompatibleProfile::OpenRouter => {
                     nonempty_env("BORG_OPENROUTER_RESPONSE_FORMAT")
                         .or_else(|| Some("json_schema".to_string()))
@@ -598,6 +623,9 @@ impl OpenAiCompatibleProvider {
             // Plan usage is quota-metered rather than priced per token, so the
             // generic extractor (which reports no cost) is the honest one.
             OpenAiCompatibleProfile::Glm => {
+                extract_chat_completions_usage(&streamed.raw, duration_ms, None)
+            }
+            OpenAiCompatibleProfile::Qwen => {
                 extract_chat_completions_usage(&streamed.raw, duration_ms, None)
             }
             OpenAiCompatibleProfile::OpenRouter => extract_chat_completions_usage(
@@ -886,6 +914,21 @@ fn glm_chat_completions_endpoint() -> String {
         // Without a plan, the general API host is the right default.
         .unwrap_or_else(|| "https://api.z.ai/api/paas/v4".to_string());
     chat_completions_url(base)
+}
+
+fn qwen_chat_completions_endpoint() -> String {
+    // An active Coding Plan is served from the regional `coding.` host; without
+    // one, the international pay-as-you-go compatible-mode host is the default.
+    let base = nonempty_env("BORG_QWEN_BASE_URL")
+        .or_else(|| subscription_base_url(crate::subscription::Plan::QwenCoding))
+        .unwrap_or_else(|| "https://dashscope-intl.aliyuncs.com/compatible-mode/v1".to_string());
+    chat_completions_url(base)
+}
+
+/// Qwen gates reasoning with `enable_thinking`. A caller that asked for no
+/// effort gets thinking off; every other level leaves the vendor default on.
+fn qwen_thinking_enabled(effort: Option<&str>) -> bool {
+    !matches!(effort.map(str::trim), Some("none") | Some("off"))
 }
 
 fn kimi_reasoning_effort(effort: Option<&str>) -> &'static str {

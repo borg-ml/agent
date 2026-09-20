@@ -1490,6 +1490,7 @@ impl ProviderModelClient {
         let profile = match provider {
             crate::CodingProvider::Kimi => OpenAiCompatibleProfile::Kimi,
             crate::CodingProvider::Glm => OpenAiCompatibleProfile::Glm,
+            crate::CodingProvider::Qwen => OpenAiCompatibleProfile::Qwen,
             crate::CodingProvider::OpenRouter => OpenAiCompatibleProfile::OpenRouter,
             crate::CodingProvider::OpenAiCompatible => OpenAiCompatibleProfile::Generic,
             // OpenCode reaches the native client only through the Go access
@@ -1504,7 +1505,9 @@ impl ProviderModelClient {
             }
             crate::CodingProvider::Codex
             | crate::CodingProvider::Claude
-            | crate::CodingProvider::OpenCode => return Err(NotNative),
+            | crate::CodingProvider::OpenCode
+            | crate::CodingProvider::Grok
+            | crate::CodingProvider::Muse => return Err(NotNative),
         };
         Ok(NativeRoute::ChatCompletions { profile, gateway })
     }
@@ -4396,7 +4399,7 @@ mod tests {
                     ..Default::default()
                 }],
                 runtime_mcp_context: Default::default(),
-            runtime_provider_context: None,
+                runtime_provider_context: None,
                 extension_skill_roots: Vec::new(),
                 extension_workflows: Vec::new(),
                 extension_api: Default::default(),
@@ -5957,7 +5960,7 @@ mod tests {
                 .with_watches(watches.clone()),
                 external_mcp_servers: Vec::new(),
                 runtime_mcp_context: Default::default(),
-            runtime_provider_context: None,
+                runtime_provider_context: None,
                 extension_skill_roots: Vec::new(),
                 extension_workflows: Vec::new(),
                 extension_api: Default::default(),
@@ -6192,7 +6195,7 @@ mod tests {
                 .with_watches(watches.clone()),
                 external_mcp_servers: Vec::new(),
                 runtime_mcp_context: Default::default(),
-            runtime_provider_context: None,
+                runtime_provider_context: None,
                 extension_skill_roots: Vec::new(),
                 extension_workflows: Vec::new(),
                 extension_api: Default::default(),
@@ -6647,7 +6650,7 @@ mod tests {
                 ),
                 external_mcp_servers: Vec::new(),
                 runtime_mcp_context: Default::default(),
-            runtime_provider_context: None,
+                runtime_provider_context: None,
                 extension_skill_roots: Vec::new(),
                 extension_workflows: Vec::new(),
                 extension_api: Default::default(),

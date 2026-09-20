@@ -10386,6 +10386,78 @@ fn native_replay_preserves_an_interrupted_incomplete_tool_round() {
 }
 
 #[test]
+fn an_oversized_native_model_message_is_deferred_and_replays_identically() {
+    use crate::session_store::{
+        INLINE_SESSION_PAYLOAD_BYTES, deferred_provider_payload, deferred_provider_payload_ref,
+        oversized_provider_payload_bytes, resolve_provider_payload,
+    };
+    use crate::{SessionPayloadKind, SessionPayloadRef};
+    use borg_provider::provider::ModelMessage;
+
+    let session_id = Uuid::new_v4();
+    let message = ModelMessage::user("x".repeat(INLINE_SESSION_PAYLOAD_BYTES + 1024));
+    let payload = serde_json::to_value(&message).unwrap();
+    let event = |payload| {
+        SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "native_model_message".to_string(),
+                payload,
+            },
+        )
+    };
+
+    // The store defers a payload above the inline limit and keeps only a
+    // reference behind.
+    let bytes = oversized_provider_payload_bytes(&payload)
+        .unwrap()
+        .expect("a payload above the inline limit must be deferred");
+    let reference = SessionPayloadRef {
+        id: Uuid::new_v4(),
+        kind: SessionPayloadKind::ProviderModelMessage,
+        byte_len: bytes.len() as u64,
+    };
+    let deferred = event(deferred_provider_payload(&reference));
+    assert_eq!(
+        deferred.kind.deferred_provider_payload_ref(),
+        Some(reference.clone())
+    );
+    // The reference is what a relay transfer moves, so it must be visible
+    // through the same accessor tool payloads use.
+    assert_eq!(deferred.kind.payload_refs(), vec![reference]);
+    assert!(
+        serde_json::to_vec(&deferred.kind).unwrap().len()
+            < serde_json::to_vec(&payload).unwrap().len()
+    );
+
+    // A legacy inline event still replays unchanged.
+    let inline = event(payload);
+    let expected =
+        native_conversation(std::slice::from_ref(&inline), CodingProvider::Codex).unwrap();
+    assert_eq!(expected, vec![message]);
+
+    // Resolving the reference reconstructs the identical model message.
+    let mut resolved = deferred.clone();
+    {
+        let SessionEventKind::ProviderEvent { payload, .. } = &mut resolved.kind else {
+            unreachable!("provider event");
+        };
+        resolve_provider_payload(payload, &bytes).unwrap();
+        assert_eq!(
+            deferred_provider_payload_ref(payload),
+            None,
+            "a resolved payload is no longer deferred"
+        );
+    }
+    assert_eq!(
+        native_conversation(std::slice::from_ref(&resolved), CodingProvider::Codex).unwrap(),
+        expected
+    );
+}
+
+#[test]
 fn native_replay_keeps_completed_batch_results_after_failure_or_crash() {
     use borg_provider::provider::{ModelMessage, ModelToolCall};
 
@@ -10978,6 +11050,101 @@ fn failed_user_prompt_survives_a_later_context_compaction_boundary() {
             ModelMessage::user("preserve this before compacting"),
         ]
     );
+}
+
+/// A completed compaction boundary that follows a successful turn opens a new
+/// context generation, so the in-memory projection can drop everything before
+/// it while the rebuilt conversation stays identical. A boundary after a failed
+/// or unfinished turn is the unsafe case: its unresolved prompt is carried
+/// across the boundary from those pre-boundary events, so it must stay whole.
+#[test]
+fn a_clean_compaction_boundary_bounds_context_without_changing_replay() {
+    use borg_provider::provider::ModelMessage;
+
+    let session_id = Uuid::new_v4();
+    let turn = |message_id: Uuid, prompt: &str, error: Option<&str>, sequence: u64| {
+        [
+            SessionEvent::new(
+                session_id,
+                sequence,
+                SessionEventKind::TurnStarted {
+                    message_id,
+                    provider: CodingProvider::Codex,
+                    model: Some("gpt-5.6-luna".to_string()),
+                    effort: Some("max".to_string()),
+                    fast: false,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                sequence + 1,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::User,
+                    text: prompt.to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ),
+            SessionEvent::new(
+                session_id,
+                sequence + 2,
+                SessionEventKind::TurnCompleted {
+                    message_id,
+                    provider_session_id: None,
+                    final_text: "done".to_string(),
+                    error: error.map(str::to_string),
+                },
+            ),
+        ]
+    };
+    let boundary = SessionEvent::new(
+        session_id,
+        4,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: json!({"status": "completed", "summary": "kept decisions"}),
+        },
+    );
+    let mut superseded: Vec<SessionEvent> =
+        turn(Uuid::new_v4(), "work the summary replaces", None, 1).into();
+    let mut full = superseded.clone();
+    full.push(boundary.clone());
+    full.extend(turn(Uuid::new_v4(), "continue", None, 5));
+
+    bound_context_at_compaction(&mut superseded, &boundary);
+    assert!(
+        superseded.is_empty(),
+        "a clean boundary drops the superseded generation"
+    );
+    let mut bounded = superseded;
+    bounded.push(boundary.clone());
+    bounded.extend(full[4..].iter().cloned());
+
+    assert_eq!(
+        native_conversation(&bounded, CodingProvider::Codex).unwrap(),
+        vec![
+            ModelMessage::user("Previous conversation summary:\n\nkept decisions"),
+            ModelMessage::user("continue"),
+        ]
+    );
+    assert_eq!(
+        native_conversation(&bounded, CodingProvider::Codex).unwrap(),
+        native_conversation(&full, CodingProvider::Codex).unwrap(),
+        "the bounded generation must rebuild the same conversation"
+    );
+
+    let mut failed: Vec<SessionEvent> = turn(
+        Uuid::new_v4(),
+        "owed to the model",
+        Some("turn interrupted"),
+        1,
+    )
+    .into();
+    bound_context_at_compaction(&mut failed, &boundary);
+    assert_eq!(failed.len(), 3, "a failed boundary keeps its carry");
 }
 
 #[test]
