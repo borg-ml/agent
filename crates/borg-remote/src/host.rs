@@ -2037,7 +2037,7 @@ pub async fn run_host_with_executor_factory(
             &config,
             &session_root,
             &sessions,
-            session_store.as_ref(),
+            &session_store,
             &executor_factory,
         )
         .await
@@ -3404,6 +3404,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                 request: *request,
                 attachment,
             },
+            Arc::clone(&session_store),
         )
         .await;
         return true;
@@ -3565,6 +3566,7 @@ async fn dispatch(context: DispatchContext, command: HostCommand) -> bool {
                                 request: metadata.request,
                                 attachment: metadata.attachment,
                             },
+                            Arc::clone(&session_store),
                         )
                         .await,
                     )
@@ -4586,7 +4588,7 @@ async fn resume_pending_host_sessions(
     config: &HostConfig,
     session_root: &Path,
     sessions: &Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
-    session_store: &dyn SessionStore,
+    session_store: &Arc<dyn SessionStore>,
     executor_factory: &HostExecutorFactory,
 ) -> Result<usize> {
     let mut available = config
@@ -4733,6 +4735,7 @@ async fn resume_pending_host_sessions(
                 request: metadata.request,
                 attachment: metadata.attachment,
             },
+            Arc::clone(session_store),
         )
         .await;
         available -= 1;
@@ -4747,11 +4750,13 @@ async fn spawn_host_session(
     sessions: Arc<Mutex<HashMap<Uuid, mpsc::Sender<HostCommand>>>>,
     executor_factory: HostExecutorFactory,
     launch: HostSessionLaunch,
+    durable_store: Arc<dyn SessionStore>,
 ) -> mpsc::Sender<HostCommand> {
     let session_id = launch.session_id;
     let (tx, rx) = mpsc::channel(64);
     sessions.lock().await.insert(session_id, tx.clone());
     let sessions_for_cleanup = sessions.clone();
+    let cleanup_store = Arc::clone(&durable_store);
     tokio::spawn(async move {
         let mut supervisor = AbortTask(tokio::spawn(run_session(
             client.clone(),
@@ -4760,6 +4765,7 @@ async fn spawn_host_session(
             executor_factory,
             launch,
             rx,
+            durable_store,
         )));
         if let Err(error) = (&mut supervisor.0)
             .await
@@ -4769,15 +4775,10 @@ async fn spawn_host_session(
             tracing::error!(session_id = %session_id, %error, "remote agent session failed");
             // A fresh launch has no action for ordinary prompt recovery yet.
             // Keep its bootstrap marker until terminal settlement is durable.
-            // Best-effort cleanup on a failed launch: open the configured
-            // backend, and if even that fails, leave the bootstrap marker
-            // rather than guessing at the session's state.
-            if let Ok(opened) = crate::session_store::factory::open(
-                &crate::session_store::factory::SessionStoreConfig::from_env(),
-            )
-            .await
+            // Best-effort cleanup on a failed launch, through the same store
+            // the session ran on.
             {
-                let store = Arc::clone(opened.session());
+                let store = cleanup_store;
                 match stored_host_session_state(store.as_ref(), session_id).await {
                     Ok(state)
                         if state
@@ -4800,8 +4801,6 @@ async fn spawn_host_session(
                         tracing::warn!(%error, %session_id, "cannot read failed bootstrap; retaining recovery marker")
                     }
                 }
-            } else {
-                tracing::warn!(%session_id, "cannot open failed bootstrap journal; retaining recovery marker");
             }
         }
         sessions_for_cleanup.lock().await.remove(&session_id);
@@ -4860,6 +4859,7 @@ async fn run_session(
     executor_factory: HostExecutorFactory,
     launch_request: HostSessionLaunch,
     commands: mpsc::Receiver<HostCommand>,
+    durable_store: Arc<dyn SessionStore>,
 ) -> Result<()> {
     let HostSessionLaunch {
         session_id,
@@ -4868,14 +4868,6 @@ async fn run_session(
     } = launch_request;
     launch.cwd = validate_host_cwd(&config.roots, &launch.cwd)?;
     discard_serialized_extension_roots(&mut launch);
-    // This session is about to run, so resolve every tier before starting it.
-    let durable_store = Arc::clone(
-        crate::session_store::factory::open_resolved(
-            &crate::session_store::factory::SessionStoreConfig::from_env(),
-        )
-        .await?
-        .session(),
-    );
     ensure_host_launch_owner(&client, &config, durable_store.as_ref(), session_id).await?;
     // Expired recovery must not depend on relay availability or create a provider.
     if stored_host_session_state(durable_store.as_ref(), session_id)
@@ -6238,6 +6230,17 @@ mod tests {
         );
     }
     use crate::{RuntimeMcpServer, WorkspaceFilesystemOperation};
+
+    /// The store a host process opens for itself, pointed at this test's own
+    /// journal. `run_session` is handed its store rather than resolving one
+    /// from the environment, so a test drives the same database it seeded.
+    async fn host_store(scratch: &ScratchDatabase) -> Arc<dyn SessionStore> {
+        Arc::new(
+            PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+                .await
+                .unwrap(),
+        )
+    }
 
     /// Receipts live in the same scratch database as the session store that
     /// bootstrapped its schema, which is how a host holds them in production.
@@ -8456,6 +8459,7 @@ mod tests {
                 attachment: None,
             },
             rx,
+            host_store(&scratch).await,
         )));
         tokio::time::timeout(Duration::from_secs(30), started.notified())
             .await
@@ -8526,7 +8530,7 @@ mod tests {
             &config,
             root.path(),
             &sessions,
-            &store,
+            &host_store(&scratch).await,
             &forbidden,
         )
         .await
@@ -8636,7 +8640,7 @@ mod tests {
                 &foreign,
                 root.path(),
                 &sessions,
-                &store,
+                &host_store(&scratch).await,
                 &executor,
             )
             .await
@@ -8649,7 +8653,7 @@ mod tests {
                 &foreign,
                 root.path(),
                 &sessions,
-                &store,
+                &host_store(&scratch).await,
                 &executor,
             )
             .await
@@ -8661,7 +8665,7 @@ mod tests {
                 &config,
                 root.path(),
                 &sessions,
-                &store,
+                &host_store(&scratch).await,
                 &executor,
             )
             .await
@@ -8691,7 +8695,7 @@ mod tests {
                 &config,
                 root.path(),
                 &sessions,
-                &store,
+                &host_store(&scratch).await,
                 &executor,
             )
             .await
@@ -8715,7 +8719,7 @@ mod tests {
                 &extended,
                 root.path(),
                 &sessions,
-                &store,
+                &host_store(&scratch).await,
                 &executor,
             )
             .await
@@ -8730,7 +8734,7 @@ mod tests {
                 &config,
                 root.path(),
                 &sessions,
-                &store,
+                &host_store(&scratch).await,
                 &executor,
             )
             .await
@@ -8766,7 +8770,7 @@ mod tests {
                 &config,
                 root.path(),
                 &sessions,
-                &store,
+                &host_store(&scratch).await,
                 &executor,
             )
             .await
@@ -8847,6 +8851,7 @@ mod tests {
                     attachment: None
                 },
                 held_rx,
+                host_store(&scratch).await,
             )
             .await
             .is_err()
@@ -8875,6 +8880,7 @@ mod tests {
                     attachment: None,
                 },
                 rx,
+                host_store(&scratch).await,
             ),
         )
         .await;
@@ -8992,6 +8998,7 @@ mod tests {
                     request: launch,
                     attachment: None,
                 },
+                host_store(&scratch).await,
             )
             .await;
             tokio::time::timeout(Duration::from_secs(30), reached.notified())
@@ -9059,7 +9066,7 @@ mod tests {
                 &config,
                 root.path(),
                 &sessions,
-                &store,
+                &host_store(&scratch).await,
                 &retry,
             )
             .await
@@ -9173,6 +9180,7 @@ mod tests {
                 attachment: None,
             },
             rx,
+            host_store(&scratch).await,
         )));
         tokio::time::timeout(Duration::from_secs(30), started.notified())
             .await
@@ -9262,6 +9270,7 @@ mod tests {
                     attachment: None,
                 },
                 rx,
+                host_store(&scratch).await,
             )));
             tokio::time::timeout(Duration::from_secs(30), started.notified())
                 .await
@@ -9406,7 +9415,7 @@ mod tests {
             &config,
             root.path(),
             &sessions,
-            store.as_ref(),
+            &host_store(&scratch).await,
             &executor,
         )
         .await
@@ -9605,6 +9614,7 @@ mod tests {
                         attachment: None
                     },
                     rx,
+                    host_store(&scratch).await,
                 )
             )
             .await
@@ -9649,7 +9659,7 @@ mod tests {
             &config,
             root.path(),
             &sessions,
-            store.as_ref(),
+            &host_store(&scratch).await,
             &executor,
         )
         .await
@@ -9727,7 +9737,7 @@ mod tests {
             &config,
             root.path(),
             &sessions,
-            store.as_ref(),
+            &host_store(&scratch).await,
             &executor,
         )
         .await
@@ -10051,7 +10061,7 @@ mod tests {
                 &config,
                 root.path(),
                 &sessions,
-                &store,
+                &host_store(&scratch).await,
                 &executor,
             )
             .await
@@ -10068,7 +10078,7 @@ mod tests {
                 &config,
                 root.path(),
                 &sessions,
-                &store,
+                &host_store(&scratch).await,
                 &executor,
             )
             .await
@@ -10085,7 +10095,7 @@ mod tests {
                     &config,
                     root.path(),
                     &sessions,
-                    &store,
+                    &host_store(&scratch).await,
                     &executor,
                 )
                 .await
@@ -10368,7 +10378,7 @@ mod tests {
                 &config,
                 root.path(),
                 &sessions,
-                store.as_ref(),
+                &host_store(&scratch).await,
                 &executor,
             )
             .await
@@ -10630,7 +10640,7 @@ mod tests {
             &config,
             root.path(),
             &sessions,
-            reopened.as_ref(),
+            &reopened,
             &executor,
         )
         .await
@@ -10666,7 +10676,7 @@ mod tests {
             &config,
             root.path(),
             &sessions,
-            reopened.as_ref(),
+            &reopened,
             &executor,
         )
         .await
@@ -10711,6 +10721,7 @@ mod tests {
                 attachment: None,
             },
             stale_rx,
+            host_store(&scratch).await,
         ));
         let (mut stale_stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
             .await
@@ -12301,7 +12312,7 @@ connection: close
                 &config,
                 root.path(),
                 &sessions,
-                store.as_ref(),
+                &host_store(&scratch).await,
                 &executor,
             ),
         )
@@ -12353,7 +12364,7 @@ connection: close
                 &config,
                 root.path(),
                 &sessions,
-                &store,
+                &host_store(&scratch).await,
                 &executor,
             ),
         )
@@ -12579,7 +12590,7 @@ connection: close
             &config,
             root.path(),
             &sessions,
-            store.as_ref(),
+            &host_store(&scratch).await,
             &executor,
         )
         .await
@@ -12754,7 +12765,7 @@ connection: close
             &config,
             root.path(),
             &sessions,
-            &store,
+            &host_store(&scratch).await,
             &executor,
         )
         .await
