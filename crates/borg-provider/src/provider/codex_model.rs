@@ -292,6 +292,14 @@ impl CodexModelProvider {
         expected_account: &str,
         refresh: Option<PromptCacheRefresh>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        // See the same guard in `openai_compatible`: a refresh gets its own
+        // client request id so an upstream cannot deduplicate it against the
+        // real turn and return without refreshing anything.
+        if refresh.is_some()
+            && let Some(id) = request.request_id.as_mut()
+        {
+            id.push_str(":warm");
+        }
         let started = Instant::now();
         let mut trace = ProviderAttemptTrace {
             invocation: ProviderInvocation {

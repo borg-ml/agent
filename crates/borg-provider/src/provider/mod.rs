@@ -712,9 +712,10 @@ pub(crate) fn extract_chat_completions_usage(
 /// the provider recognises the same cached prefix and resets its expiry while
 /// billing a cache read instead of a full prompt. The cap is per route rather
 /// than a constant because "one output token" is not universally accepted: a
-/// chat-completions route takes `max_tokens: 1`, while OpenAI's Responses API
-/// rejects a cap below [`RESPONSES_MIN_OUTPUT_TOKENS`] for reasoning models.
-/// Routes that cannot express a minimal budget at all must report themselves
+/// non-reasoning chat-completions route takes a literal `1`, while any
+/// reasoning model spends the budget on reasoning tokens before it can stop,
+/// and rejects or wastes a cap below [`MIN_REASONING_OUTPUT_TOKENS`]. Routes
+/// that cannot express a minimal budget at all must report themselves
 /// ineligible rather than send a full-budget request and call it warming.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PromptCacheRefresh {
@@ -722,21 +723,21 @@ pub struct PromptCacheRefresh {
 }
 
 impl PromptCacheRefresh {
-    /// A chat-completions route honours a literal one-token budget.
+    /// A non-reasoning chat-completions route honours a literal one token.
     pub const ONE_TOKEN: Self = Self {
         max_output_tokens: 1,
     };
 
-    /// The smallest budget OpenAI's Responses API accepts for a reasoning
-    /// model. Reasoning tokens count against `max_output_tokens`, so the cap
-    /// still bounds what a refresh can spend.
-    pub const RESPONSES_MINIMUM: Self = Self {
-        max_output_tokens: RESPONSES_MIN_OUTPUT_TOKENS,
+    /// The smallest budget a reasoning model accepts, on the Responses API and
+    /// on chat completions alike. Reasoning tokens count against the cap, so
+    /// it still bounds what a refresh can spend.
+    pub const REASONING_FLOOR: Self = Self {
+        max_output_tokens: MIN_REASONING_OUTPUT_TOKENS,
     };
 }
 
-/// OpenAI rejects `max_output_tokens` below this on the Responses API.
-pub const RESPONSES_MIN_OUTPUT_TOKENS: u64 = 16;
+/// A reasoning model rejects or wastes an output cap below this.
+pub const MIN_REASONING_OUTPUT_TOKENS: u64 = 16;
 
 /// Estimate the extra API-equivalent cost of reprocessing tokens that would
 /// otherwise have been served from OpenAI's prompt cache.
@@ -765,12 +766,15 @@ pub fn estimate_openai_cache_miss_microusd(
 /// Estimate what re-reading a cached prompt of `prompt_tokens` costs, plus an
 /// upper bound on `output_tokens` of generated output.
 ///
-/// This is the price of one prompt-cache refresh. The output allowance is
-/// charged at the *input* rate because the catalog above carries no output
-/// price: a refresh emits at most a handful of tokens, and over-charging them
-/// can only make Borg warm less often than the true economics justify, never
-/// more. Returns `None` when the model's prices are unknown, which is what
-/// makes a route report honestly ineligible instead of guessing.
+/// This is the price of one prompt-cache refresh, and it is charged at the
+/// model's real output rate. Output costs several times input, so pricing the
+/// allowance as input understated every refresh -- by a small absolute amount,
+/// but in the direction that makes Borg warm more often than the economics
+/// justify, which is the wrong way for an error about someone else's money to
+/// point. The long-context multiplier is deliberately not applied to output:
+/// the threshold it keys on is a property of the prompt. Returns `None` when
+/// the model's prices are unknown, which is what makes a route report honestly
+/// ineligible instead of guessing.
 pub fn estimate_prompt_cache_refresh_microusd(
     model: &str,
     prompt_tokens: u64,
@@ -784,12 +788,11 @@ pub fn estimate_prompt_cache_refresh_microusd(
     let cached_rate = pricing
         .cached_input_microusd_per_million
         .saturating_mul(multiplier);
-    let input_rate = pricing
-        .input_microusd_per_million
-        .saturating_mul(multiplier);
     Some(
-        microusd_for_tokens(prompt_tokens, cached_rate)
-            .saturating_add(microusd_for_tokens(output_tokens, input_rate)),
+        microusd_for_tokens(prompt_tokens, cached_rate).saturating_add(microusd_for_tokens(
+            output_tokens,
+            pricing.output_microusd_per_million,
+        )),
     )
 }
 
@@ -834,6 +837,7 @@ fn provider_cost_usd_to_microusd(cost_usd: f64) -> Option<u64> {
 struct OpenAiModelPricing {
     input_microusd_per_million: u64,
     cached_input_microusd_per_million: u64,
+    output_microusd_per_million: u64,
     long_context_input_threshold: Option<u64>,
 }
 
@@ -843,11 +847,13 @@ fn openai_model_pricing(model: &str) -> Option<OpenAiModelPricing> {
         "gpt-5.5" => Some(OpenAiModelPricing {
             input_microusd_per_million: 5_000_000,
             cached_input_microusd_per_million: 500_000,
+            output_microusd_per_million: 30_000_000,
             long_context_input_threshold: Some(272_000),
         }),
         model if model == crate::codex_product_model() => Some(OpenAiModelPricing {
             input_microusd_per_million: 5_000_000,
             cached_input_microusd_per_million: 500_000,
+            output_microusd_per_million: 30_000_000,
             long_context_input_threshold: Some(272_000),
         }),
         _ => None,

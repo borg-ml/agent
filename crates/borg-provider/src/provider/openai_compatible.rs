@@ -48,6 +48,11 @@ pub struct ModelGateway {
     pub variant_bodies: BTreeMap<String, Map<String, Value>>,
     pub context_window_tokens: Option<u64>,
     pub max_output_tokens: Option<u64>,
+    /// How long this route keeps a prompt cache entry, when the operator has
+    /// stated it. Borg documents no default here: warming spends money on a
+    /// schedule derived from this number, so it is taken only from someone who
+    /// knows the upstream, never guessed from a vendor's observed behaviour.
+    pub prompt_cache_ttl_seconds: Option<u64>,
 }
 
 impl ModelGateway {
@@ -62,6 +67,7 @@ impl ModelGateway {
             variant_bodies: BTreeMap::new(),
             context_window_tokens: None,
             max_output_tokens: None,
+            prompt_cache_ttl_seconds: None,
         }
     }
 }
@@ -241,6 +247,17 @@ impl OpenAiCompatibleProvider {
         profile: OpenAiCompatibleProfile,
         refresh: Option<PromptCacheRefresh>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        let mut request = request;
+        // A refresh must not reuse the real turn's client request id. An
+        // upstream that deduplicates on it could answer from the original
+        // response without refreshing anything, and the paid refresh would be
+        // indistinguishable from the turn it is protecting in any log. The
+        // cache entry is keyed by `prompt_cache_key`, which is left alone.
+        if refresh.is_some()
+            && let Some(id) = request.request_id.as_mut()
+        {
+            id.push_str(":warm");
+        }
         let started_at = Instant::now();
         let endpoint = gateway
             .map(|gateway| gateway.endpoint.clone())
@@ -443,15 +460,22 @@ impl OpenAiCompatibleProvider {
         }
 
         // Applied last so it overrides every profile, env and gateway budget
-        // above. Both spellings are set because a gateway may have merged in
-        // whichever one its upstream honours, and a refresh that silently kept
-        // a full output budget would bill like a real turn.
+        // above, but only in the spelling the body already uses: an OpenAI
+        // style endpoint rejects `max_tokens` outright for a reasoning model,
+        // so writing both would turn a refresh into a failed request. With
+        // neither present the profile is the only evidence of what the
+        // upstream accepts.
         if let Some(refresh) = refresh {
-            let cap = json!(refresh.max_output_tokens);
-            if body.get("max_completion_tokens").is_some() {
-                body["max_completion_tokens"] = cap.clone();
-            }
-            body["max_tokens"] = cap;
+            let field = if body.get("max_completion_tokens").is_some() {
+                "max_completion_tokens"
+            } else if body.get("max_tokens").is_some() {
+                "max_tokens"
+            } else if profile == OpenAiCompatibleProfile::Generic {
+                "max_completion_tokens"
+            } else {
+                "max_tokens"
+            };
+            body[field] = json!(refresh.max_output_tokens);
         }
 
         let client = compatible_http_client();

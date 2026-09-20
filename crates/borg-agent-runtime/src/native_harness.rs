@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use base64::Engine as _;
+use borg_core::compaction::{CompactionBudgetPolicy, EffectiveCompactionBudget};
 use borg_provider::provider::{
     ModelGateway, ModelInputAttachment, ModelMessage, ModelToolCall, ModelToolDefinition,
     ModelTurnRequest, ModelTurnResult, OpenAiCompatibleProfile, OpenAiCompatibleProvider,
@@ -27,6 +28,7 @@ use crate::{
 
 mod cache_warming;
 
+use crate::prompt_context::DeclarationTransport;
 use cache_warming::{
     CacheWarmRequest, CacheWarmer, CacheWarmingMode, Economics, Ineligible,
     PromptCacheRefreshClient, RefreshSupport,
@@ -64,6 +66,15 @@ pub(crate) struct NativeHarness {
     reviewer_model: Option<String>,
     reviewer_effort: Option<String>,
     harness: HarnessMode,
+    /// Per-model compaction budgets from `[compaction]`. An empty policy
+    /// resolves every model to the percentage defaults.
+    compaction: CompactionBudgetPolicy,
+    /// Aliases of routes configured in `[providers]`. A configured route is
+    /// already spelled `provider/model`, so its budget is keyed by that alias
+    /// rather than by the generic provider kind prefixed again.
+    configured_model_aliases: std::collections::BTreeSet<String>,
+    /// `[warming] mode`, unless `BORG_CACHE_WARMING` overrides it.
+    warming: CacheWarmingMode,
 }
 
 impl std::fmt::Debug for NativeHarness {
@@ -89,11 +100,66 @@ impl Default for NativeHarness {
             reviewer_model: None,
             reviewer_effort: None,
             harness: HarnessMode::Borg,
+            compaction: CompactionBudgetPolicy::default(),
+            configured_model_aliases: std::collections::BTreeSet::new(),
+            warming: CacheWarmingMode::default(),
         }
     }
 }
 
 impl NativeHarness {
+    /// How aggressively this process keeps prompt cache entries alive.
+    ///
+    /// `BORG_CACHE_WARMING` beats `[warming] mode`, which beats the default,
+    /// because the variable is the per-process escape hatch and a config file
+    /// cannot be edited for a single run. A value the variable cannot parse
+    /// warns and falls through to the configured mode rather than resetting to
+    /// the default, which is the one outcome the operator did not ask for.
+    fn cache_warming_mode(&self) -> CacheWarmingMode {
+        let raw = std::env::var("BORG_CACHE_WARMING").unwrap_or_default();
+        if raw.trim().is_empty() {
+            return self.warming;
+        }
+        match CacheWarmingMode::parse(&raw) {
+            Some(mode) => mode,
+            None => {
+                tracing::warn!(
+                    value = %raw,
+                    configured = %self.warming.as_str(),
+                    "BORG_CACHE_WARMING is not off, streaming, or idle; \
+                     using the configured warming mode"
+                );
+                self.warming
+            }
+        }
+    }
+
+    /// The compaction budget this model runs on.
+    ///
+    /// A route configured in `[providers]` is already spelled
+    /// `provider/model`, and that alias is both what the operator wrote and
+    /// what the config validated its window against. Prefixing the generic
+    /// provider kind again would look the budget up under a name nobody
+    /// configured, so the setting would parse, validate, and never apply.
+    fn compaction_budget(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+        context_window_tokens: u64,
+    ) -> EffectiveCompactionBudget {
+        if self.configured_model_aliases.contains(model)
+            && let Some((configured_provider, configured_model)) = model.split_once('/')
+        {
+            return self.compaction.resolve(
+                configured_provider,
+                configured_model,
+                context_window_tokens,
+            );
+        }
+        self.compaction
+            .resolve(provider.config_alias(), model, context_window_tokens)
+    }
+
     pub(crate) fn with_settings(settings: &super::agent::LocalAgentSettings) -> Self {
         Self {
             model_client: Arc::new(ProviderModelClient {
@@ -107,6 +173,9 @@ impl NativeHarness {
             execution_provider: Arc::new(crate::LocalExecutionProvider::new()),
             workflow_process_manager: crate::native_process::ProcessManager::default(),
             harness: settings.harness,
+            compaction: settings.compaction.clone(),
+            configured_model_aliases: settings.configured_model_gateways.keys().cloned().collect(),
+            warming: settings.warming,
         }
     }
 
@@ -286,7 +355,11 @@ impl NativeHarness {
                 "Use `query_history` when compacted context is insufficient."
             )),
         }
-        system_prompt.push_str(&runtime.context.prompt_appendix());
+        // The three parts of the leading instructions that genuinely vary
+        // mid-conversation are collected rather than appended, so a lane that
+        // can carry them in conversation position keeps its cached prefix.
+        let skills_slot = runtime.context.prompt_appendix();
+        let mut mcp_slot = String::new();
         for failure in &runtime.mcp.startup_failures {
             let (server, error) = (&failure.server, &failure.error);
             // The model needs to know the tools are missing on every turn. The
@@ -307,11 +380,57 @@ impl NativeHarness {
                 )
                 .await;
             }
-            system_prompt.push_str(&format!("\nExternal MCP server {} is unavailable for this turn. Its tools are not available; do not claim to have used them.", serde_json::to_string(server)?));
+            mcp_slot.push_str(&format!("\nExternal MCP server {} is unavailable for this turn. Its tools are not available; do not claim to have used them.", serde_json::to_string(server)?));
         }
+        // Exactly the concatenation this used to splice into the head, kept
+        // byte-identical so a lane that still carries it there is unchanged.
+        let mut varying_instructions = format!("{skills_slot}{mcp_slot}");
         if !turn.system_prompt_appendix.is_empty() {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(&turn.system_prompt_appendix);
+            varying_instructions.push_str("\n\n");
+            varying_instructions.push_str(&turn.system_prompt_appendix);
+        }
+        let declarations = crate::prompt_context::Declarations::capture(
+            [
+                (crate::prompt_context::InstructionSlot::Skills, skills_slot),
+                (
+                    crate::prompt_context::InstructionSlot::McpUnavailable,
+                    mcp_slot,
+                ),
+                (
+                    crate::prompt_context::InstructionSlot::Appendix,
+                    turn.system_prompt_appendix.clone(),
+                ),
+            ],
+            &tools,
+        );
+        let transport = self
+            .model_client
+            .declaration_transport(turn.provider, &model);
+        if let Some(change) = declarations.change_against(turn.declaration_base.as_ref()) {
+            crate::prompt_context::record_declaration_change(&events, turn.provider, &change)
+                .await?;
+            // Recorded only when the declarations actually moved, which is the
+            // only moment the claim is worth anything, and states plainly
+            // whether the prefix survived the change on this lane.
+            send(
+                &events,
+                SessionEventKind::ProviderEvent {
+                    provider: turn.provider,
+                    kind: "declaration_transport".to_string(),
+                    payload: json!({
+                        "prefix_preserved": transport.prefix_preserved(),
+                        "model": &model,
+                    }),
+                },
+            )
+            .await;
+        }
+        // A lane that rewrites the head anyway gains nothing from moving these
+        // out of it, and moving them would change what that lane sends for no
+        // benefit. A lane that keeps `System` in position keeps it immutable
+        // and takes the varying text as trailing context below.
+        if !transport.prefix_preserved() {
+            system_prompt.push_str(&varying_instructions);
         }
         if let Some(instruction) = turn.response_language.instruction() {
             system_prompt.push_str("\n\n");
@@ -328,6 +447,16 @@ impl NativeHarness {
             let message = native_user_message(&turn.cwd, &steer.text, &steer.attachments).await?;
             record_native_message(&events, turn.provider, &message).await?;
             messages.push(message);
+        }
+        // Same reasoning as the volatile appendix below: ahead of the
+        // conversation this invalidated the provider's prefix cache on every
+        // change, and after it the previous turn's copy simply stays in
+        // history. Recorded as prompt context, which replay rebuilds per turn
+        // rather than retaining, because it is derived from the live runtime.
+        if transport.prefix_preserved() && !varying_instructions.trim().is_empty() {
+            let context_message = ModelMessage::user(varying_instructions);
+            record_native_prompt_context(&events, turn.provider, &context_message).await?;
+            messages.push(context_message);
         }
         let harness_prompt_appendix = turn.agent_tools.harness_prompt_appendix().await?;
         if !harness_prompt_appendix.is_empty() {
@@ -366,7 +495,7 @@ impl NativeHarness {
         // Turn-scoped on purpose: every way out of `run_bound` drops the
         // warmer, and dropping it cancels any refresh it had armed. Idle
         // warming detaches in `on_agent_settled` to outlive the turn.
-        let warming_mode = cache_warming_mode();
+        let warming_mode = self.cache_warming_mode();
         let warmer = Arc::clone(&self.model_client)
             .prompt_cache_refresh()
             .map(|client| CacheWarmer::new(turn.session_id, warming_mode, client, events.clone()));
@@ -375,7 +504,7 @@ impl NativeHarness {
         // does not clone its whole request on every model round to find out.
         let warming_armed = match warmer.as_ref() {
             Some(warmer) => {
-                let armed = warmer.arm(turn.provider, &model);
+                let armed = warmer.arm(turn.provider, &model, turn.effort.as_deref());
                 // Say why a session that asked to be warmed will not be.
                 // Warming that is simply switched off needs no explanation.
                 if !armed && warming_mode != CacheWarmingMode::Off {
@@ -796,6 +925,14 @@ impl NativeHarness {
                         },
                     )
                     .await;
+                    // The run settled here just as it does below, so warming
+                    // has to hear about it on this path too. Without this the
+                    // mode is silently ignored for a turn that ends on a
+                    // watcher yield: streaming warming would be stopped by
+                    // Drop anyway, but idle warming would never engage.
+                    if let Some(warmer) = warmer.as_ref() {
+                        warmer.on_agent_settled();
+                    }
                     return Ok(AgentTurnResult {
                         provider_session_id: None,
                         final_text: truncated_text,
@@ -803,7 +940,9 @@ impl NativeHarness {
                 }
             }
             let budget = native_context_budget(&result.usage, &messages, trailing_context_tokens);
-            if budget.needs_auto_compaction() {
+            let compaction_budget =
+                self.compaction_budget(turn.provider, &model, budget.context_window_tokens);
+            if budget.needs_auto_compaction(&compaction_budget) {
                 let context_tokens = budget.context_tokens;
                 let context_window_tokens = budget.context_window_tokens;
                 send(
@@ -838,8 +977,7 @@ impl NativeHarness {
                         absorb_usage(&mut usage, &compaction_usage);
                         let retained = retain_recent_native_messages(
                             &messages,
-                            context_window_tokens.saturating_mul(NATIVE_COMPACT_RETAIN_PERCENT)
-                                / 100,
+                            compaction_budget.keep_recent_tokens,
                         );
                         send(
                             &events,
@@ -856,8 +994,13 @@ impl NativeHarness {
                                     "effective_context_window_tokens": context_window_tokens,
                                     "context_source": budget.context_source,
                                     "context_window_source": budget.window_source,
-                                    "remaining_percent_threshold":
-                                        NATIVE_AUTO_COMPACT_REMAINING_PERCENT,
+                                    "reserve_tokens": compaction_budget.reserve_tokens,
+                                    "keep_recent_tokens": compaction_budget.keep_recent_tokens,
+                                    "reserve_source": compaction_budget.reserve_source.as_str(),
+                                    "keep_recent_source":
+                                        compaction_budget.keep_recent_source.as_str(),
+                                    "budget_clamped_to_window":
+                                        compaction_budget.clamped_to_window,
                                     "retained_messages": retained.len(),
                                     "provider_duration_ms": compaction_usage.duration_ms,
                                     "input_tokens": compaction_usage.input_tokens,
@@ -1144,6 +1287,19 @@ trait NativeModelClient: Send + Sync {
     fn prompt_cache_refresh(self: Arc<Self>) -> Option<Arc<dyn PromptCacheRefreshClient>> {
         None
     }
+
+    /// Whether this client can carry a declaration change in conversation
+    /// position, leaving the request prefix intact.
+    ///
+    /// Defaults to `Collapsed`, which makes no cache-preservation claim. A
+    /// client that cannot observe its own route must not assert one.
+    fn declaration_transport(
+        &self,
+        _provider: crate::CodingProvider,
+        _model: &str,
+    ) -> DeclarationTransport {
+        DeclarationTransport::Collapsed
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1301,16 +1457,24 @@ impl NativeModelClient for ProviderModelClient {
     fn prompt_cache_refresh(self: Arc<Self>) -> Option<Arc<dyn PromptCacheRefreshClient>> {
         Some(self)
     }
-}
 
-/// How aggressively this process keeps prompt cache entries alive. Interim
-/// source, and the single seam `[warming] mode` in AgentConfig replaces:
-/// active warming is on by default, idle warming stays opt-in.
-fn cache_warming_mode() -> CacheWarmingMode {
-    std::env::var("BORG_CACHE_WARMING")
-        .ok()
-        .and_then(|value| CacheWarmingMode::parse(&value))
-        .unwrap_or_default()
+    fn declaration_transport(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+    ) -> DeclarationTransport {
+        match self.route(provider, model) {
+            // Chat completions is the only shape in tree that keeps `System`
+            // where the conversation put it.
+            Ok(NativeRoute::ChatCompletions { .. }) => DeclarationTransport::InPlace,
+            // The Responses lane collects every `System` into one
+            // `instructions` field regardless of position, so a change there
+            // rewrites the head no matter where it is placed.
+            #[cfg(feature = "subscription-adapters")]
+            Ok(NativeRoute::CodexAccount(_)) => DeclarationTransport::Collapsed,
+            Err(NotNative) => DeclarationTransport::Collapsed,
+        }
+    }
 }
 
 /// The model id the wire actually carries, which a gateway may rename.
@@ -1326,19 +1490,35 @@ impl PromptCacheRefreshClient for ProviderModelClient {
         &self,
         provider: crate::CodingProvider,
         model: &str,
+        effort: Option<&str>,
     ) -> std::result::Result<RefreshSupport, Ineligible> {
-        let route = self
+        let gateway = match self
             .route(provider, model)
-            .map_err(|NotNative| Ineligible::RouteNotNative)?;
-        let cache_lifetime = borg_provider::provider::prompt_cache_lifetime(model)
-            .ok_or(Ineligible::CacheLifetimeUnknown)?;
-        // Each route gets the smallest output budget it will actually accept,
-        // so the refresh bills for what it asked for rather than for whatever
-        // the route silently substituted.
-        let refresh = match route {
+            .map_err(|NotNative| Ineligible::RouteNotNative)?
+        {
+            // A ChatGPT subscription turn spends quota, not API dollars. The
+            // catalog below would price a refresh in money this user never
+            // pays, so the threshold it is compared against would be fiction.
             #[cfg(feature = "subscription-adapters")]
-            NativeRoute::CodexAccount(_) => PromptCacheRefresh::RESPONSES_MINIMUM,
-            NativeRoute::ChatCompletions { .. } => PromptCacheRefresh::ONE_TOKEN,
+            NativeRoute::CodexAccount(_) => return Err(Ineligible::SubscriptionQuota),
+            NativeRoute::ChatCompletions { gateway, .. } => gateway,
+        };
+        // An operator who configured this route may know its documented
+        // retention; Borg never invents one. Everything else falls back to the
+        // model catalog, which covers only vendors that publish a lifetime.
+        let cache_lifetime = gateway
+            .and_then(|gateway| gateway.prompt_cache_ttl_seconds)
+            .map(Duration::from_secs)
+            .or_else(|| borg_provider::provider::prompt_cache_lifetime(model))
+            .ok_or(Ineligible::CacheLifetimeUnknown)?;
+        // A reasoning model burns the budget on reasoning before it can stop,
+        // so a literal one-token cap either errors or wastes the request. The
+        // floor costs a few tokens; guessing wrong the other way costs the
+        // whole refresh.
+        let refresh = if effort.is_some() {
+            PromptCacheRefresh::REASONING_FLOOR
+        } else {
+            PromptCacheRefresh::ONE_TOKEN
         };
         Ok(RefreshSupport {
             cache_lifetime,
@@ -2764,14 +2944,6 @@ fn absorb_usage(total: &mut ProviderCallUsage, usage: &ProviderCallUsage) {
     }
 }
 
-/// Remaining share of the context window at which a tool round triggers
-/// automatic compaction. The next round adds the model's reply plus every new
-/// tool result before usage is reported again, so 5% of headroom was
-/// routinely overrun by a single large read and the turn failed on length.
-const NATIVE_AUTO_COMPACT_REMAINING_PERCENT: u64 = 15;
-/// Share of the window kept verbatim after the summary so the model keeps the
-/// evidence it was just reasoning about, not only a prose recollection of it.
-const NATIVE_COMPACT_RETAIN_PERCENT: u64 = 10;
 /// Share of the window kept when summarization itself fails and the oldest
 /// context is dropped mechanically so the turn can continue.
 const NATIVE_DEGRADED_RETAIN_PERCENT: u64 = 40;
@@ -2793,11 +2965,8 @@ struct NativeContextBudget {
 }
 
 impl NativeContextBudget {
-    fn needs_auto_compaction(&self) -> bool {
-        self.context_window_tokens > 0
-            && u128::from(self.context_tokens).saturating_mul(100)
-                >= u128::from(self.context_window_tokens)
-                    .saturating_mul(100 - u128::from(NATIVE_AUTO_COMPACT_REMAINING_PERCENT))
+    fn needs_auto_compaction(&self, budget: &EffectiveCompactionBudget) -> bool {
+        self.context_window_tokens > 0 && budget.should_compact(self.context_tokens)
     }
 }
 
@@ -4731,7 +4900,10 @@ mod tests {
             ..ProviderCallUsage::default()
         };
         let needs = |usage: &ProviderCallUsage, trailing| {
-            native_context_budget(usage, &[], trailing).needs_auto_compaction()
+            let budget = native_context_budget(usage, &[], trailing);
+            budget.needs_auto_compaction(&EffectiveCompactionBudget::defaults_for_window(
+                budget.context_window_tokens,
+            ))
         };
         assert!(!needs(&usage(84_999, 100_000), 0));
         assert!(needs(&usage(85_000, 100_000), 0));
@@ -4854,7 +5026,11 @@ mod tests {
             NATIVE_ASSUMED_CONTEXT_WINDOW_TOKENS
         );
         assert!(budget.context_tokens >= 120_000);
-        assert!(budget.needs_auto_compaction());
+        assert!(
+            budget.needs_auto_compaction(&EffectiveCompactionBudget::defaults_for_window(
+                budget.context_window_tokens
+            ))
+        );
 
         let zero = ProviderCallUsage {
             context_tokens: Some(0),
@@ -4867,7 +5043,11 @@ mod tests {
             "zero usage is treated like missing usage"
         );
         let small = native_context_budget(&ProviderCallUsage::default(), &messages[..1], 1_000);
-        assert!(!small.needs_auto_compaction());
+        assert!(
+            !small.needs_auto_compaction(&EffectiveCompactionBudget::defaults_for_window(
+                small.context_window_tokens
+            ))
+        );
     }
 
     #[test]

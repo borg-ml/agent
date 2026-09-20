@@ -65,6 +65,10 @@ pub(crate) struct ConfiguredModel {
     pub(crate) name: Option<String>,
     pub(crate) context_window_tokens: Option<u64>,
     pub(crate) max_output_tokens: Option<u64>,
+    /// How long this route keeps a prompt cache entry. Set it only from the
+    /// upstream's documented retention: it is the schedule Borg pays refreshes
+    /// on, and there is no default, so leaving it unset means no warming.
+    pub(crate) prompt_cache_ttl_seconds: Option<u64>,
     /// Variant names normally match Borg effort values (`low`, `high`, ...).
     pub(crate) variants: BTreeMap<String, ConfiguredModelVariant>,
     /// Extra request fields for this model, such as `temperature` or a vendor
@@ -519,6 +523,7 @@ impl AgentConfig {
                             variant_bodies,
                             context_window_tokens: model.context_window_tokens,
                             max_output_tokens: model.max_output_tokens,
+                            prompt_cache_ttl_seconds: model.prompt_cache_ttl_seconds,
                         },
                     )
                 })
@@ -728,6 +733,15 @@ impl AgentConfig {
                     anyhow::ensure!(
                         max_output > 0,
                         "provider `{provider_id}` model `{model_id}` max_output_tokens must be positive"
+                    );
+                }
+                if let Some(ttl) = model.prompt_cache_ttl_seconds {
+                    // Warming refreshes at ninety percent of this with a ten
+                    // second margin, so anything at or under the margin has no
+                    // usable moment to refresh at and would only race expiry.
+                    anyhow::ensure!(
+                        ttl > 10,
+                        "provider `{provider_id}` model `{model_id}` prompt_cache_ttl_seconds must be greater than 10"
                     );
                 }
                 for (key, value) in &model.body {

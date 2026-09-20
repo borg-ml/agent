@@ -40,17 +40,32 @@ use crate::SessionEventKind;
 /// a counter owned by its own warmer, and every turn builds a new warmer.
 /// Without this, a session in idle mode accumulates one paid refresh loop per
 /// turn, each keeping alive a prefix that has already been replaced.
-static DETACHED_IDLE_RUNS: LazyLock<Mutex<HashMap<Uuid, CancellationToken>>> =
+static DETACHED_IDLE_RUNS: LazyLock<Mutex<HashMap<Uuid, (u64, CancellationToken)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Distinguishes one run from its replacement. A run that ends on its own must
+/// drop only its own entry: by then a newer turn may already have registered a
+/// live run under the same session, and removing that would leak the very loop
+/// this map exists to stop.
+static NEXT_RUN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Stop the idle run this session left behind, if it has one.
 pub(crate) fn cancel_detached_idle_run(session_id: Uuid) {
-    let token = DETACHED_IDLE_RUNS
+    let entry = DETACHED_IDLE_RUNS
         .lock()
         .ok()
         .and_then(|mut runs| runs.remove(&session_id));
-    if let Some(token) = token {
+    if let Some((_, token)) = entry {
         token.cancel();
+    }
+}
+
+/// Drop a finished run's registration, unless a newer run already replaced it.
+fn release_detached_idle_run(session_id: Uuid, run_id: u64) {
+    if let Ok(mut runs) = DETACHED_IDLE_RUNS.lock()
+        && runs.get(&session_id).is_some_and(|(id, _)| *id == run_id)
+    {
+        runs.remove(&session_id);
     }
 }
 
@@ -90,6 +105,10 @@ pub(crate) enum Ineligible {
     /// Borg knows no prices for this model and the last real call reported no
     /// cost, so a refresh cannot be shown to be worth sending.
     EconomicsUnavailable,
+    /// The route bills a subscription. A refresh consumes quota, and the
+    /// API prices Borg knows are not what the user pays, so the saving a
+    /// decision would be justified by is not a real number here.
+    SubscriptionQuota,
 }
 
 impl Ineligible {
@@ -105,6 +124,10 @@ impl Ineligible {
             }
             Self::EconomicsUnavailable => {
                 "no price or reported cost for this model, so a refresh cannot be justified"
+                    .to_string()
+            }
+            Self::SubscriptionQuota => {
+                "this route spends subscription quota, which Borg cannot price against a cache miss"
                     .to_string()
             }
         }
@@ -238,6 +261,7 @@ pub(crate) trait PromptCacheRefreshClient: Send + Sync {
         &self,
         provider: crate::CodingProvider,
         model: &str,
+        effort: Option<&str>,
     ) -> Result<RefreshSupport, Ineligible>;
 
     /// Price one refresh against the prompt it would re-read. `None` means the
@@ -321,9 +345,10 @@ pub(crate) struct CacheWarmer {
     mode: CacheWarmingMode,
     client: Arc<dyn PromptCacheRefreshClient>,
     events: mpsc::Sender<SessionEventKind>,
-    /// Cancels the refresh currently armed or in flight. One token per run, so
-    /// stopping a superseded run never disarms its replacement.
-    cancel: Mutex<Option<CancellationToken>>,
+    /// Cancels the refresh currently armed or in flight, with the id that
+    /// distinguishes it from its replacement. One entry per run, so stopping a
+    /// superseded run never disarms the one that replaced it.
+    cancel: Mutex<Option<(u64, CancellationToken)>>,
     generation: Arc<WarmGeneration>,
     status: Arc<Mutex<CacheWarmingStatus>>,
     phase: Arc<Mutex<Phase>>,
@@ -412,12 +437,17 @@ impl CacheWarmer {
     /// Whether this route can be warmed at all, recorded as the current
     /// status. A property of the route and model rather than of any one
     /// request, so an ineligible session says why once.
-    pub(crate) fn arm(&self, provider: crate::CodingProvider, model: &str) -> bool {
+    pub(crate) fn arm(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+        effort: Option<&str>,
+    ) -> bool {
         if self.mode == CacheWarmingMode::Off {
             self.set_status(CacheWarmingStatus::inactive(Ineligible::ModeOff.reason()));
             return false;
         }
-        match self.client.refresh_support(provider, model) {
+        match self.client.refresh_support(provider, model, effort) {
             Ok(_) => true,
             Err(ineligible) => {
                 self.set_status(CacheWarmingStatus::inactive(ineligible.reason()));
@@ -431,7 +461,7 @@ impl CacheWarmer {
     fn stop(&self, reason: impl Into<String>) {
         self.generation.bump();
         if let Ok(mut cancel) = self.cancel.lock()
-            && let Some(token) = cancel.take()
+            && let Some((_, token)) = cancel.take()
         {
             token.cancel();
         }
@@ -456,13 +486,20 @@ impl CacheWarmer {
                 self.set_phase(Phase::Idle);
                 // Idle warming is the one case that is meant to outlive the
                 // turn, so it is also the one case that has to say so.
-                self.detached
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                // Handing the run off also hands off the only way to stop
-                // it, since this warmer's Drop is now a no-op.
-                let token = self.cancel.lock().ok().and_then(|cancel| cancel.clone());
-                if let (Some(token), Ok(mut runs)) = (token, DETACHED_IDLE_RUNS.lock()) {
-                    runs.insert(self.session_id, token);
+                // Detach only once the session is actually holding the token.
+                // Setting it first and failing to register would make Drop a
+                // no-op with nothing left that could ever stop the run.
+                let entry = self.cancel.lock().ok().and_then(|cancel| cancel.clone());
+                let handed_off = match (entry, DETACHED_IDLE_RUNS.lock()) {
+                    (Some(entry), Ok(mut runs)) => {
+                        runs.insert(self.session_id, entry);
+                        true
+                    }
+                    _ => false,
+                };
+                if handed_off {
+                    self.detached
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         }
@@ -501,10 +538,11 @@ impl CacheWarmer {
             self.set_status(CacheWarmingStatus::inactive(Ineligible::ModeOff.reason()));
             return;
         }
-        let support = match self
-            .client
-            .refresh_support(request.provider, &request.model)
-        {
+        let support = match self.client.refresh_support(
+            request.provider,
+            &request.model,
+            request.effort.as_deref(),
+        ) {
             Ok(support) => support,
             Err(ineligible) => {
                 self.set_status(CacheWarmingStatus::inactive(ineligible.reason()));
@@ -519,10 +557,13 @@ impl CacheWarmer {
         };
         let generation = self.generation.current();
         let cancel = CancellationToken::new();
+        let run_id = NEXT_RUN_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut slot) = self.cancel.lock() {
-            *slot = Some(cancel.clone());
+            *slot = Some((run_id, cancel.clone()));
         }
         let run = WarmRun {
+            session_id: self.session_id,
+            run_id,
             request,
             support,
             delay,
@@ -547,6 +588,8 @@ impl CacheWarmer {
 /// One scheduled refresh loop, owning everything it needs so it can outlive
 /// the borrow that created it without holding the harness open.
 struct WarmRun {
+    session_id: Uuid,
+    run_id: u64,
     request: CacheWarmRequest,
     support: RefreshSupport,
     delay: Duration,
@@ -591,7 +634,15 @@ impl WarmRun {
         });
     }
 
+    /// Runs the refresh loop, then drops this run's registration whatever
+    /// ended it -- reaching a horizon, a failed refresh, or cancellation.
     async fn drive(self) {
+        let (session_id, run_id) = (self.session_id, self.run_id);
+        self.refresh_loop().await;
+        release_detached_idle_run(session_id, run_id);
+    }
+
+    async fn refresh_loop(self) {
         loop {
             tokio::select! {
                 // Cancellation wins over a pending refresh, so an interrupt
@@ -729,4 +780,206 @@ fn refresh_delay(lifetime: Duration) -> Option<Duration> {
     let ninety_percent = lifetime.mul_f64(f64::from(WARM_AT_PERCENT_OF_TTL) / 100.0);
     let with_margin = lifetime.saturating_sub(WARM_SAFETY_MARGIN);
     Some(ninety_percent.min(with_margin).max(Duration::from_secs(1)))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use borg_provider::provider::ModelMessage;
+
+    use super::*;
+
+    const CACHE_KEY: &str = "borg-cache:generation-1";
+
+    /// A route that bills nothing and records what it was asked to replay.
+    #[derive(Default)]
+    struct FakeRoute {
+        refreshes: AtomicUsize,
+        replayed_cache_key: Mutex<Option<String>>,
+        replayed_cap: Mutex<Option<u64>>,
+    }
+
+    #[async_trait]
+    impl PromptCacheRefreshClient for FakeRoute {
+        fn refresh_support(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+        ) -> Result<RefreshSupport, Ineligible> {
+            Ok(RefreshSupport {
+                cache_lifetime: Duration::from_secs(100),
+                max_output_tokens: 1,
+            })
+        }
+
+        fn refresh_economics(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _prompt_tokens: u64,
+            _max_output_tokens: u64,
+        ) -> Option<Economics> {
+            // A miss costs far more than the refresh, so the decision clears
+            // the threshold in both the streaming and the idle phase.
+            Some(Economics {
+                warm_microusd: 1_000,
+                miss_microusd: 5_000_000,
+            })
+        }
+
+        async fn refresh(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+            request: ModelTurnRequest,
+            support: &RefreshSupport,
+        ) -> Result<ProviderCallUsage, ProviderCallError> {
+            self.refreshes.fetch_add(1, Ordering::SeqCst);
+            *self.replayed_cache_key.lock().unwrap() = request.prompt_cache_key.clone();
+            *self.replayed_cap.lock().unwrap() = Some(support.max_output_tokens);
+            Ok(ProviderCallUsage {
+                input_tokens: 3,
+                cached_input_tokens: 40_000,
+                output_tokens: 1,
+                total_tokens: 40_004,
+                cost_microusd: Some(1_000),
+                // A refresh reads a whole context it must not report.
+                context_tokens: Some(40_000),
+                ..ProviderCallUsage::default()
+            })
+        }
+    }
+
+    fn warm_request() -> CacheWarmRequest {
+        CacheWarmRequest {
+            provider: crate::CodingProvider::OpenAiCompatible,
+            model: "test-model".to_string(),
+            effort: None,
+            request: ModelTurnRequest {
+                fast: false,
+                request_id: Some("turn-1:1".to_string()),
+                session_id: Some("borg-session:test".to_string()),
+                prompt_cache_key: Some(CACHE_KEY.to_string()),
+                messages: vec![ModelMessage::user("hello")],
+                tools: Vec::new(),
+                output_schema: None,
+            },
+            prompt_tokens: 40_000,
+        }
+    }
+
+    /// The whole contract in one pass, with no provider and no money: a refresh
+    /// goes out on time, replays the same cache entry under a minimal cap, is
+    /// billed where the user can see it, and never becomes part of the
+    /// conversation.
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_is_sent_billed_and_never_becomes_a_message() {
+        let (events, mut received) = mpsc::channel(64);
+        let route = Arc::new(FakeRoute::default());
+        let warmer = CacheWarmer::new(
+            Uuid::new_v4(),
+            CacheWarmingMode::Streaming,
+            route.clone(),
+            events,
+        );
+        assert!(warmer.arm(crate::CodingProvider::OpenAiCompatible, "test-model", None));
+        warmer.start(warm_request());
+
+        // 90% of a 100s lifetime, so one refresh is due and the second is not.
+        tokio::time::sleep(Duration::from_secs(95)).await;
+
+        assert_eq!(route.refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            route.replayed_cache_key.lock().unwrap().as_deref(),
+            Some(CACHE_KEY),
+            "a refresh that changed the cache key would extend an entry the next real request never reads"
+        );
+        assert_eq!(*route.replayed_cap.lock().unwrap(), Some(1));
+
+        let mut billed = 0;
+        let mut decisions = 0;
+        while let Ok(event) = received.try_recv() {
+            match event {
+                SessionEventKind::Message { .. } => {
+                    panic!("a refresh must never emit a model message")
+                }
+                SessionEventKind::UsageUpdated {
+                    turn_id,
+                    context_tokens,
+                    cost_microusd,
+                    ..
+                } => {
+                    billed += 1;
+                    assert_eq!(cost_microusd, Some(1_000));
+                    assert!(turn_id.is_none(), "a refresh belongs to no turn");
+                    assert!(
+                        context_tokens.is_none(),
+                        "a refresh adds nothing to context and must not move the compaction trigger"
+                    );
+                }
+                SessionEventKind::ProviderEvent { kind, .. }
+                    if kind == "cache_warming_decision" =>
+                {
+                    decisions += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(billed, 1, "the spend has to be visible exactly once");
+        assert_eq!(decisions, 1);
+    }
+
+    /// The cancellation contract: an armed refresh belongs to its turn, so a
+    /// turn that ends for any reason takes the refresh with it.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_turn_cancels_an_armed_refresh() {
+        let (events, _received) = mpsc::channel(64);
+        let route = Arc::new(FakeRoute::default());
+        {
+            let warmer = CacheWarmer::new(
+                Uuid::new_v4(),
+                CacheWarmingMode::Streaming,
+                route.clone(),
+                events,
+            );
+            warmer.start(warm_request());
+        }
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(route.refreshes.load(Ordering::SeqCst), 0);
+    }
+
+    /// Idle warming outlives its turn on purpose, which is what makes it the
+    /// one mode that can be left behind. The next turn on the session has to
+    /// end it, or a session accumulates one paid loop per turn.
+    #[tokio::test(start_paused = true)]
+    async fn a_new_turn_stops_the_idle_run_the_previous_one_detached() {
+        let (events, _received) = mpsc::channel(64);
+        let session_id = Uuid::new_v4();
+        let route = Arc::new(FakeRoute::default());
+        {
+            let warmer = CacheWarmer::new(
+                session_id,
+                CacheWarmingMode::Idle,
+                route.clone(),
+                events.clone(),
+            );
+            warmer.start(warm_request());
+            warmer.on_agent_settled();
+        }
+        let _next_turn = CacheWarmer::new(
+            session_id,
+            CacheWarmingMode::Idle,
+            route.clone(),
+            events.clone(),
+        );
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(
+            route.refreshes.load(Ordering::SeqCst),
+            0,
+            "the detached run kept billing after the turn that replaced it"
+        );
+    }
 }
