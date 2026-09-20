@@ -141,3 +141,31 @@ deny = ["n", "esc"]
 [updates]
 auto_install = true
 check_interval_hours = 24
+
+# Automatic compaction is sized as a share of the context window: a tool round
+# compacts once less than 15% of the window is free, and the most recent 10% is
+# kept verbatim after the summary. That scales from a 32k local model to a 1M
+# hosted one, which is why it is the default.
+#
+# Override either number in absolute tokens for one exact `provider/model` pair
+# when a model's economics are known: 15% of a 1M window holds back 150k tokens
+# from every turn. The two fall back independently, so setting only a reserve
+# leaves the tail on its percentage default. Keys split on the FIRST slash, so
+# a model id that contains its own slash resolves, and a configured route in
+# `[providers]` is keyed by the same `provider/model` alias you gave it there.
+#
+# A budget that cannot work is refused at startup rather than quietly ignored.
+# One that does not fit the window the provider actually reports is scaled back
+# and reported as clamped on the compaction event, so a wrong number is visible
+# instead of silently behaving unlike what you wrote.
+#
+# [compaction.budgets."claude/claude-opus-5"]
+# reserve_tokens = 40000
+# keep_recent_tokens = 250000
+
+# Prompt cache warming keeps an expensive prefix alive so a long tool run does
+# not pay to rebuild it. "streaming" refreshes across a run and is the default;
+# "idle" keeps refreshing while you are away, so it is opt-in; "off" disables
+# it. BORG_CACHE_WARMING overrides this for a single process.
+[warming]
+mode = "streaming"

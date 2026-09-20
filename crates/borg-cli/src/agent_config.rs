@@ -842,6 +842,23 @@ impl AgentConfig {
         windows
     }
 
+    /// The runtime settings a native session actually runs on.
+    ///
+    /// Built in one place because every entry point that starts a native turn
+    /// has to agree on what the operator's configuration means, and an
+    /// executor built without these runs on defaults that look exactly like a
+    /// configuration that was honored.
+    pub(crate) fn local_agent_settings(&self) -> Result<borg_remote::LocalAgentSettings> {
+        Ok(borg_remote::LocalAgentSettings {
+            approval_reviewer_model: self.approvals.reviewer_model.clone(),
+            approval_reviewer_effort: self.approvals.reviewer_effort.clone(),
+            configured_model_gateways: self.configured_model_gateways(),
+            harness: self.capabilities.harness,
+            compaction: self.compaction_budget_policy()?,
+            warming: self.warming.mode,
+        })
+    }
+
     /// The validated per-model compaction budgets. An empty policy resolves
     /// every model to the percentage defaults.
     pub(crate) fn compaction_budget_policy(&self) -> Result<CompactionBudgetPolicy> {
@@ -1200,6 +1217,81 @@ context_window_tokens = 32768
             );
         }
         assert!(std::env::var_os("BORG_OPENAI_COMPATIBLE_MODEL").is_none());
+    }
+
+    /// A budget that parses but never reaches the resolver leaves the session
+    /// on the 15%/10% defaults while the config file says otherwise, and
+    /// nothing reports it: the operator sees a setting Borg accepted and
+    /// silently did not apply. A parse-only assertion cannot see that -- it
+    /// passes whether or not the policy is ever threaded into the settings a
+    /// turn actually runs on. So this drives the payload a native turn
+    /// receives and asserts the compaction decision itself moves.
+    #[test]
+    fn a_configured_budget_moves_the_real_compaction_decision() {
+        use borg_core::compaction::EffectiveCompactionBudget;
+
+        const WINDOW: u64 = 1_000_000;
+
+        let config: AgentConfig = toml::from_str(
+            r#"
+[compaction.budgets."claude/claude-opus-5"]
+reserve_tokens = 40000
+keep_recent_tokens = 250000
+"#,
+        )
+        .expect("budgets parse");
+        config.validate().expect("budget is valid");
+
+        let settings = config
+            .local_agent_settings()
+            .expect("settings carry the policy");
+        let tuned = settings
+            .compaction
+            .resolve("claude", "claude-opus-5", WINDOW);
+        let defaults = EffectiveCompactionBudget::defaults_for_window(WINDOW);
+
+        // 15% of a 1M window holds back 150k tokens from every turn, which is
+        // the number this feature exists to let one model change.
+        assert_eq!(defaults.reserve_tokens, 150_000);
+        assert_eq!(tuned.reserve_tokens, 40_000);
+
+        // The decision, not the number: at 860k used there is 140k of headroom
+        // left, which trips the default reserve and must not trip this one.
+        assert!(defaults.should_compact(860_000));
+        assert!(!tuned.should_compact(860_000));
+        assert!(tuned.should_compact(960_000));
+
+        // The tail restored after the summary is the operator's, not 10%.
+        assert_eq!(defaults.keep_recent_tokens, 100_000);
+        assert_eq!(tuned.keep_recent_tokens, 250_000);
+
+        // A model with no entry keeps the behavior it always had.
+        let untouched = settings
+            .compaction
+            .resolve("claude", "claude-sonnet-5", WINDOW);
+        assert_eq!(untouched.reserve_tokens, defaults.reserve_tokens);
+        assert_eq!(untouched.keep_recent_tokens, defaults.keep_recent_tokens);
+    }
+
+    /// `[warming] mode` has to arrive in the payload the harness reads, or the
+    /// documented default silently becomes whatever the harness hardcodes.
+    #[test]
+    fn warming_mode_reaches_the_settings_a_turn_runs_on() {
+        let default_settings = AgentConfig::default()
+            .local_agent_settings()
+            .expect("default settings build");
+        assert_eq!(default_settings.warming, CacheWarmingMode::Streaming);
+
+        let config: AgentConfig = toml::from_str(
+            "[warming]
+mode = \"idle\"
+",
+        )
+        .expect("warming parses");
+        let settings = config
+            .local_agent_settings()
+            .expect("settings carry the mode");
+        assert_eq!(settings.warming, CacheWarmingMode::Idle);
     }
 
     #[test]

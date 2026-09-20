@@ -616,6 +616,12 @@ pub struct LocalAgentSettings {
     /// Host-local snapshot of named OpenAI-compatible routes. Secrets stay in
     /// memory and are never part of LaunchSession or durable events.
     pub configured_model_gateways: BTreeMap<String, borg_provider::provider::ModelGateway>,
+    /// Per-model compaction budgets from `[compaction]`. An empty policy
+    /// resolves every model to the percentage defaults, which is the behavior
+    /// Borg had before the setting existed.
+    pub compaction: borg_core::compaction::CompactionBudgetPolicy,
+    /// `[warming] mode`. `BORG_CACHE_WARMING` still overrides it per process.
+    pub warming: borg_core::warming::CacheWarmingMode,
 }
 
 impl LocalAgentTurnExecutor {

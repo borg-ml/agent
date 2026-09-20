@@ -17,17 +17,17 @@ use borg_provider::provider::{
 use borg_remote::{
     AgentTurnExecutor, ApprovalDecision, CodingProvider, EventActor, GoalAction, GoalStatus,
     HostCommand, HostConfig, HostExecutionProfile, HostExecutorFactory, LaunchSession,
-    LocalAgentSettings, LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus,
-    PermissionMode, PlanItem, PlanItemStatus, PromptDelivery, RecoveryParts, ResponseLanguage,
-    SessionConfigAction, SessionEvent, SessionEventKind, SessionGoal, SessionState, SessionStatus,
-    SessionStore, SessionWriterLease, SpawnSubagent, SubagentAction, SubagentSnapshot,
-    SubagentStatus, TodoAction, default_host_config_path, enroll_host,
-    force_terminate_local_session_owner, local_session_owner_is_active,
-    local_session_owner_uses_current_binary, login_provider, mirror_local_session,
-    obsolete_local_session_owner_pid, probe_capabilities, probe_provider_admission_capabilities,
-    provider_credentials_present, run_agent_session_with_store_and_writer,
-    run_agent_session_with_store_writer_and_peers, run_attached_session,
-    run_host_with_executor_factory, send_local_session_command, session_control_socket_path,
+    LocalAgentTurnExecutor, LocalSessionControlServer, MessageStatus, PermissionMode, PlanItem,
+    PlanItemStatus, PromptDelivery, RecoveryParts, ResponseLanguage, SessionConfigAction,
+    SessionEvent, SessionEventKind, SessionGoal, SessionState, SessionStatus, SessionStore,
+    SessionWriterLease, SpawnSubagent, SubagentAction, SubagentSnapshot, SubagentStatus,
+    TodoAction, default_host_config_path, enroll_host, force_terminate_local_session_owner,
+    local_session_owner_is_active, local_session_owner_uses_current_binary, login_provider,
+    mirror_local_session, obsolete_local_session_owner_pid, probe_capabilities,
+    probe_provider_admission_capabilities, provider_credentials_present,
+    run_agent_session_with_store_and_writer, run_agent_session_with_store_writer_and_peers,
+    run_attached_session, run_host_with_executor_factory, send_local_session_command,
+    session_control_socket_path,
 };
 use chrono::{DateTime, Local, TimeZone, Utc};
 use futures_util::{FutureExt, StreamExt};
@@ -712,12 +712,7 @@ fn blu_host_executor_factory() -> HostExecutorFactory {
         let mut servers = agent_config.external_mcp_servers();
         servers.extend(extension_servers);
         let roots = catalog.active_skill_roots();
-        let local_settings = LocalAgentSettings {
-            approval_reviewer_model: agent_config.approvals.reviewer_model.clone(),
-            approval_reviewer_effort: agent_config.approvals.reviewer_effort.clone(),
-            configured_model_gateways: agent_config.configured_model_gateways(),
-            harness: agent_config.capabilities.harness,
-        };
+        let local_settings = agent_config.local_agent_settings()?;
         let reload_cwd = launch.cwd.clone();
         let reload = move || {
             let agent_config = AgentConfig::load(None)?;
@@ -2238,12 +2233,7 @@ async fn run_local_agent_session(
     let mut current_effort = effort.clone();
     let mut current_fast = fast.unwrap_or(false);
     let mut current_response_language = response_language;
-    let local_settings = LocalAgentSettings {
-        approval_reviewer_model: agent_config.approvals.reviewer_model.clone(),
-        approval_reviewer_effort: agent_config.approvals.reviewer_effort.clone(),
-        configured_model_gateways: agent_config.configured_model_gateways(),
-        harness: agent_config.capabilities.harness,
-    };
+    let local_settings = agent_config.local_agent_settings()?;
     let (mut extension_catalog, extension_servers, extension_workflows) =
         crate::extensions::discover(&cwd, &agent_config.capabilities, &agent_config.extensions)?;
     extension_catalog.apply_editor_customization(&mut editor_preferences, &mut agent_config)?;

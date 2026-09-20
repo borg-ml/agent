@@ -236,6 +236,22 @@ impl CodingProvider {
             })
     }
 
+    /// The provider half of the `provider/model` alias an operator writes in
+    /// configuration, for example a `[compaction.budgets]` key. This is the
+    /// enum's own serialized spelling, so a provider is named the same way in
+    /// the config file and in the durable record of the session it configured.
+    pub const fn config_alias(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::OpenCode => "open_code",
+            Self::Kimi => "kimi",
+            Self::Glm => "glm",
+            Self::OpenRouter => "open_router",
+            Self::OpenAiCompatible => "open_ai_compatible",
+        }
+    }
+
     pub fn executable(self) -> &'static str {
         match self {
             Self::Codex => "codex",
