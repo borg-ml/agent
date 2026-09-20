@@ -18,13 +18,18 @@ runs:
           throw "Postgres installer checksum mismatch"
         }
         $prefix = Join-Path $env:RUNNER_TEMP "postgres"
+        $trace = Join-Path $env:RUNNER_TEMP "postgres-installer.log"
         $install = Start-Process $installer -Wait -PassThru -ArgumentList @(
           "--mode", "unattended", "--unattendedmodeui", "none",
+          "--debugtrace", $trace,
           "--prefix", $prefix, "--datadir", "$prefix/data",
           "--superpassword", "postgres", "--serverport", "5432",
           "--servicename", "borg-test-postgres",
           "--disable-components", "pgAdmin,stackbuilder"
         )
-        if ($install.ExitCode -ne 0) { throw "Postgres installation failed: $($install.ExitCode)" }
+        if ($install.ExitCode -ne 0) {
+          if (Test-Path $trace) { Get-Content $trace -Tail 200 }
+          throw "Postgres installation failed: $($install.ExitCode)"
+        }
         & "$prefix/bin/pg_isready.exe" -h 127.0.0.1 -p 5432 -U postgres
         if ($LASTEXITCODE -ne 0) { throw "Test Postgres is not ready" }

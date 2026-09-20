@@ -65,9 +65,9 @@ jobs:
         with:
           toolchain: "1.98.0"
           targets: ${{ matrix.target }}
+      - uses: ./.github/actions/test-postgres
       - name: Build Borg Agent
         run: cargo build --locked --release --target ${{ matrix.target }} -p borg
-      - uses: ./.github/actions/test-postgres
       - name: Run native Borg Agent core-flow tests
         run: cargo test --locked --target ${{ matrix.target }} -p borg --no-fail-fast -- --test-threads=4
       - name: Smoke-test the native Borg Agent binary
