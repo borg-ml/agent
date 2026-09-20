@@ -191,18 +191,17 @@ impl ManagedCluster {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let file = options.open(&self.start_lock).with_context(|| {
-            format!("could not open {}", self.start_lock.display())
-        })?;
+        let file = options
+            .open(&self.start_lock)
+            .with_context(|| format!("could not open {}", self.start_lock.display()))?;
         let mut attempt: u32 = 0;
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(StartupGuard { _file: file }),
                 Err(TryLockError::WouldBlock) => {}
                 Err(TryLockError::Error(error)) => {
-                    return Err(error).with_context(|| {
-                        format!("could not lock {}", self.start_lock.display())
-                    });
+                    return Err(error)
+                        .with_context(|| format!("could not lock {}", self.start_lock.display()));
                 }
             }
             tokio::time::sleep(Duration::from_millis(50 << attempt.min(3))).await;
@@ -554,7 +553,8 @@ where
         );
         // Capped early: a transition resolves in seconds, and the budget buys
         // more by being spent on attempts than on longer sleeps.
-        let pause = tokio::time::Instant::now() + Duration::from_millis(100 << (attempt - 1).min(3));
+        let pause =
+            tokio::time::Instant::now() + Duration::from_millis(100 << (attempt - 1).min(3));
         tokio::time::sleep_until(pause.min(deadline)).await;
         if tokio::time::Instant::now() >= deadline {
             return Err(gave_up(last));
@@ -724,15 +724,21 @@ mod tests {
         }
         // The gap before anything restarts it, and a socket closed on a
         // client mid-handshake during startup.
-        assert!(is_between_states(&io(std::io::ErrorKind::ConnectionRefused)));
+        assert!(is_between_states(&io(
+            std::io::ErrorKind::ConnectionRefused
+        )));
         assert!(is_between_states(&io(std::io::ErrorKind::UnexpectedEof)));
 
         // Settled facts about a running cluster.
         for code in ["28P01", "3D000", "42P04"] {
             assert!(!is_between_states(&reported(code)), "{code} is settled");
         }
-        assert!(!is_between_states(&io(std::io::ErrorKind::PermissionDenied)));
-        assert!(!is_between_states(&anyhow::anyhow!("pg_ctl is not installed")));
+        assert!(!is_between_states(&io(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        assert!(!is_between_states(&anyhow::anyhow!(
+            "pg_ctl is not installed"
+        )));
     }
 
     /// The release-blocking behaviour itself: a cluster that is shutting down
@@ -816,7 +822,11 @@ mod tests {
 
     impl std::fmt::Display for Reported {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "the database system is shutting down ({})", self.0)
+            write!(
+                formatter,
+                "the database system is shutting down ({})",
+                self.0
+            )
         }
     }
 

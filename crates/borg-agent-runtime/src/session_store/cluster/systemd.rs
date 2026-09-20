@@ -155,7 +155,11 @@ pub(super) fn classify(postmaster: Option<&str>, caller: Option<&str>, unit: &st
     let Some(postmaster) = postmaster else {
         return Supervision::Unknown;
     };
-    if postmaster.rsplit('/').next().is_some_and(|leaf| leaf == unit) {
+    if postmaster
+        .rsplit('/')
+        .next()
+        .is_some_and(|leaf| leaf == unit)
+    {
         return Supervision::OwnUnit;
     }
     Supervision::ForeignCgroup {
@@ -236,7 +240,10 @@ pub(super) async fn available() -> anyhow::Result<bool> {
         return Ok(true);
     }
     let caller = cgroup_of(std::process::id() as i32);
-    if caller.as_deref().is_some_and(|cgroup| in_borg_scope(cgroup)) {
+    if caller
+        .as_deref()
+        .is_some_and(|cgroup| in_borg_scope(cgroup))
+    {
         anyhow::bail!(
             "this machine runs systemd but its user manager did not answer within \
              {PROBE_TIMEOUT:?}, and Borg is running inside {}. Starting the cluster \
@@ -392,7 +399,11 @@ mod tests {
             },
             "a cgroup that is not ours is still fatal when it belongs to a Borg unit"
         );
-        assert!(classify(Some(incident), Some(caller), unit).warning().is_some());
+        assert!(
+            classify(Some(incident), Some(caller), unit)
+                .warning()
+                .is_some()
+        );
         assert_eq!(
             classify(Some(caller), Some(caller), unit),
             Supervision::ForeignCgroup {
@@ -402,7 +413,10 @@ mod tests {
         );
 
         let own = format!("/user.slice/user@1000.service/app.slice/{unit}");
-        assert_eq!(classify(Some(&own), Some(caller), unit), Supervision::OwnUnit);
+        assert_eq!(
+            classify(Some(&own), Some(caller), unit),
+            Supervision::OwnUnit
+        );
         assert!(classify(Some(&own), Some(caller), unit).warning().is_none());
         assert_eq!(classify(None, Some(caller), unit), Supervision::Unknown);
     }
@@ -420,10 +434,14 @@ mod tests {
             "/user.slice/user@1000.service/app.slice/app-borg.slice/borg-session-1a2b.scope"
         ));
         // A unit Borg grows later is covered without being listed.
-        assert!(in_borg_scope("/user.slice/app.slice/borg-workflow-7.service"));
+        assert!(in_borg_scope(
+            "/user.slice/app.slice/borg-workflow-7.service"
+        ));
 
         // Somewhere Borg does not own, where pg_ctl is no worse than before.
-        assert!(!in_borg_scope("/user.slice/user@1000.service/app.slice/ghostty.scope"));
+        assert!(!in_borg_scope(
+            "/user.slice/user@1000.service/app.slice/ghostty.scope"
+        ));
         assert!(!in_borg_scope("/system.slice/postgresql.service"));
         assert!(!in_borg_scope(""));
     }
@@ -437,5 +455,4 @@ mod tests {
         assert_eq!(parse_cgroup("3:cpu:/some/v1/path\n"), None);
         assert_eq!(parse_cgroup(""), None);
     }
-
 }
