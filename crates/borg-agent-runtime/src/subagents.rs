@@ -7885,7 +7885,7 @@ async fn send_prompt(
             session_id,
             message_id: message.message_id,
             text: message.text,
-            attachments: Vec::new(),
+            attachments: message.attachments,
             output_schema: None,
             delivery: message.delivery,
         })

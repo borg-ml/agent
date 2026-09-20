@@ -4479,3 +4479,284 @@ async fn a_same_host_message_delivers_verified_image_files_and_replays_without_t
     );
     scratch.discard().await;
 }
+
+/// Manual probe: prove a forwarded image reaches a recipient model as pixels.
+///
+/// Generate the image first, so the token exists ONLY in pixels and in the
+/// assertion variable -- never in the prompt, the filename, or this source:
+///   TOKEN=$(python3 -c "import secrets;print('BORG-VIS-'+secrets.token_hex(4).upper())")
+///   python3 -c "
+/// from PIL import Image, ImageDraw, ImageFont
+/// import os
+/// img=Image.new('RGB',(1024,256),'white'); d=ImageDraw.Draw(img)
+/// f=ImageFont.truetype('/usr/share/fonts/TTF/JetBrainsMono-ExtraBold.ttf',72)
+/// d.text((40,90), os.environ['TOKEN'], fill='black', font=f)
+/// img.save('/tmp/borg-vision-probe.png')"
+///   BORG_VISION_IMAGE=/tmp/borg-vision-probe.png BORG_VISION_TOKEN="$TOKEN" \
+///   cargo test -p borg-agent-runtime --lib -- \
+///     forwarded_image_reaches_the_recipient_model_as_pixels --ignored --nocapture
+///
+/// A random token is the whole point: a model that only infers "a white image
+/// with text on it" fails, and nothing in the request tells it what to say.
+/// Only reading the pixels produces the token.
+///
+/// SCOPE: this covers the new send_message capture/persist/resolve path plus a
+/// real recipient model turn over the resolved bytes. It does NOT cover
+/// session.rs's TeamPrompt-to-Prompt conversion or two-host routing.
+#[tokio::test]
+#[ignore]
+async fn forwarded_image_reaches_the_recipient_model_as_pixels() {
+    // Explicit and actionable: invoking this without the variables must fail
+    // loudly rather than pass while proving nothing.
+    let source = std::env::var("BORG_VISION_IMAGE").expect(
+        "set BORG_VISION_IMAGE=/tmp/borg-vision-probe.png (see this test's doc comment for the \
+         generator); running it without a real image would assert nothing",
+    );
+    let token = std::env::var("BORG_VISION_TOKEN").expect(
+        "set BORG_VISION_TOKEN to the token rendered into BORG_VISION_IMAGE; without it this \
+         test cannot tell pixels from a plausible guess",
+    );
+    assert!(
+        std::env::var_os("ANTHROPIC_API_KEY").is_none(),
+        "refusing to run: ANTHROPIC_API_KEY is set, which would bill the API instead of the \
+         authenticated subscription",
+    );
+
+    let directory = tempdir().unwrap();
+    let (coordinator, sender, recipient, store, scratch) =
+        image_routing_fixture(directory.path()).await;
+
+    // The test owns its copy, under a neutral name: the filename must not be
+    // able to tell the model what the answer is.
+    let owned = directory.path().join("forwarded-evidence.png");
+    std::fs::copy(&source, &owned).expect("copy the probe image into the test's own temp path");
+
+    let options = TeamMessageOptions {
+        attachments: capture_message_attachments(directory.path(), &[owned.clone()])
+            .await
+            .expect("capture the image through the send_message path"),
+        ..TeamMessageOptions::default()
+    };
+    let digest = options.attachments[0].sha256.clone();
+
+    let (inbox, receipt) = coordinator
+        .persist_team_message(
+            sender,
+            recipient,
+            "/root",
+            "Attached image forwarded for visual verification.",
+            crate::contract::PromptDelivery::Queue,
+            DeliveryMode::NextTurn,
+            options,
+        )
+        .await
+        .expect("a same-host image message must route");
+    assert!(receipt.is_some());
+    assert_eq!(inbox.attachments.len(), 1);
+
+    // Force the model to read what the store kept, not the sender's file.
+    std::fs::remove_file(&owned).expect("remove the sender's copy");
+
+    let autonomy: Option<std::sync::Arc<dyn crate::autonomy::AutonomyStore>> =
+        store.autonomy_store().await.unwrap();
+    let turn = crate::AgentTurn {
+        session_id: recipient,
+        prompt_cache_session_id: None,
+        message_id: inbox.message_id,
+        context_generation: 0,
+        provider: CodingProvider::Claude,
+        provider_session_id: None,
+        provider_fork_turn_id: None,
+        cwd: directory.path().to_path_buf(),
+        // The prompt must not name the token, or a model could answer without
+        // ever decoding the image.
+        prompt_delta: "Reply with only the exact text visible in the attached image.".to_string(),
+        prompt: "Reply with only the exact text visible in the attached image. Output that text \
+                 and nothing else."
+            .to_string(),
+        attachments: inbox.attachments.clone(),
+        output_schema: None,
+        model: Some("claude-opus-5".to_string()),
+        effort: None,
+        fast: None,
+        response_language: crate::ResponseLanguage::Auto,
+        permission_mode: PermissionMode::FullAccess,
+        conversation: Vec::new(),
+        agent_mcp_server: borg_provider::mcp::ExternalMcpServer {
+            name: "vision-probe".to_string(),
+            command: "true".to_string(),
+            ..Default::default()
+        },
+        agent_tools: AgentToolDispatcher::new(
+            SessionGoalTools::disconnected(),
+            SessionTodoTools::disconnected(),
+            None,
+            crate::LspService::new(directory.path()),
+            CodingProvider::Claude,
+            recipient,
+            false,
+            None,
+            None,
+            directory.path().to_path_buf(),
+            None,
+            autonomy,
+            Some(std::sync::Arc::new(store.clone()) as std::sync::Arc<dyn crate::SessionStore>),
+            Vec::new(),
+            None,
+            crate::native_process::ProcessManager::default(),
+            PermissionMode::FullAccess,
+        ),
+        external_mcp_servers: Vec::new(),
+        runtime_mcp_context: Default::default(),
+        extension_skill_roots: Vec::new(),
+        extension_workflows: Vec::new(),
+        extension_api: Default::default(),
+        system_prompt_appendix: String::new(),
+        volatile_system_prompt_appendix: String::new(),
+    };
+
+    let (events, mut drain) = mpsc::channel(64);
+    let pump = tokio::spawn(async move { while drain.recv().await.is_some() {} });
+    let executor = crate::LocalAgentTurnExecutor::default();
+    let result = crate::AgentTurnExecutor::execute(&executor, turn, events, None)
+        .await
+        .expect("one real vision turn");
+    pump.abort();
+
+    // Receipt, printed under --nocapture so the run is auditable.
+    eprintln!("VISION RECEIPT provider=Claude model=claude-opus-5");
+    eprintln!("VISION RECEIPT billing_path=claude_code_session (authenticated subscription)");
+    eprintln!("VISION RECEIPT attachment_sha256={digest}");
+    eprintln!(
+        "VISION RECEIPT provider_session={:?}",
+        result.provider_session_id
+    );
+    eprintln!("VISION RECEIPT literal_response={:?}", result.final_text);
+
+    assert!(
+        result.final_text.contains(&token),
+        "the recipient model did not report the token rendered in the image; it saw no pixels. \
+         literal response: {:?}",
+        result.final_text
+    );
+    scratch.discard().await;
+}
+
+/// Records the attachments each turn actually received.
+struct AttachmentRecordingExecutor {
+    attachments: Arc<StdMutex<Vec<Vec<PathBuf>>>>,
+}
+
+#[async_trait::async_trait]
+impl crate::AgentTurnExecutor for AttachmentRecordingExecutor {
+    async fn execute(
+        &self,
+        turn: crate::AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<crate::AgentTurnControl>>,
+    ) -> Result<crate::AgentTurnResult> {
+        self.attachments
+            .lock()
+            .expect("attachment lock")
+            .push(turn.attachments.clone());
+        Ok(crate::AgentTurnResult {
+            provider_session_id: None,
+            final_text: "noted".to_string(),
+        })
+    }
+}
+
+/// Images must survive all the way into the turn the model is given.
+///
+/// Delivery to a local subagent goes through send_prompt rather than the
+/// control socket, and that path passed an empty attachment list, so a child
+/// received the text of a message and none of its pictures -- the message
+/// looked delivered and its evidence was silently gone. A real model would
+/// have to be asked about an image it never received to notice. This asserts
+/// on the turn itself, so the fake executor is enough to catch it.
+#[tokio::test]
+async fn images_sent_to_a_local_subagent_arrive_in_its_model_turn() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    let executor = AttachmentRecordingExecutor {
+        attachments: Arc::clone(&seen),
+    };
+    let mut root_launch = launch();
+    root_launch.capabilities.multiplayer = false;
+    root_launch.cwd = directory.path().to_path_buf();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        root_launch,
+        1,
+        Arc::new(executor),
+        store,
+    )
+    .unwrap();
+
+    let spawned = coordinator
+        .call_tool(
+            "spawn_agent",
+            json!({
+                "action": "review evidence",
+                "task_name": "reviewer",
+                "message": "Stand by for evidence."
+            }),
+        )
+        .await
+        .unwrap();
+    let child = Uuid::parse_str(spawned["session_id"].as_str().unwrap()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if coordinator.get(child).await.unwrap().status == SubagentStatus::Ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the subagent should become ready");
+
+    let source = directory.path().join("evidence.png");
+    let original = sample_png();
+    std::fs::write(&source, &original).unwrap();
+    let before = seen.lock().expect("attachment lock").len();
+
+    coordinator
+        .call_tool(
+            "send_message",
+            json!({
+                "target": "reviewer",
+                "message": "Look at the attached frame.",
+                "attachments": [source.to_str().unwrap()],
+            }),
+        )
+        .await
+        .expect("sending an image to a local subagent must route");
+
+    let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let recorded = seen.lock().expect("attachment lock").clone();
+            if let Some(turn) = recorded.get(before)
+                && !turn.is_empty()
+            {
+                return turn.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the subagent's turn must carry the forwarded image");
+
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(
+        std::fs::read(&delivered[0]).unwrap(),
+        original,
+        "the turn carried a file, but not the bytes that were sent"
+    );
+    scratch.discard().await;
+}
