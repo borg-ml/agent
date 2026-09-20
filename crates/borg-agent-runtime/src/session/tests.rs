@@ -9130,6 +9130,59 @@ async fn a_turn_cut_off_by_a_crash_resumes_its_prompt_instead_of_re_asking_it() 
 }
 
 #[tokio::test]
+async fn a_turn_killed_before_it_produced_anything_replays_its_prompt_verbatim() {
+    // The other side of the line, and the one that keeps this honest. A turn
+    // whose boundary is journaled and is then killed before the provider
+    // emitted anything has nothing to continue from. Telling the model it may
+    // already have answered and made progress would be false, and the request
+    // it never acted on is owed a plain replay -- byte for byte, so a
+    // subscription prompt still ends with exactly the input.
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "recover this exact input".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::TurnStarted {
+            message_id,
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+        },
+        // The host died here, between the boundary and the first output.
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let recovery = store.recovery(session_id).await.unwrap();
+    assert_eq!(
+        interrupted_turn_prompt(&recovery.context_events),
+        None,
+        "a boundary alone is not progress: there is nothing to continue from"
+    );
+    assert_eq!(
+        recover_prompts_on_resume(&recovery.queue_events)
+            .iter()
+            .map(|prompt| prompt.message_id)
+            .collect::<Vec<_>>(),
+        vec![message_id],
+        "and the input it never acted on is still replayed"
+    );
+    scratch.discard().await;
+}
+
+#[tokio::test]
 async fn a_resumed_turn_continues_the_original_prompt_and_settles_it_once() {
     // The runtime half of the crash-resume contract. The classifier test
     // above would still pass if the dispatch and admission wiring were

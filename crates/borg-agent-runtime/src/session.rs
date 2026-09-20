@@ -7714,20 +7714,38 @@ pub(crate) const RESUMED_TURN_CONTINUATION: &str = "\n\nThe previous attempt was
 /// answered at 02:08 on 2026-09-20, lost its turn to a host OOM at 02:16,
 /// and was asked again as a fresh turn at 02:21.
 ///
+/// The turn must also have PRODUCED something -- an assistant message, a
+/// tool call, a native model message. A turn the host killed between its
+/// boundary and the provider's first output has nothing to continue from,
+/// and telling the model it may already have answered and made progress
+/// would be false. That one replays verbatim, which is what it is owed.
+///
 /// Answering that with a drop would be worse than the repeat: that turn kept
 /// working for seven minutes after it answered, and unfinished work is not
 /// something recovery may discard. The prompt is resumed instead, under its
 /// original id, without re-announcing its admission and with the dispatch
 /// demoted from instruction to continuation.
 fn interrupted_turn_prompt(context_events: &[SessionEvent]) -> Option<Uuid> {
-    context_events
-        .iter()
-        .rev()
-        .find_map(|event| match &event.kind {
-            SessionEventKind::TurnStarted { message_id, .. } => Some(Some(*message_id)),
-            SessionEventKind::TurnCompleted { .. } => Some(None),
-            _ => None,
-        })?
+    let mut produced_work = false;
+    for event in context_events.iter().rev() {
+        match &event.kind {
+            SessionEventKind::TurnCompleted { .. } => return None,
+            SessionEventKind::TurnStarted { message_id, .. } => {
+                return produced_work.then_some(*message_id);
+            }
+            SessionEventKind::Message {
+                actor: EventActor::Assistant,
+                ..
+            }
+            | SessionEventKind::ToolStarted { .. }
+            | SessionEventKind::ToolCompleted { .. } => produced_work = true,
+            SessionEventKind::ProviderEvent { kind, .. } if kind == "native_model_message" => {
+                produced_work = true;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn recover_prompts_on_resume(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
