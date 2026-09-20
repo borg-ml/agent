@@ -4384,7 +4384,11 @@ impl SubagentCoordinator {
                     session_id: actor_session_id,
                     message_id: message.message_id,
                     text: message.text,
-                    attachments: Vec::new(),
+                    // A message that waited in the inbox keeps its images. The
+                    // wait is the whole reason they could be lost here: the
+                    // child was idle when they were sent, so this is where they
+                    // are finally handed over.
+                    attachments: message.attachments,
                     output_schema: None,
                     delivery: message.delivery,
                 })

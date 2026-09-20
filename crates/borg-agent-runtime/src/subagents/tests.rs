@@ -4740,6 +4740,10 @@ async fn images_sent_to_a_local_subagent_arrive_in_its_model_turn() {
                 "target": "reviewer",
                 "message": "Look at the attached frame.",
                 "attachments": [source.to_str().unwrap()],
+                // An idle child only QUEUES a plain message, so a turn would
+                // never start and the assertion below would time out proving
+                // nothing. Waking it is what makes the delivery observable.
+                "wake": true,
             }),
         )
         .await
