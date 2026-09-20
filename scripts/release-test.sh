@@ -266,6 +266,11 @@ FAKE_CARGO
 } >"$fake_bin/cargo"
 chmod +x "$fake_bin/cargo"
 
+# release.sh refuses to start without a configured session-journal test server.
+# The fixtures never reach a real test run -- cargo is faked -- so this URL is
+# only ever read by that check and is never connected to.
+readonly FIXTURE_SESSIONS_URL="postgres://release-test@127.0.0.1:5432/postgres"
+
 run_release() {
   local fixture="$1"
   shift
@@ -274,6 +279,8 @@ run_release() {
   (
     cd "$fixture"
     PATH="$fake_bin:$PATH" FAKE_CARGO_LOG="$cargo_log" \
+      BORG_TEST_SESSIONS_URL="$FIXTURE_SESSIONS_URL" \
+      BORG_SESSIONS_URL="$FIXTURE_SESSIONS_URL" \
       ./scripts/release.sh "$@"
   )
 }
@@ -287,6 +294,8 @@ run_release_with_touch() {
   (
     cd "$fixture"
     PATH="$fake_bin:$PATH" FAKE_CARGO_LOG="$cargo_log" \
+      BORG_TEST_SESSIONS_URL="$FIXTURE_SESSIONS_URL" \
+      BORG_SESSIONS_URL="$FIXTURE_SESSIONS_URL" \
       FAKE_CARGO_TOUCH_FILE="$touch_file" ./scripts/release.sh "$@"
   )
 }
@@ -409,6 +418,8 @@ rollback_log="$test_root/rollback-fake-cargo.log"
 if (
   cd "$rollback_fixture"
   PATH="$fake_bin:$PATH" FAKE_CARGO_LOG="$rollback_log" FAKE_CARGO_FAIL=test \
+    BORG_TEST_SESSIONS_URL="$FIXTURE_SESSIONS_URL" \
+    BORG_SESSIONS_URL="$FIXTURE_SESSIONS_URL" \
     ./scripts/release.sh
 ) >/dev/null 2>&1; then
   fail "a failing release unexpectedly succeeded"
@@ -425,6 +436,76 @@ if git -C "$rollback_fixture" rev-parse --verify 'refs/tags/v1.2.4^{commit}' \
   >/dev/null 2>&1; then
   fail "failed release created a tag"
 fi
+
+# The release suite needs a PostgreSQL server, and release.sh must refuse
+# before it fetches, bumps the version or runs anything. The rollback case
+# above only proves the manifest is restored AFTER a failed test run; it cannot
+# catch a preflight that runs too late or not at all, which is what turned a
+# missing variable into a wall of storage failures on a mutated manifest. Each
+# variable is checked on its own, blank as well as unset, because a half
+# configured environment is the one that reaches a production journal.
+preflight_fixture="$(make_fixture preflight)"
+preflight_manifest="$(sha256sum "$preflight_fixture/Cargo.toml")"
+preflight_lock="$(sha256sum "$preflight_fixture/Cargo.lock")"
+preflight_head="$(git -C "$preflight_fixture" rev-parse HEAD)"
+preflight_origin="$test_root/preflight-origin.git"
+preflight_remote_head="$(git --git-dir="$preflight_origin" rev-parse refs/heads/main)"
+preflight_log="$test_root/preflight-fake-cargo.log"
+
+for preflight_variable in BORG_TEST_SESSIONS_URL BORG_SESSIONS_URL; do
+  for preflight_value in "" "   " "$(printf '\t')"; do
+    for preflight_mode in "" "--check"; do
+      label="$preflight_variable='$preflight_value' ${preflight_mode:-release}"
+      : >"$preflight_log"
+      if (
+        cd "$preflight_fixture"
+        export PATH="$fake_bin:$PATH"
+        export FAKE_CARGO_LOG="$preflight_log"
+        export BORG_TEST_SESSIONS_URL="$FIXTURE_SESSIONS_URL"
+        export BORG_SESSIONS_URL="$FIXTURE_SESSIONS_URL"
+        export "$preflight_variable=$preflight_value"
+        ./scripts/release.sh ${preflight_mode:+"$preflight_mode"}
+      ) >/dev/null 2>&1; then
+        fail "release ran without a configured test journal ($label)"
+      fi
+      [[ ! -s "$preflight_log" ]] ||
+        fail "release invoked cargo without a configured test journal ($label)"
+      assert_equal "$preflight_manifest" \
+        "$(sha256sum "$preflight_fixture/Cargo.toml")" \
+        "Cargo.toml after refused release ($label)"
+      assert_equal "$preflight_lock" \
+        "$(sha256sum "$preflight_fixture/Cargo.lock")" \
+        "Cargo.lock after refused release ($label)"
+      assert_equal "$preflight_head" \
+        "$(git -C "$preflight_fixture" rev-parse HEAD)" \
+        "HEAD after refused release ($label)"
+      assert_equal "$preflight_remote_head" \
+        "$(git --git-dir="$preflight_origin" rev-parse refs/heads/main)" \
+        "remote main after refused release ($label)"
+      [[ -z "$(git -C "$preflight_fixture" status --porcelain)" ]] ||
+        fail "refused release left a dirty fixture ($label)"
+      if git -C "$preflight_fixture" rev-parse --verify 'refs/tags/v1.2.4^{commit}' \
+        >/dev/null 2>&1; then
+        fail "refused release created a tag ($label)"
+      fi
+    done
+  done
+done
+
+# Tag verification compares two strings and runs no tests, so it must stay
+# usable without a journal; the release workflow calls it on a runner before
+# anything else is set up.
+(
+  cd "$preflight_fixture"
+  env -u BORG_TEST_SESSIONS_URL -u BORG_SESSIONS_URL \
+    ./scripts/release.sh --verify-tag v1.2.3
+) >/dev/null || fail "tag verification requires a test journal it never uses"
+
+# A fully configured environment still reaches the version bump, so the check
+# above is proving ordering rather than simply blocking every release.
+run_release "$preflight_fixture"
+assert_equal "1.2.4" "$(fixture_version "$preflight_fixture")" \
+  "release version once the test journal is configured"
 
 dirty_fixture="$(make_fixture dirty)"
 echo "unrelated work" >"$dirty_fixture/uncommitted"

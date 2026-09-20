@@ -189,6 +189,25 @@ prebumped_release_commit() {
   return 1
 }
 
+# The release suite runs the session-journal tests, and those require a real
+# PostgreSQL server. Check for one here, before the fetch and long before the
+# version bump: without this check the first signal an operator gets is a
+# mutated manifest followed by a wall of connection panics, which reads like a
+# code regression rather than an unconfigured environment.
+require_test_environment() {
+  local variable
+  local value
+  for variable in BORG_TEST_SESSIONS_URL BORG_SESSIONS_URL; do
+    value="$(printf '%s' "${!variable-}" | tr -d '[:space:]')"
+    [[ -n "$value" ]] ||
+      die "$variable is not set, so the release tests have no session journal to run against.
+  Set both BORG_TEST_SESSIONS_URL and BORG_SESSIONS_URL to an isolated test server
+  whose role may create databases. The tests create and drop their own scratch
+  databases, so neither variable may name a production journal.
+  See docs/session-store-backends.md."
+  done
+}
+
 run_release_checks() (
   local test_tmp
   # Keep the sandbox path short: borg-remote exposes Unix sockets below
@@ -246,6 +265,8 @@ if [[ "$mode" == "verify-tag" ]]; then
   echo "Release tag $1 matches workspace version $current_version."
   exit 0
 fi
+
+require_test_environment
 
 requested_version="${1:-}"
 requested_version="${requested_version#v}"
