@@ -9,7 +9,8 @@ use borg_provider::provider::{
     ChatApprovalDecision, ChatStreamControl, ChatStreamEvent, ChatStreamRequest,
     ClaudeSubscriptionPool, LocalAgentPermission, ProviderStreamError, SteerAdmission,
     run_claude_chat_stream_with_control, run_claude_local_chat_stream,
-    run_claude_local_chat_stream_pooled, run_opencode_local_chat_stream,
+    run_claude_local_chat_stream_pooled, run_grok_local_chat_stream,
+    run_muse_local_chat_stream, run_opencode_local_chat_stream,
 };
 use borg_provider::{ProviderCallUsage, ProviderChannel};
 use serde_json::Value;
@@ -992,7 +993,10 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         }
         let completed_hook_turn = turn.clone();
         let result = match turn.provider {
-            CodingProvider::Claude | CodingProvider::OpenCode => {
+            CodingProvider::Claude
+            | CodingProvider::OpenCode
+            | CodingProvider::Grok
+            | CodingProvider::Muse => {
                 run_borg_provider_turn(
                     turn,
                     events,
@@ -1514,6 +1518,14 @@ async fn run_borg_provider_turn(
         CodingProvider::OpenCode if local => run_opencode_local_chat_stream(request, permission),
         CodingProvider::OpenCode => {
             bail!("OpenCode execution is only supported on an enrolled host")
+        }
+        CodingProvider::Grok if local => run_grok_local_chat_stream(request, permission),
+        CodingProvider::Grok => {
+            bail!("Grok execution is only supported on an enrolled host")
+        }
+        CodingProvider::Muse if local => run_muse_local_chat_stream(request, permission),
+        CodingProvider::Muse => {
+            bail!("Muse execution is only supported on an enrolled host")
         }
         provider => bail!("{provider:?} must use a NativeHarness-compatible route"),
     };

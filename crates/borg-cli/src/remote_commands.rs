@@ -1644,6 +1644,8 @@ fn provider_argument(provider: crate::cli::RemoteProviderArg) -> &'static str {
         RemoteProviderArg::Kimi => "kimi",
         RemoteProviderArg::Glm => "glm",
         RemoteProviderArg::Qwen => "qwen",
+        RemoteProviderArg::Grok => "grok",
+        RemoteProviderArg::Muse => "muse",
         RemoteProviderArg::OpenRouter => "open-router",
         RemoteProviderArg::OpenAiCompatible => "open-ai-compatible",
     }
@@ -2166,6 +2168,8 @@ async fn run_local_agent_session(
             Some(borg_provider::kimi_default_effort().to_string())
         }
         CodingProvider::Qwen => Some(borg_provider::qwen_default_effort().to_string()),
+        // Grok Build and Muse Code choose their own reasoning depth.
+        CodingProvider::Grok | CodingProvider::Muse => None,
     });
     let (
         recorded_cwd,
@@ -7458,6 +7462,8 @@ pub(crate) async fn login_command(
             CodingProvider::Codex,
             CodingProvider::Claude,
             CodingProvider::OpenCode,
+            CodingProvider::Grok,
+            CodingProvider::Muse,
             CodingProvider::OpenRouter,
             CodingProvider::Kimi,
             CodingProvider::Glm,
@@ -7494,19 +7500,18 @@ pub(crate) async fn login_command(
             let path = prompt_and_store_api_key(provider)?;
             println!("{} API key saved to {}.", provider.label(), path.display());
         }
-        CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode => {
+        CodingProvider::Codex
+        | CodingProvider::Claude
+        | CodingProvider::OpenCode
+        | CodingProvider::Grok
+        | CodingProvider::Muse => {
             println!(
                 "{}",
                 authenticate_provider(provider, ProviderAuthChoice::ReconnectSubscription).await?
             );
         }
         CodingProvider::Kimi | CodingProvider::Glm | CodingProvider::Qwen => {
-            let plan = match provider {
-                CodingProvider::Kimi => borg_provider::Plan::KimiCode,
-                CodingProvider::Glm => borg_provider::Plan::GlmCoding,
-                CodingProvider::Qwen => borg_provider::Plan::QwenCoding,
-                _ => unreachable!("matched above"),
-            };
+            let plan = coding_plan_for(provider).expect("matched a coding-plan provider");
             println!(
                 "Paste your {} key (input hidden), then press Enter:",
                 plan.label()
@@ -7541,9 +7546,18 @@ pub(crate) async fn login_command(
     Ok(())
 }
 
-/// One line telling a user how a provider gets its credentials.
-fn credential_guidance(provider: CodingProvider) -> &'static str {
+/// The coding plan a provider is served by, if it is a plan provider.
+fn coding_plan_for(provider: CodingProvider) -> Option<borg_provider::Plan> {
     match provider {
+        CodingProvider::Kimi => Some(borg_provider::Plan::KimiCode),
+        CodingProvider::Glm => Some(borg_provider::Plan::GlmCoding),
+        CodingProvider::Qwen => Some(borg_provider::Plan::QwenCoding),
+        _ => None,
+    }
+}
+
+/// One line telling a user how a provider gets its credentials.
+fn credential_guidance(provider: CodingProvider) -> &'static str {    match provider {
         CodingProvider::Codex => {
             "`borg login codex` (ChatGPT) or `borg login codex --api-key` (API billing); /login switches saved credentials"
         }
@@ -7552,6 +7566,12 @@ fn credential_guidance(provider: CodingProvider) -> &'static str {
         }
         CodingProvider::OpenCode => {
             "`borg login opencode --api-key` (Go subscription key), then /model → OpenCode Go"
+        }
+        CodingProvider::Grok => {
+            "`borg login grok` runs the Grok Build sign-in (or set XAI_API_KEY for the API)"
+        }
+        CodingProvider::Muse => {
+            "`borg login muse` runs the Muse Code sign-in (or set META_API_KEY for CI)"
         }
         CodingProvider::OpenRouter => "`borg login openrouter` stores an OpenRouter API key",
         CodingProvider::Kimi => "`borg login kimi` selects the Kimi Code plan and stores its key",
@@ -7654,6 +7674,15 @@ async fn authenticate_provider(
                     ),
                 },
             );
+        }
+        if let Some(plan) = coding_plan_for(provider) {
+            // Selecting a plan is what routes the profile at the plan's quota
+            // host; a stored key alone would otherwise sit unused.
+            credentials::set_active_subscription(plan.id())?;
+            return Ok(format!(
+                "{} connected · served directly by Borg, no CLI required.",
+                plan.label()
+            ));
         }
         return Ok(format!("{} API key saved.", provider.label()));
     }
@@ -7941,6 +7970,8 @@ fn default_model_for_provider(provider: CodingProvider) -> Option<String> {
         CodingProvider::Kimi => Some(borg_provider::kimi_product_model().to_string()),
         CodingProvider::Glm => Some(borg_provider::glm_product_model().to_string()),
         CodingProvider::Qwen => Some(borg_provider::qwen_product_model().to_string()),
+        CodingProvider::Grok => Some(borg_provider::grok_product_model().to_string()),
+        CodingProvider::Muse => Some(borg_provider::muse_product_model().to_string()),
         CodingProvider::OpenRouter => Some(borg_provider::openrouter_product_model().to_string()),
         CodingProvider::OpenAiCompatible => std::env::var("BORG_OPENAI_COMPATIBLE_MODEL")
             .ok()
@@ -9727,6 +9758,8 @@ fn provider_name(provider: CodingProvider) -> &'static str {
         CodingProvider::Codex => "codex",
         CodingProvider::Claude => "claude",
         CodingProvider::OpenCode => "open-code",
+        CodingProvider::Grok => "grok",
+        CodingProvider::Muse => "muse",
         CodingProvider::Kimi => "kimi",
         CodingProvider::Glm => "glm",
         CodingProvider::Qwen => "qwen",

@@ -130,6 +130,17 @@ pub fn qwen_default_effort() -> &'static str {
     "high"
 }
 
+/// The model Grok Build runs by default. Borg pins it so the session records
+/// what it is actually talking to; the CLI's own default can change under it.
+pub fn grok_product_model() -> &'static str {
+    "grok-4.6"
+}
+
+/// Muse Code's default model.
+pub fn muse_product_model() -> &'static str {
+    "muse-spark-1.2"
+}
+
 /// A runtime-discovered model entry for the /model picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicModelEntry {

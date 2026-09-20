@@ -30,6 +30,16 @@ mod opencode_stream;
 
 pub use opencode_stream::run_opencode_local_chat_stream;
 
+#[path = "grok_stream.rs"]
+mod grok_stream;
+
+pub use grok_stream::run_grok_local_chat_stream;
+
+#[path = "muse_stream.rs"]
+mod muse_stream;
+
+pub use muse_stream::run_muse_local_chat_stream;
+
 #[cfg(not(feature = "claude"))]
 #[allow(dead_code)]
 mod claude_agents {

@@ -16,6 +16,13 @@ pub enum CodingProvider {
     Codex,
     Claude,
     OpenCode,
+    /// xAI Grok Build. The SuperGrok/X Premium subscription is reachable only
+    /// through xAI's own CLI, so Borg drives it as a compatibility route.
+    Grok,
+    /// Meta Muse Code. The subscription only works through Meta's own CLI,
+    /// signed in with a Meta Model API account, so Borg drives it as a
+    /// compatibility route.
+    Muse,
     Kimi,
     /// Z.ai GLM. Like Kimi, driven by Borg's native model client over the
     /// OpenAI-compatible wire format — no vendor CLI is involved.
@@ -183,6 +190,8 @@ impl CodingProvider {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::OpenCode => "open-code",
+            Self::Grok => "grok",
+            Self::Muse => "muse",
             Self::Kimi => "kimi",
             Self::Glm => "glm",
             Self::Qwen => "qwen",
@@ -200,6 +209,8 @@ impl CodingProvider {
             Self::Codex => "Codex",
             Self::Claude => "Claude",
             Self::OpenCode => "OpenCode",
+            Self::Grok => "Grok",
+            Self::Muse => "Muse",
             Self::Kimi => "Kimi",
             Self::Glm => "GLM",
             Self::Qwen => "Qwen",
@@ -227,6 +238,8 @@ impl CodingProvider {
             .or_else(|| model.starts_with("gpt-").then_some(Self::Codex))
             .or_else(|| (model == borg_provider::glm_product_model()).then_some(Self::Glm))
             .or_else(|| (model == borg_provider::qwen_product_model()).then_some(Self::Qwen))
+            .or_else(|| (model == borg_provider::grok_product_model()).then_some(Self::Grok))
+            .or_else(|| (model == borg_provider::muse_product_model()).then_some(Self::Muse))
             .or_else(|| {
                 model
                     .strip_prefix("opencode/")
@@ -252,6 +265,8 @@ impl CodingProvider {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::OpenCode => "open_code",
+            Self::Grok => "grok",
+            Self::Muse => "muse",
             Self::Kimi => "kimi",
             Self::Glm => "glm",
             Self::Qwen => "qwen",
@@ -265,6 +280,8 @@ impl CodingProvider {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
+            Self::Grok => "grok",
+            Self::Muse => "muse",
             Self::Kimi | Self::Glm | Self::Qwen | Self::OpenRouter | Self::OpenAiCompatible => "borg",
         }
     }

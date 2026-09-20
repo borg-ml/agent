@@ -5901,7 +5901,7 @@ fn default_consultation_effort(provider: CodingProvider) -> Option<String> {
         CodingProvider::Qwen => Some(borg_provider::qwen_default_effort().to_string()),
         CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => Some("medium".to_string()),
         CodingProvider::Claude => Some(borg_provider::claude_default_effort().to_string()),
-        CodingProvider::OpenCode => None,
+        CodingProvider::OpenCode | CodingProvider::Grok | CodingProvider::Muse => None,
     }
 }
 

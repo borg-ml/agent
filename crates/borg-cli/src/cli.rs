@@ -583,10 +583,12 @@ pub(crate) struct LocalAgentCliArgs {
 /// Provider preference used when no `--provider` was given. Codex stays first
 /// so an existing ChatGPT login keeps its behaviour; every later entry is only
 /// reached when the providers before it have no credentials on this machine.
-pub(crate) const DEFAULT_PROVIDER_PREFERENCE: [RemoteProviderArg; 8] = [
+pub(crate) const DEFAULT_PROVIDER_PREFERENCE: [RemoteProviderArg; 10] = [
     RemoteProviderArg::Codex,
     RemoteProviderArg::Claude,
     RemoteProviderArg::OpenCode,
+    RemoteProviderArg::Grok,
+    RemoteProviderArg::Muse,
     RemoteProviderArg::Kimi,
     RemoteProviderArg::Glm,
     RemoteProviderArg::Qwen,
@@ -1255,6 +1257,8 @@ pub(crate) enum RemoteProviderArg {
     Claude,
     #[value(name = "opencode", alias = "open-code")]
     OpenCode,
+    Grok,
+    Muse,
     Kimi,
     Glm,
     Qwen,
@@ -1269,6 +1273,8 @@ impl From<RemoteProviderArg> for borg_remote::CodingProvider {
             RemoteProviderArg::Codex => Self::Codex,
             RemoteProviderArg::Claude => Self::Claude,
             RemoteProviderArg::OpenCode => Self::OpenCode,
+            RemoteProviderArg::Grok => Self::Grok,
+            RemoteProviderArg::Muse => Self::Muse,
             RemoteProviderArg::Kimi => Self::Kimi,
             RemoteProviderArg::Glm => Self::Glm,
             RemoteProviderArg::Qwen => Self::Qwen,

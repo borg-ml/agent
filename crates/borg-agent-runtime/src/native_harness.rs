@@ -1455,7 +1455,9 @@ impl ProviderModelClient {
             }
             crate::CodingProvider::Codex
             | crate::CodingProvider::Claude
-            | crate::CodingProvider::OpenCode => return Err(NotNative),
+            | crate::CodingProvider::OpenCode
+            | crate::CodingProvider::Grok
+            | crate::CodingProvider::Muse => return Err(NotNative),
         };
         Ok(NativeRoute::ChatCompletions { profile, gateway })
     }
