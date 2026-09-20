@@ -13232,6 +13232,67 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
 }
 
 #[test]
+fn watcher_process_is_counted_as_a_watcher_not_a_shell() {
+    let session_id = Uuid::new_v4();
+    let watch_id = Uuid::new_v4();
+    let shell_process_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::RuntimeProcessStarted {
+            process_id: watch_id,
+            pid: 1111,
+            command: "tail -f log".to_string(),
+            cwd: PathBuf::from("/workspace"),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::WatchesChanged {
+            watches: vec![WatchSummary {
+                watch_id,
+                label: "Build".to_string(),
+                command: "tail -f log".to_string(),
+                running: true,
+                started_at: Utc::now(),
+                last_event_at: None,
+                event_count: 0,
+            }],
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "shell-1".to_string(),
+            name: "exec_command".to_string(),
+            input: serde_json::json!({"cmd": "cargo test"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        4,
+        SessionEventKind::RuntimeProcessStarted {
+            process_id: shell_process_id,
+            pid: 4242,
+            command: "cargo test".to_string(),
+            cwd: PathBuf::from("/workspace"),
+        },
+    ));
+
+    assert_eq!(transcript.watch_status().as_deref(), Some("1 watcher"));
+    assert_eq!(transcript.shell_status().as_deref(), Some("1 shell"));
+    assert_eq!(
+        transcript.active_shell_rows(),
+        vec![("pid 4242  cargo test".to_string(), Some(0))]
+    );
+}
+
+#[test]
 fn provider_background_handle_drives_shell_status_and_full_output() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();

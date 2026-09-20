@@ -3468,16 +3468,18 @@ impl Transcript {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let watch_ids: HashSet<Uuid> = self.watches.iter().map(|watch| watch.watch_id).collect();
         rows.extend(
             self.runtime_processes
-                .values()
-                .filter(|process| {
-                    process.running
+                .iter()
+                .filter(|(process_id, process)| {
+                    !watch_ids.contains(process_id)
+                        && process.running
                         && process
                             .tool_index
                             .is_none_or(|tool_index| !claimed_tools.contains(&tool_index))
                 })
-                .map(|process| {
+                .map(|(_, process)| {
                     (
                         format!(
                             "pid {}  {}",
