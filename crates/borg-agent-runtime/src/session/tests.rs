@@ -4229,11 +4229,13 @@ async fn assert_interrupted_fifo(
                 ))
             );
         } else {
+            // Escaped rather than a raw multi-line literal: this assertion
+            // is nested one block deeper than it used to be, and the
+            // re-indent that moved it silently indented the literal's second
+            // line too, so the expected text grew four spaces it never had.
             assert!(subscription_prompt_ends_with(
                 &seen[1].0,
-                "second [Image 1]
-
-    third"
+                "second [Image 1]\n\nthird"
             ));
         }
         assert_eq!(
