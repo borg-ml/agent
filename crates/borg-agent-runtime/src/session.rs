@@ -1781,6 +1781,22 @@ async fn run_agent_session_store_kernel_inner(
         .then(Instant::now);
     let mut goal_turn_failures = ConsecutiveGoalTurnFailures::default();
     let mut pending = recover_prompts_on_resume(&recovery.queue_events);
+    // Admissions the dead run already made durable. Only these may be
+    // skipped: a resumed prompt has one, at its original timestamp, and
+    // announcing it again dates the message to the restart. A prompt that
+    // was merely queued has none and still has to be announced.
+    let mut durable_admissions = recovery
+        .queue_events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::Message {
+                message_id,
+                status: MessageStatus::InProgress,
+                ..
+            } => Some(*message_id),
+            _ => None,
+        })
+        .collect::<HashSet<Uuid>>();
     for action in recovered_actions {
         if let Some(prompt) = queued_prompt_from_action(&action)
             && !pending
@@ -3317,7 +3333,7 @@ async fn run_agent_session_store_kernel_inner(
         // one. Only the re-announcement is skipped; every terminal status
         // below still fires, so the message lifecycle still closes.
         let resuming_interrupted_turn = resumed_turn_message_id == Some(prompt.message_id);
-        if prompt.visible && !resuming_interrupted_turn {
+        if prompt.visible && !durable_admissions.remove(&prompt.message_id) {
             record_prompt_status(
                 &mut journal,
                 &events,
@@ -3890,7 +3906,7 @@ async fn run_agent_session_store_kernel_inner(
         } else {
             format_subscription_frame(&format_subscription_actor_value(prompt.actor, &prompt.text))
         };
-        if resumed_turn_message_id == Some(prompt.message_id) {
+        if resuming_interrupted_turn && prompt.visible {
             // Same durable id, so cancelling, recovery and the message
             // lifecycle keep working -- and the same reason the network path
             // spells this out applies harder here. The turn this prompt
@@ -4275,7 +4291,16 @@ async fn run_agent_session_store_kernel_inner(
                             // on. Re-sending it would repeat that work, so the
                             // resume is a continuation rather than a replay.
                             let usage_limit_continue = usage_limit_retry && turn_had_side_effects;
-                            let continuation = usage_limit_continue.then(|| usage_limit_continuation(&prompt));
+                            // A resumed turn continues progress made before this
+                            // attempt began, recorded in the conversation above, so
+                            // there is work to continue even when this attempt made
+                            // none of its own. Without this the checkpoint persists
+                            // the bare prompt and the restart after it asks the
+                            // original question again -- the same repeat, one
+                            // boundary later.
+                            let continuation = (usage_limit_continue
+                                || (usage_limit_retry && resuming_interrupted_turn))
+                                .then(|| usage_limit_continuation(&prompt));
                             let auth_lookup_failure = provider_error_is_auth_lookup_unavailable(&error);
                             if network_retry_message_id != Some(prompt.message_id) {
                                 auth_lookup_retries = 0;

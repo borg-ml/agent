@@ -9335,6 +9335,156 @@ async fn in_progress_admissions(
 }
 
 #[tokio::test]
+async fn a_resumed_turn_that_hits_a_usage_limit_checkpoints_as_a_continuation() {
+    // The boundary after the boundary. A turn the host killed is resumed as
+    // a continuation, and then that resumed attempt hits a usage limit
+    // before making any side effects of its own. The checkpoint it writes is
+    // what the NEXT restart reads, so if it persists the bare prompt the
+    // original question is asked again one boundary later -- the same defect
+    // this contract exists to prevent, just deferred.
+    //
+    // The progress being continued predates this attempt: it is in the
+    // conversation, not in this turn's side effects, which is exactly why
+    // `turn_had_side_effects` alone is the wrong test here.
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    for kind in [
+        SessionEventKind::SessionStarted,
+        SessionEventKind::SessionConfigured {
+            cwd: root.path().to_path_buf(),
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+            response_language: crate::ResponseLanguage::Auto,
+            permission_mode: PermissionMode::Manual,
+        },
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User,
+            text: "finish the committed work".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::TurnStarted {
+            message_id,
+            provider: CodingProvider::Codex,
+            model: None,
+            effort: None,
+            fast: false,
+        },
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: EventActor::Assistant,
+            text: "starting on it".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+        // No TurnCompleted: the host died inside this turn.
+    ] {
+        store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let executor = Arc::new(UsageLimitThenSuccessExecutor {
+        calls: Arc::new(AtomicUsize::new(0)),
+        side_effects_before_limit: false,
+        prompts: Arc::new(Mutex::new(Vec::new())),
+    });
+    let actor_store = Arc::clone(&store);
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                actor_store,
+            )
+            .await
+        }
+    });
+
+    let mut checkpoint = None;
+    while checkpoint.is_none() {
+        let Some(event) = tokio::time::timeout(Duration::from_secs(10), event_rx.recv())
+            .await
+            .expect("the resumed turn checkpoints when it hits the usage limit")
+        else {
+            panic!("session exited before writing a usage limit checkpoint");
+        };
+        if let SessionEventKind::ProviderEvent { kind, payload, .. } = &event.kind
+            && kind == "usage_limit_retry"
+        {
+            checkpoint = Some(
+                serde_json::from_value::<crate::session_store::PendingUsageLimitRetry>(
+                    payload.clone(),
+                )
+                .unwrap(),
+            );
+        }
+    }
+    let checkpoint = checkpoint.unwrap();
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = actor.await.unwrap();
+
+    assert!(
+        checkpoint.continuation,
+        "a resumed turn is still a continuation when it parks on a usage limit; \
+         without this its originals never settle and it is re-announced and re-asked"
+    );
+    // Structural rather than prose, so rewording the continuation text does
+    // not break a test that is here for the wiring.
+    assert_ne!(
+        checkpoint.prompt.message_id, message_id,
+        "the checkpoint carries a continuation prompt, not the bare original"
+    );
+    assert_eq!(checkpoint.prompt.actor, EventActor::System);
+    assert!(!checkpoint.prompt.visible);
+    assert!(
+        checkpoint.prompt.text.contains("finish the committed work"),
+        "the original request travels with the continuation as reference data"
+    );
+    assert!(
+        checkpoint.replaced_message_ids.contains(&message_id),
+        "the original is named so the next resume settles it instead of replaying it"
+    );
+    scratch.discard().await;
+}
+
+#[tokio::test]
 async fn a_turn_that_reached_its_boundary_is_not_resumed_as_a_continuation() {
     // The other half. Once `TurnCompleted` is durable the turn ended on its
     // own terms, so nothing about it is interrupted and a later prompt with
