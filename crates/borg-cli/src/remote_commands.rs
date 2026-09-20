@@ -62,7 +62,7 @@ mod local_server;
 const MIN_TUI_FPS: u64 = 15;
 const MAX_TUI_FPS: u64 = 240;
 const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
-const TOOL_STARTED_FRAME_MIN_DURATION: std::time::Duration = std::time::Duration::from_millis(500);
+const TOOL_STARTED_FRAME_MIN_DURATION: std::time::Duration = std::time::Duration::from_millis(150);
 const IDLE_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const MAX_RENDER_BACKOFF_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 const LOCAL_RESUME_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
@@ -8941,10 +8941,8 @@ fn terminal_needs_idle_tick(has_expiring_notice: bool, has_blinking_cursor: bool
 }
 
 fn session_event_needs_immediate_frame(kind: &SessionEventKind) -> bool {
-    matches!(
-        kind,
-        SessionEventKind::ToolStarted { .. } | SessionEventKind::ToolUpdated { .. }
-    ) || matches!(kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "tool_call_started" || kind == "action/preparing")
+    matches!(kind, SessionEventKind::ToolStarted { .. })
+        || matches!(kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "tool_call_started" || kind == "action/preparing")
 }
 
 fn should_schedule_interaction_frame(

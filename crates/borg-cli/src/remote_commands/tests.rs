@@ -535,6 +535,17 @@ fn first_tool_argument_token_gets_an_immediate_generating_frame() {
 }
 
 #[test]
+fn streaming_tool_updates_coalesce_instead_of_forcing_a_full_frame() {
+    let updated = SessionEventKind::ToolUpdated {
+        tool_call_id: "tool-1".to_string(),
+        name: "command_execution".to_string(),
+        input: serde_json::json!({"command": "true"}),
+    };
+
+    assert!(!session_event_needs_immediate_frame(&updated));
+}
+
+#[test]
 fn status_is_an_alias_for_usage() {
     assert!(is_usage_command("/usage"));
     assert!(is_usage_command("/status"));
