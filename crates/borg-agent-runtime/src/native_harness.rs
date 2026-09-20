@@ -558,6 +558,17 @@ impl NativeHarness {
                     record_native_message(&events, turn.provider, &message).await?;
                     messages.push(message);
                     canonicalize_native_messages(&mut messages);
+                    // A human spoke, which is what makes a parked wait
+                    // obsolete -- `Watches::resume` states the rule as "any
+                    // real input resumes". The tool-boundary path below already
+                    // retires the yield for a steer folded during a tool round,
+                    // but a steer absorbed mid-stream reaches this arm instead
+                    // and used to leave the wait standing, so the next tool
+                    // round ended the turn underneath the request the human had
+                    // just made. Which path a steer takes is a race between the
+                    // provider stream and the tool round; the yield must be
+                    // retired on both or the outcome depends on scheduling.
+                    turn.agent_tools.clear_watcher_yield();
                     assistant_message_id = Uuid::new_v4();
                     send(
                         &events,

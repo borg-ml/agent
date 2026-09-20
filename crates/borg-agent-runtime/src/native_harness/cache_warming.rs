@@ -427,13 +427,6 @@ impl CacheWarmer {
         }
     }
 
-    fn phase(&self) -> Phase {
-        self.phase
-            .lock()
-            .map(|phase| *phase)
-            .unwrap_or(Phase::Streaming)
-    }
-
     /// Whether this route can be warmed at all, recorded as the current
     /// status. A property of the route and model rather than of any one
     /// request, so an ineligible session says why once.

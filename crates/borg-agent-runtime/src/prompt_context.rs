@@ -221,41 +221,6 @@ impl DeclarationDelta {
     pub(crate) fn is_empty(&self) -> bool {
         self.instructions.is_empty() && self.tools_added.is_empty() && self.tools_removed.is_empty()
     }
-
-    /// What the model is told when this change keeps a positional marker.
-    ///
-    /// Names only: the effective declarations are already in the head, so the
-    /// marker exists to place the change in time, not to restate it.
-    pub(crate) fn marker_text(&self) -> String {
-        let mut parts = Vec::new();
-        if !self.tools_added.is_empty() {
-            let names = self
-                .tools_added
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            parts.push(format!("tools available: {names}"));
-        }
-        if !self.tools_removed.is_empty() {
-            parts.push(format!(
-                "tools withdrawn: {}",
-                self.tools_removed.join(", ")
-            ));
-        }
-        for (slot, text) in &self.instructions {
-            let slot = match slot {
-                InstructionSlot::Skills => "skills",
-                InstructionSlot::McpUnavailable => "mcp availability",
-                InstructionSlot::Appendix => "instructions",
-            };
-            parts.push(match text {
-                Some(_) => format!("{slot} updated"),
-                None => format!("{slot} cleared"),
-            });
-        }
-        format!("## Declaration change\n{}", parts.join("; "))
-    }
 }
 
 /// What one turn contributes to the durable declaration record.
