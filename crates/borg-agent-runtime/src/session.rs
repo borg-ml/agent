@@ -770,10 +770,55 @@ impl RuntimeSessionStore {
             self.context_events.clear();
             self.context_complete = true;
         }
+        bound_context_at_compaction(&mut self.context_events, &event);
         if event.kind.is_context_relevant() {
             self.context_events.push(event.clone());
         }
         Ok(event)
+    }
+}
+
+/// A completed `context_compaction` that `native_conversation` treats as the
+/// start of a fresh context generation: it clears the conversation at the
+/// boundary and rebuilds it from the summary plus the verbatim tail carried on
+/// the event itself. Matches the boundary arm exactly so the in-memory
+/// projection and the rebuilt conversation can never disagree about where a
+/// generation begins.
+fn starts_context_generation(kind: &SessionEventKind) -> bool {
+    matches!(
+        kind,
+        SessionEventKind::ProviderEvent { kind, payload, .. }
+            if kind == "context_compaction"
+                && compaction_restarts_replay(payload)
+                && matches!(
+                    payload.get("status").and_then(Value::as_str),
+                    None | Some("completed")
+                )
+    )
+}
+
+/// Bound the in-memory context projection at a completed compaction boundary.
+///
+/// Every event before such a boundary is superseded for replay, so a long
+/// session would otherwise retain its whole history for its whole life. They
+/// can be dropped only when the boundary directly follows a successful
+/// `TurnCompleted`: at that instant no failed and no in-flight prompt is
+/// pending, so nothing crosses the boundary, and the retained slice rebuilds
+/// the identical conversation (and the reverse scans over it --
+/// `native_declarations`, `codex_checkpoint_is_acknowledged`,
+/// `interrupted_turn_prompt` -- see the same trailing state). A boundary that
+/// follows a failed or unfinished turn is deliberately left whole: its
+/// unresolved-prompt carry lives in those pre-boundary events, and dropping
+/// them would erase a prompt the model is still owed.
+fn bound_context_at_compaction(events: &mut Vec<SessionEvent>, boundary: &SessionEvent) {
+    if !starts_context_generation(&boundary.kind) {
+        return;
+    }
+    if matches!(
+        events.last().map(|event| &event.kind),
+        Some(SessionEventKind::TurnCompleted { error: None, .. })
+    ) {
+        events.clear();
     }
 }
 
