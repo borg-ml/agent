@@ -4,6 +4,10 @@ This document defines practical parity for Borg's coding-provider transports.
 Parity means equivalent user-visible behavior and reliability; it does not
 require identical provider protocols.
 
+Codex no longer runs an app server, so the Codex column records the historical
+transport rather than a current path. The capability comparison below is still
+the record of what parity required.
+
 ## Capability matrix
 
 | Capability | Codex app-server | Claude Agent SDK | Borg status |

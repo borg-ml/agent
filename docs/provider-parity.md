@@ -4,6 +4,11 @@ Borg keeps provider-specific wire protocols behind one durable session contract.
 The target ownership boundary is defined in
 [Provider ownership](provider-ownership.md). The table below describes today's
 execution paths, including the external agent runtimes still being reduced.
+
+Codex no longer runs an app server: the app-server adapters were removed, so the
+Codex column below records the historical transport rather than a current path.
+Codex now executes on the native harness and direct model transport like the
+other native lanes.
 Parity is checked at the boundaries where regressions matter:
 
 | Contract | Codex app server | Claude Agent SDK | Native harness |
