@@ -595,7 +595,7 @@ impl OpenAiCompatibleProvider {
                 ),
                 trace: Box::new(trace),
                 session_id: None,
-                kind: ProviderErrorKind::Unknown,
+                kind: compatible_provider_error_kind(&raw_text),
             });
         }
 
@@ -798,7 +798,7 @@ impl OpenAiCompatibleProvider {
                 ),
                 trace: Box::new(trace),
                 session_id: None,
-                kind: ProviderErrorKind::Unknown,
+                kind: compatible_provider_error_kind(&raw_text),
             });
         }
 
@@ -1517,6 +1517,29 @@ fn compatible_retryable_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
+/// Classify a refused compatible request from its own body.
+///
+/// A gateway in front of a vendor reports the vendor failure under the gateway
+/// status rather than the vendor status: OpenCode Go answers a transient
+/// upstream failure with `403` and a `server_error` body. Read by status alone
+/// that is a permission refusal, which is never retried, so a blip that a
+/// resend would clear instead ends the turn. The declared error type decides
+/// when the two disagree, and every other refusal keeps the old answer.
+fn compatible_provider_error_kind(body: &str) -> ProviderErrorKind {
+    let compact = body
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>();
+    let declares_server_error = [r#""type":"server_error""#, r#""code":"server_error""#]
+        .iter()
+        .any(|marker| compact.contains(marker));
+    if declares_server_error {
+        ProviderErrorKind::ConnectionLost
+    } else {
+        ProviderErrorKind::Unknown
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CompatibleRetryAttempt {
     attempt: u32,
@@ -2215,6 +2238,30 @@ mod tests {
         // must say so in its type rather than relying on the wording happening
         // to match a pattern downstream.
         assert_eq!(error.kind, ProviderErrorKind::ConnectionLost);
+    }
+
+    // A gateway carries a transient upstream failure on its own status, so the
+    // status alone cannot decide whether a resend is worth it. Reading the
+    // declared type keeps such a blip from ending the turn without turning
+    // every refusal into a retry.
+    #[test]
+    fn a_declared_server_error_is_retryable_but_a_genuine_refusal_is_not() {
+        assert_eq!(
+            compatible_provider_error_kind(
+                r#"{"error":{"type":"server_error","code":"server_error","message":"Upstream request failed: [server_error] Upstream response was not valid JSON"}}"#
+            ),
+            ProviderErrorKind::ConnectionLost
+        );
+        assert_eq!(
+            compatible_provider_error_kind(
+                r#"{"error":{"type":"invalid_request_error","message":"unknown model"}}"#
+            ),
+            ProviderErrorKind::Unknown
+        );
+        assert_eq!(
+            compatible_provider_error_kind("403 Forbidden"),
+            ProviderErrorKind::Unknown
+        );
     }
 
     #[tokio::test]
