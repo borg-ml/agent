@@ -110,6 +110,14 @@ impl Default for NativeHarness {
     }
 }
 
+/// The per-turn state a compaction rewrites and reports through.
+struct NativeCompactionContext<'a> {
+    messages: &'a mut Vec<ModelMessage>,
+    usage: &'a mut ProviderCallUsage,
+    warmer: Option<&'a CacheWarmer>,
+    events: &'a mpsc::Sender<SessionEventKind>,
+}
+
 impl NativeHarness {
     /// How aggressively this process keeps prompt cache entries alive.
     ///
@@ -341,7 +349,7 @@ impl NativeHarness {
 
     async fn run_bound(
         &self,
-        turn: AgentTurn,
+        mut turn: AgentTurn,
         events: mpsc::Sender<SessionEventKind>,
         mut controls: Option<mpsc::Receiver<AgentTurnControl>>,
         steers: Vec<CapturedSteer>,
@@ -486,7 +494,7 @@ impl NativeHarness {
         messages.push(ModelMessage::System {
             content: system_prompt,
         });
-        messages.extend(turn.conversation);
+        messages.extend(std::mem::take(&mut turn.conversation));
         let user_message = native_user_message(&turn.cwd, &turn.prompt, &turn.attachments).await?;
         record_native_message(&events, turn.provider, &user_message).await?;
         messages.push(user_message);
@@ -567,6 +575,16 @@ impl NativeHarness {
         };
 
         let mut usage = ProviderCallUsage::default();
+        // A session adopted onto Borg's harness can arrive with a replay larger
+        // than the model's window, and the provider refuses the first request
+        // before the post-round check below can run. Resolve the route's
+        // advertised window once so the first round can compact from an
+        // estimate. A route that states no window is left to the post-round
+        // check rather than compacted against a guess.
+        let route_window_tokens = self
+            .model_client
+            .context_window(turn.provider, &model)
+            .await;
         let mut assistant_message_id = Uuid::new_v4();
         let mut model_round = 0_usize;
         let mut tool_round = 0_usize;
@@ -578,6 +596,31 @@ impl NativeHarness {
         let mut queued_steer: Vec<CapturedSteer> = Vec::new();
         loop {
             model_round += 1;
+            if model_round == 1
+                && let Some(window) = route_window_tokens
+            {
+                let budget = native_context_budget(
+                    &ProviderCallUsage {
+                        context_window_tokens: Some(window),
+                        ..Default::default()
+                    },
+                    &messages,
+                    0,
+                );
+                self.compact_context_if_needed(
+                    &turn,
+                    &model,
+                    "turn_start_context_threshold",
+                    budget,
+                    NativeCompactionContext {
+                        messages: &mut messages,
+                        usage: &mut usage,
+                        warmer: warmer.as_ref(),
+                        events: &events,
+                    },
+                )
+                .await?;
+            }
             let request = ModelTurnRequest {
                 fast: turn.fast.unwrap_or(false),
                 request_id: Some(format!("{}:{model_round}", turn.message_id)),
@@ -1070,160 +1113,19 @@ impl NativeHarness {
                 }
             }
             let budget = native_context_budget(&result.usage, &messages, trailing_context_tokens);
-            let compaction_budget =
-                self.compaction_budget(turn.provider, &model, budget.context_window_tokens);
-            if budget.needs_auto_compaction(&compaction_budget) {
-                let context_tokens = budget.context_tokens;
-                let context_window_tokens = budget.context_window_tokens;
-                send(
-                    &events,
-                    SessionEventKind::ProviderEvent {
-                        provider: turn.provider,
-                        kind: "context_compaction".to_string(),
-                        payload: json!({
-                            "status": "started",
-                            "summary": "Compacting context…",
-                            "automatic": true,
-                            "trigger": "tool_round_context_threshold",
-                            "context_tokens_before": context_tokens,
-                            "effective_context_window_tokens": context_window_tokens,
-                            "context_source": budget.context_source,
-                            "context_window_source": budget.window_source,
-                        }),
-                    },
-                )
-                .await;
-                let compacted = self
-                    .compact(
-                        turn.provider,
-                        &model,
-                        turn.effort.as_deref(),
-                        turn.fast.unwrap_or(false),
-                        messages.clone(),
-                    )
-                    .await;
-                let (summary, retained, degraded) = match compacted {
-                    Ok((summary, compaction_usage)) => {
-                        absorb_usage(&mut usage, &compaction_usage);
-                        let retained = retain_recent_native_messages(
-                            &messages,
-                            compaction_budget.keep_recent_tokens,
-                        );
-                        send(
-                            &events,
-                            SessionEventKind::ProviderEvent {
-                                provider: turn.provider,
-                                kind: "context_compaction".to_string(),
-                                payload: json!({
-                                    "status": "completed",
-                                    "summary": summary,
-                                    "native": true,
-                                    "automatic": true,
-                                    "trigger": "tool_round_context_threshold",
-                                    "context_tokens_before": context_tokens,
-                                    "effective_context_window_tokens": context_window_tokens,
-                                    "context_source": budget.context_source,
-                                    "context_window_source": budget.window_source,
-                                    "reserve_tokens": compaction_budget.reserve_tokens,
-                                    "keep_recent_tokens": compaction_budget.keep_recent_tokens,
-                                    "reserve_source": compaction_budget.reserve_source.as_str(),
-                                    "keep_recent_source":
-                                        compaction_budget.keep_recent_source.as_str(),
-                                    "budget_clamped_to_window":
-                                        compaction_budget.clamped_to_window,
-                                    "retained_messages": retained.len(),
-                                    "provider_duration_ms": compaction_usage.duration_ms,
-                                    "input_tokens": compaction_usage.input_tokens,
-                                    "output_tokens": compaction_usage.output_tokens,
-                                }),
-                            },
-                        )
-                        .await;
-                        (summary, retained, false)
-                    }
-                    Err(error) => {
-                        // Summarization is one more best-effort model call.
-                        // When it fails, the oldest context is dropped
-                        // mechanically so the turn continues on the recent
-                        // window instead of dying with the work half done.
-                        send(
-                            &events,
-                            SessionEventKind::ProviderEvent {
-                                provider: turn.provider,
-                                kind: "context_compaction_failed".to_string(),
-                                payload: json!({
-                                    "automatic": true,
-                                    "trigger": "tool_round_context_threshold",
-                                    "context_tokens_before": context_tokens,
-                                    "effective_context_window_tokens": context_window_tokens,
-                                    "error": format!("{error:#}"),
-                                    "degraded_to": "recent_window",
-                                }),
-                            },
-                        )
-                        .await;
-                        let retained = retain_recent_native_messages(
-                            &messages,
-                            context_window_tokens.saturating_mul(NATIVE_DEGRADED_RETAIN_PERCENT)
-                                / 100,
-                        );
-                        let summary = NATIVE_DEGRADED_COMPACTION_SUMMARY.to_string();
-                        send(
-                            &events,
-                            SessionEventKind::ProviderEvent {
-                                provider: turn.provider,
-                                kind: "context_compaction".to_string(),
-                                payload: json!({
-                                    "status": "completed",
-                                    "summary": summary,
-                                    "native": true,
-                                    "automatic": true,
-                                    "degraded": true,
-                                    "trigger": "tool_round_context_threshold",
-                                    "context_tokens_before": context_tokens,
-                                    "effective_context_window_tokens": context_window_tokens,
-                                    "retained_messages": retained.len(),
-                                }),
-                            },
-                        )
-                        .await;
-                        (summary, retained, true)
-                    }
-                };
-                // The prefix that was being kept warm no longer exists, so
-                // any armed refresh would pay to extend an entry that nothing
-                // will read again.
-                if let Some(warmer) = warmer.as_ref() {
-                    warmer.on_context_changed();
-                }
-                messages.truncate(1);
-                messages.push(ModelMessage::user(format!(
-                    "Previous conversation summary:\n\n{summary}"
-                )));
-                // The verbatim tail is re-journaled after the boundary so a
-                // replayed conversation carries the same recent evidence the
-                // live turn continued with.
-                for message in &retained {
-                    record_native_message(&events, turn.provider, message).await?;
-                }
-                messages.extend(retained);
-                canonicalize_native_messages(&mut messages);
-                if degraded {
-                    tracing::warn!(
-                        context_tokens,
-                        context_window_tokens,
-                        "native compaction failed; continued on the recent window"
-                    );
-                }
-                send(
-                    &events,
-                    SessionEventKind::ContextWindowUpdated {
-                        context_tokens: estimated_messages_tokens(&messages),
-                        context_window_tokens,
-                    },
-                )
-                .await;
-            }
+            self.compact_context_if_needed(
+                &turn,
+                &model,
+                "tool_round_context_threshold",
+                budget,
+                NativeCompactionContext {
+                    messages: &mut messages,
+                    usage: &mut usage,
+                    warmer: warmer.as_ref(),
+                    events: &events,
+                },
+            )
+            .await?;
         }
     }
 
@@ -1369,6 +1271,178 @@ Return only the internal continuation checkpoint.",
         Ok((summary, result.usage))
     }
 
+    /// Compact `messages` in place when `budget` says the next request would
+    /// exceed the window.
+    ///
+    /// Shared by the pre-call guard, which runs with only an estimate, and the
+    /// post-round check, which runs on provider-reported usage. Both emit the
+    /// same `context_compaction` boundary so a replay rebuilds from either.
+    async fn compact_context_if_needed(
+        &self,
+        turn: &AgentTurn,
+        model: &str,
+        trigger: &'static str,
+        budget: NativeContextBudget,
+        context: NativeCompactionContext<'_>,
+    ) -> Result<()> {
+        let NativeCompactionContext {
+            messages,
+            usage,
+            warmer,
+            events,
+        } = context;
+        let compaction_budget =
+            self.compaction_budget(turn.provider, model, budget.context_window_tokens);
+        if !budget.needs_auto_compaction(&compaction_budget) {
+            return Ok(());
+        }
+        let context_tokens = budget.context_tokens;
+        let context_window_tokens = budget.context_window_tokens;
+        send(
+            events,
+            SessionEventKind::ProviderEvent {
+                provider: turn.provider,
+                kind: "context_compaction".to_string(),
+                payload: json!({
+                    "status": "started",
+                    "summary": "Compacting context…",
+                    "automatic": true,
+                    "trigger": trigger,
+                    "context_tokens_before": context_tokens,
+                    "effective_context_window_tokens": context_window_tokens,
+                    "context_source": budget.context_source,
+                    "context_window_source": budget.window_source,
+                }),
+            },
+        )
+        .await;
+        let compacted = self
+            .compact(
+                turn.provider,
+                model,
+                turn.effort.as_deref(),
+                turn.fast.unwrap_or(false),
+                messages.clone(),
+            )
+            .await;
+        let (summary, retained, degraded) = match compacted {
+            Ok((summary, compaction_usage)) => {
+                absorb_usage(usage, &compaction_usage);
+                let retained =
+                    retain_recent_native_messages(messages, compaction_budget.keep_recent_tokens);
+                send(
+                    events,
+                    SessionEventKind::ProviderEvent {
+                        provider: turn.provider,
+                        kind: "context_compaction".to_string(),
+                        payload: json!({
+                            "status": "completed",
+                            "summary": summary,
+                            "native": true,
+                            "automatic": true,
+                            "trigger": trigger,
+                            "context_tokens_before": context_tokens,
+                            "effective_context_window_tokens": context_window_tokens,
+                            "context_source": budget.context_source,
+                            "context_window_source": budget.window_source,
+                            "reserve_tokens": compaction_budget.reserve_tokens,
+                            "keep_recent_tokens": compaction_budget.keep_recent_tokens,
+                            "reserve_source": compaction_budget.reserve_source.as_str(),
+                            "keep_recent_source": compaction_budget.keep_recent_source.as_str(),
+                            "budget_clamped_to_window": compaction_budget.clamped_to_window,
+                            "retained_messages": retained.len(),
+                            "provider_duration_ms": compaction_usage.duration_ms,
+                            "input_tokens": compaction_usage.input_tokens,
+                            "output_tokens": compaction_usage.output_tokens,
+                        }),
+                    },
+                )
+                .await;
+                (summary, retained, false)
+            }
+            Err(error) => {
+                // Summarization is one more best-effort model call. When it
+                // fails, the oldest context is dropped mechanically so the
+                // turn continues on the recent window instead of dying with
+                // the work half done.
+                send(
+                    events,
+                    SessionEventKind::ProviderEvent {
+                        provider: turn.provider,
+                        kind: "context_compaction_failed".to_string(),
+                        payload: json!({
+                            "automatic": true,
+                            "trigger": trigger,
+                            "context_tokens_before": context_tokens,
+                            "effective_context_window_tokens": context_window_tokens,
+                            "error": format!("{error:#}"),
+                            "degraded_to": "recent_window",
+                        }),
+                    },
+                )
+                .await;
+                let retained = retain_recent_native_messages(
+                    messages,
+                    context_window_tokens.saturating_mul(NATIVE_DEGRADED_RETAIN_PERCENT) / 100,
+                );
+                let summary = NATIVE_DEGRADED_COMPACTION_SUMMARY.to_string();
+                send(
+                    events,
+                    SessionEventKind::ProviderEvent {
+                        provider: turn.provider,
+                        kind: "context_compaction".to_string(),
+                        payload: json!({
+                            "status": "completed",
+                            "summary": summary,
+                            "native": true,
+                            "automatic": true,
+                            "degraded": true,
+                            "trigger": trigger,
+                            "context_tokens_before": context_tokens,
+                            "effective_context_window_tokens": context_window_tokens,
+                            "retained_messages": retained.len(),
+                        }),
+                    },
+                )
+                .await;
+                (summary, retained, true)
+            }
+        };
+        // The prefix that was being kept warm no longer exists, so any armed
+        // refresh would pay to extend an entry that nothing will read again.
+        if let Some(warmer) = warmer {
+            warmer.on_context_changed();
+        }
+        messages.truncate(1);
+        messages.push(ModelMessage::user(format!(
+            "Previous conversation summary:\n\n{summary}"
+        )));
+        // The verbatim tail is re-journaled after the boundary so a replayed
+        // conversation carries the same recent evidence the live turn
+        // continued with.
+        for message in &retained {
+            record_native_message(events, turn.provider, message).await?;
+        }
+        messages.extend(retained);
+        canonicalize_native_messages(messages);
+        if degraded {
+            tracing::warn!(
+                context_tokens,
+                context_window_tokens,
+                "native compaction failed; continued on the recent window"
+            );
+        }
+        send(
+            events,
+            SessionEventKind::ContextWindowUpdated {
+                context_tokens: estimated_messages_tokens(messages),
+                context_window_tokens,
+            },
+        )
+        .await;
+        Ok(())
+    }
+
     async fn call_model(
         &self,
         provider: crate::CodingProvider,
@@ -1432,6 +1506,16 @@ trait NativeModelClient: Send + Sync {
         _model: &str,
     ) -> DeclarationTransport {
         DeclarationTransport::Collapsed
+    }
+
+    /// The route's advertised context window when it is known without a model
+    /// call, so the harness can compact an oversized replay before the
+    /// provider refuses the first request.
+    ///
+    /// Defaults to `None`: a client that cannot state a window must not have
+    /// one guessed for it, or a normal session would be compacted early.
+    async fn context_window(&self, _provider: crate::CodingProvider, _model: &str) -> Option<u64> {
+        None
     }
 }
 
@@ -1619,6 +1703,27 @@ impl NativeModelClient for ProviderModelClient {
             Ok(NativeRoute::CodexAccount(_)) => DeclarationTransport::Collapsed,
             Err(NotNative) => DeclarationTransport::Collapsed,
         }
+    }
+
+    async fn context_window(&self, provider: crate::CodingProvider, model: &str) -> Option<u64> {
+        let gateway = match self.route(provider, model) {
+            Ok(NativeRoute::ChatCompletions { gateway, .. }) => gateway,
+            _ => return None,
+        };
+        if let Some(window) = gateway.and_then(|gateway| gateway.context_window_tokens) {
+            return Some(window);
+        }
+        // The Go gateway advertises no window and the chat-completions payload
+        // carries none. It is still known before the call from the same
+        // models.dev catalog `model_turn` resolves, so a replay larger than the
+        // window can be compacted instead of refused.
+        let is_go = gateway.is_some_and(|gateway| {
+            gateway.label.as_deref() == Some(borg_provider::provider::opencode_model::LABEL)
+        });
+        if is_go {
+            return borg_provider::provider::opencode_model::context_window_tokens(model).await;
+        }
+        None
     }
 }
 
@@ -5586,25 +5691,23 @@ mod tests {
         completed: bool,
     }
 
-    async fn run_prefix_turn(
+    /// Run one native turn against `model_client`, returning every event it
+    /// emitted and whether it completed. Shared so a test only supplies the
+    /// client whose behavior it is asserting on.
+    async fn run_turn_events(
+        model_client: Arc<dyn NativeModelClient>,
         cwd: PathBuf,
         session_id: Uuid,
         conversation: Vec<ModelMessage>,
         prompt: &str,
         volatile: &str,
-        truncate_forever: bool,
         system_prompt_appendix: &str,
-    ) -> PrefixTurn {
-        let client = Arc::new(PrefixClient {
-            rounds: Mutex::new(Vec::new()),
-            truncate_forever,
-        });
+    ) -> (Vec<SessionEventKind>, bool) {
         let harness = NativeHarness {
-            model_client: client.clone(),
+            model_client,
             harness: HarnessMode::Native,
             ..NativeHarness::default()
         };
-        let mut durable = conversation.clone();
         let turn = AgentTurn {
             session_id,
             prompt_cache_session_id: None,
@@ -5664,25 +5767,154 @@ mod tests {
         let task = tokio::spawn(async move { harness.run(turn, events_tx, None).await });
         // The timeout has to enclose the drain as well as the join, or a harness
         // that never finishes hangs the test instead of failing it.
-        let completed = tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let mut events = Vec::new();
             while let Some(event) = events_rx.recv().await {
-                if let SessionEventKind::ProviderEvent { kind, payload, .. } = event
-                    && (kind == "native_prompt_context" || kind == "native_model_message")
-                    && let Ok(message) = serde_json::from_value::<ModelMessage>(payload)
-                {
-                    durable.push(message);
-                }
+                events.push(event);
             }
-            task.await.expect("the harness task joined").is_ok()
+            let completed = task.await.expect("the harness task joined").is_ok();
+            (events, completed)
         })
         .await
-        .expect("the harness turn finished inside the timeout");
+        .expect("the harness turn finished inside the timeout")
+    }
+
+    async fn run_prefix_turn(
+        cwd: PathBuf,
+        session_id: Uuid,
+        conversation: Vec<ModelMessage>,
+        prompt: &str,
+        volatile: &str,
+        truncate_forever: bool,
+        system_prompt_appendix: &str,
+    ) -> PrefixTurn {
+        let client = Arc::new(PrefixClient {
+            rounds: Mutex::new(Vec::new()),
+            truncate_forever,
+        });
+        let mut durable = conversation.clone();
+        let (events, completed) = run_turn_events(
+            client.clone(),
+            cwd,
+            session_id,
+            conversation,
+            prompt,
+            volatile,
+            system_prompt_appendix,
+        )
+        .await;
+        for event in events {
+            if let SessionEventKind::ProviderEvent { kind, payload, .. } = event
+                && (kind == "native_prompt_context" || kind == "native_model_message")
+                && let Ok(message) = serde_json::from_value::<ModelMessage>(payload)
+            {
+                durable.push(message);
+            }
+        }
         let rounds = client.rounds.lock().unwrap().clone();
         PrefixTurn {
             rounds,
             durable,
             completed,
         }
+    }
+
+    /// A session adopted onto Borg's harness can arrive with a replay larger
+    /// than the model's window. The provider would refuse the first request
+    /// before the post-round budget check ever runs, so the guard must compact
+    /// from the estimate before that call.
+    #[tokio::test]
+    async fn an_oversized_replay_is_compacted_before_the_first_model_call() {
+        const WINDOW: u64 = 10_000;
+
+        struct WindowClient {
+            /// Estimated tokens every non-compaction model call was asked to
+            /// read, in order.
+            calls: Mutex<Vec<u64>>,
+        }
+        #[async_trait]
+        impl NativeModelClient for WindowClient {
+            async fn context_window(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+            ) -> Option<u64> {
+                Some(WINDOW)
+            }
+
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                request: ModelTurnRequest,
+                _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                let is_compaction = request.messages.first().is_some_and(|message| {
+                    matches!(message, ModelMessage::System { content }
+                        if content == crate::session::COMPACTION_SUMMARY_PROMPT)
+                });
+                if !is_compaction {
+                    self.calls
+                        .lock()
+                        .unwrap()
+                        .push(estimated_messages_tokens(&request.messages));
+                }
+                let content = if is_compaction { "summary" } else { "done" };
+                Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(
+                        Some(content.to_string()),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    finish_reason: "stop".to_string(),
+                    usage: ProviderCallUsage::default(),
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().to_path_buf();
+        let client = Arc::new(WindowClient {
+            calls: Mutex::new(Vec::new()),
+        });
+        // ~40k characters: an order of magnitude past the window once the
+        // transcript is serialized, exactly the shape of an adopted CLI session.
+        let conversation = vec![ModelMessage::user("x".repeat(40_000))];
+        let (events, completed) = run_turn_events(
+            client.clone(),
+            cwd,
+            Uuid::new_v4(),
+            conversation,
+            "go",
+            "",
+            "",
+        )
+        .await;
+
+        assert!(
+            completed,
+            "the adopted session's first native turn must complete"
+        );
+        assert!(
+            events.iter().any(|event| matches!(event,
+                SessionEventKind::ProviderEvent { kind, payload, .. }
+                    if kind == "context_compaction"
+                        && payload.get("status").and_then(Value::as_str) == Some("completed")
+                        && payload.get("trigger").and_then(Value::as_str)
+                            == Some("turn_start_context_threshold"))),
+            "the oversized replay must be compacted before the first model call"
+        );
+        let calls = client.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "one model round answers the turn");
+        assert!(
+            calls[0] <= WINDOW,
+            "the first model call read {} tokens for a {WINDOW}-token window",
+            calls[0]
+        );
     }
 
     /// Provider admission status carries live usage percentages and reset
