@@ -1609,6 +1609,10 @@ pub struct BorgTerminal {
     status: SessionStatus,
     interrupt_requested: bool,
     connection_retry_at: Option<DateTime<Utc>>,
+    /// Which attempt of the bounded resend chain the countdown belongs to, as
+    /// the runtime reported it. Shown in the status line so a session waiting on
+    /// a retry never looks idle: it says how far along the chain it is.
+    connection_retry_attempt: Option<(u64, u64)>,
     usage_retry_at: Option<DateTime<Utc>>,
     steer_active_turn: bool,
     /// Highest durable root sequence incorporated into this projection.
@@ -2832,6 +2836,7 @@ impl BorgTerminal {
             status: SessionStatus::Starting,
             interrupt_requested: false,
             connection_retry_at: None,
+            connection_retry_attempt: None,
             usage_retry_at: None,
             steer_active_turn: false,
             session_state_sequence: 0,
@@ -3534,6 +3539,7 @@ impl BorgTerminal {
                 )
             {
                 self.connection_retry_at = None;
+                self.connection_retry_attempt = None;
                 self.notice = None;
             }
             match &event.kind {
@@ -3570,17 +3576,56 @@ impl BorgTerminal {
                         .unwrap_or(0);
                     self.connection_retry_at =
                         Some(event.created_at + chrono::Duration::milliseconds(delay));
+                    self.connection_retry_attempt = payload
+                        .get("attempt")
+                        .and_then(serde_json::Value::as_u64)
+                        .zip(
+                            payload
+                                .get("max_attempts")
+                                .and_then(serde_json::Value::as_u64),
+                        );
+                    let bound = self
+                        .connection_retry_attempt
+                        .map(|(_, max_attempts)| max_attempts.to_string())
+                        .unwrap_or_else(|| "?".to_string());
                     if let Some(attempt) = payload
                         .get("auth_lookup_retry")
                         .and_then(serde_json::Value::as_u64)
                     {
-                        self.set_notice(format!("Codex authentication lookup unavailable · retry {attempt}/10 · work saved · Esc to cancel"));
+                        self.set_notice(format!("Codex authentication lookup unavailable · attempt {attempt}/{bound} · work saved · Esc to cancel"));
+                    } else if let Some((attempt, max_attempts)) = self.connection_retry_attempt {
+                        self.set_notice(format!(
+                            "Connection interrupted · attempt {attempt}/{max_attempts} · work saved · reconnecting automatically · Esc to cancel · the reason: {}",
+                            payload
+                                .get("error")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("the provider did not say")
+                        ));
                     } else {
                         self.set_notice("Connection interrupted · work saved · reconnecting automatically · Esc to cancel");
                     }
                 }
+                SessionEventKind::ProviderEvent { kind, payload, .. }
+                    if kind == "network_retry_exhausted" =>
+                {
+                    self.connection_retry_at = None;
+                    self.connection_retry_attempt = None;
+                    let attempts = payload
+                        .get("attempts")
+                        .and_then(serde_json::Value::as_u64)
+                        .map(|attempts| attempts.to_string())
+                        .unwrap_or_else(|| "the allowed number of".to_string());
+                    self.set_notice(format!(
+                        "Stopped retrying after {attempts} attempts · the turn was not resent again · check the provider status or /model, then resend · your work is saved · last error: {}",
+                        payload
+                            .get("error")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("the provider did not say")
+                    ));
+                }
                 SessionEventKind::ProviderEvent { kind, .. } if kind == "network_recovered" => {
                     self.connection_retry_at = None;
+                    self.connection_retry_attempt = None;
                     self.set_notice("Connection restored · work resumed");
                 }
                 SessionEventKind::StatusChanged {
@@ -3589,6 +3634,7 @@ impl BorgTerminal {
                     ..
                 } => {
                     if self.connection_retry_at.take().is_some() {
+                        self.connection_retry_attempt = None;
                         self.notice = None;
                     }
                     if *status != SessionStatus::Ready {
@@ -7197,6 +7243,15 @@ impl BorgTerminal {
                         "resumes {}",
                         deadline.with_timezone(&Local).format("%a %H:%M")
                     )
+                } else if let Some((attempt, max_attempts)) = self.connection_retry_attempt {
+                    // The bound is what makes the countdown honest: a session is
+                    // never waiting on an attempt that cannot be the last one
+                    // without saying so.
+                    if seconds > 0 {
+                        format!("retry {attempt}/{max_attempts} in {seconds}s")
+                    } else {
+                        format!("retry {attempt}/{max_attempts}")
+                    }
                 } else if seconds > 0 {
                     format!("retry in {seconds}s")
                 } else {

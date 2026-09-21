@@ -14159,6 +14159,116 @@ async fn interrupt_is_honoured_while_a_stalled_observer_backs_up_the_event_strea
     scratch.discard().await;
 }
 
+/// A usage limit and a lost connection can arrive in one failure: an exhausted
+/// lane drops its stream mid-turn, or answers through a gateway whose error body
+/// also reads as a transport fault. The usage path is the only one that carries a
+/// reset deadline and a visible "resumes" state, so it has to win. Read as a
+/// connection instead, the same failure becomes a resend loop and the deadline
+/// the user could plan around is lost.
+struct UsageLimitAndConnectionExecutor {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for UsageLimitAndConnectionExecutor {
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            return Err(anyhow::anyhow!(
+                "usage limit reached · Provider-reported retry delay: 7200 seconds · connection reset by peer"
+            ));
+        }
+        Ok(AgentTurnResult {
+            provider_session_id: Some("provider-session".to_string()),
+            final_text: "resumed after the limit cleared".to_string(),
+        })
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_usage_limit_is_never_retried_as_a_connection_loss() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let message_id = Uuid::new_v4();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let executor = Arc::new(UsageLimitAndConnectionExecutor {
+        calls: Arc::new(AtomicUsize::new(0)),
+    });
+    let actor_store = Arc::clone(&store);
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: message_id,
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: Some("finish this task".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                actor_store,
+            )
+            .await
+        }
+    });
+
+    let mut network_retries = 0_usize;
+    let retry_at = loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), event_rx.recv())
+            .await
+            .expect("the usage limit schedules a resume")
+            .expect("session remains attached");
+        match &event.kind {
+            SessionEventKind::ProviderEvent { kind, .. } if kind == "network_retry" => {
+                network_retries += 1;
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "usage_limit_retry" =>
+            {
+                break payload.get("retry_at").cloned();
+            }
+            _ => {}
+        }
+    };
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(30), actor).await;
+    assert_eq!(
+        network_retries, 0,
+        "a usage limit must not be scheduled as a connection retry"
+    );
+    assert!(
+        retry_at.is_some(),
+        "the resume carries the deadline the provider reported"
+    );
+    scratch.discard().await;
+}
+
 struct NetworkThenSuccessExecutor {
     calls: Arc<AtomicUsize>,
     failures: usize,
@@ -14336,29 +14446,41 @@ fn a_typed_transport_failure_is_retried_whatever_its_wording() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt() {
-    for (error, failures, expected_attempts) in [
-        ("Codex subscription connection failed", 3, 4),
-        ("Codex model catalog disconnected", 3, 4),
+    // (error, failures, expected attempts, expected terminal stops). Only a
+    // failure the connection path retries can spend its attempts; a refusal such
+    // as an authentication error is not retried at all and never reaches the
+    // bound.
+    for (error, failures, expected_attempts, expected_exhausted) in [
+        ("Codex subscription connection failed", 3, 4, 0),
+        ("Codex model catalog disconnected", 3, 4, 0),
         (
             "openrouter request failed with HTTP 502: Provider returned error",
             3,
             4,
+            0,
         ),
-        ("authentication failed", 3, 1),
+        ("authentication failed", 3, 1, 0),
         (
             "Codex subscription credentials rejected; reconnect Codex",
             3,
             1,
+            0,
         ),
         (
             "Codex subscription authentication lookup unavailable",
             9,
             10,
+            0,
         ),
         (
+            // Twelve failures is past the bound, so the chain stops: one more
+            // attempt than it is allowed to resend, never a thirteenth. A
+            // session must not keep resending a request the provider keeps
+            // refusing while the status line only counts down.
             "Codex subscription authentication lookup unavailable",
             12,
-            13,
+            11,
+            1,
         ),
     ] {
         let root = tempdir().unwrap();
@@ -14450,6 +14572,8 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
         let mut completed_tools = 0;
         let mut retry_delays = Vec::new();
         let mut recovered = false;
+        let mut exhausted = 0_usize;
+        let mut exhausted_reason = None;
         while completions < expected_attempts {
             let event = tokio::time::timeout(Duration::from_secs(60), event_rx.recv())
                 .await
@@ -14463,6 +14587,12 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
             if matches!(&event.kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "network_recovered")
             {
                 recovered = true;
+            }
+            if let SessionEventKind::ProviderEvent { kind, payload, .. } = &event.kind
+                && kind == "network_retry_exhausted"
+            {
+                exhausted += 1;
+                exhausted_reason = payload["error"].as_str().map(str::to_string);
             }
             if matches!(&event.kind, SessionEventKind::ToolStarted { tool_call_id, .. } if tool_call_id == "resumed-work")
             {
@@ -14506,6 +14636,16 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
             .await
             .unwrap();
         actor.await.unwrap().unwrap();
+        // The terminal event is recorded after the attempt turn_completed, so it
+        // can still be queued once the loop above has seen its last completion.
+        while let Ok(event) = event_rx.try_recv() {
+            if let SessionEventKind::ProviderEvent { kind, payload, .. } = &event.kind
+                && kind == "network_retry_exhausted"
+            {
+                exhausted += 1;
+                exhausted_reason = payload["error"].as_str().map(str::to_string);
+            }
+        }
         assert_eq!(calls.load(Ordering::Acquire), expected_attempts);
         assert_eq!(completed_tools, 1);
         assert_eq!(retry_delays.len(), expected_attempts - 1);
@@ -14517,14 +14657,30 @@ async fn connection_outage_retries_repeatedly_and_preserves_the_durable_prompt()
             );
         }
         assert_eq!(visible_errors, usize::from(failures >= expected_attempts));
+        // The turn stops visibly: one terminal event naming why, and no goal
+        // left silently active behind it.
+        assert_eq!(
+            exhausted, expected_exhausted,
+            "a chain that spent its attempts must stop and say so exactly once, \
+             and a failure that was never retried must not claim it did"
+        );
+        if expected_exhausted == 1 {
+            assert_eq!(
+                exhausted_reason.as_deref(),
+                Some(error),
+                "the terminal reason is the provider error, not a countdown"
+            );
+        }
 
         let store = PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
             .await
             .unwrap();
         if failures > 10 {
+            // Handed back rather than left active: the reported bug was a goal
+            // listed active for hours while its session only counted down.
             assert_eq!(
                 store.state(session_id).await.unwrap().goal.unwrap().status,
-                GoalStatus::Complete
+                GoalStatus::Blocked
             );
         }
         assert_eq!(
