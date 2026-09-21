@@ -22,6 +22,7 @@ pub(crate) struct AgentConfig {
     pub(crate) usage_count: UsageCountConfig,
     pub(crate) compaction: CompactionConfig,
     pub(crate) warming: WarmingConfig,
+    pub(crate) shell: ShellConfig,
     pub(crate) local: LocalProviderConfig,
     /// Named OpenAI-compatible routes. The durable session keeps the generic
     /// native provider kind and records the stable `provider/model` alias.
@@ -166,15 +167,16 @@ const LOCAL_PROVIDER_ENV_KEYS: [&str; 4] = [
     "BORG_OPENAI_COMPATIBLE_CONTEXT_WINDOW_TOKENS",
 ];
 
-/// Restores the provider environment snapshot taken before a local session.
-/// The guard also covers values written by the optional local-server launcher,
-/// which uses the same environment variables to communicate its bound
-/// endpoint to the provider adapter.
-pub(crate) struct LocalProviderEnvGuard {
+/// Restores the environment snapshot taken before a local session: the
+/// `[local]` provider variables and `[shell] command`.
+/// It also covers values written by the optional local-server launcher, which
+/// uses the same provider variables to communicate its bound endpoint to the
+/// provider adapter.
+pub(crate) struct ConfiguredEnvGuard {
     previous: Vec<(&'static str, Option<OsString>)>,
 }
 
-impl Drop for LocalProviderEnvGuard {
+impl Drop for ConfiguredEnvGuard {
     fn drop(&mut self) {
         for (key, value) in &self.previous {
             // SAFETY: local sessions are run serially by the CLI. The guard is
@@ -349,6 +351,25 @@ pub(crate) struct CompactionConfig {
 #[serde(default)]
 pub(crate) struct WarmingConfig {
     pub(crate) mode: CacheWarmingMode,
+}
+
+/// Which interpreter agent shell commands run under.
+///
+/// `SHELL` is deliberately not consulted: it describes how the human talks to
+/// their terminal, and on a fish host it made every agent command a fish
+/// command, where `VAR=value`, heredocs, `$( )` in command position, and
+/// `<`/`>` are a different language the model never chose. Leaving `command`
+/// unset selects bash when it is installed, else `/bin/sh`, else the platform
+/// default (PowerShell, then `ComSpec`, on Windows). `BORG_AGENT_SHELL`
+/// overrides that default chain for one process; this setting outranks the
+/// variable, and the resolved interpreter is fixed when a session starts.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct ShellConfig {
+    /// The interpreter: a name on `PATH`, or an absolute path. An explicitly
+    /// configured shell is honored even when its dialect is not POSIX, so
+    /// `fish` works for a user who wants their own shell.
+    pub(crate) command: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -841,6 +862,35 @@ impl AgentConfig {
             );
         }
         self.compaction_budget_policy()?;
+        self.validate_shell()?;
+        Ok(())
+    }
+
+    /// A configured shell that is not installed would be replaced by the
+    /// default at session start, which is the one outcome the operator did not
+    /// ask for. Reject it here, where the error can name the setting.
+    ///
+    /// The lookup is the runtime's own (`native_process::Shell::locate`), so a
+    /// shell a session can find is never refused at startup, and a shell
+    /// accepted here is never missing when the session runs.
+    fn validate_shell(&self) -> Result<()> {
+        let Some(command) = self
+            .shell
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+        else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            !command.contains('\0'),
+            "shell.command must not contain NUL bytes"
+        );
+        anyhow::ensure!(
+            borg_remote::Shell::locate(command).is_some(),
+            "shell.command `{command}` is not installed; install it or remove the setting to run agent commands under bash, /bin/sh, or this host's default shell"
+        );
         Ok(())
     }
 
@@ -907,9 +957,17 @@ impl AgentConfig {
     /// Export `[local]` settings into the process environment so the
     /// `OpenAiCompatible` provider picks them up. Existing environment values
     /// are never overwritten: an explicit export or `--model` still wins.
-    pub(crate) fn apply_local_provider_env(&self) -> LocalProviderEnvGuard {
+    ///
+    /// `[shell] command` is published the same way, as `BORG_AGENT_SHELL`: the
+    /// runtime resolves a session's interpreter once, when it builds that
+    /// session's process manager, and it reads the environment to do it. This
+    /// is the session-start hook the local agent path already calls. Unlike the
+    /// provider variables it does replace an inherited value, because an
+    /// explicit setting outranks the per-process override.
+    pub(crate) fn apply_local_provider_env(&self) -> ConfiguredEnvGuard {
         let previous = LOCAL_PROVIDER_ENV_KEYS
             .into_iter()
+            .chain([borg_remote::SHELL_ENV])
             .map(|key| (key, std::env::var_os(key)))
             .collect();
         let entries = [
@@ -948,7 +1006,17 @@ impl AgentConfig {
             // read provider environment are spawned.
             unsafe { std::env::set_var(key, value) };
         }
-        LocalProviderEnvGuard { previous }
+        if let Some(command) = self
+            .shell
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+        {
+            // SAFETY: as above; the runtime reads this when a session starts.
+            unsafe { std::env::set_var(borg_remote::SHELL_ENV, command) };
+        }
+        ConfiguredEnvGuard { previous }
     }
 
     pub(crate) fn autonomous_team_policy(
@@ -1398,6 +1466,67 @@ mode = \"idle\"
             .local_agent_settings()
             .expect("settings carry the mode");
         assert_eq!(settings.warming, CacheWarmingMode::Idle);
+    }
+
+    /// The precedence the interpreter is chosen with: an explicit setting,
+    /// then the per-process override, then the default chain. A setting must
+    /// beat the user's own `BORG_AGENT_SHELL`, and an unset setting must leave
+    /// that variable exactly where the user put it.
+    #[test]
+    fn a_configured_shell_outranks_the_environment_override() {
+        let _lock = LOCAL_ENV_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os(borg_remote::SHELL_ENV);
+        // SAFETY: the test holds the process-local environment lock.
+        unsafe { std::env::set_var(borg_remote::SHELL_ENV, "sh") };
+
+        let inherited: AgentConfig =
+            toml::from_str("[capabilities]\nsubagents = false\n").expect("config parses");
+        let guard = inherited.apply_local_provider_env();
+        assert_eq!(std::env::var(borg_remote::SHELL_ENV).unwrap(), "sh");
+        drop(guard);
+
+        let configured: AgentConfig =
+            toml::from_str("[shell]\ncommand = \"/bin/sh\"\n").expect("config parses");
+        configured.validate().expect("an installed shell is valid");
+        let guard = configured.apply_local_provider_env();
+        assert_eq!(std::env::var(borg_remote::SHELL_ENV).unwrap(), "/bin/sh");
+        // Ending the session puts the operator's own value back.
+        drop(guard);
+        assert_eq!(std::env::var(borg_remote::SHELL_ENV).unwrap(), "sh");
+
+        // SAFETY: as above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(borg_remote::SHELL_ENV, value),
+                None => std::env::remove_var(borg_remote::SHELL_ENV),
+            }
+        }
+    }
+
+    /// A shell that is not installed is refused at load: the alternative is a
+    /// setting Borg accepts and then quietly does not apply.
+    #[test]
+    fn an_uninstalled_shell_command_is_refused_at_load() {
+        let config: AgentConfig = toml::from_str("[shell]\ncommand = \"definitely-not-a-shell\"\n")
+            .expect("config parses");
+        let error = config
+            .validate()
+            .expect_err("an uninstalled shell is rejected");
+        assert!(
+            error.to_string().contains("shell.command"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn no_shell_setting_leaves_the_default_chain_in_charge() {
+        assert!(AgentConfig::default().shell.command.is_none());
+        AgentConfig::default()
+            .validate()
+            .expect("the default is valid");
     }
 
     #[test]

@@ -90,7 +90,7 @@ pub use local_control::{
 };
 pub use lsp::LspPathPolicy;
 pub use lsp::LspService;
-pub use native_process::ProcessSnapshot;
+pub use native_process::{ProcessSnapshot, SHELL_ENV, Shell};
 pub use orchestration::*;
 #[cfg(feature = "profiling")]
 pub use profiling::RuntimeProfiler;
