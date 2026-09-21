@@ -230,6 +230,26 @@ impl CodingProvider {
         }
     }
 
+    /// Every provider, in the order an admission list or picker should show
+    /// them.
+    ///
+    /// One place, so a tool schema or an admission list cannot quietly disagree
+    /// with the enum by listing fewer routes than exist. `config_alias` is the
+    /// serialized spelling, which is what those surfaces take.
+    pub const ALL: [Self; 11] = [
+        Self::Codex,
+        Self::Claude,
+        Self::Anthropic,
+        Self::OpenCode,
+        Self::Grok,
+        Self::Muse,
+        Self::Kimi,
+        Self::Glm,
+        Self::Qwen,
+        Self::OpenRouter,
+        Self::OpenAiCompatible,
+    ];
+
     /// Every provider that publishes a fixed model catalog, in picker order.
     pub const CATALOG_PROVIDERS: [Self; 2] = [Self::Codex, Self::Claude];
 

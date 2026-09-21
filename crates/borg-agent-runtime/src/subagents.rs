@@ -6007,6 +6007,10 @@ fn boxed_agent_store_session(
 pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
     let description = subagent_tool_description(provider);
     let model_description = subagent_model_override_description();
+    let provider_choices = crate::CodingProvider::ALL
+        .iter()
+        .map(|provider| provider.config_alias())
+        .collect::<Vec<_>>();
     let model_examples = borg_provider::runtime::MODEL_CATALOGS
         .iter()
         .flat_map(|catalog| catalog.selectable_models.iter().map(|(model, _)| *model))
@@ -6026,12 +6030,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
                     "message": { "type": "string" },
                     "provider": {
                         "type": "string",
-                        "enum": [
-                            "codex",
-                            "claude",
-                            "open_router",
-                            "open_ai_compatible"
-                        ]
+                        "enum": provider_choices
                     },
                     "model": {
                         "type": "string",
