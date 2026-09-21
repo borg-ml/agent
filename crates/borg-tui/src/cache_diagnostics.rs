@@ -68,8 +68,13 @@ impl PromptSnapshot {
     /// of cache reads can exceed the turn's real context. Comparing such a
     /// total with the next request's cached prefix is meaningless.
     fn single_request(&self) -> bool {
+        // The context gauge is what proves these counters describe one request.
+        // A turn that sums several model rounds reports cached reads far larger
+        // than its real context, and a provider that omits the gauge leaves no
+        // way to tell a summed turn from a single request. Absent telemetry is
+        // unknown, not a licence to compare incomparable totals.
         self.reusable_context_tokens
-            .is_none_or(|context| self.cached_input_tokens <= context)
+            .is_some_and(|context| self.cached_input_tokens <= context)
     }
 }
 
@@ -875,13 +880,59 @@ mod tests {
         let mut diagnostics = CacheDiagnostics::default();
         let at = Utc::now();
         let signature = claude_signature("claude-opus-5");
-        diagnostics.observe(at, signature.clone(), usage(1_000, 99_000));
+        // A context gauge proves each snapshot is a single request, which is
+        // what lets the short-interval eviction be compared at all.
+        let mut first = usage(1_000, 99_000);
+        first.context_tokens = Some(100_000);
+        diagnostics.observe(at, signature.clone(), first);
+        let mut second = usage(100_000, 0);
+        second.context_tokens = Some(100_000);
 
         let notice = diagnostics
-            .observe(at + TimeDelta::seconds(2), signature, usage(100_000, 0))
+            .observe(at + TimeDelta::seconds(2), signature, second)
             .expect("observed short-interval miss");
         assert_eq!(notice.cause, CacheMissCause::Unknown);
         assert!(!notice.text().contains("idle exceeded"));
+    }
+
+    /// The OpenCode CLI route reports per-turn sums across model rounds and no
+    /// context gauge. Consecutive turns can differ by millions of cached reads
+    /// purely because they ran a different number of tool rounds; that is not an
+    /// eviction, and comparing the sums raised a false "Prompt cache miss" card
+    /// on every turn.
+    #[test]
+    fn a_multi_round_snapshot_without_a_context_gauge_is_not_reported_as_a_miss() {
+        let mut diagnostics = CacheDiagnostics::default();
+        let at = Utc::now();
+        let signature = CacheSignature::new(
+            CodingProvider::OpenCode,
+            Some("opencode-go/deepseek-v4.1-flash"),
+            None,
+        );
+
+        assert!(
+            diagnostics
+                .observe(at, signature.clone(), usage(842_493, 9_462_656))
+                .is_none()
+        );
+        assert!(
+            diagnostics
+                .observe(
+                    at + TimeDelta::minutes(1),
+                    signature.clone(),
+                    usage(221_309, 6_119_680),
+                )
+                .is_none()
+        );
+        assert!(
+            diagnostics
+                .observe(
+                    at + TimeDelta::minutes(2),
+                    signature,
+                    usage(243_802, 2_437_632),
+                )
+                .is_none()
+        );
     }
 
     #[test]
