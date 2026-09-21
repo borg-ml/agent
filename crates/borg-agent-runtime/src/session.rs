@@ -33,6 +33,10 @@ impl<T> Drop for AbortTask<T> {
 }
 
 const ROOT_INBOX_REFRESH_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How many child activities the actor may queue from the coordinator before
+/// the forwarder has to wait for it to catch up.
+const CHILD_ACTIVITY_BUFFER: usize = 64;
 #[cfg(not(test))]
 const USAGE_LIMIT_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(30 * 60);
 #[cfg(test)]
@@ -1983,20 +1987,51 @@ async fn run_agent_session_store_kernel_inner(
     };
     let (disabled_activity_tx, disabled_root_tx) =
         (broadcast::channel(1).0, broadcast::channel(1).0);
-    let mut subagent_activity_rx = subagents
+    let subagent_activity_rx = subagents
         .as_ref()
         .map(SubagentCoordinator::subscribe)
         .unwrap_or_else(|| disabled_activity_tx.subscribe());
+    // Child activity reaches the actor on one channel of its own, so no loop has
+    // to know where it came from. See `forward_child_activity`.
+    let (child_activity_tx, mut child_activity_rx) = mpsc::channel(CHILD_ACTIVITY_BUFFER);
+    let mut child_activity_open = owns_team;
+    let _child_activity_forwarder = owns_team.then(|| {
+        AbortTask(tokio::spawn(forward_child_activity(
+            subagent_activity_rx,
+            child_activity_tx,
+        )))
+    });
     let mut root_message_rx = subagents
         .as_ref()
         .map(SubagentCoordinator::subscribe_root_messages)
         .unwrap_or_else(|| disabled_root_tx.subscribe());
     let mut root_inbox_tick = tokio::time::interval(ROOT_INBOX_REFRESH_INTERVAL);
     root_inbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Watchers exist before the restored activity is recorded: recording a
+    // child's lifecycle and telling the watcher about it are one place, and the
+    // resume path below is one of them.
+    let workflow_processes = crate::native_process::ProcessManager::default();
+    let (watch_events_tx, mut watch_events_rx) = mpsc::channel(16);
+    let watches =
+        crate::watch::Watches::new(workflow_processes.clone(), watch_events_tx, session_id);
+    let _watch_shutdown = SessionAutonomyShutdown(watches.cancel.clone());
     if owns_team {
         let team = subagents.as_ref().expect("enabled team");
         for activity in team.restore_from_events(&recovery.subagent_events).await? {
-            record_subagent_activity(&mut journal, &events, session_id, team, activity).await?;
+            record_subagent_activity(&mut journal, &events, session_id, team, &watches, activity)
+                .await?;
+        }
+        // The recorded activity reports changes; this is the state itself, so a
+        // child that finished while this session was not running is already
+        // known to the watcher before any watch can name it.
+        for agent in team.list(None).await {
+            watches
+                .observe_agent(
+                    agent.session_id,
+                    subject_life(agent.status),
+                    &agent.task_name,
+                )
+                .await;
         }
     }
     if fresh && !initial_peers.is_empty() {
@@ -2025,28 +2060,7 @@ async fn run_agent_session_store_kernel_inner(
         })
         .flatten();
     let workflow_snapshot = executor.extension_workflow_snapshot();
-    let workflow_processes = crate::native_process::ProcessManager::default();
     let web_search = executor.web_search_provider();
-    let (watch_events_tx, mut watch_events_rx) = mpsc::channel(16);
-    let watches =
-        crate::watch::Watches::new(workflow_processes.clone(), watch_events_tx, session_id);
-    let _watch_shutdown = SessionAutonomyShutdown(watches.cancel.clone());
-
-    // Child agents are watched from the lifecycle the runtime already records,
-    // so the watcher starts with what this session knows: a child that finished
-    // while the session was not running must not leave a watch armed later
-    // waiting for an edge that has already gone by.
-    if owns_team && let Some(team) = subagents.as_ref() {
-        for agent in team.list(None).await {
-            watches
-                .observe_agent(
-                    agent.session_id,
-                    subject_life(agent.status),
-                    &agent.task_name,
-                )
-                .await;
-        }
-    }
     let dispatcher = crate::AgentToolDispatcher::new_with_search(
         goal_tools.clone(),
         todo_tools.clone(),
@@ -2425,18 +2439,23 @@ async fn run_agent_session_store_kernel_inner(
                                             Err(broadcast::error::RecvError::Closed) => continue,
                                         }
                                     }
-                                    activity = subagent_activity_rx.recv(), if owns_team => {
-                                        if let Ok(activity) = activity {
-                                            let team = subagents.as_ref().expect("team activity requires coordinator");
-                                            observe_child_life(&watches, team, &activity).await;
-                                            record_subagent_activity(
-                                                &mut journal,
-                                                &events,
-                                                session_id,
-                                                team,
-                                                activity,
-                                            ).await?;
-                                        }
+                                    // The actor owns the journal; an append from another
+                                    // task would leave the live context behind and change replay.
+                                    activity = child_activity_rx.recv(), if child_activity_open => {
+                                        let Some(activity) = activity else {
+                                            // The forwarder is gone, so nothing can
+                                            // arrive on this channel again.
+                                            child_activity_open = false;
+                                            continue;
+                                        };
+                                        record_subagent_activity(
+                                            &mut journal,
+                                            &events,
+                                            session_id,
+                                            subagents.as_ref().expect("child activity requires coordinator"),
+                                            &watches,
+                                            activity,
+                                        ).await?;
                                         continue;
                                     }
                                     _ = root_inbox_tick.tick(), if owns_team => {
@@ -2445,6 +2464,7 @@ async fn run_agent_session_store_kernel_inner(
                                             &events,
                                             session_id,
                                             subagents.as_ref().expect("team inbox requires coordinator"),
+                                            &watches,
                                         ).await?;
                                         continue;
                                     }
@@ -3421,8 +3441,15 @@ async fn run_agent_session_store_kernel_inner(
         let Some(mut prompt) = next else {
             if owns_team && let Some(team) = &subagents {
                 for activity in team.stop_all().await {
-                    record_subagent_activity(&mut journal, &events, session_id, team, activity)
-                        .await?;
+                    record_subagent_activity(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        team,
+                        &watches,
+                        activity,
+                    )
+                    .await?;
                 }
             }
             stop(&mut journal, &events, session_id).await?;
@@ -4672,18 +4699,23 @@ async fn run_agent_session_store_kernel_inner(
                     }
                     break;
                 }
-                activity = subagent_activity_rx.recv(), if owns_team => {
-                    if let Ok(activity) = activity {
-                        let team = subagents.as_ref().expect("team activity requires coordinator");
-                        observe_child_life(&watches, team, &activity).await;
-                        record_subagent_activity(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            team,
-                            activity,
-                        ).await?;
-                    }
+                // The actor owns the journal; an append from another task
+                // would leave the live context behind and change replay.
+                activity = child_activity_rx.recv(), if child_activity_open => {
+                    let Some(activity) = activity else {
+                        // The forwarder is gone, so nothing can arrive on this
+                        // channel again.
+                        child_activity_open = false;
+                        continue;
+                    };
+                    record_subagent_activity(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        subagents.as_ref().expect("child activity requires coordinator"),
+                        &watches,
+                        activity,
+                    ).await?;
                 }
                 message = root_message_rx.recv(), if owns_team => {
                     match message {
@@ -4708,6 +4740,7 @@ async fn run_agent_session_store_kernel_inner(
                         &events,
                         session_id,
                         subagents.as_ref().expect("team inbox requires coordinator"),
+                        &watches,
                     ).await?;
                 }
                 // Suspended while a human owns the turn: an operator may sit on
@@ -5577,6 +5610,7 @@ async fn run_agent_session_store_kernel_inner(
                                         &events,
                                         session_id,
                                         team,
+                                        &watches,
                                         activity,
                                     )
                                     .await?;
@@ -9561,49 +9595,6 @@ async fn apply_model_goal_request(
     })
 }
 
-/// Hand one live child activity to the watcher's subject state.
-///
-/// The life recorded is the one the coordinator holds durably: the snapshot a
-/// lifecycle change carries, or the snapshot a child's own status change is
-/// resolved against. A status this session has not been told about is left
-/// unknown rather than guessed, so an agent watch cannot fire early.
-async fn observe_child_life(
-    watches: &crate::watch::Watches,
-    subagents: &SubagentCoordinator,
-    activity: &SubagentActivity,
-) {
-    match activity {
-        SubagentActivity::Started { agent }
-        | SubagentActivity::Completed { agent }
-        | SubagentActivity::Stopped { agent }
-        | SubagentActivity::Failed { agent } => {
-            watches
-                .observe_agent(
-                    agent.session_id,
-                    subject_life(agent.status),
-                    &agent.task_name,
-                )
-                .await;
-        }
-        SubagentActivity::SessionEvent { event, .. } => {
-            // Only a status change moves a child between lives; every other
-            // mirrored event is stream noise a watcher has no use for.
-            if !matches!(event.kind, SessionEventKind::StatusChanged { .. }) {
-                return;
-            }
-            if let Some(agent) = subagents.get(event.session_id).await {
-                watches
-                    .observe_agent(
-                        agent.session_id,
-                        subject_life(agent.status),
-                        &agent.task_name,
-                    )
-                    .await;
-            }
-        }
-    }
-}
-
 /// What a child's recorded status means to a watcher.
 ///
 /// `Ready` is a child that finished its assignment and stays addressable, and
@@ -9618,11 +9609,52 @@ fn subject_life(status: SubagentStatus) -> SubjectLife {
     }
 }
 
+/// Forward the coordinator's child activity onto the actor's own channel.
+///
+/// The coordinator broadcasts on a receiver of its own, so without this every
+/// loop in the actor has to select on it and record it, and a loop that forgets
+/// records child activity late or never. One task owns that receiver and
+/// republishes each activity here instead.
+///
+/// Ordering and durability: the actor is the only writer to the journal and
+/// writes in its receive order, so the durable sequence is the order in which it
+/// drained this channel. This task reads one source and writes one channel
+/// without reordering and without dropping, so what the coordinator emitted is
+/// what the actor receives, and a restart replays that written sequence.
+async fn forward_child_activity(
+    mut activity: broadcast::Receiver<SubagentActivity>,
+    forwarded: mpsc::Sender<SubagentActivity>,
+) {
+    loop {
+        match activity.recv().await {
+            Ok(activity) => {
+                if forwarded.send(activity).await.is_err() {
+                    return;
+                }
+            }
+            // A reader that fell behind loses activity where it was lost before
+            // this task existed; the ones that did arrive still have to be
+            // forwarded.
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+/// Record one child's activity, and hand the same resolved snapshot to the
+/// watcher.
+///
+/// This is the one place either happens. Every path that sees child activity --
+/// the actor's forwarded channel, the coordinator's restore at startup, the
+/// drains at stop, the durable root-inbox refresh -- comes through here, so the
+/// journal and the watcher cannot disagree about a child's life, and a further
+/// source only has to call this rather than be added to every loop.
 async fn record_subagent_activity(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
     subagents: &SubagentCoordinator,
+    watches: &crate::watch::Watches,
     activity: SubagentActivity,
 ) -> Result<()> {
     // A child's assistant message is a mutable live projection until its
@@ -9699,6 +9731,16 @@ async fn record_subagent_activity(
             (SubagentActivityKind::Updated, agent, Some(Box::new(event)))
         }
     };
+    // The snapshot the journal is about to record, so a watch cannot be told a
+    // life the session did not record. A child the coordinator no longer tracks
+    // was skipped above rather than guessed at.
+    watches
+        .observe_agent(
+            agent.session_id,
+            subject_life(agent.status),
+            &agent.task_name,
+        )
+        .await;
     let kind = SessionEventKind::SubagentActivity {
         activity: kind,
         agent,
@@ -9716,9 +9758,10 @@ async fn refresh_durable_root_inbox(
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
     subagents: &SubagentCoordinator,
+    watches: &crate::watch::Watches,
 ) -> Result<()> {
     for (_, activity) in subagents.refresh_root_inbox_reports().await? {
-        record_subagent_activity(journal, events, session_id, subagents, activity).await?;
+        record_subagent_activity(journal, events, session_id, subagents, watches, activity).await?;
     }
     subagents.wake_pending_root_messages().await;
     Ok(())

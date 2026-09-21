@@ -13785,11 +13785,13 @@ async fn parent_journal_preserves_full_child_transcript_events() {
         },
     );
 
+    let watches = test_watches(parent_id);
     record_subagent_activity(
         &mut journal,
         &events,
         parent_id,
         &coordinator,
+        &watches,
         SubagentActivity::SessionEvent {
             parent_session_id: parent_id,
             task_name: "/root/worker".to_string(),
@@ -13856,6 +13858,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
         &events,
         parent_id,
         &coordinator,
+        &watches,
         child_message(0, "I", MessageStatus::InProgress),
     )
     .await
@@ -13865,6 +13868,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
         &events,
         parent_id,
         &coordinator,
+        &watches,
         child_message(8, "I am complete", MessageStatus::Complete),
     )
     .await
@@ -13961,6 +13965,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
         &events,
         parent_id,
         &coordinator,
+        &watches,
         child_message(8, "I am complete", MessageStatus::Complete),
     )
     .await
@@ -17622,4 +17627,65 @@ async fn assert_immediate_interrupt(control_backlog: usize) {
         "a turn that produced nothing must not pay the cooperative grace before \
          reaching a terminal boundary: waited {waited:?}"
     );
+}
+
+/// The forwarder between the coordinator's broadcast and the actor's channel is
+/// the one place child activity can be reordered or dropped.
+///
+/// Failure mode: the hop reorders activity against itself or loses it, so the
+/// durable sequence the actor writes -- and every replay taken from that
+/// journal -- differs from what the coordinator emitted, or a child's later
+/// state is recorded before its earlier one.
+#[tokio::test]
+async fn forwarded_child_activity_keeps_the_coordinator_order() {
+    let (activity_tx, activity_rx) = broadcast::channel(8);
+    let (forwarded_tx, mut forwarded_rx) = mpsc::channel(8);
+    let forwarder = tokio::spawn(forward_child_activity(activity_rx, forwarded_tx));
+    let children: Vec<Uuid> = (0..4).map(|_| Uuid::new_v4()).collect();
+    for child in &children {
+        activity_tx
+            .send(SubagentActivity::Started {
+                agent: watched_child(*child),
+            })
+            .unwrap();
+    }
+    for (index, child) in children.iter().enumerate() {
+        let activity = forwarded_rx.recv().await.expect("every activity arrives");
+        let SubagentActivity::Started { agent } = activity else {
+            panic!("the activity has to survive the hop unchanged");
+        };
+        assert_eq!(agent.session_id, *child, "activity {index} kept its order");
+    }
+    // The coordinator going away ends the forwarder rather than leaving it
+    // waiting on a source that can never speak again.
+    drop(activity_tx);
+    forwarder.await.unwrap();
+}
+
+fn watched_child(session_id: Uuid) -> crate::SubagentSnapshot {
+    crate::SubagentSnapshot {
+        session_id,
+        parent_session_id: Uuid::new_v4(),
+        task_name: "/root/worker".to_string(),
+        status: crate::SubagentStatus::Running,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        cwd: PathBuf::from("/tmp"),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        detail: None,
+        final_text: None,
+        usage: Default::default(),
+    }
+}
+
+/// The watcher set for tests that drive `record_subagent_activity` directly.
+fn test_watches(session_id: Uuid) -> crate::watch::Watches {
+    let (events, _events_rx) = mpsc::channel(8);
+    crate::watch::Watches::new(
+        crate::native_process::ProcessManager::default(),
+        events,
+        session_id,
+    )
 }
