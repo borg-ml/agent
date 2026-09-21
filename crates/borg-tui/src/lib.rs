@@ -3601,14 +3601,14 @@ impl BorgTerminal {
                         self.set_notice(format!("Codex authentication lookup unavailable · attempt {attempt}/{bound} · work saved · Esc to cancel"));
                     } else if let Some((attempt, max_attempts)) = self.connection_retry_attempt {
                         self.set_notice(format!(
-                            "Connection interrupted · attempt {attempt}/{max_attempts} · work saved · reconnecting automatically · Esc to cancel · the reason: {}",
+                            "Retrying the request · attempt {attempt}/{max_attempts} · work saved · Esc to cancel · the reason: {}",
                             payload
                                 .get("error")
                                 .and_then(serde_json::Value::as_str)
                                 .unwrap_or("the provider did not say")
                         ));
                     } else {
-                        self.set_notice("Connection interrupted · work saved · reconnecting automatically · Esc to cancel");
+                        self.set_notice("Retrying the request · work saved · Esc to cancel");
                     }
                 }
                 SessionEventKind::ProviderEvent { kind, payload, .. }

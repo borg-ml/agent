@@ -588,16 +588,38 @@ impl OpenAiCompatibleProvider {
         trace.invocation.args.push(format!("attempts={attempt}"));
         let status = response.status();
         if !status.is_success() {
+            // A refusal with no body is unactionable, and a 400 usually means the
+            // request itself was malformed, so record what the response says about
+            // itself before the body is consumed.
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("none")
+                .to_string();
+            let request_id = response
+                .headers()
+                .get("x-request-id")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("none")
+                .to_string();
             let raw_text = read_provider_error_response_text(response)
                 .await
                 .unwrap_or_else(|error| error.to_string());
+            let body = if raw_text.trim().is_empty() {
+                format!(
+                    "the provider sent no body (content-type {content_type}, request-id {request_id})"
+                )
+            } else {
+                truncate_provider_text(&raw_text, 500)
+            };
             trace.exit_status = Some(1);
             trace.stderr = raw_text.clone();
             return Err(ProviderCallError {
                 message: format!(
                     "{provider_label} request failed with HTTP {}: {}",
                     status.as_u16(),
-                    truncate_provider_text(&raw_text, 500)
+                    body
                 ),
                 trace: Box::new(trace),
                 session_id: None,
@@ -800,7 +822,7 @@ impl OpenAiCompatibleProvider {
                 message: format!(
                     "OpenAI-compatible request failed with HTTP {}: {}",
                     status.as_u16(),
-                    truncate_provider_text(&raw_text, 500)
+                    body
                 ),
                 trace: Box::new(trace),
                 session_id: None,
