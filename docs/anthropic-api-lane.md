@@ -22,8 +22,10 @@ native-only entries.
 
 ## Verified current state
 
-- No Anthropic HTTP client exists in the repository: no api.anthropic.com, no
-  anthropic-version header, no /v1/messages request builder.
+- The adapter exists as crates/borg-provider/src/provider/anthropic_messages.rs
+  and is routed: CodingProvider::Anthropic resolves to
+  NativeRoute::AnthropicMessages, which no other provider shares. Before this
+  change the repository had no Anthropic HTTP client at all.
 - Claude is the CLI subscription lane only: run_claude_chat_stream and
   run_claude_chat_stream_with_control reach run_subscription_stream(...,
   SubscriptionProvider::Claude, ...) and the pooled claude_agents CLI.
@@ -81,16 +83,34 @@ key and run in CI. A live two-turn smoke, checking a cache read on the second
 turn, tools and nonzero usage, needs a configured key and belongs in the
 credentialed smoke set.
 
-## Ordered plan
+## Implementation status
 
-1. Adapter module with the SSE fixture tests. No routing change, so the tree
-   stays green and nothing is reachable yet.
-2. NativeRoute::AnthropicMessages, the dispatch arms, and the provider variant
-   with its metadata, in one commit that makes the lane selectable and
-   functional together.
-3. Pricing and the capability and login surface, so billing reports honestly and
-   the key can be stored.
-4. Credentialed smoke, then install.
+Landed, in this order:
+
+1. The Messages adapter, with fixture tests over the request shape, attachments,
+   the thinking budget, the stream mapping, frame splitting across a chunk
+   boundary, and refusal classification.
+2. The route, the four dispatch arms, the provider variant and its metadata,
+   plus the capability snapshot that always reports the API-key lane and never a
+   subscription on this provider.
+3. Selection end to end: the CLI provider argument, the reserved config id, and
+   a login path that stores the key.
+
+Remaining, each with what it would take:
+
+- **Credentialed smoke.** Needs a key on the host; none is configured. Two turns
+  in one session, tools, nonzero usage.
+- **Pricing.** The lane reports tokens with an unavailable cost basis rather than
+  a dollar figure nobody verified. Adding it means transcribing current published
+  rates, which this environment could not check.
+- **A pinned default model.** Deliberately absent: naming a model id this code
+  cannot confirm would fail on the first call instead of asking the operator.
+- **Prompt-cache breakpoints.** The adapter sends none, so the route is refused
+  for cache warming with CacheWriteUnsupported. Sending cache_control breakpoints
+  is what would make warming meaningful here.
+- **Vendor OpenAI-compatibility shim.** Not chosen. It would be far less code,
+  but it is a reduced-fidelity path and its current support for streaming, tool
+  calls and prompt caching was not verifiable when this was written.
 
 ## Open questions
 
