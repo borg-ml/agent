@@ -4238,6 +4238,10 @@ async fn run_agent_session_store_kernel_inner(
         let (steer_result_tx, mut steer_results) =
             mpsc::channel::<(Uuid, std::result::Result<(), String>)>(32);
         let mut provider_events_open = true;
+        // Provider events a batch could not finish before control arrived. They
+        // are served before the channel, so arrival order is preserved, and the
+        // interrupt path settles them before the terminal events.
+        let mut provider_carry: VecDeque<SessionEventKind> = VecDeque::new();
         let mut interrupted = false;
         let mut network_recovery_pending = network_retry_message_id.is_some();
         let mut turn_had_side_effects = false;
@@ -4254,8 +4258,8 @@ async fn run_agent_session_store_kernel_inner(
         loop {
             tokio::select! {
                 biased;
-                _ = generation.wait(), if !interrupted && provider_events.is_empty() => {
-                    if !provider_events.is_empty() { continue; }
+                _ = generation.wait(), if !interrupted && provider_events.is_empty() && provider_carry.is_empty() => {
+                    if !provider_events.is_empty() || !provider_carry.is_empty() { continue; }
                     for kind in generation.expire(tokio::time::Instant::now()) {
                         record_provider_event(
                             kind,
@@ -4310,7 +4314,10 @@ async fn run_agent_session_store_kernel_inner(
                     } else {
                         result
                     };
-                    while let Ok(kind) = provider_events.try_recv() {
+                    while let Some(kind) = provider_carry
+                        .pop_front()
+                        .or_else(|| provider_events.try_recv().ok())
+                    {
                         if network_recovery_pending && provider_event_is_progress(&kind) {
                             network_recovery_pending = false;
                             record(&mut journal, &events, session_id, SessionEventKind::ProviderEvent {
@@ -5826,7 +5833,8 @@ async fn run_agent_session_store_kernel_inner(
                     }
                     request.response.send(result).ok();
                 }
-                kind = provider_events.recv(), if provider_events_open => {
+                kind = next_provider_event(&mut provider_carry, &mut provider_events),
+                    if provider_events_open || !provider_carry.is_empty() => {
                     let Some(first_kind) = kind else {
                         provider_events_open = false;
                         continue;
@@ -5839,13 +5847,35 @@ async fn run_agent_session_store_kernel_inner(
                     push_coalesced_provider_event(&mut provider_batch, first_kind);
                     let mut consumed = 1;
                     while consumed < PROVIDER_EVENT_BATCH_LIMIT {
-                        let Ok(kind) = provider_events.try_recv() else {
+                        let Some(kind) = provider_carry
+                            .pop_front()
+                            .or_else(|| provider_events.try_recv().ok())
+                        else {
                             break;
                         };
                         consumed += 1;
                         push_coalesced_provider_event(&mut provider_batch, kind);
                     }
-                    for kind in provider_batch {
+                    let mut remaining = VecDeque::from(provider_batch);
+                    while let Some(kind) = remaining.pop_front() {
+                        // Control does not queue behind provider output. Checked
+                        // between events and before this event own durable work,
+                        // so a human Escape is not delayed by the rest of the
+                        // batch. A cancellation stops the batch here; anything
+                        // unprocessed is carried, not dropped, and the interrupt
+                        // path settles it before the turn terminal events, so
+                        // replay still sees the turn output before its boundary.
+                        if let Ok(command) = commands.try_recv() {
+                            let cancellation = matches!(
+                                command,
+                                HostCommand::Interrupt { .. } | HostCommand::Stop { .. }
+                            );
+                            deferred_commands.push_front(command);
+                            if cancellation {
+                                provider_carry.append(&mut remaining);
+                                break;
+                            }
+                        }
                     // Classify liveness on the raw event: coalescing drops
                     // streaming fragments, which are still real progress.
                     let progress = provider_event_is_progress(&kind);
@@ -10977,6 +11007,19 @@ async fn record_all(
         .await;
     }
     Ok(())
+}
+
+/// The next provider event in arrival order: carried events first, then the
+/// channel. Awaiting only happens when nothing is carried, so a pending carry
+/// is served without polling the channel and stealing an event.
+async fn next_provider_event(
+    carry: &mut VecDeque<SessionEventKind>,
+    events: &mut mpsc::Receiver<SessionEventKind>,
+) -> Option<SessionEventKind> {
+    if let Some(kind) = carry.pop_front() {
+        return Some(kind);
+    }
+    events.recv().await
 }
 
 fn push_coalesced_provider_event(batch: &mut Vec<SessionEventKind>, next: SessionEventKind) {

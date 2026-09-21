@@ -14091,7 +14091,12 @@ async fn interrupt_is_honoured_while_a_stalled_observer_backs_up_the_event_strea
     // 1.15s and 3,586 gave 3.86s, so a faster host failed a test a slower one
     // passed. Waiting for a fixed backlog makes every run measure the same
     // thing.
-    const SATURATION_EVENTS: u64 = 400;
+    // Escape latency must not scale with provider event volume, so the volume
+    // is overridable to measure that: BORG_TEST_FLOOD_EVENTS=50/450/2000.
+    let SATURATION_EVENTS: u64 = std::env::var("BORG_TEST_FLOOD_EVENTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(400);
     let saturate = std::time::Instant::now();
     while sent.load(std::sync::atomic::Ordering::Relaxed) < SATURATION_EVENTS {
         tokio::time::sleep(Duration::from_millis(5)).await;
