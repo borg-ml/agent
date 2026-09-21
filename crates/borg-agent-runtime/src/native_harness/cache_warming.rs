@@ -109,6 +109,12 @@ pub(crate) enum Ineligible {
     /// API prices Borg knows are not what the user pays, so the saving a
     /// decision would be justified by is not a real number here.
     SubscriptionQuota,
+    /// Extended thinking is enabled on this route with a thinking budget the
+    /// provider keys the cached prefix on. A refresh replays the request under
+    /// a minimal output cap, which cannot reproduce that budget, so the replay
+    /// would not refresh the entry the next real request reads -- and the
+    /// model could still spend thousands of tokens thinking.
+    ThinkingBudgetNotReplayable,
 }
 
 impl Ineligible {
@@ -128,6 +134,10 @@ impl Ineligible {
             }
             Self::SubscriptionQuota => {
                 "this route spends subscription quota, which Borg cannot price against a cache miss"
+                    .to_string()
+            }
+            Self::ThinkingBudgetNotReplayable => {
+                "reasoning is enabled on this route, so a replay cannot reproduce the thinking budget its cache prefix is keyed on"
                     .to_string()
             }
         }

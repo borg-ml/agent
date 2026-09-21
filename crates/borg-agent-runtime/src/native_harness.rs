@@ -121,6 +121,10 @@ struct NativeCompactionContext<'a> {
     usage: &'a mut ProviderCallUsage,
     warmer: Option<&'a CacheWarmer>,
     events: &'a mpsc::Sender<SessionEventKind>,
+    /// Tool calls the durable transcript already held when this turn started,
+    /// which are the only results micro-compaction may clear. A result this
+    /// turn produced is the evidence the model is working from.
+    earlier_tool_calls: &'a HashSet<String>,
     /// Compact even when the pre-call estimate says the request fits. Set only
     /// after the provider has already refused for context length, where the
     /// estimate is demonstrably wrong or its window unknown.
@@ -503,7 +507,9 @@ impl NativeHarness {
         messages.push(ModelMessage::System {
             content: system_prompt,
         });
-        messages.extend(std::mem::take(&mut turn.conversation));
+        let history = std::mem::take(&mut turn.conversation);
+        let earlier_tool_calls = tool_call_ids(&history);
+        messages.extend(history);
         let user_message = native_user_message(&turn.cwd, &turn.prompt, &turn.attachments).await?;
         record_native_message(&events, turn.provider, &user_message).await?;
         messages.push(user_message);
@@ -627,6 +633,7 @@ impl NativeHarness {
                         usage: &mut usage,
                         warmer: warmer.as_ref(),
                         events: &events,
+                        earlier_tool_calls: &earlier_tool_calls,
                         force: false,
                     },
                 )
@@ -730,6 +737,7 @@ impl NativeHarness {
                             usage: &mut usage,
                             warmer: warmer.as_ref(),
                             events: &events,
+                            earlier_tool_calls: &earlier_tool_calls,
                             force: true,
                         },
                     )
@@ -1176,6 +1184,7 @@ impl NativeHarness {
                     usage: &mut usage,
                     warmer: warmer.as_ref(),
                     events: &events,
+                    earlier_tool_calls: &earlier_tool_calls,
                     force: false,
                 },
             )
@@ -1344,12 +1353,56 @@ Return only the internal continuation checkpoint.",
             usage,
             warmer,
             events,
+            earlier_tool_calls,
             force,
         } = context;
         let compaction_budget =
             self.compaction_budget(turn.provider, model, budget.context_window_tokens);
         if !force && !budget.needs_auto_compaction(&compaction_budget) {
             return Ok(());
+        }
+        // Context is reduced in two stages, cheapest first. Clearing the
+        // contents of old tool results keeps the message structure, the tool
+        // call pairing and every recent result, and it touches only the view
+        // this request is built from, so the transcript keeps every byte and
+        // the model can be told to read again what it needs. Summarisation
+        // rewrites history and invalidates the whole cached prefix, so it runs
+        // only when trimming was not enough.
+        let mut budget = budget;
+        if let Some(trim) = microcompact_native_messages(messages, earlier_tool_calls) {
+            budget.context_tokens = budget.context_tokens.saturating_sub(trim.saved_tokens);
+            let enough = !force && !budget.needs_auto_compaction(&compaction_budget);
+            send(
+                events,
+                SessionEventKind::ProviderEvent {
+                    provider: turn.provider,
+                    kind: "context_microcompaction".to_string(),
+                    payload: json!({
+                        "status": "completed",
+                        "summary": format!(
+                            "Cleared {} older tool results to free {} tokens of context; the transcript keeps them.",
+                            trim.cleared, trim.saved_tokens
+                        ),
+                        "automatic": true,
+                        "trigger": trigger,
+                        "tool_results_cleared": trim.cleared,
+                        "tokens_saved": trim.saved_tokens,
+                        "context_tokens_after": budget.context_tokens,
+                        "effective_context_window_tokens": budget.context_window_tokens,
+                        "summarized": !enough,
+                    }),
+                },
+            )
+            .await;
+            // The trimmed messages are no longer the prefix the last real
+            // request wrote, so a refresh would extend an entry the next
+            // request no longer reads -- the same reason a summary stops one.
+            if let Some(warmer) = warmer {
+                warmer.on_context_changed();
+            }
+            if enough {
+                return Ok(());
+            }
         }
         let context_tokens = budget.context_tokens;
         let context_window_tokens = budget.context_window_tokens;
@@ -1821,6 +1874,21 @@ fn wire_model<'a>(gateway: Option<&'a ModelGateway>, model: &'a str) -> &'a str 
         .unwrap_or(model)
 }
 
+/// Whether the Anthropic lane enables extended thinking for `effort`.
+///
+/// Mirrors `thinking_budget` in the provider's Messages adapter, which is
+/// private to that crate: the two have to agree, or this guard would judge a
+/// route the request does not actually take.
+fn anthropic_thinking_enabled(effort: Option<&str>) -> bool {
+    let Some(effort) = effort.map(str::trim).filter(|effort| !effort.is_empty()) else {
+        return false;
+    };
+    !matches!(
+        effort.to_ascii_lowercase().as_str(),
+        "none" | "off" | "minimal"
+    )
+}
+
 #[async_trait]
 impl PromptCacheRefreshClient for ProviderModelClient {
     fn refresh_support(
@@ -1842,7 +1910,24 @@ impl PromptCacheRefreshClient for ProviderModelClient {
             // refresh has something to keep alive. Whether one is worth sending
             // is still decided below, from a documented lifetime and a real
             // price rather than from an assumption about this route.
-            NativeRoute::AnthropicMessages => None,
+            //
+            // Extended thinking is the exception: this lane enables it with a
+            // thinking budget, and a refresh replays the request under a
+            // minimal output cap. That is a different budget from the one the
+            // provider keys the cached prefix on, so the replay would not
+            // refresh the entry the next real request reads, and the model
+            // could still think for thousands of tokens. pi draws the same line
+            // in its cache warmer (isReplayable): a request that cannot be
+            // replayed faithfully must not be warmed at all, rather than
+            // refreshed with a cap the route cannot honour. Borg's reasoning
+            // floor only raises the cap, so the distinction has to be made
+            // here, before a refresh is sent.
+            NativeRoute::AnthropicMessages => {
+                if anthropic_thinking_enabled(effort) {
+                    return Err(Ineligible::ThinkingBudgetNotReplayable);
+                }
+                None
+            }
             NativeRoute::ChatCompletions { gateway, .. } => gateway,
         };
         // An operator who configured this route may know its documented
@@ -3546,6 +3631,109 @@ fn retain_recent_native_messages(
         start += 1;
     }
     body[start..].to_vec()
+}
+
+/// Contents of the oldest tool results are cleared from the request view before
+/// any summary is written. The newest few stay readable: they are the evidence
+/// the model is most likely still working from.
+const MICROCOMPACT_KEEP_RECENT_TOOL_RESULTS: usize = 5;
+/// Clearing a couple of small results is not worth invalidating the cached
+/// prefix they sit in, so a pass that would save less than this changes nothing.
+const MICROCOMPACT_MIN_SAVED_TOKENS: u64 = 256;
+/// What a cleared tool result says instead of its output. The transcript keeps
+/// the original, so the note says how to get it back rather than pretending the
+/// result was never produced.
+const MICROCOMPACT_CLEARED_TOOL_RESULT: &str = "This tool result was cleared to free context. Its output is kept in the session transcript: re-run the tool, or use `query_history`, if it is needed.";
+
+/// The tool calls a message list answers for.
+fn tool_call_ids(messages: &[ModelMessage]) -> HashSet<String> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            ModelMessage::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What one micro-compaction pass cleared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Microcompaction {
+    cleared: usize,
+    saved_tokens: u64,
+}
+
+/// Clear the contents of the oldest tool results in `messages`.
+///
+/// `messages` is the request view of the conversation, never the transcript:
+/// the durable journal keeps every byte, the tool call ids and the message
+/// count are untouched, and the next turn rebuilds the view from the journal
+/// and decides again. Only results the transcript already held when the turn
+/// started are eligible, so nothing the live turn produced is dropped, and a
+/// result carrying an image is left alone because the model cannot ask for it
+/// again by name.
+///
+/// Returns `None` when there is nothing worth clearing, leaving `messages`
+/// exactly as it was.
+fn microcompact_native_messages(
+    messages: &mut [ModelMessage],
+    earlier_tool_calls: &HashSet<String>,
+) -> Option<Microcompaction> {
+    let results = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            matches!(message, ModelMessage::Tool { .. }).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    let eligible = results
+        .len()
+        .saturating_sub(MICROCOMPACT_KEEP_RECENT_TOOL_RESULTS);
+    let candidates = results[..eligible]
+        .iter()
+        .copied()
+        .filter(|index| match &messages[*index] {
+            ModelMessage::Tool {
+                tool_call_id,
+                content,
+                attachments,
+            } => {
+                attachments.is_empty()
+                    && content != MICROCOMPACT_CLEARED_TOOL_RESULT
+                    && earlier_tool_calls.contains(tool_call_id)
+            }
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+    // Measured before anything is written, so a pass that would save too little
+    // leaves the request, and the cached prefix under it, untouched.
+    let saved_tokens = candidates
+        .iter()
+        .map(|index| {
+            let cleared = match &messages[*index] {
+                ModelMessage::Tool { tool_call_id, .. } => estimated_message_tokens(
+                    &ModelMessage::tool(tool_call_id.clone(), MICROCOMPACT_CLEARED_TOOL_RESULT),
+                ),
+                _ => 0,
+            };
+            estimated_message_tokens(&messages[*index]).saturating_sub(cleared)
+        })
+        .fold(0_u64, u64::saturating_add);
+    if saved_tokens < MICROCOMPACT_MIN_SAVED_TOKENS {
+        return None;
+    }
+    for index in &candidates {
+        if let ModelMessage::Tool { content, .. } = &mut messages[*index] {
+            *content = MICROCOMPACT_CLEARED_TOOL_RESULT.to_string();
+        }
+    }
+    Some(Microcompaction {
+        cleared: candidates.len(),
+        saved_tokens,
+    })
 }
 
 fn estimated_message_tokens(message: &ModelMessage) -> u64 {
@@ -5392,6 +5580,25 @@ mod tests {
         );
     }
 
+    /// A thinking Anthropic route cannot be refreshed. Replaying it under a
+    /// minimal output cap changes the thinking budget the provider keys the
+    /// cached prefix on, so the route reports itself ineligible instead of
+    /// spending on an entry the next real request will not read.
+    #[test]
+    fn a_thinking_anthropic_route_refuses_a_cache_refresh() {
+        let client = ProviderModelClient::default();
+        assert_eq!(
+            client
+                .refresh_support(
+                    crate::CodingProvider::Anthropic,
+                    "claude-opus-5",
+                    Some("high")
+                )
+                .unwrap_err(),
+            Ineligible::ThinkingBudgetNotReplayable
+        );
+    }
+
     #[test]
     fn native_request_canonicalization_merges_adjacent_users_without_crossing_roles() {
         let attachment = ModelInputAttachment {
@@ -5502,6 +5709,119 @@ mod tests {
             assert_eq!(cost_basis, expected_basis.as_str());
             assert_eq!(cost_microusd, expected_cost);
         }
+    }
+
+    fn tool_result_with(id: &str, content: usize) -> ModelMessage {
+        ModelMessage::tool(id, "x".repeat(content))
+    }
+
+    fn tool_result_ids(messages: &[ModelMessage]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                ModelMessage::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tool_result_content(message: &ModelMessage) -> &str {
+        match message {
+            ModelMessage::Tool { content, .. } => content,
+            _ => panic!("not a tool result"),
+        }
+    }
+
+    /// Clearing contents must not break the request it trims: every tool call
+    /// keeps its result in place, the newest results stay readable, and nothing
+    /// this turn produced is dropped.
+    #[test]
+    fn microcompaction_clears_only_old_tool_results_from_before_this_turn() {
+        let mut messages = vec![ModelMessage::System {
+            content: "system".to_string(),
+        }];
+        // One result the transcript already held, then six this turn produced.
+        messages.push(tool_result_with("old-1", 4_000));
+        for index in 0..6 {
+            messages.push(tool_result_with(&format!("live-{index}"), 4_000));
+        }
+        let ids_before = tool_result_ids(&messages);
+        let earlier = HashSet::from(["old-1".to_string()]);
+
+        let trim = microcompact_native_messages(&mut messages, &earlier).expect("a trim");
+
+        assert_eq!(trim.cleared, 1);
+        assert!(trim.saved_tokens >= MICROCOMPACT_MIN_SAVED_TOKENS);
+        assert_eq!(
+            tool_result_ids(&messages),
+            ids_before,
+            "clearing contents must never remove or reorder a tool result"
+        );
+        assert_eq!(messages.len(), ids_before.len() + 1);
+        assert_eq!(
+            tool_result_content(&messages[1]),
+            MICROCOMPACT_CLEARED_TOOL_RESULT
+        );
+        for index in 2..messages.len() {
+            assert_eq!(
+                tool_result_content(&messages[index]).len(),
+                4_000,
+                "a result the live turn produced was dropped"
+            );
+        }
+    }
+
+    /// A trim is only worth the cached prefix it invalidates when it removes a
+    /// meaningful amount of context, and an image cannot be replaced by a note
+    /// because the model cannot ask for it again by name.
+    #[test]
+    fn microcompaction_declines_small_savings_and_keeps_attached_results() {
+        let earlier = HashSet::from(["image-1".to_string(), "old-1".to_string()]);
+        let mut small = vec![ModelMessage::System {
+            content: "system".to_string(),
+        }];
+        small.push(tool_result_with("old-1", 8));
+        for index in 0..6 {
+            small.push(tool_result_with(&format!("live-{index}"), 8));
+        }
+        assert!(microcompact_native_messages(&mut small, &earlier).is_none());
+        assert_eq!(
+            small
+                .iter()
+                .filter_map(|message| match message {
+                    ModelMessage::Tool { content, .. } => Some(content.len()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![8; 7],
+            "a trim that saves too little must leave the request untouched"
+        );
+
+        let mut mixed = vec![ModelMessage::System {
+            content: "system".to_string(),
+        }];
+        mixed.push(ModelMessage::Tool {
+            tool_call_id: "image-1".to_string(),
+            content: "x".repeat(4_000),
+            attachments: vec![ModelInputAttachment {
+                media_type: "image/png".to_string(),
+                data_base64: "AAAA".to_string(),
+                filename: None,
+            }],
+        });
+        mixed.push(tool_result_with("old-1", 4_000));
+        for index in 0..6 {
+            mixed.push(tool_result_with(&format!("live-{index}"), 4_000));
+        }
+
+        let trim = microcompact_native_messages(&mut mixed, &earlier).expect("a trim");
+
+        assert_eq!(trim.cleared, 1);
+        assert_eq!(
+            tool_result_content(&mixed[1]).len(),
+            4_000,
+            "a result carrying an image was cleared"
+        );
     }
 
     #[test]
