@@ -14093,12 +14093,12 @@ async fn interrupt_is_honoured_while_a_stalled_observer_backs_up_the_event_strea
     // thing.
     // Escape latency must not scale with provider event volume, so the volume
     // is overridable to measure that: BORG_TEST_FLOOD_EVENTS=50/450/2000.
-    let SATURATION_EVENTS: u64 = std::env::var("BORG_TEST_FLOOD_EVENTS")
+    let saturation_events: u64 = std::env::var("BORG_TEST_FLOOD_EVENTS")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(400);
     let saturate = std::time::Instant::now();
-    while sent.load(std::sync::atomic::Ordering::Relaxed) < SATURATION_EVENTS {
+    while sent.load(std::sync::atomic::Ordering::Relaxed) < saturation_events {
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(
             // A guard on the loop, not the measurement. Every flooded event is
@@ -14107,7 +14107,7 @@ async fn interrupt_is_honoured_while_a_stalled_observer_backs_up_the_event_strea
             // what keeps the run comparable; this only has to be long enough
             // that a loaded database does not look like a hang.
             saturate.elapsed() < Duration::from_secs(120),
-            "the flood never reached {SATURATION_EVENTS} events"
+            "the flood never reached {saturation_events} events"
         );
     }
     // Scheduler starvation is reported with the result below. It is not the

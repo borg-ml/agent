@@ -446,6 +446,7 @@ mod tests {
         assert!(!prices.contains_key(&("anthropic".to_string(), "no-cache-rate".to_string())));
     }
 
+    #[test]
     fn context_windows_are_read_from_the_models_dev_catalog() {
         let payload = serde_json::json!({
             "opencode-go": {
