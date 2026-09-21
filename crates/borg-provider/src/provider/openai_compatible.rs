@@ -503,6 +503,12 @@ impl OpenAiCompatibleProvider {
             body[field] = json!(refresh.max_output_tokens);
         }
 
+        // Prompt cache markers are per model: this wire format is shared with
+        // vendors that answer 400 for the field, so it goes out only where the
+        // gateway was verified to accept it.
+        if anthropic_cache_markers_enabled(provider_label, request_model) {
+            apply_anthropic_cache_markers(&mut body);
+        }
         let client = compatible_http_client();
         // A refresh is best-effort and must never queue retries behind the
         // agent's real traffic: if the first attempt fails the cache entry is
@@ -1052,6 +1058,128 @@ fn openrouter_model_limits_from_response(raw: &Value) -> Option<OpenRouterModelL
             .pointer("/data/top_provider/max_completion_tokens")
             .and_then(Value::as_u64),
     })
+}
+
+/// Model ids that are established to accept Anthropic-style prompt cache
+/// markers on the OpenCode Go route, keyed by the id the wire carries.
+///
+/// This is a list and not a name pattern because the gateway *rejects* the
+/// field everywhere else instead of ignoring it: on the same body and endpoint,
+/// glm-5.3 answered 400 with "Extra inputs are not permitted ... cache_control"
+/// and kimi-k3 answered 400 with "The parameter cache_control is not supported
+/// for the requested model", while every model listed here answered 200. A
+/// wrong guess is therefore a failed turn, not a silent no-op. Verified live
+/// against the Go gateway: a repeated 6418-token prefix reported 6412 cached
+/// tokens with the markers, and no cache accounting at all without them.
+const ANTHROPIC_CACHE_MARKER_MODELS: [&str; 5] = [
+    "qwen3.6-plus",
+    "qwen3.7-plus",
+    "qwen3.7-max",
+    "qwen3.8-flash",
+    "qwen3.8-max",
+];
+
+/// The only route that may carry the markers: the OpenCode Go gateway these
+/// models were verified against. Every other compatible endpoint - a
+/// user-configured one, Kimi, GLM, Qwen through Alibaba Model Studio, or
+/// OpenRouter - keeps the request body it sends today, byte for byte.
+const ANTHROPIC_CACHE_MARKER_LABEL: &str = "opencode-go";
+
+/// Override for a model that has not been added to the list yet, and for
+/// turning the markers off if an upstream change breaks them. It can only widen
+/// or narrow the selection within ANTHROPIC_CACHE_MARKER_LABEL: no value of it
+/// makes another vendor receive the field.
+const ANTHROPIC_CACHE_MARKER_ENV: &str = "BORG_ANTHROPIC_CACHE_MARKERS";
+
+/// Whether this turn may carry Anthropic-style cache_control markers.
+///
+/// Off unless an entry in the list, or the environment override, says
+/// otherwise.
+fn anthropic_cache_markers_enabled(provider_label: &str, model: &str) -> bool {
+    anthropic_cache_markers_for(
+        provider_label,
+        model,
+        nonempty_env(ANTHROPIC_CACHE_MARKER_ENV).as_deref(),
+    )
+}
+
+/// The enabled check with the override supplied by the caller, so the selection
+/// can be exercised without touching the environment.
+fn anthropic_cache_markers_for(
+    provider_label: &str,
+    model: &str,
+    override_value: Option<&str>,
+) -> bool {
+    if provider_label != ANTHROPIC_CACHE_MARKER_LABEL {
+        return false;
+    }
+    match override_value {
+        Some("off") => false,
+        Some("on") => true,
+        _ => ANTHROPIC_CACHE_MARKER_MODELS.contains(&model),
+    }
+}
+
+/// Mark the instruction block, the end of the conversation, and the tool list
+/// boundary: the positions this upstream caches on.
+///
+/// Applied to the finished body, so no profile or configured gateway body can
+/// add a marker and nothing built afterwards can drop one.
+fn apply_anthropic_cache_markers(body: &mut Value) {
+    let marker = json!({ "type": "ephemeral" });
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        // The system prompt is the part of the prefix that never changes.
+        if let Some(first) = messages.first_mut()
+            && first.get("role").and_then(Value::as_str) == Some("system")
+        {
+            mark_last_text_part(first, &marker);
+        }
+        // The last message is the breakpoint the next turn extends.
+        if let Some(last) = messages.last_mut()
+            && last.get("role").and_then(Value::as_str) != Some("system")
+        {
+            mark_last_text_part(last, &marker);
+        }
+    }
+    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut)
+        && let Some(last) = tools.last_mut()
+    {
+        last["cache_control"] = marker;
+    }
+}
+
+/// Point cache_control at the last text part of a message, which is the only
+/// part an upstream accepts it on.
+///
+/// A plain string body becomes a single text part. A message with nothing to
+/// mark - an assistant turn that is only tool calls - is left alone rather than
+/// given invented content. Returns whether a marker was placed.
+fn mark_last_text_part(message: &mut Value, marker: &Value) -> bool {
+    let Some(content) = message.get_mut("content") else {
+        return false;
+    };
+    if let Some(text) = content.as_str().map(str::to_string) {
+        if text.is_empty() {
+            return false;
+        }
+        *content = json!([{ "type": "text", "text": text, "cache_control": marker.clone() }]);
+        return true;
+    }
+    let Some(parts) = content.as_array_mut() else {
+        return false;
+    };
+    for part in parts.iter_mut().rev() {
+        if part.get("type").and_then(Value::as_str) == Some("text")
+            && part
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+        {
+            part["cache_control"] = marker.clone();
+            return true;
+        }
+    }
+    false
 }
 
 fn compatible_http_client() -> &'static reqwest::Client {
@@ -2486,5 +2614,93 @@ mod tests {
                 .saturating_sub(limits.max_completion_tokens.unwrap_or(0)),
             168_000
         );
+    }
+
+    /// The gateway answers 400 for cache_control on a model that does not
+    /// accept it, so a wrong selection is a failed turn. This pins the
+    /// selection: an unlisted model, another route, and another vendor all keep
+    /// the request body they send today.
+    #[test]
+    fn anthropic_cache_markers_are_selected_only_where_the_gateway_accepts_them() {
+        assert!(anthropic_cache_markers_for(
+            "opencode-go",
+            "qwen3.6-plus",
+            None
+        ));
+        assert!(!anthropic_cache_markers_for("opencode-go", "glm-5.3", None));
+        assert!(!anthropic_cache_markers_for("opencode-go", "kimi-k3", None));
+        assert!(!anthropic_cache_markers_for("qwen", "qwen3.6-plus", None));
+        assert!(!anthropic_cache_markers_for(
+            "openai-compatible",
+            "qwen3.6-plus",
+            None
+        ));
+        // The override adds a model or disables the field, but it can never
+        // move the field onto a different vendor.
+        assert!(anthropic_cache_markers_for(
+            "opencode-go",
+            "qwen3.9-plus",
+            Some("on")
+        ));
+        assert!(!anthropic_cache_markers_for(
+            "opencode-go",
+            "qwen3.6-plus",
+            Some("off")
+        ));
+        assert!(!anthropic_cache_markers_for(
+            "openai-compatible",
+            "qwen3.9-plus",
+            Some("on")
+        ));
+    }
+
+    /// A marker on the wrong part caches nothing while still paying for the
+    /// cache, so placement is part of the contract: the instruction block, the
+    /// end of the conversation, and the last tool.
+    #[test]
+    fn anthropic_cache_markers_mark_system_conversation_end_and_tools() {
+        let mut body = json!({
+            "model": "qwen3.6-plus",
+            "messages": [
+                { "role": "system", "content": "You are Borg." },
+                { "role": "assistant", "content": null, "tool_calls": [] },
+                {
+                    "role": "user",
+                    "content": [
+                        { "type": "image_url", "image_url": { "url": "data:image/png;base64,aW1hZ2U=" } },
+                        { "type": "text", "text": "inspect the repository" }
+                    ]
+                }
+            ],
+            "tools": [
+                { "type": "function", "function": { "name": "read_file" } },
+                { "type": "function", "function": { "name": "write_file" } }
+            ]
+        });
+        apply_anthropic_cache_markers(&mut body);
+
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([{ "type": "text", "text": "You are Borg.", "cache_control": { "type": "ephemeral" } }])
+        );
+        // The last text part, not the last part: an image cannot carry it.
+        assert_eq!(
+            body["messages"][2]["content"][1]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(
+            body["messages"][2]["content"][0]
+                .get("cache_control")
+                .is_none()
+        );
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(body["tools"][0].get("cache_control").is_none());
+        // An assistant turn that is only tool calls has no text to mark and is
+        // left untouched rather than given invented content.
+        assert_eq!(body["messages"][1]["content"], json!(null));
+        assert!(body["messages"][1].get("cache_control").is_none());
     }
 }
