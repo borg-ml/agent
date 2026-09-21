@@ -66,7 +66,7 @@ Do not silently switch billing routes or execute a second agent loop as fallback
 | Route | Current implementation | Remaining external agent behavior |
 | --- | --- | --- |
 | Fresh Codex subscription sessions | Borg native harness and direct model transport | CLI retained for subscription authentication/recovery, version metadata, and quota reads; no provider agent turn |
-| Existing Codex compatibility sessions | Pooled `codex app-server` | Model/tool loop, native tools, context/compaction behavior, and parts of approval policy |
+| Legacy Codex sessions | Borg native harness over direct model transport | None; the app-server adapters and their pool were removed (see below), so Codex no longer has an external agent runtime |
 | Claude subscription | Claude binary through `claude-agents` | Model/tool loop, native tools, and native session/context behavior |
 | OpenCode | Authenticated local server event stream | Model/tool loop, native tools, and native session/context behavior |
 | Kimi, GLM, OpenRouter, compatible endpoints | Borg native harness | Model service and provider protocol only |
