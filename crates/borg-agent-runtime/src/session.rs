@@ -46,6 +46,17 @@ const NETWORK_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const NETWORK_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const NETWORK_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+/// How many times one interrupted turn is resent before Borg stops and hands the
+/// failure back to the human.
+///
+/// The delay caps at [`NETWORK_RETRY_MAX_DELAY`], so without an attempt bound a
+/// provider that keeps refusing the identical request is resent for ever: a real
+/// session spent 68 minutes resending an HTTP 413 every 30 seconds, 94 retries,
+/// while the status line only counted down and its goal stayed active. A resend is
+/// worth a bounded number of tries; past that the honest answer is the error the
+/// provider gave and a human decision.
+const NETWORK_RETRY_MAX_ATTEMPTS: usize = 10;
+
 const USAGE_LIMIT_RETRY_MAX_DELAY: Duration = Duration::from_secs(30 * 60);
 const WORKSPACE_PROJECTION_REPAIR_BATCH_SIZE: usize = 512;
 pub(crate) const COMPACTION_SUMMARY_PROMPT: &str = concat!(
@@ -1955,6 +1966,7 @@ async fn run_agent_session_store_kernel_inner(
     });
     let mut usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
     let mut network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+    let mut network_retry_attempts = 0_usize;
     let mut network_retry_message_id = None;
     let mut usage_limit_continuation_id = None;
     if let Some(retry) = state.usage_limit_retry {
@@ -2212,6 +2224,7 @@ async fn run_agent_session_store_kernel_inner(
                     )
                     .await?;
                     network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+                    network_retry_attempts = 0;
                     auth_lookup_retries = 0;
                     next_ready_detail = Some("Reconnection cancelled. Your work is saved.".into());
                 }
@@ -2804,6 +2817,7 @@ async fn run_agent_session_store_kernel_inner(
                         )
                         .await?;
                         network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+                        network_retry_attempts = 0;
                         auth_lookup_retries = 0;
                         pause_active_goal(
                             &mut journal,
@@ -2834,6 +2848,7 @@ async fn run_agent_session_store_kernel_inner(
                             if network_retry_message_id == Some(recalled.message_id) {
                                 network_retry_message_id = None;
                                 network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+                                network_retry_attempts = 0;
                                 auth_lookup_retries = 0;
                             }
                             record_recalled_prompt(&mut journal, &events, session_id, &recalled)
@@ -4474,6 +4489,7 @@ async fn run_agent_session_store_kernel_inner(
                                 }).await?;
                             }
                             network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+                            network_retry_attempts = 0;
                             auth_lookup_retries = 0;
                             usage_limit_retry_delay = USAGE_LIMIT_RETRY_INITIAL_DELAY;
                             retry_not_before = None;
@@ -4565,23 +4581,37 @@ async fn run_agent_session_store_kernel_inner(
                             if network_retry_message_id != Some(prompt.message_id) {
                                 auth_lookup_retries = 0;
                             }
-                            let network_retry = !interrupted && (turn_error_is_connection_lost(&turn_error, &error)
-                                || provider_error_is_transient_api_failure(&error)
-                                || auth_lookup_failure);
-                            let retry = network_retry || usage_limit_retry || automatic_retry_allowed(
+                            // A usage limit is not a lost connection. Both can be true of one failure --
+                            // an exhausted lane can drop its stream or hand back a gateway error -- and the
+                            // usage path is the one that carries a reset deadline and a visible resumes
+                            // state, so it has to win. Reading a limit as a connection first is how
+                            // something the user could plan around becomes a silent resend loop instead.
+                            let network_retry = !interrupted
+                                && !usage_limit_retry
+                                && (turn_error_is_connection_lost(&turn_error, &error)
+                                    || provider_error_is_transient_api_failure(&error)
+                                    || auth_lookup_failure);
+                            // The bound the status line already implies. Once this chain has spent its
+                            // attempts the failure is terminal: the prompt settles failed, the goal goes
+                            // back to the human, and the reason is recorded instead of counted down again.
+                            let network_retry_exhausted =
+                                network_retry && network_retry_attempts >= NETWORK_RETRY_MAX_ATTEMPTS;
+                            let network_retry = network_retry && !network_retry_exhausted;
+                            let retry = (network_retry || usage_limit_retry || automatic_retry_allowed(
                                 &error,
                                 interrupted,
                                 prompt.visible,
                                 prompt.actor,
                                 turn_had_side_effects,
                                 !automatic_retry_message_ids.contains(&prompt.message_id),
-                            );
+                            )) && !network_retry_exhausted;
                             if retry && !usage_limit_retry && !network_retry {
                                 automatic_retry_message_ids.insert(prompt.message_id);
                             }
                             if !retry {
                                 network_retry_message_id = None;
                                 network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+                                network_retry_attempts = 0;
                                 auth_lookup_retries = 0;
                                 retry_not_before = None;
                                 if interrupted {
@@ -4611,11 +4641,27 @@ async fn run_agent_session_store_kernel_inner(
                             if autonomy_result_sender.is_some() {
                                 autonomy_result = Some(Err(anyhow::anyhow!(error.clone())));
                             }
-                            let ready_detail = if retry {
+                            let ready_detail = if network_retry_exhausted {
+                                format!(
+                                    "Provider kept refusing · stopped after {} attempts · check the provider status or /model, then resend · your work is saved · last error: {}",
+                                    NETWORK_RETRY_MAX_ATTEMPTS,
+                                    compact_provider_error(&error)
+                                )
+                            } else if retry {
                                 if network_retry && auth_lookup_failure {
-                                    format!("Codex authentication lookup unavailable · retry {} in {}s · Esc to cancel. Your work is saved.", auth_lookup_retries.saturating_add(1), network_retry_delay.as_secs())
+                                    format!(
+                                        "Codex authentication lookup unavailable · attempt {}/{} · retrying in {}s · Esc to cancel. Your work is saved.",
+                                        network_retry_attempts.saturating_add(1),
+                                        NETWORK_RETRY_MAX_ATTEMPTS,
+                                        network_retry_delay.as_secs()
+                                    )
                                 } else if network_retry {
-                                    format!("Provider temporarily unavailable · retrying in {}s · Esc to cancel. Your work is saved.", network_retry_delay.as_secs())
+                                    format!(
+                                        "Provider temporarily unavailable · attempt {}/{} · retrying in {}s · Esc to cancel. Your work is saved.",
+                                        network_retry_attempts.saturating_add(1),
+                                        NETWORK_RETRY_MAX_ATTEMPTS,
+                                        network_retry_delay.as_secs()
+                                    )
                                 } else if let Some(wait) = usage_limit_wait {
                                     if usage_limit_continue {
                                         format!(
@@ -4653,7 +4699,40 @@ async fn run_agent_session_store_kernel_inner(
                             } else {
                                 format!("Turn failed; the session remains available: {error}")
                             };
-                            if network_retry {
+                            if network_retry_exhausted {
+                                // Terminal: no resend, and no goal left silently active behind a
+                                // countdown that never ends. The attempt that scheduled this retry
+                                // already put a copy of the prompt back in `pending`, so that copy
+                                // has to go as well: settling the original failed while its copy
+                                // sat in the queue would be a resend with no countdown and no
+                                // resume wording, which is worse than the loop it replaces.
+                                pending.retain(|queued| queued.message_id != prompt.message_id);
+                                goal_turn_failures.reset();
+                                network_retry_message_id = None;
+                                network_retry_delay = NETWORK_RETRY_INITIAL_DELAY;
+                                network_retry_attempts = 0;
+                                auth_lookup_retries = 0;
+                                retry_not_before = None;
+                                let exhausted = SessionEventKind::ProviderEvent {
+                                    provider: launch.provider,
+                                    kind: "network_retry_exhausted".into(),
+                                    payload: serde_json::json!({
+                                        "attempts": NETWORK_RETRY_MAX_ATTEMPTS,
+                                        "message_ids": prompt.batch_entries().iter().map(|entry| entry.message_id).collect::<Vec<_>>(),
+                                        "error": compact_provider_error(&error),
+                                    }),
+                                };
+                                record(&mut journal, &events, session_id, exhausted).await?;
+                                block_active_goal(
+                                    &mut journal,
+                                    &events,
+                                    session_id,
+                                    &mut goal,
+                                    &mut goal_active_since,
+                                )
+                                .await?;
+                            } else if network_retry {
+                                network_retry_attempts = network_retry_attempts.saturating_add(1);
                                 if auth_lookup_failure { auth_lookup_retries = auth_lookup_retries.saturating_add(1); }
                                 goal_turn_failures.reset();
                                 network_retry_message_id = Some(prompt.message_id);
@@ -4739,7 +4818,14 @@ async fn run_agent_session_store_kernel_inner(
                                 record(&mut journal, &events, session_id, SessionEventKind::ProviderEvent {
                                     provider: launch.provider,
                                     kind: "network_retry".into(),
-                                    payload: serde_json::json!({"message_ids": prompt.batch_entries().iter().map(|entry| entry.message_id).collect::<Vec<_>>(), "delay_ms": network_retry_delay.as_millis() as u64, "auth_lookup_retry": auth_lookup_failure.then_some(auth_lookup_retries)}),
+                                    payload: serde_json::json!({
+                                        "message_ids": prompt.batch_entries().iter().map(|entry| entry.message_id).collect::<Vec<_>>(),
+                                        "delay_ms": network_retry_delay.as_millis() as u64,
+                                        "attempt": network_retry_attempts,
+                                        "max_attempts": NETWORK_RETRY_MAX_ATTEMPTS,
+                                        "error": compact_provider_error(&error),
+                                        "auth_lookup_retry": auth_lookup_failure.then_some(network_retry_attempts),
+                                    }),
                                 }).await?;
                                 network_retry_delay = network_retry_delay.saturating_mul(2).min(NETWORK_RETRY_MAX_DELAY);
                             }
@@ -10474,6 +10560,19 @@ fn turn_error_is_connection_lost(error: &anyhow::Error, rendered: &str) -> bool 
             provider_error_is_connection_lost(rendered)
         }
     }
+}
+
+/// One line of a provider failure, for a status line and a provider event.
+///
+/// The rendered error can carry a whole JSON body; a caller asking why this
+/// stopped needs the cause, not the envelope.
+fn compact_provider_error(error: &str) -> String {
+    let single_line = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut summary = single_line.chars().take(240).collect::<String>();
+    if single_line.chars().count() > 240 {
+        summary.push('\u{2026}');
+    }
+    summary
 }
 
 fn provider_error_is_connection_lost(error: &str) -> bool {
