@@ -11,6 +11,7 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::agent_watch::SubjectLife;
 use crate::subagents::{SharedWorkToolContext, TeamInboxMessage};
 use crate::{
     AgentCompaction, AgentTurn, AgentTurnControl, AgentTurnExecutor, CodingProvider,
@@ -19,8 +20,8 @@ use crate::{
     SessionEvent, SessionEventKind, SessionGoal, SessionGoalToolRequest, SessionGoalToolResponse,
     SessionState, SessionStatus, SessionStore, SessionTodoToolRequest, SessionTodoToolResponse,
     SessionWriterLease, SubagentAction, SubagentActivity, SubagentActivityKind,
-    SubagentControlOutcome, SubagentCoordinator, TodoAction, TodoItemUpdate, WorkspaceEvent,
-    WorkspaceEventKind, WorkspaceStore,
+    SubagentControlOutcome, SubagentCoordinator, SubagentStatus, TodoAction, TodoItemUpdate,
+    WorkspaceEvent, WorkspaceEventKind, WorkspaceStore,
 };
 
 pub struct AbortTask<T = ()>(pub tokio::task::JoinHandle<T>);
@@ -2030,6 +2031,22 @@ async fn run_agent_session_store_kernel_inner(
     let watches =
         crate::watch::Watches::new(workflow_processes.clone(), watch_events_tx, session_id);
     let _watch_shutdown = SessionAutonomyShutdown(watches.cancel.clone());
+
+    // Child agents are watched from the lifecycle the runtime already records,
+    // so the watcher starts with what this session knows: a child that finished
+    // while the session was not running must not leave a watch armed later
+    // waiting for an edge that has already gone by.
+    if owns_team && let Some(team) = subagents.as_ref() {
+        for agent in team.list(None).await {
+            watches
+                .observe_agent(
+                    agent.session_id,
+                    subject_life(agent.status),
+                    &agent.task_name,
+                )
+                .await;
+        }
+    }
     let dispatcher = crate::AgentToolDispatcher::new_with_search(
         goal_tools.clone(),
         todo_tools.clone(),
@@ -2410,11 +2427,13 @@ async fn run_agent_session_store_kernel_inner(
                                     }
                                     activity = subagent_activity_rx.recv(), if owns_team => {
                                         if let Ok(activity) = activity {
+                                            let team = subagents.as_ref().expect("team activity requires coordinator");
+                                            observe_child_life(&watches, team, &activity).await;
                                             record_subagent_activity(
                                                 &mut journal,
                                                 &events,
                                                 session_id,
-                                                subagents.as_ref().expect("team activity requires coordinator"),
+                                                team,
                                                 activity,
                                             ).await?;
                                         }
@@ -4655,11 +4674,13 @@ async fn run_agent_session_store_kernel_inner(
                 }
                 activity = subagent_activity_rx.recv(), if owns_team => {
                     if let Ok(activity) = activity {
+                        let team = subagents.as_ref().expect("team activity requires coordinator");
+                        observe_child_life(&watches, team, &activity).await;
                         record_subagent_activity(
                             &mut journal,
                             &events,
                             session_id,
-                            subagents.as_ref().expect("team activity requires coordinator"),
+                            team,
                             activity,
                         ).await?;
                     }
@@ -9538,6 +9559,63 @@ async fn apply_model_goal_request(
         remaining_tokens: goal.as_ref().and_then(SessionGoal::remaining_tokens),
         goal: goal.clone(),
     })
+}
+
+/// Hand one live child activity to the watcher's subject state.
+///
+/// The life recorded is the one the coordinator holds durably: the snapshot a
+/// lifecycle change carries, or the snapshot a child's own status change is
+/// resolved against. A status this session has not been told about is left
+/// unknown rather than guessed, so an agent watch cannot fire early.
+async fn observe_child_life(
+    watches: &crate::watch::Watches,
+    subagents: &SubagentCoordinator,
+    activity: &SubagentActivity,
+) {
+    match activity {
+        SubagentActivity::Started { agent }
+        | SubagentActivity::Completed { agent }
+        | SubagentActivity::Stopped { agent }
+        | SubagentActivity::Failed { agent } => {
+            watches
+                .observe_agent(
+                    agent.session_id,
+                    subject_life(agent.status),
+                    &agent.task_name,
+                )
+                .await;
+        }
+        SubagentActivity::SessionEvent { event, .. } => {
+            // Only a status change moves a child between lives; every other
+            // mirrored event is stream noise a watcher has no use for.
+            if !matches!(event.kind, SessionEventKind::StatusChanged { .. }) {
+                return;
+            }
+            if let Some(agent) = subagents.get(event.session_id).await {
+                watches
+                    .observe_agent(
+                        agent.session_id,
+                        subject_life(agent.status),
+                        &agent.task_name,
+                    )
+                    .await;
+            }
+        }
+    }
+}
+
+/// What a child's recorded status means to a watcher.
+///
+/// `Ready` is a child that finished its assignment and stays addressable, and
+/// `WaitingForApproval` one blocked on the parent: both are alive and waiting on
+/// the parent, which is what `notify_on=attention` reports. `Starting` and
+/// `Running` are working, and `Stopped` and `Failed` are gone.
+fn subject_life(status: SubagentStatus) -> SubjectLife {
+    match status {
+        SubagentStatus::Starting | SubagentStatus::Running => SubjectLife::Live,
+        SubagentStatus::Ready | SubagentStatus::WaitingForApproval => SubjectLife::Parked,
+        SubagentStatus::Stopped | SubagentStatus::Failed => SubjectLife::Exited,
+    }
 }
 
 async fn record_subagent_activity(
