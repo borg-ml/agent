@@ -2660,7 +2660,7 @@ mod tests {
         }
         for label in [
             "Run",
-            "Thinking",
+            "Reasoning",
             "Search",
             "Search web",
             "Edit",
@@ -2669,7 +2669,7 @@ mod tests {
         ] {
             assert!(!tool_action_is_instant(label, None), "{label}");
         }
-        assert!(!tool_action_is_instant("Thinking", Some("reasoning")));
+        assert!(!tool_action_is_instant("Reasoning", Some("reasoning")));
     }
 
     #[test]
