@@ -140,6 +140,9 @@ create table if not exists agent_instances (
     -- sessions in different checkouts are otherwise indistinguishable.
     cwd            text,
     pid            bigint,
+    -- The owning host's lifecycle state as last reported by a directory sync
+    -- (running, ready, starting, stopped). Null when no sync has covered it.
+    status         text,
     -- Tombstone set by reaping when the local owner is gone; null means the
     -- row is still advertised by discovery.
     exited_at      text

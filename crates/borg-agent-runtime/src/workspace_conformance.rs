@@ -1103,6 +1103,210 @@ async fn instance_discovery_tombstones_and_revives_identically() {
 /// Postgres is the only backend, so an unset or broken `BORG_TEST_SESSIONS_URL`
 /// leaves `harnesses()` empty and every test above passes without asserting
 /// anything. This is the guard that makes that vacuum visible instead of green.
+/// A directory sync is how this installation learns about peers on other
+/// machines, and it is the only source of their working directory and their
+/// lifecycle state. Without those, a peer on another host carries no identity
+/// and no liveness, and nothing here can retire it: the reap sweep observes
+/// local rows only, so a stopped peer stays in the default listing for ever and
+/// buries the instances that are actually running.
+#[tokio::test]
+async fn a_directory_sync_identifies_instances_and_retires_stopped_ones() {
+    for harness in harnesses().await {
+        let store = harness.store.as_ref();
+        let name = harness.name;
+        let participant_id = Uuid::new_v4();
+        let remote_host = Uuid::new_v4();
+        store
+            .create_participant(participant(participant_id, "remote peer"))
+            .await
+            .expect("participant");
+
+        let sync = move |status: &'static str, cwd: &'static str| async move {
+            store
+                .upsert_directory_instance(
+                    participant(participant_id, "remote peer"),
+                    Some(remote_host),
+                    None,
+                    Some(cwd),
+                    Some(status),
+                )
+                .await
+        };
+
+        sync("running", "/home/remote/checkout")
+            .await
+            .unwrap_or_else(|error| panic!("[{name}] directory sync: {error:#}"));
+
+        let listed = store
+            .list_instances(false)
+            .await
+            .unwrap_or_else(|error| panic!("[{name}] list: {error:#}"));
+        let found = listed
+            .iter()
+            .find(|instance| instance.participant.id == participant_id)
+            .unwrap_or_else(|| panic!("[{name}] a running directory peer is discoverable"));
+        assert_eq!(
+            found.cwd.as_deref(),
+            Some("/home/remote/checkout"),
+            "[{name}] the owning host working directory identifies the peer"
+        );
+        assert_eq!(
+            found.status.as_deref(),
+            Some("running"),
+            "[{name}] the owning host lifecycle state is carried through"
+        );
+
+        // Stopped is the state that retires a peer: nothing on this
+        // installation can reach it, and no local sweep will ever see it.
+        sync("stopped", "/home/remote/checkout")
+            .await
+            .unwrap_or_else(|error| panic!("[{name}] stopped sync: {error:#}"));
+        let advertised = store
+            .list_instances(false)
+            .await
+            .unwrap_or_else(|error| panic!("[{name}] list: {error:#}"));
+        assert!(
+            !advertised
+                .iter()
+                .any(|instance| instance.participant.id == participant_id),
+            "[{name}] a stopped peer leaves the default listing"
+        );
+        let history = store
+            .list_instances(true)
+            .await
+            .unwrap_or_else(|error| panic!("[{name}] list incl. exited: {error:#}"));
+        assert!(
+            history
+                .iter()
+                .any(|instance| instance.participant.id == participant_id
+                    && instance.status.as_deref() == Some("stopped")),
+            "[{name}] the stopped peer is still readable as history"
+        );
+
+        // The shape that started this: one running peer on another host, buried
+        // under a long history of stopped ones. Dead rows must not occupy the
+        // default view in numbers that swamp it.
+        for index in 0..40 {
+            store
+                .upsert_directory_instance(
+                    participant(Uuid::new_v4(), &format!("stopped peer {index}")),
+                    Some(remote_host),
+                    None,
+                    Some("/home/remote/checkout"),
+                    Some("stopped"),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("[{name}] stopped peer: {error:#}"));
+        }
+
+        // A peer that starts again is advertised again.
+        sync("ready", "/home/remote/checkout")
+            .await
+            .unwrap_or_else(|error| panic!("[{name}] revive sync: {error:#}"));
+        let revived = store
+            .list_instances(false)
+            .await
+            .unwrap_or_else(|error| panic!("[{name}] list: {error:#}"));
+        assert!(
+            revived
+                .iter()
+                .any(|instance| instance.participant.id == participant_id),
+            "[{name}] a peer that is ready again is discoverable again"
+        );
+        assert_eq!(
+            revived
+                .iter()
+                .filter(|instance| instance.status.as_deref() == Some("stopped"))
+                .count(),
+            0,
+            "[{name}] forty stopped peers must not swamp the one that is running"
+        );
+        assert_eq!(
+            revived
+                .iter()
+                .filter(|instance| instance.host_id == Some(remote_host))
+                .count(),
+            1,
+            "[{name}] exactly the running peer on that host is advertised"
+        );
+        let history = store
+            .list_instances(true)
+            .await
+            .unwrap_or_else(|error| panic!("[{name}] list incl. exited: {error:#}"));
+        assert_eq!(
+            history
+                .iter()
+                .filter(|instance| instance.host_id == Some(remote_host))
+                .count(),
+            41,
+            "[{name}] the stopped peers remain readable as history"
+        );
+    }
+}
+
+/// A directory entry is a thin mirror of another host registry, and it usually
+/// omits the workspace. Letting that empty field overwrite what local
+/// registration knows is how a peer loses the one identity that makes it
+/// recognisable in a listing.
+#[tokio::test]
+async fn a_directory_entry_never_erases_a_locally_known_identity() {
+    for harness in harnesses().await {
+        let store = harness.store.as_ref();
+        let name = harness.name;
+        let participant_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        store
+            .create_participant(participant(participant_id, "local peer"))
+            .await
+            .expect("participant");
+        store
+            .register_local_instance(
+                participant_id,
+                Some(workspace_id),
+                std::path::Path::new("/home/local/checkout"),
+                4242,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("[{name}] register: {error:#}"));
+
+        store
+            .upsert_directory_instance(
+                participant(participant_id, "local peer"),
+                Some(Uuid::new_v4()),
+                None,
+                None,
+                Some("running"),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("[{name}] directory sync: {error:#}"));
+
+        let listed = store
+            .list_instances(false)
+            .await
+            .unwrap_or_else(|error| panic!("[{name}] list: {error:#}"));
+        let found = listed
+            .iter()
+            .find(|instance| instance.participant.id == participant_id)
+            .unwrap_or_else(|| panic!("[{name}] the instance is still discoverable"));
+        assert_eq!(
+            found.workspace_id,
+            Some(workspace_id),
+            "[{name}] an omitted workspace in the mirror does not erase the local one"
+        );
+        assert_eq!(
+            found.cwd.as_deref(),
+            Some("/home/local/checkout"),
+            "[{name}] the locally recorded launch directory survives the mirror"
+        );
+        assert_eq!(found.pid, Some(4242), "[{name}]");
+        assert_eq!(
+            found.status.as_deref(),
+            Some("running"),
+            "[{name}] the mirror still supplies the lifecycle state it is the only source of"
+        );
+    }
+}
+
 #[tokio::test]
 async fn postgres_coverage_follows_its_configuration() {
     let configured = test_url().is_some();

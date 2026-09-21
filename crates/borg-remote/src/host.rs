@@ -293,6 +293,17 @@ struct RelayInstanceParticipant {
     created_at: DateTime<Utc>,
     host_id: Option<Uuid>,
     workspace_id: Option<Uuid>,
+    /// Where the owning host says this instance runs. It is the only identity a
+    /// peer on another machine offers, since that host's pid means nothing
+    /// here, and several sessions in one workspace are otherwise
+    /// indistinguishable.
+    #[serde(default)]
+    cwd: Option<String>,
+    /// The owning host's lifecycle state: `running`, `ready`, `starting`, or
+    /// `stopped`. `stopped` is what retires a dead peer from the default
+    /// listing.
+    #[serde(default)]
+    status: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -5649,7 +5660,7 @@ async fn sync_instance_directory(
     let count = directory.participants.len();
     for remote in directory.participants {
         store
-            .upsert_instance(
+            .upsert_directory_instance(
                 Participant {
                     id: remote.id,
                     display_name: remote.display_name,
@@ -5658,6 +5669,8 @@ async fn sync_instance_directory(
                 },
                 remote.host_id,
                 remote.workspace_id,
+                remote.cwd.as_deref(),
+                remote.status.as_deref(),
             )
             .await?;
     }
@@ -7306,7 +7319,9 @@ mod tests {
                     "display_name": "Healthy peer",
                     "created_at": created_at,
                     "host_id": remote_host_id,
-                    "workspace_id": null
+                    "workspace_id": null,
+                    "cwd": "/home/remote/checkout",
+                    "status": "running"
                 }
             ]
         })
@@ -7455,15 +7470,17 @@ mod tests {
             .unwrap();
         assert_eq!(stale_deliveries.len(), 1);
         assert_eq!(stale_deliveries[0].state, crate::DeliveryState::Failed);
-        assert!(
-            workspace
-                .list_instances(false)
-                .await
-                .unwrap()
-                .iter()
-                .any(|instance| instance.participant.id == healthy_recipient
-                    && instance.host_id == Some(remote_host_id))
-        );
+        let listed = workspace.list_instances(false).await.unwrap();
+        let healthy = listed
+            .iter()
+            .find(|instance| instance.participant.id == healthy_recipient)
+            .expect("the directory peer is discoverable");
+        assert_eq!(healthy.host_id, Some(remote_host_id));
+        // The two fields the relay has always sent and this client used to
+        // discard: without them a peer on another host cannot be told apart
+        // from the dozens of stopped ones, and cannot be identified at all.
+        assert_eq!(healthy.cwd.as_deref(), Some("/home/remote/checkout"));
+        assert_eq!(healthy.status.as_deref(), Some("running"));
         let healthy_deliveries = workspace
             .deliveries_after(
                 direct_workspaces[&healthy_recipient],
