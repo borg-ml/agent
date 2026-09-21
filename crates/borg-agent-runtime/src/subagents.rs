@@ -6468,21 +6468,6 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
             }),
         ),
         tool(
-            "list_watches",
-            "Compatibility alias for list_watchers. List this session's background watchers.",
-            json!({
-                "type": "object", "properties": {}, "additionalProperties": false
-            }),
-        ),
-        tool(
-            "stop_watch",
-            "Compatibility alias for stop_watcher. Stop a background watcher and its process tree.",
-            json!({
-                "type": "object", "properties": {"watch_id": {"type": "string", "format": "uuid"}},
-                "required": ["watch_id"], "additionalProperties": false
-            }),
-        ),
-        tool(
             "list_workflows",
             "List active trusted extension workflows across embedded Blu/Lua/Luau, Python, IPython, JavaScript, and TypeScript runtimes. Sources are never exposed; use extension_id and name with run_workflow.",
             json!({
