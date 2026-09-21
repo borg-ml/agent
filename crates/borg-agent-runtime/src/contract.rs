@@ -298,6 +298,20 @@ impl CodingProvider {
             Self::Kimi | Self::Glm | Self::Qwen | Self::OpenRouter | Self::OpenAiCompatible
         )
     }
+
+    /// Whether a turn already running on this route can take a mid-turn steer.
+    ///
+    /// The route decides, not the provider name: an `opencode-go` model runs on
+    /// Borg own harness, so it steers, while every other OpenCode model stays on
+    /// the CLI compatibility route and cannot. The runtime still owns the final
+    /// answer -- it resolves the durable route for the session -- so this is the
+    /// caller-side reading of the same rule, used before the session is asked.
+    pub fn supports_active_turn_steer(self, model: Option<&str>) -> bool {
+        matches!(self, Self::Codex | Self::Claude)
+            || self.uses_native_harness()
+            || (self == Self::OpenCode
+                && model.is_some_and(borg_provider::provider::opencode_model::is_go_model))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]

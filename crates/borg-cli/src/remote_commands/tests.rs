@@ -682,11 +682,11 @@ fn director_command_extracts_text_without_matching_longer_commands() {
     assert!(director_prompt_command("/director").is_some_and(|result| result.is_err()));
     assert!(director_prompt_command("/directorate review").is_none());
     assert_eq!(
-        director_prompt_delivery(true, CodingProvider::Codex, true),
+        director_prompt_delivery(true, CodingProvider::Codex, true, None),
         PromptDelivery::Steer
     );
     assert_eq!(
-        director_prompt_delivery(false, CodingProvider::Codex, true),
+        director_prompt_delivery(false, CodingProvider::Codex, true, None),
         PromptDelivery::Steer
     );
     let session_id = Uuid::new_v4();
@@ -785,7 +785,7 @@ fn consultation_aliases_route_through_the_primary_model() {
         "/ask claude review this"
     );
     assert_eq!(
-        running_input("/gpt compare this", CodingProvider::Claude, true).1,
+        running_input("/gpt compare this", CodingProvider::Claude, true, None).1,
         "/ask gpt compare this"
     );
 }
@@ -2131,55 +2131,91 @@ fn provider_mcp_elicitation_accepts_structured_content_and_cancellation() {
 #[test]
 fn active_message_delivery_respects_provider_capability_and_explicit_override() {
     assert_eq!(
-        running_input("plain", CodingProvider::Codex, true).0,
+        running_input("plain", CodingProvider::Codex, true, None).0,
         PromptDelivery::Steer
     );
     assert_eq!(
-        running_input("plain", CodingProvider::Codex, false).0,
+        running_input("plain", CodingProvider::Codex, false, None).0,
         PromptDelivery::Queue
     );
     assert_eq!(
-        running_input("/queue later", CodingProvider::Codex, true).0,
+        running_input("/queue later", CodingProvider::Codex, true, None).0,
         PromptDelivery::Queue
     );
     assert_eq!(
-        running_input("/steer now", CodingProvider::Codex, false).0,
+        running_input("/steer now", CodingProvider::Codex, false, None).0,
         PromptDelivery::Steer
     );
     assert_eq!(
-        running_input("plain", CodingProvider::OpenRouter, true).0,
+        running_input("plain", CodingProvider::OpenRouter, true, None).0,
         PromptDelivery::Steer
     );
     assert_eq!(
-        running_input("/steer now", CodingProvider::OpenAiCompatible, false).0,
+        running_input("/steer now", CodingProvider::OpenAiCompatible, false, None).0,
         PromptDelivery::Steer
     );
     assert_eq!(
-        running_input("plain", CodingProvider::Claude, true).0,
+        running_input("plain", CodingProvider::Claude, true, None).0,
         PromptDelivery::Steer
     );
     assert_eq!(
-        running_input("/steer now", CodingProvider::Claude, false).0,
+        running_input("/steer now", CodingProvider::Claude, false, None).0,
         PromptDelivery::Steer
+    );
+    // An `opencode-go` model runs on Borg own harness, so its active turn takes
+    // a steer; every other OpenCode model stays on the CLI route, which cannot.
+    assert_eq!(
+        running_input(
+            "plain",
+            CodingProvider::OpenCode,
+            true,
+            Some("opencode-go/deepseek-v4.1-flash")
+        )
+        .0,
+        PromptDelivery::Steer
+    );
+    assert_eq!(
+        running_input(
+            "/steer now",
+            CodingProvider::OpenCode,
+            false,
+            Some("opencode-go/glm-5.3")
+        )
+        .0,
+        PromptDelivery::Steer
+    );
+    assert_eq!(
+        running_input(
+            "plain",
+            CodingProvider::OpenCode,
+            true,
+            Some("opencode/gpt-5-nano")
+        )
+        .0,
+        PromptDelivery::Queue
+    );
+    assert_eq!(
+        running_input("plain", CodingProvider::OpenCode, true, None).0,
+        PromptDelivery::Queue
     );
 }
 
 #[test]
 fn compaction_does_not_change_active_input_delivery() {
     assert_eq!(
-        running_input("usage details", CodingProvider::Codex, true).0,
+        running_input("usage details", CodingProvider::Codex, true, None).0,
         PromptDelivery::Steer
     );
     assert_eq!(
-        running_input("usage details", CodingProvider::Claude, true).0,
+        running_input("usage details", CodingProvider::Claude, true, None).0,
         PromptDelivery::Steer
     );
     assert_eq!(
-        running_input("/steer now", CodingProvider::Codex, false).0,
+        running_input("/steer now", CodingProvider::Codex, false, None).0,
         PromptDelivery::Steer
     );
     assert_eq!(
-        running_input("/queue later", CodingProvider::Codex, true).0,
+        running_input("/queue later", CodingProvider::Codex, true, None).0,
         PromptDelivery::Queue
     );
 }

@@ -4609,6 +4609,7 @@ async fn run_local_agent_session(
                                 active,
                                 provider,
                                 steer_active_turn,
+                                current_model.as_deref(),
                             );
                             let message_id = Uuid::new_v4();
                             if session_command_tx
@@ -4643,6 +4644,7 @@ async fn run_local_agent_session(
                                     line,
                                     provider,
                                     steer_active_turn,
+                                    current_model.as_deref(),
                                 )
                                 .0
                             } else {
@@ -4717,6 +4719,7 @@ async fn run_local_agent_session(
                                 line,
                                 provider,
                                 steer_active_turn,
+                                current_model.as_deref(),
                             )
                         } else {
                             idle_input(line)
@@ -5835,6 +5838,7 @@ async fn run_local_agent_session(
                                         active,
                                         provider,
                                         steer_active_turn,
+                                        current_model.as_deref(),
                                     );
                                     let message_id = Uuid::new_v4();
                                     if active {
@@ -6992,8 +6996,11 @@ async fn run_local_agent_session(
                                             .as_ref()
                                             .and_then(BorgTerminal::session_provider)
                                             .unwrap_or(provider);
-                                        let delivery =
-                                            default_active_delivery(active_provider, steer_active_turn);
+                                        let delivery = default_active_delivery(
+                                            active_provider,
+                                            steer_active_turn,
+                                            current_model.as_deref(),
+                                        );
                                         terminal
                                             .as_mut()
                                             .expect("terminal")
@@ -7062,6 +7069,7 @@ async fn run_local_agent_session(
                                             &text,
                                             active_provider,
                                             steer_active_turn,
+                                            current_model.as_deref(),
                                         )
                                     } else {
                                         idle_input(&text)
@@ -9071,6 +9079,7 @@ fn running_input(
     line: &str,
     provider: CodingProvider,
     steer_active_turn: bool,
+    model: Option<&str>,
 ) -> (PromptDelivery, String) {
     let line = normalize_consultation_command(line);
     if let Some(text) = line.strip_prefix("/queue ") {
@@ -9078,9 +9087,7 @@ fn running_input(
     }
     if let Some(text) = line.strip_prefix("/steer ") {
         return (
-            if matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
-                || provider.uses_native_harness()
-            {
+            if provider.supports_active_turn_steer(model) {
                 PromptDelivery::Steer
             } else {
                 PromptDelivery::Queue
@@ -9089,7 +9096,7 @@ fn running_input(
         );
     }
     (
-        default_active_delivery(provider, steer_active_turn),
+        default_active_delivery(provider, steer_active_turn, model),
         line.to_string(),
     )
 }
@@ -9269,9 +9276,10 @@ fn director_prompt_delivery(
     active: bool,
     provider: CodingProvider,
     steer_active_turn: bool,
+    model: Option<&str>,
 ) -> PromptDelivery {
     if active {
-        default_active_delivery(provider, steer_active_turn)
+        default_active_delivery(provider, steer_active_turn, model)
     } else {
         PromptDelivery::Steer
     }
@@ -9294,11 +9302,12 @@ fn director_prompt_host_command(
     }
 }
 
-fn default_active_delivery(provider: CodingProvider, steer_active_turn: bool) -> PromptDelivery {
-    if steer_active_turn
-        && (matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
-            || provider.uses_native_harness())
-    {
+fn default_active_delivery(
+    provider: CodingProvider,
+    steer_active_turn: bool,
+    model: Option<&str>,
+) -> PromptDelivery {
+    if steer_active_turn && provider.supports_active_turn_steer(model) {
         PromptDelivery::Steer
     } else {
         PromptDelivery::Queue
