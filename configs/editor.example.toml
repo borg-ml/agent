@@ -23,6 +23,7 @@ ui_language = "auto"
 refresh_rate_fps = 60
 diff_expansion = "expanded" # expanded | collapsed | until_next_action
 auto_expand_tools = false
+auto_expand_thinking = false
 tool_click_behavior = "fullscreen" # expandable timeline details: fullscreen | inline
 # Show the short "Generating edit…" descriptor while a tool call is assembled.
 action_descriptors = true

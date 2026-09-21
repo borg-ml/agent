@@ -73,6 +73,7 @@ assistant_label_color = "#ff8e24"
 
 [api.editor.presentation]
 auto_expand_tools = false
+auto_expand_thinking = false
 
 [api.editor.layout]
 horizontal_margin = 2

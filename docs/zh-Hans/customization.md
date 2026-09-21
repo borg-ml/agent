@@ -19,7 +19,7 @@ refresh_rate_fps = 60
 界面语言是本机偏好，不写入会话事件；模型回复语言由 `/language` 单独设置。
 
 其他常用设置包括 `/followups`、`/sleep`、`/notifications`、`/sound`、
-`/refresh`、`/expand-edits`、`/expand-tools`、`/icons`、`/colors` 和
+`/refresh`、`/expand-edits`、`/expand-tools`、`/expand-thinking`、`/icons`、`/colors` 和
 `/user-label`。详细字段和扩展权限规则请以
 [英文自定义文档](../customization.md)为准。
 

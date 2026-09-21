@@ -11502,6 +11502,59 @@ fn expanding_an_action_preserves_the_current_line_anchor() {
 }
 
 #[test]
+fn thinking_stays_collapsed_while_streaming_unless_auto_expand_is_enabled() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ReasoningDelta {
+            text: "Checking".to_string(),
+        },
+    ));
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Tool {
+            complete: false,
+            expanded: false,
+            ..
+        }
+    ));
+
+    transcript.set_auto_expand_thinking(true);
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Tool { expanded: true, .. }
+    ));
+    transcript.set_auto_expand_thinking(false);
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Tool {
+            expanded: false,
+            ..
+        }
+    ));
+
+    let mut opted_in = Transcript::default();
+    opted_in.set_auto_expand_thinking(true);
+    opted_in.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ReasoningDelta {
+            text: "Checking".to_string(),
+        },
+    ));
+    assert!(matches!(
+        &opted_in.order[0],
+        TranscriptEntry::Tool {
+            complete: false,
+            expanded: true,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
@@ -11527,7 +11580,7 @@ fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
             name,
             code_view: Some((language, source)),
             complete: false,
-            expanded: true,
+            expanded: false,
             ..
         } if name == "Thinking"
             && language == "reasoning"
@@ -11589,7 +11642,7 @@ fn reasoning_lifecycle_events_show_thinking_without_a_text_delta() {
             name,
             code_view: Some((language, source)),
             complete: false,
-            expanded: true,
+            expanded: false,
             ..
         } if name == "Thinking" && language == "reasoning" && source.is_empty()
     ));

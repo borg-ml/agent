@@ -153,6 +153,7 @@ struct Transcript {
     selected: Option<usize>,
     diff_expansion: DiffExpansionPolicy,
     auto_expand_tools: bool,
+    auto_expand_thinking: bool,
     action_descriptors: bool,
     show_subagent_messages: bool,
     tool_click_behavior: ToolClickBehavior,
@@ -263,6 +264,7 @@ impl Default for Transcript {
             selected: None,
             diff_expansion: DiffExpansionPolicy::Expanded,
             auto_expand_tools: false,
+            auto_expand_thinking: false,
             action_descriptors: true,
             show_subagent_messages: false,
             tool_click_behavior: ToolClickBehavior::Fullscreen,
@@ -2604,7 +2606,7 @@ impl Transcript {
             error: false,
             user_interrupted: false,
             backgrounded: false,
-            expanded: true,
+            expanded: self.auto_expand_thinking,
         });
         self.active_reasoning = Some(index);
     }
@@ -3219,6 +3221,15 @@ impl Transcript {
             {
                 *expanded = enabled;
             }
+        }
+    }
+
+    fn set_auto_expand_thinking(&mut self, enabled: bool) {
+        self.auto_expand_thinking = enabled;
+        if let Some(index) = self.active_reasoning
+            && let Some(TranscriptEntry::Tool { expanded, .. }) = self.order.get_mut(index)
+        {
+            *expanded = enabled;
         }
     }
 

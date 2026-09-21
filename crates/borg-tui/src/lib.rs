@@ -575,6 +575,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/sleep", "keep the machine awake, even with the lid down"),
     ("/expand-edits", "auto-expand edit diffs"),
     ("/expand-tools", "auto-expand other tool details"),
+    ("/expand-thinking", "auto-expand thinking while it streams"),
     ("/tool-click", "choose full-screen or inline action opening"),
     (
         "/action-descriptors",
@@ -899,6 +900,7 @@ pub enum UiAction {
     SetSteerActive(bool),
     SetDiffExpansion(DiffExpansionPolicy),
     SetAutoExpandTools(bool),
+    SetAutoExpandThinking(bool),
     SetToolClickBehavior(ToolClickBehavior),
     SetActionDescriptors(bool),
     SetRunningSweeps(bool),
@@ -1805,6 +1807,7 @@ enum PickerKind {
     ActiveMessages,
     AutoExpandEdits,
     AutoExpandTools,
+    AutoExpandThinking,
     ToolClickBehavior,
     ActionDescriptors,
     RunningSweeps,
@@ -4609,6 +4612,7 @@ impl BorgTerminal {
             "/sleep",
             "/expand-edits",
             "/expand-tools",
+            "/expand-thinking",
             "/tool-click",
             "/action-descriptors",
             "/animations",
@@ -4934,6 +4938,19 @@ impl BorgTerminal {
         ));
     }
 
+    pub fn open_auto_expand_thinking_picker(&mut self) {
+        self.picker = Some(Picker::new(
+            PickerKind::AutoExpandThinking,
+            "Auto-expand thinking while it streams",
+            ["On", "Off"],
+            Some(if self.transcript.auto_expand_thinking {
+                "On"
+            } else {
+                "Off"
+            }),
+        ));
+    }
+
     pub fn open_tool_click_behavior_picker(&mut self) {
         self.picker = Some(Picker::new(
             PickerKind::ToolClickBehavior,
@@ -5125,6 +5142,14 @@ impl BorgTerminal {
             self.capture_transcript_anchor_for_collapse();
         }
         self.transcript.set_auto_expand_tools(enabled);
+        self.invalidate_transcript_render_cache();
+    }
+
+    pub fn set_auto_expand_thinking(&mut self, enabled: bool) {
+        if !enabled {
+            self.capture_transcript_anchor_for_collapse();
+        }
+        self.transcript.set_auto_expand_thinking(enabled);
         self.invalidate_transcript_render_cache();
     }
 
@@ -6746,6 +6771,9 @@ impl BorgTerminal {
             }
             PickerKind::AutoExpandTools => {
                 UiAction::SetAutoExpandTools(picker.selected_value() == "On")
+            }
+            PickerKind::AutoExpandThinking => {
+                UiAction::SetAutoExpandThinking(picker.selected_value() == "On")
             }
             PickerKind::ToolClickBehavior => {
                 UiAction::SetToolClickBehavior(if picker.selected_value() == "Inline" {
@@ -10005,6 +10033,7 @@ fn fresh_transcript_like(previous: &Transcript) -> Transcript {
     Transcript {
         diff_expansion: previous.diff_expansion,
         auto_expand_tools: previous.auto_expand_tools,
+        auto_expand_thinking: previous.auto_expand_thinking,
         tool_click_behavior: previous.tool_click_behavior,
         show_subagent_messages: previous.show_subagent_messages,
         follow_tail: previous.follow_tail,

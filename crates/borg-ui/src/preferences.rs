@@ -158,6 +158,7 @@ pub struct PresentationPreferences {
     /// Legacy compatibility for editor.toml files written before diff_expansion.
     pub auto_expand_edits: bool,
     pub auto_expand_tools: bool,
+    pub auto_expand_thinking: bool,
     pub tool_click_behavior: ToolClickBehavior,
     pub action_descriptors: bool,
     pub running_sweeps: bool,
@@ -178,6 +179,7 @@ impl Default for PresentationPreferences {
             diff_expansion: None,
             auto_expand_edits: true,
             auto_expand_tools: false,
+            auto_expand_thinking: false,
             tool_click_behavior: ToolClickBehavior::Fullscreen,
             action_descriptors: true,
             running_sweeps: true,
@@ -541,6 +543,7 @@ keep = true
                 diff_expansion: Some(DiffExpansionPolicy::UntilNextAction),
                 auto_expand_edits: false,
                 auto_expand_tools: true,
+                auto_expand_thinking: false,
                 tool_click_behavior: ToolClickBehavior::Inline,
                 action_descriptors: false,
                 running_sweeps: false,

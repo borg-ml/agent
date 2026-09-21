@@ -2648,6 +2648,7 @@ async fn run_local_agent_session(
         );
         terminal.set_diff_expansion(editor_preferences.presentation.effective_diff_expansion());
         terminal.set_auto_expand_tools(editor_preferences.presentation.auto_expand_tools);
+        terminal.set_auto_expand_thinking(editor_preferences.presentation.auto_expand_thinking);
         terminal.set_tool_click_behavior(editor_preferences.presentation.tool_click_behavior);
         terminal.set_action_descriptors(editor_preferences.presentation.action_descriptors);
         terminal.set_running_sweeps(editor_preferences.presentation.running_sweeps);
@@ -3732,6 +3733,9 @@ async fn run_local_agent_session(
                                 );
                                 terminal.set_auto_expand_tools(
                                     editor_preferences.presentation.auto_expand_tools,
+                                );
+                                terminal.set_auto_expand_thinking(
+                                    editor_preferences.presentation.auto_expand_thinking,
                                 );
                                 terminal.set_tool_click_behavior(
                                     editor_preferences.presentation.tool_click_behavior,
@@ -5367,6 +5371,19 @@ async fn run_local_agent_session(
                             diff_expansion_label(policy)
                         ));
                     }
+                    UiAction::SetAutoExpandThinking(enabled) => {
+                        editor_preferences.presentation.auto_expand_thinking = enabled;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_auto_expand_thinking(enabled);
+                        terminal.set_notice(format!(
+                            "Auto-expand thinking while it streams: {}",
+                            if enabled { "on" } else { "off" }
+                        ));
+                    }
                     UiAction::SetAutoExpandTools(enabled) => {
                         editor_preferences.presentation.auto_expand_tools = enabled;
                         dispatch_editor_preferences_save(
@@ -6026,6 +6043,11 @@ async fn run_local_agent_session(
                                 .as_mut()
                                 .expect("terminal")
                                 .open_auto_expand_edits_picker();
+                        } else if line == "/expand-thinking" && attachments.is_empty() {
+                            terminal
+                                .as_mut()
+                                .expect("terminal")
+                                .open_auto_expand_thinking_picker();
                         } else if line == "/expand-tools" && attachments.is_empty() {
                             terminal
                                 .as_mut()
@@ -6448,6 +6470,26 @@ async fn run_local_agent_session(
                             } else {
                                 terminal.as_mut().expect("terminal").set_notice(
                                     "Choose /expand-edits expanded, collapsed, or until-next-action",
+                                );
+                            }
+                        } else if let Some(value) = line.strip_prefix("/expand-thinking ")
+                            && attachments.is_empty()
+                        {
+                            if let Some(enabled) = parse_on_off(value) {
+                                editor_preferences.presentation.auto_expand_thinking = enabled;
+                                dispatch_editor_preferences_save(
+                                    &editor_preferences_tx,
+                                    &editor_preferences,
+                                );
+                                let terminal = terminal.as_mut().expect("terminal");
+                                terminal.set_auto_expand_thinking(enabled);
+                                terminal.set_notice(format!(
+                                    "Auto-expand thinking while it streams: {}",
+                                    if enabled { "on" } else { "off" }
+                                ));
+                            } else {
+                                terminal.as_mut().expect("terminal").set_notice(
+                                    "Choose /expand-thinking on or /expand-thinking off",
                                 );
                             }
                         } else if let Some(value) = line.strip_prefix("/expand-tools ")
@@ -9847,10 +9889,11 @@ fn live_customization_summary(
             }
         ),
         format!(
-            "rendering: {} FPS · edits {} · tools {} · tool clicks {} · action descriptors {} · sweeps {}",
+            "rendering: {} FPS · edits {} · tools {} · thinking {} · tool clicks {} · action descriptors {} · sweeps {}",
             editor.presentation.refresh_rate_fps,
             diff_expansion_label(editor.presentation.effective_diff_expansion()),
             editor.presentation.auto_expand_tools,
+            editor.presentation.auto_expand_thinking,
             tool_click_behavior_label(editor.presentation.tool_click_behavior),
             editor.presentation.action_descriptors,
             editor.presentation.running_sweeps
