@@ -609,6 +609,7 @@ impl OpenAiCompatibleProvider {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or("none")
                 .to_string();
+            let shape = request_shape(&body);
             let raw_text = read_provider_error_response_text(response)
                 .await
                 .unwrap_or_else(|error| error.to_string());
@@ -620,10 +621,13 @@ impl OpenAiCompatibleProvider {
                 truncate_provider_text(&raw_text, 500)
             };
             trace.exit_status = Some(1);
-            trace.stderr = raw_text.clone();
+            trace.stderr = format!(
+                "{raw_text}
+request: {shape}"
+            );
             return Err(ProviderCallError {
                 message: format!(
-                    "{provider_label} request failed with HTTP {}: {}",
+                    "{provider_label} request failed with HTTP {}: {} [request: {shape}]",
                     status.as_u16(),
                     body
                 ),
@@ -1681,6 +1685,72 @@ fn compatible_retryable_status(status: reqwest::StatusCode) -> bool {
 /// that is a permission refusal, which is never retried, so a blip that a
 /// resend would clear instead ends the turn. The declared error type decides
 /// when the two disagree, and every other refusal keeps the old answer.
+/// The shape of the request a refusal answered.
+///
+/// Bounded on purpose: the roles in order (capped), the serialized size, how many
+/// messages carry images, how many tool calls were sent and how many of them
+/// nothing answers. A provider can refuse a request with no body at all, and then
+/// this is the only evidence of what we sent - without it the refusal is
+/// unattributable and the next reader is left guessing.
+fn request_shape(body: &Value) -> String {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return "messages=<none>".to_string();
+    };
+    let mut roles = String::new();
+    let mut images = 0_usize;
+    let mut calls = 0_usize;
+    let mut sent: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut answered: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for message in messages {
+        roles.push_str(match message.get("role").and_then(Value::as_str) {
+            Some("system") => "s",
+            Some("user") => "u",
+            Some("assistant") => "a",
+            Some("tool") => "t",
+            _ => "?",
+        });
+        if message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    part.get("type").and_then(Value::as_str) == Some("image")
+                        || part.get("image_url").is_some()
+                })
+            })
+        {
+            images += 1;
+        }
+        for call in message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            calls += 1;
+            if let Some(id) = call.get("id").and_then(Value::as_str) {
+                sent.insert(id);
+            }
+        }
+        if let Some(id) = message.get("tool_call_id").and_then(Value::as_str) {
+            answered.insert(id);
+        }
+    }
+    let shown: String = roles.chars().take(32).collect();
+    let elided = roles.chars().count().saturating_sub(32);
+    format!(
+        "messages={}, roles={shown}{}, bytes={}, images={images}, tool_calls={calls}, unanswered_calls={}",
+        messages.len(),
+        if elided > 0 {
+            format!("+{elided}")
+        } else {
+            String::new()
+        },
+        body.to_string().len(),
+        sent.difference(&answered).count(),
+    )
+}
+
 fn compatible_provider_error_kind(body: &str, status: u16) -> ProviderErrorKind {
     // A body too large for the endpoint is a deterministic refusal: a resend is
     // byte-identical, so retrying it can only repeat the same answer. Shrinking the
