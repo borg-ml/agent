@@ -5449,3 +5449,66 @@ fn a_message_without_images_serializes_without_an_attachments_field() {
         "an empty attachment list must not be written: {encoded}"
     );
 }
+
+/// Failure mode: a child surface drifting from the director surface. Three
+/// ways it did: a child kept the parent yield and the consultation tools it
+/// must not hold, a child silently lost a tool the director has (the
+/// advertised surface was built with search off), and a tool present in both
+/// carried a different schema for a child (spawn_agent advertised four
+/// providers while the runtime admitted eleven, fixed in 5a38ea2).
+#[test]
+fn a_child_surface_is_the_director_surface_minus_the_documented_exceptions() {
+    // The three documented exceptions, by tool name.
+    let exceptions = [
+        "consult_model",
+        "consult_peer",
+        "rotate_peer",
+        "computer_use",
+        "update_agent_settings",
+        "watch",
+        "list_watchers",
+        "await_watchers",
+        "stop_watcher",
+    ];
+    for provider in [
+        CodingProvider::Codex,
+        CodingProvider::Claude,
+        CodingProvider::OpenRouter,
+        CodingProvider::OpenAiCompatible,
+    ] {
+        let director = agent_tool_specs_for_surface(provider, ToolSurface::director(), None);
+        let child =
+            agent_tool_specs_for_surface(provider, ToolSurface::director().for_child(), None);
+        let names = |specs: &[Value]| {
+            specs
+                .iter()
+                .filter_map(|spec| spec["name"].as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        };
+        let director_names = names(&director);
+        let expected = director_names
+            .iter()
+            .filter(|name| !exceptions.contains(&name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names(&child),
+            expected,
+            "{provider:?} child surface is not the director surface minus the documented exceptions"
+        );
+        for name in names(&child) {
+            let in_director = director
+                .iter()
+                .find(|spec| spec["name"] == name.as_str())
+                .expect("director surface has the tool");
+            let in_child = child
+                .iter()
+                .find(|spec| spec["name"] == name.as_str())
+                .expect("child surface has the tool");
+            assert_eq!(
+                in_director, in_child,
+                "{provider:?} advertises {name} with a different schema for a child"
+            );
+        }
+    }
+}

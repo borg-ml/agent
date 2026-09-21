@@ -124,9 +124,9 @@ pub use session_store::{
 pub use subagents::{
     AgentToolDispatcher, AgentToolServer, DEFAULT_MAX_SUBAGENTS, SpawnSubagent, SubagentActivity,
     SubagentActivityKind, SubagentCoordinator, SubagentSnapshot, SubagentStatus, SubagentUsage,
-    agent_tool_specs, agent_tool_specs_with_capabilities,
-    agent_tool_specs_with_capabilities_and_consultation, agent_tool_specs_with_subagents,
-    agent_tool_specs_with_team_policy, subagent_tool_specs,
+    ToolSurface, agent_tool_specs, agent_tool_specs_for_child, agent_tool_specs_for_surface,
+    agent_tool_specs_with_capabilities, agent_tool_specs_with_capabilities_and_consultation,
+    agent_tool_specs_with_subagents, agent_tool_specs_with_team_policy, subagent_tool_specs,
 };
 pub use tool_presentation::{
     ToolPresentation, ToolPresentationBody, ToolPresentationCategory, canonical_action_descriptor,
