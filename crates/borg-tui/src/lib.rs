@@ -2600,7 +2600,8 @@ fn model_picker_options_with_configured(
                 options.push(PickerOption::new(model, model));
             }
         }
-        provider @ (Some(CodingProvider::OpenAiCompatible)
+        provider @ (Some(CodingProvider::Anthropic)
+        | Some(CodingProvider::OpenAiCompatible)
         | Some(CodingProvider::OpenCode)
         | None) => {
             let backend = provider

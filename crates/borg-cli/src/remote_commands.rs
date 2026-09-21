@@ -1640,6 +1640,7 @@ fn provider_argument(provider: crate::cli::RemoteProviderArg) -> &'static str {
     match provider {
         RemoteProviderArg::Codex => "codex",
         RemoteProviderArg::Claude => "claude",
+        RemoteProviderArg::Anthropic => "anthropic",
         RemoteProviderArg::OpenCode => "open-code",
         RemoteProviderArg::Kimi => "kimi",
         RemoteProviderArg::Glm => "glm",
@@ -2168,8 +2169,9 @@ async fn run_local_agent_session(
             Some(borg_provider::kimi_default_effort().to_string())
         }
         CodingProvider::Qwen => Some(borg_provider::qwen_default_effort().to_string()),
-        // Grok Build and Muse Code choose their own reasoning depth.
-        CodingProvider::Grok | CodingProvider::Muse => None,
+        // Grok Build and Muse Code choose their own reasoning depth, and the
+        // Anthropic lane sends extended thinking only when asked for it.
+        CodingProvider::Anthropic | CodingProvider::Grok | CodingProvider::Muse => None,
     });
     let (
         recorded_cwd,
@@ -7542,7 +7544,7 @@ pub(crate) async fn login_command(
                 authenticate_provider(provider, ProviderAuthChoice::ReplaceApiKey).await?
             );
         }
-        CodingProvider::OpenRouter => {
+        CodingProvider::Anthropic | CodingProvider::OpenRouter => {
             let path = prompt_and_store_api_key(provider)?;
             println!("{} API key saved to {}.", provider.label(), path.display());
         }
@@ -7623,6 +7625,9 @@ fn credential_guidance(provider: CodingProvider) -> &'static str {
         }
         CodingProvider::Muse => {
             "`borg login muse` runs the Muse Code sign-in (or set META_API_KEY for CI)"
+        }
+        CodingProvider::Anthropic => {
+            "`borg login anthropic` stores an Anthropic API key for the API lane"
         }
         CodingProvider::OpenRouter => "`borg login openrouter` stores an OpenRouter API key",
         CodingProvider::Kimi => "`borg login kimi` selects the Kimi Code plan and stores its key",
@@ -8027,6 +8032,11 @@ fn default_model_for_provider(provider: CodingProvider) -> Option<String> {
         CodingProvider::OpenAiCompatible => std::env::var("BORG_OPENAI_COMPATIBLE_MODEL")
             .ok()
             .filter(|model| !model.trim().is_empty()),
+        // The Anthropic API lane has no pinned default: this code cannot
+        // confirm which Claude model ids the account can reach, and inventing
+        // one would fail on the first call instead of asking. The operator
+        // names the model, and the picker lists what the host discovered.
+        CodingProvider::Anthropic => None,
         CodingProvider::OpenCode => None,
     }
 }
@@ -9807,6 +9817,7 @@ fn provider_name(provider: CodingProvider) -> &'static str {
     match provider {
         CodingProvider::Codex => "codex",
         CodingProvider::Claude => "claude",
+        CodingProvider::Anthropic => "anthropic",
         CodingProvider::OpenCode => "open-code",
         CodingProvider::Grok => "grok",
         CodingProvider::Muse => "muse",

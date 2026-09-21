@@ -518,7 +518,7 @@ fn apply_sse_frame(
             event_name = Some(rest.trim().to_string());
         } else if let Some(rest) = line.strip_prefix("data:") {
             if !data.is_empty() {
-                data.push_str("\n");
+                data.push('\n');
             }
             data.push_str(rest.trim_start());
         }

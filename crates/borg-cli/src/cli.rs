@@ -1255,6 +1255,8 @@ pub(crate) enum RemoteProviderArg {
     #[value(alias = "openai")]
     Codex,
     Claude,
+    /// The Anthropic API lane, billed to a configured API key.
+    Anthropic,
     #[value(name = "opencode", alias = "open-code")]
     OpenCode,
     Grok,
@@ -1272,6 +1274,7 @@ impl From<RemoteProviderArg> for borg_remote::CodingProvider {
         match value {
             RemoteProviderArg::Codex => Self::Codex,
             RemoteProviderArg::Claude => Self::Claude,
+            RemoteProviderArg::Anthropic => Self::Anthropic,
             RemoteProviderArg::OpenCode => Self::OpenCode,
             RemoteProviderArg::Grok => Self::Grok,
             RemoteProviderArg::Muse => Self::Muse,

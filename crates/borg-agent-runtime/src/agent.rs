@@ -1063,6 +1063,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 .await
             }
             CodingProvider::Codex
+            | CodingProvider::Anthropic
             | CodingProvider::Kimi
             | CodingProvider::Glm
             | CodingProvider::Qwen

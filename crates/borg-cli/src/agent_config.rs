@@ -1111,6 +1111,7 @@ fn is_reserved_provider_id(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "codex"
             | "claude"
+            | "anthropic"
             | "opencode"
             | "open-code"
             | "kimi"

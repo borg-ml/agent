@@ -437,7 +437,10 @@ fn cache_window(provider: CodingProvider) -> Option<Duration> {
     match provider {
         CodingProvider::Codex => Some(CODEX_CACHE_WINDOW),
         CodingProvider::Claude => Some(CLAUDE_CACHE_WINDOW),
-        CodingProvider::OpenCode
+        // The API lane sends no cache breakpoints yet, so there is no window to
+        // explain a miss against, and guessing one would misreport the cause.
+        CodingProvider::Anthropic
+        | CodingProvider::OpenCode
         | CodingProvider::Grok
         | CodingProvider::Muse
         | CodingProvider::Kimi

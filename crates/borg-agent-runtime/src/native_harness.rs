@@ -1595,6 +1595,9 @@ struct ProviderModelClient {
 enum NativeRoute<'a> {
     #[cfg(feature = "subscription-adapters")]
     CodexAccount(&'a str),
+    /// The Anthropic Messages API, reached with the API key the user stored for
+    /// the Anthropic lane.
+    AnthropicMessages,
     ChatCompletions {
         profile: OpenAiCompatibleProfile,
         gateway: Option<&'a ModelGateway>,
@@ -1622,6 +1625,11 @@ impl ProviderModelClient {
         {
             return Ok(NativeRoute::CodexAccount(account));
         }
+        // The Anthropic lane is a Messages route Borg drives itself, so it
+        // never shares the compatibility path or its credentials.
+        if provider == crate::CodingProvider::Anthropic {
+            return Ok(NativeRoute::AnthropicMessages);
+        }
         let configured_gateway = (provider == crate::CodingProvider::OpenAiCompatible)
             .then(|| self.configured_model_gateways.get(model))
             .flatten();
@@ -1643,6 +1651,7 @@ impl ProviderModelClient {
                 OpenAiCompatibleProfile::Generic
             }
             crate::CodingProvider::Codex
+            | crate::CodingProvider::Anthropic
             | crate::CodingProvider::Claude
             | crate::CodingProvider::OpenCode
             | crate::CodingProvider::Grok
@@ -1708,6 +1717,21 @@ impl NativeModelClient for ProviderModelClient {
                 )
                 .await;
             }
+            NativeRoute::AnthropicMessages => {
+                // The adapter reports a missing key itself, so an unconfigured
+                // lane fails with one actionable message instead of a second
+                // error type invented here.
+                let api_key = borg_provider::credentials::api_key(
+                    borg_provider::credentials::ApiKeyCredential::Anthropic,
+                )
+                .unwrap_or_default();
+                return borg_provider::provider::AnthropicMessagesProvider {
+                    model: model.to_string(),
+                    effort: effort.map(str::to_string),
+                }
+                .model_turn(request, progress, &api_key)
+                .await;
+            }
             NativeRoute::ChatCompletions { profile, gateway } => (profile, gateway),
         };
         // The Go gateway advertises no context window, and the chat-completions
@@ -1756,6 +1780,9 @@ impl NativeModelClient for ProviderModelClient {
             // rewrites the head no matter where it is placed.
             #[cfg(feature = "subscription-adapters")]
             Ok(NativeRoute::CodexAccount(_)) => DeclarationTransport::Collapsed,
+            // The Messages API collects `System` into one top-level field, so a
+            // change there rewrites the head wherever it was placed.
+            Ok(NativeRoute::AnthropicMessages) => DeclarationTransport::Collapsed,
             Err(NotNative) => DeclarationTransport::Collapsed,
         }
     }
@@ -1763,6 +1790,11 @@ impl NativeModelClient for ProviderModelClient {
     async fn context_window(&self, provider: crate::CodingProvider, model: &str) -> Option<u64> {
         let gateway = match self.route(provider, model) {
             Ok(NativeRoute::ChatCompletions { gateway, .. }) => gateway,
+            // A published Claude window keeps the context meter and the pre-call
+            // budget check working on this route too.
+            Ok(NativeRoute::AnthropicMessages) => {
+                return borg_provider::provider::context_window_tokens(model);
+            }
             _ => return None,
         };
         if let Some(window) = gateway.and_then(|gateway| gateway.context_window_tokens) {
@@ -1806,6 +1838,7 @@ impl PromptCacheRefreshClient for ProviderModelClient {
             // pays, so the threshold it is compared against would be fiction.
             #[cfg(feature = "subscription-adapters")]
             NativeRoute::CodexAccount(_) => return Err(Ineligible::SubscriptionQuota),
+            NativeRoute::AnthropicMessages => return Err(Ineligible::CacheWriteUnsupported),
             NativeRoute::ChatCompletions { gateway, .. } => gateway,
         };
         // An operator who configured this route may know its documented
@@ -1885,6 +1918,12 @@ impl PromptCacheRefreshClient for ProviderModelClient {
                 )
                 .await
             }
+            NativeRoute::AnthropicMessages => Err(ProviderCallError {
+                message: "the anthropic-api lane does not support prompt-cache refresh".to_string(),
+                trace: Box::default(),
+                session_id: None,
+                kind: borg_provider::provider::ProviderErrorKind::Fatal,
+            }),
             // The OpenCode context-window resolution the real turn performs is
             // skipped on purpose: it only fills the context meter, and a
             // refresh reports no context.

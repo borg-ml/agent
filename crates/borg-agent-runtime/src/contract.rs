@@ -15,6 +15,15 @@ pub const REMOTE_PROTOCOL_VERSION: u16 = 6;
 pub enum CodingProvider {
     Codex,
     Claude,
+    /// Anthropic API, driven by Borg with a user-supplied API key on a
+    /// pay-as-you-go lane.
+    ///
+    /// Deliberately separate from `Claude`, which is the subscription lane that
+    /// runs the unmodified Claude Code binary. They use different credentials
+    /// and bill differently, so they are different providers rather than one
+    /// provider with two routes, and a session can never drift from one lane
+    /// into the other by changing a model.
+    Anthropic,
     OpenCode,
     /// xAI Grok Build. The SuperGrok/X Premium subscription is reachable only
     /// through xAI's own CLI, so Borg drives it as a compatibility route.
@@ -189,6 +198,7 @@ impl CodingProvider {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Anthropic => "anthropic",
             Self::OpenCode => "open-code",
             Self::Grok => "grok",
             Self::Muse => "muse",
@@ -208,6 +218,7 @@ impl CodingProvider {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude",
+            Self::Anthropic => "Anthropic API",
             Self::OpenCode => "OpenCode",
             Self::Grok => "Grok",
             Self::Muse => "Muse",
@@ -264,6 +275,7 @@ impl CodingProvider {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Anthropic => "anthropic",
             Self::OpenCode => "open_code",
             Self::Grok => "grok",
             Self::Muse => "muse",
@@ -282,9 +294,12 @@ impl CodingProvider {
             Self::OpenCode => "opencode",
             Self::Grok => "grok",
             Self::Muse => "muse",
-            Self::Kimi | Self::Glm | Self::Qwen | Self::OpenRouter | Self::OpenAiCompatible => {
-                "borg"
-            }
+            Self::Anthropic
+            | Self::Kimi
+            | Self::Glm
+            | Self::Qwen
+            | Self::OpenRouter
+            | Self::OpenAiCompatible => "borg",
         }
     }
 
@@ -295,7 +310,12 @@ impl CodingProvider {
     pub fn uses_native_harness(self) -> bool {
         matches!(
             self,
-            Self::Kimi | Self::Glm | Self::Qwen | Self::OpenRouter | Self::OpenAiCompatible
+            Self::Anthropic
+                | Self::Kimi
+                | Self::Glm
+                | Self::Qwen
+                | Self::OpenRouter
+                | Self::OpenAiCompatible
         )
     }
 

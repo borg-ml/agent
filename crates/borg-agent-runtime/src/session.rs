@@ -5906,7 +5906,10 @@ fn resolve_consultation_profile(
         });
     let provider = match provider_hint {
         "gpt" | "codex" | "openai" => CodingProvider::Codex,
-        "claude" | "anthropic" => CodingProvider::Claude,
+        "claude" => CodingProvider::Claude,
+        // The API lane answers to the credential name it spends, so `anthropic`
+        // now selects the API route and `claude` keeps the subscription one.
+        "anthropic" | "anthropic-api" | "anthropic_api" => CodingProvider::Anthropic,
         "openrouter" | "open-router" => CodingProvider::OpenRouter,
         "openai-compatible" | "open-ai-compatible" => CodingProvider::OpenAiCompatible,
         _ => CodingProvider::for_model(profile)
@@ -5951,7 +5954,13 @@ fn default_consultation_effort(provider: CodingProvider) -> Option<String> {
         CodingProvider::Qwen => Some(borg_provider::qwen_default_effort().to_string()),
         CodingProvider::OpenRouter | CodingProvider::OpenAiCompatible => Some("medium".to_string()),
         CodingProvider::Claude => Some(borg_provider::claude_default_effort().to_string()),
-        CodingProvider::OpenCode | CodingProvider::Grok | CodingProvider::Muse => None,
+        // Nothing is enabled by default on these routes: effort is what asks
+        // for extended thinking, so a session that did not ask for it should
+        // not pay for it.
+        CodingProvider::Anthropic
+        | CodingProvider::OpenCode
+        | CodingProvider::Grok
+        | CodingProvider::Muse => None,
     }
 }
 

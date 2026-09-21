@@ -1274,7 +1274,8 @@ async fn probe_provider(
                             | CodingProvider::OpenCode
                             | CodingProvider::Grok
                             | CodingProvider::Muse => provider_auth_status(provider).await.ok(),
-                            CodingProvider::Kimi
+                            CodingProvider::Anthropic
+                            | CodingProvider::Kimi
                             | CodingProvider::Glm
                             | CodingProvider::Qwen
                             | CodingProvider::OpenRouter
@@ -1297,7 +1298,8 @@ async fn probe_provider(
                     // an API key is the signal.
                     CodingProvider::Grok => grok_credentials_present(),
                     CodingProvider::Muse => muse_credentials_present(),
-                    CodingProvider::Kimi
+                    CodingProvider::Anthropic
+                    | CodingProvider::Kimi
                     | CodingProvider::Glm
                     | CodingProvider::Qwen
                     | CodingProvider::OpenRouter
@@ -1482,6 +1484,21 @@ async fn probe_provider(
                 None
             }
         }
+        CodingProvider::Anthropic => {
+            // This lane is API-key only. It never reports a subscription lane,
+            // because it has no way to spend one.
+            if borg_provider::credentials::api_key(
+                borg_provider::credentials::ApiKeyCredential::Anthropic,
+            )
+            .is_some()
+            {
+                auth_methods.push(ProviderAuthMethod::ApiKey);
+                detail.push("Anthropic API key configured");
+                Some(BillingLane::ApiKey)
+            } else {
+                None
+            }
+        }
         CodingProvider::OpenAiCompatible => {
             // The native generic route deliberately has a localhost default,
             // but it is only an advertised lane after the caller configured an
@@ -1520,6 +1537,7 @@ async fn probe_provider(
         // on a separately installed `borg` executable being discoverable in a
         // service user's PATH.
         CodingProvider::Codex
+        | CodingProvider::Anthropic
         | CodingProvider::Kimi
         | CodingProvider::Glm
         | CodingProvider::Qwen
@@ -1569,7 +1587,8 @@ fn provider_subscription_credentials_present(provider: CodingProvider) -> bool {
             .is_some_and(opencode_auth_json_authenticated),
         CodingProvider::Grok => grok_credentials_present(),
         CodingProvider::Muse => muse_credentials_present(),
-        CodingProvider::Kimi
+        CodingProvider::Anthropic
+        | CodingProvider::Kimi
         | CodingProvider::Glm
         | CodingProvider::Qwen
         | CodingProvider::OpenRouter
@@ -1868,6 +1887,10 @@ pub fn provider_credentials_present(provider: CodingProvider) -> bool {
             borg_provider::credentials::opencode_go_api_key().is_some()
                 || provider_subscription_credentials_present(provider)
         }
+        CodingProvider::Anthropic => borg_provider::credentials::api_key(
+            borg_provider::credentials::ApiKeyCredential::Anthropic,
+        )
+        .is_some(),
         CodingProvider::Grok => grok_credentials_present(),
         CodingProvider::Muse => muse_credentials_present(),
         CodingProvider::Kimi => {
@@ -1921,7 +1944,8 @@ fn provider_login_command(provider: CodingProvider, mut command: Command) -> Res
         CodingProvider::Muse => {
             command.args(["login"]);
         }
-        CodingProvider::Kimi
+        CodingProvider::Anthropic
+        | CodingProvider::Kimi
         | CodingProvider::Glm
         | CodingProvider::Qwen
         | CodingProvider::OpenRouter
@@ -4262,6 +4286,7 @@ fn provider_arg(provider: CodingProvider) -> &'static str {
     match provider {
         CodingProvider::Codex => "codex",
         CodingProvider::Claude => "claude",
+        CodingProvider::Anthropic => "anthropic",
         CodingProvider::OpenCode => "open-code",
         CodingProvider::Grok => "grok",
         CodingProvider::Muse => "muse",
