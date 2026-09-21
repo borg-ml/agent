@@ -1559,6 +1559,9 @@ Return only the internal continuation checkpoint.",
         request: ModelTurnRequest,
         context: ModelStreamContext<'_>,
     ) -> Result<NativeModelOutcome> {
+        let mut request = request;
+        repair_native_messages(&mut request.messages);
+        validate_native_messages(&request.messages)?;
         call_model_streaming(
             self.model_client.as_ref(),
             provider,
@@ -3627,10 +3630,108 @@ fn retain_recent_native_messages(
         used = used.saturating_add(tokens);
         start -= 1;
     }
-    while start < body.len() && matches!(body[start], ModelMessage::Tool { .. }) {
-        start += 1;
+    while start < body.len() {
+        match &body[start] {
+            // A result whose call is gone cannot open a request.
+            ModelMessage::Tool { .. } => start += 1,
+            // A call whose results are gone cannot either: the provider refuses
+            // an assistant turn with `tool_calls` that nothing answers, which is
+            // a 400 rather than a shorter request.
+            ModelMessage::Assistant { tool_calls, .. }
+                if tool_calls
+                    .iter()
+                    .any(|call| !tool_call_ids(&body[start..]).contains(&call.id)) =>
+            {
+                start += 1;
+            }
+            _ => break,
+        }
     }
     body[start..].to_vec()
+}
+
+/// Repair a durable history into a request the provider will accept.
+///
+/// A history can hold a turn the provider refuses: an assistant message whose
+/// tool call never got a result - a turn interrupted between the call and its
+/// answer, or a window that kept the call and dropped the answers - or a message
+/// left with neither content nor a call. Because the history is durable, every
+/// rebuild assembles the same refused request, which is why one thread can fail
+/// on every attempt while a fresh session on the same lane works. The request
+/// view is repaired here and the transcript keeps every byte: the call nothing
+/// answers is dropped from the request rather than sent.
+fn repair_native_messages(messages: &mut Vec<ModelMessage>) {
+    let called: HashSet<String> = messages
+        .iter()
+        .filter_map(|message| match message {
+            ModelMessage::Assistant { tool_calls, .. } => Some(tool_calls),
+            _ => None,
+        })
+        .flatten()
+        .map(|call| call.id.clone())
+        .collect();
+    let answered = tool_call_ids(messages);
+    let mut repaired = Vec::with_capacity(messages.len());
+    for mut message in std::mem::take(messages) {
+        match &mut message {
+            // A result whose call is gone is refused the same way.
+            ModelMessage::Tool { tool_call_id, .. } => {
+                if called.contains(tool_call_id) {
+                    repaired.push(message);
+                }
+            }
+            ModelMessage::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                tool_calls.retain(|call| answered.contains(&call.id));
+                let has_content = content
+                    .as_deref()
+                    .is_some_and(|content| !content.trim().is_empty());
+                if !tool_calls.is_empty() || has_content {
+                    repaired.push(message);
+                }
+            }
+            _ => repaired.push(message),
+        }
+    }
+    *messages = repaired;
+}
+
+/// Whether an assembled request is one a chat-completions provider will accept.
+///
+/// A request that is empty, opens with an assistant turn, or answers tool calls
+/// it does not contain is refused with a 400 that reads like a provider fault.
+/// Checking here makes it our fault, named as such, before it leaves the process.
+fn validate_native_messages(messages: &[ModelMessage]) -> Result<()> {
+    if messages.is_empty() {
+        bail!("assembled request has no messages");
+    }
+    if !matches!(
+        messages[0],
+        ModelMessage::System { .. } | ModelMessage::User { .. }
+    ) {
+        bail!(
+            "assembled request opens with {:?}, which no chat-completions provider accepts",
+            std::mem::discriminant(&messages[0])
+        );
+    }
+    let answered = tool_call_ids(messages);
+    for message in messages {
+        let ModelMessage::Assistant { tool_calls, .. } = message else {
+            continue;
+        };
+        for call in tool_calls {
+            if !answered.contains(&call.id) {
+                bail!(
+                    "assembled request has an assistant tool call `{}` that no tool result answers",
+                    call.id
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Contents of the oldest tool results are cleared from the request view before
@@ -6025,6 +6126,128 @@ mod tests {
         assert_eq!(everything.len(), messages.len() - 1);
         assert!(!matches!(everything[0], ModelMessage::System { .. }));
         assert!(retain_recent_native_messages(&messages[..1], u64::MAX).is_empty());
+    }
+
+    /// The same failure seen from the durable side: the history itself holds an
+    /// assistant call that nothing answers, so every rebuild sends a request the
+    /// provider refuses. The repair drops what cannot be sent and keeps the rest.
+    #[test]
+    fn a_durable_history_is_repaired_into_a_request_the_provider_accepts() {
+        let assistant = |content: Option<&str>, calls: &[&str]| ModelMessage::Assistant {
+            content: content.map(str::to_string),
+            reasoning_content: None,
+            reasoning_details: None,
+            provider_state: None,
+            tool_calls: calls
+                .iter()
+                .map(|id| {
+                    ModelToolCall::function(
+                        id.to_string(),
+                        "read_file".to_string(),
+                        "{}".to_string(),
+                    )
+                })
+                .collect(),
+        };
+        let result = |id: &str| ModelMessage::Tool {
+            tool_call_id: id.to_string(),
+            content: "output".to_string(),
+            attachments: Vec::new(),
+        };
+        let mut messages = vec![
+            ModelMessage::System {
+                content: "system".to_string(),
+            },
+            ModelMessage::user("go"),
+            assistant(Some("thinking out loud"), &["unanswered"]),
+            assistant(Some(""), &["empty_and_unanswered"]),
+            assistant(None, &["answered"]),
+            result("answered"),
+            result("never_called"),
+        ];
+        repair_native_messages(&mut messages);
+        let shape: Vec<String> = messages
+            .iter()
+            .map(|message| match message {
+                ModelMessage::System { .. } => "system".to_string(),
+                ModelMessage::User { .. } => "user".to_string(),
+                ModelMessage::Assistant {
+                    content,
+                    tool_calls,
+                    ..
+                } => format!(
+                    "assistant(content={}, calls={})",
+                    content.as_deref().map(str::len).unwrap_or(0),
+                    tool_calls.len()
+                ),
+                ModelMessage::Tool { tool_call_id, .. } => format!("tool({tool_call_id})"),
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                "system".to_string(),
+                "user".to_string(),
+                "assistant(content=17, calls=0)".to_string(),
+                "assistant(content=0, calls=1)".to_string(),
+                "tool(answered)".to_string(),
+            ],
+            "the unanswered call, the empty turn and the orphan result are gone"
+        );
+        validate_native_messages(&messages)
+            .expect("the repaired request is one a provider accepts");
+    }
+
+    /// The live failure: a compaction window whose oldest message is an
+    /// assistant turn whose tool results fell outside the budget. The provider
+    /// refuses that request with a 400 - "an assistant message with 'tool_calls'
+    /// must be followed by tool messages responding to each 'tool_call_id'" -
+    /// which reads as a provider fault rather than as a request we assembled
+    /// wrongly. The window has to drop the call instead.
+    #[test]
+    fn a_retained_tail_never_opens_with_an_unanswered_tool_call() {
+        let assistant_call = |id: &str| ModelMessage::Assistant {
+            content: None,
+            reasoning_content: None,
+            reasoning_details: None,
+            provider_state: None,
+            tool_calls: vec![ModelToolCall::function(
+                id.to_string(),
+                "read_file".to_string(),
+                "{}".to_string(),
+            )],
+        };
+        let tool_result = |id: &str, size: usize| ModelMessage::Tool {
+            tool_call_id: id.to_string(),
+            content: "y".repeat(size),
+            attachments: Vec::new(),
+        };
+        let messages = vec![
+            ModelMessage::System {
+                content: "system".to_string(),
+            },
+            ModelMessage::user("first"),
+            assistant_call("a"),
+            tool_result("a", 4_000),
+            assistant_call("b"),
+            tool_result("b", 40_000),
+        ];
+        for budget in [1_u64, 400, 4_000, 20_000] {
+            let tail = retain_recent_native_messages(&messages, budget);
+            let unanswered = matches!(
+                tail.first(),
+                Some(ModelMessage::Assistant { tool_calls, .. })
+                    if tool_calls.iter().any(|call| !tool_call_ids(&tail).contains(&call.id))
+            );
+            assert!(
+                !unanswered,
+                "budget {budget} left an unanswered call: {tail:?}"
+            );
+            assert!(
+                tail.is_empty() || matches!(tail[0], ModelMessage::User { .. }),
+                "budget {budget} must not open with a tool turn: {tail:?}"
+            );
+        }
     }
 
     #[test]

@@ -103,12 +103,74 @@ fn provider_timeout_from_env(name: &str, default_secs: u64) -> Option<Duration> 
 pub(crate) async fn read_provider_error_response_text(
     response: reqwest::Response,
 ) -> Result<String> {
-    read_provider_response_text_with_limit(
+    let event_stream = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .trim()
+                .to_ascii_lowercase()
+                .starts_with("text/event-stream")
+        });
+    let body = read_provider_response_text_with_limit(
         response,
         "provider error response",
         PROVIDER_HTTP_ERROR_BODY_MAX_BYTES,
     )
-    .await
+    .await?;
+    Ok(if event_stream {
+        event_stream_error_text(&body)
+    } else {
+        body
+    })
+}
+
+/// The reason out of an error that arrived in the format the success path uses.
+///
+/// These lanes ask for `text/event-stream`, so a refusal can come back as events
+/// rather than as a JSON body. Reading that as plain text keeps only `data:`
+/// lines and loses the reason inside them, which is how a provider that answered
+/// clearly gets recorded as having said nothing at all. Every event carrying an
+/// error contributes its message; a stream with none of them is returned as it
+/// arrived, so nothing is hidden by this reading.
+fn event_stream_error_text(body: &str) -> String {
+    let mut reasons: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(payload) else {
+            continue;
+        };
+        let error = value.get("error").or_else(|| {
+            value
+                .pointer("/choices/0/delta/error")
+                .or_else(|| value.pointer("/choices/0/error"))
+        });
+        let Some(error) = error else {
+            continue;
+        };
+        let reason = ["message", "type", "code"]
+            .into_iter()
+            .find_map(|key| error.get(key).and_then(Value::as_str))
+            .map(str::to_string)
+            .or_else(|| (!error.is_null()).then(|| error.to_string()));
+        if let Some(reason) = reason
+            && !reasons.contains(&reason)
+        {
+            reasons.push(reason);
+        }
+    }
+    if reasons.is_empty() {
+        body.trim().to_string()
+    } else {
+        reasons.join("; ")
+    }
 }
 
 pub(crate) async fn read_provider_success_response_text(
