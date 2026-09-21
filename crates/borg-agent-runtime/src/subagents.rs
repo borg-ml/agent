@@ -6251,15 +6251,82 @@ fn effective_worker_effort(
         .or_else(|| default_effort_for_cross_provider_peer(launch.provider))
 }
 
+/// Which tools an agent surface advertises.
+///
+/// One builder reads this, so a surface is a set of flags rather than a second
+/// hand-written list. `for_child` is the whole definition of how a child
+/// differs from its director: exactly the three documented exceptions below,
+/// and everything else follows the director automatically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolSurface {
+    /// Collaboration tools: spawning, messaging and settling child agents.
+    pub subagents: bool,
+    /// Consultation with other models. A child may not fan out consultation:
+    /// fan-out of work is cheap, fan-out of spend the director cannot see is not.
+    pub consultation: bool,
+    pub shared_work: bool,
+    pub web_search: bool,
+    /// Interactive prompting of the human. A child reports back to its parent
+    /// instead: sixty children must not interrogate one person.
+    pub human_prompt: bool,
+    /// Parent yield, steering and watcher lifecycle. A child holding the
+    /// parent yield on its behalf is a deadlock.
+    pub parent_control: bool,
+}
+
+impl ToolSurface {
+    /// Everything on: the director default, before a session disables a
+    /// capability it does not have.
+    pub fn director() -> Self {
+        Self {
+            subagents: true,
+            consultation: true,
+            shared_work: true,
+            web_search: true,
+            human_prompt: true,
+            parent_control: true,
+        }
+    }
+
+    /// A child gets the director surface minus the three documented
+    /// exceptions. Anything else the director gains reaches children too.
+    pub fn for_child(self) -> Self {
+        Self {
+            consultation: false,
+            human_prompt: false,
+            parent_control: false,
+            ..self
+        }
+    }
+}
+
 pub fn agent_tool_specs(provider: CodingProvider) -> Vec<Value> {
-    agent_tool_specs_with_capabilities(provider, true, true, None)
+    agent_tool_specs_for_surface(provider, ToolSurface::director(), None)
+}
+
+/// The child surface: the same builder with the director surface minus the
+/// documented exceptions. Callers that know they are building a child surface
+/// use this rather than repeating the flags.
+pub fn agent_tool_specs_for_child(
+    provider: CodingProvider,
+    director: ToolSurface,
+    team_policy: Option<&crate::TeamPolicy>,
+) -> Vec<Value> {
+    agent_tool_specs_for_surface(provider, director.for_child(), team_policy)
 }
 
 pub fn agent_tool_specs_with_subagents(
     provider: CodingProvider,
     subagents_enabled: bool,
 ) -> Vec<Value> {
-    agent_tool_specs_with_capabilities(provider, subagents_enabled, true, None)
+    agent_tool_specs_for_surface(
+        provider,
+        ToolSurface {
+            subagents: subagents_enabled,
+            ..ToolSurface::director()
+        },
+        None,
+    )
 }
 
 pub fn agent_tool_specs_with_team_policy(
@@ -6267,7 +6334,14 @@ pub fn agent_tool_specs_with_team_policy(
     subagents_enabled: bool,
     team_policy: Option<&crate::TeamPolicy>,
 ) -> Vec<Value> {
-    agent_tool_specs_with_capabilities(provider, subagents_enabled, true, team_policy)
+    agent_tool_specs_for_surface(
+        provider,
+        ToolSurface {
+            subagents: subagents_enabled,
+            ..ToolSurface::director()
+        },
+        team_policy,
+    )
 }
 
 pub fn agent_tool_specs_with_capabilities(
@@ -6276,12 +6350,14 @@ pub fn agent_tool_specs_with_capabilities(
     shared_work_enabled: bool,
     team_policy: Option<&crate::TeamPolicy>,
 ) -> Vec<Value> {
-    agent_tool_specs_with_capabilities_and_consultation(
+    agent_tool_specs_for_surface(
         provider,
-        subagents_enabled,
-        shared_work_enabled,
+        ToolSurface {
+            subagents: subagents_enabled,
+            shared_work: shared_work_enabled,
+            ..ToolSurface::director()
+        },
         team_policy,
-        true,
     )
 }
 
@@ -6292,13 +6368,18 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
     team_policy: Option<&crate::TeamPolicy>,
     consultation_enabled: bool,
 ) -> Vec<Value> {
-    agent_tool_specs_with_capabilities_and_consultation_and_search(
+    agent_tool_specs_for_surface(
         provider,
-        subagents_enabled,
-        shared_work_enabled,
+        ToolSurface {
+            subagents: subagents_enabled,
+            shared_work: shared_work_enabled,
+            consultation: consultation_enabled,
+            // Search is added by the runtime when it has a search service, so
+            // this surface never carries it implicitly.
+            web_search: false,
+            ..ToolSurface::director()
+        },
         team_policy,
-        consultation_enabled,
-        false,
     )
 }
 
@@ -6309,6 +6390,25 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
     team_policy: Option<&crate::TeamPolicy>,
     consultation_enabled: bool,
     web_search_enabled: bool,
+) -> Vec<Value> {
+    agent_tool_specs_for_surface(
+        provider,
+        ToolSurface {
+            subagents: subagents_enabled,
+            shared_work: shared_work_enabled,
+            consultation: consultation_enabled,
+            web_search: web_search_enabled,
+            ..ToolSurface::director()
+        },
+        team_policy,
+    )
+}
+
+/// The one builder. Every surface, director or child, comes from here.
+pub fn agent_tool_specs_for_surface(
+    provider: CodingProvider,
+    surface: ToolSurface,
+    team_policy: Option<&crate::TeamPolicy>,
 ) -> Vec<Value> {
     let update_plan_item_schema = json!({
         "type": "object",
@@ -6730,10 +6830,10 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
             }),
         ),
     ];
-    if web_search_enabled {
+    if surface.web_search {
         specs.push(web_search_tool_spec());
     }
-    if subagents_enabled && consultation_enabled {
+    if surface.subagents && surface.consultation {
         specs.insert(
             1,
             tool(
@@ -6783,7 +6883,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
             ),
         );
     }
-    if !consultation_enabled {
+    if !surface.consultation {
         specs.retain(|spec| {
             !matches!(
                 spec.get("name").and_then(Value::as_str),
@@ -6792,10 +6892,10 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         });
     }
     specs.extend(crate::self_service::tool_specs());
-    if shared_work_enabled {
+    if surface.shared_work {
         specs.extend(shared_work_tool_specs());
     }
-    if subagents_enabled {
+    if surface.subagents {
         let mut subagent_specs = subagent_tool_specs(provider);
         if let Some(policy) = team_policy {
             let metadata = serde_json::to_string(policy)
@@ -6812,6 +6912,27 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
             }
         }
         specs.extend(subagent_specs);
+    }
+    // Exception: interactive prompting of the human. These tools stop for a
+    // person to decide; a child reports to its parent instead, or sixty
+    // children interrogate one human.
+    if !surface.human_prompt {
+        specs.retain(|spec| {
+            !matches!(
+                spec["name"].as_str(),
+                Some("computer_use" | "update_agent_settings")
+            )
+        });
+    }
+    // Exception: the parent yield, steering and watcher lifecycle. A child
+    // holding the parent yield on its behalf is a deadlock.
+    if !surface.parent_control {
+        specs.retain(|spec| {
+            !matches!(
+                spec["name"].as_str(),
+                Some("watch" | "list_watchers" | "await_watchers" | "stop_watcher")
+            )
+        });
     }
     add_action_metadata(&mut specs);
     specs
