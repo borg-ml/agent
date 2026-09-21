@@ -4448,33 +4448,36 @@ async fn run_agent_session_store_kernel_inner(
                                     }))
                                 });
                             }
-                            if prompt.visible {
-                                record_prompt_status(
-                                    &mut journal,
-                                    &events,
-                                    session_id,
-                                    &prompt,
-                                    if interrupted {
-                                        MessageStatus::Failed
-                                    } else {
-                                        MessageStatus::Complete
-                                    },
-                                    prompt.delivery,
-                                )
-                                .await?;
-                            }
-                            record(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                SessionEventKind::TurnCompleted {
-                                    message_id: prompt.message_id,
-                                    provider_session_id: outcome.provider_session_id,
-                                    final_text,
-                                    error: interrupted.then(|| "turn interrupted".to_string()),
-                                },
-                            )
-                            .await?;
+                            // The prompt own terminal status and the turn
+                            // boundary are one step for a reader of the
+                            // transcript, and one transaction here.
+                            let mut settlement: Vec<SessionEventKind> = if prompt.visible {
+                                prompt
+                                    .batch_entries()
+                                    .into_iter()
+                                    .map(|entry| SessionEventKind::Message {
+                                        message_id: entry.message_id,
+                                        actor: entry.actor,
+                                        text: entry.text,
+                                        attachments: entry.attachments,
+                                        status: if interrupted {
+                                            MessageStatus::Failed
+                                        } else {
+                                            MessageStatus::Complete
+                                        },
+                                        delivery: Some(prompt.delivery),
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            settlement.push(SessionEventKind::TurnCompleted {
+                                message_id: prompt.message_id,
+                                provider_session_id: outcome.provider_session_id,
+                                final_text,
+                                error: interrupted.then(|| "turn interrupted".to_string()),
+                            });
+                            record_all(&mut journal, &events, session_id, settlement).await?;
                         }
                         Err(turn_error) => {
                             subscription_context_reusable = false;
@@ -5586,16 +5589,17 @@ async fn run_agent_session_store_kernel_inner(
                                         &mut journal, &events, session_id, &mut goal,
                                         &mut goal_active_since,
                                     ).await?;
-                                    set_user_stop(
-                                        &mut journal, &events, session_id, &mut user_stop, true,
-                                    ).await?;
-                                    record(
-                                        &mut journal, &events, session_id,
-                                        SessionEventKind::StatusChanged {
-                                            status: SessionStatus::Running,
-                                            detail: Some(TurnPhase::Cancelling.detail().to_string()),
-                                        },
-                                    ).await?;
+                                    // The latch and the phase it puts the turn in
+                                    // are one step: one transaction, so the
+                                    // settlement the person is waiting on costs
+                                    // one commit rather than two.
+                                    let mut terminal = Vec::new();
+                                    terminal.extend(stage_user_stop(&mut user_stop, true));
+                                    terminal.push(SessionEventKind::StatusChanged {
+                                        status: SessionStatus::Running,
+                                        detail: Some(TurnPhase::Cancelling.detail().to_string()),
+                                    });
+                                    record_all(&mut journal, &events, session_id, terminal).await?;
                                     Ok::<(), anyhow::Error>(())
                                 }
                             );
@@ -10238,18 +10242,21 @@ async fn set_user_stop(
     user_stop: &mut bool,
     engaged: bool,
 ) -> Result<()> {
+    if let Some(kind) = stage_user_stop(user_stop, engaged) {
+        record(journal, events, session_id, kind).await?;
+    }
+    Ok(())
+}
+
+/// Engage or release the stop latch and hand back the event that records it,
+/// without writing. Callers settling several events as one step put it in the
+/// same transaction instead; see `record_all`.
+fn stage_user_stop(user_stop: &mut bool, engaged: bool) -> Option<SessionEventKind> {
     if *user_stop == engaged {
-        return Ok(());
+        return None;
     }
     *user_stop = engaged;
-    record(
-        journal,
-        events,
-        session_id,
-        SessionEventKind::UserStopChanged { engaged },
-    )
-    .await?;
-    Ok(())
+    Some(SessionEventKind::UserStopChanged { engaged })
 }
 
 /// Record which User prompts were already queued at the instant Escape was
@@ -10912,6 +10919,54 @@ async fn record(
         .await;
     }
     deliver_recorded_event(events, session_id, event, persistence).await;
+    for diagnostic in following_diagnostics {
+        deliver_recorded_event(
+            events,
+            session_id,
+            diagnostic,
+            crate::EventPersistence::Durable,
+        )
+        .await;
+    }
+    Ok(())
+}
+
+/// Record a run of events as one durable settlement: one journal transaction,
+/// delivered in the order given.
+///
+/// Use it where several events are one logical step and the caller is waiting
+/// on the result - the terminal sequence of an interrupted turn is the case
+/// that matters. See `RuntimeSessionStore::append_all` for why the run shares
+/// one transaction.
+async fn record_all(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    kinds: Vec<SessionEventKind>,
+) -> Result<()> {
+    if kinds.is_empty() {
+        return Ok(());
+    }
+    let preceding_diagnostics = journal.take_projection_diagnostics();
+    let persistences: Vec<_> = kinds.iter().map(SessionEventKind::persistence).collect();
+    let pending = kinds
+        .into_iter()
+        .map(|kind| SessionEvent::new(session_id, 0, kind))
+        .collect();
+    let appended = journal.append_all(pending).await?;
+    let following_diagnostics = journal.take_projection_diagnostics();
+    for diagnostic in preceding_diagnostics {
+        deliver_recorded_event(
+            events,
+            session_id,
+            diagnostic,
+            crate::EventPersistence::Durable,
+        )
+        .await;
+    }
+    for (event, persistence) in appended.into_iter().zip(persistences) {
+        deliver_recorded_event(events, session_id, event, persistence).await;
+    }
     for diagnostic in following_diagnostics {
         deliver_recorded_event(
             events,
