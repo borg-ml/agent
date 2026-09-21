@@ -6421,15 +6421,17 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
         ),
         tool(
             "watch",
-            "Start a session-scoped background command that watches logs, files, or external status. By default output wakes you in bounded batches. Set notify_on=exit for terminal events only, or notify_on=match with notify_pattern (Rust regex) for error/milestone lines. Matching is per line (oversized lines split at 16KiB); exit and stop always notify. Filtering affects model notifications only, not process output capture/journaling. Use a command that emits only meaningful changes. Do not poll or wait for it. Requires shell approval; runs until stopped, session exit, or 24 hours. Use list_watchers and stop_watcher to manage watchers.",
+            "Watch a session-scoped background command, or watch child agents and be woken when they settle. Give `command`, or `agents`, not both. A command watch runs a background command that watches logs, files, or external status: by default output wakes you in bounded batches, notify_on=exit reports terminal events only, and notify_on=match with notify_pattern (Rust regex) selects error/milestone lines. An agent watch names child sessions: the default is notify_on=attention, which reports a child that is ALIVE and waiting on the parent (idle after finishing its assignment, or blocked on an approval), while notify_on=exit means the child was stopped or failed - so exit does NOT report a child that finished successfully and parked, and a batch of successful children would never wake you. aggregate=all (the default) waits for every named agent, aggregate=any for the first. One event per watch, and then the watch is done. Matching is per line (oversized lines split at 16KiB); exit and stop always notify, and filtering affects model notifications only, not process output capture/journaling. Requires shell approval or Full Access; runs until stopped, session exit, or 24 hours. Use list_watchers and stop_watcher to manage watchers.",
             json!({
                 "type": "object", "properties": {
-                    "command": {"type": "string", "minLength": 1},
+                    "command": {"type": "string", "minLength": 1, "description": "The command to run and watch. Give this or agents, not both."},
+                    "agents": {"type": "array", "items": {"type": "string", "format": "uuid"}, "minItems": 1, "description": "Child agent session ids to watch, settled when they reach the life notify_on names."},
+                    "aggregate": {"type": "string", "enum": ["all", "any"], "default": "all", "description": "all: every named agent must settle. any: the first one does."},
                     "label": {"type": "string", "minLength": 1, "maxLength": 100},
                     "workdir": {"type": "string"},
-                    "notify_on": {"type": "string", "enum": ["output", "match", "exit"], "default": "output"},
+                    "notify_on": {"type": "string", "enum": ["output", "match", "exit", "attention"], "description": "Command watches default to output, and match requires notify_pattern. Agent watches default to attention: exit means stopped or failed, while attention means alive and waiting on the parent."},
                     "notify_pattern": {"type": "string", "maxLength": 4096, "description": "Required only with notify_on=match; Rust regex selecting error/milestone output lines. Terminal events always notify."}
-                }, "required": ["command", "label"], "additionalProperties": false
+                }, "required": ["label"], "additionalProperties": false
             }),
         ),
         tool(

@@ -20,8 +20,10 @@ pub(crate) struct WatchArgs {
     pub command: String,
     pub label: String,
     pub workdir: Option<String>,
+    /// Which event notifies. Omitted, a command watch reports output and an
+    /// agent watch reports a child waiting on the parent.
     #[serde(default)]
-    pub notify_on: NotifyOn,
+    pub notify_on: Option<NotifyOn>,
     pub notify_pattern: Option<String>,
     /// Child agents to watch. A non-empty set is the agent subject kind and
     /// takes the place of `command`.
@@ -261,11 +263,12 @@ impl Watches {
             !args.label.trim().is_empty() && args.label.chars().count() <= 100,
             "watcher label must contain 1–100 characters"
         );
+        let notify_on = args.notify_on.unwrap_or_default();
         ensure!(
-            args.notify_on != NotifyOn::Attention,
+            notify_on != NotifyOn::Attention,
             "notify_on=attention applies to an agent watcher, not a command"
         );
-        let filter = NotificationFilter::new(args.notify_on, args.notify_pattern.as_deref())?;
+        let filter = NotificationFilter::new(notify_on, args.notify_pattern.as_deref())?;
         ensure!(!self.cancel.is_cancelled(), "session watchers have stopped");
         let mut entries = self.entries.lock().await;
         ensure!(
@@ -352,11 +355,19 @@ impl Watches {
             "notify_pattern selects command output, which an agent has none of"
         );
         let signal = match args.notify_on {
-            // A child emits no command output, so the process default means
-            // nothing here and resolves to the agent default: exit.
-            NotifyOn::Output | NotifyOn::Exit => AgentSignal::Exit,
-            NotifyOn::Attention => AgentSignal::Attention,
-            NotifyOn::Match => bail!("an agent watcher notifies on exit or attention"),
+            // Omitted means attention, because exit alone would miss the
+            // ordinary case: a child that finishes its assignment parks at
+            // `Ready` and stays alive, so a successful batch never exits.
+            None | Some(NotifyOn::Attention) => AgentSignal::Attention,
+            Some(NotifyOn::Exit) => AgentSignal::Exit,
+            // The command modes are refused rather than reinterpreted: a caller
+            // who asked for `output` would silently get a different wake.
+            Some(NotifyOn::Output) => {
+                bail!("notify_on=output selects command output, which an agent has none of")
+            }
+            Some(NotifyOn::Match) => {
+                bail!("notify_on=match needs command output for notify_pattern to select")
+            }
         };
         ensure!(!self.cancel.is_cancelled(), "session watchers have stopped");
         let subjects = AgentSubjects::new(args.agents, signal, args.aggregate);
@@ -634,7 +645,7 @@ mod tests {
                         .into(),
                     label: "Filtered build".into(),
                     workdir: None,
-                    notify_on: NotifyOn::Match,
+                    notify_on: Some(NotifyOn::Match),
                     notify_pattern: Some("ERROR|MILESTONE".into()),
                     ..Default::default()
                 },
@@ -700,7 +711,7 @@ mod tests {
                     command: "echo ERROR-warmup; sleep 30".into(),
                     label: "Completion only".into(),
                     workdir: None,
-                    notify_on: NotifyOn::Exit,
+                    notify_on: Some(NotifyOn::Exit),
                     notify_pattern: None,
                     ..Default::default()
                 },
@@ -729,7 +740,7 @@ mod tests {
                     command: "echo final-result; exit 9".into(),
                     label: "Fast failure".into(),
                     workdir: None,
-                    notify_on: NotifyOn::Exit,
+                    notify_on: Some(NotifyOn::Exit),
                     notify_pattern: None,
                     ..Default::default()
                 },
@@ -770,10 +781,17 @@ mod tests {
         let legacy: WatchArgs =
             serde_json::from_value(serde_json::json!({"command":"echo ready", "label":"legacy"}))
                 .unwrap();
-        assert!(legacy.notify_on == NotifyOn::Output);
+        assert!(
+            legacy.notify_on.is_none(),
+            "an omitted notify_on is resolved from the subject kind"
+        );
     }
 
-    fn agent_args(agents: Vec<Uuid>, notify_on: NotifyOn, aggregate: Aggregate) -> WatchArgs {
+    fn agent_args(
+        agents: Vec<Uuid>,
+        notify_on: Option<NotifyOn>,
+        aggregate: Aggregate,
+    ) -> WatchArgs {
         WatchArgs {
             command: String::new(),
             label: "workers".into(),
@@ -795,7 +813,7 @@ mod tests {
         let info = watches
             .start_agents(agent_args(
                 vec![first, second],
-                NotifyOn::Exit,
+                Some(NotifyOn::Exit),
                 Aggregate::All,
             ))
             .await
@@ -846,7 +864,7 @@ mod tests {
         watches
             .start_agents(agent_args(
                 vec![first, second],
-                NotifyOn::Exit,
+                Some(NotifyOn::Exit),
                 Aggregate::All,
             ))
             .await
@@ -859,7 +877,7 @@ mod tests {
         let attention = watches
             .start_agents(agent_args(
                 vec![second],
-                NotifyOn::Attention,
+                Some(NotifyOn::Attention),
                 Aggregate::All,
             ))
             .await
@@ -869,6 +887,35 @@ mod tests {
             .expect("attention settles on the parked child");
         assert!(event.contains("waiting on the parent"), "{event}");
         assert!(!attention.running, "it settled as it was armed");
+    }
+
+    /// An agent watch that names no `notify_on` reports the child that is alive
+    /// and waiting on the parent, because `exit` alone would wait forever on a
+    /// batch that finished successfully; the command modes are refused there.
+    #[tokio::test]
+    async fn an_agent_watch_defaults_to_attention_and_refuses_the_command_modes() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let watches = Watches::new(ProcessManager::default(), tx, Uuid::new_v4());
+        let child = Uuid::new_v4();
+        watches
+            .observe_agent(child, SubjectLife::Parked, "worker-a")
+            .await;
+        let info = watches
+            .start_agents(agent_args(vec![child], None, Aggregate::All))
+            .await
+            .unwrap();
+        let event = rx.try_recv().expect("the parked child settles it");
+        assert!(event.contains("waiting on the parent"), "{event}");
+        assert!(!info.running, "it settled as it was armed");
+        for mode in [NotifyOn::Output, NotifyOn::Match] {
+            assert!(
+                watches
+                    .start_agents(agent_args(vec![child], Some(mode), Aggregate::All))
+                    .await
+                    .is_err(),
+                "a command mode has no meaning for an agent watcher"
+            );
+        }
     }
 
     /// `any` reports the first subject to exit, and stopping an agent watch
@@ -882,7 +929,7 @@ mod tests {
         watches
             .start_agents(agent_args(
                 vec![first, second],
-                NotifyOn::Exit,
+                Some(NotifyOn::Exit),
                 Aggregate::Any,
             ))
             .await
@@ -908,7 +955,11 @@ mod tests {
             .observe_agent(third, SubjectLife::Live, "worker-c")
             .await;
         let armed = watches
-            .start_agents(agent_args(vec![third], NotifyOn::Exit, Aggregate::All))
+            .start_agents(agent_args(
+                vec![third],
+                Some(NotifyOn::Exit),
+                Aggregate::All,
+            ))
             .await
             .unwrap();
         assert!(armed.running);
@@ -939,7 +990,7 @@ mod tests {
                     command: "printf 'ready\\n'; sleep 30".into(),
                     label: "Build".into(),
                     workdir: None,
-                    notify_on: NotifyOn::Output,
+                    notify_on: Some(NotifyOn::Output),
                     notify_pattern: None,
                     ..Default::default()
                 },
@@ -981,7 +1032,7 @@ mod tests {
                     command: "printf 'one\\n'; sleep 30".into(),
                     label: "Watch".into(),
                     workdir: None,
-                    notify_on: NotifyOn::Output,
+                    notify_on: Some(NotifyOn::Output),
                     notify_pattern: None,
                     ..Default::default()
                 },
@@ -1034,7 +1085,7 @@ mod tests {
                     command: "printf 'first\\nfinal'".into(),
                     label: "Deploy".into(),
                     workdir: None,
-                    notify_on: NotifyOn::Output,
+                    notify_on: Some(NotifyOn::Output),
                     notify_pattern: None,
                     ..Default::default()
                 },
@@ -1087,7 +1138,7 @@ mod tests {
                     command: "printf 'ready\\n'; sleep 30".into(),
                     label: "Sweep".into(),
                     workdir: None,
-                    notify_on: NotifyOn::Output,
+                    notify_on: Some(NotifyOn::Output),
                     notify_pattern: None,
                     ..Default::default()
                 },
