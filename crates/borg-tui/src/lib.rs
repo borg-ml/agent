@@ -990,16 +990,66 @@ impl Default for GitStatusCache {
     }
 }
 
-/// Background `git push` runner for the footer's unpushed-commits indicator.
-/// Mirrors [`GitStatusCache`]: the push runs off the UI thread and its result
-/// is drained on a later tick so a slow network push never blocks rendering.
-struct GitPushState {
-    in_flight: HashSet<PathBuf>,
-    sender: mpsc::Sender<(PathBuf, std::result::Result<String, String>)>,
-    receiver: mpsc::Receiver<(PathBuf, std::result::Result<String, String>)>,
+/// A remote-sync command the footer's ahead/behind indicators run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum GitRemoteAction {
+    Push,
+    Pull,
 }
 
-impl Default for GitPushState {
+impl GitRemoteAction {
+    fn run(self, cwd: &Path) -> std::result::Result<String, String> {
+        match self {
+            Self::Push => run_git_push(cwd),
+            Self::Pull => run_git_pull(cwd),
+        }
+    }
+
+    /// Lowercase command name, used in failure notices.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Push => "push",
+            Self::Pull => "pull",
+        }
+    }
+
+    /// Past-tense label for a successful sync.
+    fn done(self) -> &'static str {
+        match self {
+            Self::Push => "Pushed",
+            Self::Pull => "Pulled",
+        }
+    }
+
+    /// Progress notice shown while the command runs.
+    fn in_progress(self) -> &'static str {
+        match self {
+            Self::Push => "Pushing to upstream…",
+            Self::Pull => "Pulling from upstream…",
+        }
+    }
+}
+
+/// Background `git push`/`git pull` runner for the footer's ahead/behind
+/// indicators. Mirrors [`GitStatusCache`]: the remote command runs off the UI
+/// thread and its result is drained on a later tick so a slow network sync
+/// never blocks rendering. Push and pull are tracked separately per directory
+/// so each indicator shows its own progress.
+struct GitRemoteState {
+    in_flight: HashSet<(PathBuf, GitRemoteAction)>,
+    sender: mpsc::Sender<(
+        PathBuf,
+        GitRemoteAction,
+        std::result::Result<String, String>,
+    )>,
+    receiver: mpsc::Receiver<(
+        PathBuf,
+        GitRemoteAction,
+        std::result::Result<String, String>,
+    )>,
+}
+
+impl Default for GitRemoteState {
     fn default() -> Self {
         let (sender, receiver) = mpsc::channel();
         Self {
@@ -1010,30 +1060,36 @@ impl Default for GitPushState {
     }
 }
 
-impl GitPushState {
-    fn is_pushing(&self, cwd: &Path) -> bool {
-        self.in_flight.contains(cwd)
+impl GitRemoteState {
+    fn is_running(&self, cwd: &Path, action: GitRemoteAction) -> bool {
+        self.in_flight.contains(&(cwd.to_path_buf(), action))
     }
 
-    /// Spawn `git push` for `cwd` unless one is already running there. Returns
-    /// true when a new push started.
-    fn start(&mut self, cwd: &Path) -> bool {
-        if !self.in_flight.insert(cwd.to_path_buf()) {
+    /// Spawn `action` for `cwd` unless the same action is already running
+    /// there. Returns true when a new command started.
+    fn start(&mut self, cwd: &Path, action: GitRemoteAction) -> bool {
+        if !self.in_flight.insert((cwd.to_path_buf(), action)) {
             return false;
         }
         let cwd = cwd.to_path_buf();
         let sender = self.sender.clone();
         thread::spawn(move || {
-            let outcome = run_git_push(&cwd);
-            let _ = sender.send((cwd, outcome));
+            let outcome = action.run(&cwd);
+            let _ = sender.send((cwd, action, outcome));
         });
         true
     }
 
-    fn drain(&mut self) -> Vec<(PathBuf, std::result::Result<String, String>)> {
+    fn drain(
+        &mut self,
+    ) -> Vec<(
+        PathBuf,
+        GitRemoteAction,
+        std::result::Result<String, String>,
+    )> {
         let mut finished = Vec::new();
         while let Ok(result) = self.receiver.try_recv() {
-            self.in_flight.remove(&result.0);
+            self.in_flight.remove(&(result.0.clone(), result.1));
             finished.push(result);
         }
         finished
@@ -1068,6 +1124,52 @@ fn run_git_push(cwd: &Path) -> std::result::Result<String, String> {
             .unwrap_or("git push failed")
             .to_string())
     }
+}
+
+fn run_git_pull(cwd: &Path) -> std::result::Result<String, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .arg("pull")
+        .output()
+        .map_err(|error| format!("could not run git: {error}"))?;
+    if output.status.success() {
+        // git writes the merge/rebase summary to stdout; the last non-empty
+        // line is the useful one ("Already up to date." or a fast-forward).
+        let summary = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("Pulled")
+            .to_string();
+        Ok(summary)
+    } else {
+        Err(git_last_stderr_line(&output))
+    }
+}
+
+/// Screen rectangle of the `↓M` token inside a right-aligned footer metadata
+/// line, or `None` when there is nothing to pull. Behind is the right-most
+/// metadata token, so its box ends at the metadata's right edge. Right
+/// alignment clips overflow on the left, so the suffix stays intact even when
+/// the path is truncated.
+fn git_behind_hit_area(status: &GitWorktreeStatus, metadata: Rect) -> Option<Rect> {
+    if status.behind == 0 {
+        return None;
+    }
+    let behind_token = format!("↓{}", status.behind);
+    let behind_width = behind_token.width() as u16;
+    let x = metadata.right().saturating_sub(behind_width);
+    if x < metadata.x {
+        return None;
+    }
+    Some(Rect {
+        x,
+        y: metadata.y,
+        width: behind_width,
+        height: 1,
+    })
 }
 
 /// Screen rectangle of the `↑N` token inside a right-aligned footer metadata
@@ -1497,10 +1599,11 @@ pub struct BorgTerminal {
     configured_model_entries: Vec<borg_provider::DynamicModelEntry>,
     extension_commands: Vec<borg_remote::ExtensionApiCommand>,
     git_status_cache: GitStatusCache,
-    git_push: GitPushState,
+    git_push: GitRemoteState,
     git_commit: GitCommitState,
     git_status_area: Option<Rect>,
     git_status_hovered: bool,
+    git_pull_area: Option<Rect>,
     git_commit_area: Option<Rect>,
     git_commit_hovered: bool,
     status: SessionStatus,
@@ -2718,10 +2821,11 @@ impl BorgTerminal {
             configured_model_entries: Vec::new(),
             extension_commands: Vec::new(),
             git_status_cache: GitStatusCache::default(),
-            git_push: GitPushState::default(),
+            git_push: GitRemoteState::default(),
             git_commit: GitCommitState::default(),
             git_status_area: None,
             git_status_hovered: false,
+            git_pull_area: None,
             git_commit_area: None,
             git_commit_hovered: false,
             status: SessionStatus::Starting,
@@ -2895,10 +2999,11 @@ impl BorgTerminal {
         self.cwd = cwd;
         self.extension_commands.clear();
         self.git_status_cache = GitStatusCache::default();
-        self.git_push = GitPushState::default();
+        self.git_push = GitRemoteState::default();
         self.git_commit = GitCommitState::default();
         self.git_status_area = None;
         self.git_status_hovered = false;
+        self.git_pull_area = None;
         self.git_commit_area = None;
         self.git_commit_hovered = false;
         self.status = SessionStatus::Starting;
@@ -4075,22 +4180,38 @@ impl BorgTerminal {
     /// UI thread; the result is drained on a later frame and shown as a notice.
     fn push_unpushed_commits(&mut self) {
         let cwd = self.active_git_cwd();
-        if self.git_push.is_pushing(&cwd) {
+        let action = GitRemoteAction::Push;
+        if self.git_push.is_running(&cwd, action) {
             self.notice = Some("Already pushing…".to_string());
             return;
         }
-        if self.git_push.start(&cwd) {
-            self.notice = Some("Pushing to upstream…".to_string());
+        if self.git_push.start(&cwd, action) {
+            self.notice = Some(action.in_progress().to_string());
+        }
+    }
+
+    /// Pull the upstream commits the footer behind-count is showing. Same
+    /// off-thread shape as the push path, with its own in-flight entry so a
+    /// push and a pull of the same directory do not block each other.
+    fn pull_upstream_commits(&mut self) {
+        let cwd = self.active_git_cwd();
+        let action = GitRemoteAction::Pull;
+        if self.git_push.is_running(&cwd, action) {
+            self.notice = Some("Already pulling…".to_string());
+            return;
+        }
+        if self.git_push.start(&cwd, action) {
+            self.notice = Some(action.in_progress().to_string());
         }
     }
 
     /// Drain finished background pushes, report the outcome, and force a git
     /// status refresh so the footer's ↑N reflects the new upstream.
     fn drain_git_push_results(&mut self) {
-        for (cwd, outcome) in self.git_push.drain() {
+        for (cwd, action, outcome) in self.git_push.drain() {
             match outcome {
-                Ok(summary) => self.notice = Some(format!("Pushed · {summary}")),
-                Err(error) => self.notice = Some(format!("git push failed · {error}")),
+                Ok(summary) => self.notice = Some(format!("{} · {summary}", action.done())),
+                Err(error) => self.notice = Some(format!("git {} failed · {error}", action.verb())),
             }
             self.git_status_cache.invalidate(&cwd);
         }
@@ -5626,6 +5747,13 @@ impl BorgTerminal {
                             .is_some_and(|area| area.contains(pointer))
                         {
                             self.push_unpushed_commits();
+                            return Ok(UiAction::None);
+                        }
+                        if self
+                            .git_pull_area
+                            .is_some_and(|area| area.contains(pointer))
+                        {
+                            self.pull_upstream_commits();
                             return Ok(UiAction::None);
                         }
                     }
@@ -8572,7 +8700,7 @@ impl BorgTerminal {
                 }
                 && let Some(git_status) = footer_git_status.as_ref()
             {
-                let pushing = self.git_push.is_pushing(&active_cwd);
+                let pushing = self.git_push.is_running(&active_cwd, GitRemoteAction::Push);
                 let committing = self.git_commit.is_committing(&active_cwd);
                 let tooltip_title = if self.git_commit_hovered {
                     " git commit "
@@ -8828,6 +8956,7 @@ impl BorgTerminal {
                 );
             }
             self.git_status_area = None;
+            self.git_pull_area = None;
             self.git_commit_area = None;
             if !is_launch_screen {
                 let footer_metadata = Some(footer_metadata_text(
@@ -8892,6 +9021,9 @@ impl BorgTerminal {
                     self.git_status_area = footer_git_status
                         .as_ref()
                         .and_then(|status| git_ahead_hit_area(status, metadata_rect));
+                    self.git_pull_area = footer_git_status
+                        .as_ref()
+                        .and_then(|status| git_behind_hit_area(status, metadata_rect));
                     self.git_commit_area = footer_git_status
                         .as_ref()
                         .and_then(|status| git_commit_hit_area(status, metadata_rect));
