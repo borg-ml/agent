@@ -180,6 +180,10 @@ struct Transcript {
     /// the entry the user chose rather than whatever slid into its index.
     pending_entry_insertions: Vec<usize>,
     next_image_number: usize,
+    /// Cell pixel size when the terminal can draw images (from the protocol
+    /// probe). `None` means a preview can only be a glyph tile, which packs two
+    /// pixels into one cell and cannot render text legibly.
+    image_cell: Option<(u16, u16)>,
     message_markdown_cache: RefCell<MessageMarkdownCache>,
     tool_body_cache: RefCell<ToolBodyCache>,
 }
@@ -228,6 +232,14 @@ struct ToolBodyCache {
     #[cfg(test)]
     misses: usize,
 }
+
+/// Glyph previews carry two pixels per cell, so past this width the extra
+/// columns show nothing a reader can use.
+const GLYPH_PREVIEW_TILE_WIDTH: usize = 48;
+const GLYPH_PREVIEW_TILE_ROWS: usize = 24;
+/// Rows a graphics preview may reserve. Two screens is enough for a full-size
+/// screenshot and keeps one image from burying the transcript around it.
+const MAX_GRAPHICS_PREVIEW_ROWS: usize = 120;
 
 impl Default for Transcript {
     fn default() -> Self {
@@ -286,6 +298,7 @@ impl Default for Transcript {
             last_edit: None,
             pending_entry_insertions: Vec::new(),
             next_image_number: 1,
+            image_cell: None,
             message_markdown_cache: RefCell::new(MessageMarkdownCache::default()),
             tool_body_cache: RefCell::new(ToolBodyCache::default()),
         }
@@ -507,6 +520,25 @@ fn transcript_entry_is_turn_output(entry: &TranscriptEntry) -> bool {
 }
 
 impl Transcript {
+    fn set_image_cell(&mut self, cell: Option<(u16, u16)>) {
+        self.image_cell = cell;
+    }
+
+    /// The line under a preview tile. On a terminal without graphics the reader
+    /// is told the tile cannot show the text rather than left to squint at it.
+    fn preview_caption(&self, number: usize, path: &std::path::Path) -> String {
+        if self.image_cell.is_some() {
+            format!("Image {number} · {}", display_name(path))
+        } else {
+            // The limitation goes before the name so truncation cannot
+            // swallow it.
+            format!(
+                "Image {number} · text unreadable here · {}",
+                display_name(path)
+            )
+        }
+    }
+
     fn message_id_at(&self, index: usize) -> Option<Uuid> {
         self.messages
             .iter()
@@ -4017,11 +4049,20 @@ impl Transcript {
                     link_rows.extend(message_lines.links);
                     lines.extend(message_lines.lines);
                     let available = width.saturating_sub(MESSAGE_HORIZONTAL_PADDING).max(1);
-                    // Give attachments a generous tile so the downscaled preview
-                    // keeps enough resolution to read the shape of the image,
-                    // while still allowing two side by side on a wide transcript.
-                    let tile_width = available.min(48);
-                    let tile_rows = tile_width.min(24);
+                    // A preview is only as legible as the resolution it is drawn
+                    // at. A graphics terminal draws the image at the tile pixel
+                    // size, so the tile takes the whole transcript width and the
+                    // rows the image needs at that width: a screenshot keeps its
+                    // own resolution and the text inside it stays readable. A
+                    // glyph tile packs two pixels into one cell, so it stays
+                    // small - and its caption says the text cannot be read there.
+                    let (tile_width, tile_rows) = match self.image_cell {
+                        Some(_) => (available, GLYPH_PREVIEW_TILE_ROWS.min(available)),
+                        None => {
+                            let tile_width = available.min(GLYPH_PREVIEW_TILE_WIDTH);
+                            (tile_width, tile_width.min(GLYPH_PREVIEW_TILE_ROWS))
+                        }
+                    };
                     let columns = ((available + 2) / (tile_width + 2)).max(1);
                     for group in attachments.chunks(columns) {
                         let mut cache = self.message_markdown_cache.borrow_mut();
@@ -4035,8 +4076,37 @@ impl Transcript {
                                     .previews
                                     .entry((path.clone(), tile_width, tile_rows))
                                     .or_insert_with(|| {
-                                        attachments::preview(path, tile_width, tile_rows)
-                                            .unwrap_or_default()
+                                        match self.image_cell {
+                                            Some(cell) => {
+                                                if let Some(rows) =
+                                                    attachments::graphics_preview_rows(
+                                                        path,
+                                                        tile_width,
+                                                        cell,
+                                                        MAX_GRAPHICS_PREVIEW_ROWS,
+                                                    )
+                                                {
+                                                    // The graphics protocol draws
+                                                    // over these rows; reserving
+                                                    // them is what sizes the image.
+                                                    vec![Line::default(); rows]
+                                                } else {
+                                                    // Unreadable size: a glyph
+                                                    // tile at least shows shape.
+                                                    attachments::preview(
+                                                        path,
+                                                        available
+                                                            .min(GLYPH_PREVIEW_TILE_WIDTH),
+                                                        GLYPH_PREVIEW_TILE_ROWS,
+                                                    )
+                                                    .unwrap_or_default()
+                                                }
+                                            }
+                                            None => {
+                                                attachments::preview(path, tile_width, tile_rows)
+                                                    .unwrap_or_default()
+                                            }
+                                        }
                                     })
                                     .clone()
                             })
@@ -4049,7 +4119,7 @@ impl Transcript {
                                 let tile = if row == height {
                                     Line::from(Span::styled(
                                         truncate_table_cell(
-                                            &format!("Image {number} · {}", display_name(path)),
+                                            &self.preview_caption(*number, path),
                                             tile_width,
                                         ),
                                         Style::default().fg(Color::LightCyan),

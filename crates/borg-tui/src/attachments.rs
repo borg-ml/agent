@@ -78,6 +78,40 @@ pub(super) fn preview(
     )
 }
 
+/// Rows a graphics preview needs at `width` columns so the image is drawn at
+/// its own resolution.
+///
+/// One cell carries `cell` pixels, so the tile geometry *is* the resolution the
+/// reader sees: reserving the rows the image needs is what keeps text inside a
+/// screenshot legible. Never upscales, and never exceeds `max_rows`.
+pub(super) fn graphics_preview_rows(
+    path: &Path,
+    width: usize,
+    cell: (u16, u16),
+    max_rows: usize,
+) -> Option<usize> {
+    if width == 0 || max_rows == 0 {
+        return None;
+    }
+    if fs::metadata(path).ok()?.len() > MAX_ATTACHMENT_BYTES {
+        return None;
+    }
+    let (image_width, image_height) = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if image_width == 0 || image_height == 0 {
+        return None;
+    }
+    let cell_width = f64::from(cell.0.max(1));
+    let cell_height = f64::from(cell.1.max(1));
+    let scale = (width as f64 * cell_width / f64::from(image_width)).min(1.0);
+    let rows = (f64::from(image_height) * scale / cell_height).ceil();
+    Some((rows.max(1.0) as usize).min(max_rows))
+}
+
 /// Decode an attachment for a terminal graphics protocol; bounded like `preview`.
 pub(super) fn load_preview_image(path: &Path) -> Option<image::DynamicImage> {
     if fs::metadata(path).ok()?.len() > MAX_ATTACHMENT_BYTES {
