@@ -32,6 +32,10 @@ pub enum SearchBackend {
     Firecrawl,
     Parallel,
     Brave,
+    /// Keyless search through the Exa MCP endpoint. It needs no credential,
+    /// which is what keeps web_search available on a host with none.
+    #[serde(rename = "exa-mcp")]
+    ExaMcp,
     Federated,
 }
 
@@ -42,6 +46,7 @@ impl SearchBackend {
             Self::Firecrawl => "firecrawl",
             Self::Parallel => "parallel",
             Self::Brave => "brave",
+            Self::ExaMcp => "exa-mcp",
             Self::Federated => "federated",
         }
     }
@@ -63,6 +68,7 @@ pub enum SearchBackendChoice {
     Firecrawl,
     Parallel,
     Brave,
+    ExaMcp,
 }
 
 impl SearchBackendChoice {
@@ -73,8 +79,9 @@ impl SearchBackendChoice {
             "firecrawl" => Ok(Self::Firecrawl),
             "parallel" => Ok(Self::Parallel),
             "brave" => Ok(Self::Brave),
+            "exa-mcp" | "exa_mcp" | "keyless" => Ok(Self::ExaMcp),
             other => bail!(
-                "unsupported BORG_SEARCH_BACKEND {other}; expected auto, exa, firecrawl, parallel, or brave"
+                "unsupported BORG_SEARCH_BACKEND {other}; expected auto, exa, firecrawl, parallel, brave, or exa-mcp"
             ),
         }
     }
@@ -168,7 +175,8 @@ impl SearchConfig {
             SearchBackend::Firecrawl => self.firecrawl_api_key.as_deref(),
             SearchBackend::Parallel => self.parallel_api_key.as_deref(),
             SearchBackend::Brave => self.brave_api_key.as_deref(),
-            SearchBackend::Federated => None,
+            // The keyless route carries no credential by design.
+            SearchBackend::ExaMcp | SearchBackend::Federated => None,
         }
         .filter(|key| !key.trim().is_empty())
     }
@@ -305,6 +313,7 @@ impl SearchService {
             SearchBackendChoice::Firecrawl => config.key_for(SearchBackend::Firecrawl).is_some(),
             SearchBackendChoice::Parallel => config.key_for(SearchBackend::Parallel).is_some(),
             SearchBackendChoice::Brave => config.key_for(SearchBackend::Brave).is_some(),
+            SearchBackendChoice::ExaMcp => true,
         };
         configured.then(|| Self::new(config)).transpose()
     }
@@ -328,6 +337,7 @@ impl SearchService {
                 .config
                 .key_for(SearchBackend::Brave)
                 .map(|_| SearchBackend::Brave),
+            SearchBackendChoice::ExaMcp => Some(SearchBackend::ExaMcp),
         }
     }
 
@@ -336,6 +346,9 @@ impl SearchService {
         backend: SearchBackend,
         request: &SearchRequest,
     ) -> Result<SearchResponse> {
+        if backend == SearchBackend::ExaMcp {
+            return self.search_exa_mcp(request).await;
+        }
         let key = self
             .config
             .key_for(backend)
@@ -345,7 +358,9 @@ impl SearchService {
             SearchBackend::Firecrawl => self.search_firecrawl(key, request).await,
             SearchBackend::Parallel => self.search_parallel(key, request).await,
             SearchBackend::Brave => self.search_brave(key, request).await,
-            SearchBackend::Federated => bail!("federated is not a direct search backend"),
+            SearchBackend::ExaMcp | SearchBackend::Federated => {
+                bail!("{backend} is not a keyed search backend")
+            }
         }
     }
 
@@ -378,6 +393,59 @@ impl SearchService {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             results: normalize_results(request, parse_exa_results(&payload)),
+            backends: Vec::new(),
+            warnings: Vec::new(),
+        })
+    }
+
+    /// Keyless search through the Exa MCP endpoint.
+    ///
+    /// The endpoint speaks JSON-RPC over server-sent events and needs no
+    /// credential, which is what keeps web_search available on a host with no
+    /// keys at all. Auto selects it only when nothing keyed is configured, and
+    /// an explicit BORG_SEARCH_BACKEND still overrides that in either
+    /// direction.
+    async fn search_exa_mcp(&self, request: &SearchRequest) -> Result<SearchResponse> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "web_search_exa",
+                "arguments": {
+                    "query": request.query.trim(),
+                    "numResults": request.max_results,
+                },
+            },
+        });
+        let response = self
+            .client
+            .post(EXA_MCP_ENDPOINT)
+            .header("accept", "application/json, text/event-stream")
+            .header("user-agent", EXA_MCP_USER_AGENT)
+            .json(&body)
+            .send()
+            .await
+            .context("Exa MCP web search request failed")?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("read Exa MCP web search response")?;
+        ensure!(
+            status.is_success(),
+            "Exa MCP web search returned HTTP {}",
+            status.as_u16()
+        );
+        let payload = parse_mcp_sse_payload(&text).context("decode Exa MCP web search response")?;
+        let blocks = mcp_result_text(&payload)?;
+        Ok(SearchResponse {
+            backend: SearchBackend::ExaMcp,
+            query: request.query.trim().to_string(),
+            request_id: None,
+            // The endpoint offers no domain filter of its own, so this request
+            // filters and caps whatever it returns instead.
+            results: normalize_results(request, parse_exa_mcp_results(&blocks)),
             backends: Vec::new(),
             warnings: Vec::new(),
         })
@@ -514,6 +582,10 @@ impl WebSearchProvider for SearchService {
                 self.search_with_backend(SearchBackend::Brave, &request)
                     .await
             }
+            SearchBackendChoice::ExaMcp => {
+                self.search_with_backend(SearchBackend::ExaMcp, &request)
+                    .await
+            }
         }
     }
 }
@@ -537,7 +609,7 @@ impl SearchService {
 }
 
 fn configured_backends(config: &SearchConfig) -> Vec<SearchBackend> {
-    [
+    let keyed = [
         SearchBackend::Exa,
         SearchBackend::Firecrawl,
         SearchBackend::Parallel,
@@ -545,7 +617,15 @@ fn configured_backends(config: &SearchConfig) -> Vec<SearchBackend> {
     ]
     .into_iter()
     .filter(|backend| config.key_for(*backend).is_some())
-    .collect()
+    .collect::<Vec<_>>();
+    if keyed.is_empty() {
+        // With nothing keyed, the keyless route is the only backend there is,
+        // so Auto selects it instead of reporting search as unavailable. A host
+        // that configured a key keeps exactly the set it had before, and an
+        // explicit BORG_SEARCH_BACKEND still overrides the choice either way.
+        return vec![SearchBackend::ExaMcp];
+    }
+    keyed
 }
 
 fn merge_search_outcomes(
@@ -648,6 +728,151 @@ async fn response_json(response: reqwest::Response, label: &str) -> Result<Value
         );
     }
     serde_json::from_slice(&body).with_context(|| format!("decode {label} JSON response"))
+}
+
+/// The keyless Exa MCP endpoint.
+const EXA_MCP_ENDPOINT: &str = "https://mcp.exa.ai/mcp";
+
+/// The user agent this route presents.
+///
+/// Cloudflare fronts the endpoint and answers a request that carries no user
+/// agent with Error 1010 before it reaches the service, so the header is
+/// required rather than polite.
+const EXA_MCP_USER_AGENT: &str = concat!("borg/", env!("CARGO_PKG_VERSION"));
+
+/// Pull the JSON-RPC payload out of an MCP server-sent event stream.
+///
+/// The endpoint frames one data line per event, but a proxy in front of it may
+/// hand back a plain JSON body, so both shapes are accepted.
+fn parse_mcp_sse_payload(text: &str) -> Result<Value> {
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(data.trim()) else {
+            continue;
+        };
+        if value.get("result").is_some() || value.get("error").is_some() {
+            return Ok(value);
+        }
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(text.trim()) {
+        return Ok(value);
+    }
+    bail!("no JSON-RPC payload in the response")
+}
+
+/// The readable text blocks carried by a JSON-RPC tool result.
+fn mcp_result_text(payload: &Value) -> Result<String> {
+    if let Some(error) = payload.get("error") {
+        bail!(
+            "Exa MCP web search failed: {}",
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+        );
+    }
+    let content = payload
+        .pointer("/result/content")
+        .and_then(Value::as_array)
+        .context("Exa MCP web search returned no content")?;
+    let text = content
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ensure!(
+        !text.trim().is_empty(),
+        "Exa MCP web search returned empty content"
+    );
+    Ok(text)
+}
+
+/// Parse the readable result blocks into the normalized result shape.
+///
+/// Each block is a run of label and value lines, so a new title line starts the
+/// next result and the lines under the highlights field become the snippet.
+fn parse_exa_mcp_results(text: &str) -> Vec<SearchResult> {
+    let mut results: Vec<SearchResult> = Vec::new();
+    for line in text.lines() {
+        if let Some((field, value)) = split_mcp_field(line) {
+            match field.as_str() {
+                "title" => results.push(SearchResult {
+                    title: value,
+                    url: String::new(),
+                    snippet: String::new(),
+                    published_at: None,
+                }),
+                "url" => {
+                    if let Some(last) = results.last_mut() {
+                        last.url = value;
+                    }
+                }
+                "published" => {
+                    if let Some(last) = results.last_mut() {
+                        // The endpoint writes a placeholder where it has no
+                        // date, which is not a publication time.
+                        last.published_at = (!is_missing_mcp_value(&value)).then_some(value);
+                    }
+                }
+                "highlights" | "text" | "summary" => append_mcp_snippet(&mut results, &value),
+                // The author and any other label have no field in the
+                // normalized result, so they are dropped rather than folded
+                // into the snippet.
+                _ => {}
+            }
+            continue;
+        }
+        append_mcp_snippet(&mut results, line.trim());
+    }
+    results.retain(|result| !result.url.trim().is_empty());
+    for result in &mut results {
+        result.snippet = truncate(result.snippet.trim());
+    }
+    results
+}
+
+/// Whether a field carries the endpoint placeholder instead of a value.
+fn is_missing_mcp_value(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty()
+        || matches!(
+            value.to_ascii_lowercase().as_str(),
+            "n/a" | "na" | "none" | "unknown" | "-"
+        )
+}
+
+/// The label and value of one field line, when the label is one the endpoint is
+/// known to emit.
+fn split_mcp_field(line: &str) -> Option<(String, String)> {
+    const FIELDS: [&str; 7] = [
+        "title",
+        "url",
+        "published",
+        "author",
+        "highlights",
+        "text",
+        "summary",
+    ];
+    let (label, value) = line.split_once(":")?;
+    let label = label.trim().to_ascii_lowercase();
+    FIELDS
+        .contains(&label.as_str())
+        .then(|| (label, value.trim().to_string()))
+}
+
+fn append_mcp_snippet(results: &mut [SearchResult], line: &str) {
+    if line.is_empty() {
+        return;
+    }
+    let Some(last) = results.last_mut() else {
+        return;
+    };
+    if !last.snippet.is_empty() {
+        last.snippet.push('\n');
+    }
+    last.snippet.push_str(line);
 }
 
 fn parse_exa_results(payload: &Value) -> Vec<SearchResult> {
@@ -1063,6 +1288,69 @@ mod tests {
         assert_eq!(results[0].title, "Brave docs");
         assert_eq!(results[0].snippet, "Brave description");
         assert_eq!(results[0].published_at.as_deref(), Some("2 days ago"));
+    }
+
+    #[test]
+    fn keyless_backend_carries_auto_only_when_nothing_is_keyed() {
+        let unconfigured = SearchConfig::default();
+        assert_eq!(
+            configured_backends(&unconfigured),
+            vec![SearchBackend::ExaMcp]
+        );
+        // The service therefore exists on a host with no credentials at all,
+        // which is what keeps the web_search tool in the session.
+        let service = SearchService::new(unconfigured).expect("keyless service");
+        assert_eq!(service.configured_backend(), Some(SearchBackend::ExaMcp));
+
+        let keyed = SearchConfig {
+            exa_api_key: Some("test-key".to_string()),
+            ..SearchConfig::default()
+        };
+        // A host that configured a key keeps exactly the set it had.
+        assert_eq!(configured_backends(&keyed), vec![SearchBackend::Exa]);
+    }
+
+    #[test]
+    fn keyless_mcp_reply_parses_into_normalized_results() {
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "Title: Rust async book\nURL: https://rust-lang.github.io/async-book/\nPublished: 2024-01-02\nAuthor: Jane Doe\nHighlights:\nAsync in depth\n\nTitle: Excluded\nURL: https://example.com/blocked\nHighlights:\nnoise\n\nTitle: Undated\nURL: https://doc.rust-lang.org/stable/book/\nPublished: N/A\nHighlights:\nno date given"
+                }]
+            }
+        });
+        let framed = format!("event: message\ndata: {reply}\n\n");
+        let payload = parse_mcp_sse_payload(&framed).expect("json-rpc payload");
+        let blocks = mcp_result_text(&payload).expect("text blocks");
+        let mut request = SearchRequest::bounded("rust async", Some(5)).expect("request");
+        request.exclude_domains = vec!["example.com".to_string()];
+        let results = normalize_results(&request, parse_exa_mcp_results(&blocks));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].title, "Rust async book");
+        assert_eq!(results[0].url, "https://rust-lang.github.io/async-book/");
+        assert_eq!(results[0].published_at.as_deref(), Some("2024-01-02"));
+        assert!(results[0].snippet.contains("Async in depth"));
+        // The endpoint writes a placeholder where it has no date, so an undated
+        // result must not report one.
+        assert_eq!(results[1].title, "Undated");
+        assert_eq!(results[1].published_at, None);
+        assert!(results[1].snippet.contains("no date given"));
+    }
+
+    #[test]
+    fn a_json_rpc_error_is_reported_rather_than_read_as_results() {
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "error": { "code": -32000, "message": "rate limited" }
+        });
+        let framed = format!("event: message\ndata: {reply}\n\n");
+        let payload = parse_mcp_sse_payload(&framed).expect("json-rpc payload");
+        let error = mcp_result_text(&payload).expect_err("an error reply is a failure");
+        assert!(error.to_string().contains("rate limited"), "{error}");
     }
 
     #[test]
