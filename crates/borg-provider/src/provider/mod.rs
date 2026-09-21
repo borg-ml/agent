@@ -746,25 +746,17 @@ pub const MIN_REASONING_OUTPUT_TOKENS: u64 = 16;
 
 /// Estimate the extra API-equivalent cost of reprocessing tokens that would
 /// otherwise have been served from OpenAI's prompt cache.
-pub fn estimate_openai_cache_miss_microusd(
+pub fn estimate_cache_miss_microusd(
+    provider: Option<&str>,
     model: &str,
     missed_tokens: u64,
-    prompt_tokens: u64,
 ) -> Option<u64> {
-    let pricing = openai_model_pricing(model)?;
-    let long_context_pricing = pricing
-        .long_context_input_threshold
-        .is_some_and(|threshold| prompt_tokens > threshold);
-    let multiplier = if long_context_pricing { 2 } else { 1 };
-    let input_rate = pricing
-        .input_microusd_per_million
-        .saturating_mul(multiplier);
-    let cached_rate = pricing
-        .cached_input_microusd_per_million
-        .saturating_mul(multiplier);
+    let pricing = model_pricing(provider, model)?;
     Some(microusd_for_tokens(
         missed_tokens,
-        input_rate.saturating_sub(cached_rate),
+        pricing
+            .input_microusd_per_million
+            .saturating_sub(pricing.cached_input_microusd_per_million),
     ))
 }
 
@@ -781,18 +773,13 @@ pub fn estimate_openai_cache_miss_microusd(
 /// the model's prices are unknown, which is what makes a route report honestly
 /// ineligible instead of guessing.
 pub fn estimate_prompt_cache_refresh_microusd(
+    provider: Option<&str>,
     model: &str,
     prompt_tokens: u64,
     output_tokens: u64,
 ) -> Option<u64> {
-    let pricing = openai_model_pricing(model)?;
-    let long_context_pricing = pricing
-        .long_context_input_threshold
-        .is_some_and(|threshold| prompt_tokens > threshold);
-    let multiplier = if long_context_pricing { 2 } else { 1 };
-    let cached_rate = pricing
-        .cached_input_microusd_per_million
-        .saturating_mul(multiplier);
+    let pricing = model_pricing(provider, model)?;
+    let cached_rate = pricing.cached_input_microusd_per_million;
     Some(
         microusd_for_tokens(prompt_tokens, cached_rate).saturating_add(microusd_for_tokens(
             output_tokens,
@@ -839,30 +826,31 @@ fn provider_cost_usd_to_microusd(cost_usd: f64) -> Option<u64> {
     Some(cost_microusd as u64)
 }
 
-struct OpenAiModelPricing {
+struct ModelPricing {
     input_microusd_per_million: u64,
     cached_input_microusd_per_million: u64,
     output_microusd_per_million: u64,
-    long_context_input_threshold: Option<u64>,
 }
 
-fn openai_model_pricing(model: &str) -> Option<OpenAiModelPricing> {
-    let normalized = model.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "gpt-5.5" => Some(OpenAiModelPricing {
-            input_microusd_per_million: 5_000_000,
-            cached_input_microusd_per_million: 500_000,
-            output_microusd_per_million: 30_000_000,
-            long_context_input_threshold: Some(272_000),
-        }),
-        model if model == crate::codex_product_model() => Some(OpenAiModelPricing {
-            input_microusd_per_million: 5_000_000,
-            cached_input_microusd_per_million: 500_000,
-            output_microusd_per_million: 30_000_000,
-            long_context_input_threshold: Some(272_000),
-        }),
-        _ => None,
-    }
+/// The published price of `model`, from the shared models.dev catalog.
+///
+/// Borg used to carry a hand-written table here that knew two model ids, one of
+/// them obsolete, so warming and cost estimates were effectively limited to one
+/// route. The catalog Borg already downloads for context windows states the
+/// prices, so there is one source and no second copy to rot. A model the catalog
+/// omits has no price, and every estimate that needs one stays unavailable
+/// rather than guessed.
+///
+/// The catalog quotes one rate per model, so a vendor long-context surcharge is
+/// not modelled. That makes an estimate past such a threshold conservative,
+/// which is the safe direction for a decision about spending.
+fn model_pricing(provider: Option<&str>, model: &str) -> Option<ModelPricing> {
+    let price = opencode_model::catalog_pricing(provider, model)?;
+    Some(ModelPricing {
+        input_microusd_per_million: price.input_microusd_per_million,
+        cached_input_microusd_per_million: price.cached_input_microusd_per_million,
+        output_microusd_per_million: price.output_microusd_per_million,
+    })
 }
 
 pub(crate) fn parse_chat_completion_json_text(text: &str) -> Option<Value> {
@@ -1001,7 +989,7 @@ mod tests {
 
     use super::{
         CLAUDE_DEFAULT_MODEL, CLAUDE_SELECTABLE_MODELS, PROVIDER_HTTP_ERROR_BODY_MAX_BYTES,
-        estimate_openai_cache_miss_microusd, extract_chat_completions_usage, microusd_for_tokens,
+        estimate_cache_miss_microusd, extract_chat_completions_usage, microusd_for_tokens,
         parse_chat_completion_json_text, provider_cost_usd_to_microusd,
         provider_response_body_would_exceed_limit, truncate_provider_text,
     };
@@ -1046,14 +1034,6 @@ mod tests {
             1,
             PROVIDER_HTTP_ERROR_BODY_MAX_BYTES,
         ));
-    }
-
-    #[test]
-    fn openai_cache_miss_estimate_is_the_uncached_read_premium() {
-        assert_eq!(
-            estimate_openai_cache_miss_microusd(crate::codex_product_model(), 100_000, 100_000,),
-            Some(450_000)
-        );
     }
 
     #[test]

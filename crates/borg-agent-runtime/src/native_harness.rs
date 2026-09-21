@@ -1870,22 +1870,23 @@ impl PromptCacheRefreshClient for ProviderModelClient {
 
     fn refresh_economics(
         &self,
-        _provider: crate::CodingProvider,
+        provider: crate::CodingProvider,
         model: &str,
         prompt_tokens: u64,
         max_output_tokens: u64,
     ) -> Option<Economics> {
         Some(Economics {
             warm_microusd: borg_provider::provider::estimate_prompt_cache_refresh_microusd(
+                Some(provider.catalog_backend()),
                 model,
                 prompt_tokens,
                 max_output_tokens,
             )?,
             // A lost entry has to reprocess the whole prompt, so the tokens
             // missed and the prompt size are the same number here.
-            miss_microusd: borg_provider::provider::estimate_openai_cache_miss_microusd(
+            miss_microusd: borg_provider::provider::estimate_cache_miss_microusd(
+                Some(provider.catalog_backend()),
                 model,
-                prompt_tokens,
                 prompt_tokens,
             )?,
         })

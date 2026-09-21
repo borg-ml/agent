@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use borg_provider::provider::estimate_openai_cache_miss_microusd;
+use borg_provider::provider::estimate_cache_miss_microusd;
 use borg_remote::CodingProvider;
 use chrono::{DateTime, Utc};
 
@@ -352,8 +352,7 @@ impl CacheMissNotice {
         );
         if api_billing_basis
             && let Some(model) = self.model.as_deref()
-            && let Some(cost) =
-                estimate_openai_cache_miss_microusd(model, self.missed_tokens, self.prompt_tokens)
+            && let Some(cost) = estimate_cache_miss_microusd(None, model, self.missed_tokens)
         {
             facts.push(format!(
                 "estimated API cache-miss premium {}",

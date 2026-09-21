@@ -44,17 +44,21 @@ available to read.
    rather than durable history: the transcript keeps every byte and only the
    replayed view is trimmed, with a boundary event recorded so the trim is
    visible and attributable.
-2. **Warming economics.** Warming is unreachable for most routes for two
-   compounding reasons: a cache lifetime is known only for `claude-` models
-   (`prompt_cache_lifetime`), and the economics check needs a price, which exists
-   only for `gpt-5.5` and the Codex product model. An operator can declare
-   `prompt_cache_ttl_seconds` for a configured provider, but with no price the
-   route still refuses. Raising this needs a decision rather than a guess: either
-   price tables per vendor, or a quota-aware justification that lets a
-   subscription route warm when its own reported cached-token usage shows the
-   saving, without pretending to know dollars.
-3. **Anthropic pricing.** Unlocks both an honest cost basis on that route and its
-   cache warming, with no further code change.
+2. **Warming where no lifetime is documented.** Prices come from the catalog
+   (below), so warming fires wherever a documented lifetime exists, which today
+   is the direct Anthropic route. Every other vendor is left without a lifetime
+   on purpose, and pi reaches the same conclusion: it annotates only direct
+   Anthropic rather than assuming a proxy behaves the same, and refuses OpenAI
+   lifetimes until observed expiry and billing show a documented TTL means full
+   cache loss. An operator who knows a vendor retention can still declare
+   `prompt_cache_ttl_seconds` for a configured provider. Making warming fire on a
+   subscription route because its own cached-token usage shows a saving, without
+   knowing dollars, is a product decision rather than a missing capability.
+3. **Pricing source.** Done: prices are read from the models.dev document Borg
+   already downloads for context windows, per provider and model, instead of the
+   hand-written table that knew two ids, one of them obsolete. A model the
+   catalog omits has no price, so an estimate stays unavailable rather than
+   invented.
 4. **Request-body recording for cache forensics.** Borg classifies misses after
    the fact from usage. ZCode records exact request bodies per turn and asserts
    the append-only invariant, ignoring `cache_control` drift when comparing,
