@@ -29,6 +29,32 @@ pub struct PostgresWorkspaceStore {
     pool: PgPool,
 }
 
+/// Provision or refresh the participant row an agent instance belongs to.
+///
+/// Both instance upserts need it, and both must not clobber a display name or
+/// kind another path already recorded.
+async fn upsert_participant_row(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    participant: &Participant,
+) -> Result<()> {
+    ensure!(
+        participant.kind == ParticipantKind::Agent,
+        "instance must be an agent"
+    );
+    sqlx::query(
+        "insert into workspace_participants (id, display_name, kind, created_at) \
+         values ($1, $2, $3, $4) on conflict (id) do update set \
+         display_name = excluded.display_name, kind = excluded.kind",
+    )
+    .bind(participant.id.to_string())
+    .bind(&participant.display_name)
+    .bind(serde_json::to_string(&participant.kind)?)
+    .bind(participant.created_at.to_rfc3339())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 impl PostgresWorkspaceStore {
     /// Adopt a pool that already has the satellite schema applied.
     ///
@@ -1120,32 +1146,68 @@ impl WorkspaceStore for PostgresWorkspaceStore {
         host_id: Option<Uuid>,
         workspace_id: Option<Uuid>,
     ) -> Result<()> {
-        ensure!(
-            participant.kind == ParticipantKind::Agent,
-            "instance must be an agent"
-        );
         let mut transaction = self.pool.begin().await?;
-        sqlx::query(
-            "insert into workspace_participants (id, display_name, kind, created_at) \
-             values ($1, $2, $3, $4) on conflict (id) do update set \
-             display_name = excluded.display_name, kind = excluded.kind",
-        )
-        .bind(participant.id.to_string())
-        .bind(&participant.display_name)
-        .bind(serde_json::to_string(&participant.kind)?)
-        .bind(participant.created_at.to_rfc3339())
-        .execute(&mut *transaction)
-        .await?;
+        upsert_participant_row(&mut transaction, &participant).await?;
         sqlx::query(
             "insert into agent_instances (participant_id, host_id, workspace_id, seen_at) \
              values ($1, $2, $3, $4) on conflict (participant_id) do update set \
-             host_id = excluded.host_id, workspace_id = excluded.workspace_id, \
+             host_id = excluded.host_id, \
+             workspace_id = coalesce(excluded.workspace_id, agent_instances.workspace_id), \
              seen_at = excluded.seen_at",
         )
         .bind(participant.id.to_string())
         .bind(host_id.map(|id| id.to_string()))
         .bind(workspace_id.map(|id| id.to_string()))
         .bind(Utc::now().to_rfc3339())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    async fn upsert_directory_instance(
+        &self,
+        participant: Participant,
+        host_id: Option<Uuid>,
+        workspace_id: Option<Uuid>,
+        cwd: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<()> {
+        // A directory entry is a thin mirror of another host's registry: it
+        // carries the launch directory and the owning host's lifecycle state,
+        // and it routinely leaves the workspace out. So every column it can
+        // fail to supply keeps what a local registration already knows, and
+        // only the columns it does supply are authoritative.
+        //
+        // `stopped` is the one state that retires a peer: nothing on this
+        // installation can reach it, and the listing's reap sweep only ever
+        // sees local rows, so an unretired stopped row is advertised for ever.
+        let mut transaction = self.pool.begin().await?;
+        upsert_participant_row(&mut transaction, &participant).await?;
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(
+            "insert into agent_instances \
+             (participant_id, host_id, workspace_id, seen_at, cwd, pid, status, exited_at) \
+             values ($1, $2, $3, $4, $5, null, $6, case when $6 = 'stopped' then $4 else null end) \
+             on conflict (participant_id) do update set \
+             host_id = excluded.host_id, \
+             workspace_id = coalesce(excluded.workspace_id, agent_instances.workspace_id), \
+             seen_at = excluded.seen_at, \
+             cwd = coalesce(agent_instances.cwd, excluded.cwd), \
+             status = excluded.status, \
+             exited_at = case \
+                 when excluded.status = 'stopped' \
+                     then coalesce(agent_instances.exited_at, excluded.seen_at) \
+                 when excluded.status in ('running', 'ready', 'starting') then null \
+                 else agent_instances.exited_at \
+             end",
+        )
+        .bind(participant.id.to_string())
+        .bind(host_id.map(|id| id.to_string()))
+        .bind(workspace_id.map(|id| id.to_string()))
+        .bind(&now)
+        .bind(cwd)
+        .bind(status)
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
@@ -1188,7 +1250,7 @@ impl WorkspaceStore for PostgresWorkspaceStore {
         // it materialises.
         let rows = sqlx::query(
             "select p.id, p.display_name, p.kind, p.created_at, i.host_id, i.workspace_id, \
-                    i.seen_at, i.cwd, i.pid, i.exited_at \
+                    i.seen_at, i.cwd, i.pid, i.status, i.exited_at \
              from workspace_participants p \
              left join agent_instances i on i.participant_id = p.id \
              where p.kind = $1 and ($2 or i.exited_at is null) \
@@ -1223,6 +1285,7 @@ impl WorkspaceStore for PostgresWorkspaceStore {
                         .transpose()?
                         .map(|seen| seen.with_timezone(&Utc)),
                     cwd: row.try_get("cwd")?,
+                    status: row.try_get("status")?,
                     pid,
                     exited_at: row
                         .try_get::<Option<String>, _>("exited_at")?

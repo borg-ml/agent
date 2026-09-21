@@ -297,6 +297,9 @@ impl PostgresSessionStore {
             .execute(&mut *transaction)
             .await
             .context("failed to apply the Postgres satellite schema")?;
+        sqlx::query("alter table agent_instances add column if not exists status text")
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query(
             "alter table borg_session_schema add column if not exists definition_hash text",
         )

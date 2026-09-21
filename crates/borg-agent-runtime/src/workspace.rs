@@ -41,8 +41,16 @@ pub struct AgentInstance {
     /// The working directory the instance was launched against. `display_name`
     /// is only the workspace basename, so several sessions in different
     /// checkouts are otherwise indistinguishable; this is what tells them
-    /// apart. Recorded locally at launch and absent for remote entries.
+    /// apart. Recorded locally at launch, and for an instance on another host
+    /// reported by that host in the directory sync.
     pub cwd: Option<String>,
+    /// The owning host's lifecycle state for this instance as last reported by
+    /// the directory sync: `running`, `ready`, `starting`, or `stopped`.
+    /// Absent for a row no directory sync has covered. A `stopped` instance is
+    /// tombstoned the moment it is reported, because nothing on this
+    /// installation can reach it and a listing that keeps advertising it buries
+    /// the peers that are running.
+    pub status: Option<String>,
     /// The owning OS process, recorded locally at launch. Absent for remote
     /// entries, whose pids are meaningless on this machine.
     pub pid: Option<i64>,
@@ -533,6 +541,27 @@ pub trait WorkspaceStore: Send + Sync {
         participant: Participant,
         host_id: Option<Uuid>,
         workspace_id: Option<Uuid>,
+    ) -> Result<()>;
+
+    /// Cache one entry of an authenticated directory sync.
+    ///
+    /// Separate from [`WorkspaceStore::upsert_instance`] because it carries what
+    /// the owning host reports about the instance: where it runs, and whether
+    /// it runs at all. `upsert_instance` provisions a participant this
+    /// installation is arranging to reach and knows none of that.
+    ///
+    /// A `stopped` instance is tombstoned on sight, so the default listing stops
+    /// advertising a peer that cannot answer; any running state clears the
+    /// tombstone again. Fields the directory leaves empty never erase what was
+    /// learned locally, because a directory entry is a thin mirror -- it even
+    /// omits the workspace most of the time.
+    async fn upsert_directory_instance(
+        &self,
+        participant: Participant,
+        host_id: Option<Uuid>,
+        workspace_id: Option<Uuid>,
+        cwd: Option<&str>,
+        status: Option<&str>,
     ) -> Result<()>;
 
     /// Transition a delivery addressed by message id rather than sequence.
