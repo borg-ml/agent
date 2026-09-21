@@ -2791,12 +2791,18 @@ impl BorgTerminal {
         // Query before the input thread takes stdin: the probe reads the
         // terminal's reply itself.
         let image_picker = detect_image_picker();
+        let mut transcript = root_transcript_from_environment();
+        // The preview resolution is the tile geometry, and the tile is sized in
+        // cells: without the cell pixel size a graphics preview cannot know how
+        // many rows the image needs. A picker that reports none keeps glyph
+        // previews, which say so rather than pretending to be legible.
+        transcript.set_image_cell(image_preview_cell(image_picker.as_ref()));
         Ok(Self {
             terminal,
             input: TerminalInput::spawn(),
             mode,
             keyboard_enhanced,
-            transcript: root_transcript_from_environment(),
+            transcript,
             director_transcript: None,
             child_transcripts: HashMap::new(),
             child_unhydrated_events: HashMap::new(),
@@ -15783,6 +15789,12 @@ fn image_preview_slots(links: &[LinkRowRange]) -> Vec<ImagePreviewSlot> {
         index = end;
     }
     slots
+}
+
+/// Cell pixel size for transcript previews, when the terminal reported it.
+fn image_preview_cell(picker: Option<&ImagePicker>) -> Option<(u16, u16)> {
+    let cell = picker?.font_size();
+    (cell.width > 0 && cell.height > 0).then_some((cell.width, cell.height))
 }
 
 /// Probe the terminal for a graphics protocol. `BORG_IMAGE_PROTOCOL=halfblocks`

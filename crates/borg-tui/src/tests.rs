@@ -14553,3 +14553,87 @@ fn copied_image_message_round_trips_text_and_ordered_images_into_another_session
         }
     }
 }
+
+/// Rows the transcript reserved for an attachment preview, counted the way the
+/// graphics overlay finds them: consecutive link rows carrying the same URL.
+fn preview_rows_for(rendered: &TranscriptRender, path: &Path) -> (usize, usize) {
+    let url = url::Url::from_file_path(path).unwrap().to_string();
+    let rows = rendered
+        .5
+        .iter()
+        .filter(|link| link.url == url)
+        .collect::<Vec<_>>();
+    let width = rows
+        .first()
+        .map(|link| link.end.saturating_sub(link.start))
+        .unwrap_or(0);
+    (rows.len(), width)
+}
+
+fn attachment_transcript(path: &Path, cell: Option<(u16, u16)>) -> Transcript {
+    let mut transcript = Transcript::default();
+    transcript.set_image_cell(cell);
+    transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::User,
+        text: "inspect [Image 1]".to_string(),
+        attachments: vec![(1, path.to_path_buf())],
+        model: None,
+        effort: None,
+        time: "2026-08-26 12:00".to_string(),
+        status: MessageStatus::Complete,
+        complete: true,
+        user_interrupted: false,
+        redirected: false,
+    });
+    transcript
+}
+
+#[test]
+fn graphics_terminal_reserves_the_resolution_an_image_preview_needs() {
+    // Failure mode: a graphics-capable terminal showing a screenshot squeezed
+    // into the glyph tile, which is a thumbnail no reader can read text in.
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("shot.png");
+    image::RgbImage::from_pixel(1600, 900, image::Rgb([10, 20, 30]))
+        .save(&path)
+        .unwrap();
+
+    let rendered = attachment_transcript(&path, Some((8, 16))).render(200, None, None, None);
+    let (rows, width) = preview_rows_for(&rendered, &path);
+
+    // 200 columns carry 1600 pixels, so the image is drawn at its own size: one
+    // cell per 16 rows of a 900 pixel image.
+    assert!(rows >= 50, "reserved {rows} rows for a 900px image");
+    assert!(width >= 150, "preview width {width} columns");
+    assert!(
+        !rendered
+            .0
+            .iter()
+            .any(|line| line.to_string().contains("not readable")),
+        "a graphics terminal must not claim the preview is unreadable"
+    );
+}
+
+#[test]
+fn glyph_terminal_says_a_preview_cannot_show_text() {
+    // Failure mode: a terminal without graphics silently printing an
+    // unreadable block instead of telling the reader why.
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("shot.png");
+    image::RgbImage::from_pixel(1600, 900, image::Rgb([10, 20, 30]))
+        .save(&path)
+        .unwrap();
+
+    let rendered = attachment_transcript(&path, None).render(200, None, None, None);
+    let (rows, width) = preview_rows_for(&rendered, &path);
+
+    assert!(rows <= 25, "glyph tile reserved {rows} rows");
+    assert!(width <= 48, "glyph tile width {width} columns");
+    assert!(
+        rendered
+            .0
+            .iter()
+            .any(|line| line.to_string().contains("text unreadable")),
+        "the glyph fallback must say the text cannot be read"
+    );
+}
