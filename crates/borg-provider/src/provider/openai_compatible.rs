@@ -601,7 +601,7 @@ impl OpenAiCompatibleProvider {
                 ),
                 trace: Box::new(trace),
                 session_id: None,
-                kind: compatible_provider_error_kind(&raw_text),
+                kind: compatible_provider_error_kind(&raw_text, status.as_u16()),
             });
         }
 
@@ -804,7 +804,7 @@ impl OpenAiCompatibleProvider {
                 ),
                 trace: Box::new(trace),
                 session_id: None,
-                kind: compatible_provider_error_kind(&raw_text),
+                kind: compatible_provider_error_kind(&raw_text, status.as_u16()),
             });
         }
 
@@ -1653,7 +1653,16 @@ fn compatible_retryable_status(status: reqwest::StatusCode) -> bool {
 /// that is a permission refusal, which is never retried, so a blip that a
 /// resend would clear instead ends the turn. The declared error type decides
 /// when the two disagree, and every other refusal keeps the old answer.
-fn compatible_provider_error_kind(body: &str) -> ProviderErrorKind {
+fn compatible_provider_error_kind(body: &str, status: u16) -> ProviderErrorKind {
+    // A body too large for the endpoint is a deterministic refusal: a resend is
+    // byte-identical, so retrying it can only repeat the same answer. Shrinking the
+    // request is the one remedy that can succeed, and the context-length recovery
+    // already knows how to do that, so this routes there instead of to the
+    // connection-retry path. The status decides, because the body is the gateway
+    // own wording and does not name the size.
+    if status == 413 {
+        return ProviderErrorKind::ContextLength;
+    }
     let compact = body
         .chars()
         .filter(|character| !character.is_ascii_whitespace())
@@ -2376,19 +2385,33 @@ mod tests {
     fn a_declared_server_error_is_retryable_but_a_genuine_refusal_is_not() {
         assert_eq!(
             compatible_provider_error_kind(
-                r#"{"error":{"type":"server_error","code":"server_error","message":"Upstream request failed: [server_error] Upstream response was not valid JSON"}}"#
+                r#"{"error":{"type":"server_error","code":"server_error","message":"Upstream request failed: [server_error] Upstream response was not valid JSON"}}"#,
+                403
             ),
             ProviderErrorKind::ConnectionLost
         );
         assert_eq!(
             compatible_provider_error_kind(
-                r#"{"error":{"type":"invalid_request_error","message":"unknown model"}}"#
+                r#"{"error":{"type":"invalid_request_error","message":"unknown model"}}"#,
+                400
             ),
             ProviderErrorKind::Unknown
         );
         assert_eq!(
-            compatible_provider_error_kind("403 Forbidden"),
+            compatible_provider_error_kind("403 Forbidden", 403),
             ProviderErrorKind::Unknown
+        );
+        // A body too large for the endpoint is deterministic: a resend is
+        // byte-identical, so retrying it can only repeat the same answer. The
+        // remedy is to shrink the request, which is what the context-length
+        // recovery does, so this must not be read as a transient loss however
+        // the gateway words the body.
+        assert_eq!(
+            compatible_provider_error_kind(
+                r#"{"error":{"type":"server_error","code":"server_error","message":"Upstream request failed: [server_error] Upstream response was not valid JSON"}}"#,
+                413
+            ),
+            ProviderErrorKind::ContextLength
         );
     }
 
