@@ -1838,7 +1838,11 @@ impl PromptCacheRefreshClient for ProviderModelClient {
             // pays, so the threshold it is compared against would be fiction.
             #[cfg(feature = "subscription-adapters")]
             NativeRoute::CodexAccount(_) => return Err(Ineligible::SubscriptionQuota),
-            NativeRoute::AnthropicMessages => return Err(Ineligible::CacheWriteUnsupported),
+            // A real turn writes a cache entry through the system marker, so a
+            // refresh has something to keep alive. Whether one is worth sending
+            // is still decided below, from a documented lifetime and a real
+            // price rather than from an assumption about this route.
+            NativeRoute::AnthropicMessages => None,
             NativeRoute::ChatCompletions { gateway, .. } => gateway,
         };
         // An operator who configured this route may know its documented

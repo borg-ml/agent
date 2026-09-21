@@ -109,9 +109,6 @@ pub(crate) enum Ineligible {
     /// API prices Borg knows are not what the user pays, so the saving a
     /// decision would be justified by is not a real number here.
     SubscriptionQuota,
-    /// The route does not write a prompt cache entry at all, so a refresh would
-    /// spend money and leave nothing for the next turn to read.
-    CacheWriteUnsupported,
 }
 
 impl Ineligible {
@@ -131,10 +128,6 @@ impl Ineligible {
             }
             Self::SubscriptionQuota => {
                 "this route spends subscription quota, which Borg cannot price against a cache miss"
-                    .to_string()
-            }
-            Self::CacheWriteUnsupported => {
-                "this route writes no prompt cache entry, so a refresh would save nothing"
                     .to_string()
             }
         }

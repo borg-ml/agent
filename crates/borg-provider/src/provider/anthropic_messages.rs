@@ -39,6 +39,14 @@ const THINKING_BUDGET_TOKENS: u64 = 4096;
 /// A stream that grows past this is not a conversation Borg can hold in memory.
 const STREAM_MAX_BYTES: usize = 128 * 1024 * 1024;
 
+/// The cache marker the API accepts on a content block.
+///
+/// Anthropic caches everything up to and including a marked block, and allows
+/// four markers per request. Borg spends one on the system block, which also
+/// covers the tool definitions that precede it, and one on the newest text the
+/// conversation has produced.
+const EPHEMERAL_CACHE_CONTROL: &str = "ephemeral";
+
 /// The Messages endpoint, overridable for a proxy or an on-premise gateway.
 pub fn messages_endpoint() -> String {
     let base = crate::env::nonempty_var("BORG_ANTHROPIC_BASE_URL")
@@ -273,13 +281,24 @@ pub(crate) fn messages_request_body(
         }
     }
 
+    // Marked before assembly: `json!` takes a reference, so a marker applied to
+    // the vector afterwards would never reach the request.
+    mark_tail_for_cache(&mut messages);
     let mut body = json!({
         "model": model,
         "max_tokens": max_output_tokens(effort),
         "messages": messages,
     });
     if !system_parts.is_empty() {
-        body["system"] = json!(system_parts.join("\n\n"));
+        // Sent as a block rather than a bare string so it can carry the cache
+        // marker. The tools field precedes it in the cached prefix, so this one
+        // marker covers the tool definitions and the instructions together: the
+        // part of every request that is byte-identical turn after turn.
+        body["system"] = json!([{
+            "type": "text",
+            "text": system_parts.join("\n\n"),
+            "cache_control": { "type": EPHEMERAL_CACHE_CONTROL },
+        }]);
     }
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(
@@ -300,6 +319,33 @@ pub(crate) fn messages_request_body(
         body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
     }
     body
+}
+
+/// Move the conversation marker onto the newest text block.
+///
+/// The marker advances with the conversation, so what this turn writes is what
+/// the next turn reads instead of paying full price for it again. It is placed
+/// only on a text block: the tail is often a run of tool results, and a marker
+/// on a block type whose support Borg has not verified against the live API is
+/// not worth a rejected request. A tail without text keeps the system marker,
+/// which is where most of the reusable prefix lives anyway.
+fn mark_tail_for_cache(messages: &mut [Value]) {
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
+    let Some(blocks) = last.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(block) = blocks.last_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    if block.get("type").and_then(Value::as_str) != Some("text") {
+        return;
+    }
+    block.insert(
+        "cache_control".to_string(),
+        json!({ "type": EPHEMERAL_CACHE_CONTROL }),
+    );
 }
 
 /// Append one turn, merging it into the previous turn when the role repeats.
@@ -883,7 +929,12 @@ mod tests {
         );
 
         // Every system message is hoisted into the single top-level field.
-        assert_eq!(body["system"], json!("first\n\nsecond"));
+        assert_eq!(body["system"][0]["type"], json!("text"));
+        assert_eq!(body["system"][0]["text"], json!("first\n\nsecond"));
+        assert_eq!(
+            body["system"][0]["cache_control"]["type"],
+            json!("ephemeral")
+        );
         assert_eq!(body["messages"][0]["role"], json!("user"));
         assert_eq!(body["messages"][0]["content"][0]["type"], json!("text"));
         // Thinking is not replayed, so the assistant turn is text plus the
@@ -909,6 +960,65 @@ mod tests {
         // The API requires a budget, so one is always present.
         assert_eq!(body["max_tokens"], json!(DEFAULT_MAX_OUTPUT_TOKENS));
         assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn the_cache_marker_budget_holds_for_both_tail_shapes() {
+        let text_tail = messages_request_body(
+            "claude-sonnet-4-5",
+            None,
+            &request(
+                vec![
+                    ModelMessage::System {
+                        content: "stable instructions".to_string(),
+                    },
+                    ModelMessage::user("cache me"),
+                ],
+                Vec::new(),
+            ),
+        );
+        assert_eq!(
+            text_tail["messages"][0]["content"][0]["cache_control"]["type"],
+            json!("ephemeral")
+        );
+        assert_eq!(
+            text_tail.to_string().matches("cache_control").count(),
+            2,
+            "one marker on the system block and one on the newest text: {text_tail}"
+        );
+
+        // A tail of tool results keeps only the system marker. Marking a block
+        // type whose support Borg has not verified against the live API risks a
+        // rejected request for a smaller gain than the system marker already
+        // covers.
+        let tool_tail = messages_request_body(
+            "claude-sonnet-4-5",
+            None,
+            &request(
+                vec![
+                    ModelMessage::System {
+                        content: "stable instructions".to_string(),
+                    },
+                    ModelMessage::assistant(
+                        Some("calling".to_string()),
+                        None,
+                        None,
+                        vec![ModelToolCall::function(
+                            "toolu_1".to_string(),
+                            "read_file".to_string(),
+                            "{}".to_string(),
+                        )],
+                    ),
+                    ModelMessage::tool("toolu_1", "contents"),
+                ],
+                Vec::new(),
+            ),
+        );
+        assert_eq!(
+            tool_tail["messages"][1]["content"][0].get("cache_control"),
+            None
+        );
+        assert_eq!(tool_tail.to_string().matches("cache_control").count(), 1);
     }
 
     #[test]

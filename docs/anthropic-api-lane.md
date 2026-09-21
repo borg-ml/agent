@@ -105,9 +105,10 @@ Remaining, each with what it would take:
   rates, which this environment could not check.
 - **A pinned default model.** Deliberately absent: naming a model id this code
   cannot confirm would fail on the first call instead of asking the operator.
-- **Prompt-cache breakpoints.** The adapter sends none, so the route is refused
-  for cache warming with CacheWriteUnsupported. Sending cache_control breakpoints
-  is what would make warming meaningful here.
+- **Pricing**, which is also the only thing between this lane and cache warming.
+  The adapter now sends breakpoints, so a real turn writes a cache entry and the
+  refresh gate gets past its lifetime check; the economics check then refuses
+  because Borg knows no price for these models.
 - **Vendor OpenAI-compatibility shim.** Not chosen. It would be far less code,
   but it is a reduced-fidelity path and its current support for streaming, tool
   calls and prompt caching was not verifiable when this was written.
