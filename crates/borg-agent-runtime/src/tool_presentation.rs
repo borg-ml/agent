@@ -67,14 +67,24 @@ pub fn project_tool_presentation(
     {
         detail = output_detail;
     }
-    let input_body = tool_code_view(name, input)
-        .or_else(|| {
-            (tool_leaf_name(name) == "exec").then_some(())?;
-            let value = serde_json::from_str::<Value>(&readable_result_text(output?)).ok()?;
-            command_from_input(&value)?;
-            tool_code_view(name, &value)
+    let input_body = if is_error && is_edit_tool(name, "Edit") && edit_replacement(input).is_some()
+    {
+        // The edit did not land, so the request it sent is the honest body:
+        // rendering the intended change as a diff would claim it happened.
+        Some(ToolPresentationBody {
+            language: "json".to_string(),
+            text: serde_json::to_string_pretty(input).unwrap_or_else(|_| input.to_string()),
         })
-        .map(|(language, text)| ToolPresentationBody { language, text });
+    } else {
+        tool_code_view(name, input)
+            .or_else(|| {
+                (tool_leaf_name(name) == "exec").then_some(())?;
+                let value = serde_json::from_str::<Value>(&readable_result_text(output?)).ok()?;
+                command_from_input(&value)?;
+                tool_code_view(name, &value)
+            })
+            .map(|(language, text)| ToolPresentationBody { language, text })
+    };
     let input_has_diff = input_body
         .as_ref()
         .is_some_and(|body| is_diff_language(&body.language));
@@ -1060,6 +1070,12 @@ fn summarize_tool_result(
     if trimmed.is_empty() || trimmed == "null" {
         return None;
     }
+    if !is_error
+        && is_edit_tool(name, "Edit")
+        && let Some((path, old, new)) = edit_replacement(input)
+    {
+        return Some(edit_change_summary(&path, old, new));
+    }
     if is_mcp_resource_probe(name) {
         if is_error {
             return Some(mcp_resource_error_detail(trimmed));
@@ -1960,12 +1976,15 @@ fn command_from_input(input: &Value) -> Option<&str> {
 }
 
 fn input_path(input: &Value) -> Option<&str> {
-    ["path", "file_path", "filepath", "filename"]
+    ["path", "file_path", "filePath", "filepath", "filename"]
         .iter()
         .find_map(|key| input.get(key).and_then(Value::as_str))
 }
 
 fn edit_detail(input: &Value) -> Option<String> {
+    if let Some((path, old, new)) = edit_replacement(input) {
+        return Some(edit_change_summary(&path, old, new));
+    }
     input_path(input)
         .map(str::to_string)
         .or_else(|| edit_source(input).and_then(patch_path))
@@ -1984,7 +2003,7 @@ fn collect_edit_paths<'a>(input: &'a Value, paths: &mut Vec<&'a str>) {
             }
         }
         Value::Object(fields) => {
-            if let Some(path) = ["path", "file_path", "filepath", "filename"]
+            if let Some(path) = ["path", "file_path", "filePath", "filepath", "filename"]
                 .iter()
                 .find_map(|key| fields.get(*key).and_then(Value::as_str))
                 && !paths.contains(&path)
@@ -2001,18 +2020,20 @@ fn collect_edit_paths<'a>(input: &'a Value, paths: &mut Vec<&'a str>) {
     }
 }
 
+fn display_edit_path(path: &str) -> String {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        path.to_string_lossy().into_owned()
+    }
+}
+
 fn summarize_edit_paths(paths: &[&str]) -> Option<String> {
-    let display = |path: &str| {
-        let path = Path::new(path);
-        if path.is_absolute() {
-            path.file_name()
-                .unwrap_or(path.as_os_str())
-                .to_string_lossy()
-                .into_owned()
-        } else {
-            path.to_string_lossy().into_owned()
-        }
-    };
+    let display = display_edit_path;
     match paths {
         [] => None,
         [path] => Some(display(path)),
@@ -2314,35 +2335,57 @@ fn edit_source(value: &Value) -> Option<&str> {
     }
 }
 
-/// Claude's native Edit tool carries a replacement pair instead of a patch.
-/// Keep the input useful while the tool is running by projecting that pair
-/// into the same diff body used by patch-based edit tools.
-fn claude_edit_diff(value: &Value) -> Option<(String, String)> {
+/// The before/after pair an edit tool carries instead of a patch.
+///
+/// Claude's native Edit spells the three fields in snake_case and OpenCode's
+/// edit spells the same fields in camelCase, so both are read here rather than
+/// leaving one provider's edit to fall back to a raw JSON preview.
+fn edit_replacement(value: &Value) -> Option<(String, &str, &str)> {
     match value {
-        Value::Array(items) => items.iter().find_map(claude_edit_diff),
+        Value::Array(items) => items.iter().find_map(edit_replacement),
         Value::Object(fields) => {
-            let path = ["file_path", "path", "filename"]
+            let path = ["file_path", "filePath", "path", "filename"]
                 .into_iter()
                 .find_map(|key| fields.get(key).and_then(Value::as_str));
-            let old = fields
-                .get("old_string")
-                .or_else(|| fields.get("old_text"))
-                .and_then(Value::as_str);
-            let new = fields
-                .get("new_string")
-                .or_else(|| fields.get("new_text"))
-                .and_then(Value::as_str);
-            if let (Some(path), Some(old), Some(new)) = (path, old, new)
-                && old != new
-            {
-                return Some((path.to_string(), replacement_diff(old, new, path)));
+            let old = ["old_string", "oldString", "old_text"]
+                .into_iter()
+                .find_map(|key| fields.get(key).and_then(Value::as_str));
+            let new = ["new_string", "newString", "new_text"]
+                .into_iter()
+                .find_map(|key| fields.get(key).and_then(Value::as_str));
+            if let (Some(path), Some(old), Some(new)) = (path, old, new) {
+                return Some((path.to_string(), old, new));
             }
             fields
                 .get("input")
-                .and_then(claude_edit_diff)
-                .or_else(|| fields.get("changes").and_then(claude_edit_diff))
+                .and_then(edit_replacement)
+                .or_else(|| fields.get("changes").and_then(edit_replacement))
         }
         _ => None,
+    }
+}
+
+/// Project a replacement pair into the diff body used by patch-based edit
+/// tools. An identical pair is not a change, and an empty side is an insertion
+/// or a deletion rather than a hunk that removes nothing.
+fn claude_edit_diff(value: &Value) -> Option<(String, String)> {
+    let (path, old, new) = edit_replacement(value)?;
+    (old != new).then(|| {
+        let diff = replacement_diff(old, new, &path);
+        (path, diff)
+    })
+}
+
+/// The one-line summary of a replacement pair: what changed, and by how much.
+fn edit_change_summary(path: &str, old: &str, new: &str) -> String {
+    let name = display_edit_path(path);
+    if old == new {
+        return format!("{name} no change");
+    }
+    match (new.lines().count(), old.lines().count()) {
+        (added, 0) => format!("{name} +{added}"),
+        (0, removed) => format!("{name} -{removed}"),
+        (added, removed) => format!("{name} +{added} -{removed}"),
     }
 }
 
@@ -2589,6 +2632,87 @@ mod tests {
             edit.input.as_ref().map(|body| body.text.as_str()),
             Some("--- docs/review.md\n+++ docs/review.md\n-old line\n+new line")
         );
+    }
+
+    #[test]
+    fn presents_open_code_camel_case_replacement_as_a_diff() {
+        let edit = project_tool_presentation(
+            "edit",
+            &json!({
+                "filePath": "/home/shulgin/abundance/Source/Abundance/Private/ABCharacter.cpp",
+                "oldString": "  if (Lamp) {\n    Lamp->Set(false);\n  }",
+                "newString": "  if (Lamp && Lamp->IsVisible()) {\n    Lamp->Set(false);\n  }"
+            }),
+            Some("\"Edit applied successfully.\""),
+            false,
+        );
+
+        assert_eq!(edit.label, "Edit");
+        assert_eq!(edit.detail, "ABCharacter.cpp +3 -3");
+        assert_eq!(
+            edit.input.as_ref().map(|body| body.language.as_str()),
+            Some("diff:cpp")
+        );
+        assert_eq!(
+            edit.input.as_ref().map(|body| body.text.as_str()),
+            Some(
+                "--- /home/shulgin/abundance/Source/Abundance/Private/ABCharacter.cpp\n\
+                 +++ /home/shulgin/abundance/Source/Abundance/Private/ABCharacter.cpp\n\
+                 -  if (Lamp) {\n-    Lamp->Set(false);\n-  }\n\
+                 +  if (Lamp && Lamp->IsVisible()) {\n+    Lamp->Set(false);\n+  }"
+            )
+        );
+        assert_eq!(edit.result.as_deref(), Some("ABCharacter.cpp +3 -3"));
+    }
+
+    #[test]
+    fn an_edit_that_changes_nothing_says_so_instead_of_showing_a_diff() {
+        let edit = project_tool_presentation(
+            "edit",
+            &json!({"filePath": "a/b.cpp", "oldString": "same\n", "newString": "same\n"}),
+            Some("\"Edit applied successfully.\""),
+            false,
+        );
+
+        assert_eq!(edit.detail, "a/b.cpp no change");
+        assert_eq!(edit.result.as_deref(), Some("a/b.cpp no change"));
+        assert_ne!(
+            edit.input.as_ref().map(|body| body.language.as_str()),
+            Some("diff:cpp")
+        );
+    }
+
+    #[test]
+    fn an_empty_old_string_renders_insertions_rather_than_a_removal() {
+        let edit = project_tool_presentation(
+            "edit",
+            &json!({"filePath": "notes/todo.md", "oldString": "", "newString": "first\nsecond\n"}),
+            None,
+            false,
+        );
+
+        assert_eq!(edit.detail, "notes/todo.md +2");
+        assert_eq!(
+            edit.input.as_ref().map(|body| body.text.as_str()),
+            Some("--- notes/todo.md\n+++ notes/todo.md\n+first\n+second")
+        );
+    }
+
+    #[test]
+    fn a_failed_edit_shows_the_request_and_claims_no_change() {
+        let edit = project_tool_presentation(
+            "edit",
+            &json!({"filePath": "a/b.cpp", "oldString": "old\n", "newString": "new\n"}),
+            Some("\"no match found in a/b.cpp\""),
+            true,
+        );
+
+        assert_eq!(
+            edit.input.as_ref().map(|body| body.language.as_str()),
+            Some("json")
+        );
+        let result = edit.result.as_deref().unwrap_or_default();
+        assert!(result.contains("no match found"), "{result}");
     }
 
     #[test]
