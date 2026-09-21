@@ -14501,7 +14501,7 @@ async fn resumed_work_clears_reconnecting_without_recovery_marker() {
                     .notice
                     .as_deref()
                     .unwrap()
-                    .contains("Connection interrupted")
+                    .contains("Retrying the request")
             );
         }
         terminal.apply_session_event(&SessionEvent::new(session_id, 3, progress));
