@@ -6657,6 +6657,7 @@ mod tests {
                         workdir: None,
                         notify_on: crate::watch::NotifyOn::Output,
                         notify_pattern: None,
+                        ..Default::default()
                     },
                     None,
                     60_000,
@@ -6888,6 +6889,7 @@ mod tests {
                         workdir: None,
                         notify_on: crate::watch::NotifyOn::Output,
                         notify_pattern: None,
+                        ..Default::default()
                     },
                     None,
                     60_000,

@@ -50,6 +50,7 @@ mod plugin_conformance;
 mod receipt_conformance;
 pub mod workspace_postgres;
 
+mod agent_watch;
 mod subagents;
 mod tool_presentation;
 mod watch;
