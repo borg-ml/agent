@@ -23,6 +23,7 @@ pub(crate) struct AgentConfig {
     pub(crate) compaction: CompactionConfig,
     pub(crate) warming: WarmingConfig,
     pub(crate) shell: ShellConfig,
+    pub(crate) git: GitConfig,
     pub(crate) local: LocalProviderConfig,
     /// Named OpenAI-compatible routes. The durable session keeps the generic
     /// native provider kind and records the stable `provider/model` alias.
@@ -363,6 +364,21 @@ pub(crate) struct WarmingConfig {
 /// default (PowerShell, then `ComSpec`, on Windows). `BORG_AGENT_SHELL`
 /// overrides that default chain for one process; this setting outranks the
 /// variable, and the resolved interpreter is fixed when a session starts.
+/// The identity agent-authored commits are marked with.
+///
+/// The default overrides nothing. Agent commands run with the environment Borg
+/// inherited, so git resolves the identity from the user's own configuration,
+/// exactly as it does in an ordinary shell -- and a commit that cannot be
+/// attributed fails with git's own error instead of being given a name nobody
+/// chose. Setting `identity` is the whole opt-in, for marking automation on
+/// purpose.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct GitConfig {
+    /// `Name <email>`, the shape git accepts.
+    pub(crate) identity: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct ShellConfig {
@@ -863,6 +879,30 @@ impl AgentConfig {
         }
         self.compaction_budget_policy()?;
         self.validate_shell()?;
+        self.validate_git_identity()?;
+        Ok(())
+    }
+
+    /// `git.identity` must be `Name <email>`. A typo here would otherwise mark
+    /// every agent commit with a name the operator did not write.
+    fn validate_git_identity(&self) -> Result<()> {
+        let Some(identity) = self
+            .git
+            .identity
+            .as_deref()
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty())
+        else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            !identity.contains('\0'),
+            "git.identity must not contain NUL bytes"
+        );
+        anyhow::ensure!(
+            parse_git_identity(identity).is_some(),
+            "git.identity must be `Name <email>`, for example `Borg Agent <agent@borg.local>`"
+        );
         Ok(())
     }
 
@@ -967,7 +1007,7 @@ impl AgentConfig {
     pub(crate) fn apply_local_provider_env(&self) -> ConfiguredEnvGuard {
         let previous = LOCAL_PROVIDER_ENV_KEYS
             .into_iter()
-            .chain([borg_remote::SHELL_ENV])
+            .chain([borg_remote::SHELL_ENV, borg_remote::GIT_IDENTITY_ENV])
             .map(|key| (key, std::env::var_os(key)))
             .collect();
         let entries = [
@@ -1015,6 +1055,19 @@ impl AgentConfig {
         {
             // SAFETY: as above; the runtime reads this when a session starts.
             unsafe { std::env::set_var(borg_remote::SHELL_ENV, command) };
+        }
+        // `git.identity` travels the same way and is applied by the runtime to
+        // the commands it spawns. Unset publishes nothing, which is what keeps
+        // the default at "whatever git resolves for the user".
+        if let Some(identity) = self
+            .git
+            .identity
+            .as_deref()
+            .map(str::trim)
+            .filter(|identity| !identity.is_empty())
+        {
+            // SAFETY: as above; the runtime reads this when a session starts.
+            unsafe { std::env::set_var(borg_remote::GIT_IDENTITY_ENV, identity) };
         }
         ConfiguredEnvGuard { previous }
     }
@@ -1203,6 +1256,21 @@ fn chat_completions_endpoint(base_url: &str) -> String {
     } else {
         format!("{trimmed}/chat/completions")
     }
+}
+
+/// Split a `Name <email>` identity the way git spells it: the name is
+/// everything before the last `<`, the address is inside the angle brackets.
+fn parse_git_identity(identity: &str) -> Option<(&str, &str)> {
+    let start = identity.rfind('<')?;
+    let end = start + identity[start..].find('>')?;
+    let name = identity[..start].trim();
+    let email = identity[start + 1..end].trim();
+    let plausible = !name.is_empty()
+        && email.contains('@')
+        && !email.contains(['<', '>', ' '])
+        && !email.starts_with('@')
+        && !email.ends_with('@');
+    plausible.then_some((name, email))
 }
 
 fn valid_allowed_tool(value: &str) -> bool {
@@ -1504,6 +1572,74 @@ mode = \"idle\"
                 None => std::env::remove_var(borg_remote::SHELL_ENV),
             }
         }
+    }
+
+    /// The default is that Borg overrides nothing: a session with no
+    /// `git.identity` publishes no identity, so git resolves the user's own
+    /// configuration, and a session that sets one publishes exactly it.
+    #[test]
+    fn an_unset_git_identity_publishes_nothing() {
+        let _lock = LOCAL_ENV_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = std::env::var_os(borg_remote::GIT_IDENTITY_ENV);
+        // SAFETY: the test holds the process-local environment lock.
+        unsafe { std::env::remove_var(borg_remote::GIT_IDENTITY_ENV) };
+
+        let inherited = AgentConfig::default();
+        inherited.validate().expect("the default is valid");
+        let guard = inherited.apply_local_provider_env();
+        assert!(std::env::var_os(borg_remote::GIT_IDENTITY_ENV).is_none());
+        drop(guard);
+
+        let configured: AgentConfig =
+            toml::from_str("[git]\nidentity = \"Borg Agent <agent@borg.local>\"\n")
+                .expect("config parses");
+        configured.validate().expect("an identity is valid");
+        let guard = configured.apply_local_provider_env();
+        assert_eq!(
+            std::env::var(borg_remote::GIT_IDENTITY_ENV).unwrap(),
+            "Borg Agent <agent@borg.local>"
+        );
+        drop(guard);
+        assert!(std::env::var_os(borg_remote::GIT_IDENTITY_ENV).is_none());
+
+        // SAFETY: as above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(borg_remote::GIT_IDENTITY_ENV, value),
+                None => std::env::remove_var(borg_remote::GIT_IDENTITY_ENV),
+            }
+        }
+    }
+
+    /// An identity git could not use would mark every agent commit with a name
+    /// the operator did not write, so it is refused where the message can name
+    /// the setting.
+    #[test]
+    fn a_malformed_git_identity_is_refused_at_load() {
+        for value in [
+            "Borg Agent",
+            "Borg Agent <agent@borg.local",
+            "<agent@borg.local>",
+            "Borg Agent <agent@>",
+            "Borg Agent <borg.local>",
+        ] {
+            let config: AgentConfig =
+                toml::from_str(&format!("[git]\nidentity = {value:?}\n")).expect("config parses");
+            let error = config
+                .validate()
+                .expect_err("a malformed identity is rejected");
+            assert!(
+                error.to_string().contains("git.identity"),
+                "unexpected error for {value}: {error}"
+            );
+        }
+        assert_eq!(
+            parse_git_identity("Borg Agent <agent@borg.local>"),
+            Some(("Borg Agent", "agent@borg.local"))
+        );
     }
 
     /// A shell that is not installed is refused at load: the alternative is a

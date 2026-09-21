@@ -42,6 +42,25 @@ aliases you define interactively in your own shell do not exist there, which is
 why they are interactive conveniences rather than configuration. Select that
 shell explicitly if you want them.
 
+## Commits and agent identity
+
+By default Borg overrides nothing. The commands a session runs inherit Borg's
+environment, so `git commit` resolves the identity from your own git
+configuration, exactly as it does in an ordinary shell. When no identity can be
+resolved, git fails with its own message: Borg does not invent one, because a
+commit attributed to a name nobody chose is worse than a commit that fails.
+
+`git.identity` is the one opt-in for marking automation on purpose:
+
+```toml
+[git]
+identity = "Borg Agent <agent@borg.local>"
+```
+
+It is applied to the commands a session spawns, as both author and committer.
+Nothing else changes: Borg writes no git configuration file, and an unset
+setting is the same as never having configured one.
+
 ## Interactive agent settings
 
 Run `/settings` to open the settings picker. Changes made by agent UI pickers are
