@@ -946,6 +946,14 @@ const TURN_WATCHDOG_STOP_TIMEOUT: Duration = Duration::from_millis(500);
 const INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(test)]
 const INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_millis(100);
+/// Provider events are handled in batches, so a burst costs one pass through
+/// the select rather than one per event. The batch is also the longest a human
+/// Escape can wait, because the actor does not return to the select until it is
+/// done: measured on this host, a full batch of 64 cost 0.92-1.65s of durable
+/// writes, and the interrupt was read only after it. Eight keeps the
+/// amortisation and bounds that wait to about a tenth of it. Raising this
+/// trades Escape latency for select throughput one for one.
+const PROVIDER_EVENT_BATCH_LIMIT: usize = 8;
 #[cfg(not(test))]
 const PROVIDER_DRAIN_LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
@@ -5823,10 +5831,10 @@ async fn run_agent_session_store_kernel_inner(
                     // must not stay penalised, and one that has not must not be
                     // waited on again inside this batch.
                     begin_live_delivery_burst();
-                    let mut provider_batch = Vec::with_capacity(8);
+                    let mut provider_batch = Vec::with_capacity(PROVIDER_EVENT_BATCH_LIMIT);
                     push_coalesced_provider_event(&mut provider_batch, first_kind);
                     let mut consumed = 1;
-                    while consumed < 64 {
+                    while consumed < PROVIDER_EVENT_BATCH_LIMIT {
                         let Ok(kind) = provider_events.try_recv() else {
                             break;
                         };
