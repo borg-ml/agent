@@ -2594,7 +2594,7 @@ impl Transcript {
         let index = self.order.len();
         self.order.push(TranscriptEntry::Tool {
             source_name: "reasoning".to_string(),
-            name: "Thinking".to_string(),
+            name: "Reasoning".to_string(),
             detail: String::new(),
             code_view: Some(("reasoning".to_string(), String::new())),
             output_view: None,
@@ -2634,12 +2634,16 @@ impl Transcript {
             return;
         };
         if let Some(TranscriptEntry::Tool {
+            name,
             complete,
             expanded,
             completed_at: stored_completed_at,
             ..
         }) = self.order.get_mut(index)
         {
+            // The row reads Reasoning while it runs and Reasoned once it ends,
+            // so the label matches the tick beside it.
+            *name = "Reasoned".to_string();
             *complete = true;
             *expanded = false;
             *stored_completed_at = Some(completed_at);

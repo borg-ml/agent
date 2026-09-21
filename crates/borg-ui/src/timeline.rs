@@ -233,7 +233,7 @@ impl TimelineProjector {
                         id: format!("reasoning:{}", event.id),
                         created_at: event.created_at,
                         kind: TimelineKind::Reasoning,
-                        title: "Thinking".into(),
+                        title: "Reasoning".into(),
                         detail: None,
                         body: text.clone(),
                         rich_body: None,

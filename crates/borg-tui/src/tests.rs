@@ -10365,7 +10365,7 @@ fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
     let mut transcript = Transcript::default();
     let thinking = |text: &str| TranscriptEntry::Tool {
         source_name: "reasoning".to_string(),
-        name: "Thinking".to_string(),
+        name: "Reasoning".to_string(),
         detail: String::new(),
         code_view: Some(("reasoning".to_string(), text.to_string())),
         output_view: None,
@@ -10398,7 +10398,7 @@ fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
     let thinking_rows = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| line.to_string().contains("Thinking"))
+        .filter(|(_, line)| line.to_string().contains("Reasoning"))
         .map(|(row, _)| row)
         .collect::<Vec<_>>();
     let message_header = lines
@@ -10597,7 +10597,7 @@ fn boxed_thinking_rows_keep_one_edge_separator_without_duplicates() {
         .order
         .extend((0..9).map(|index| TranscriptEntry::Tool {
             source_name: "reasoning".to_string(),
-            name: "Thinking".to_string(),
+            name: "Reasoning".to_string(),
             detail: String::new(),
             code_view: Some(("reasoning".to_string(), format!("thought {index}"))),
             output_view: None,
@@ -11582,7 +11582,7 @@ fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
             complete: false,
             expanded: false,
             ..
-        } if name == "Thinking"
+        } if name == "Reasoning"
             && language == "reasoning"
             && source == "Checking the source"
     ));
@@ -11623,7 +11623,7 @@ fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
 }
 
 #[test]
-fn reasoning_lifecycle_events_show_thinking_without_a_text_delta() {
+fn reasoning_lifecycle_events_show_reasoning_without_a_text_delta() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
     transcript.apply(&SessionEvent::new(
@@ -11644,7 +11644,7 @@ fn reasoning_lifecycle_events_show_thinking_without_a_text_delta() {
             complete: false,
             expanded: false,
             ..
-        } if name == "Thinking" && language == "reasoning" && source.is_empty()
+        } if name == "Reasoning" && language == "reasoning" && source.is_empty()
     ));
 
     transcript.apply(&SessionEvent::new(
@@ -11663,7 +11663,7 @@ fn reasoning_lifecycle_events_show_thinking_without_a_text_delta() {
             complete: true,
             expanded: false,
             ..
-        } if name == "Thinking"
+        } if name == "Reasoned"
     ));
     let rendered = transcript
         .lines(100)
@@ -11671,7 +11671,7 @@ fn reasoning_lifecycle_events_show_thinking_without_a_text_delta() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("✓ Thinking"));
+    assert!(rendered.contains("✓ Reasoned"));
     assert!(!rendered.contains("◇ Thinking"));
 }
 
@@ -14135,7 +14135,7 @@ async fn action_inspector_stays_on_its_entry_when_late_messages_arrive() {
 }
 
 #[test]
-fn empty_thinking_row_is_not_expandable_or_hinted() {
+fn empty_reasoning_row_is_not_expandable_or_hinted() {
     let session_id = Uuid::new_v4();
     let mut transcript = Transcript::default();
     for (sequence, kind) in ["item/started:reasoning", "item/completed:reasoning"]
@@ -14154,7 +14154,7 @@ fn empty_thinking_row_is_not_expandable_or_hinted() {
     }
     assert!(matches!(
         &transcript.order[0],
-        TranscriptEntry::Tool { name, complete: true, .. } if name == "Thinking"
+        TranscriptEntry::Tool { name, complete: true, .. } if name == "Reasoned"
     ));
     assert_eq!(transcript.tool_copy_hint(0), None);
     assert!(!transcript.tool_is_expandable(0));
