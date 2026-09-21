@@ -603,12 +603,18 @@ impl OpenAiCompatibleProvider {
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or("none")
                 .to_string();
+            let log_id = response
+                .headers()
+                .get("x-opencode-log-id")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("none")
+                .to_string();
             let raw_text = read_provider_error_response_text(response)
                 .await
                 .unwrap_or_else(|error| error.to_string());
             let body = if raw_text.trim().is_empty() {
                 format!(
-                    "the provider sent no body (content-type {content_type}, request-id {request_id})"
+                    "the provider sent no body (content-type {content_type}, request-id {request_id}, provider-log-id {log_id})"
                 )
             } else {
                 truncate_provider_text(&raw_text, 500)
