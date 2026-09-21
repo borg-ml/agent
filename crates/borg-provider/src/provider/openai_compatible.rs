@@ -1738,8 +1738,17 @@ fn request_shape(body: &Value) -> String {
     }
     let shown: String = roles.chars().take(32).collect();
     let elided = roles.chars().count().saturating_sub(32);
+    let tools_hash = body
+        .get("tools")
+        .map(|tools| format!("{:016x}", stable_hash(tools.to_string().as_bytes())))
+        .unwrap_or_else(|| "none".to_string());
+    let mut fields: Vec<&str> = body
+        .as_object()
+        .map(|fields| fields.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    fields.sort_unstable();
     format!(
-        "messages={}, roles={shown}{}, bytes={}, images={images}, tool_calls={calls}, unanswered_calls={}",
+        "messages={}, roles={shown}{}, bytes={}, images={images}, tool_calls={calls}, unanswered_calls={}, tools_hash={tools_hash}, fields={}",
         messages.len(),
         if elided > 0 {
             format!("+{elided}")
@@ -1748,7 +1757,18 @@ fn request_shape(body: &Value) -> String {
         },
         body.to_string().len(),
         sent.difference(&answered).count(),
+        fields.join(","),
     )
+}
+
+/// FNV-1a, so a recorded catalog hash is stable across runs and toolchains.
+fn stable_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn compatible_provider_error_kind(body: &str, status: u16) -> ProviderErrorKind {
