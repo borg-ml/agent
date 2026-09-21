@@ -1323,16 +1323,17 @@ impl SessionStore for PostgresSessionStore {
             .collect()
     }
 
-    async fn append_batch(&self, events: Vec<SessionEvent>) -> Result<u64> {
+    async fn append_batch(&self, events: Vec<SessionEvent>) -> Result<Vec<SessionEvent>> {
         if events.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         let mut transaction = self.pool().begin().await?;
-        let mut appended = 0u64;
+        let mut appended = Vec::with_capacity(events.len());
         for event in events {
-            self.append_durable_in_transaction(&mut transaction, event)
-                .await?;
-            appended += 1;
+            appended.push(
+                self.append_durable_in_transaction(&mut transaction, event)
+                    .await?,
+            );
         }
         transaction.commit().await?;
         Ok(appended)
