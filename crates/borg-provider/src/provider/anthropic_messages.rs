@@ -42,9 +42,10 @@ const STREAM_MAX_BYTES: usize = 128 * 1024 * 1024;
 /// The cache marker the API accepts on a content block.
 ///
 /// Anthropic caches everything up to and including a marked block, and allows
-/// four markers per request. Borg spends one on the system block, which also
-/// covers the tool definitions that precede it, and one on the newest text the
-/// conversation has produced.
+/// four markers per request. Borg spends three: the last tool definition, the
+/// system block, and the newest block the conversation has produced. Tool
+/// schemas get their own marker so a changed system prompt does not invalidate
+/// them.
 const EPHEMERAL_CACHE_CONTROL: &str = "ephemeral";
 
 /// The Messages endpoint, overridable for a proxy or an on-premise gateway.
@@ -291,9 +292,8 @@ pub(crate) fn messages_request_body(
     });
     if !system_parts.is_empty() {
         // Sent as a block rather than a bare string so it can carry the cache
-        // marker. The tools field precedes it in the cached prefix, so this one
-        // marker covers the tool definitions and the instructions together: the
-        // part of every request that is byte-identical turn after turn.
+        // marker. The tools field precedes it in the cached prefix, so this
+        // marker extends the cached prefix through the instructions.
         body["system"] = json!([{
             "type": "text",
             "text": system_parts.join("\n\n"),
@@ -301,16 +301,26 @@ pub(crate) fn messages_request_body(
         }]);
     }
     if !request.tools.is_empty() {
+        // The API's cache prefix runs tools, then system, then messages, and a
+        // marker goes on a block rather than on the array, so the last
+        // definition is the one marked: that caches every schema without
+        // spending a marker per tool.
+        let last_tool = request.tools.len() - 1;
         body["tools"] = Value::Array(
             request
                 .tools
                 .iter()
-                .map(|tool| {
-                    json!({
+                .enumerate()
+                .map(|(index, tool)| {
+                    let mut definition = json!({
                         "name": tool.name,
                         "description": tool.description,
                         "input_schema": tool.input_schema,
-                    })
+                    });
+                    if index == last_tool {
+                        definition["cache_control"] = json!({ "type": EPHEMERAL_CACHE_CONTROL });
+                    }
+                    definition
                 })
                 .collect(),
         );
@@ -321,14 +331,14 @@ pub(crate) fn messages_request_body(
     body
 }
 
-/// Move the conversation marker onto the newest text block.
+/// Move the conversation marker onto the newest cacheable block.
 ///
 /// The marker advances with the conversation, so what this turn writes is what
-/// the next turn reads instead of paying full price for it again. It is placed
-/// only on a text block: the tail is often a run of tool results, and a marker
-/// on a block type whose support Borg has not verified against the live API is
-/// not worth a rejected request. A tail without text keeps the system marker,
-/// which is where most of the reusable prefix lives anyway.
+/// the next turn reads instead of paying full price for it again. The API
+/// accepts it on a text or tool_result block, which are the two shapes a turn
+/// ends with; the tool-result shape is where most turns end, so marking text
+/// alone drops the marker on exactly the turns with the newest content. Every
+/// other block type is left unmarked.
 fn mark_tail_for_cache(messages: &mut [Value]) {
     let Some(last) = messages.last_mut() else {
         return;
@@ -339,7 +349,10 @@ fn mark_tail_for_cache(messages: &mut [Value]) {
     let Some(block) = blocks.last_mut().and_then(Value::as_object_mut) else {
         return;
     };
-    if block.get("type").and_then(Value::as_str) != Some("text") {
+    if !matches!(
+        block.get("type").and_then(Value::as_str),
+        Some("text" | "tool_result")
+    ) {
         return;
     }
     block.insert(
@@ -963,7 +976,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_marker_budget_holds_for_both_tail_shapes() {
+    fn the_cache_marker_budget_holds_for_every_tail_shape() {
         let text_tail = messages_request_body(
             "claude-sonnet-4-5",
             None,
@@ -987,10 +1000,9 @@ mod tests {
             "one marker on the system block and one on the newest text: {text_tail}"
         );
 
-        // A tail of tool results keeps only the system marker. Marking a block
-        // type whose support Borg has not verified against the live API risks a
-        // rejected request for a smaller gain than the system marker already
-        // covers.
+        // A tail of tool results carries the tail marker too. This is where
+        // most turns end, so a text-only marker would drop the marker on the
+        // turns that have the most new content to cache.
         let tool_tail = messages_request_body(
             "claude-sonnet-4-5",
             None,
@@ -1015,10 +1027,56 @@ mod tests {
             ),
         );
         assert_eq!(
-            tool_tail["messages"][1]["content"][0].get("cache_control"),
-            None
+            tool_tail["messages"][1]["content"][0]["cache_control"]["type"],
+            json!("ephemeral")
         );
-        assert_eq!(tool_tail.to_string().matches("cache_control").count(), 1);
+        assert_eq!(
+            tool_tail.to_string().matches("cache_control").count(),
+            2,
+            "one marker on the system block and one on the tool result: {tool_tail}"
+        );
+
+        // Tools bring a third marker, spent on the last definition so the
+        // schemas stay cached when the system prompt changes.
+        let with_tools = messages_request_body(
+            "claude-sonnet-4-5",
+            None,
+            &request(
+                vec![
+                    ModelMessage::System {
+                        content: "stable instructions".to_string(),
+                    },
+                    ModelMessage::user("cache me"),
+                ],
+                vec![
+                    ModelToolDefinition::new(
+                        "read_file",
+                        "read one file",
+                        json!({ "type": "object", "properties": {} }),
+                    )
+                    .expect("tool definition"),
+                    ModelToolDefinition::new(
+                        "write_file",
+                        "write one file",
+                        json!({ "type": "object", "properties": {} }),
+                    )
+                    .expect("tool definition"),
+                ],
+            ),
+        );
+        assert!(
+            with_tools["tools"][0].get("cache_control").is_none(),
+            "only the last tool definition is marked: {with_tools}"
+        );
+        assert_eq!(
+            with_tools["tools"][1]["cache_control"]["type"],
+            json!("ephemeral")
+        );
+        assert_eq!(
+            with_tools.to_string().matches("cache_control").count(),
+            3,
+            "last tool, system, newest text, and no more: {with_tools}"
+        );
     }
 
     #[test]
