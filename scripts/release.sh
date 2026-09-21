@@ -2,6 +2,15 @@
 set -euo pipefail
 
 readonly REPOSITORY_URL="https://github.com/borg-ml/agent"
+# The release stages its Postgres cluster and the test temporaries under TMPDIR,
+# so the disk-space guard below measures whatever filesystem that is. On a host
+# whose /tmp is tmpfs that is memory rather than disk, and the guard would ask for
+# 20 GiB of RAM. Default to a disk-backed directory unless the caller chose one.
+if [[ -z "${TMPDIR:-}" ]]; then
+  export TMPDIR="${XDG_CACHE_HOME:-$HOME/.cache}/borg-release-tmp"
+  mkdir -p -- "$TMPDIR"
+fi
+
 readonly VERSION_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 
 die() {
