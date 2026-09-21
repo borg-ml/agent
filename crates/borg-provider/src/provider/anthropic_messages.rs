@@ -233,9 +233,7 @@ pub(crate) fn messages_request_body(
             } => {
                 let mut blocks = text_blocks(content);
                 blocks.extend(image_blocks(attachments));
-                if !blocks.is_empty() {
-                    messages.push(json!({ "role": "user", "content": blocks }));
-                }
+                push_turn(&mut messages, "user", blocks);
             }
             ModelMessage::Assistant {
                 content,
@@ -254,28 +252,23 @@ pub(crate) fn messages_request_body(
                         "input": parse_tool_arguments(&call.function.arguments),
                     }));
                 }
-                if !blocks.is_empty() {
-                    messages.push(json!({ "role": "assistant", "content": blocks }));
-                }
+                push_turn(&mut messages, "assistant", blocks);
             }
             ModelMessage::Tool {
                 tool_call_id,
                 content,
                 attachments,
             } => {
-                messages.push(json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": tool_call_id,
-                        "content": content,
-                    }],
-                }));
-                // The API cannot attach images to a tool result, so they follow
-                // in their own message instead of being dropped.
-                if !attachments.is_empty() {
-                    messages.push(json!({ "role": "user", "content": image_blocks(attachments) }));
-                }
+                let mut blocks = vec![json!({
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": content,
+                })];
+                // The API cannot attach images to a tool result, so they ride
+                // along as later blocks of the same turn rather than being
+                // dropped or split into a second turn.
+                blocks.extend(image_blocks(attachments));
+                push_turn(&mut messages, "user", blocks);
             }
         }
     }
@@ -307,6 +300,27 @@ pub(crate) fn messages_request_body(
         body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
     }
     body
+}
+
+/// Append one turn, merging it into the previous turn when the role repeats.
+///
+/// The API requires strictly alternating roles, so the shapes the portable
+/// conversation legitimately produces have to collapse: one user turn per
+/// parallel tool result, a tool result followed by real user text, and the
+/// images a tool returned. Sent as separate turns they are rejected outright,
+/// which would fail every multi-tool round.
+fn push_turn(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
+    if blocks.is_empty() {
+        return;
+    }
+    if let Some(previous) = messages.last_mut()
+        && previous.get("role").and_then(Value::as_str) == Some(role)
+        && let Some(content) = previous.get_mut("content").and_then(Value::as_array_mut)
+    {
+        content.extend(blocks);
+        return;
+    }
+    messages.push(json!({ "role": role, "content": blocks }));
 }
 
 fn text_blocks(content: &str) -> Vec<Value> {
@@ -760,6 +774,75 @@ mod tests {
     /// One server-sent event, the way the service frames it.
     fn frame(event: &str, payload: Value) -> String {
         format!("event: {event}\ndata: {payload}")
+    }
+
+    #[test]
+    fn a_tool_result_run_and_following_user_text_share_one_turn() {
+        // The API requires strictly alternating roles, so a run of tool results,
+        // the images one of them returned, and the user text that follows all
+        // have to arrive as a single user turn. Sent as separate turns they are
+        // rejected, which would fail every round with more than one tool call.
+        let attachment = ModelInputAttachment {
+            media_type: "image/png".to_string(),
+            data_base64: "AAAA".to_string(),
+            filename: None,
+        };
+        let body = messages_request_body(
+            "claude-sonnet-4-5",
+            None,
+            &request(
+                vec![
+                    ModelMessage::user("run both"),
+                    ModelMessage::assistant(
+                        Some("calling".to_string()),
+                        None,
+                        None,
+                        vec![
+                            ModelToolCall::function(
+                                "toolu_1".to_string(),
+                                "read_file".to_string(),
+                                "{}".to_string(),
+                            ),
+                            ModelToolCall::function(
+                                "toolu_2".to_string(),
+                                "read_file".to_string(),
+                                "{}".to_string(),
+                            ),
+                        ],
+                    ),
+                    ModelMessage::tool("toolu_1", "first"),
+                    ModelMessage::Tool {
+                        tool_call_id: "toolu_2".to_string(),
+                        content: "second".to_string(),
+                        attachments: vec![attachment],
+                    },
+                    ModelMessage::user("and now this"),
+                ],
+                Vec::new(),
+            ),
+        );
+
+        let messages = body["messages"].as_array().expect("messages");
+        let roles = messages
+            .iter()
+            .map(|message| message["role"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(roles, vec!["user", "assistant", "user"]);
+        assert!(
+            roles.windows(2).all(|pair| pair[0] != pair[1]),
+            "roles must alternate: {roles:?}"
+        );
+
+        let blocks = messages[2]["content"].as_array().expect("content");
+        let kinds = blocks
+            .iter()
+            .map(|block| block["type"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>();
+        // Tool results first, then the image the second one carried, then text.
+        assert_eq!(kinds, vec!["tool_result", "tool_result", "image", "text"]);
+        assert_eq!(blocks[0]["tool_use_id"], json!("toolu_1"));
+        assert_eq!(blocks[1]["tool_use_id"], json!("toolu_2"));
+        assert_eq!(blocks[3]["text"], json!("and now this"));
     }
 
     #[test]
