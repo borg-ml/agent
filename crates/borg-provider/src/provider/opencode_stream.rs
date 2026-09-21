@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -227,6 +227,10 @@ async fn run(
     let mut described_tools = HashSet::new();
     let mut started_tools = HashSet::new();
     let mut completed_tools = HashSet::new();
+    // What each running command found dirty when it started, so the change it
+    // introduced can be told apart from what was already there.
+    let mut command_baselines: HashMap<String, (std::path::PathBuf, BTreeMap<String, String>)> =
+        HashMap::new();
 
     loop {
         let event = tokio::select! {
@@ -363,11 +367,13 @@ async fn run(
                 emit_tool(
                     &events,
                     &value,
+                    &cwd,
                     &mut generating_tools,
                     &mut pending_tool_snapshots,
                     &mut described_tools,
                     &mut started_tools,
                     &mut completed_tools,
+                    &mut command_baselines,
                 )
                 .await?
             }
@@ -413,6 +419,153 @@ async fn run(
         .await
         .ok();
     Ok(())
+}
+
+fn is_command_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "bash" | "shell" | "exec" | "command_execution" | "exec_command"
+    )
+}
+
+/// The repository root and the status of every path in it, or `None` when the
+/// directory is not inside a repository or git is unavailable.
+///
+/// `--no-optional-locks` keeps the probe from taking the index lock: these
+/// commands run in a live repository where a human or another agent may be
+/// using git at the same moment.
+fn working_tree_state(
+    cwd: &std::path::Path,
+) -> Option<(std::path::PathBuf, BTreeMap<String, String>)> {
+    let root = std::path::PathBuf::from(git_output(cwd, &["rev-parse", "--show-toplevel"])?.trim());
+    let status = git_output(&root, &["status", "--porcelain"])?;
+    let dirty = status
+        .lines()
+        .filter_map(|line| {
+            let (code, rest) = line.split_at_checked(2)?;
+            let path = rest.trim_start().rsplit(" -> ").next()?.trim_matches('"');
+            (!path.is_empty()).then(|| (path.to_string(), code.to_string()))
+        })
+        .collect();
+    Some((root, dirty))
+}
+
+fn git_output(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The diff of one path, including a file git does not track yet.
+fn git_diff(cwd: &std::path::Path, path: &str, untracked: bool) -> String {
+    let mut command = std::process::Command::new("git");
+    command.arg("--no-optional-locks").current_dir(cwd);
+    if untracked {
+        // Exit status 1 means "these differ", which is the answer we want.
+        command.args(["diff", "--no-index", "--", "/dev/null", path]);
+    } else {
+        command.args(["diff", "--", path]);
+    }
+    match command.output() {
+        Ok(output) => String::from_utf8_lossy(&output.stdout).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
+/// At most this many paths become diffs for one command; the rest are still
+/// named and counted in the summary.
+const MAX_COMMAND_DIFF_PATHS: usize = 8;
+
+/// Enrich a command's result with the change it introduced, or leave it alone.
+///
+/// Only paths that were clean when the command started are reported. A path that
+/// was already dirty cannot be attributed to this action - another agent, a
+/// formatter or a build may have written it - and blaming this action for that
+/// work would be worse than showing nothing. A command that changed nothing, or
+/// only changed paths it did not start clean, returns `None` and costs the
+/// reader nothing.
+fn introduced_change_output(
+    root: &std::path::Path,
+    before: &BTreeMap<String, String>,
+    output: &str,
+) -> Option<String> {
+    let (_, after) = working_tree_state(root)?;
+    if &after == before {
+        return None;
+    }
+    let introduced = after
+        .iter()
+        .filter(|(path, _)| !before.contains_key(*path))
+        .map(|(path, code)| (path.clone(), code.clone()))
+        .collect::<Vec<_>>();
+    if introduced.is_empty() {
+        return None;
+    }
+    let tracked = introduced
+        .iter()
+        .filter(|(_, code)| code.as_str() != "??")
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    let mut stats = BTreeMap::new();
+    if !tracked.is_empty() {
+        let args = ["diff", "--numstat", "--"]
+            .into_iter()
+            .chain(tracked.iter().map(|path| path.as_str()))
+            .collect::<Vec<_>>();
+        for line in git_output(root, &args).unwrap_or_default().lines() {
+            let mut fields = line.split('\t');
+            if let (Some(added), Some(removed), Some(path)) =
+                (fields.next(), fields.next(), fields.next())
+            {
+                stats.insert(path.to_string(), (added.to_string(), removed.to_string()));
+            }
+        }
+    }
+    let changes = introduced
+        .iter()
+        .enumerate()
+        .map(|(index, (path, code))| {
+            let untracked = code.as_str() == "??";
+            let diff = if index < MAX_COMMAND_DIFF_PATHS {
+                git_diff(root, path.as_str(), untracked)
+            } else {
+                String::new()
+            };
+            let (added, removed) = match stats.get(path.as_str()) {
+                Some((added, removed)) => (added.clone(), removed.clone()),
+                None => (
+                    diff.lines()
+                        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+                        .count()
+                        .to_string(),
+                    diff.lines()
+                        .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+                        .count()
+                        .to_string(),
+                ),
+            };
+            serde_json::json!({
+                "path": path,
+                "added": added.parse::<u64>().unwrap_or(0),
+                "removed": removed.parse::<u64>().unwrap_or(0),
+                "diff": diff,
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(
+        serde_json::json!({
+            "content": [{"type": "text", "text": output}],
+            "changes": changes,
+        })
+        .to_string(),
+    )
 }
 
 /// OpenCode's `/event` bus is a plain chunked HTTP stream with no resume
@@ -632,14 +785,17 @@ struct PendingToolInput {
     action_parser: crate::provider::StreamedToolAction,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_tool(
     events: &mpsc::Sender<ChatStreamEvent>,
     value: &Value,
+    cwd: &std::path::Path,
     generating_tools: &mut HashSet<String>,
     pending_tool_snapshots: &mut HashMap<String, PendingToolInput>,
     described_tools: &mut HashSet<String>,
     started_tools: &mut HashSet<String>,
     completed_tools: &mut HashSet<String>,
+    command_baselines: &mut HashMap<String, (std::path::PathBuf, BTreeMap<String, String>)>,
 ) -> Result<()> {
     let id = value
         .pointer("/part/id")
@@ -726,6 +882,13 @@ async fn emit_tool(
         return Ok(());
     }
     pending_tool_snapshots.remove(&id);
+    if status == Some("running")
+        && is_command_tool(&name)
+        && !command_baselines.contains_key(&id)
+        && let Some(baseline) = working_tree_state(cwd)
+    {
+        command_baselines.insert(id.clone(), baseline);
+    }
     if started_tools.insert(id.clone())
         && events
             .send(ChatStreamEvent::ToolCall {
@@ -746,6 +909,14 @@ async fn emit_tool(
         .get(if is_error { "error" } else { "output" })
         .map(Value::to_string)
         .unwrap_or_default();
+    // A failed command keeps its own output: a partial change it left behind is
+    // not a change it made successfully, and attributing one would be a lie.
+    let output = match command_baselines.remove(&id) {
+        Some((root, before)) if !is_error => {
+            introduced_change_output(&root, &before, &output).unwrap_or(output)
+        }
+        _ => output,
+    };
     events
         .send(ChatStreamEvent::ToolResult {
             tool_use_id: id,
@@ -1003,6 +1174,8 @@ mod tests {
         let mut described = HashSet::new();
         let mut started = HashSet::new();
         let mut completed = HashSet::new();
+        let cwd = std::path::Path::new(".");
+        let mut command_baselines = HashMap::new();
         emit_tool(
             &sender,
             &json!({
@@ -1017,11 +1190,13 @@ mod tests {
                     }
                 }
             }),
+            &cwd,
             &mut generating,
             &mut snapshots,
             &mut described,
             &mut started,
             &mut completed,
+            &mut command_baselines,
         )
         .await
         .unwrap();
@@ -1038,11 +1213,13 @@ mod tests {
                 "state": {"status": "pending", "input": {},
                     "raw": "{\"nested\":{\"action\":\"wrong\"},\"action\":\"edit\",\"plan\":["}
             }}),
+            &cwd,
             &mut generating,
             &mut snapshots,
             &mut described,
             &mut started,
             &mut completed,
+            &mut command_baselines,
         )
         .await
         .unwrap();
@@ -1063,11 +1240,13 @@ mod tests {
                 "state": {"status": "pending", "input": {},
                     "raw": "{\"nested\":{\"action\":\"wrong\"},\"action\":\"edit\",\"plan\":["}
             }}),
+            &cwd,
             &mut generating,
             &mut snapshots,
             &mut described,
             &mut started,
             &mut completed,
+            &mut command_baselines,
         )
         .await
         .unwrap();
@@ -1086,11 +1265,13 @@ mod tests {
                     }
                 }
             }),
+            &cwd,
             &mut generating,
             &mut snapshots,
             &mut described,
             &mut started,
             &mut completed,
+            &mut command_baselines,
         )
         .await
         .unwrap();
@@ -1112,6 +1293,8 @@ mod tests {
             let mut described = HashSet::new();
             let mut started = HashSet::new();
             let mut completed = HashSet::new();
+            let cwd = std::path::Path::new(".");
+            let mut command_baselines = HashMap::new();
             let mut snapshot = json!({"part": {
                 "id": "tool-1", "tool": "bash",
                 "state": {"status": status, "input": {"action": "read file"},
@@ -1120,11 +1303,13 @@ mod tests {
             emit_tool(
                 &sender,
                 &snapshot,
+                &cwd,
                 &mut generating,
                 &mut snapshots,
                 &mut described,
                 &mut started,
                 &mut completed,
+                &mut command_baselines,
             )
             .await
             .unwrap();
@@ -1141,11 +1326,13 @@ mod tests {
             emit_tool(
                 &sender,
                 &snapshot,
+                &cwd,
                 &mut generating,
                 &mut snapshots,
                 &mut described,
                 &mut started,
                 &mut completed,
+                &mut command_baselines,
             )
             .await
             .unwrap();

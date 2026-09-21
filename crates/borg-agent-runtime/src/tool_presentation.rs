@@ -92,8 +92,12 @@ pub fn project_tool_presentation(
         .then(|| output.and_then(|output| edit_result_presentation(name, output)))
         .flatten();
     if let Some(edit) = &edit_result {
-        label.clone_from(&edit.label);
-        detail.clone_from(&edit.detail);
+        // A command keeps its own name. The change is what it did, not what it
+        // is, so the row still says which command ran.
+        if !is_command_tool(name) {
+            label.clone_from(&edit.label);
+            detail.clone_from(&edit.detail);
+        }
     }
     ToolPresentation {
         category: tool_category(name, &label, input),
@@ -737,6 +741,41 @@ pub fn tool_output_code_view(name: &str, output: &str) -> Option<(String, String
     if normalized.contains("lsp") || normalized.contains("diagnostic") {
         return Some(("lsp".to_string(), trimmed.to_string()));
     }
+    if is_command_tool(name)
+        && let Some(changes) = introduced_changes(trimmed)
+    {
+        // A command that changed files shows the change it introduced. The
+        // command's own output stays in the result summary and in the record;
+        // this is the body the reader came to the action for.
+        let patches = changes
+            .iter()
+            .filter(|change| !change.diff.trim().is_empty())
+            .collect::<Vec<_>>();
+        if !patches.is_empty() {
+            let language = if patches.len() == 1 {
+                Path::new(&patches[0].path)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| format!("diff:{extension}"))
+                    .unwrap_or_else(|| "diff".to_string())
+            } else {
+                "diff".to_string()
+            };
+            let multi_file = patches.len() > 1;
+            let text = patches
+                .iter()
+                .map(|change| {
+                    if multi_file {
+                        format!("*** Update File: {}\n{}", change.path, change.diff)
+                    } else {
+                        change.diff.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Some((language, text));
+        }
+    }
     let readable = readable_result_text(trimmed);
     if let Ok(value) = serde_json::from_str::<Value>(&readable) {
         if tool_leaf_name(name) == "exec" && value.get("stdout").is_some() {
@@ -1075,6 +1114,12 @@ fn summarize_tool_result(
         && let Some((path, old, new)) = edit_replacement(input)
     {
         return Some(edit_change_summary(&path, old, new));
+    }
+    if !is_error
+        && is_command_tool(name)
+        && let Some(changes) = introduced_changes(output)
+    {
+        return Some(introduced_change_summary(&changes));
     }
     if is_mcp_resource_probe(name) {
         if is_error {
@@ -2335,6 +2380,77 @@ fn edit_source(value: &Value) -> Option<&str> {
     }
 }
 
+/// True for the tool names that run a command, whose result may carry the
+/// change the command introduced rather than a diff of its own.
+fn is_command_tool(name: &str) -> bool {
+    matches!(
+        tool_leaf_name(name).as_str(),
+        "bash" | "command_execution" | "exec_command" | "exec" | "shell"
+    )
+}
+
+struct IntroducedChange {
+    path: String,
+    added: usize,
+    removed: usize,
+    diff: String,
+}
+
+/// The change a command action introduced, as the lane that ran it recorded it.
+///
+/// A command reports stdout, not a patch, so the change is gathered by the lane
+/// that owns the workdir and the timing: `changes` is only present when the
+/// action actually changed something it can attribute.
+fn introduced_changes(output: &str) -> Option<Vec<IntroducedChange>> {
+    // The envelope is the result itself; only fall back to the readable text for
+    // a result that wraps its payload.
+    let value = serde_json::from_str::<Value>(output.trim())
+        .ok()
+        .or_else(|| serde_json::from_str::<Value>(readable_result_text(output).trim()).ok())?;
+    let Value::Object(fields) = value else {
+        return None;
+    };
+    let changes = fields.get("changes")?.as_array()?;
+    let parsed = changes
+        .iter()
+        .filter_map(|entry| {
+            let path = entry.get("path")?.as_str()?.to_string();
+            Some(IntroducedChange {
+                path,
+                added: entry.get("added").and_then(Value::as_u64).unwrap_or(0) as usize,
+                removed: entry.get("removed").and_then(Value::as_u64).unwrap_or(0) as usize,
+                diff: entry
+                    .get("diff")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    (!parsed.is_empty()).then_some(parsed)
+}
+
+/// The collapsed-row summary for a command that changed files: which files, and
+/// by how much, in place of the command's own closing sentence.
+fn introduced_change_summary(changes: &[IntroducedChange]) -> String {
+    let added: usize = changes.iter().map(|change| change.added).sum();
+    let removed: usize = changes.iter().map(|change| change.removed).sum();
+    let named = changes
+        .iter()
+        .map(|change| display_edit_path(&change.path))
+        .collect::<Vec<_>>();
+    let files = match named.as_slice() {
+        [only] => only.clone(),
+        [first, rest @ ..] => format!("{first} + {} more", rest.len()),
+        [] => "files".to_string(),
+    };
+    match (added, removed) {
+        (added, 0) => format!("{files} +{added}"),
+        (0, removed) => format!("{files} -{removed}"),
+        (added, removed) => format!("{files} +{added} -{removed}"),
+    }
+}
+
 /// The before/after pair an edit tool carries instead of a patch.
 ///
 /// Claude's native Edit spells the three fields in snake_case and OpenCode's
@@ -2631,6 +2747,73 @@ mod tests {
         assert_eq!(
             edit.input.as_ref().map(|body| body.text.as_str()),
             Some("--- docs/review.md\n+++ docs/review.md\n-old line\n+new line")
+        );
+    }
+
+    #[test]
+    fn a_command_that_changed_files_shows_the_change_and_keeps_its_own_name() {
+        let output = json!({
+            "content": [{"type": "text", "text": "formatted 3 files
+        "}],
+            "changes": [{
+                "path": "src/main.rs",
+                "added": 2,
+                "removed": 1,
+                "diff": "--- a/src/main.rs
++++ b/src/main.rs
+-old
++new
++extra"
+            }]
+        })
+        .to_string();
+        let command = project_tool_presentation(
+            "bash",
+            &json!({"command": "cargo fmt"}),
+            Some(&output),
+            false,
+        );
+
+        assert_eq!(command.result.as_deref(), Some("src/main.rs +2 -1"));
+        assert_eq!(command.detail, "cargo fmt");
+        assert_eq!(
+            command.output.as_ref().map(|body| body.language.as_str()),
+            Some("diff:rs")
+        );
+        assert!(
+            command
+                .output
+                .as_ref()
+                .is_some_and(|body| body.text.contains("+extra"))
+        );
+        // The command is still readable from its own result text.
+        assert!(readable_result_text(&output).contains("formatted 3 files"));
+    }
+
+    #[test]
+    fn a_command_that_changed_nothing_is_presented_as_it_always_was() {
+        let command = project_tool_presentation(
+            "bash",
+            &json!({"command": "cargo test"}),
+            Some(
+                "running 3 tests
+all green
+",
+            ),
+            false,
+        );
+
+        assert_eq!(command.detail, "cargo test");
+        assert_eq!(
+            command.output.as_ref().map(|body| body.language.as_str()),
+            Some("text")
+        );
+        assert_eq!(
+            command.output.as_ref().map(|body| body.text.as_str()),
+            Some(
+                "running 3 tests
+all green"
+            )
         );
     }
 
