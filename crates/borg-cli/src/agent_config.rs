@@ -1657,6 +1657,37 @@ mode = \"idle\"
         );
     }
 
+    /// agent.toml is not solely this CLI s file: a sibling product writes its
+    /// own sections and keys into it. Loading has to tolerate them, because
+    /// refusing would strand a session on a file another product wrote, while
+    /// still applying the settings this CLI does understand.
+    #[test]
+    fn another_product_sections_and_keys_do_not_stop_a_session() {
+        let directory = tempfile::tempdir().expect("config directory");
+        let path = directory.path().join("agent.toml");
+        fs::write(
+            &path,
+            r#"[sibling-product]
+endpoint = "https://example.invalid"
+retain_days = 30
+
+[memory]
+recall = true
+
+[capabilities]
+subagents = false
+sibling_flag = "theirs"
+
+[warming]
+mode = "idle"
+"#,
+        )
+        .expect("config file");
+        let config = AgentConfig::load(Some(&path)).expect("another product sections load");
+        assert!(!config.capabilities.subagents);
+        assert_eq!(config.warming.mode, CacheWarmingMode::Idle);
+    }
+
     #[test]
     fn no_shell_setting_leaves_the_default_chain_in_charge() {
         assert!(AgentConfig::default().shell.command.is_none());

@@ -271,6 +271,26 @@ impl SelfServiceContext {
             );
         }
         let updated_sections = updates.keys().cloned().collect::<Vec<_>>();
+        // Validate what this call writes, not the whole document. agent.toml is
+        // written by more than one product, so a section or a key somebody else
+        // put there must not stop the user own settings from being saved; what
+        // is not ours is left exactly as it is.
+        let mut written = toml::Value::Table(toml::map::Map::new());
+        {
+            let written = written.as_table_mut().expect("a fresh table");
+            for (key, value) in &updates {
+                if value.is_null() {
+                    continue;
+                }
+                written.insert(
+                    key.clone(),
+                    json_to_toml(value.clone()).with_context(|| {
+                        format!("settings section `{key}` is not TOML-compatible")
+                    })?,
+                );
+            }
+        }
+        validate_settings_shape(&written)?;
         let mut root = if path.is_file() {
             let source = fs::read_to_string(&path)
                 .with_context(|| format!("failed to read agent settings {}", path.display()))?;
@@ -296,7 +316,6 @@ impl SelfServiceContext {
                 patch,
             );
         }
-        validate_settings_shape(&root)?;
         let rendered = toml::to_string_pretty(&root).context("serialize agent settings")?;
         write_atomic(&path, rendered.as_bytes())?;
         Ok(json!({
@@ -2631,6 +2650,11 @@ fn redact_toml(value: toml::Value) -> toml::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// The settings tests point the user config path at a scratch directory, so
+    /// they serialize on this lock.
+    static SETTINGS_ENV_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     #[test]
     fn trusted_settings_sections_only_flag_privilege_bearing_writes() {
@@ -2649,6 +2673,74 @@ mod tests {
             .is_empty()
         );
         assert!(trusted_settings_sections("read_file", &arguments).is_empty());
+    }
+
+    /// agent.toml is written by more than one product. A section or a key this
+    /// tool does not know must not stop the user own settings from being saved,
+    /// and saving must not drop what another product put there: the failure
+    /// mode on the other side is a sibling CLI that then refuses to start on a
+    /// file Borg rewrote.
+    #[test]
+    fn another_products_sections_and_keys_survive_a_settings_update() {
+        let _lock = SETTINGS_ENV_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let root = tempfile::tempdir().expect("config home");
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: serialized by SETTINGS_ENV_TEST_LOCK.
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", root.path()) };
+        let path = root.path().join("borg").join("agent.toml");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("config directory");
+        std::fs::write(
+            &path,
+            r#"[sibling-product]
+endpoint = "https://example.invalid"
+retain_days = 30
+
+[warming]
+mode = "idle"
+
+[capabilities]
+subagents = false
+sibling_flag = "theirs"
+
+[commands.aliases]
+"#,
+        )
+        .expect("seed config");
+
+        let context = SelfServiceContext::new(root.path().to_path_buf());
+        let updates: Map<String, Value> =
+            serde_json::from_value(json!({"commands": {"aliases": {"ship": "/status"}}}))
+                .expect("updates");
+        let result = context.update_settings("user", updates);
+        let written = std::fs::read_to_string(&path).expect("config is readable");
+        // SAFETY: as above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+
+        result.expect("another product section does not block saving");
+        let written = toml::from_str::<toml::Value>(&written).expect("written config parses");
+        assert_eq!(
+            written["commands"]["aliases"]["ship"].as_str(),
+            Some("/status")
+        );
+        for (section, key, expected) in [
+            ("sibling-product", "endpoint", "https://example.invalid"),
+            ("sibling-product", "retain_days", "30"),
+            ("capabilities", "sibling_flag", "theirs"),
+            ("warming", "mode", "idle"),
+        ] {
+            let value = written[section]
+                .get(key)
+                .unwrap_or_else(|| panic!("{section}.{key} was dropped: {written}"));
+            assert_eq!(value.to_string().trim_matches('"'), expected);
+        }
     }
 
     #[test]
