@@ -5028,40 +5028,88 @@ async fn run_agent_session_store_kernel_inner(
                             delivery,
                             executor.uses_native_harness(launch.provider),
                         ) => {
-                            if prompt.message_id == message_id
-                                || prompt
-                                    .batch
-                                    .iter()
-                                    .any(|entry| entry.message_id == message_id)
-                                || pending
-                                    .iter()
-                                    .any(|queued| queued.message_id == message_id)
-                                || pending_steers
-                                    .iter()
-                                    .any(|steer| steer.prompt.message_id == message_id)
-                            {
-                                continue;
+                            // Drain the steer commands already waiting behind this
+                            // one into a single admission run. The run shares one
+                            // commit, because a commit per prompt is exactly what an
+                            // Escape queued behind them waits for. Anything that is
+                            // not a steer goes back to the front of the queue, which
+                            // `next_host_command` reads before the channel, so
+                            // Escape keeps its place instead of waiting on the
+                            // batch.
+                            let mut drained = vec![(message_id, text, attachments, output_schema)];
+                            while let Ok(waiting) = commands.try_recv() {
+                                match waiting {
+                                    HostCommand::TeamPrompt {
+                                        message_id,
+                                        text,
+                                        attachments,
+                                        output_schema,
+                                        delivery,
+                                        ..
+                                    }
+                                    | HostCommand::Prompt {
+                                        message_id,
+                                        text,
+                                        attachments,
+                                        output_schema,
+                                        delivery,
+                                        ..
+                                    } if steers_active_provider_turn(
+                                        launch.provider,
+                                        delivery,
+                                        executor.uses_native_harness(launch.provider),
+                                    ) =>
+                                    {
+                                        team_message_ids.insert(message_id);
+                                        drained.push((message_id, text, attachments, output_schema));
+                                    }
+                                    other => {
+                                        deferred_commands.push_front(other);
+                                        break;
+                                    }
+                                }
                             }
-                            let admission_state = journal
-                                .prompt_admission_state(session_id, message_id)
-                                .await?;
-                            if admission_state == PromptAdmissionState::Settled {
-                                continue;
-                            }
-                            let actor = if team_message_ids.remove(&message_id) {
-                                EventActor::System
-                            } else {
-                                EventActor::User
-                            };
-                            if user_stop {
-                                if actor == EventActor::System {
-                                    // A background wake cannot steer a stopped
-                                    // session's turn; keep it visible only.
-                                    settle_team_notification(
-                                        &mut journal,
-                                        &events,
-                                        session_id,
-                                        QueuedPrompt {
+                            let mut statuses = Vec::new();
+                            let mut admitted: Vec<(QueuedPrompt, SteerAdmission, Uuid, bool)> =
+                                Vec::new();
+                            let mut has_pending = pending_steers
+                                .iter()
+                                .any(|steer| !steer.admission.is_accepted());
+                            let had_pending = has_pending;
+                            for (message_id, text, attachments, output_schema) in drained {
+                                if prompt.message_id == message_id
+                                    || prompt
+                                        .batch
+                                        .iter()
+                                        .any(|entry| entry.message_id == message_id)
+                                    || pending
+                                        .iter()
+                                        .any(|queued| queued.message_id == message_id)
+                                    || pending_steers
+                                        .iter()
+                                        .any(|steer| steer.prompt.message_id == message_id)
+                                    || admitted
+                                        .iter()
+                                        .any(|(queued, _, _, _)| queued.message_id == message_id)
+                                {
+                                    continue;
+                                }
+                                let admission_state = journal
+                                    .prompt_admission_state(session_id, message_id)
+                                    .await?;
+                                if admission_state == PromptAdmissionState::Settled {
+                                    continue;
+                                }
+                                let actor = if team_message_ids.remove(&message_id) {
+                                    EventActor::System
+                                } else {
+                                    EventActor::User
+                                };
+                                if user_stop {
+                                    if actor == EventActor::System {
+                                        // A background wake cannot steer a stopped
+                                        // session's turn; keep it visible only.
+                                        let settled = QueuedPrompt {
                                             message_id,
                                             text,
                                             actor,
@@ -5071,79 +5119,104 @@ async fn run_agent_session_store_kernel_inner(
                                             visible: true,
                                             interrupt_batch: false,
                                             batch: Vec::new(),
-                                        },
+                                        };
+                                        if settled.visible {
+                                            statuses.extend(settled.batch_entries().into_iter().map(
+                                                |entry| {
+                                                    (
+                                                        entry,
+                                                        MessageStatus::Complete,
+                                                        settled.delivery,
+                                                    )
+                                                },
+                                            ));
+                                        }
+                                        continue;
+                                    }
+                                    // New human input on the active path is the
+                                    // resume authority: clear the durable latch.
+                                    set_user_stop(
+                                        &mut journal,
+                                        &events,
+                                        session_id,
+                                        &mut user_stop,
+                                        false,
                                     )
                                     .await?;
-                                    continue;
+                                    stale_user_prompts.clear();
                                 }
-                                // New human input on the active path is the
-                                // resume authority: clear the durable latch.
-                                set_user_stop(
-                                    &mut journal,
-                                    &events,
-                                    session_id,
-                                    &mut user_stop,
-                                    false,
-                                )
-                                .await?;
-                                stale_user_prompts.clear();
+                                let prompt = QueuedPrompt {
+                                    message_id,
+                                    text,
+                                    actor,
+                                    attachments,
+                                    output_schema,
+                                    delivery: PromptDelivery::Steer,
+                                    visible: true,
+                                    interrupt_batch: actor == EventActor::User,
+                                    batch: Vec::new(),
+                                };
+                                if admission_state == PromptAdmissionState::New {
+                                    statuses.extend(prompt.batch_entries().into_iter().map(
+                                        |entry| (entry, MessageStatus::Queued, PromptDelivery::Steer),
+                                    ));
+                                }
+                                let will_send = !context_compaction_in_progress && !has_pending;
+                                admitted.push((
+                                    prompt,
+                                    SteerAdmission::pending(),
+                                    Uuid::new_v4(),
+                                    will_send,
+                                ));
+                                has_pending = true;
                             }
-                            let prompt = QueuedPrompt {
-                                message_id,
-                                text,
-                                actor,
-                                attachments,
-                                output_schema,
-                                delivery: PromptDelivery::Steer,
-                                visible: true,
-                                interrupt_batch: actor == EventActor::User,
-                                batch: Vec::new(),
-                            };
-                            if admission_state == PromptAdmissionState::New {
-                                record_prompt_status(
-                                    &mut journal,
-                                    &events,
-                                    session_id,
-                                    &prompt,
-                                    MessageStatus::Queued,
-                                    PromptDelivery::Steer,
-                                )
+                            // Durable before the provider can be handed any of
+                            // them, which is why the run is written here rather
+                            // than per prompt above.
+                            record_prompt_statuses(&mut journal, &events, session_id, statuses)
                                 .await?;
-                            }
-                            let admission = SteerAdmission::pending();
-                            let acknowledgement_id = Uuid::new_v4();
-                            let has_pending = pending_steers.iter().any(|steer| !steer.admission.is_accepted());
-                            let sent = if context_compaction_in_progress || has_pending {
-                                false
-                            } else {
-                                dispatch_steer(
-                                    &control_tx,
-                                    &steer_result_tx,
-                                    &prompt,
-                                    admission.clone(),
-                                    acknowledgement_id, launch.capabilities.frames_steers_for(launch.provider, launch.model.as_deref()),
-                                )
-                                .await
-                            };
-                            pending_steers.push_back(PendingSteer {
-                                prompt,
-                                acknowledgement_id,
-                                admission,
-                                state: if sent {
-                                    PendingSteerState::AwaitingAcknowledgement
-                                } else {
-                                    PendingSteerState::RetryAtBoundary {
-                                        error: if context_compaction_in_progress {
-                                            "provider is compacting context".to_string()
-                                        } else {
-                                            "provider turn control was unavailable".to_string()
-                                        },
-                                    }
-                                },
-                                attempt_boundary: steer_boundary_generation,
-                            });
-                            if has_pending && !context_compaction_in_progress && !user_stop && !interrupted {
-                                retry_pending_steers(&control_tx, &steer_result_tx, &mut pending_steers, steer_boundary_generation, launch.capabilities.frames_steers_for(launch.provider, launch.model.as_deref())).await;
+                            let handing_over = !context_compaction_in_progress
+                                && !user_stop
+                                && !interrupted;
+                            for (index, (prompt, admission, acknowledgement_id, will_send)) in
+                                admitted.into_iter().enumerate()
+                            {
+                                let sent = will_send
+                                    && dispatch_steer(
+                                        &control_tx,
+                                        &steer_result_tx,
+                                        &prompt,
+                                        admission.clone(),
+                                        acknowledgement_id, launch.capabilities.frames_steers_for(launch.provider, launch.model.as_deref()),
+                                    )
+                                    .await;
+                                pending_steers.push_back(PendingSteer {
+                                    prompt,
+                                    acknowledgement_id,
+                                    admission,
+                                    state: if sent {
+                                        PendingSteerState::AwaitingAcknowledgement
+                                    } else {
+                                        PendingSteerState::RetryAtBoundary {
+                                            error: if context_compaction_in_progress {
+                                                "provider is compacting context".to_string()
+                                            } else {
+                                                "provider turn control was unavailable".to_string()
+                                            },
+                                        }
+                                    },
+                                    attempt_boundary: steer_boundary_generation,
+                                });
+                                // One retry per admitted prompt, exactly as when
+                                // each prompt was admitted on its own: the retry
+                                // is what hands a retained prompt to the provider,
+                                // and batching the records must not thin out the
+                                // turns the provider control queue fills on. The
+                                // first prompt of a run retries only if something
+                                // was already pending ahead of it.
+                                if (index > 0 || had_pending) && handing_over {
+                                    retry_pending_steers(&control_tx, &steer_result_tx, &mut pending_steers, steer_boundary_generation, launch.capabilities.frames_steers_for(launch.provider, launch.model.as_deref())).await;
+                                }
                             }
                         }
                         HostCommand::Prompt {
