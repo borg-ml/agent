@@ -1,3 +1,4 @@
+mod anthropic_messages;
 pub mod chat_stream;
 #[cfg(feature = "codex")]
 mod codex_model;
@@ -8,6 +9,9 @@ mod openai_compatible;
 /// header, and owns no tool loop. Every other OpenCode route keeps the
 /// compatibility path through the `opencode` CLI.
 pub mod opencode_model;
+pub use anthropic_messages::{
+    ANTHROPIC_LABEL, AnthropicMessagesProvider, context_window_tokens, messages_endpoint,
+};
 #[cfg(feature = "codex")]
 pub use codex_model::CodexModelProvider;
 
