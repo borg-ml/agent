@@ -60,6 +60,9 @@ struct ProcessManagerInner {
     /// when the session's process manager is built, so a session keeps the
     /// shell it started with and a later choice applies to new sessions.
     shell: Shell,
+    /// Identity every command of this session commits under, when the operator
+    /// configured one. `None` is the default and exports nothing.
+    identity: Option<GitIdentity>,
     processes: Mutex<HashMap<Uuid, Arc<ProcessEntry>>>,
     recovered_sessions: Mutex<HashSet<Uuid>>,
     updates: broadcast::Sender<(Uuid, Option<Vec<u8>>)>,
@@ -176,6 +179,7 @@ impl Default for ProcessManager {
         Self {
             inner: Arc::new(ProcessManagerInner {
                 shell: Shell::resolve(),
+                identity: GitIdentity::resolve(),
                 processes: Mutex::new(HashMap::new()),
                 recovered_sessions: Mutex::new(HashSet::new()),
                 updates: broadcast::channel(256).0,
@@ -320,6 +324,13 @@ impl ProcessManager {
         let mut process = self.inner.shell.command(&command);
         crate::process_environment::configure_host_child_environment(&mut process);
         process.envs(environment);
+        // Applied last, after the caller's environment and after the sanitized
+        // hosted profile: the operator's identity is a decision about who
+        // authored a commit, so neither a session-scoped variable nor an
+        // emptied environment may drop it. Unset changes nothing.
+        if let Some(identity) = &self.inner.identity {
+            identity.apply(&mut process);
+        }
         // Set after the caller's environment so a session-scoped variable can
         // never shadow this process' own private spool with another one's.
         if let Some(spool) = &attachment_spool {
@@ -1334,6 +1345,54 @@ fn process_is_alive(pid: u32) -> bool {
 /// starts; the variable is the per-process override for entry points that do
 /// not read that config file.
 pub const SHELL_ENV: &str = "BORG_AGENT_SHELL";
+
+/// Environment variable that carries `[git] identity` from the CLI to a
+/// session. It is an internal hand-off, not a user-facing switch: the config
+/// setting is the one knob.
+pub const GIT_IDENTITY_ENV: &str = "BORG_AGENT_GIT_IDENTITY";
+
+/// The identity agent-authored commits are marked with, when an operator asked
+/// for one. Unset (the default) applies nothing, so the commands a session
+/// spawns run with the environment Borg itself inherited and git resolves the
+/// user's own identity exactly as it does in an ordinary shell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitIdentity {
+    name: String,
+    email: String,
+}
+
+impl GitIdentity {
+    /// `Name <email>`, the shape git itself accepts.
+    fn parse(value: &str) -> Option<Self> {
+        let start = value.rfind('<')?;
+        let end = start + value[start..].find('>')?;
+        let name = value[..start].trim();
+        let email = value[start + 1..end].trim();
+        let plausible = !name.is_empty()
+            && email.contains('@')
+            && !email.contains(['<', '>', ' '])
+            && !email.starts_with('@')
+            && !email.ends_with('@');
+        plausible.then(|| Self {
+            name: name.to_string(),
+            email: email.to_string(),
+        })
+    }
+
+    fn resolve() -> Option<Self> {
+        Self::parse(&std::env::var(GIT_IDENTITY_ENV).ok()?)
+    }
+
+    /// Author and committer both, because a commit whose author and committer
+    /// disagree is what a later rebase turns into a fake attribution.
+    fn apply(&self, command: &mut Command) {
+        command
+            .env("GIT_AUTHOR_NAME", &self.name)
+            .env("GIT_AUTHOR_EMAIL", &self.email)
+            .env("GIT_COMMITTER_NAME", &self.name)
+            .env("GIT_COMMITTER_EMAIL", &self.email);
+    }
+}
 
 /// The command-line form an interpreter wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2833,6 +2892,10 @@ mod tests {
 
     static ENV_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    /// The two identity tests mutate process-global state and then await a
+    /// spawn, so they serialize on an async lock rather than a std one.
+    static IDENTITY_TEST_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
     fn stub_shell(directory: &Path, name: &str) -> PathBuf {
         let program = directory.join(name);
         std::fs::write(&program, "#!/bin/sh\n").expect("stub shell");
@@ -2939,7 +3002,11 @@ mod tests {
                 ShellFlavor::PowerShell,
                 &["-NoProfile", "-Command", "echo hi"],
             ),
-            ("/usr/bin/cmd", ShellFlavor::Cmd, &["/D", "/S", "/C", "echo hi"]),
+            (
+                "/usr/bin/cmd",
+                ShellFlavor::Cmd,
+                &["/D", "/S", "/C", "echo hi"],
+            ),
         ];
         for (program, flavor, expected) in cases {
             let shell = Shell::installed(PathBuf::from(program));
@@ -2951,6 +3018,122 @@ mod tests {
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
             assert_eq!(arguments, expected, "{program}");
+        }
+    }
+
+    /// The default must override nothing: a session with no configured identity
+    /// leaves the commands it spawns exactly the environment Borg inherited, so
+    /// git resolves the user's own identity and a commit cannot be attributed
+    /// to a name nobody chose.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_session_without_a_configured_identity_sets_no_identity() {
+        // The sibling identity test publishes the carrier variable, so both
+        // hold the same lock: without it this session could be built while that
+        // one has an identity published.
+        let _lock = IDENTITY_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let previous = std::env::var_os(GIT_IDENTITY_ENV);
+        // SAFETY: serialized by IDENTITY_TEST_LOCK, which no other test reads
+        // these variables under.
+        unsafe { std::env::remove_var(GIT_IDENTITY_ENV) };
+        let root = tempfile::tempdir().expect("workspace");
+        let manager = ProcessManager::default();
+        assert_eq!(manager.inner.identity, None);
+        let result = manager
+            .exec(
+                Uuid::new_v4(),
+                root.path(),
+                "printf '%s|%s' \"$GIT_AUTHOR_NAME\" \"$GIT_COMMITTER_EMAIL\"".to_string(),
+                None,
+                Some(2_000),
+                Some(100),
+                10_000,
+                None,
+            )
+            .await
+            .expect("command");
+        // Whatever the environment already had, Borg added no identity of its
+        // own: the child sees the values it inherited, not one from Borg.
+        let expected = format!(
+            "{}|{}",
+            std::env::var("GIT_AUTHOR_NAME").unwrap_or_default(),
+            std::env::var("GIT_COMMITTER_EMAIL").unwrap_or_default()
+        );
+        // SAFETY: as above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(GIT_IDENTITY_ENV, value),
+                None => std::env::remove_var(GIT_IDENTITY_ENV),
+            }
+        }
+        assert_eq!(result.stdout, expected);
+    }
+
+    /// The other half: a configured identity must actually reach the commands a
+    /// session spawns, or the opt-in would mark nothing.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_configured_identity_reaches_every_agent_command() {
+        let _lock = IDENTITY_TEST_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
+        let previous = std::env::var_os(GIT_IDENTITY_ENV);
+        // SAFETY: serialized by IDENTITY_TEST_LOCK, which no other test reads
+        // these variables under.
+        unsafe { std::env::set_var(GIT_IDENTITY_ENV, "Borg Agent <agent@borg.local>") };
+        let manager = ProcessManager::default();
+        let root = tempfile::tempdir().expect("workspace");
+        let command = "printf '%s|%s|%s|%s' \"$GIT_AUTHOR_NAME\" \"$GIT_AUTHOR_EMAIL\" \"$GIT_COMMITTER_NAME\" \"$GIT_COMMITTER_EMAIL\"";
+        let result = manager
+            .exec(
+                Uuid::new_v4(),
+                root.path(),
+                command.to_string(),
+                None,
+                Some(2_000),
+                Some(100),
+                10_000,
+                None,
+            )
+            .await
+            .expect("command");
+        // SAFETY: as above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(GIT_IDENTITY_ENV, value),
+                None => std::env::remove_var(GIT_IDENTITY_ENV),
+            }
+        }
+        assert_eq!(
+            result.stdout,
+            "Borg Agent|agent@borg.local|Borg Agent|agent@borg.local"
+        );
+    }
+
+    #[test]
+    fn git_identity_parsing_matches_the_shape_git_accepts() {
+        let identity = GitIdentity::parse("Borg Agent <agent@borg.local>").expect("parses");
+        assert_eq!(identity.name, "Borg Agent");
+        assert_eq!(identity.email, "agent@borg.local");
+        assert_eq!(
+            GitIdentity::parse("  Sasha  <s@example.com>  ")
+                .unwrap()
+                .name,
+            "Sasha"
+        );
+        for rejected in [
+            "Borg Agent",
+            "Borg Agent <agent@borg.local",
+            "<agent@borg.local>",
+            "Borg Agent <agent@>",
+            "Borg Agent <borg.local>",
+            "Borg Agent <a b@borg.local>",
+        ] {
+            assert!(GitIdentity::parse(rejected).is_none(), "{rejected}");
         }
     }
 }

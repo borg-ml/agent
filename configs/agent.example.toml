@@ -179,5 +179,15 @@ check_interval_hours = 24
 # command = "bash"
 
 
+# The identity agent-authored commits are marked with. Left unset, Borg overrides
+# nothing: agent commands keep the environment Borg inherited, so git resolves
+# your own identity from your git configuration exactly as it does in an
+# ordinary shell -- and a commit git cannot attribute fails with git's own error
+# rather than being given a name nobody chose. Set it to mark automation on
+# purpose; author and committer both.
+# [git]
+# identity = "Borg Agent <agent@borg.local>"
+
+
 [warming]
 mode = "streaming"
