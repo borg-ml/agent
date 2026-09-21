@@ -103,21 +103,35 @@ impl AgentSubjects {
     /// the aggregate asks for them. `None` means it keeps waiting: a subject the
     /// session has never been told about is unknown rather than exited, and
     /// guessing would wake the session before the child was ever terminal.
+    ///
+    /// Every subject being gone settles the watch whatever its signal asks for.
+    /// Nothing can make a dead child signal, so such a watch can never fire
+    /// again, and a watch left running holds a yielded session on a wake that
+    /// cannot arrive.
     pub fn settle(
         &self,
         states: &BTreeMap<Uuid, SubjectRecord>,
     ) -> Option<Vec<(Uuid, SubjectLife)>> {
-        let signalled: Vec<(Uuid, SubjectLife)> = self
+        let known: Vec<(Uuid, SubjectLife)> = self
             .subjects
             .iter()
             .filter_map(|id| states.get(id).map(|record| (*id, record.life)))
+            .collect();
+        let signalled: Vec<(Uuid, SubjectLife)> = known
+            .iter()
+            .copied()
             .filter(|(_, life)| self.signal.matches(*life))
             .collect();
         let settled = match self.aggregate {
             Aggregate::All => signalled.len() == self.subjects.len(),
             Aggregate::Any => !signalled.is_empty(),
         };
-        settled.then_some(signalled)
+        if settled {
+            return Some(signalled);
+        }
+        let gone = known.len() == self.subjects.len()
+            && known.iter().all(|(_, life)| *life == SubjectLife::Exited);
+        gone.then_some(known)
     }
 }
 
@@ -185,6 +199,29 @@ mod tests {
                 .settle(&states(&[(child, SubjectLife::Live)]))
                 .is_none(),
             "a child still working needs nothing from the parent"
+        );
+    }
+
+    /// A watch whose subjects are all gone settles even when it asked for
+    /// attention, because a dead child can never signal again; a subject that is
+    /// still working keeps it waiting, so a live batch is not woken early.
+    #[test]
+    fn a_watch_whose_subjects_are_all_gone_settles_even_for_attention() {
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let alone = AgentSubjects::new(vec![first], AgentSignal::Attention, Aggregate::All);
+        assert_eq!(
+            alone.settle(&states(&[(first, SubjectLife::Exited)])),
+            Some(vec![(first, SubjectLife::Exited)])
+        );
+
+        let pair = AgentSubjects::new(vec![first, second], AgentSignal::Attention, Aggregate::All);
+        assert!(
+            pair.settle(&states(&[
+                (first, SubjectLife::Exited),
+                (second, SubjectLife::Live)
+            ]))
+            .is_none(),
+            "a child still working can still signal"
         );
     }
 

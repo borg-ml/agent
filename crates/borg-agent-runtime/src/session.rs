@@ -2389,6 +2389,13 @@ async fn run_agent_session_store_kernel_inner(
             );
             loop {
                 let usage_limit_wait = wait_for_retry_deadline(retry_not_before);
+                // A yielded goal is ended by watchers, and a watcher that cannot
+                // fire never ends anything: bound the silence here so the session
+                // comes back with the facts instead of idling on it. Recomputed
+                // per pass, so a watcher that does speak restarts the clock.
+                let silence_remaining = watches
+                    .silence_remaining(crate::watch::YIELD_SILENCE_BOUND)
+                    .await;
                 let command = tokio::select! {
                                     biased;
                                     _ = usage_limit_wait, if retry_not_before.is_some() => {
@@ -2610,6 +2617,41 @@ async fn run_agent_session_store_kernel_inner(
                                             output_schema: None,
                                             delivery: PromptDelivery::Queue,
                                         })
+                                    }
+                                    _ = tokio::time::sleep(silence_remaining.unwrap_or_default()), if silence_remaining.is_some() => {
+                                        // Nothing reported for the bound. Take the wait
+                                        // back with the silence and the subject state, so
+                                        // the resumed turn has something to act on rather
+                                        // than only the absence of an event that was never
+                                        // going to arrive.
+                                        let Some(silent) = watches
+                                            .resume_if_silent(crate::watch::YIELD_SILENCE_BOUND)
+                                            .await
+                                        else {
+                                            continue;
+                                        };
+                                        yield_journalled = false;
+                                        record(
+                                            &mut journal,
+                                            &events,
+                                            session_id,
+                                            SessionEventKind::ProviderEvent {
+                                                provider: launch.provider,
+                                                kind: "goal_resumed".to_string(),
+                                                payload: serde_json::json!({
+                                                    "cause": "watchers_silent",
+                                                    "reason": silent.wait.reason,
+                                                    "watch_ids": silent.wait.watch_ids,
+                                                    "waited_ms": (chrono::Utc::now() - silent.wait.since)
+                                                        .num_milliseconds()
+                                                        .max(0),
+                                                    "quiet_ms": silent.quiet_ms,
+                                                    "status": silent.status,
+                                                }),
+                                            },
+                                        )
+                                        .await?;
+                                        continue 'session;
                                     }
                                 };
                 match command {
