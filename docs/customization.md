@@ -22,6 +22,26 @@ Borg starts the server lazily when a shell file is used with its LSP tools;
 no agent configuration or restart is needed. ShellCheck supplies shell diagnostics
 through `lsp_diagnostics` and `lsp_workspace_diagnostics`.
 
+## Agent shell
+
+Agent shell commands run under one interpreter, resolved once when a session
+starts: `shell.command` in `agent.toml`, else `BORG_AGENT_SHELL`, else bash when
+it is installed, else `/bin/sh` (PowerShell, then `ComSpec`, on Windows). Borg
+does not consult `SHELL`: that variable describes how you talk to your terminal,
+and on a fish host it made every agent command a fish command, where
+`VAR=value`, heredocs, `$( )` in command position, and `<`/`>` are a different
+language the model never chose. Set `shell.command` (`command = "fish"`) to pin a
+specific interpreter; an explicit choice is honored, and a configured shell that
+is not installed is refused when the configuration loads instead of being
+quietly replaced. Each shell family is invoked in its own form (`-c` for the
+`sh` family, `-NoProfile -Command` for PowerShell, `/D /S /C` for `cmd`).
+
+A running session keeps the shell it started with; a change applies to the next
+session. Only the environment carries over to the agent's shell: functions and
+aliases you define interactively in your own shell do not exist there, which is
+why they are interactive conveniences rather than configuration. Select that
+shell explicitly if you want them.
+
 ## Interactive agent settings
 
 Run `/settings` to open the settings picker. Changes made by agent UI pickers are

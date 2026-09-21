@@ -167,5 +167,17 @@ check_interval_hours = 24
 # not pay to rebuild it. "streaming" refreshes across a run and is the default;
 # "idle" keeps refreshing while you are away, so it is opt-in; "off" disables
 # it. BORG_CACHE_WARMING overrides this for a single process.
+# The interpreter agent shell commands run under, resolved once when a session
+# starts. Unset uses bash when it is installed, else /bin/sh (PowerShell, then
+# ComSpec, on Windows); BORG_AGENT_SHELL overrides that default chain for one
+# process and this setting outranks the variable. SHELL is deliberately ignored:
+# it describes how you talk to your terminal, not which dialect an agent should
+# write. Setting `command` pins a shell you want instead, for example "fish"; a
+# configured shell that is not installed is refused when this file is loaded
+# rather than quietly replaced.
+# [shell]
+# command = "bash"
+
+
 [warming]
 mode = "streaming"

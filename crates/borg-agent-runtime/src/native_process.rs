@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -55,6 +56,10 @@ pub(crate) struct ProcessManager {
 
 #[derive(Debug)]
 struct ProcessManagerInner {
+    /// Interpreter every command of this session runs under. Resolved once,
+    /// when the session's process manager is built, so a session keeps the
+    /// shell it started with and a later choice applies to new sessions.
+    shell: Shell,
     processes: Mutex<HashMap<Uuid, Arc<ProcessEntry>>>,
     recovered_sessions: Mutex<HashSet<Uuid>>,
     updates: broadcast::Sender<(Uuid, Option<Vec<u8>>)>,
@@ -170,6 +175,7 @@ impl Default for ProcessManager {
     fn default() -> Self {
         Self {
             inner: Arc::new(ProcessManagerInner {
+                shell: Shell::resolve(),
                 processes: Mutex::new(HashMap::new()),
                 recovered_sessions: Mutex::new(HashSet::new()),
                 updates: broadcast::channel(256).0,
@@ -311,7 +317,7 @@ impl ProcessManager {
             Ok(spool) => (Some(spool), None),
             Err(error) => (None, Some(error)),
         };
-        let mut process = shell_command(&command);
+        let mut process = self.inner.shell.command(&command);
         crate::process_environment::configure_host_child_environment(&mut process);
         process.envs(environment);
         // Set after the caller's environment so a session-scoped variable can
@@ -1322,22 +1328,194 @@ fn process_is_alive(pid: u32) -> bool {
     pid != 0
 }
 
-#[cfg(unix)]
-fn shell_command(command: &str) -> Command {
-    let shell = std::env::var_os("SHELL")
-        .filter(|value| Path::new(value).is_absolute())
-        .unwrap_or_else(|| "/bin/sh".into());
-    let mut process = Command::new(shell);
-    process.args(["-lc", command]);
-    process
+/// Environment variable naming the interpreter agent shell commands run under.
+///
+/// `[shell] command` in the agent config is published here when a session
+/// starts; the variable is the per-process override for entry points that do
+/// not read that config file.
+pub const SHELL_ENV: &str = "BORG_AGENT_SHELL";
+
+/// The command-line form an interpreter wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellFlavor {
+    /// `sh` family: `bash`, `dash`, `zsh`, `ksh`, `fish`, and any name Borg
+    /// does not recognize: `-c COMMAND`.
+    Posix,
+    /// PowerShell: `-NoProfile -Command COMMAND`.
+    PowerShell,
+    /// `cmd.exe`: `/D /S /C COMMAND`.
+    Cmd,
 }
 
-#[cfg(windows)]
-fn shell_command(command: &str) -> Command {
-    let shell = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
-    let mut process = Command::new(shell);
-    process.args(["/D", "/S", "/C", command]);
-    process
+impl ShellFlavor {
+    fn of(program: &Path) -> Self {
+        let name = program
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        match name.as_str() {
+            "powershell" | "pwsh" => Self::PowerShell,
+            "cmd" => Self::Cmd,
+            _ => Self::Posix,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Posix => "posix",
+            Self::PowerShell => "powershell",
+            Self::Cmd => "cmd",
+        }
+    }
+}
+
+/// The interpreter agent shell commands run under.
+#[derive(Debug, Clone)]
+pub struct Shell {
+    program: PathBuf,
+    flavor: ShellFlavor,
+}
+
+impl Shell {
+    /// Resolve the interpreter for agent commands: `BORG_AGENT_SHELL` (which
+    /// carries an explicitly configured `[shell] command`), else bash when it
+    /// is installed, else `/bin/sh` as the POSIX floor, else the platform
+    /// default -- PowerShell and then `ComSpec` on Windows.
+    ///
+    /// `SHELL` is deliberately not consulted. It describes how the human talks
+    /// to their terminal, not which dialect an agent should write: on a fish
+    /// host it made every agent command a fish command, where `VAR=value`,
+    /// heredocs, `$( )` in command position, and `<`/`>` are a different
+    /// language. The model cannot see which shell it has, so each such failure
+    /// reads as the model's own mistake and costs a turn.
+    pub fn resolve() -> Self {
+        let configured =
+            std::env::var_os(SHELL_ENV).filter(|value| !value.to_string_lossy().trim().is_empty());
+        let shell = Self::resolve_from(configured.as_deref(), std::env::var_os("PATH").as_deref());
+        tracing::info!(
+            program = %shell.program.display(),
+            flavor = shell.flavor.as_str(),
+            source = if configured.is_some() { SHELL_ENV } else { "default" },
+            "agent shell resolved"
+        );
+        shell
+    }
+
+    fn resolve_from(configured: Option<&OsStr>, path: Option<&OsStr>) -> Self {
+        if let Some(configured) = configured {
+            let name = configured.to_string_lossy();
+            let name = name.trim();
+            if !name.is_empty() {
+                match Self::locate_in(name, path) {
+                    Some(program) => return Self::installed(program),
+                    // A shell that is not installed must not be chosen, and the
+                    // choice must not be silent either: say which shell the
+                    // commands will actually run under.
+                    None => tracing::warn!(
+                        variable = SHELL_ENV,
+                        shell = name,
+                        "the configured agent shell is not installed; agent commands run under the default shell"
+                    ),
+                }
+            }
+        }
+        Self::installed(default_shell_program(path))
+    }
+
+    fn installed(program: PathBuf) -> Self {
+        Self {
+            flavor: ShellFlavor::of(&program),
+            program,
+        }
+    }
+
+    /// Where `program` is installed, if it is: an explicit path that exists, or
+    /// a name found on `PATH`.
+    ///
+    /// `[shell] command` validation goes through this, so a shell a session
+    /// could find is never rejected at startup, and a shell the CLI accepts is
+    /// never unavailable to a session.
+    pub fn locate(program: &str) -> Option<PathBuf> {
+        Self::locate_in(program.trim(), std::env::var_os("PATH").as_deref())
+    }
+
+    fn locate_in(program: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+        if program.is_empty() {
+            return None;
+        }
+        let candidate = Path::new(program);
+        if candidate.is_absolute() || program.contains(std::path::MAIN_SEPARATOR) {
+            return is_executable_file(candidate).then(|| candidate.to_path_buf());
+        }
+        let names: Vec<String> = if cfg!(windows) {
+            vec![format!("{program}.exe"), program.to_string()]
+        } else {
+            vec![program.to_string()]
+        };
+        for directory in std::env::split_paths(path?) {
+            if directory.as_os_str().is_empty() {
+                continue;
+            }
+            for name in &names {
+                let candidate = directory.join(name);
+                if is_executable_file(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
+    /// Start `command` the way this interpreter understands it. Each family
+    /// gets its own form; a flag one family understands is not passed to
+    /// another.
+    fn command(&self, command: &str) -> Command {
+        let mut process = Command::new(&self.program);
+        match self.flavor {
+            ShellFlavor::Posix => process.args(["-c", command]),
+            ShellFlavor::PowerShell => process.args(["-NoProfile", "-Command", command]),
+            ShellFlavor::Cmd => process.args(["/D", "/S", "/C", command]),
+        };
+        process
+    }
+}
+
+/// The default chain: bash when it is installed, else `/bin/sh` as the POSIX
+/// floor, else the platform default. Bash is preferred for the dialect an agent
+/// writes, never assumed to exist.
+fn default_shell_program(path: Option<&OsStr>) -> PathBuf {
+    if cfg!(windows) {
+        for candidate in ["pwsh", "powershell"] {
+            if let Some(program) = Shell::locate_in(candidate, path) {
+                return program;
+            }
+        }
+        std::env::var_os("ComSpec")
+            .map(PathBuf::from)
+            .filter(|program| !program.as_os_str().is_empty())
+            .unwrap_or_else(|| PathBuf::from("cmd.exe"))
+    } else {
+        Shell::locate_in("bash", path).unwrap_or_else(|| PathBuf::from("/bin/sh"))
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 #[cfg(unix)]
@@ -1419,7 +1597,9 @@ fn terminate_process_tree_now(pid: u32) {
 mod tests {
     use super::*;
     use crate::SessionStore;
-    use std::sync::Arc;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex, OnceLock};
 
     #[test]
     fn head_tail_output_preserves_the_failure_tail() {
@@ -2649,5 +2829,128 @@ mod tests {
             spool.path().join("0003.tmp").exists(),
             "an in-flight write was consumed"
         );
+    }
+
+    static ENV_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn stub_shell(directory: &Path, name: &str) -> PathBuf {
+        let program = directory.join(name);
+        std::fs::write(&program, "#!/bin/sh\n").expect("stub shell");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("stub shell is executable");
+        program
+    }
+
+    /// The failure this protects: on a host without bash, choosing bash anyway
+    /// turns every agent command into a spawn error. The default chain has to
+    /// reach the POSIX floor instead.
+    #[test]
+    #[cfg(unix)]
+    fn the_default_chain_prefers_bash_and_never_assumes_it_exists() {
+        let with_bash = tempfile::tempdir().expect("path");
+        let bash = stub_shell(with_bash.path(), "bash");
+
+        let shell = Shell::resolve_from(None, Some(with_bash.path().as_os_str()));
+        assert_eq!(shell.program, bash);
+        assert_eq!(shell.flavor, ShellFlavor::Posix);
+
+        let without_bash = tempfile::tempdir().expect("path");
+        let shell = Shell::resolve_from(None, Some(without_bash.path().as_os_str()));
+        assert_eq!(shell.program, Path::new("/bin/sh"));
+        assert_eq!(shell.flavor, ShellFlavor::Posix);
+    }
+
+    /// The other half of the same failure: a configured shell that is not
+    /// installed must not be chosen, and the substitution must not be silent.
+    #[test]
+    #[cfg(unix)]
+    fn a_configured_shell_is_used_and_an_uninstalled_one_is_not_chosen() {
+        let directory = tempfile::tempdir().expect("path");
+        let fish = stub_shell(directory.path(), "fish");
+
+        // Selecting fish explicitly is a user decision Borg honors, including
+        // the dialect that comes with it.
+        let shell =
+            Shell::resolve_from(Some(OsStr::new("fish")), Some(directory.path().as_os_str()));
+        assert_eq!(shell.program, fish);
+        assert_eq!(shell.flavor, ShellFlavor::Posix);
+
+        let empty = tempfile::tempdir().expect("path");
+        let shell = Shell::resolve_from(
+            Some(OsStr::new("definitely-not-a-shell")),
+            Some(empty.path().as_os_str()),
+        );
+        assert_eq!(shell.program, Path::new("/bin/sh"));
+    }
+
+    /// The defect this replaces: `SHELL` names the human's interactive shell,
+    /// so on a fish host every agent command ran under fish -- where
+    /// `VAR=value`, heredocs, `$( )` in command position, and `<`/`>` are a
+    /// different language -- and the model could not tell why its commands
+    /// failed.
+    #[test]
+    #[cfg(unix)]
+    fn the_users_interactive_shell_does_not_decide_the_agent_shell() {
+        let _lock = ENV_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous_shell = std::env::var_os("SHELL");
+        let previous_override = std::env::var_os(SHELL_ENV);
+        // SAFETY: serialized by ENV_TEST_LOCK, which no other test reads these
+        // two variables under.
+        unsafe {
+            std::env::set_var("SHELL", "/nonexistent/fish");
+            std::env::remove_var(SHELL_ENV);
+        }
+        let default = Shell::resolve();
+        // SAFETY: as above.
+        unsafe { std::env::set_var(SHELL_ENV, "/bin/sh") };
+        let overridden = Shell::resolve();
+        // SAFETY: as above.
+        unsafe {
+            match previous_shell {
+                Some(value) => std::env::set_var("SHELL", value),
+                None => std::env::remove_var("SHELL"),
+            }
+            match previous_override {
+                Some(value) => std::env::set_var(SHELL_ENV, value),
+                None => std::env::remove_var(SHELL_ENV),
+            }
+        }
+
+        assert_ne!(default.program, Path::new("/nonexistent/fish"));
+        assert_eq!(default.flavor, ShellFlavor::Posix);
+        assert_eq!(overridden.program, Path::new("/bin/sh"));
+    }
+
+    /// Passing one shell a flag only another understands is the bug this
+    /// guards: PowerShell has no `-c`, and `sh` has no `-NoProfile`.
+    #[test]
+    fn each_shell_family_gets_the_flags_it_understands() {
+        // Host-native spellings: `Path::file_stem` is what maps a program to a
+        // family, and it strips `.exe` on Windows.
+        let cases: [(&str, ShellFlavor, &[&str]); 5] = [
+            ("/bin/bash", ShellFlavor::Posix, &["-c", "echo hi"]),
+            ("/usr/bin/fish", ShellFlavor::Posix, &["-c", "echo hi"]),
+            ("/usr/bin/sh", ShellFlavor::Posix, &["-c", "echo hi"]),
+            (
+                "/usr/bin/pwsh",
+                ShellFlavor::PowerShell,
+                &["-NoProfile", "-Command", "echo hi"],
+            ),
+            ("/usr/bin/cmd", ShellFlavor::Cmd, &["/D", "/S", "/C", "echo hi"]),
+        ];
+        for (program, flavor, expected) in cases {
+            let shell = Shell::installed(PathBuf::from(program));
+            assert_eq!(shell.flavor, flavor, "{program}");
+            let arguments = shell
+                .command("echo hi")
+                .as_std()
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(arguments, expected, "{program}");
+        }
     }
 }
