@@ -10095,6 +10095,10 @@ fn turn_error_is_connection_lost(error: &anyhow::Error, rendered: &str) -> bool 
     match borg_provider::provider::classify_provider_error(error) {
         borg_provider::provider::ProviderErrorKind::ConnectionLost => true,
         borg_provider::provider::ProviderErrorKind::Fatal => false,
+        // A context-length refusal is not a lost connection; the harness
+        // recovers it by compacting, and this session-level retry must not
+        // resend the same oversized request while that happens.
+        borg_provider::provider::ProviderErrorKind::ContextLength => false,
         borg_provider::provider::ProviderErrorKind::Unknown => {
             provider_error_is_connection_lost(rendered)
         }

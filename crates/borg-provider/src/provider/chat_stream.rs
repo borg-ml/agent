@@ -374,6 +374,12 @@ pub enum ProviderErrorKind {
     /// The provider is alive and refusing for a reason retrying cannot fix
     /// (auth, billing, quota). Retrying burns budget and hides the cause.
     Fatal,
+    /// The request was refused because the conversation, plus the output still
+    /// to be generated, does not fit the model's context window. Distinct from
+    /// `Fatal` because the harness can recover it by dropping the oldest
+    /// context and retrying, and distinct from `ConnectionLost` because
+    /// retrying the identical request cannot succeed.
+    ContextLength,
     /// No typed signal available; fall back to inspecting the message text.
     Unknown,
 }
@@ -467,7 +473,37 @@ pub fn classify_provider_error(error: &anyhow::Error) -> ProviderErrorKind {
             }
         }
     }
+    // Many provider APIs report a context-length refusal only as prose in an
+    // error body, and the native path flattens its typed cause into that
+    // message. It is not a transport failure and cannot be fixed by retrying
+    // the identical request, so it must not fall through to `Unknown`, where
+    // the caller would treat it as an ordinary transient failure.
+    if provider_error_is_context_length(&format!("{error:#}")) {
+        return ProviderErrorKind::ContextLength;
+    }
     ProviderErrorKind::Unknown
+}
+
+/// Whether a rendered provider error reports that the request exceeded the
+/// model's context window. Phrasing varies across vendors, so match the
+/// established spellings rather than one vendor's wording.
+fn provider_error_is_context_length(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    [
+        "context length",
+        "context_length",
+        "context limit",
+        "maximum context",
+        "max context",
+        "context window",
+        "too many tokens",
+        "input is too long",
+        "prompt is too long",
+        "reduce the length",
+        "exceeds the maximum",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
 }
 
 #[derive(Debug, Clone)]
@@ -1974,6 +2010,31 @@ fn has_nonempty_env(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_context_length_refusal_classifies_as_recoverable_not_unknown() {
+        // A prose refusal from an API error body, and the native path flattens
+        // typed causes into exactly this kind of message.
+        let refused = anyhow::anyhow!(
+            "This model's maximum context length is 128000 tokens, however you requested 140000 tokens"
+        );
+        assert_eq!(
+            classify_provider_error(&refused),
+            ProviderErrorKind::ContextLength
+        );
+        // Codex's own wording, which reaches the classifier as prose too.
+        let codex = anyhow::anyhow!(
+            "Codex context limit reached; compact the conversation before trying again. HTTP 400."
+        );
+        assert_eq!(
+            classify_provider_error(&codex),
+            ProviderErrorKind::ContextLength
+        );
+        // An unrelated provider failure must stay `Unknown`, so it is not
+        // mistaken for something compaction can fix.
+        let other = anyhow::anyhow!("the model produced malformed tool arguments");
+        assert_eq!(classify_provider_error(&other), ProviderErrorKind::Unknown);
+    }
 
     #[test]
     fn codex_account_rate_limits_parse_native_usage_shape() {

@@ -53,6 +53,11 @@ const MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 /// message and asks the model to resume, instead of discarding the turn.
 const MAX_LENGTH_CONTINUATIONS: usize = 2;
 const LENGTH_CONTINUATION_PROMPT: &str = "Your previous reply was cut off at the output-token limit. Continue exactly where it stopped, without repeating what was already written.";
+/// Model rounds recovered by compacting after the provider refused a request
+/// for context length. The pre-call guard cannot catch this when the window is
+/// unknown or the estimate is low, so the rejection itself is the last resort.
+/// Two attempts let a first compaction that retained too much compact again.
+const MAX_CONTEXT_LENGTH_RECOVERIES: usize = 2;
 /// How long a running command gets to observe an interrupt's cancel signal
 /// before the turn is abandoned. The cancel token is the real kill switch and
 /// session teardown reaps anything that lingers, so this only bounds how long
@@ -116,6 +121,10 @@ struct NativeCompactionContext<'a> {
     usage: &'a mut ProviderCallUsage,
     warmer: Option<&'a CacheWarmer>,
     events: &'a mpsc::Sender<SessionEventKind>,
+    /// Compact even when the pre-call estimate says the request fits. Set only
+    /// after the provider has already refused for context length, where the
+    /// estimate is demonstrably wrong or its window unknown.
+    force: bool,
 }
 
 impl NativeHarness {
@@ -589,6 +598,7 @@ impl NativeHarness {
         let mut model_round = 0_usize;
         let mut tool_round = 0_usize;
         let mut length_continuations = 0_usize;
+        let mut context_length_recoveries = 0_usize;
         let mut truncated_text = String::new();
         // A steer that lands while the model is still streaming is parked here
         // rather than ending the request, so a tool call in mid-generation
@@ -617,6 +627,7 @@ impl NativeHarness {
                         usage: &mut usage,
                         warmer: warmer.as_ref(),
                         events: &events,
+                        force: false,
                     },
                 )
                 .await?;
@@ -648,10 +659,10 @@ impl NativeHarness {
                         queued_steer: &mut queued_steer,
                     },
                 )
-                .await?
+                .await
             {
-                NativeModelOutcome::Completed(result) => *result,
-                NativeModelOutcome::Steered(captured) => {
+                Ok(NativeModelOutcome::Completed(result)) => *result,
+                Ok(NativeModelOutcome::Steered(captured)) => {
                     let Some((steer, acks)) = admit_steers(vec![captured]) else {
                         // Withdrawn while the stream was ending, so there is
                         // nothing to fold and nothing to claim was delivered.
@@ -684,6 +695,48 @@ impl NativeHarness {
                     assistant_message_id = Uuid::new_v4();
                     continue;
                 }
+                Err(error)
+                    if context_length_recoveries < MAX_CONTEXT_LENGTH_RECOVERIES
+                        && borg_provider::provider::classify_provider_error(&error)
+                            == borg_provider::provider::ProviderErrorKind::ContextLength =>
+                {
+                    // The provider refused because the request exceeds its
+                    // context window, which the pre-call estimate missed
+                    // (unknown window, or a low `chars / 4` count). Compact
+                    // against the current size and retry the round instead of
+                    // losing the turn. `force` is required because the same
+                    // estimate that failed to predict this would also decline
+                    // to compact.
+                    context_length_recoveries += 1;
+                    let estimated = estimated_messages_tokens(&messages);
+                    let window = route_window_tokens
+                        .map_or(estimated, |window| window.min(estimated))
+                        .max(1);
+                    let budget = native_context_budget(
+                        &ProviderCallUsage {
+                            context_window_tokens: Some(window),
+                            ..Default::default()
+                        },
+                        &messages,
+                        0,
+                    );
+                    self.compact_context_if_needed(
+                        &turn,
+                        &model,
+                        "context_length_recovery",
+                        budget,
+                        NativeCompactionContext {
+                            messages: &mut messages,
+                            usage: &mut usage,
+                            warmer: warmer.as_ref(),
+                            events: &events,
+                            force: true,
+                        },
+                    )
+                    .await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
             absorb_usage(&mut usage, &result.usage);
             if let (Some(warmer), Some(request)) = (warmer.as_ref(), warm_request) {
@@ -1123,6 +1176,7 @@ impl NativeHarness {
                     usage: &mut usage,
                     warmer: warmer.as_ref(),
                     events: &events,
+                    force: false,
                 },
             )
             .await?;
@@ -1290,10 +1344,11 @@ Return only the internal continuation checkpoint.",
             usage,
             warmer,
             events,
+            force,
         } = context;
         let compaction_budget =
             self.compaction_budget(turn.provider, model, budget.context_window_tokens);
-        if !budget.needs_auto_compaction(&compaction_budget) {
+        if !force && !budget.needs_auto_compaction(&compaction_budget) {
             return Ok(());
         }
         let context_tokens = budget.context_tokens;
@@ -5914,6 +5969,117 @@ mod tests {
             calls[0] <= WINDOW,
             "the first model call read {} tokens for a {WINDOW}-token window",
             calls[0]
+        );
+    }
+
+    /// The pre-call guard cannot see a window the route never advertises, and a
+    /// `chars / 4` estimate can be low. When the provider refuses for context
+    /// length anyway, the harness must compact and retry rather than lose the
+    /// turn, and it must do so on an estimate that would not have compacted.
+    #[tokio::test]
+    async fn a_context_length_refusal_compacts_and_retries_instead_of_failing() {
+        const MAX_TOKENS: u64 = 20_000;
+
+        struct RefusingClient {
+            non_compaction_calls: Mutex<Vec<u64>>,
+        }
+        #[async_trait]
+        impl NativeModelClient for RefusingClient {
+            // No `context_window`: the route advertises none, so only the
+            // provider's own refusal can trigger recovery.
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                request: ModelTurnRequest,
+                _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                let is_compaction = request.messages.first().is_some_and(|message| {
+                    matches!(message, ModelMessage::System { content }
+                        if content == crate::session::COMPACTION_SUMMARY_PROMPT)
+                });
+                if is_compaction {
+                    return Ok(ModelTurnResult {
+                        message: ModelMessage::assistant(
+                            Some("summary".to_string()),
+                            None,
+                            None,
+                            Vec::new(),
+                        ),
+                        finish_reason: "stop".to_string(),
+                        usage: ProviderCallUsage::default(),
+                        raw_response: Value::Null,
+                        trace: ProviderAttemptTrace::default(),
+                    });
+                }
+                let tokens = estimated_messages_tokens(&request.messages);
+                self.non_compaction_calls.lock().unwrap().push(tokens);
+                if tokens > MAX_TOKENS {
+                    return Err(ProviderCallError {
+                        message: format!(
+                            "This model's maximum context length is {MAX_TOKENS} tokens, however \
+                             you requested {tokens} tokens"
+                        ),
+                        trace: Box::new(ProviderAttemptTrace::default()),
+                        session_id: None,
+                        kind: borg_provider::provider::ProviderErrorKind::Unknown,
+                    });
+                }
+                Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(
+                        Some("done".to_string()),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    finish_reason: "stop".to_string(),
+                    usage: ProviderCallUsage::default(),
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().to_path_buf();
+        let client = Arc::new(RefusingClient {
+            non_compaction_calls: Mutex::new(Vec::new()),
+        });
+        let (events, completed) = run_turn_events(
+            client.clone(),
+            cwd,
+            Uuid::new_v4(),
+            vec![ModelMessage::user("x".repeat(200_000))],
+            "go",
+            "",
+            "",
+        )
+        .await;
+
+        assert!(completed, "a context-length refusal must not lose the turn");
+        assert!(
+            events.iter().any(|event| matches!(event,
+                SessionEventKind::ProviderEvent { kind, payload, .. }
+                    if kind == "context_compaction"
+                        && payload.get("status").and_then(Value::as_str) == Some("completed")
+                        && payload.get("trigger").and_then(Value::as_str)
+                            == Some("context_length_recovery"))),
+            "the refusal must be recovered by a compaction"
+        );
+        let calls = client.non_compaction_calls.lock().unwrap().clone();
+        assert!(
+            calls.len() >= 2,
+            "the refused request must be retried, saw {calls:?}"
+        );
+        assert!(
+            calls[0] > MAX_TOKENS,
+            "the first request must actually exceed the window, saw {}",
+            calls[0]
+        );
+        assert!(
+            *calls.last().unwrap() <= MAX_TOKENS,
+            "the retried request must fit the window, saw {calls:?}"
         );
     }
 
