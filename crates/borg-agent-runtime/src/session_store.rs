@@ -20,10 +20,6 @@ pub const INLINE_SESSION_PAYLOAD_BYTES: usize = 64 * 1024;
 pub(crate) const SESSION_PAYLOAD_PREVIEW_BYTES: usize = 4 * 1024;
 pub(crate) const PROMPT_ADMISSION_SESSION_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Borg's catalog alias prefix for the OpenCode Go route. It is the only
-/// OpenCode route with an authenticated API Borg can call directly, so it is
-/// the only one eligible for the native harness.
-const OPENCODE_GO_MODEL_PREFIX: &str = "opencode-go/";
 pub const MAX_HOST_LAUNCH_METADATA_BYTES: usize = 512 * 1024;
 // Cap fork replay at 255 local events without duplicating SessionState in every row.
 const FORK_PROJECTION_CHECKPOINT_INTERVAL: u64 = 256;

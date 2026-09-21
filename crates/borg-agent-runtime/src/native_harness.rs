@@ -300,13 +300,13 @@ impl NativeHarness {
         Ok(self.clone())
     }
 
-    /// Bind the OpenCode Go access gateway for a session already pinned to
-    /// Borg's harness.
+    /// Bind the OpenCode Go access gateway for a session on Borg's harness.
     ///
-    /// This refuses rather than falls back. Quietly serving an OpenCode turn
-    /// from the CLI route instead would move the conversation to a
-    /// provider-owned history, and quietly serving a non-Go OpenCode model
-    /// here would bill a different account's allowance.
+    /// Route resolution already selects Borg's harness for every `opencode-go`
+    /// model, so the guard below is defensive: it refuses rather than quietly
+    /// serving the turn from the CLI route, which would move the conversation
+    /// to a provider-owned history. A non-Go OpenCode model has no gateway and
+    /// is refused by [`gateway`] rather than billed against another account.
     async fn with_opencode_go_access(
         &self,
         model: Option<&str>,

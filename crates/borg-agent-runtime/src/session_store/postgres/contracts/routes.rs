@@ -313,10 +313,11 @@ async fn opencode_route_is_native_only_for_go_models() {
     scratch.discard().await;
 }
 
-/// The route is pinned on first resolution. A session that has been answering
-/// through the `opencode` CLI keeps a transcript only that CLI can replay, so
-/// switching to a Go model must not move the conversation onto Borg's harness
-/// — and a session Borg already owns must not be handed back.
+/// The route is pinned once resolved, so a session keeps the harness that owns
+/// its transcript. The one deliberate exception is an `opencode-go` model,
+/// which always moves the conversation onto Borg's harness: the Go route is an
+/// API Borg drives itself, and its durable journal can replay a CLI-written
+/// history, so nothing is gained by leaving it on the CLI.
 #[tokio::test]
 async fn a_pinned_opencode_route_survives_model_switches_and_restart() {
     let (scratch, store) = store().await;
@@ -338,7 +339,8 @@ async fn a_pinned_opencode_route_survives_model_switches_and_restart() {
         "a pinned native session keeps its Borg-owned history across a model switch"
     );
 
-    // A CLI-owned conversation that later selects a Go model.
+    // A CLI-owned conversation that later selects a Go model is adopted onto
+    // Borg's harness; the durable journal is the authority for the replay.
     let legacy_session = Uuid::new_v4();
     store.create_session(legacy_session).await.unwrap();
     store
@@ -362,11 +364,11 @@ async fn a_pinned_opencode_route_survives_model_switches_and_restart() {
         .await
         .unwrap();
     assert!(
-        !store
+        store
             .uses_native_opencode_harness(legacy_session, Some("opencode-go/kimi-k2.7-code"))
             .await
             .unwrap(),
-        "legacy OpenCode history must not be adopted by Borg's harness"
+        "a Go model adopts legacy OpenCode history onto Borg's harness"
     );
 
     store.pool().close().await;
@@ -380,16 +382,20 @@ async fn a_pinned_opencode_route_survives_model_switches_and_restart() {
             .unwrap()
     );
     assert!(
-        !reopened
+        reopened
             .uses_native_opencode_harness(legacy_session, None)
             .await
-            .unwrap()
+            .unwrap(),
+        "the adopted route is durable"
     );
     scratch.discard().await;
 }
 
-/// A fork or child shares its owner's transcript, so it must share whichever
-/// harness owns it; otherwise one conversation would have two owners.
+/// A fork or child shares its owner's transcript, so on first resolution it
+/// must share whichever harness owns it; otherwise one conversation would have
+/// two owners. Selecting a Go model is the one deliberate exception: it adopts
+/// the inheritor onto Borg's harness, whose journal can replay the shared
+/// history.
 #[tokio::test]
 async fn opencode_route_is_inherited_by_forks_and_children() {
     let (scratch, store) = store().await;
@@ -424,13 +430,23 @@ async fn opencode_route_is_inherited_by_forks_and_children() {
                 native,
                 "{model}"
             );
-            // Re-resolving under the opposite model cannot rewrite the route.
-            assert_eq!(
+            // A Go model adopts even a CLI-owned fork or child onto Borg's
+            // harness: the route is not frozen against the model Borg owns.
+            assert!(
                 store
                     .uses_native_opencode_harness(inheritor, Some("opencode-go/other"))
                     .await
                     .unwrap(),
-                native
+                "{model} inheritor adopts a Go model"
+            );
+            // Once adopted, a non-Go model cannot hand the conversation back
+            // to the CLI.
+            assert!(
+                store
+                    .uses_native_opencode_harness(inheritor, Some("opencode/other"))
+                    .await
+                    .unwrap(),
+                "{model} inheritor keeps its adopted route"
             );
         }
     }

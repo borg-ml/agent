@@ -390,9 +390,9 @@ pub trait AgentTurnExecutor: Send + Sync {
 #[derive(Clone)]
 pub struct LocalAgentTurnExecutor {
     native_harness: NativeHarness,
-    /// The durable OpenCode route pinned for this session. Only the
-    /// `opencode-go` aliases have an API Borg calls directly; a legacy CLI
-    /// history stays on the OpenCode compatibility route.
+    /// The durable OpenCode route resolved for this session. Only the
+    /// `opencode-go` aliases have an API Borg calls directly; every other
+    /// OpenCode model stays on the compatibility route.
     opencode_session_native: bool,
     runtime_extensions: Arc<RwLock<RuntimeExtensions>>,
     runtime_extension_loader: Option<RuntimeExtensionLoader>,
@@ -910,11 +910,11 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         store: &dyn crate::SessionStore,
         model: Option<&str>,
     ) -> Result<Option<Arc<dyn AgentTurnExecutor>>> {
-        // Resolve the pinned OpenCode route too. A `opencode-go` session must
-        // run Borg's native harness (gateway, steering, structured context);
-        // a legacy CLI history must keep the compatibility route. The model
-        // decides a fresh session, so pass the launch model; pinning happens
-        // on first resolution and is then stable across restarts.
+        // Resolve the pinned OpenCode route too. An `opencode-go` model always
+        // runs Borg's native harness (gateway, steering, structured context),
+        // even over a CLI-written history; every other OpenCode model keeps the
+        // compatibility route. Resolution is durable, so it is stable across
+        // restarts.
         let opencode_native = store
             .uses_native_opencode_harness(session_id, model)
             .await?;

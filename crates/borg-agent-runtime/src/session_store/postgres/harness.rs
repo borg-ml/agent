@@ -12,7 +12,6 @@ use uuid::Uuid;
 
 use super::PostgresSessionStore;
 use crate::SessionEventKind;
-use crate::session_store::OPENCODE_GO_MODEL_PREFIX;
 
 /// Does this session's lineage contain a native model message for `provider`?
 ///
@@ -139,11 +138,12 @@ impl PostgresSessionStore {
 
     /// Resolve and pin the OpenCode harness route.
     ///
-    /// Unlike Codex this route is *model-aware*: only the `opencode-go` aliases
-    /// expose an endpoint Borg can drive itself, so every other OpenCode model
-    /// stays on the CLI. Returns `None` while the route is still undecidable --
-    /// a fresh session with no history and no model. Pinning that case would
-    /// strand the session on a route before its model was ever known.
+    /// The route is *model-aware*: an `opencode-go` alias always selects Borg's
+    /// harness (see the policy below), while every other OpenCode model stays on
+    /// the CLI because it has no endpoint Borg can drive directly. Returns
+    /// `None` while the route is still undecidable -- a fresh session with no
+    /// history and no model. Pinning that case would strand the session on a
+    /// route before its model was ever known.
     pub(super) async fn resolve_opencode_harness(
         transaction: &mut Transaction<'_, Postgres>,
         session_id: Uuid,
@@ -157,19 +157,11 @@ impl PostgresSessionStore {
         .bind(session_id)
         .fetch_optional(&mut **transaction)
         .await?;
-        if let Some(existing) = existing {
-            ensure!(
-                inherited.is_none_or(|owner| owner == existing),
-                "child OpenCode harness differs from its owner's durable route; \
-                 start a new child session"
-            );
-            return Ok(Some(existing));
-        }
 
         let native_history = has_native_history(transaction, session_id, "open_code").await?;
         // Anything else on an OpenCode session -- a linked CLI thread, or
-        // simply existing events -- means the CLI owns the transcript and only
-        // it can replay that history. A model switch clears
+        // simply existing events -- means the CLI once owned the transcript and
+        // only it can replay that history. A model switch clears
         // `provider_session_id`, hence the second signal.
         let row = sqlx::query(
             "with recursive lineage(id) as ( \
@@ -192,6 +184,47 @@ impl PostgresSessionStore {
         let legacy_history: bool = row.try_get("legacy_history")?;
         let durable_model: Option<String> = row.try_get("durable_model")?;
 
+        let selected = model
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned)
+            .or(durable_model);
+
+        // An `opencode-go` model always runs on Borg's harness, whatever the
+        // session did before. The Go route is an OpenAI-compatible API Borg
+        // drives itself, so the CLI compatibility route buys only a
+        // provider-owned duplicate of the transcript, no mid-turn steering, and
+        // a weaker compaction path. Borg's durable journal can replay the
+        // conversation into the native harness regardless of which harness
+        // wrote it, so neither a stored CLI pin nor CLI history keeps such a
+        // session off it. Every other OpenCode model has no Borg-reachable
+        // endpoint and stays on the CLI route.
+        if selected
+            .as_deref()
+            .is_some_and(borg_provider::provider::opencode_model::is_go_model)
+        {
+            if existing != Some(true) {
+                sqlx::query(
+                    "insert into session_harness_routes (session_id, provider, native) \
+                     values ($1, 'open_code', true) \
+                     on conflict (session_id, provider) do update set native = excluded.native",
+                )
+                .bind(session_id)
+                .execute(&mut **transaction)
+                .await?;
+            }
+            return Ok(Some(true));
+        }
+
+        if let Some(existing) = existing {
+            ensure!(
+                inherited.is_none_or(|owner| owner == existing),
+                "child OpenCode harness differs from its owner's durable route; \
+                 start a new child session"
+            );
+            return Ok(Some(existing));
+        }
+
         if let Some(inherited) = inherited {
             ensure!(
                 !(inherited && legacy_history) && !(!inherited && native_history),
@@ -200,11 +233,6 @@ impl PostgresSessionStore {
             );
         }
 
-        let selected = model
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-            .map(str::to_owned)
-            .or(durable_model);
         let native = if let Some(inherited) = inherited {
             // A child or fork shares its owner's history, so a split route
             // would give one conversation two different owners.
@@ -215,12 +243,9 @@ impl PostgresSessionStore {
             false
         } else {
             match selected.as_deref() {
-                // Must agree with the adapter's own alias check: pinning a
-                // route the gateway then refuses would strand the session.
-                Some(selected) => selected
-                    .trim()
-                    .strip_prefix(OPENCODE_GO_MODEL_PREFIX)
-                    .is_some_and(|upstream| !upstream.trim().is_empty()),
+                // Any remaining model has no Borg-reachable API and stays on
+                // the CLI route.
+                Some(_) => false,
                 None => return Ok(None),
             }
         };
