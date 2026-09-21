@@ -9,7 +9,8 @@ Quickstart:
   borg                       start a session in the current directory
   borg login codex           connect a ChatGPT/Codex subscription (or: claude, opencode)
   borg login claude --api-key   store an Anthropic API key instead of a subscription
-  borg --provider claude     start with a specific provider (codex, claude, opencode, kimi, glm, openrouter)
+  borg login anthropic       store an Anthropic API key for the separate API lane
+  borg --provider claude     start with a specific provider (codex, claude, anthropic, opencode, kimi, glm, openrouter)
   borg resume                pick up the latest session; `borg resume <id>` for a specific one
   borg config init           write a commented agent.toml; `borg config path` shows where
   borg doctor                check durable storage and provider readiness
