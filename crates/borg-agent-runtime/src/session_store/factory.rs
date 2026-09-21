@@ -867,7 +867,7 @@ mod tests {
         ) -> Result<Vec<SessionLineage>> {
             unimplemented!("journal access is not part of this test")
         }
-        async fn append_batch(&self, _events: Vec<SessionEvent>) -> Result<u64> {
+        async fn append_batch(&self, _events: Vec<SessionEvent>) -> Result<Vec<SessionEvent>> {
             unimplemented!("journal access is not part of this test")
         }
         async fn raw_event_page(

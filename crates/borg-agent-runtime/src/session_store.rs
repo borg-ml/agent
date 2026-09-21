@@ -1685,7 +1685,7 @@ pub trait SessionStore: Send + Sync {
     ///
     /// All-or-nothing: a failure rolls the whole batch back, so a resumed
     /// migration re-copies the batch rather than finding it half applied.
-    async fn append_batch(&self, events: Vec<SessionEvent>) -> Result<u64>;
+    async fn append_batch(&self, events: Vec<SessionEvent>) -> Result<Vec<SessionEvent>>;
     // Verbatim copy, for migrating a journal between backends. See
     // `RawSessionEvent` for why replay is not sufficient.
     /// A page of stored event rows after `after_sequence`, in sequence order.

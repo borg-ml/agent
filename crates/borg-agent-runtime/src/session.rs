@@ -759,6 +759,50 @@ impl RuntimeSessionStore {
         std::mem::take(&mut self.projection_diagnostics)
     }
 
+    /// Append a run of events as one settlement.
+    ///
+    /// One journal transaction for the whole run, with the workspace mirror left
+    /// to `repair`. Settling a backlog with one `append` per prompt is what put a
+    /// human Escape behind the backlog it interrupted: forty queued prompts cost
+    /// forty commits plus forty projected rows -- about 2.4s measured on this
+    /// host -- before the turn could reach its terminal boundary. The journal
+    /// stays authoritative and still takes every event in order; the mirror is
+    /// repairable by design (`repair` batches ordinary rows and runs from every
+    /// turn boundary), and a person waiting at the keyboard is not.
+    async fn append_all(&mut self, events: Vec<SessionEvent>) -> Result<Vec<SessionEvent>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let appended = self.store.append_batch(events).await?;
+        let mut absorbed = Vec::with_capacity(appended.len());
+        for event in appended {
+            self.absorb_appended(&event).await?;
+            absorbed.push(event);
+        }
+        Ok(absorbed)
+    }
+
+    /// Fold a persisted event into the live context, exactly as `append` does.
+    async fn absorb_appended(&mut self, event: &SessionEvent) -> Result<()> {
+        if matches!(event.kind, SessionEventKind::ContextCleared) {
+            self.context_events.clear();
+            self.context_complete = true;
+        }
+        bound_context_at_compaction(&mut self.context_events, event);
+        if event.kind.is_context_relevant() {
+            let mut context_event = event.clone();
+            if let SessionEventKind::ProviderEvent { payload, .. } = &mut context_event.kind
+                && let Some(reference) =
+                    crate::session_store::deferred_provider_payload_ref(payload)
+            {
+                let bytes = self.store.load_payload(&reference).await?;
+                crate::session_store::resolve_provider_payload(payload, &bytes)?;
+            }
+            self.context_events.push(context_event);
+        }
+        Ok(())
+    }
+
     async fn append(&mut self, event: SessionEvent) -> Result<SessionEvent> {
         let event = self.store.append(event).await?;
         if let Some(projection) = &self.workspace_projection
@@ -790,22 +834,7 @@ impl RuntimeSessionStore {
                 .await?;
             self.projection_diagnostics.push_back(diagnostic_event);
         }
-        if matches!(event.kind, SessionEventKind::ContextCleared) {
-            self.context_events.clear();
-            self.context_complete = true;
-        }
-        bound_context_at_compaction(&mut self.context_events, &event);
-        if event.kind.is_context_relevant() {
-            let mut context_event = event.clone();
-            if let SessionEventKind::ProviderEvent { payload, .. } = &mut context_event.kind
-                && let Some(reference) =
-                    crate::session_store::deferred_provider_payload_ref(payload)
-            {
-                let bytes = self.store.load_payload(&reference).await?;
-                crate::session_store::resolve_provider_payload(payload, &bytes)?;
-            }
-            self.context_events.push(context_event);
-        }
+        self.absorb_appended(&event).await?;
         Ok(event)
     }
 }
@@ -8410,6 +8439,7 @@ async fn settle_non_waking_team_notifications(
     usage_limit_continuation_id: Option<Uuid>,
 ) -> Result<()> {
     let mut retained = VecDeque::with_capacity(pending.len());
+    let mut statuses = Vec::new();
     while let Some(prompt) = pending.pop_front() {
         // The usage-limit continuation is internal but not a team
         // notification; it must survive until its turn starts.
@@ -8417,13 +8447,17 @@ async fn settle_non_waking_team_notifications(
             && Some(prompt.message_id) != usage_limit_continuation_id
             && (user_stop || prompt.delivery == PromptDelivery::Queue)
         {
-            settle_team_notification(journal, events, session_id, prompt).await?;
+            if prompt.visible {
+                for entry in prompt.batch_entries() {
+                    statuses.push((entry, MessageStatus::Complete, prompt.delivery));
+                }
+            }
         } else {
             retained.push_back(prompt);
         }
     }
     *pending = retained;
-    Ok(())
+    record_prompt_statuses(journal, events, session_id, statuses).await
 }
 
 fn coalesce_queued_prompts(pending: &mut VecDeque<QueuedPrompt>) {
@@ -9007,6 +9041,61 @@ async fn record_prompt_status(
     Ok(())
 }
 
+/// Record the terminal status of a run of prompts with one journal commit.
+///
+/// The settlement of input a turn never consumed runs at the turn boundary, so a
+/// commit per prompt there is time a person spends waiting after pressing
+/// Escape. See `RuntimeSessionStore::append_all` for why the run shares one.
+async fn record_prompt_statuses(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    statuses: Vec<(PromptBatchEntry, MessageStatus, PromptDelivery)>,
+) -> Result<()> {
+    if statuses.is_empty() {
+        return Ok(());
+    }
+    let pending: Vec<SessionEvent> = statuses
+        .into_iter()
+        .map(|(entry, status, delivery)| {
+            SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id: entry.message_id,
+                    actor: entry.actor,
+                    text: entry.text,
+                    attachments: entry.attachments,
+                    status,
+                    delivery: Some(delivery),
+                },
+            )
+        })
+        .collect();
+    for diagnostic in journal.take_projection_diagnostics() {
+        deliver_recorded_event(
+            events,
+            session_id,
+            diagnostic,
+            crate::EventPersistence::Durable,
+        )
+        .await;
+    }
+    for event in journal.append_all(pending).await? {
+        deliver_recorded_event(events, session_id, event, crate::EventPersistence::Durable).await;
+    }
+    for diagnostic in journal.take_projection_diagnostics() {
+        deliver_recorded_event(
+            events,
+            session_id,
+            diagnostic,
+            crate::EventPersistence::Durable,
+        )
+        .await;
+    }
+    Ok(())
+}
+
 async fn promote_uncommitted_steers(
     journal: &mut RuntimeSessionStore,
     events: &mpsc::Sender<SessionEvent>,
@@ -9016,6 +9105,7 @@ async fn promote_uncommitted_steers(
     native_harness: bool,
 ) -> Result<()> {
     let mut promoted = Vec::new();
+    let mut statuses = Vec::new();
     while let Some(steer) = pending_steers.pop_front() {
         // Under the native harness an accepted admission is not delivery. A
         // steer still sitting here never had a fold journaled for it, so
@@ -9023,42 +9113,27 @@ async fn promote_uncommitted_steers(
         // human's steer would be silently lost. Send it back as pending
         // input instead; a marked one was already settled and popped.
         if steer.admission.is_accepted() && !native_harness {
-            record_prompt_status(
-                journal,
-                events,
-                session_id,
-                &steer.prompt,
-                MessageStatus::InProgress,
-                PromptDelivery::Steer,
-            )
-            .await?;
-            record_prompt_status(
-                journal,
-                events,
-                session_id,
-                &steer.prompt,
-                MessageStatus::Complete,
-                PromptDelivery::Steer,
-            )
-            .await?;
+            for (status, delivery) in [
+                (MessageStatus::InProgress, PromptDelivery::Steer),
+                (MessageStatus::Complete, PromptDelivery::Steer),
+            ] {
+                for entry in steer.prompt.batch_entries() {
+                    statuses.push((entry, status, delivery));
+                }
+            }
         } else {
             promoted.push(steer.prompt);
         }
     }
     for prompt in &mut promoted {
         if prompt.delivery == PromptDelivery::Steer {
-            record_prompt_status(
-                journal,
-                events,
-                session_id,
-                prompt,
-                MessageStatus::Queued,
-                PromptDelivery::Queue,
-            )
-            .await?;
+            for entry in prompt.batch_entries() {
+                statuses.push((entry, MessageStatus::Queued, PromptDelivery::Queue));
+            }
             prompt.delivery = PromptDelivery::Queue;
         }
     }
+    record_prompt_statuses(journal, events, session_id, statuses).await?;
     for prompt in promoted.into_iter().rev() {
         pending.push_front(prompt);
     }
@@ -9226,10 +9301,16 @@ async fn flush_awaiting_steers(
     };
     let mut entries: Vec<_> = awaiting.drain().collect();
     entries.sort_by_key(|(id, _)| *id);
-    for (_, entry) in entries {
-        record_steer_entry_status(journal, events, session_id, entry, status).await?;
-    }
-    Ok(())
+    record_prompt_statuses(
+        journal,
+        events,
+        session_id,
+        entries
+            .into_iter()
+            .map(|(_, entry)| (entry, status, PromptDelivery::Steer))
+            .collect(),
+    )
+    .await
 }
 
 async fn record_steer_entry_status(
