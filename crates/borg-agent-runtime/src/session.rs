@@ -7399,16 +7399,29 @@ fn fit_compaction_context(
     // user turns, with an explicit durable-history marker for the omitted
     // middle. The final bounded cut is defense-in-depth only; ordinary
     // tool-heavy histories are handled by the semantic pruning above.
+    //
+    // Everything after the newest kept user turn is retained unconditionally.
+    // That suffix is the turn the provider is about to be asked to continue:
+    // the assistant reply the human is answering, and the live round of tool
+    // calls that reply already made. Dropping it presented the human's reply as
+    // an orphan and made the model re-ask questions it had already answered.
     let recent_user_indices = recent_user_turn_indices(&projected, 2);
+    let live_tail_start = recent_user_indices
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(projected.len());
     let mut selected = Vec::with_capacity(projected.len());
     let mut omitted = false;
     let mut messages_omitted = 0usize;
     for (index, message) in projected.into_iter().enumerate() {
-        let keep = matches!(
-            message,
-            borg_provider::provider::ModelMessage::System { .. }
-                | borg_provider::provider::ModelMessage::User { .. }
-        ) || recent_user_indices.contains(&index);
+        let keep = index >= live_tail_start
+            || matches!(
+                message,
+                borg_provider::provider::ModelMessage::System { .. }
+                    | borg_provider::provider::ModelMessage::User { .. }
+            )
+            || recent_user_indices.contains(&index);
         if keep {
             if omitted {
                 selected.push(borg_provider::provider::ModelMessage::user(

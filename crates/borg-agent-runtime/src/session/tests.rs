@@ -11636,6 +11636,52 @@ fn replay_projection_reports_the_messages_it_omitted() {
     assert!(projection.context.chars().count() <= 2_048);
 }
 
+/// The projection's message-dropping backstop must never omit the live turn.
+///
+/// The human replied to the newest assistant message, but the projection kept
+/// only the newest user prompt and dropped the reply it answered -- so the model
+/// saw an orphaned request, re-read stale history, and re-asked questions it had
+/// already put to the human. Everything from the newest kept user turn onward is
+/// the turn being continued and has to survive the projection intact.
+#[test]
+fn replay_projection_keeps_the_live_turn_after_the_newest_user_prompt() {
+    use borg_provider::provider::ModelMessage;
+
+    let filler = "u".repeat(2_000);
+    let mut conversation = Vec::new();
+    for index in 0..6 {
+        conversation.push(ModelMessage::user(format!("user turn {index} {filler}")));
+        conversation.push(ModelMessage::assistant(
+            Some(format!("assistant turn {index}")),
+            None,
+            None,
+            Vec::new(),
+        ));
+    }
+    conversation.push(ModelMessage::user(format!("newest request {filler}")));
+    conversation.push(ModelMessage::assistant(
+        Some("the reply the human is answering".to_string()),
+        None,
+        None,
+        Vec::new(),
+    ));
+    conversation.push(ModelMessage::user("a direct answer to that reply".to_string()));
+
+    let projection = fit_compaction_context(&conversation, 2_048);
+
+    assert!(projection.messages_omitted > 0);
+    assert!(
+        projection
+            .context
+            .contains("the reply the human is answering"),
+        "the assistant reply the human answered must survive the projection"
+    );
+    assert!(
+        projection.context.contains("a direct answer to that reply"),
+        "the newest prompt must survive the projection"
+    );
+}
+
 #[test]
 fn subscription_replay_budget_accounts_for_the_context_separator() {
     let current_prompt = "continue safely";
