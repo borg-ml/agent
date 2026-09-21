@@ -1632,6 +1632,11 @@ pub trait SessionStore: Send + Sync {
     /// A deeper health check, including an integrity pass.
     async fn health(&self) -> Result<SessionStoreHealth>;
     /// Import a session's events wholesale, for migration and import tooling.
+    /// An empty import is a legitimate empty session rather than a failure: a
+    /// journal with no events is what an interrupted first run leaves behind,
+    /// and the session row is what a later start or resume checks for. Events
+    /// that are present but invalid are still refused, so empty and malformed
+    /// never collapse into one another.
     async fn import_session_events(
         &self,
         session_id: Uuid,

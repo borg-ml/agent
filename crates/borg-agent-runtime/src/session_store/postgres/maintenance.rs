@@ -271,12 +271,19 @@ impl PostgresSessionStore {
     /// All-or-nothing, and only into a session id that does not exist yet: a
     /// partial import would leave a transcript with a hole in it, and importing
     /// over a live session would rewrite history that something else owns.
+    ///
+    /// An EMPTY import creates an empty session rather than failing. A journal
+    /// file of zero bytes is exactly what an interrupted first run leaves
+    /// behind, and the session row is the only thing `contains_session` can
+    /// answer from, so refusing the import left that session impossible to start
+    /// or resume again. Events that are present but do not belong to the
+    /// destination session, or that already carry a sequence, are still refused:
+    /// empty is a legitimate state, malformed is not.
     pub async fn import_session_events(
         &self,
         session_id: Uuid,
         events: Vec<SessionEvent>,
     ) -> Result<bool> {
-        ensure!(!events.is_empty(), "import contains no events");
         ensure!(
             events
                 .iter()
@@ -477,12 +484,96 @@ mod tests {
                 .is_err()
         );
         assert!(!store.contains_session(other).await.unwrap());
+        scratch.discard().await;
+    }
+
+    /// A journal with no events is an empty session, not a failed import. The
+    /// failure mode is a session that can never be started or resumed again: a
+    /// first run interrupted before it journaled anything leaves a zero-byte
+    /// journal, and the row created here is the only thing a resume checks.
+    /// Content that is present but malformed must still be refused, so the
+    /// reader cannot be widened into treating a broken journal as an empty one.
+    #[tokio::test]
+    async fn an_empty_journal_imports_as_an_empty_session() {
+        let Some(url) = test_url() else {
+            eprintln!("skipping: BORG_TEST_SESSIONS_URL is not set");
+            return;
+        };
+        let (scratch, store) = store(&url).await;
+        let session_id = Uuid::new_v4();
+        let directory = tempfile::tempdir().expect("scratch directory");
+        // The journal an interrupted first run leaves behind, read the way a
+        // journal import reads one: one event per line.
+        let journal = directory.path().join(format!("{session_id}.jsonl"));
+        std::fs::write(&journal, b"").expect("write empty journal");
+        let read_journal = |path: &std::path::Path| {
+            std::fs::read_to_string(path)
+                .expect("read journal")
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    serde_json::from_str::<SessionEvent>(line).expect("journal event parses")
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            read_journal(&journal).is_empty(),
+            "a zero-byte journal carries no events at all"
+        );
+
         assert!(
             store
-                .import_session_events(other, Vec::new())
+                .import_session_events(session_id, read_journal(&journal))
+                .await
+                .expect("an empty journal imports")
+        );
+        assert!(
+            store.contains_session(session_id).await.unwrap(),
+            "without the row the session can never be started or resumed"
+        );
+        assert!(store.read(session_id).await.unwrap().is_empty());
+
+        // The session the import created is usable: a resumed run journals into
+        // it normally, and the first real event takes the first sequence.
+        let appended = store
+            .append(message(session_id, "first event after resume"))
+            .await
+            .expect("append into the imported session");
+        assert_eq!(appended.sequence, 1);
+        assert_eq!(store.read(session_id).await.unwrap().len(), 1);
+
+        // Importing the same journal again finds the session present.
+        assert!(
+            !store
+                .import_session_events(session_id, Vec::new())
+                .await
+                .expect("re-import")
+        );
+
+        // A journal with content is not an empty one: broken bytes fail to
+        // parse rather than reaching the import as zero events.
+        let broken = directory.path().join("broken.jsonl");
+        std::fs::write(
+            &broken,
+            b"{\"not\":\"an event\"}
+",
+        )
+        .expect("write broken journal");
+        assert!(
+            serde_json::from_str::<SessionEvent>(std::fs::read_to_string(&broken).unwrap().trim())
+                .is_err(),
+            "a malformed journal must fail instead of importing as empty"
+        );
+
+        // And an import carrying events for another session is still refused.
+        let other = Uuid::new_v4();
+        assert!(
+            store
+                .import_session_events(other, vec![message(Uuid::new_v4(), "wrong session")])
                 .await
                 .is_err()
         );
+        assert!(!store.contains_session(other).await.unwrap());
         scratch.discard().await;
     }
 
