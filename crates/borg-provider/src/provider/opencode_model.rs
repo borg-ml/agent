@@ -148,11 +148,13 @@ pub struct CatalogPricing {
     pub output_microusd_per_million: u64,
 }
 
-/// Prices from the same document as the windows, keyed by provider and model.
-static CATALOG_PRICING: OnceLock<RwLock<Option<HashMap<(String, String), CatalogPricing>>>> =
-    OnceLock::new();
+/// Catalog prices, keyed by provider and model.
+type CatalogPrices = HashMap<(String, String), CatalogPricing>;
 
-fn catalog_prices() -> &'static RwLock<Option<HashMap<(String, String), CatalogPricing>>> {
+/// Prices from the same document as the windows, keyed by provider and model.
+static CATALOG_PRICING: OnceLock<RwLock<Option<CatalogPrices>>> = OnceLock::new();
+
+fn catalog_prices() -> &'static RwLock<Option<CatalogPrices>> {
     CATALOG_PRICING.get_or_init(|| RwLock::new(None))
 }
 
@@ -243,7 +245,7 @@ async fn fetch_catalog() -> Result<(
 /// A model whose entry states no cached-input rate is left out on purpose: both
 /// estimates built on this need the cached rate, and half a price would silently
 /// become a wrong decision about spending money.
-fn parse_catalog_pricing(payload: &serde_json::Value) -> HashMap<(String, String), CatalogPricing> {
+fn parse_catalog_pricing(payload: &serde_json::Value) -> CatalogPrices {
     let Some(providers) = payload.as_object() else {
         return HashMap::new();
     };
