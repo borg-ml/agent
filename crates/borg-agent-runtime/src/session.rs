@@ -7348,12 +7348,44 @@ fn fit_compaction_context(
         };
     }
 
+    // The live exchange -- the assistant reply the newest prompt is answering,
+    // plus the recent user turns -- must survive both the marker replacement
+    // below and the message drop further down. The window is otherwise measured
+    // in user turns, which ignores a trailing assistant tail: the reply the
+    // human is about to answer sits after the newest user message, falls outside
+    // the window, and was erased from the provider request. A steer can also
+    // place several user messages after that reply, so the anchor is the last
+    // assistant text before the newest user message, not simply the previous
+    // message or the newest two user turns.
+    let recent_turn_start = recent_user_turn_indices(&projected, 2)
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(projected.len());
+    let reply_start = projected
+        .iter()
+        .rposition(|message| matches!(message, borg_provider::provider::ModelMessage::User { .. }))
+        .map(|newest_user| {
+            projected[..newest_user]
+                .iter()
+                .rposition(|message| {
+                    matches!(
+                        message,
+                        borg_provider::provider::ModelMessage::Assistant {
+                            content: Some(content),
+                            ..
+                        } if !content.trim().is_empty()
+                    )
+                })
+                .unwrap_or(newest_user)
+        })
+        .unwrap_or(projected.len());
+    let live_tail_start = reply_start.min(recent_turn_start);
     // If non-tool messages themselves are unusually large, reduce them at
     // message boundaries. This keeps the user/system records identifiable and
     // avoids a blind cut through the middle of the whole transcript.
-    let recent_user_indices = recent_user_turn_indices(&projected, 2);
     for (index, message) in projected.iter_mut().enumerate() {
-        if recent_user_indices.contains(&index) {
+        if index >= live_tail_start {
             continue;
         }
         if let borg_provider::provider::ModelMessage::Assistant {
@@ -7395,22 +7427,12 @@ fn fit_compaction_context(
     }
 
     // A pathological transcript can contain more non-tool text than the
-    // provider accepts. Keep the first system/user context and the newest two
-    // user turns, with an explicit durable-history marker for the omitted
-    // middle. The final bounded cut is defense-in-depth only; ordinary
-    // tool-heavy histories are handled by the semantic pruning above.
-    //
-    // Everything after the newest kept user turn is retained unconditionally.
-    // That suffix is the turn the provider is about to be asked to continue:
-    // the assistant reply the human is answering, and the live round of tool
-    // calls that reply already made. Dropping it presented the human's reply as
-    // an orphan and made the model re-ask questions it had already answered.
-    let recent_user_indices = recent_user_turn_indices(&projected, 2);
-    let live_tail_start = recent_user_indices
-        .iter()
-        .copied()
-        .min()
-        .unwrap_or(projected.len());
+    // provider accepts. Keep every system/user message for intent, plus the
+    // live exchange for continuity, with an explicit durable-history marker for
+    // the omitted middle. The final bounded cut below is defense-in-depth only;
+    // ordinary tool-heavy histories are handled by the semantic pruning above.
+    // `live_tail_start` was computed above so the marker replacement and this
+    // drop agree on exactly which messages are load-bearing.
     let mut selected = Vec::with_capacity(projected.len());
     let mut omitted = false;
     let mut messages_omitted = 0usize;
@@ -7420,8 +7442,7 @@ fn fit_compaction_context(
                 message,
                 borg_provider::provider::ModelMessage::System { .. }
                     | borg_provider::provider::ModelMessage::User { .. }
-            )
-            || recent_user_indices.contains(&index);
+            );
         if keep {
             if omitted {
                 selected.push(borg_provider::provider::ModelMessage::user(

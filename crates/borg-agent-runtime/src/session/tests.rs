@@ -11636,15 +11636,18 @@ fn replay_projection_reports_the_messages_it_omitted() {
     assert!(projection.context.chars().count() <= 2_048);
 }
 
-/// The projection's message-dropping backstop must never omit the live turn.
+/// The projection's message-dropping backstop must never elide the assistant
+/// reply that the next prompt answers.
 ///
-/// The human replied to the newest assistant message, but the projection kept
-/// only the newest user prompt and dropped the reply it answered -- so the model
-/// saw an orphaned request, re-read stale history, and re-asked questions it had
-/// already put to the human. Everything from the newest kept user turn onward is
-/// the turn being continued and has to survive the projection intact.
+/// The conversation ends on the assistant reply: the human is about to answer
+/// it, so the reply is not followed by any user message yet. A window measured
+/// in user turns never covers that trailing assistant tail, so the reply was
+/// marker-replaced and then dropped -- the model could no longer see what the
+/// human was responding to, re-read stale history, and re-asked questions it had
+/// already put to the human. The live exchange is anchored on the reply itself,
+/// so it survives however the tail is shaped.
 #[test]
-fn replay_projection_keeps_the_live_turn_after_the_newest_user_prompt() {
+fn replay_projection_keeps_the_trailing_reply_the_next_prompt_answers() {
     use borg_provider::provider::ModelMessage;
 
     let filler = "u".repeat(2_000);
@@ -11658,14 +11661,15 @@ fn replay_projection_keeps_the_live_turn_after_the_newest_user_prompt() {
             Vec::new(),
         ));
     }
-    conversation.push(ModelMessage::user(format!("newest request {filler}")));
+    conversation.push(ModelMessage::user(format!(
+        "the request being answered {filler}"
+    )));
     conversation.push(ModelMessage::assistant(
         Some("the reply the human is answering".to_string()),
         None,
         None,
         Vec::new(),
     ));
-    conversation.push(ModelMessage::user("a direct answer to that reply".to_string()));
 
     let projection = fit_compaction_context(&conversation, 2_048);
 
@@ -11674,11 +11678,7 @@ fn replay_projection_keeps_the_live_turn_after_the_newest_user_prompt() {
         projection
             .context
             .contains("the reply the human is answering"),
-        "the assistant reply the human answered must survive the projection"
-    );
-    assert!(
-        projection.context.contains("a direct answer to that reply"),
-        "the newest prompt must survive the projection"
+        "the trailing assistant reply must survive the projection"
     );
 }
 
