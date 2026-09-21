@@ -5762,9 +5762,9 @@ mod tests {
             tool_result_content(&messages[1]),
             MICROCOMPACT_CLEARED_TOOL_RESULT
         );
-        for index in 2..messages.len() {
+        for message in &messages[2..] {
             assert_eq!(
-                tool_result_content(&messages[index]).len(),
+                tool_result_content(message).len(),
                 4_000,
                 "a result the live turn produced was dropped"
             );
