@@ -191,6 +191,7 @@ struct BluWorkflowToolContext {
 #[derive(Clone)]
 pub struct AgentToolDispatcher {
     watches: Option<crate::watch::Watches>,
+    watcher_yield_enabled: bool,
     goals: SessionGoalTools,
     todos: SessionTodoTools,
     consultation: Option<SessionConsultationTools>,
@@ -294,6 +295,7 @@ pub struct AgentToolServer {
     consultation_enabled: bool,
     shared_work_enabled: bool,
     web_search_enabled: bool,
+    watcher_yield_enabled: bool,
     extension_tool_names: Vec<String>,
     team_policy: Option<crate::TeamPolicy>,
     cancel: CancellationToken,
@@ -362,6 +364,7 @@ impl AgentToolServer {
         let consultation_enabled = dispatcher.consultation_enabled();
         let shared_work_enabled = dispatcher.shared_work.is_some();
         let web_search_enabled = dispatcher.web_search.is_some();
+        let watcher_yield_enabled = dispatcher.watcher_yield_enabled;
         let extension_tool_names = dispatcher.extension_tool_names();
         let team_policy = dispatcher.team_policy.clone();
         tokio::spawn(async move {
@@ -392,6 +395,7 @@ impl AgentToolServer {
             consultation_enabled,
             shared_work_enabled,
             web_search_enabled,
+            watcher_yield_enabled,
             extension_tool_names,
             team_policy,
             cancel,
@@ -418,6 +422,7 @@ impl AgentToolServer {
         let consultation_enabled = dispatcher.consultation_enabled();
         let shared_work_enabled = dispatcher.shared_work.is_some();
         let web_search_enabled = dispatcher.web_search.is_some();
+        let watcher_yield_enabled = dispatcher.watcher_yield_enabled;
         let extension_tool_names = dispatcher.extension_tool_names();
         let team_policy = dispatcher.team_policy.clone();
         tokio::spawn(async move {
@@ -450,6 +455,7 @@ impl AgentToolServer {
             consultation_enabled,
             shared_work_enabled,
             web_search_enabled,
+            watcher_yield_enabled,
             extension_tool_names,
             team_policy,
             cancel,
@@ -485,6 +491,10 @@ impl AgentToolServer {
             "BORG_AGENT_CONSULTATION_ENABLED".to_string(),
             self.consultation_enabled.to_string(),
         );
+        env.insert(
+            "BORG_AGENT_WATCHER_YIELD_ENABLED".to_string(),
+            self.watcher_yield_enabled.to_string(),
+        );
         #[cfg(unix)]
         env.insert(
             "BORG_AGENT_TOOL_SOCKET".to_string(),
@@ -507,6 +517,7 @@ impl AgentToolServer {
                 self.team_policy.as_ref(),
                 self.consultation_enabled,
                 self.web_search_enabled,
+                self.watcher_yield_enabled,
             )
             .into_iter()
             .filter_map(|tool| {
@@ -769,6 +780,7 @@ impl AgentToolDispatcher {
             });
         Self {
             watches: None,
+            watcher_yield_enabled: false,
             journal,
             goals,
             todos,
@@ -801,6 +813,11 @@ impl AgentToolDispatcher {
 
     pub(crate) fn with_watches(mut self, watches: crate::watch::Watches) -> Self {
         self.watches = Some(watches);
+        self
+    }
+
+    pub(crate) fn with_watcher_yield(mut self, enabled: bool) -> Self {
+        self.watcher_yield_enabled = enabled;
         self
     }
 
@@ -923,6 +940,7 @@ impl AgentToolDispatcher {
             self.shared_work.is_some(),
             self.team_policy.as_ref(),
             self.consultation_enabled,
+            self.watcher_yield_enabled,
         );
         if self.web_search.is_some() {
             specs.push(web_search_tool_spec());
@@ -1531,6 +1549,10 @@ impl AgentToolDispatcher {
                 )?)
             }
             "await_watchers" | "await_watches" => {
+                ensure!(
+                    self.watcher_yield_enabled,
+                    "watcher yield is disabled; set capabilities.watcher_yield = true to opt in"
+                );
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct Args {
@@ -6313,14 +6335,15 @@ pub struct ToolSurface {
     /// Interactive prompting of the human. A child reports back to its parent
     /// instead: sixty children must not interrogate one person.
     pub human_prompt: bool,
-    /// Parent yield, steering and watcher lifecycle. A child holding the
-    /// parent yield on its behalf is a deadlock.
+    /// Parent steering and watcher lifecycle. A child managing the parent
+    /// watcher set or yield on its behalf is a deadlock.
     pub parent_control: bool,
+    /// Yielding on watchers is opt-in even for the director.
+    pub watcher_yield: bool,
 }
 
 impl ToolSurface {
-    /// Everything on: the director default, before a session disables a
-    /// capability it does not have.
+    /// Director defaults, before a session opts in to watcher yielding.
     pub fn director() -> Self {
         Self {
             subagents: true,
@@ -6329,6 +6352,7 @@ impl ToolSurface {
             web_search: true,
             human_prompt: true,
             parent_control: true,
+            watcher_yield: false,
         }
     }
 
@@ -6339,6 +6363,7 @@ impl ToolSurface {
             consultation: false,
             human_prompt: false,
             parent_control: false,
+            watcher_yield: false,
             ..self
         }
     }
@@ -6411,6 +6436,7 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
     shared_work_enabled: bool,
     team_policy: Option<&crate::TeamPolicy>,
     consultation_enabled: bool,
+    watcher_yield_enabled: bool,
 ) -> Vec<Value> {
     agent_tool_specs_for_surface(
         provider,
@@ -6418,6 +6444,7 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
             subagents: subagents_enabled,
             shared_work: shared_work_enabled,
             consultation: consultation_enabled,
+            watcher_yield: watcher_yield_enabled,
             // Search is added by the runtime when it has a search service, so
             // this surface never carries it implicitly.
             web_search: false,
@@ -6434,6 +6461,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
     team_policy: Option<&crate::TeamPolicy>,
     consultation_enabled: bool,
     web_search_enabled: bool,
+    watcher_yield_enabled: bool,
 ) -> Vec<Value> {
     agent_tool_specs_for_surface(
         provider,
@@ -6442,6 +6470,7 @@ fn agent_tool_specs_with_capabilities_and_consultation_and_search(
             shared_work: shared_work_enabled,
             consultation: consultation_enabled,
             web_search: web_search_enabled,
+            watcher_yield: watcher_yield_enabled,
             ..ToolSurface::director()
         },
         team_policy,
@@ -6977,6 +7006,9 @@ pub fn agent_tool_specs_for_surface(
                 Some("watch" | "list_watchers" | "await_watchers" | "stop_watcher")
             )
         });
+    }
+    if !surface.watcher_yield {
+        specs.retain(|spec| spec["name"] != "await_watchers");
     }
     add_action_metadata(&mut specs);
     specs

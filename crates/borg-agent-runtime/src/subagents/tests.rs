@@ -3602,6 +3602,7 @@ fn persistent_peer_tool_is_root_only_and_not_recursive() {
         false,
         None,
         true,
+        false,
     )
     .into_iter()
     .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
@@ -3614,6 +3615,7 @@ fn persistent_peer_tool_is_root_only_and_not_recursive() {
         true,
         false,
         None,
+        false,
         false,
     )
     .into_iter()
@@ -4771,6 +4773,58 @@ async fn agent_tool_provider_environment_parses_back_for_every_provider() {
     }
 }
 
+#[tokio::test]
+async fn watcher_yield_is_hidden_and_rejected_until_opted_in() {
+    let directory = tempdir().unwrap();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        Uuid::new_v4(),
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    let args = json!({"watch_ids": [Uuid::new_v4()], "reason": "build is running"});
+    let error = dispatcher.call("await_watchers", args).await.unwrap_err();
+    assert!(error.to_string().contains("watcher yield is disabled"));
+    assert!(
+        !dispatcher
+            .specs()
+            .iter()
+            .any(|tool| tool["name"] == "await_watchers")
+    );
+    assert!(
+        dispatcher
+            .specs()
+            .iter()
+            .any(|tool| tool["name"] == "watch")
+    );
+
+    let enabled = dispatcher.with_watcher_yield(true);
+    let server = AgentToolServer::start(directory.path(), Uuid::new_v4(), enabled)
+        .await
+        .unwrap();
+    let external = server.external_mcp_server().unwrap();
+    assert_eq!(external.env["BORG_AGENT_WATCHER_YIELD_ENABLED"], "true");
+    assert!(
+        external
+            .allowed_tools
+            .iter()
+            .any(|name| name == "mcp__borg_agent__await_watchers")
+    );
+}
+
 /// One-pixel PNG, small but a genuine PNG signature.
 fn sample_png() -> Vec<u8> {
     let mut bytes = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
@@ -5624,6 +5678,20 @@ fn a_child_surface_is_the_director_surface_minus_the_documented_exceptions() {
         "await_watchers",
         "stop_watcher",
     ];
+    let names = |surface| {
+        agent_tool_specs_for_surface(CodingProvider::Codex, surface, None)
+            .into_iter()
+            .filter_map(|spec| spec["name"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    let normal = names(ToolSurface::director());
+    assert!(normal.contains(&"watch".to_string()));
+    assert!(!normal.contains(&"await_watchers".to_string()));
+    let enabled = names(ToolSurface {
+        watcher_yield: true,
+        ..ToolSurface::director()
+    });
+    assert!(enabled.contains(&"await_watchers".to_string()));
     for provider in [
         CodingProvider::Codex,
         CodingProvider::Claude,

@@ -498,6 +498,8 @@ async fn handle_line_with_cancel(
                     endpoint.shared_work_enabled(),
                     endpoint.team_policy(),
                     endpoint.consultation_enabled(),
+                    std::env::var("BORG_AGENT_WATCHER_YIELD_ENABLED")
+                        .is_ok_and(|value| value == "true"),
                 )
             });
             Ok(if modern {
@@ -948,6 +950,7 @@ mod tests {
         assert!(names.contains(&"rotate_peer"));
         assert!(names.contains(&"lsp_workspace_diagnostics"));
         assert!(names.contains(&"list_blu_workflows"));
+        assert!(!names.contains(&"await_watchers"));
         assert!(names.contains(&"run_blu_extension"));
         for tool in tools {
             let properties = tool["inputSchema"]["properties"]

@@ -272,6 +272,7 @@ pub(crate) struct CapabilityConfig {
     pub(crate) web_relay: bool,
     pub(crate) telemetry: bool,
     pub(crate) auto_resume_usage_limits: bool,
+    pub(crate) watcher_yield: bool,
     /// Providers whose mid-turn human messages are framed with an instruction
     /// to address them next: `true` (default set), `false`, or a list.
     pub(crate) steer_reply_prompt: borg_remote::SteerReplyPrompt,
@@ -293,6 +294,7 @@ impl Default for CapabilityConfig {
             web_relay: true,
             telemetry: false,
             auto_resume_usage_limits: true,
+            watcher_yield: false,
             steer_reply_prompt: borg_remote::SteerReplyPrompt::default(),
             harness: borg_remote::HarnessMode::Borg,
         }
@@ -311,6 +313,7 @@ impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
             web_relay: value.web_relay,
             telemetry: value.telemetry,
             auto_resume_usage_limits: value.auto_resume_usage_limits,
+            watcher_yield: value.watcher_yield,
             steer_reply_prompt: value.steer_reply_prompt.clone(),
             provider_capabilities: Vec::new(),
             runtime_mcp_context: None,
@@ -1772,6 +1775,14 @@ reasoning_format = "deepseek"
         config.validate().unwrap();
         assert_eq!(config.expand_command("/quick"), "/fast on");
         assert!(config.capabilities.auto_resume_usage_limits);
+    }
+
+    #[test]
+    fn watcher_yield_requires_explicit_opt_in() {
+        assert!(!AgentConfig::default().capabilities.watcher_yield);
+        let configured: AgentConfig =
+            toml::from_str("[capabilities]\nwatcher_yield = true\n").unwrap();
+        assert!(borg_remote::SessionCapabilities::from(&configured.capabilities).watcher_yield);
     }
 
     #[test]

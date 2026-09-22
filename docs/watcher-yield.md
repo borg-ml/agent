@@ -1,5 +1,15 @@
 # Yielding to watchers
 
+`await_watchers` is opt-in. In the agent config, set:
+
+```toml
+[capabilities]
+watcher_yield = true
+```
+
+Do this before starting a new session. By default the tool is not advertised or
+callable, and ordinary watcher management remains available.
+
 `await_watchers` lets an agent say "every remaining step depends on a watcher I
 already started, so stop generating turns until one reports". It exists because
 the alternative is worse: without it an active goal keeps producing

@@ -1010,6 +1010,9 @@ pub struct SessionCapabilities {
     /// usage limits have had time to clear.
     #[serde(default = "default_true")]
     pub auto_resume_usage_limits: bool,
+    /// Permit a goal to yield until a running watcher reports progress.
+    #[serde(default)]
+    pub watcher_yield: bool,
     /// Providers or model ids whose mid-turn human messages are framed with an
     /// instruction to address them in the next visible response. Those models
     /// otherwise fold the bare text silently into the running task; Codex
@@ -1068,6 +1071,7 @@ impl Default for SessionCapabilities {
             web_relay: true,
             telemetry: false,
             auto_resume_usage_limits: true,
+            watcher_yield: false,
             steer_reply_prompt: SteerReplyPrompt::default(),
             provider_capabilities: Vec::new(),
             runtime_mcp_context: None,

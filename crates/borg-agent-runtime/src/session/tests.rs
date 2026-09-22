@@ -8182,6 +8182,13 @@ async fn goal_state_is_recoverable_from_the_session_journal() {
 }
 
 #[test]
+fn watcher_yield_instruction_requires_opt_in() {
+    let goal = SessionGoal::new("work".to_string(), None);
+    assert!(!continuation_prompt(&goal, false).contains("await_watchers"));
+    assert!(continuation_prompt(&goal, true).contains("await_watchers"));
+}
+
+#[test]
 fn automatic_goal_continuation_supports_unbudgeted_goals() {
     let unbudgeted = SessionGoal::new("work continuously".to_string(), None);
     assert!(goal_allows_automatic_continuation(&unbudgeted));
@@ -17050,7 +17057,10 @@ async fn assert_watcher_yield_blocks_automatic_turns(queue_reports: bool) {
                     permission_mode: PermissionMode::FullAccess,
                     name: None,
                     initial_prompt: Some("run the sweep".to_string()),
-                    capabilities: Default::default(),
+                    capabilities: crate::SessionCapabilities {
+                        watcher_yield: true,
+                        ..Default::default()
+                    },
                     subagent_concurrency_limit: None,
                     extension_skill_roots: Vec::new(),
                     team_policy: None,
@@ -17207,7 +17217,10 @@ async fn a_stopped_silent_watcher_ends_the_yield_instead_of_stranding_the_goal()
                     permission_mode: PermissionMode::FullAccess,
                     name: None,
                     initial_prompt: Some("run the sweep".to_string()),
-                    capabilities: Default::default(),
+                    capabilities: crate::SessionCapabilities {
+                        watcher_yield: true,
+                        ..Default::default()
+                    },
                     subagent_concurrency_limit: None,
                     extension_skill_roots: Vec::new(),
                     team_policy: None,
@@ -17312,7 +17325,10 @@ async fn an_interrupt_while_yielded_holds_watcher_output_until_a_human_returns()
                     permission_mode: PermissionMode::FullAccess,
                     name: None,
                     initial_prompt: Some("run the sweep".to_string()),
-                    capabilities: Default::default(),
+                    capabilities: crate::SessionCapabilities {
+                        watcher_yield: true,
+                        ..Default::default()
+                    },
                     subagent_concurrency_limit: None,
                     extension_skill_roots: Vec::new(),
                     team_policy: None,
@@ -17441,7 +17457,10 @@ async fn a_watcher_that_finishes_while_yielded_resumes_the_goal_without_ending_t
                     permission_mode: PermissionMode::FullAccess,
                     name: None,
                     initial_prompt: Some("run the sweep".to_string()),
-                    capabilities: Default::default(),
+                    capabilities: crate::SessionCapabilities {
+                        watcher_yield: true,
+                        ..Default::default()
+                    },
                     subagent_concurrency_limit: None,
                     extension_skill_roots: Vec::new(),
                     team_policy: None,
