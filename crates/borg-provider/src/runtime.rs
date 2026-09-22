@@ -39,14 +39,14 @@ pub const CODEX_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
 };
 
 pub const CLAUDE_SELECTABLE_MODELS: [(&str, &str); 3] = [
-    ("claude-opus-5", "Opus 5"),
+    ("claude-opus-5-5", "Opus 5.5"),
     ("claude-sonnet-5", "Sonnet 5"),
     ("claude-fable-5-1", "Fable 5.1"),
 ];
 pub const CLAUDE_EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 pub const CLAUDE_MODEL_CATALOG: ProviderModelCatalog = ProviderModelCatalog {
     backend: "claude",
-    default_model: "claude-opus-5",
+    default_model: "claude-opus-5-5",
     selectable_models: &CLAUDE_SELECTABLE_MODELS,
     effort_levels: &CLAUDE_EFFORT_LEVELS,
 };

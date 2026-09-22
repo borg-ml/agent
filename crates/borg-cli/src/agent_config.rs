@@ -343,7 +343,7 @@ pub(crate) struct UpdateConfig {
 #[serde(default)]
 pub(crate) struct CompactionConfig {
     /// Keyed by the same `provider/model` alias Borg uses everywhere else,
-    /// for example `claude/claude-opus-5` or
+    /// for example `claude/claude-opus-5-5` or
     /// `open_router/anthropic/claude-opus-5`.
     pub(crate) budgets: BTreeMap<String, CompactionBudgetOverride>,
 }

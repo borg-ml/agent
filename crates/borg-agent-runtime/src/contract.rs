@@ -2759,7 +2759,7 @@ mod tests {
     #[test]
     fn models_resolve_back_to_the_provider_that_serves_them() {
         assert_eq!(
-            CodingProvider::for_model("claude-opus-5"),
+            CodingProvider::for_model("claude-fable-5-1"),
             Some(CodingProvider::Claude)
         );
         assert_eq!(

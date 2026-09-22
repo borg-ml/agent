@@ -813,7 +813,7 @@ fn persistent_sidecar_prompt_is_ensured_then_sent_to_the_same_child() {
                 ..
             },
             ..
-        } if task_name == "claude" && model == "claude-opus-5" && effort == "high"
+        } if task_name == "claude" && model == borg_provider::claude_product_model() && effort == "high"
     ));
     assert!(matches!(
         &commands[1],
@@ -2717,8 +2717,8 @@ async fn resume_switch_rejects_remote_owned_session_before_stopping_current() {
 fn every_defaultable_provider_pins_a_model_for_a_fresh_session() {
     assert_eq!(
         default_model_for_provider(CodingProvider::Claude).as_deref(),
-        Some("claude-opus-5"),
-        "a Claude session must pin Opus 5 rather than record an empty model"
+        Some(borg_provider::claude_product_model()),
+        "a Claude session must pin a model rather than record an empty model"
     );
     assert_eq!(
         borg_provider::claude_default_effort(),

@@ -1621,7 +1621,8 @@ fn model_picker_none_yields_no_open_ended_placeholder() {
     // With None and no current, the dynamic arm returns empty; only catalogs render.
     // We still check that catalog providers remain selectable.
     assert!(options.iter().any(|o| o.value == "gpt-5.6-luna"));
-    assert!(options.iter().any(|o| o.value == "claude-opus-5"));
+    assert!(options.iter().any(|o| o.value == "claude-fable-5-1"));
+    assert!(!options.iter().any(|o| o.value == "claude-opus-5"));
 }
 
 #[test]
@@ -6559,7 +6560,10 @@ fn subagent_roster_shows_full_model_ids() {
         usage: borg_remote::SubagentUsage::default(),
     };
 
-    assert_eq!(display_subagent_model(&peer), "claude-opus-5");
+    assert_eq!(
+        display_subagent_model(&peer),
+        borg_provider::claude_product_model()
+    );
 
     peer.provider = CodingProvider::Codex;
     peer.task_name = "/root/gameplay_ui_polish".to_string();
