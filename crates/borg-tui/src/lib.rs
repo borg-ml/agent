@@ -6157,13 +6157,14 @@ impl BorgTerminal {
     }
 
     fn send_completion_alert(&mut self, notification: bool, sound: bool) {
-        // The desktop notification asks the host terminal to post a banner;
-        // BEL requests the user's configured terminal sound.
         if notification {
             let sequence = desktop_notification_sequence("Borg Agent", "Finished working");
             let _ = write!(self.terminal.backend_mut(), "{sequence}");
         }
-        if sound {
+        // Terminal bells are often muted even when desktop notifications are
+        // enabled. Play the system chime without holding up the TUI, and keep
+        // BEL as a fallback when no native player is available.
+        if sound && !play_system_completion_sound() {
             let _ = write!(self.terminal.backend_mut(), "\x07");
         }
         let _ = io::Write::flush(self.terminal.backend_mut());
@@ -10142,6 +10143,62 @@ impl Drop for BorgTerminal {
     fn drop(&mut self) {
         self.restore_terminal();
     }
+}
+
+fn play_system_completion_sound() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = Command::new("/usr/bin/afplay");
+        command.arg("/System/Library/Sounds/Glass.aiff");
+        return start_completion_sound(command);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[System.Media.SystemSounds]::Asterisk.Play(); Start-Sleep -Milliseconds 750",
+        ]);
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        return start_completion_sound(command);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut command = Command::new("canberra-gtk-play");
+        command.args(["--id", "complete"]);
+        if start_completion_sound(command) {
+            return true;
+        }
+        let sound = Path::new("/usr/share/sounds/freedesktop/stereo/complete.oga");
+        if sound.exists() {
+            let mut command = Command::new("paplay");
+            command.arg(sound);
+            return start_completion_sound(command);
+        }
+        false
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        false
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn start_completion_sound(mut command: Command) -> bool {
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    true
 }
 
 fn completion_alert_enabled(policy: CompletionAlertPolicy, window_focused: bool) -> bool {
