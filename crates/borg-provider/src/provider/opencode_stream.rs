@@ -1190,7 +1190,7 @@ mod tests {
                     }
                 }
             }),
-            &cwd,
+            cwd,
             &mut generating,
             &mut snapshots,
             &mut described,
@@ -1213,7 +1213,7 @@ mod tests {
                 "state": {"status": "pending", "input": {},
                     "raw": "{\"nested\":{\"action\":\"wrong\"},\"action\":\"edit\",\"plan\":["}
             }}),
-            &cwd,
+            cwd,
             &mut generating,
             &mut snapshots,
             &mut described,
@@ -1240,7 +1240,7 @@ mod tests {
                 "state": {"status": "pending", "input": {},
                     "raw": "{\"nested\":{\"action\":\"wrong\"},\"action\":\"edit\",\"plan\":["}
             }}),
-            &cwd,
+            cwd,
             &mut generating,
             &mut snapshots,
             &mut described,
@@ -1265,7 +1265,7 @@ mod tests {
                     }
                 }
             }),
-            &cwd,
+            cwd,
             &mut generating,
             &mut snapshots,
             &mut described,
@@ -1303,7 +1303,7 @@ mod tests {
             emit_tool(
                 &sender,
                 &snapshot,
-                &cwd,
+                cwd,
                 &mut generating,
                 &mut snapshots,
                 &mut described,
@@ -1326,7 +1326,7 @@ mod tests {
             emit_tool(
                 &sender,
                 &snapshot,
-                &cwd,
+                cwd,
                 &mut generating,
                 &mut snapshots,
                 &mut described,

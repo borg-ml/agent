@@ -1556,11 +1556,12 @@ mode = \"idle\"
         assert_eq!(std::env::var(borg_remote::SHELL_ENV).unwrap(), "sh");
         drop(guard);
 
+        let command = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
         let configured: AgentConfig =
-            toml::from_str("[shell]\ncommand = \"/bin/sh\"\n").expect("config parses");
+            toml::from_str(&format!("[shell]\ncommand = {command:?}\n")).expect("config parses");
         configured.validate().expect("an installed shell is valid");
         let guard = configured.apply_local_provider_env();
-        assert_eq!(std::env::var(borg_remote::SHELL_ENV).unwrap(), "/bin/sh");
+        assert_eq!(std::env::var(borg_remote::SHELL_ENV).unwrap(), command);
         // Ending the session puts the operator's own value back.
         drop(guard);
         assert_eq!(std::env::var(borg_remote::SHELL_ENV).unwrap(), "sh");
