@@ -1697,7 +1697,8 @@ fn request_shape(body: &Value) -> String {
         return "messages=<none>".to_string();
     };
     let mut roles = String::new();
-    let mut images = 0_usize;
+    let mut images: Vec<String> = Vec::new();
+    let mut image_count = 0_usize;
     let mut calls = 0_usize;
     let mut sent: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut answered: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -1709,17 +1710,52 @@ fn request_shape(body: &Value) -> String {
             Some("tool") => "t",
             _ => "?",
         });
-        if message
+        for part in message
             .get("content")
             .and_then(Value::as_array)
-            .is_some_and(|parts| {
-                parts.iter().any(|part| {
-                    part.get("type").and_then(Value::as_str) == Some("image")
-                        || part.get("image_url").is_some()
-                })
-            })
+            .into_iter()
+            .flatten()
         {
-            images += 1;
+            let is_image = part.get("type").and_then(Value::as_str) == Some("image")
+                || part.get("image_url").is_some();
+            if !is_image {
+                continue;
+            }
+            image_count += 1;
+            if images.len() < 8 {
+                // The wire uses image_url: {url: data:...}, not a string.
+                let url = part
+                    .pointer("/image_url/url")
+                    .or_else(|| part.get("image_url"));
+                let encoded_bytes = |data: &str| {
+                    (data.len() / 4 * 3)
+                        .saturating_sub(usize::from(data.ends_with('=')))
+                        .saturating_sub(usize::from(data.ends_with("==")))
+                };
+                let (media, bytes) = if let Some((media, data)) = url
+                    .and_then(Value::as_str)
+                    .and_then(|url| url.strip_prefix("data:"))
+                    .and_then(|url| url.split_once(";base64,"))
+                {
+                    (media, encoded_bytes(data))
+                } else {
+                    let source = part.get("source");
+                    (
+                        source
+                            .and_then(|source| source.get("media_type"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown"),
+                        source
+                            .and_then(|source| source.get("data"))
+                            .and_then(Value::as_str)
+                            .map_or(0, encoded_bytes),
+                    )
+                };
+                images.push(format!(
+                    "{}:{bytes}B",
+                    media.chars().take(48).collect::<String>()
+                ));
+            }
         }
         for call in message
             .get("tool_calls")
@@ -1748,7 +1784,7 @@ fn request_shape(body: &Value) -> String {
         .unwrap_or_default();
     fields.sort_unstable();
     format!(
-        "messages={}, roles={shown}{}, bytes={}, images={images}, tool_calls={calls}, unanswered_calls={}, tools_hash={tools_hash}, fields={}",
+        "messages={}, roles={shown}{}, bytes={}, images=[{}], tool_calls={calls}, tools={}, unanswered_calls={}, tools_hash={tools_hash}, fields={}",
         messages.len(),
         if elided > 0 {
             format!("+{elided}")
@@ -1756,6 +1792,14 @@ fn request_shape(body: &Value) -> String {
             String::new()
         },
         body.to_string().len(),
+        if image_count > images.len() {
+            format!("{} +{}", images.join(" "), image_count - images.len())
+        } else {
+            images.join(" ")
+        },
+        body.get("tools")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len),
         sent.difference(&answered).count(),
         fields.join(","),
     )
@@ -1942,6 +1986,27 @@ fn merge_object(target: &mut Value, extra: Map<String, Value>) {
 mod tests {
     use super::*;
     use std::fmt::Write as _;
+
+    // A bodyless refusal must report the actual image bytes and MIME types,
+    // not unknown:0B from reading the image_url object as a string.
+    #[test]
+    fn refusal_shape_records_nested_image_urls_without_leaking_image_data() {
+        let body = json!({
+            "model": "deepseek-v4.1-flash",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,ZGF0YQ=="}}
+            ]}],
+            "tools": [{"type": "function", "function": {"name": "read_file"}}]
+        });
+        let shape = request_shape(&body);
+        assert!(
+            shape.contains("images=[image/png:5B image/jpeg:4B]"),
+            "{shape}"
+        );
+        assert!(shape.contains("tools=1"), "{shape}");
+        assert!(!shape.contains("aW1hZ2U="), "{shape}");
+    }
 
     #[test]
     fn native_images_use_chat_completions_multimodal_blocks() {
