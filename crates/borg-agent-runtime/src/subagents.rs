@@ -3576,7 +3576,9 @@ impl SubagentCoordinator {
             .or_else(|| {
                 launch
                     .provider
-                    .model_catalog()
+                    .uses_native_harness()
+                    .then(|| launch.provider.model_catalog())
+                    .flatten()
                     .map(|catalog| catalog.default_model.to_string())
             });
         if inherits_parent {
