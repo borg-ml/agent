@@ -2023,7 +2023,7 @@ async fn ensuring_a_sidecar_reuses_one_idle_provider_session() {
         .ensure_sidecar(
             "claude",
             CodingProvider::Claude,
-            Some("claude-opus-5".to_string()),
+            Some("claude-opus-5-5".to_string()),
             Some("high".to_string()),
         )
         .await
@@ -2032,7 +2032,7 @@ async fn ensuring_a_sidecar_reuses_one_idle_provider_session() {
         .ensure_sidecar(
             "claude",
             CodingProvider::Claude,
-            Some("claude-opus-5".to_string()),
+            Some("claude-opus-5-5".to_string()),
             Some("high".to_string()),
         )
         .await
@@ -2041,7 +2041,7 @@ async fn ensuring_a_sidecar_reuses_one_idle_provider_session() {
     assert_eq!(first.session_id, second.session_id);
     assert_eq!(second.task_name, "/root/claude");
     assert_eq!(second.provider, CodingProvider::Claude);
-    assert_eq!(second.model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(second.model.as_deref(), Some("claude-opus-5-5"));
     assert_eq!(second.effort.as_deref(), Some("high"));
 
     coordinator.stop("/root/claude").await.unwrap();
@@ -2049,7 +2049,7 @@ async fn ensuring_a_sidecar_reuses_one_idle_provider_session() {
         .ensure_sidecar(
             "claude",
             CodingProvider::Claude,
-            Some("claude-opus-5".to_string()),
+            Some("claude-opus-5-5".to_string()),
             Some("high".to_string()),
         )
         .await
@@ -2157,7 +2157,7 @@ async fn subagent_admission_rejects_a_provider_without_host_authentication() {
         .ensure_sidecar(
             "claude",
             CodingProvider::Claude,
-            Some("claude-opus-5".to_string()),
+            Some("claude-opus-5-5".to_string()),
             Some("high".to_string()),
         )
         .await
@@ -2208,7 +2208,7 @@ async fn subagent_admission_rejects_an_exhausted_subscription() {
         .ensure_sidecar(
             "claude",
             CodingProvider::Claude,
-            Some("claude-opus-5".to_string()),
+            Some("claude-opus-5-5".to_string()),
             Some("high".to_string()),
         )
         .await
@@ -2453,7 +2453,10 @@ fn persistent_peer_defaults_to_the_opposite_provider_and_stable_sidecar_profile(
     let (provider, model, effort) =
         resolve_persistent_peer_profile(CodingProvider::Codex, None).unwrap();
     assert_eq!(provider, CodingProvider::Claude);
-    assert_eq!(model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(
+        model.as_deref(),
+        Some(borg_provider::claude_product_model())
+    );
     assert_eq!(effort.as_deref(), Some("high"));
 
     let (provider, model, effort) =
@@ -2466,9 +2469,10 @@ fn persistent_peer_defaults_to_the_opposite_provider_and_stable_sidecar_profile(
     );
 
     let (provider, model, effort) =
-        resolve_persistent_peer_profile(CodingProvider::Codex, Some("claude-opus-5@high")).unwrap();
+        resolve_persistent_peer_profile(CodingProvider::Codex, Some("claude-fable-5-1@high"))
+            .unwrap();
     assert_eq!(provider, CodingProvider::Claude);
-    assert_eq!(model.as_deref(), Some("claude-opus-5"));
+    assert_eq!(model.as_deref(), Some("claude-fable-5-1"));
     assert_eq!(effort.as_deref(), Some("high"));
 
     let (provider, model, effort) =

@@ -358,7 +358,7 @@ impl PeerTarget {
 
     pub const fn default_model(self) -> &'static str {
         match self {
-            Self::Claude => "claude-opus-5",
+            Self::Claude => borg_provider::CLAUDE_MODEL_CATALOG.default_model,
             Self::Gpt => "gpt-5.6-sol",
         }
     }

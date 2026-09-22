@@ -10672,7 +10672,7 @@ fn display_agent_name(task_name: &str) -> String {
 fn display_subagent_model(agent: &SubagentSnapshot) -> String {
     let explicit = agent.model.as_deref();
     let model = explicit.or(match (agent.provider, agent.task_name.as_str()) {
-        (CodingProvider::Claude, "/root/claude") => Some("claude-opus-5"),
+        (CodingProvider::Claude, "/root/claude") => Some(borg_provider::claude_product_model()),
         _ => None,
     });
     model

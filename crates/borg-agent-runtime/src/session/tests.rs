@@ -1423,7 +1423,7 @@ impl AgentTurnExecutor for ConsultingExecutor {
             .call(
                 "consult_model",
                 json!({
-                    "profile": "claude-opus-5@high",
+                    "profile": "claude-fable-5-1@high",
                     "prompt": "Review the selected interface and call out hidden risks."
                 }),
             )
@@ -13427,7 +13427,7 @@ fn consultation_profiles_resolve_aliases_and_catalog_models() {
         resolve_consultation_profile("claude").unwrap(),
         (
             CodingProvider::Claude,
-            Some("claude-opus-5".to_string()),
+            Some(borg_provider::claude_product_model().to_string()),
             None
         )
     );
@@ -13436,18 +13436,18 @@ fn consultation_profiles_resolve_aliases_and_catalog_models() {
         (CodingProvider::Codex, Some("gpt-6-astra".to_string()), None)
     );
     assert_eq!(
-        resolve_consultation_profile("claude/claude-opus-5").unwrap(),
+        resolve_consultation_profile("claude/claude-opus-5-5").unwrap(),
         (
             CodingProvider::Claude,
-            Some("claude-opus-5".to_string()),
+            Some("claude-opus-5-5".to_string()),
             None
         )
     );
     assert_eq!(
-        resolve_consultation_profile("claude-opus-5@high").unwrap(),
+        resolve_consultation_profile("claude-fable-5-1@high").unwrap(),
         (
             CodingProvider::Claude,
-            Some("claude-opus-5".to_string()),
+            Some("claude-fable-5-1".to_string()),
             Some("high".to_string())
         )
     );

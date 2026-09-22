@@ -87,7 +87,7 @@ peer thread alive across calls and returns the peer's answer to you privately so
 it before answering. Use `consult_model` only when a deliberately isolated one-shot opinion is wanted. \
 Call the peer only when another viewpoint would materially help; do not call it reflexively on every turn. \
 Preserve an explicit `@EFFORT` suffix in a profile when the intent includes one (for example, \
-`claude-opus-5@high` or `gpt-5.6-sol@xhigh`). \
+`claude-opus-5-5@high` or `gpt-5.6-sol@xhigh`). \
 You choose the complete freeform briefing: include the relevant objective, evidence, constraints, and \
 exact question, while omitting unrelated transcript noise. Never ask the human to relay messages manually. \
 The peer cannot invoke another peer; after the response returns, reconcile it with your own judgment and \
