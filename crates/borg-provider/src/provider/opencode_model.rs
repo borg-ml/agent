@@ -405,10 +405,6 @@ mod tests {
         }
     }
 
-    /// models.dev carries the window under the Go provider's `limit.context`.
-    /// Losing that field would silently blank the context meter and disable
-    /// auto-compaction rather than fail loudly.
-    #[test]
     /// Prices come from the same document, per provider and model. A model with
     /// no cached-input rate is excluded: the estimates that read this need that
     /// rate, and half a price would become a wrong decision about spending.
@@ -446,6 +442,9 @@ mod tests {
         assert!(!prices.contains_key(&("anthropic".to_string(), "no-cache-rate".to_string())));
     }
 
+    /// models.dev carries the window under the Go provider's `limit.context`.
+    /// Losing that field would silently blank the context meter and disable
+    /// auto-compaction rather than fail loudly.
     #[test]
     fn context_windows_are_read_from_the_models_dev_catalog() {
         let payload = serde_json::json!({

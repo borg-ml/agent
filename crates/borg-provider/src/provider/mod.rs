@@ -1051,9 +1051,9 @@ mod tests {
 
     use super::{
         CLAUDE_DEFAULT_MODEL, CLAUDE_SELECTABLE_MODELS, PROVIDER_HTTP_ERROR_BODY_MAX_BYTES,
-        estimate_cache_miss_microusd, extract_chat_completions_usage, microusd_for_tokens,
-        parse_chat_completion_json_text, provider_cost_usd_to_microusd,
-        provider_response_body_would_exceed_limit, truncate_provider_text,
+        extract_chat_completions_usage, microusd_for_tokens, parse_chat_completion_json_text,
+        provider_cost_usd_to_microusd, provider_response_body_would_exceed_limit,
+        truncate_provider_text,
     };
 
     #[test]
