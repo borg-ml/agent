@@ -1,10 +1,8 @@
 //! Which harness owns a session's transcript.
 //!
-//! A conversation has exactly one owner: either Borg's own harness or the
-//! provider's CLI. The route is decided once and then pinned, because a
-//! transcript cannot migrate between owners in either direction -- only the
-//! owner can replay its own history. Everything here exists to make that
-//! decision once, durably, and never silently revise it.
+//! OpenCode CLI routes remain pinned unless the selected model is OpenCode Go.
+//! Codex now runs through Borg's harness, which can replay its durable journal
+//! even for sessions that previously used the Codex CLI.
 
 use anyhow::{Context, Result, ensure};
 use sqlx::{Postgres, Row, Transaction};
@@ -78,62 +76,20 @@ async fn has_native_history(
 }
 
 impl PostgresSessionStore {
-    /// Resolve and pin this session's Codex harness route.
+    /// Adopt a legacy Codex session onto Borg's harness.
     pub(super) async fn resolve_codex_harness(
         transaction: &mut Transaction<'_, Postgres>,
         session_id: Uuid,
-        inherited: Option<bool>,
     ) -> Result<bool> {
-        let existing: Option<bool> = sqlx::query_scalar(
-            "select native from session_harness_routes \
-             where session_id = $1 and provider = 'codex'",
+        sqlx::query(
+            "insert into session_harness_routes (session_id, provider, native) \
+             values ($1, 'codex', true) on conflict (session_id, provider) \
+             do update set native = true where not session_harness_routes.native",
         )
         .bind(session_id)
-        .fetch_optional(&mut **transaction)
+        .execute(&mut **transaction)
         .await?;
-        let native = if let Some(existing) = existing {
-            existing
-        } else {
-            // Existing native history stays on Borg's harness, including
-            // history predating account tags; never fall back to a CLI-owned
-            // conversation.
-            let tagged: bool = sqlx::query_scalar(
-                "select exists(select 1 from session_model_access \
-                 where session_id = $1 and provider = 'codex')",
-            )
-            .bind(session_id)
-            .fetch_one(&mut **transaction)
-            .await?;
-            let native_history =
-                tagged || has_native_history(transaction, session_id, "codex").await?;
-            let row = sqlx::query(
-                "select next_sequence, parent_session_id, owner_session_id \
-                 from sessions where id = $1",
-            )
-            .bind(session_id)
-            .fetch_one(&mut **transaction)
-            .await?;
-            let empty_root = row.try_get::<i64, _>("next_sequence")? == 1
-                && row
-                    .try_get::<Option<Uuid>, _>("parent_session_id")?
-                    .is_none();
-            let owner: Option<Uuid> = row.try_get("owner_session_id")?;
-            let native = native_history || (empty_root && inherited.unwrap_or(owner.is_none()));
-            sqlx::query(
-                "insert into session_harness_routes (session_id, provider, native) \
-                 values ($1, 'codex', $2) on conflict (session_id, provider) do nothing",
-            )
-            .bind(session_id)
-            .bind(native)
-            .execute(&mut **transaction)
-            .await?;
-            native
-        };
-        ensure!(
-            inherited.is_none_or(|owner| owner == native),
-            "child Codex harness differs from its owner's durable route; start a new child session"
-        );
-        Ok(native)
+        Ok(true)
     }
 
     /// Resolve and pin the OpenCode harness route.
@@ -273,21 +229,18 @@ impl PostgresSessionStore {
         Ok(native.unwrap_or(false))
     }
 
-    /// Resolve, and durably pin, this session's Codex route.
+    /// Ensure this session uses Borg's Codex harness.
     pub async fn uses_native_codex_harness(&self, session_id: Uuid) -> Result<bool> {
         let mut transaction = self.pool().begin().await?;
-        let native = Self::resolve_codex_harness(&mut transaction, session_id, None).await?;
+        let native = Self::resolve_codex_harness(&mut transaction, session_id).await?;
         transaction.commit().await?;
         Ok(native)
     }
 
     /// Record which account last drove this session for `provider`.
     ///
-    /// Refuses a Codex write when the session is pinned to the CLI route: the
-    /// account tag is also the signal `resolve_codex_harness` reads to decide a
-    /// route for an untagged session, so tagging a CLI-owned conversation would
-    /// later flip it to Borg's harness and strand a transcript only the CLI can
-    /// replay.
+    /// A Codex write also adopts any legacy CLI route, matching the executor
+    /// that now runs every Codex turn through Borg's harness.
     pub async fn record_model_access(
         &self,
         session_id: Uuid,
@@ -300,18 +253,7 @@ impl PostgresSessionStore {
         );
         let mut transaction = self.pool().begin().await?;
         if provider == crate::CodingProvider::Codex {
-            let native: Option<bool> = sqlx::query_scalar(
-                "select native from session_harness_routes \
-                 where session_id = $1 and provider = 'codex'",
-            )
-            .bind(session_id)
-            .fetch_optional(&mut *transaction)
-            .await?;
-            ensure!(
-                native != Some(false),
-                "this session retains its Codex compatibility route; \
-                 start a new session for Borg-owned execution"
-            );
+            Self::resolve_codex_harness(&mut transaction, session_id).await?;
         }
         let provider = serde_json::to_value(provider)?
             .as_str()
@@ -332,39 +274,15 @@ impl PostgresSessionStore {
         Ok(())
     }
 
-    /// Give `session_id` the same routes as `source_session_id`.
-    ///
-    /// Used when a fork or child adopts an existing conversation: the inherited
-    /// route is passed to the resolver rather than copied, so a conflicting
-    /// pinned route is refused instead of silently overwritten.
-    /// Give a fork the route its parent's transcript already belongs to.
-    ///
-    /// A fork COPIES the parent's decision rather than re-deriving its own, and
-    /// the distinction is not cosmetic. Resolution answers "what route does this
-    /// session's own shape imply", and a fork's shape implies the CLI: it has a
-    /// parent, so it is not an empty root, and the events it inherited belong to
-    /// rows another session owns. Re-deriving therefore returns `false` for a
-    /// fork of a native session, and comparing that against the parent then
-    /// fails a fork that is behaving exactly as intended -- which is what
-    /// `inherit_harness_routes` would do here.
-    ///
-    /// An undecided parent leaves the fork undecided: pinning a route the parent
-    /// has not chosen would strand the fork on it before its model is known.
+    /// Adopt Codex and copy the parent's decided OpenCode route to a fork.
+    /// An undecided OpenCode parent leaves the fork undecided.
     pub(super) async fn copy_harness_routes(
         transaction: &mut Transaction<'_, Postgres>,
         parent_session_id: Uuid,
         session_id: Uuid,
     ) -> Result<()> {
-        let parent_codex =
-            Self::resolve_codex_harness(transaction, parent_session_id, None).await?;
-        sqlx::query(
-            "insert into session_harness_routes (session_id, provider, native) \
-             values ($1, 'codex', $2) on conflict (session_id, provider) do nothing",
-        )
-        .bind(session_id)
-        .bind(parent_codex)
-        .execute(&mut **transaction)
-        .await?;
+        Self::resolve_codex_harness(transaction, parent_session_id).await?;
+        Self::resolve_codex_harness(transaction, session_id).await?;
         if let Some(parent_opencode) =
             Self::resolve_opencode_harness(transaction, parent_session_id, None, None).await?
         {
@@ -385,9 +303,8 @@ impl PostgresSessionStore {
         source_session_id: Uuid,
         session_id: Uuid,
     ) -> Result<()> {
-        let source_codex =
-            Self::resolve_codex_harness(transaction, source_session_id, None).await?;
-        Self::resolve_codex_harness(transaction, session_id, Some(source_codex)).await?;
+        Self::resolve_codex_harness(transaction, source_session_id).await?;
+        Self::resolve_codex_harness(transaction, session_id).await?;
         // An undecided source leaves the child free to resolve its own route.
         let source_opencode =
             Self::resolve_opencode_harness(transaction, source_session_id, None, None).await?;

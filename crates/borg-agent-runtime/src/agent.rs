@@ -2675,7 +2675,7 @@ mod tests {
             .unwrap();
         assert!(native.uses_native_harness(CodingProvider::Codex));
         assert!(!native.supports_subscription_context_reuse(CodingProvider::Codex));
-        assert!(!store.uses_native_codex_harness(legacy).await.unwrap());
+        assert!(store.uses_native_codex_harness(legacy).await.unwrap());
         let migrated = native
             .for_session(legacy, &store, None)
             .await

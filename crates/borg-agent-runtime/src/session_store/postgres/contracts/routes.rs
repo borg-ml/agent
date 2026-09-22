@@ -1,13 +1,8 @@
 //! Provider-route and model-identity contracts.
 //!
-//! WHAT THESE PROTECT: a session is pinned to exactly one harness route, and
-//! that pin is part of its execution contract rather than a detail of the row
-//! it happens to live in. A conversation that has been answered through a
-//! provider CLI keeps a transcript only that CLI can replay; one Borg's own
-//! harness owns keeps a transcript only Borg can replay. Moving a live session
-//! between the two silently breaks resume, so the route has to survive a
-//! restart, a context clear, a fork, and child registration -- and changing
-//! the selected model or account must not rewrite it.
+//! WHAT THESE PROTECT: Codex sessions use Borg's harness, including sessions
+//! with a legacy CLI route. OpenCode sessions retain their decided route across
+//! a restart, a context clear, a fork, and child registration.
 //!
 //! WHERE POSTGRES DIFFERS: the original suite restarted by closing the SQLite
 //! file and reopening it. The equivalent here is a second store opened against
@@ -26,13 +21,13 @@ use crate::{
 };
 
 #[tokio::test]
-async fn codex_harness_route_survives_restart_clear_fork_and_child_registration() {
+async fn legacy_codex_routes_adopt_borg_across_restart_clear_fork_and_child_registration() {
     let (scratch, store) = store().await;
     let mut expected = Vec::new();
-    for native in [true, false] {
+    for legacy in [false, true] {
         let parent = Uuid::new_v4();
         store.create_session(parent).await.unwrap();
-        if !native {
+        if legacy {
             store
                 .append(SessionEvent::new(
                     parent,
@@ -41,20 +36,31 @@ async fn codex_harness_route_survives_restart_clear_fork_and_child_registration(
                 ))
                 .await
                 .unwrap();
+            sqlx::query(
+                "insert into session_harness_routes (session_id, provider, native) \
+                 values ($1, 'codex', false)",
+            )
+            .bind(parent)
+            .execute(store.pool())
+            .await
+            .unwrap();
+            // The first native turn binds account access before route lookup.
+            store
+                .record_model_access(parent, CodingProvider::Codex, "account-a")
+                .await
+                .unwrap();
         }
         let (first, second) = tokio::join!(
             store.uses_native_codex_harness(parent),
             store.uses_native_codex_harness(parent),
         );
-        assert_eq!(first.unwrap(), native);
-        assert_eq!(second.unwrap(), native);
-        if !native {
-            assert!(
-                store
-                    .record_model_access(parent, CodingProvider::Codex, "account-a")
-                    .await
-                    .is_err()
-            );
+        assert!(first.unwrap());
+        assert!(second.unwrap());
+        if !legacy {
+            store
+                .record_model_access(parent, CodingProvider::Codex, "account-a")
+                .await
+                .unwrap();
         }
         store
             .append(SessionEvent::new(
@@ -69,12 +75,12 @@ async fn codex_harness_route_survives_restart_clear_fork_and_child_registration(
         let child = Uuid::new_v4();
         store.register_child_session(parent, child).await.unwrap();
         store.register_child_session(parent, child).await.unwrap();
-        expected.extend([parent, fork, child].map(|id| (id, native)));
+        expected.extend([parent, fork, child]);
     }
-    // Attaching an already routed child cannot rewrite its execution contract.
+    // A child already attached to another parent remains owned by that parent.
     assert!(
         store
-            .register_child_session(expected[0].0, expected[3].0)
+            .register_child_session(expected[0], expected[5])
             .await
             .is_err()
     );
@@ -82,13 +88,12 @@ async fn codex_harness_route_survives_restart_clear_fork_and_child_registration(
     let reopened = PostgresSessionStore::connect_with_pool_size(&scratch.url, 4)
         .await
         .unwrap();
-    for (session_id, native) in expected {
-        assert_eq!(
+    for session_id in expected {
+        assert!(
             reopened
                 .uses_native_codex_harness(session_id)
                 .await
-                .unwrap(),
-            native
+                .unwrap()
         );
     }
     scratch.discard().await;

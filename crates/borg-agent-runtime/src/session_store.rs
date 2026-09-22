@@ -1747,7 +1747,7 @@ pub trait SessionStore: Send + Sync {
         session_id: Uuid,
         query: SessionHistoryQuery,
     ) -> Result<SessionHistoryPage>;
-    /// Resolve, and durably pin, this session's Codex route.
+    /// Ensure this session uses Borg's Codex harness.
     async fn uses_native_codex_harness(&self, session_id: Uuid) -> Result<bool>;
     /// Resolve, and durably pin, this session's OpenCode route. The route is
     /// model-aware, so the launch model is passed for a fresh session.
