@@ -1662,6 +1662,9 @@ pub struct BorgTerminal {
     /// Terminal graphics protocol detected at startup (Kitty/Sixel/iTerm2);
     /// `None` keeps the half-block fallback drawn by the transcript.
     image_picker: Option<ImagePicker>,
+    /// Fitted previews survive viewport clipping while scrolling over an image.
+    image_fits: HashMap<(PathBuf, u16, u16), image::DynamicImage>,
+    image_scroll_settles_at: Option<Instant>,
     /// Encoded previews keyed by source path and tile size in cells.
     image_protocols: HashMap<(PathBuf, u16, u16, usize, u16), StatefulProtocol>,
     picker_hit_areas: Vec<(Rect, usize)>,
@@ -2887,6 +2890,8 @@ impl BorgTerminal {
             message_hit_areas: Vec::new(),
             link_hit_areas: Vec::new(),
             image_picker,
+            image_fits: HashMap::new(),
+            image_scroll_settles_at: None,
             image_protocols: HashMap::new(),
             picker_hit_areas: Vec::new(),
             hovered_tool: None,
@@ -6253,7 +6258,9 @@ impl BorgTerminal {
     }
 
     pub fn has_pending_scroll_frame(&self) -> bool {
-        self.scroll_motion.is_active()
+        self.image_scroll_settles_at
+            .is_some_and(|deadline| Instant::now() < deadline)
+            || self.scroll_motion.is_active()
             || self
                 .nested_scroll_motion
                 .as_ref()
@@ -6265,6 +6272,9 @@ impl BorgTerminal {
 
     fn queue_wheel_scroll(&mut self, lines: isize) {
         self.advance_nested_scroll_frame();
+        if self.image_picker.is_some() {
+            self.image_scroll_settles_at = Some(Instant::now() + Duration::from_millis(75));
+        }
         self.history_page_requested = lines > 0 && self.focused_tool.is_none();
         if lines > 0 {
             self.transcript.follow_tail = false;
@@ -8098,20 +8108,39 @@ impl BorgTerminal {
                             area.height,
                         );
                         if !self.image_protocols.contains_key(&key) {
+                            // A moving viewport would create a new encoded image at
+                            // every clipped row. Draw the text immediately and
+                            // encode the visible image once the motion settles.
+                            if self.scroll_motion.is_active()
+                                || self
+                                    .image_scroll_settles_at
+                                    .is_some_and(|deadline| Instant::now() < deadline)
+                            {
+                                continue;
+                            }
                             if self.image_protocols.len() >= 64 {
                                 self.image_protocols.clear();
                             }
-                            let Some(image) = attachments::load_preview_image(&slot.path) else {
-                                continue;
-                            };
                             let font = picker.font_size();
-                            // Keep the full preview scale when only part of it is visible.
-                            let fitted = Resize::Fit(None).resize(
-                                &image,
-                                font,
-                                ratatui::layout::Size::new(width, slot.rows as u16),
-                                None,
-                            );
+                            let fit_key = (slot.path.clone(), width, slot.rows as u16);
+                            if !self.image_fits.contains_key(&fit_key) {
+                                if self.image_fits.len() >= 8 {
+                                    self.image_fits.clear();
+                                }
+                                let Some(image) = attachments::load_preview_image(&slot.path)
+                                else {
+                                    continue;
+                                };
+                                // Fit once for the full tile, not once for each scroll clip.
+                                let fitted = Resize::Fit(None).resize(
+                                    &image,
+                                    font,
+                                    ratatui::layout::Size::new(width, slot.rows as u16),
+                                    None,
+                                );
+                                self.image_fits.insert(fit_key.clone(), fitted);
+                            }
+                            let fitted = &self.image_fits[&fit_key];
                             let visible = fitted.crop_imm(
                                 0,
                                 skipped_rows as u32 * u32::from(font.height),
