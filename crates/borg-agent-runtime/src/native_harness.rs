@@ -333,7 +333,13 @@ impl NativeHarness {
         model: Option<&str>,
         access: &crate::ModelAccessContext,
     ) -> Result<Self> {
-        let model = model.context("OpenCode native sessions require an explicit model")?;
+        // Name what is missing and how to supply it: a child spawned without a
+        // model lands here, and the spawning parent can act on this.
+        let model = model.context(
+            "OpenCode needs a model on Borg's harness and this session has none: pass \
+             model=<id> (for example opencode-go/deepseek-v4.1-flash) when spawning, or select a \
+             model for this session",
+        )?;
         let store = access
             .store
             .as_ref()
@@ -343,8 +349,9 @@ impl NativeHarness {
             .await?;
         anyhow::ensure!(
             native,
-            "this session retains its OpenCode compatibility route; start a new session to run \
-             {model} on Borg's harness"
+            "this session's OpenCode conversation belongs to the OpenCode CLI route, which \
+             cannot serve {model} on Borg's harness: spawn a child on a provider whose route \
+             is Borg's (for example open_code), or start a new session on Borg's harness"
         );
         let gateway = borg_provider::provider::opencode_model::gateway(model, access.session_id)?;
         Ok(Self {

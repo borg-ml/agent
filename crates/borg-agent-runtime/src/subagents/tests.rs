@@ -1741,6 +1741,156 @@ async fn spawn_tool_reuses_a_compatible_ready_worker_for_a_new_task() {
     scratch.discard().await;
 }
 
+/// A child spawned without a provider, or with a provider but no model, runs on
+/// the lane its parent is on *now* rather than the lane the parent session was
+/// launched on.
+///
+/// The failure this protects is a fan-out: a session that has switched provider
+/// or model since it started hands every child the lane it was launched with, so
+/// each child first fails on a route the parent is not even using
+/// ("this session retains its Codex compatibility route") and then fails again
+/// when the caller names a provider without a model ("OpenCode native sessions
+/// require an explicit model"). The caller cannot tell the two apart from the
+/// refusals, and every child dies before doing any work.
+#[tokio::test]
+async fn a_child_without_a_lane_inherits_the_parent_live_lane() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+
+    // The session was launched on Codex, and the host it runs on offers the
+    // provider it has since switched to.
+    let mut root_launch = launch();
+    root_launch.capabilities.multiplayer = false;
+    root_launch.cwd = directory.path().to_path_buf();
+    root_launch
+        .capabilities
+        .provider_capabilities
+        .push(crate::ProviderCapability {
+            provider: CodingProvider::OpenCode,
+            installed: true,
+            version: Some("test".to_string()),
+            authenticated: true,
+            auth_detail: Some("test credentials".to_string()),
+            auth_methods: vec![crate::ProviderAuthMethod::Subscription],
+            can_spawn: true,
+            usage: None,
+            billing: None,
+        });
+    // Its own turns have run on OpenCode since the switch: this is the lane the
+    // parent is really on, and the one its children must inherit.
+    store
+        .append(SessionEvent::new(
+            root,
+            0,
+            SessionEventKind::SessionConfigured {
+                cwd: directory.path().to_path_buf(),
+                provider: CodingProvider::OpenCode,
+                model: Some("opencode-go/deepseek-v4.1-flash".to_string()),
+                effort: None,
+                fast: false,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+            },
+        ))
+        .await
+        .unwrap();
+
+    let prompts = Arc::new(StdMutex::new(Vec::new()));
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        root_launch.clone(),
+        2,
+        Arc::new(RecordingPeerExecutor {
+            prompts: Arc::clone(&prompts),
+        }),
+        store,
+    )
+    .unwrap();
+
+    let defaulted = coordinator
+        .subagent_launch(&SpawnSubagent {
+            task_name: "defaulted".to_string(),
+            message: "Complete the bounded task.".to_string(),
+            provider: None,
+            model: None,
+            effort: None,
+        })
+        .await
+        .expect("a child with no lane named resolves the parent lane");
+    assert_ne!(
+        defaulted.provider, root_launch.provider,
+        "the launch lane is not the parent live lane"
+    );
+    assert_eq!(defaulted.provider, CodingProvider::OpenCode);
+    assert_eq!(
+        defaulted.model.as_deref(),
+        Some("opencode-go/deepseek-v4.1-flash")
+    );
+
+    // Naming the provider without a model resolves the model with it, rather
+    // than handing the child a provider it cannot run on.
+    let named = coordinator
+        .subagent_launch(&SpawnSubagent {
+            task_name: "named_provider".to_string(),
+            message: "Complete the bounded task.".to_string(),
+            provider: Some(CodingProvider::OpenCode),
+            model: None,
+            effort: None,
+        })
+        .await
+        .expect("a provider named without a model still resolves a lane");
+    assert_eq!(named.provider, CodingProvider::OpenCode);
+    assert_eq!(
+        named.model.as_deref(),
+        Some("opencode-go/deepseek-v4.1-flash")
+    );
+
+    // And the child actually runs: the whole path, through the tool the model
+    // calls, reaches a turn on that lane.
+    let spawned = coordinator
+        .call_tool(
+            "spawn_agent",
+            json!({
+                "action": "delegate task",
+                "task_name": "inherit_lane",
+                "message": "Complete the bounded task."
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spawned["provider"], "open_code", "{spawned}");
+    assert_eq!(
+        spawned["model"], "opencode-go/deepseek-v4.1-flash",
+        "{spawned}"
+    );
+    let child = Uuid::parse_str(spawned["session_id"].as_str().unwrap()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if coordinator.get(child).await.unwrap().status == SubagentStatus::Ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the defaulted child should take its turn");
+    assert!(
+        prompts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|prompt| prompt.contains("bounded task")),
+        "the child ran its assignment as a turn"
+    );
+
+    coordinator.stop_all().await;
+    scratch.discard().await;
+}
+
 #[tokio::test]
 async fn a_human_stopped_worker_is_not_reused_for_a_new_task() {
     // A human stop journals `Ready` in the same breath it latches the gate,

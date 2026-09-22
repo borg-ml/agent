@@ -3518,16 +3518,42 @@ impl SubagentCoordinator {
     }
 
     pub async fn spawn(&self, request: SpawnSubagent) -> Result<SubagentSnapshot> {
-        let launch = self.subagent_launch(&request)?;
+        let launch = self.subagent_launch(&request).await?;
         self.spawn_with_launch(&request.task_name, launch).await
     }
 
-    fn subagent_launch(&self, request: &SpawnSubagent) -> Result<LaunchSession> {
+    /// Resolve the lane a child runs on: the parent's own, unless the caller
+    /// names a different provider, model, or effort.
+    ///
+    /// The parent's lane is read from its *current* configuration rather than
+    /// from the launch this session started with. A session that has switched
+    /// provider or model since then would otherwise hand its children the lane
+    /// it was launched on, and a fan-out then dies on a route the spawning
+    /// parent is not even using, with a refusal it cannot act on.
+    async fn subagent_launch(&self, request: &SpawnSubagent) -> Result<LaunchSession> {
         let message = required_message(&request.message)?;
         let mut launch = self.root_launch.clone();
         launch.request_id = Uuid::new_v4();
         launch.initial_prompt = Some(message);
-        let parent_provider = launch.provider;
+        // A session that has not recorded a configuration yet, or a store that
+        // cannot answer, keeps the launch it was started with.
+        let parent = self
+            .store
+            .state(self.root_session_id)
+            .await
+            .ok()
+            .and_then(|state| state.configuration);
+        let parent_provider = parent
+            .as_ref()
+            .map_or(launch.provider, |parent| parent.provider);
+        let parent_model = parent
+            .as_ref()
+            .and_then(|parent| parent.model.clone())
+            .or_else(|| launch.model.clone());
+        let parent_effort = parent
+            .as_ref()
+            .and_then(|parent| parent.effort.clone())
+            .or_else(|| launch.effort.clone());
         launch.provider = request.provider.unwrap_or(parent_provider);
         ensure_provider_can_spawn(&launch, launch.provider)?;
         validate_subagent_overrides(
@@ -3535,25 +3561,41 @@ impl SubagentCoordinator {
             request.model.as_deref(),
             request.effort.as_deref(),
         )?;
-        if launch.provider != parent_provider {
-            launch.model = request
-                .model
-                .clone()
-                .or_else(|| default_model_for_cross_provider_peer(launch.provider));
+        // Provider and model are resolved together: a provider without the
+        // model that goes with it is not a lane, and every route that runs on
+        // Borg's harness refuses a turn that has none. The caller is therefore
+        // never asked to know the pair -- naming the provider is enough, and
+        // naming neither inherits both from the parent.
+        let inherits_parent = launch.provider == parent_provider;
+        let inherited_model = inherits_parent.then_some(parent_model).flatten();
+        launch.model = request
+            .model
+            .clone()
+            .or(inherited_model)
+            .or_else(|| default_model_for_cross_provider_peer(launch.provider))
+            .or_else(|| {
+                launch
+                    .provider
+                    .model_catalog()
+                    .map(|catalog| catalog.default_model.to_string())
+            });
+        if inherits_parent {
+            // The parent's live effort is what a worker inherits; the team
+            // policy preset still comes first, because it deliberately assigns
+            // workers low effort.
+            launch.effort = parent_effort;
+            launch.effort = effective_worker_effort(&launch, request.effort.clone());
+        } else {
             launch.effort = request
                 .effort
                 .clone()
                 .or_else(|| default_effort_for_cross_provider_peer(launch.provider));
-        } else {
-            if request.model.is_some() {
-                launch.model = request.model.clone();
-            }
-            launch.effort = effective_worker_effort(&launch, request.effort.clone());
         }
         anyhow::ensure!(
             !launch.provider.uses_native_harness() || launch.model.is_some(),
-            "{:?} peer requires an explicit model",
-            launch.provider
+            "{} children run on Borg's harness and need a model: pass model=<id> to \
+             spawn_agent, or leave provider and model unset to inherit this session's lane",
+            launch.provider.label()
         );
         launch.name = Some(canonical_task_name(&request.task_name)?);
         Ok(launch)
@@ -3574,7 +3616,7 @@ impl SubagentCoordinator {
         actor_session_id: Uuid,
         request: SpawnSubagent,
     ) -> Result<Value> {
-        let launch = self.subagent_launch(&request)?;
+        let launch = self.subagent_launch(&request).await?;
         let assignment_name = launch
             .name
             .as_deref()
