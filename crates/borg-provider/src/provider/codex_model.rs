@@ -192,7 +192,7 @@ impl SubscriptionAccess {
         }) {
             // The catalog gates model visibility on its client protocol version, not Borg releases.
             // Keep Borg identified by originator; no installed executable is needed.
-            let version = "0.154.0";
+            let version = "0.155.1";
             let rejected_token = self.token.clone();
             let auth_file = self.auth_file.clone();
             let response = self
