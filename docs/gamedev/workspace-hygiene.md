@@ -34,7 +34,8 @@ record in the Git common directory is only a handshake.
   `BORG_WORKTREE_AGENT_DISK_GIB`, and `BORG_WORKTREE_AGENT_RAM_GIB`;
   invalid/zero/overflowing overrides fail closed instead of silently falling
   back to defaults. Admission subtracts projected outputs and current reservations; `create`
-  counts other Borg-owned worktrees toward the same owner's disk cap. Lanes
+  counts Borg-owned trees across repositories in the configured root toward
+  the same owner's disk cap, and refuses admission if a disk-size probe fails. Lanes
   call `assess_budget(&AdmissionBudget, reserved_ram, reserved_disk)` at
   dispatch and queue with its explicit reason; this is an API and **not** a
   substitute for an actual lane supervisor maintaining cross-process
