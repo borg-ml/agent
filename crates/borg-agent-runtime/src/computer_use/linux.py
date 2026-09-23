@@ -617,20 +617,26 @@ class BorgDisplay:
             return configured
         return shutil.which("borg-display")
 
+    @staticmethod
+    def runtime_dir():
+        runtime = os.environ.get("XDG_RUNTIME_DIR")
+        if not runtime or not os.path.isdir(runtime):
+            raise ValueError("XDG_RUNTIME_DIR is required for the private display sockets")
+        return runtime
+
     def __init__(self, width, height, render_node=None):
         import select
-        import socket
-        import tempfile
-        binary, runtime = self.binary(), os.environ.get("XDG_RUNTIME_DIR")
+        binary, runtime = self.binary(), self.runtime_dir()
         if not binary:
             raise ValueError("borg-display is not installed; build it with `cargo install --path crates/borg-display` "
                              "or set BORG_DISPLAY_BIN")
-        if not runtime or not os.path.isdir(runtime):
-            raise ValueError("XDG_RUNTIME_DIR is required for the private display sockets")
         self.sweep(runtime)
-        self.directory = tempfile.mkdtemp(prefix="borg-display-", dir=runtime)
+        # display_id names both sockets so another session can attach_display to it.
+        self.display_id, self.owned = uuid.uuid4().hex[:16], True
+        self.directory = os.path.join(runtime, f"borg-display-{self.display_id}")
+        os.mkdir(self.directory, 0o700)
         control = os.path.join(self.directory, "control")
-        command = [binary, "--socket", "borg-private-" + uuid.uuid4().hex[:12], "--control", control,
+        command = [binary, "--socket", f"borg-private-{self.display_id}", "--control", control,
                    "--size", f"{width}x{height}"]
         if render_node:
             command += ["--render-node", str(render_node)]
@@ -652,6 +658,28 @@ class BorgDisplay:
             shutil.rmtree(self.directory, ignore_errors=True)
             raise ValueError("borg-display failed to start: " + (detail or "no readiness report"))
         self.wayland_display = ready["wayland_display"]
+        self.connect(control)
+
+    @classmethod
+    def attach(cls, display_id):
+        """Share a display another session started, as a non-owner: it keeps
+        running when this session detaches, and stops when its owner does."""
+        if not isinstance(display_id, str) or len(display_id) != 16 or \
+                any(c not in "0123456789abcdef" for c in display_id):
+            raise ValueError("display_id must be the 16-hex-digit display_id reported by the display's owner")
+        backend = cls.__new__(cls)
+        backend.display_id, backend.owned, backend.process = display_id, False, None
+        backend.directory = os.path.join(cls.runtime_dir(), f"borg-display-{display_id}")
+        backend.wayland_display = f"borg-private-{display_id}"
+        control = os.path.join(backend.directory, "control")
+        if not os.path.exists(control):
+            raise ValueError("no running private display has that display_id")
+        backend.connect(control)
+        return backend
+
+    def connect(self, control):
+        import socket
+        self.closed = False
         self.socket = socket.socket(socket.AF_UNIX)
         self.socket.settimeout(20)
         self.socket.connect(control)
@@ -671,7 +699,7 @@ class BorgDisplay:
                 pass
 
     def running(self):
-        return self.process.poll() is None
+        return not self.closed and (self.process is None or self.process.poll() is None)
 
     def call(self, request):
         if not self.running():
@@ -680,8 +708,10 @@ class BorgDisplay:
             self.socket.sendall(json.dumps(request).encode() + b"\n")
             line = self.reader.readline(8 * 1024 * 1024)
         except OSError as error:
+            self.closed = True
             raise ValueError(f"private display control failed: {error}")
         if not line:
+            self.closed = True
             raise ValueError("the private display exited; call start_display again")
         response = json.loads(line)
         if not response.get("ok"):
@@ -724,6 +754,9 @@ class BorgDisplay:
                 closeable.close()
             except OSError:
                 pass
+        self.closed = True
+        if not self.owned:
+            return
         try:
             self.process.wait(timeout=5)  # closing the owner socket makes it exit
         except subprocess.TimeoutExpired:
@@ -748,7 +781,7 @@ def display_status(info=None):
     info = info or PRIVATE.info()
     x11 = getattr(PRIVATE, "x11", None)
     return {"display": "private", "running": True, "backend": PRIVATE.name,
-            "wayland_display": PRIVATE.wayland_display,
+            "display_id": PRIVATE.display_id, "owner": PRIVATE.owned, "wayland_display": PRIVATE.wayland_display,
             "x11_display": x11[1] if x11 and x11[0].poll() is None else None,
             "width": info["width"], "height": info["height"], "gpu_accelerated": info["hardware"],
             "gl_renderer": info["gl_renderer"], "render_node": info["render_node"], "dmabuf": info["dmabuf"],
@@ -782,6 +815,17 @@ def start_display(args):
     return display_status()
 
 
+def attach_display(args):
+    global PRIVATE
+    if private_running():
+        raise ValueError("this session already uses a private display; stop_display before attaching to another")
+    if PRIVATE is not None:
+        stop_display()
+    PRIVATE = BorgDisplay.attach(args.get("display_id"))
+    PRIVATE.x11 = None
+    return display_status()
+
+
 def stop_display(_args=None):
     global PRIVATE
     terminated = sorted(PRIVATE_APPS)
@@ -793,7 +837,8 @@ def stop_display(_args=None):
     if backend.x11 is not None:
         stop_x11(backend.x11)
     backend.stop()
-    return {"display": "private", "running": False, "stopped": True, "terminated_pids": terminated}
+    return {"display": "private", "running": False, "stopped": backend.owned, "detached": not backend.owned,
+            "terminated_pids": terminated}
 
 
 def stop_x11(x11):
@@ -853,6 +898,9 @@ def launch(args):
     overrides = args.get("env") or {}
     if not isinstance(overrides, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in overrides.items()):
         raise ValueError("env must map strings to strings")
+    redirected = sorted(set(overrides) & set(SCRUBBED_DISPLAY_ENV))
+    if redirected:
+        raise ValueError(f"env may not set {', '.join(redirected)}: launched apps always run on the private display")
     cwd = args.get("cwd")
     if cwd is not None and (not isinstance(cwd, str) or not os.path.isdir(cwd)):
         raise ValueError("cwd must be an existing directory")
@@ -1101,7 +1149,7 @@ def private_capabilities():
               "render_nodes": sorted(glob.glob("/dev/dri/renderD*")),
               "x11": "xwayland-satellite" if shutil.which("xwayland-satellite") else None,
               "input_backend": "private seat through the display's control socket (never uinput or the user's focus)",
-              "operations": ["start_display", "stop_display", "launch", "list_windows", "observe", "screenshot",
+              "operations": ["start_display", "stop_display", "attach_display", "launch", "list_windows", "observe", "screenshot",
                              "click", "set_value", "type_text", "key", "pointer_click", "pointer_move", "scroll", "drag"],
               "gpu_accelerated": None,
               "gpu_note": "Measured when the display starts: true means hardware EGL on a render node plus dmabuf "
@@ -1132,6 +1180,8 @@ def dispatch(args):
         return start_display(args)
     if op == "stop_display":
         return stop_display()
+    if op == "attach_display":
+        return attach_display(args)
     if op == "launch":
         return launch(args)
     if display == "private" and op == "list_windows":
@@ -1153,7 +1203,7 @@ def dispatch(args):
                 limitations.append("On Wayland, element-targeted pointer_click/scroll are refused because AT-SPI extents are window-relative; use x,y from a desktop screenshot.")
         private = private_capabilities()
         if private["available"]:
-            operations += ["start_display", "stop_display", "launch"]
+            operations += ["start_display", "stop_display", "attach_display", "launch"]
             operations += [o for o in ("type_text", "key", "pointer_click", "scroll", "drag") if o not in operations]
             limitations.append("Prefer the private display (launch, then display=private / pd: window ids) for app testing: "
                                "its input and capture never touch the user's desktop. Desktop input goes to the user's focused window.")

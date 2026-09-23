@@ -1049,6 +1049,9 @@ class ComputerUse:
     def stop_display(self):
         return self("stop_display")
 
+    def attach_display(self, display_id):
+        return self("attach_display", display_id=display_id)
+
     def pointer_move(self, window_id, dx=0, dy=0, **options):
         return self("pointer_move", window_id=window_id, dx=dx, dy=dy, **options)
 
@@ -1352,6 +1355,7 @@ cua.screenshot = (scope, window_id, display) => cua("screenshot", {scope, ...(wi
 cua.launch = (argv, options = {}) => cua("launch", {...options, argv});
 cua.start_display = (options = {}) => cua("start_display", options);
 cua.stop_display = () => cua("stop_display");
+cua.attach_display = (display_id) => cua("attach_display", {display_id});
 cua.pointer_move = (window_id, dx = 0, dy = 0, options = {}) => cua("pointer_move", {...options, window_id, dx, dy});
 cua.observe = (window_id, options = {}) => cua("observe", {...options, window_id});
 cua.click = (window_id, element_id, observation_id, options = {}) => cua("click", {...options, window_id, element_id, observation_id});

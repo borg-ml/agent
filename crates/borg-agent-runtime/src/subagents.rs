@@ -202,6 +202,9 @@ pub struct AgentToolDispatcher {
     provider: CodingProvider,
     actor_session_id: Uuid,
     consultation_enabled: bool,
+    /// Only the top-level session may use the user's desktop through
+    /// computer_use; a sub-agent is confined to a private display.
+    desktop_enabled: bool,
     team_policy: Option<crate::TeamPolicy>,
     self_service: crate::self_service::SelfServiceContext,
     autonomy: Option<Arc<dyn crate::autonomy::AutonomyStore>>,
@@ -293,6 +296,7 @@ pub struct AgentToolServer {
     provider: CodingProvider,
     subagents_enabled: bool,
     consultation_enabled: bool,
+    desktop_enabled: bool,
     shared_work_enabled: bool,
     web_search_enabled: bool,
     watcher_yield_enabled: bool,
@@ -362,6 +366,7 @@ impl AgentToolServer {
         let provider = dispatcher.provider;
         let subagents_enabled = dispatcher.subagents_enabled;
         let consultation_enabled = dispatcher.consultation_enabled();
+        let desktop_enabled = dispatcher.desktop_enabled;
         let shared_work_enabled = dispatcher.shared_work.is_some();
         let web_search_enabled = dispatcher.web_search.is_some();
         let watcher_yield_enabled = dispatcher.watcher_yield_enabled;
@@ -393,6 +398,7 @@ impl AgentToolServer {
             provider,
             subagents_enabled,
             consultation_enabled,
+            desktop_enabled,
             shared_work_enabled,
             web_search_enabled,
             watcher_yield_enabled,
@@ -420,6 +426,7 @@ impl AgentToolServer {
         let provider = dispatcher.provider;
         let subagents_enabled = dispatcher.subagents_enabled;
         let consultation_enabled = dispatcher.consultation_enabled();
+        let desktop_enabled = dispatcher.desktop_enabled;
         let shared_work_enabled = dispatcher.shared_work.is_some();
         let web_search_enabled = dispatcher.web_search.is_some();
         let watcher_yield_enabled = dispatcher.watcher_yield_enabled;
@@ -453,6 +460,7 @@ impl AgentToolServer {
             provider,
             subagents_enabled,
             consultation_enabled,
+            desktop_enabled,
             shared_work_enabled,
             web_search_enabled,
             watcher_yield_enabled,
@@ -492,6 +500,10 @@ impl AgentToolServer {
             self.consultation_enabled.to_string(),
         );
         env.insert(
+            "BORG_AGENT_DESKTOP_ENABLED".to_string(),
+            self.desktop_enabled.to_string(),
+        );
+        env.insert(
             "BORG_AGENT_WATCHER_YIELD_ENABLED".to_string(),
             self.watcher_yield_enabled.to_string(),
         );
@@ -510,14 +522,18 @@ impl AgentToolServer {
             command: agent_mcp_executable()?.to_string_lossy().into_owned(),
             args: vec!["__agent-mcp".to_string()],
             env,
-            allowed_tools: agent_tool_specs_with_capabilities_and_consultation_and_search(
+            allowed_tools: agent_tool_specs_for_surface(
                 self.provider,
-                self.subagents_enabled,
-                self.shared_work_enabled,
+                ToolSurface {
+                    subagents: self.subagents_enabled,
+                    shared_work: self.shared_work_enabled,
+                    consultation: self.consultation_enabled,
+                    desktop: self.desktop_enabled,
+                    web_search: self.web_search_enabled,
+                    watcher_yield: self.watcher_yield_enabled,
+                    ..ToolSurface::director()
+                },
                 self.team_policy.as_ref(),
-                self.consultation_enabled,
-                self.web_search_enabled,
-                self.watcher_yield_enabled,
             )
             .into_iter()
             .filter_map(|tool| {
@@ -744,9 +760,11 @@ impl AgentToolDispatcher {
         permission: crate::PermissionMode,
         web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
     ) -> Self {
-        let consultation_enabled = subagents
+        let root_session = subagents
             .as_ref()
             .is_none_or(|team| team.is_root_session(actor_session_id));
+        let consultation_enabled = root_session;
+        let desktop_enabled = root_session;
         let runtime_root = cwd.clone();
         let execution_provider: Arc<dyn crate::ExecutionProvider> = Arc::new(
             crate::LocalExecutionProvider::with_process_manager(workflow_processes.clone()),
@@ -792,6 +810,7 @@ impl AgentToolDispatcher {
             provider,
             actor_session_id,
             consultation_enabled,
+            desktop_enabled,
             team_policy,
             self_service: crate::self_service::SelfServiceContext::new(cwd),
             autonomy,
@@ -940,6 +959,7 @@ impl AgentToolDispatcher {
             self.shared_work.is_some(),
             self.team_policy.as_ref(),
             self.consultation_enabled,
+            self.desktop_enabled,
             self.watcher_yield_enabled,
         );
         if self.web_search.is_some() {
@@ -1715,6 +1735,9 @@ impl AgentToolDispatcher {
                         || workflow_approved,
                     "computer use requires Full Access or explicit approval, including observation"
                 );
+                if !self.desktop_enabled {
+                    crate::computer_use::ensure_private_display_only(&arguments)?;
+                }
                 let cancel = workflow_cancel.unwrap_or_default();
                 tokio::select! {
                     biased;
@@ -6347,6 +6370,10 @@ pub struct ToolSurface {
     /// Interactive prompting of the human. A child reports back to its parent
     /// instead: sixty children must not interrogate one person.
     pub human_prompt: bool,
+    /// The user's desktop seat through computer_use (desktop windows and
+    /// screenshots, input that reaches the user's focus). A child's
+    /// computer_use is confined to its own private display instead.
+    pub desktop: bool,
     /// Parent steering and watcher lifecycle. A child managing the parent
     /// watcher set or yield on its behalf is a deadlock.
     pub parent_control: bool,
@@ -6363,17 +6390,19 @@ impl ToolSurface {
             shared_work: true,
             web_search: true,
             human_prompt: true,
+            desktop: true,
             parent_control: true,
             watcher_yield: false,
         }
     }
 
-    /// A child gets the director surface minus the three documented
-    /// exceptions. Anything else the director gains reaches children too.
+    /// A child gets the director surface minus the documented exceptions.
+    /// Anything else the director gains reaches children too.
     pub fn for_child(self) -> Self {
         Self {
             consultation: false,
             human_prompt: false,
+            desktop: false,
             parent_control: false,
             watcher_yield: false,
             ..self
@@ -6448,6 +6477,7 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
     shared_work_enabled: bool,
     team_policy: Option<&crate::TeamPolicy>,
     consultation_enabled: bool,
+    desktop_enabled: bool,
     watcher_yield_enabled: bool,
 ) -> Vec<Value> {
     agent_tool_specs_for_surface(
@@ -6456,6 +6486,7 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
             subagents: subagents_enabled,
             shared_work: shared_work_enabled,
             consultation: consultation_enabled,
+            desktop: desktop_enabled,
             watcher_yield: watcher_yield_enabled,
             // Search is added by the runtime when it has a search service, so
             // this surface never carries it implicitly.
@@ -6466,28 +6497,7 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
     )
 }
 
-fn agent_tool_specs_with_capabilities_and_consultation_and_search(
-    provider: CodingProvider,
-    subagents_enabled: bool,
-    shared_work_enabled: bool,
-    team_policy: Option<&crate::TeamPolicy>,
-    consultation_enabled: bool,
-    web_search_enabled: bool,
-    watcher_yield_enabled: bool,
-) -> Vec<Value> {
-    agent_tool_specs_for_surface(
-        provider,
-        ToolSurface {
-            subagents: subagents_enabled,
-            shared_work: shared_work_enabled,
-            consultation: consultation_enabled,
-            web_search: web_search_enabled,
-            watcher_yield: watcher_yield_enabled,
-            ..ToolSurface::director()
-        },
-        team_policy,
-    )
-}
+const SUB_AGENT_COMPUTER_USE: &str = "Sub-agent computer use, confined to a private headless GPU display; the user's desktop, windows and seat are refused. Requires Full Access or approval. launch (argv, optional env, cwd, x11=true for X11-only apps, wait, width/height on first start) starts your own display on demand, reused for your session and torn down with it; attach_display with a display_id from your parent shares its display instead (detaching kills only your apps). list_windows needs display=private and returns pd: window ids; observe, screenshot (display=private scope=desktop, or scope=window), click, set_value, type_text, key, pointer_click, pointer_move (relative dx, dy), scroll and drag all take a pd: window_id; pointer x,y are private display pixels (coordinate_space=window for window-relative). Acting on a consequential control (send, pay, delete, publish, security, credentials) is refused until the human has confirmed that exact action through your parent and you pass confirmed=true.";
 
 /// The one builder. Every surface, director or child, comes from here.
 pub fn agent_tool_specs_for_surface(
@@ -6534,11 +6544,12 @@ pub fn agent_tool_specs_for_surface(
     let mut specs = vec![
         tool(
             "computer_use",
-            "Native desktop access, including sensitive screen contents; requires Full Access or approval. Query capabilities first: it reports the platform backend (Linux AT-SPI2, macOS AXUIElement, Windows UI Automation), permissions and capture scopes. Operations: list_windows, bounded observe (optional since diff, optional screenshot=true with screenshot_scope), explicit screenshots (scope=desktop, or scope=window with window_id where supported), semantic click and set_value, and input injection where the backend supports it: type_text (text), key (keys like cmd+s), pointer_click (element_id+observation_id or x,y; button, count), scroll (dx, dy), drag (from_x, from_y, to_x, to_y). Injection raises the target window (a focus change). Prefer semantic click/set_value for element targeting; on Linux Wayland an element-targeted pointer_click/scroll fails with a clear error when the window origin is unknown, so fall back to click/set_value or to raw x,y read from a desktop screenshot. Actions require window_id, element_id and the latest observation_id; inspect returned state to verify effects. Acting on a consequential control (send, pay, delete, publish, security, credentials) is refused until the human has confirmed that exact action and you pass confirmed=true. No coordinate/clipboard fallback. Linux private display (prefer it for testing apps and games): launch (argv, optional env, cwd, x11=true for X11-only apps, wait seconds, width/height on first start) runs the app on a session-owned headless GPU display that is started on demand, reused, and torn down with the session; list_windows with display=private returns pd: window ids; every op then works on those ids (screenshot display=private scope=desktop for the whole display, or scope=window), and its input never touches the user's seat, pointer or focused window. Pointer x,y are private display pixels (coordinate_space=window for window-relative); pointer_move takes relative dx, dy. start_display/stop_display control the display explicitly; capabilities.private_display reports availability, GPU acceleration and limitations.",
+            "Native desktop access, including sensitive screen contents; requires Full Access or approval. Query capabilities first: it reports the platform backend (Linux AT-SPI2, macOS AXUIElement, Windows UI Automation), permissions and capture scopes. Operations: list_windows, bounded observe (optional since diff, optional screenshot=true with screenshot_scope), explicit screenshots (scope=desktop, or scope=window with window_id where supported), semantic click and set_value, and input injection where the backend supports it: type_text (text), key (keys like cmd+s), pointer_click (element_id+observation_id or x,y; button, count), scroll (dx, dy), drag (from_x, from_y, to_x, to_y). Injection raises the target window (a focus change). Prefer semantic click/set_value for element targeting; on Linux Wayland an element-targeted pointer_click/scroll fails with a clear error when the window origin is unknown, so fall back to click/set_value or to raw x,y read from a desktop screenshot. Actions require window_id, element_id and the latest observation_id; inspect returned state to verify effects. Acting on a consequential control (send, pay, delete, publish, security, credentials) is refused until the human has confirmed that exact action and you pass confirmed=true. No coordinate/clipboard fallback. Linux private display (prefer it for testing apps and games): launch (argv, optional env, cwd, x11=true for X11-only apps, wait seconds, width/height on first start) runs the app on a session-owned headless GPU display that is started on demand, reused, and torn down with the session; list_windows with display=private returns pd: window ids; every op then works on those ids (screenshot display=private scope=desktop for the whole display, or scope=window), and its input never touches the user's seat, pointer or focused window. Pointer x,y are private display pixels (coordinate_space=window for window-relative); pointer_move takes relative dx, dy. start_display/stop_display control the display explicitly, and its display_id lets a sub-agent attach_display to share it; capabilities.private_display reports availability, GPU acceleration and limitations.",
             json!({
                 "type": "object",
                 "properties": {
-                    "op": {"type": "string", "enum": ["capabilities", "list_windows", "observe", "screenshot", "click", "set_value", "type_text", "key", "pointer_click", "pointer_move", "scroll", "drag", "launch", "start_display", "stop_display"]},
+                    "op": {"type": "string", "enum": ["capabilities", "list_windows", "observe", "screenshot", "click", "set_value", "type_text", "key", "pointer_click", "pointer_move", "scroll", "drag", "launch", "start_display", "stop_display", "attach_display"]},
+                    "display_id": {"type": "string", "description": "attach_display: the display_id another session's private display reports (share a parent's display)."},
                     "display": {"type": "string", "enum": ["desktop", "private"], "description": "Target the user's desktop (default) or this session's private display; pd: window ids imply private."},
                     "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 256, "description": "launch: program and arguments, run on the private display."},
                     "env": {"type": "object", "additionalProperties": {"type": "string"}},
@@ -7015,12 +7026,15 @@ pub fn agent_tool_specs_for_surface(
     // person to decide; a child reports to its parent instead, or sixty
     // children interrogate one human.
     if !surface.human_prompt {
-        specs.retain(|spec| {
-            !matches!(
-                spec["name"].as_str(),
-                Some("computer_use" | "update_agent_settings")
-            )
-        });
+        specs.retain(|spec| spec["name"] != "update_agent_settings");
+    }
+    // Exception: the user's desktop. A child's computer_use drives only its
+    // own private display (or one it attaches to); the dispatcher enforces it.
+    if !surface.desktop
+        && let Some(spec) = specs.iter_mut().find(|spec| spec["name"] == "computer_use")
+    {
+        spec["description"] = Value::String(SUB_AGENT_COMPUTER_USE.to_string());
+        spec["inputSchema"]["properties"]["display"]["enum"] = json!(["private"]);
     }
     // Exception: the parent yield, steering and watcher lifecycle. A child
     // holding the parent yield on its behalf is a deadlock.
