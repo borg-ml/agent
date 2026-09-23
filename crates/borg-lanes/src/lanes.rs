@@ -285,6 +285,13 @@ pub struct LaneRecord {
     /// service lease.
     #[serde(default)]
     pub restart_barrier: bool,
+    /// A service lease's or restart barrier's owning supervisor: its start
+    /// time (with `supervisor_pid`) and the service unit cgroup it and its
+    /// backends run in, so recovery can prove the owner gone and release it.
+    #[serde(default)]
+    pub owner_start_ticks: Option<u64>,
+    #[serde(default)]
+    pub owner_cgroup: Option<String>,
     /// Only a Granted row reserves service RAM and filesystem space.
     #[serde(default)]
     pub service_admission: Option<AdmissionBudget>,
@@ -524,6 +531,9 @@ impl LaneStore {
         let service_id = service_id.to_owned();
         let mut held: Option<File> = None;
         let lease = self.locked(|state| {
+            // A predecessor killed with its backends (SIGKILL, OOM) must not
+            // hold this service's resources, or its restart barrier, forever.
+            self.release_dead_service_claims(state, false)?;
             // Preview a fresh position WITHOUT creating a new lock inode for
             // each denied retry. Only a successful attempt gets a new ticket.
             if let Some(index) = state.records.iter().position(|r| {
@@ -564,6 +574,9 @@ impl LaneStore {
                 .context("service ticket missing")?;
             entry.service_lease = true;
             entry.service_admission = Some(budget.clone());
+            entry.supervisor_pid = entry.request.holder.host_pid;
+            entry.owner_start_ticks = entry.supervisor_pid.and_then(proc_start_ticks);
+            entry.owner_cgroup = entry.supervisor_pid.and_then(service_unit_cgroup);
             if let Some(reason) = reason {
                 entry.wait_reason = Some(reason.clone());
                 entry.state = TicketState::Cancelled { reason };
@@ -579,6 +592,81 @@ impl LaneStore {
                 .insert(lease.ticket.id, held.context("service FD missing")?);
         }
         Ok(lease)
+    }
+
+    /// Release every service lease and restart barrier whose owning service
+    /// supervisor is provably gone (see `claim_owner_gone`): a Granted one
+    /// whose lock is free ends Finished, and one that recovery quarantined
+    /// (it could not prove the owner gone then) is un-quarantined. A claim
+    /// whose owner may still run is left as it is (fail closed). With
+    /// `dry_run` only the report is returned. Runs under the journal lock.
+    fn release_dead_service_claims(
+        &self,
+        state: &mut Journal,
+        dry_run: bool,
+    ) -> Result<Vec<(Uuid, String)>> {
+        let mut actions = Vec::new();
+        for row in state
+            .records
+            .iter_mut()
+            .filter(|r| r.restart_barrier || r.service_lease)
+        {
+            let granted = matches!(row.state, TicketState::Granted(_));
+            let quarantined = row.quarantined && matches!(row.state, TicketState::Finished);
+            if !granted && !quarantined {
+                continue;
+            }
+            if granted {
+                // A live owner holds this lock (nonblocking probe; the
+                // journal lock is a different file).
+                let lock = stable_file(&self.ticket_path(row.ticket.id))?;
+                match lock.try_lock_shared() {
+                    Ok(()) => (),
+                    Err(std::fs::TryLockError::WouldBlock) => continue,
+                    Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+                }
+            }
+            let Some(proof) = claim_owner_gone(row) else {
+                continue;
+            };
+            let kind = if row.restart_barrier {
+                "restart barrier"
+            } else {
+                "service lease"
+            };
+            let note = format!(
+                "{kind} {} released: its owner is gone ({proof})",
+                row.ticket.id
+            );
+            if dry_run {
+                actions.push((
+                    row.ticket.id,
+                    format!(
+                        "{kind} {}: would release, its owner is gone ({proof})",
+                        row.ticket.id
+                    ),
+                ));
+                continue;
+            }
+            actions.push((row.ticket.id, note.clone()));
+            if granted {
+                row.state = TicketState::Finished;
+                row.finished_ms = Some(milliseconds());
+            }
+            row.quarantined = false;
+            row.evidence = Some(match row.evidence.take() {
+                Some(earlier) => format!("{earlier}; {note}"),
+                None => note.clone(),
+            });
+            let entry = serde_json::json!({"time_ms": milliseconds(), "job": row.ticket.id,
+                "reason": note, "evidence": &*row});
+            let mut file = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(self.root.join("recovery.jsonl"))?;
+            writeln!(file, "{entry}")?;
+        }
+        Ok(actions)
     }
 
     /// Nonblocking, all-or-nothing exclusive claim on a service restart's
@@ -608,6 +696,9 @@ impl LaneStore {
         let mut held: Option<File> = None;
         let outcome = self.locked(|state| {
             Self::validate(&request, &state.capacities)?;
+            // A barrier left by a supervisor that is provably gone (killed
+            // mid-restart) must not defer the next one forever.
+            self.release_dead_service_claims(state, false)?;
             let blocker = state.records.iter().find_map(|record| {
                 let how = if record.quarantined {
                     "quarantined by"
@@ -644,6 +735,8 @@ impl LaneStore {
                 .context("restart barrier ticket missing")?;
             entry.restart_barrier = true;
             entry.supervisor_pid = entry.request.holder.host_pid;
+            entry.owner_start_ticks = entry.supervisor_pid.and_then(proc_start_ticks);
+            entry.owner_cgroup = entry.supervisor_pid.and_then(service_unit_cgroup);
             Ok(RestartBarrier::Held(grant_entry(entry)))
         })?;
         if let RestartBarrier::Held(lease) = &outcome {
@@ -876,6 +969,8 @@ impl LaneStore {
             quarantined: false,
             service_lease: false,
             restart_barrier: false,
+            owner_start_ticks: None,
+            owner_cgroup: None,
             service_admission: None,
             preparing_since_ms: None,
             yield_services: vec![],
@@ -1630,6 +1725,60 @@ pub(crate) fn key_label(key: &ResourceKey) -> String {
         ResourceScope::Host => format!("{} (host)", key.name),
         ResourceScope::Project(path) => format!("{} (project {})", key.name, path.display()),
         ResourceScope::Worktree(path) => format!("{} (worktree {})", key.name, path.display()),
+    }
+}
+
+/// Why the service supervisor owning a service lease or restart barrier,
+/// and every backend it started, are certainly gone; None while they might
+/// still run. With a recorded service unit cgroup (the supervisor and its
+/// backends all run in it), the cgroup must be gone or empty. Without one,
+/// the supervisor pid must be gone or name another process: a different
+/// start time, or, for a claim recorded without one (an older binary), a
+/// process that is not a supervisor of the claim's service.
+fn claim_owner_gone(row: &LaneRecord) -> Option<String> {
+    if let Some(cgroup) = &row.owner_cgroup {
+        return (!cgroup_populated(cgroup)).then(|| format!("unit cgroup {cgroup} is empty"));
+    }
+    let pid = row.supervisor_pid.or(row.request.holder.host_pid)?;
+    let Some(ticks) = proc_start_ticks(pid) else {
+        return Some(format!("supervisor pid {pid} has exited"));
+    };
+    match row.owner_start_ticks {
+        Some(recorded) => (recorded != ticks).then(|| format!("pid {pid} is now another process")),
+        None => {
+            let purpose = &row.request.holder.purpose;
+            let service = purpose
+                .strip_prefix("restart:")
+                .or_else(|| purpose.strip_prefix("service:"))
+                .unwrap_or_default();
+            let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            let args: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
+            let supervisor =
+                args.contains(&b"supervise".as_slice()) && args.contains(&service.as_bytes());
+            (!supervisor).then(|| format!("pid {pid} is not a supervisor of {service}"))
+        }
+    }
+}
+
+/// The cgroup of `pid` when it is a service supervisor's own systemd unit
+/// (`borg-service-*.service`); None for any other process.
+fn service_unit_cgroup(pid: u32) -> Option<String> {
+    let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let path = text.lines().find_map(|line| line.strip_prefix("0::"))?;
+    let unit = path.rsplit('/').next()?;
+    (unit.starts_with("borg-service-") && unit.ends_with(".service")).then(|| path.to_owned())
+}
+
+/// Whether a cgroup v2 group, or any group below it, still has a process.
+/// A group that no longer exists is empty; one that cannot be read counts
+/// as populated.
+fn cgroup_populated(path: &str) -> bool {
+    let events = Path::new("/sys/fs/cgroup")
+        .join(path.trim_start_matches('/'))
+        .join("cgroup.events");
+    match fs::read_to_string(events) {
+        Ok(text) => !text.lines().any(|line| line.trim() == "populated 0"),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     }
 }
 
@@ -2888,6 +3037,13 @@ impl LaneStore {
                     .spawn();
             }
         }
+        let released = if dry_run {
+            self.reading(|state| self.release_dead_service_claims(&mut state.clone(), true))?
+        } else {
+            self.locked(|state| self.release_dead_service_claims(state, false))?
+        };
+        let releasable: Vec<Uuid> = released.iter().map(|(id, _)| *id).collect();
+        actions.extend(released.into_iter().map(|(_, action)| action));
         // Avoid nested metadata locks: test each kernel lock before journalling.
         for record in self.snapshot()? {
             // A job that ended without starting its finish hook (its ender
@@ -2931,6 +3087,9 @@ impl LaneStore {
             if !active {
                 continue;
             }
+            if releasable.contains(&record.ticket.id) {
+                continue; // A dry run: the release above would end it.
+            }
             let note = format!(
                 "{} {} lost supervisor pid {:?} while {:?}",
                 if record.restart_barrier {
@@ -2946,9 +3105,10 @@ impl LaneStore {
             if dry_run {
                 continue;
             }
-            // A service lost mid-restart may have left its old or new
-            // backend running with nobody to stop it: without proof, fail
-            // closed rather than admit a build of its tree beside it.
+            // A service claim whose owner is not provably gone (those were
+            // released above) may still have a backend running with nobody
+            // to stop it: quarantine its keys until a later recover, or the
+            // next claim, can prove the owner gone and lift it.
             let mut verified = !record.service_lease && !record.restart_barrier;
             if let Some(JobHandle {
                 state: JobState::Running { scope },
@@ -3201,6 +3361,8 @@ mod tests {
             quarantined: false,
             service_lease: false,
             restart_barrier: false,
+            owner_start_ticks: None,
+            owner_cgroup: None,
             service_admission: None,
             preparing_since_ms: None,
             yield_services: vec![],
@@ -5311,58 +5473,145 @@ mod tests {
         );
     }
 
-    /// Failure mode: a service supervisor lost mid-restart (its old or new
-    /// backend maybe still running) letting a build of the tree start.
+    /// Failure mode: a service supervisor lost mid-restart (SIGKILL, OOM,
+    /// `systemctl stop`) leaving its restart barrier, or its own service
+    /// lease, quarantined until a reboot; or either released while the
+    /// owner, or a backend it started, may still run.
     #[test]
-    fn orphaned_restart_barrier_quarantines_its_keys() {
+    fn orphaned_service_claims_are_released_once_their_owner_is_gone() {
         let dir = tempfile::tempdir().unwrap();
+        let set_owner = |store: &LaneStore, id: Uuid, pid: u32, ticks, cgroup| {
+            store
+                .locked(|state| {
+                    let row = state
+                        .records
+                        .iter_mut()
+                        .find(|r| r.ticket.id == id)
+                        .unwrap();
+                    row.supervisor_pid = Some(pid);
+                    row.owner_start_ticks = ticks;
+                    row.owner_cgroup = cgroup;
+                    Ok(())
+                })
+                .unwrap();
+        };
+        let exited = || {
+            let mut child = Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        };
+        let me = std::process::id();
+        let my_ticks = proc_start_ticks(me).unwrap();
+        let my_cgroup = fs::read_to_string("/proc/self/cgroup")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap()
+            .to_owned();
+        let has = |actions: &[String], prefix: &str| {
+            actions.iter().any(|action| action.starts_with(prefix))
+        };
+
         let store = LaneStore::new(dir.path()).unwrap();
         let barrier = held_barrier(
             store
                 .try_acquire_restart_barrier(barrier_request(&["main-build"]))
                 .unwrap(),
         );
-        // While its owner lives, recovery leaves it alone.
+        let id = barrier.ticket.id;
+        set_owner(&store, id, me, Some(my_ticks), None);
+        // While its owner holds the lock, recovery leaves it alone.
         assert!(store.recover(false).unwrap().is_empty());
         let build = store
             .enqueue_lease(exclusive_lease(&["main-build"]))
             .unwrap();
-        // The supervisor dies: its lock FD closes with no journal release.
+        // The lock closes without a journal release but the owner process
+        // lives: nothing proves its backend gone, so the keys are
+        // quarantined.
         drop(store);
-        let recovered = LaneStore::new(dir.path()).unwrap();
-        let actions = recovered.recover(false).unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let actions = store.recover(false).unwrap();
         assert!(
-            actions.iter().any(|action| action.starts_with(&format!(
-                "restart barrier {} lost supervisor",
-                barrier.ticket.id
-            ))),
+            has(&actions, &format!("restart barrier {id} lost supervisor")),
             "{actions:?}"
         );
-        let row = recovered.record(barrier.ticket.id).unwrap();
+        assert!(store.record(id).unwrap().quarantined);
+        assert!(store.try_grant(build.id).unwrap().is_none());
+        // The supervisor is gone but its unit cgroup still has a process (a
+        // backend it started): still quarantined.
+        set_owner(&store, id, exited(), None, Some(my_cgroup));
+        store.recover(false).unwrap();
+        assert!(store.record(id).unwrap().quarantined);
+        assert!(store.try_grant(build.id).unwrap().is_none());
+        // Provably gone (its pid exited, no cgroup recorded): a dry run
+        // reports it, recover lifts the quarantine and the build is admitted.
+        set_owner(&store, id, exited(), Some(my_ticks), None);
+        let planned = store.recover(true).unwrap();
         assert!(
-            row.quarantined && matches!(row.state, TicketState::Finished),
-            "orphaned barrier not quarantined: {row:?}"
+            has(&planned, &format!("restart barrier {id}: would release")),
+            "{planned:?}"
         );
-        assert!(recovered.try_grant(build.id).unwrap().is_none());
+        assert!(store.record(id).unwrap().quarantined);
+        let actions = store.recover(false).unwrap();
         assert!(
-            recovered
-                .record(build.id)
-                .unwrap()
-                .wait_reason
-                .unwrap()
-                .contains("quarantined")
+            has(&actions, &format!("restart barrier {id} released")),
+            "{actions:?}"
         );
-        let reason = deferred_barrier(
-            recovered
+        let row = store.record(id).unwrap();
+        assert!(!row.quarantined && row.evidence.unwrap().contains("has exited"));
+        assert!(store.try_grant(build.id).unwrap().is_some());
+        store.finish(build.id, 0, "test").unwrap();
+
+        // The next barrier claim (the next supervisor start) releases a
+        // Granted orphan itself: here its pid now names another process.
+        let orphan = held_barrier(
+            store
                 .try_acquire_restart_barrier(barrier_request(&["main-build"]))
                 .unwrap(),
         );
-        assert_eq!(
-            reason,
-            format!(
-                "main-build (host) quarantined by ticket {}",
-                barrier.ticket.id
-            )
+        set_owner(&store, orphan.ticket.id, me, Some(my_ticks + 1), None);
+        drop(store);
+        let store = LaneStore::new(dir.path()).unwrap();
+        let next = held_barrier(
+            store
+                .try_acquire_restart_barrier(barrier_request(&["main-build"]))
+                .unwrap(),
         );
+        let row = store.record(orphan.ticket.id).unwrap();
+        assert!(
+            matches!(row.state, TicketState::Finished)
+                && row.evidence.unwrap().contains("another process")
+        );
+        store.release_lease(&next).unwrap();
+
+        // A dead supervisor's own service lease is released when the next
+        // supervisor claims it; without that, one slot stays taken forever.
+        let request = LeaseRequest {
+            resources: vec![resource("project", Access::Shared { slots: 1 })],
+            holder: service_holder(),
+            queue_timeout_ms: None,
+        };
+        let budget = test_budget(dir.path());
+        let lease = store
+            .try_acquire_service(request.clone(), &budget)
+            .unwrap()
+            .unwrap();
+        // Recorded by a binary without start times: the pid (this test)
+        // is not a supervisor of the service.
+        set_owner(&store, lease.ticket.id, me, None, None);
+        drop(store);
+        let store = LaneStore::new(dir.path()).unwrap();
+        let successor = store.try_acquire_service(request, &budget).unwrap();
+        assert!(
+            successor.is_some(),
+            "the dead supervisor's lease blocked it"
+        );
+        let row = store.record(lease.ticket.id).unwrap();
+        assert!(
+            matches!(row.state, TicketState::Finished)
+                && row.evidence.unwrap().contains("not a supervisor of test"),
+        );
+        store.release_lease(&successor.unwrap()).unwrap();
     }
 }
