@@ -29,12 +29,26 @@ record in the Git common directory is only a handshake.
 - `borg worktree budget` checks `statvfs` on the output filesystem and Linux
   `MemAvailable`. Default safety reserves: **60 GiB free disk**, **8 GiB
   MemAvailable**, **32 GiB per agent on disk**, **16 GiB per agent RAM**.
-  Admission subtracts projected outputs and current reservations; `create`
-  counts other Borg-owned worktrees toward the same owner's disk cap. Lanes
+  Override with positive integer GiB values in
+  `BORG_WORKTREE_DISK_RESERVE_GIB`, `BORG_WORKTREE_RAM_RESERVE_GIB`,
+  `BORG_WORKTREE_AGENT_DISK_GIB`, and `BORG_WORKTREE_AGENT_RAM_GIB`;
+  invalid/zero/overflowing overrides fail closed instead of silently falling
+  back to defaults. Admission subtracts projected outputs and current reservations; `create`
+  counts Borg-owned trees across repositories in the configured root toward
+  the same owner's disk cap, and refuses admission if a disk-size probe fails. Lanes
   call `assess_budget(&AdmissionBudget, reserved_ram, reserved_disk)` at
-  dispatch and queue with its explicit reason; this is an API and **not** a
+  dispatch and queue with its explicit reason. For a per-owner job limit,
+  `hygiene::agent_budget_reason` compares active/Preparing reservations and
+  new requested RAM/disk against the configured agent caps under the same
+  dispatch lock. `hygiene::owned_root_usage` counts this agent's existing
+  Borg-managed worktrees in the configured root. **Per-agent job admission is
+  not yet enforced until the lane dispatcher calls this helper and its tests
+  exercise multiple jobs owned by one session.** This is an API and **not** a
   substitute for an actual lane supervisor maintaining cross-process
-  reservations.
+  reservations. For concurrent builds in distinct directories on the same
+  volume, use `workspace::same_filesystem(path_a, path_b)` to sum disk
+  reservations by device rather than comparing `disk_path` strings. The lane
+  dispatch code must invoke this under its admission lock.
 - A session can create a Borg command watch over `borg worktree --project P
   monitor --interval-secs 60` with `notify_on=match` and pattern
   `workspace pressure`. The timer emits only on pressure; it is not an

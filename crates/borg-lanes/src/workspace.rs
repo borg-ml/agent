@@ -48,6 +48,35 @@ pub fn assess_budget(
     })
 }
 
+/// Jobs targeting different directories on the same filesystem compete for the
+/// same free bytes. Compare devices, not path strings, when summing lane disk
+/// reservations before calling `assess_budget`.
+#[cfg(unix)]
+pub fn same_filesystem(left: &Path, right: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::metadata(left)?.dev() == std::fs::metadata(right)?.dev())
+}
+
+#[cfg(not(unix))]
+pub fn same_filesystem(_left: &Path, _right: &Path) -> Result<bool> {
+    anyhow::bail!("filesystem identity is unavailable on this platform")
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn worktrees_on_same_device_share_reservations() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let a = root.path().join("a");
+        let b = root.path().join("b");
+        std::fs::create_dir_all(&a)?;
+        std::fs::create_dir_all(&b)?;
+        assert!(same_filesystem(&a, &b)?);
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorktreeSpec {
     pub project: PathBuf,

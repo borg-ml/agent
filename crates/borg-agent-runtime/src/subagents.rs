@@ -8913,7 +8913,7 @@ impl AgentToolDispatcher {
                 exited.push(id)
             }
         }
-        let budget = hygiene::WorkspaceBudgets::default();
+        let budget = hygiene::WorkspaceBudgets::from_env()?;
         let value = match args.op.as_str() {
             "create" => {
                 let task = args.task.context("task required")?;
