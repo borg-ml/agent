@@ -272,3 +272,38 @@ failing-active-hook rollback, and two-key per-resource grace probes remain
 not enable model-facing exclusive from the SHA `77c657df…` table.
 
 These are **optional owner-branch results only**: independent review and an integrated-binary rerun are required before enabling model-facing exclusive. The current v0 integrated bridge source instead rejects model-facing exclusive and instructs coordinated manual `borg lane run --exclusive`. Neither the synthetic fake-service results nor the coordinator-lease native experiment establish real Unreal editor parity or stock PostgreSQL multi-client lease support. Logs: `/tmp/gd-bench-v01-documented-atomic-*.log`; successful temp service roots and owned units were cleaned by the probe.
+
+### v0.1 integrated CLI gates (`gamedev/v01-main`, synthetic; 2026-09-23)
+
+Source `gamedev/v01-main @e7b64d8f` (main `bd085302` + lanes-v01, services-shared,
+landscape, bench probes). Crate gates on that source: fmt, strict workspace
+Clippy, `borg-lanes` 40/40, `borg-agent-runtime` 903 passed/11 ignored (134
+Postgres), `borg` 240 passed/3 ignored. One dev-profile `borg 0.10.0` build,
+pinned read-only at `/tmp/gd-v01/borg-e7b64d8f`, SHA-256
+`ab296a7535a67446729a84cf9abb318c445b17e15584432a29f1993820ca8617`. The runner
+(`/tmp/gd-bench-run-v01main.sh`) archived the scripts at that ref and copied the
+binary. It checked the SHA before and after every probe and ran all of them
+(no stop on first failure). The archived Python tests passed 6/6. Service
+probes used `BORG_BENCH_REQUIRE_SCOPE=1`; the shared-client probes used the
+user-systemd manager.
+
+| gate | result on pinned `e7b64d8f` |
+| --- | --- |
+| v0 set: `--atomic`, `--atomic-descendant`, `--atomic-post-hook`, `--atomic-post-hook-fail`, `--atomic-failed-resume`, `--atomic-unhealthy-resume`, `--atomic-project-alias`, `--check-service-disk-budget`, `--check-running-join`, `--check-budget` | **PASS** (10/10) |
+| `--agents 6 --jobs 8 --scale 200` | **PASS**; 48 requests, 44 launches/4 pending joins, 0 failures/OOM, 9.70 s wall, wait p50/p95 6.58/7.04 s, Jain 0.832, peak 11/20 GiB |
+| `--burst-fairness` | **INFORMATIONAL**; wait p50/p95 2.47/8.16 s |
+| `--atomic-own-lease` | **PASS**; holder's own client did not block |
+| `--atomic-foreign-lease` | **PASS**; Preparing with both services Healthy until release |
+| `--atomic-foreign-grace` | **PASS**; 5 s grace expired, then yield/resume |
+| `--atomic-foreign-indefinite` | **PASS**; grace 0 held for 2 s bounded observation |
+| `--atomic-late-lease` (idle-first) | **PASS**; late grant and renewal refused, idle B's active hook **not** run |
+| `--atomic-active-hook-rollback` | **PASS**; exit 42 surfaced, no ghost client, backend unchanged |
+| `--atomic-per-resource-grace` | **PASS**; second-key grace 0 held 7 s past the job-wide 5 s |
+| `gamedev_shared_service_probe.py` | **PASS**; two foreign shared clients held the exclusive in Preparing (5 s grace), then both were restored before grant |
+| `… --restore-failure-recovery` | **PASS**; failed restore fenced Stop/Yield; the failed job's evidence named owner and lease; owner release recovered |
+
+This closes the "unverified" idle-hook, rollback and per-resource grace items
+above for this integrated binary. It is still synthetic fake-service evidence,
+not Unreal parity. Model-facing exclusives stay disabled in the bridge. Logs:
+`/tmp/gd-bench-v01main-d2uvk7u3/` (one log per gate), runner console
+`/tmp/gd-bench-v01main-e7b64d8f-matrix.log` ending in `V01 INTEGRATED CLI PASS`.
