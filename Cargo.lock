@@ -1156,6 +1156,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "borg-lanes"
+version = "0.9.5"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+ "uuid",
+]
+
+[[package]]
 name = "borg-provider"
 version = "0.10.0"
 dependencies = [

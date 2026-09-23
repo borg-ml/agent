@@ -11,6 +11,7 @@ members = [
     "crates/borg-gui",
     "crates/borg-cli",
     "crates/borg-display",
+    "crates/borg-lanes",
 ]
 default-members = [
     "crates/borg-core",
@@ -23,6 +24,7 @@ default-members = [
     "crates/borg-tui",
     "crates/borg-cli",
     "crates/borg-display",
+    "crates/borg-lanes",
 ]
 resolver = "2"
 
