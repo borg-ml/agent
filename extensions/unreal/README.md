@@ -82,10 +82,13 @@ passed a canonical Project service handoff; the final integrated binary must
 repeat this gate. The adapter canonicalizes its project path and rejects
 conflicting UBT project arguments. On separate pinned binaries, targeted
 core probes also passed failing post-hook quarantine (`011c4ba9…`),
-stopped-supervisor resume retry and same-device disk capacity (`61ece6c1…`).
-ACK-then-unhealthy recovery, model MCP owner fencing, final integrated-binary
-regression and real Unreal parity remain blockers; these targeted passes do
-not enable non-spec exclusive runs.
+stopped-supervisor and ACK-then-unhealthy resume recovery plus same-device
+disk capacity (`61ece6c1…`). **Foreign client leases do not atomically delay
+exclusive preemption:** the selected v0 model MCP policy rejects all
+model-facing exclusive templates and disables model-facing restart without an
+atomic caller-lease check. Session-derived model MCP owner fencing,
+final integrated-binary regression and real Unreal parity remain blockers.
+These targeted passes do not enable non-spec exclusive runs.
 Do not use the live shared project's editor or its port.
 
 The stock
@@ -97,9 +100,10 @@ owner-scoped PIE/cvars/camera/HUD state.
 
 `run commandlet|import|verify|exclusive --spec -- COMMAND ARGS...` generates a
 core exclusive job template. **Non-spec runs always fail closed:** the adapter
-has not wired the core's now-proven no-hook auto-yield/grant path into verified
-post-hook resume, editor owner coordination and real Unreal parity. A plain
-job submission is not a safe substitute. Never run an exclusive commandlet
+must not preempt foreign editor clients without an atomic lease policy,
+owner coordination and real Unreal parity. Core fake-service handoff tests do
+not resolve this. A plain job submission is not a safe substitute; model-facing
+exclusive templates are disabled for v0. Never run an exclusive commandlet
 against an active editor or infer safety from a JSON spec alone.
 
 Validate without UE using `python3 -m unittest discover -s extensions/unreal/tests -v`.
