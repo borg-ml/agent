@@ -1060,7 +1060,13 @@ pub struct ClaudeSubscriptionPool {
     inner: Arc<Mutex<ClaudeSubscriptionPoolState>>,
 }
 
-type ClaudeCostTracker = Arc<StdMutex<Option<u64>>>;
+type ClaudeCostTracker = Arc<StdMutex<ClaudeCostState>>;
+
+#[derive(Default)]
+struct ClaudeCostState {
+    session_id: Option<String>,
+    total_microusd: Option<u64>,
+}
 
 #[derive(Default)]
 struct ClaudeSubscriptionPoolState {
@@ -1287,10 +1293,7 @@ async fn run_claude_subscription_process_pooled(
         state.lifecycle_key = Some(lifecycle_key.clone());
         state.command = Some(command);
         state.model_effort = Some((request.model.clone(), request.effort.clone()));
-        *state
-            .cost_tracker
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        reset_claude_cost_tracker(&state.cost_tracker);
         state._auth_home = auth_home;
         state._mcp_setup = mcp_setup;
     } else if state.model_effort.as_ref() != Some(&(request.model.clone(), request.effort.clone()))
@@ -1431,6 +1434,7 @@ async fn relay_claude_runtime(
         .as_ref()
         .map(|task| AbortOnDrop(task.abort_handle()));
     let mut tool_generation = ClaudeToolGenerationState::default();
+    let mut saw_done = false;
 
     loop {
         tokio::select! {
@@ -1440,6 +1444,9 @@ async fn relay_claude_runtime(
             // cancellation reach the Claude child instead of leaving an idle
             // subscription process behind.
             _ = events.closed() => {
+                if let Some(tracker) = cost_tracker.as_ref() {
+                    reset_claude_cost_tracker(tracker);
+                }
                 if let Some(runner) = runner.take() {
                     runner.abort();
                     let _ = runner.await;
@@ -1467,10 +1474,14 @@ async fn relay_claude_runtime(
                     Some(&steer_correlation),
                 );
                 let event = normalize_claude_cost(event, cost_tracker.as_ref());
+                saw_done |= matches!(event, ChatStreamEvent::Done { .. });
                 outgoing.push(event);
                 for event in outgoing {
                     if events.send(event).await.is_err()
                     {
+                        if let Some(tracker) = cost_tracker.as_ref() {
+                            reset_claude_cost_tracker(tracker);
+                        }
                         if let Some(runner) = runner.take() {
                             runner.abort();
                             let _ = runner.await;
@@ -1493,8 +1504,15 @@ async fn relay_claude_runtime(
         forwarder.abort();
         let _ = forwarder.await;
     }
-    runner_result.context("Claude subscription runtime task failed")??;
-    Ok(())
+    let result = runner_result
+        .context("Claude subscription runtime task failed")
+        .and_then(|result| result);
+    if (!saw_done || result.is_err())
+        && let Some(tracker) = cost_tracker.as_ref()
+    {
+        reset_claude_cost_tracker(tracker);
+    }
+    result
 }
 
 fn register_claude_steer(correlation: &StdMutex<ClaudeSteerCorrelation>, message_id: String) {
@@ -1720,6 +1738,10 @@ fn normalize_claude_cost(
     let Some(cost_tracker) = cost_tracker else {
         return event;
     };
+    if matches!(event, ChatStreamEvent::Failed { .. }) {
+        reset_claude_cost_tracker(cost_tracker);
+        return event;
+    }
     let ChatStreamEvent::Done {
         final_text,
         usage,
@@ -1730,7 +1752,8 @@ fn normalize_claude_cost(
         return event;
     };
     let usage = usage.map(|mut usage| {
-        usage.cost_microusd = claude_cost_delta(cost_tracker, usage.cost_microusd);
+        usage.cost_microusd =
+            claude_cost_delta(cost_tracker, session_id.as_deref(), usage.cost_microusd);
         usage
     });
     ChatStreamEvent::Done {
@@ -1741,12 +1764,29 @@ fn normalize_claude_cost(
     }
 }
 
-fn claude_cost_delta(tracker: &ClaudeCostTracker, cumulative: Option<u64>) -> Option<u64> {
-    let cumulative = cumulative?;
-    let mut previous = tracker
+fn reset_claude_cost_tracker(tracker: &ClaudeCostTracker) {
+    *tracker
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = ClaudeCostState::default();
+}
+
+fn claude_cost_delta(
+    tracker: &ClaudeCostTracker,
+    session_id: Option<&str>,
+    cumulative: Option<u64>,
+) -> Option<u64> {
+    let mut state = tracker
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let delta = previous
+    if let Some(session_id) = session_id
+        && state.session_id.as_deref() != Some(session_id)
+    {
+        state.session_id = Some(session_id.to_string());
+        state.total_microusd = None;
+    }
+    let cumulative = cumulative?;
+    let delta = state
+        .total_microusd
         .map(|previous| {
             if cumulative >= previous {
                 cumulative - previous
@@ -1755,7 +1795,7 @@ fn claude_cost_delta(tracker: &ClaudeCostTracker, cumulative: Option<u64>) -> Op
             }
         })
         .unwrap_or(cumulative);
-    *previous = Some(cumulative);
+    state.total_microusd = Some(cumulative);
     Some(delta)
 }
 
@@ -2517,14 +2557,14 @@ mod tests {
 
     #[test]
     fn pooled_claude_done_event_reports_the_running_total_delta() {
-        let tracker = Arc::new(StdMutex::new(None));
-        let done = |cost_microusd| ChatStreamEvent::Done {
+        let tracker = ClaudeCostTracker::default();
+        let done = |session_id: &str, cost_microusd| ChatStreamEvent::Done {
             final_text: "done".to_string(),
             usage: Some(ProviderCallUsage {
                 cost_microusd,
                 ..Default::default()
             }),
-            session_id: None,
+            session_id: Some(session_id.to_string()),
             provider_turn_id: None,
         };
         let cost = |event| match normalize_claude_cost(event, Some(&tracker)) {
@@ -2535,10 +2575,22 @@ mod tests {
             _ => unreachable!("cost normalization must preserve the done event"),
         };
 
-        assert_eq!(cost(done(Some(100))), Some(100));
-        assert_eq!(cost(done(Some(160))), Some(60));
-        assert_eq!(cost(done(None)), None);
-        assert_eq!(cost(done(Some(220))), Some(60));
-        assert_eq!(cost(done(Some(15))), Some(15));
+        assert_eq!(cost(done("first-process", Some(100))), Some(100));
+        assert_eq!(cost(done("first-process", Some(160))), Some(60));
+        assert_eq!(cost(done("first-process", None)), None);
+        assert_eq!(cost(done("first-process", Some(220))), Some(60));
+        assert_eq!(cost(done("second-process", Some(300))), Some(300));
+        assert_eq!(cost(done("second-process", Some(315))), Some(15));
+        assert!(matches!(
+            normalize_claude_cost(
+                ChatStreamEvent::Failed {
+                    error: "turn failed".to_string(),
+                    kind: ProviderErrorKind::Unknown,
+                },
+                Some(&tracker),
+            ),
+            ChatStreamEvent::Failed { .. }
+        ));
+        assert_eq!(cost(done("second-process", Some(400))), Some(400));
     }
 }

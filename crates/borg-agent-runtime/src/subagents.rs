@@ -8699,13 +8699,18 @@ async fn update_from_session_event(
             if context_tokens.is_some() {
                 entry.snapshot.usage.context_tokens = *context_tokens;
             }
+            entry.snapshot.usage.cost_basis = crate::session_store::cumulative_cost_basis(
+                entry.snapshot.usage.cost_microusd,
+                &entry.snapshot.usage.cost_basis,
+                *cost_microusd,
+                cost_basis,
+            );
             entry.snapshot.usage.cost_microusd =
                 match (entry.snapshot.usage.cost_microusd, cost_microusd) {
                     (Some(current), Some(additional)) => Some(current.saturating_add(*additional)),
                     (None, Some(value)) => Some(*value),
                     (current, None) => current,
                 };
-            entry.snapshot.usage.cost_basis = cost_basis.clone();
         }
         SessionEventKind::ContextWindowUpdated { context_tokens, .. } => {
             entry.snapshot.usage.context_tokens = Some(*context_tokens);
