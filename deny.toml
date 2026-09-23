@@ -2,7 +2,8 @@
 # These advisories report upstream maintenance status, not vulnerabilities,
 # and currently have no safe upgrade. The first two come through syntect; the
 # remaining entries are transitive dependencies of GPUI (paste is also used by
-# image codecs shared with the TUI).
+# image codecs shared with the TUI). cgmath (RUSTSEC-2026-0196) comes through
+# smithay in the borg-display compositor.
 ignore = [
     "RUSTSEC-2024-0320",
     "RUSTSEC-2025-0141",
@@ -13,6 +14,7 @@ ignore = [
     "RUSTSEC-2025-0134",
     "RUSTSEC-2026-0206",
     "RUSTSEC-2026-0192",
+    "RUSTSEC-2026-0196",
 ]
 
 [licenses]
