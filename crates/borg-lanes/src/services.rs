@@ -534,36 +534,218 @@ async fn probe(spec: &ServiceSpec, port: Option<u16>) -> bool {
                 let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
                 let path = spec.health.argv.first().map(String::as_str).unwrap_or("/");
                 ensure!(path.starts_with('/') && !path.contains(['\r', '\n']), "invalid health path");
-                let body = if matches!(spec.health.kind, HealthKind::McpInitialize) {
+                let mcp = matches!(spec.health.kind, HealthKind::McpInitialize);
+                let body = if mcp {
                     r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"borg-services","version":"1"}}}"#
                 } else { "" };
                 let method = if body.is_empty() { "GET" } else { "POST" };
                 stream.write_all(format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
-                let mut reply = Vec::new();
-                loop {
-                    let mut buf = [0; 4096];
-                    let count = stream.read(&mut buf).await?;
-                    if count == 0 { return Ok(false); }
-                    reply.extend_from_slice(&buf[..count]);
-                    ensure!(reply.len() <= 16_384, "health response too large");
-                    let Some(head_end) = reply.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
-                    let head = &reply[..head_end];
-                    let success = head.starts_with(b"HTTP/1.1 2") || head.starts_with(b"HTTP/1.0 2");
-                    if !success || matches!(spec.health.kind, HealthKind::Http) { return Ok(success); }
-                    let body = String::from_utf8_lossy(&reply[head_end + 4..]);
-                    for line in body.lines() {
-                        let value = line.trim().strip_prefix("data: ").unwrap_or(line.trim());
-                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(value) {
-                            if json.get("error").is_some() { return Ok(false); }
-                            if json.pointer("/result/protocolVersion").and_then(|v| v.as_str()).is_some() {
-                                return Ok(true);
-                            }
-                        }
-                    }
+                let mut reply = HealthReply::head(&mut stream).await?;
+                if !(200..300).contains(&reply.status) || !mcp {
+                    return Ok((200..300).contains(&reply.status));
                 }
+                reply.read_body(&mut stream).await?;
+                let healthy = reply.mcp_initialized();
+                if healthy && let Some(session) = reply.header("mcp-session-id") {
+                    end_mcp_session(port, path, session.to_owned());
+                }
+                Ok(healthy)
             }
         }
     }).await.is_ok_and(|result: Result<bool>| result.unwrap_or(false))
+}
+
+/// One HTTP/1.x health reply, bounded by `HEALTH_REPLY_LIMIT` in total.
+struct HealthReply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    /// Bytes read past the header block; the whole body after `read_body`.
+    body: Vec<u8>,
+    budget: usize,
+}
+
+const HEALTH_REPLY_LIMIT: usize = 16_384;
+
+impl HealthReply {
+    async fn head(stream: &mut TcpStream) -> Result<Self> {
+        let mut raw = Vec::new();
+        let end = loop {
+            if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                break end;
+            }
+            ensure!(
+                read_some(stream, &mut raw, HEALTH_REPLY_LIMIT).await?,
+                "health response ended before its headers"
+            );
+        };
+        let head = std::str::from_utf8(&raw[..end]).context("health response head is not UTF-8")?;
+        let mut lines = head.split("\r\n");
+        let mut status = lines.next().unwrap_or_default().split_whitespace();
+        ensure!(
+            status.next().is_some_and(|v| v.starts_with("HTTP/1.")),
+            "health response is not HTTP/1.x"
+        );
+        let status = status
+            .next()
+            .context("health response has no status")?
+            .parse()?;
+        let headers = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+            .collect();
+        Ok(Self {
+            status,
+            headers,
+            body: raw.split_off(end + 4),
+            budget: HEALTH_REPLY_LIMIT - (end + 4),
+        })
+    }
+
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The complete body: chunked, Content-Length, or else until EOF. A
+    /// keep-alive server that sends Content-Length never forces a timeout.
+    async fn read_body(&mut self, stream: &mut TcpStream) -> Result<()> {
+        let mut raw = std::mem::take(&mut self.body);
+        if self
+            .header("transfer-encoding")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("chunked"))
+        {
+            let mut body = Vec::new();
+            let mut at = 0;
+            loop {
+                let line = loop {
+                    if let Some(line) = raw[at..].windows(2).position(|w| w == b"\r\n") {
+                        break at + line;
+                    }
+                    ensure!(
+                        read_some(stream, &mut raw, self.budget).await?,
+                        "chunked health body truncated"
+                    );
+                };
+                let size = std::str::from_utf8(&raw[at..line])?;
+                let size =
+                    usize::from_str_radix(size.split(';').next().unwrap_or_default().trim(), 16)
+                        .context("invalid chunk size")?;
+                ensure!(size <= self.budget, "health response too large");
+                at = line + 2;
+                if size == 0 {
+                    break;
+                }
+                while raw.len() < at + size + 2 {
+                    ensure!(
+                        read_some(stream, &mut raw, self.budget).await?,
+                        "chunked health body truncated"
+                    );
+                }
+                ensure!(
+                    &raw[at + size..at + size + 2] == b"\r\n",
+                    "malformed health chunk"
+                );
+                body.extend_from_slice(&raw[at..at + size]);
+                at += size + 2;
+            }
+            self.body = body;
+        } else if let Some(length) = self.header("content-length") {
+            let length: usize = length.parse().context("invalid health Content-Length")?;
+            ensure!(length <= self.budget, "health response too large");
+            while raw.len() < length {
+                ensure!(
+                    read_some(stream, &mut raw, self.budget).await?,
+                    "health body truncated"
+                );
+            }
+            raw.truncate(length);
+            self.body = raw;
+        } else {
+            while read_some(stream, &mut raw, self.budget).await? {}
+            self.body = raw;
+        }
+        Ok(())
+    }
+
+    /// A JSON-RPC `error` is unhealthy; `result.protocolVersion` is healthy.
+    /// JSON is one value however it is formatted; an event stream is split
+    /// into events whose `data:` lines are joined before parsing.
+    fn mcp_initialized(&self) -> bool {
+        let text = String::from_utf8_lossy(&self.body);
+        let media = self
+            .header("content-type")
+            .and_then(|value| value.split(';').next())
+            .map(|value| value.trim().to_ascii_lowercase());
+        let whole = || serde_json::from_str::<serde_json::Value>(&text).ok();
+        let messages: Vec<serde_json::Value> = match media.as_deref() {
+            Some("application/json") => whole().into_iter().collect(),
+            Some("text/event-stream") => sse_messages(&text),
+            _ => whole().map_or_else(|| sse_messages(&text), |value| vec![value]),
+        };
+        for message in messages {
+            if message.get("error").is_some() {
+                return false;
+            }
+            if message
+                .pointer("/result/protocolVersion")
+                .and_then(|v| v.as_str())
+                .is_some()
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+async fn read_some(stream: &mut TcpStream, into: &mut Vec<u8>, limit: usize) -> Result<bool> {
+    let mut chunk = [0; 4096];
+    let count = stream.read(&mut chunk).await?;
+    into.extend_from_slice(&chunk[..count]);
+    ensure!(into.len() <= limit, "health response too large");
+    Ok(count > 0)
+}
+
+fn sse_messages(text: &str) -> Vec<serde_json::Value> {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split("\n\n")
+        .filter_map(|event| {
+            let data: Vec<&str> = event
+                .lines()
+                .filter_map(|line| line.strip_prefix("data:"))
+                .map(|data| data.strip_prefix(' ').unwrap_or(data))
+                .collect();
+            (!data.is_empty())
+                .then(|| serde_json::from_str(&data.join("\n")).ok())
+                .flatten()
+        })
+        .collect()
+}
+
+/// Each health probe opens a fresh MCP session; end it at once so repeated
+/// probes do not accumulate sessions on the backend. Best effort, detached
+/// from the probe, and bounded: a failure here never changes health.
+fn end_mcp_session(port: u16, path: &str, session: String) {
+    if session.is_empty()
+        || session.len() > 256
+        || !session.bytes().all(|b| (0x21..=0x7e).contains(&b))
+    {
+        return;
+    }
+    let request = format!(
+        "DELETE {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nMcp-Session-Id: {session}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+            stream.write_all(request.as_bytes()).await?;
+            HealthReply::head(&mut stream).await
+        })
+        .await;
+    });
 }
 
 #[derive(Clone)]
@@ -3037,6 +3219,150 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
         );
         assert!(root.path().join("launches").exists());
         cleanup(&manager, task).await;
+    }
+
+    /// Answers the first request with `reply` (then holds the connection
+    /// open when `keep_open`, as a keep-alive server may) and records the
+    /// head of every request it receives.
+    async fn canned_backend(
+        reply: String,
+        keep_open: bool,
+    ) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let first = {
+                    let mut log = log.lock().unwrap();
+                    log.push(String::from_utf8_lossy(&request).into_owned());
+                    log.len() == 1
+                };
+                let answer = if first {
+                    reply.as_str()
+                } else {
+                    "HTTP/1.1 204 No Content\r\n\r\n"
+                };
+                let _ = stream.write_all(answer.as_bytes()).await;
+                if first && keep_open {
+                    held.push(stream);
+                }
+            }
+        });
+        (port, seen)
+    }
+
+    /// Failure mode: a real MCP server's valid initialize reply judged
+    /// unhealthy for its framing (pretty JSON, chunks, SSE events), an error
+    /// or non-2xx reply judged healthy, or every probe leaking a session.
+    #[tokio::test]
+    async fn mcp_probe_reads_whole_replies_and_ends_its_session() {
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = spec(root.path());
+        spec.health.kind = HealthKind::McpInitialize;
+        spec.health.argv = vec!["/mcp".into()];
+        spec.health.timeout_ms = 2000;
+        // Shaped like the Unreal editor's reply: tab-indented, one key per line.
+        let pretty = "{\n\t\"jsonrpc\": \"2.0\",\n\t\"id\": 1,\n\t\"result\":\n\t{\n\t\t\"protocolVersion\": \"2025-11-25\",\n\t\t\"capabilities\":\n\t\t{\n\t\t\t\"tools\":\n\t\t\t{\n\t\t\t\t\"listChanged\": true\n\t\t\t}\n\t\t}\n\t}\n}";
+        let failed = "{\n\t\"jsonrpc\": \"2.0\",\n\t\"id\": 1,\n\t\"error\":\n\t{\n\t\t\"code\": -32600,\n\t\t\"message\": \"refused\"\n\t}\n}";
+        let single = r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}"#;
+        let sized = |status: &str, headers: &str, body: &str| {
+            format!(
+                "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let chunked = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{}0\r\n\r\n",
+            pretty
+                .as_bytes()
+                .chunks(29)
+                .map(|piece| format!(
+                    "{:x}\r\n{}\r\n",
+                    piece.len(),
+                    String::from_utf8_lossy(piece)
+                ))
+                .collect::<String>()
+        );
+        let events = |body: &str| {
+            let data: Vec<String> = body.lines().map(|line| format!("data: {line}")).collect();
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\nevent: message\r\n{}\r\n\r\n",
+                data.join("\r\n")
+            )
+        };
+        let session = "Mcp-Session-Id: 01a0cd29435d7decaf32fb7a0851b1d9\r\n";
+        for (shape, reply, keep_open, healthy) in [
+            (
+                "pretty JSON with Content-Length, kept alive",
+                sized(
+                    "200",
+                    &format!("content-type: application/json;charset=utf-8\r\n{session}"),
+                    pretty,
+                ),
+                true,
+                true,
+            ),
+            ("chunked pretty JSON", chunked, true, true),
+            (
+                "single-line JSON",
+                sized("200 OK", "Content-Type: application/json\r\n", single),
+                true,
+                true,
+            ),
+            (
+                "SSE event with multi-line data",
+                events(pretty),
+                false,
+                true,
+            ),
+            ("SSE error event", events(failed), false, false),
+            (
+                "HTTP 200 with a JSON-RPC error",
+                sized("200 OK", "Content-Type: application/json\r\n", failed),
+                true,
+                false,
+            ),
+            (
+                "non-2xx with a result",
+                sized(
+                    "503 Service Unavailable",
+                    "Content-Type: application/json\r\n",
+                    single,
+                ),
+                true,
+                false,
+            ),
+        ] {
+            let (port, seen) = canned_backend(reply, keep_open).await;
+            assert_eq!(probe(&spec, Some(port)).await, healthy, "{shape}");
+            if shape.starts_with("pretty") {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                loop {
+                    let heads = seen.lock().unwrap().clone();
+                    if let Some(delete) = heads.get(1) {
+                        assert!(delete.starts_with("DELETE /mcp HTTP/1.1\r\n"), "{delete}");
+                        assert!(delete.contains(session), "{delete}");
+                        break;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "no session DELETE: {heads:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
     }
 
     #[tokio::test]

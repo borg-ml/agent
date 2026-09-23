@@ -58,7 +58,20 @@ before it may launch a new backend; a further callback failure keeps startup
 failed and the remaining clients recorded for manual repair.
 
 `health.kind` is `command`, `http` (argv[0] is a path), or `mcp_initialize`
-(argv[0] is `/mcp`; POST initialize). The health timeout is per attempt;
+(argv[0] is `/mcp`; POST initialize). An `mcp_initialize` probe reads the
+complete reply (Content-Length, chunked, or until EOF; 16 KiB cap) and judges
+it by Content-Type:
+- `application/json` is one JSON value, however it is formatted;
+- `text/event-stream` is split into events, and each event's `data:` lines
+  are joined before parsing;
+- otherwise the probe tries whole-body JSON, then events.
+
+A JSON-RPC `error` or a non-2xx status is unhealthy, and `result.protocolVersion`
+is healthy. Every probe opens a fresh MCP session. When the reply names an
+`Mcp-Session-Id`, the supervisor sends a best-effort `DELETE` for it (detached,
+2 s bound, failures ignored), so repeated probes do not accumulate editor
+sessions. The session is not reused, because reuse would not survive a
+backend restart. The health timeout is per attempt;
 `readiness_timeout_ms` bounds startup. Optional `graceful_stop`, `restore`,
 `idle`, and `active` are `Hook {argv:[...],timeout_ms:number}`; restore argv
 receives `{owner}` (the lease holder participant UUID). `idle_after_ms`

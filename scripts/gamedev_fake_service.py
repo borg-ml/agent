@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import uuid
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -23,6 +24,50 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self) -> None:
+        # Opt-in MCP initialize shaped like the Unreal editor's: pretty JSON,
+        # a session header, and a connection left open (Content-Length only).
+        if self.path != "/mcp" or not os.environ.get("BENCH_MCP_PRETTY"):
+            self.send_error(404)
+            return
+        request = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        session = uuid.uuid4().hex
+        body = json.dumps({"jsonrpc": "2.0", "id": request.get("id"),
+                           "result": {"protocolVersion": "2025-11-25",
+                                      "capabilities": {"resources": {}, "tools": {"listChanged": True}},
+                                      "serverInfo": {"name": "", "title": "", "version": ""}}},
+                          indent="\t").encode()
+        self.log_session("open", session)
+        self.protocol_version = "HTTP/1.1"
+        self.send_response(200)
+        self.send_header("content-type", "application/json;charset=utf-8")
+        self.send_header("Mcp-Session-Id", session)
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self.wfile.flush()
+        self.close_connection = False
+
+    def do_DELETE(self) -> None:
+        session = self.headers.get("Mcp-Session-Id")
+        if self.path != "/mcp" or not session or not os.environ.get("BENCH_MCP_PRETTY"):
+            self.send_error(404)
+            return
+        self.log_session("delete", session)
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    @staticmethod
+    def log_session(event: str, session: str) -> None:
+        log = os.environ.get("BENCH_MCP_SESSION_LOG")
+        if log:
+            fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.write(fd, f"{event} {session}\n".encode())
+            finally:
+                os.close(fd)
 
     def log_message(self, format: str, *args: object) -> None:
         pass

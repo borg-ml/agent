@@ -115,6 +115,79 @@ def run(binary: Path) -> dict:
 
 
 
+def run_mcp_pretty(binary: Path) -> dict:
+    """MCP initialize health against an editor-shaped reply: pretty JSON,
+    Content-Length and a connection the backend leaves open. The service must
+    become Healthy, and each probe's MCP session must be deleted."""
+    binary = binary.resolve(strict=True)
+    backend = Path(__file__).with_name("gamedev_fake_service.py").resolve()
+    with isolated_root() as root:
+        ports = []
+        while len(ports) < 3:
+            port = available_port()
+            if port not in ports:
+                ports.append(port)
+        sessions = root / "mcp-sessions.log"
+        name = "bench-mcp-" + uuid.uuid4().hex
+        lane(binary, root, "resource", "set-capacity", "--name", name, "--slots", "1")
+        spec = {"id": "bench-mcp", "argv": [sys.executable, str(backend), "{port}"],
+                "cwd": str(root), "env": [["BENCH_MCP_PRETTY", "1"],
+                                          ["BENCH_MCP_SESSION_LOG", str(sessions)]],
+                "resources": [{"key": {"scope": "Host", "name": name},
+                               "access": {"Shared": {"slots": 1}}}],
+                "adapter_enforces_leases": False, "read_only_paths": ["/"],
+                "memory_max_bytes": 128 * 1024 * 1024,
+                "admission": {"min_available_ram_bytes": 0, "reserve_ram_bytes": 0,
+                              "min_free_disk_bytes": 0, "reserve_disk_bytes": 0,
+                              "disk_path": str(root)},
+                "health": {"argv": ["/mcp"], "kind": "mcp_initialize", "interval_ms": 100,
+                           "timeout_ms": 1000},
+                "readiness_timeout_ms": 6000,
+                "restart": {"max_restarts": 1, "backoff_ms": 100, "debounce_ms": 100},
+                "endpoint": {"listen": f"127.0.0.1:{ports[0]}", "backend_ports": ports[1:]},
+                "restore": None}
+        definition = root / "service.json"
+        definition.write_text(json.dumps(spec))
+
+        def ledger() -> tuple[set[str], set[str]]:
+            lines = sessions.read_text().split() if sessions.exists() else []
+            events = list(zip(lines[::2], lines[1::2]))
+            return ({s for e, s in events if e == "open"}, {s for e, s in events if e == "delete"})
+
+        started = False
+        try:
+            started = True
+            status = command(binary, root, "start", "bench-mcp", "--definition", str(definition),
+                             "--wait-ready", "8")
+            if "Healthy" not in status.get("state", {}):
+                raise RuntimeError(f"MCP service not Healthy: {status!r}")
+            served = health_at(ports[0])
+            # Keep probing until several sessions opened and all but one in-flight were deleted.
+            deadline = time.monotonic() + 8
+            while True:
+                opened, deleted = ledger()
+                if len(opened) >= 5 and len(opened - deleted) <= 1:
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"MCP health sessions leaked: {len(opened)} opened, "
+                                       f"{len(opened & deleted)} deleted")
+                subprocess.run(["inotifywait", "-q", "-t", "1", "-e", "modify,create", str(root)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+            if deleted - opened:
+                raise RuntimeError(f"DELETE for unknown sessions: {sorted(deleted - opened)}")
+            still = command(binary, root, "status", "bench-mcp")
+            if "Healthy" not in still.get("state", {}) or still.get("backend_pid") != status.get("backend_pid"):
+                raise RuntimeError(f"MCP service did not stay Healthy on one backend: {still!r}")
+            return {"mode": "mcp-pretty-health-cli", "state": status["state"],
+                    "backend_pid": status.get("backend_pid"), "front_served": served.strip(),
+                    "sessions_opened": len(opened), "sessions_deleted": len(opened & deleted)}
+        finally:
+            if started:
+                current = command(binary, root, "status", "bench-mcp")
+                if current.get("supervisor_pid"):
+                    command(binary, root, "stop", "bench-mcp")
+
+
 def lane(binary: Path, root: Path, *args: str, input_data: dict | None = None,
          timeout: float = 10, allow_failure: bool = False) -> dict:
     cmd = [str(binary), "lane", "--json", *args]
@@ -847,6 +920,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--borg", required=True, type=Path)
     ap.add_argument("--atomic", action="store_true", help="run degraded-mode D11 coordination gate")
+    ap.add_argument("--mcp-pretty-health", action="store_true",
+                    help="MCP initialize health on a pretty-printed keep-alive reply; sessions deleted")
     ap.add_argument("--check-service-disk-budget", action="store_true",
                     help="disjoint service admissions share same-device disk reservation")
     ap.add_argument("--check-service-budget", action="store_true",
@@ -921,6 +996,8 @@ def main() -> None:
                                 per_resource_grace=args.atomic_per_resource_grace)
             if args.atomic_project_alias and not result["alias_rejected"]:
                 result["canonical_handoff"] = run_atomic(args.borg, canonical_project=True)
+        elif args.mcp_pretty_health:
+            result = run_mcp_pretty(args.borg)
         else:
             result = run(args.borg)
         print(json.dumps(result, indent=2))
