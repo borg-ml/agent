@@ -225,6 +225,9 @@ pub struct AgentToolDispatcher {
     runtime_mcp: Arc<Mutex<RuntimeMcpState>>,
     harness_lock: Arc<Mutex<()>>,
     web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
+    /// Whether human or team input is queued behind the running turn. A
+    /// blocking `wait_agent` returns on it so the parent answers promptly.
+    input_pending: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 #[derive(Default)]
@@ -827,6 +830,7 @@ impl AgentToolDispatcher {
             runtime_mcp: Arc::new(Mutex::new(RuntimeMcpState::default())),
             harness_lock: Arc::new(Mutex::new(())),
             web_search,
+            input_pending: Arc::new(tokio::sync::watch::Sender::new(false)),
         }
     }
 
@@ -838,6 +842,15 @@ impl AgentToolDispatcher {
     pub(crate) fn with_watcher_yield(mut self, enabled: bool) -> Self {
         self.watcher_yield_enabled = enabled;
         self
+    }
+
+    /// Published by the session loop while input waits for the running turn.
+    pub(crate) fn set_input_pending(&self, pending: bool) {
+        self.input_pending.send_if_modified(|current| {
+            let changed = *current != pending;
+            *current = pending;
+            changed
+        });
     }
 
     pub(crate) fn configure_tool_approvals(&self, approvals: crate::session::SessionToolApprovals) {
@@ -1939,9 +1952,24 @@ impl AgentToolDispatcher {
                 if !self.subagents_enabled {
                     bail!("subagent tools are disabled by session capabilities");
                 }
-                self.subagents
+                let subagents = self
+                    .subagents
                     .as_ref()
-                    .context("subagent coordinator is disabled")?
+                    .context("subagent coordinator is disabled")?;
+                if name == "wait_agent" {
+                    let args: WaitAgentArgs = serde_json::from_value(arguments)?;
+                    return subagents
+                        .wait_for(
+                            self.actor_session_id,
+                            args.timeout(),
+                            WaitSignals {
+                                cancel: workflow_cancel,
+                                input_pending: Some(self.input_pending.subscribe()),
+                            },
+                        )
+                        .await;
+                }
+                subagents
                     .call_tool_as(self.actor_session_id, name, arguments)
                     .await
             }
@@ -2830,6 +2858,7 @@ pub struct SubagentCoordinator {
     root_message_dispatches: Arc<Mutex<HashMap<Uuid, Instant>>>,
     projected_root_messages: Arc<Mutex<HashSet<Uuid>>>,
     consultation_lock: Arc<Mutex<()>>,
+    wait_cursors: Arc<Mutex<HashMap<Uuid, wait::WaitCursor>>>,
 }
 
 impl SubagentCoordinator {
@@ -2865,6 +2894,7 @@ impl SubagentCoordinator {
             root_message_dispatches: Arc::new(Mutex::new(HashMap::new())),
             projected_root_messages: Arc::new(Mutex::new(HashSet::new())),
             consultation_lock: Arc::new(Mutex::new(())),
+            wait_cursors: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -5597,48 +5627,6 @@ impl SubagentCoordinator {
         .await
     }
 
-    pub async fn wait(&self, timeout: Duration) -> Result<Option<SubagentActivity>> {
-        let timeout = timeout.clamp(Duration::from_millis(100), Duration::from_secs(60));
-        if let Some(agent) = self
-            .table
-            .lock()
-            .await
-            .snapshots()
-            .into_iter()
-            .find(|agent| agent.status == SubagentStatus::Ready && agent.final_text.is_some())
-        {
-            return Ok(Some(SubagentActivity::Completed { agent }));
-        }
-        let mut receiver = self.subscribe();
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, receiver.recv()).await {
-                Ok(Ok(activity)) => {
-                    if let Some(session_id) = ready_session_id(&activity)
-                        && let Some(agent) = self
-                            .table
-                            .lock()
-                            .await
-                            .entries
-                            .get(&session_id)
-                            .map(|entry| entry.snapshot.clone())
-                    {
-                        return Ok(Some(SubagentActivity::Completed { agent }));
-                    }
-                    if significant_activity(&activity) {
-                        return Ok(Some(activity));
-                    }
-                }
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(broadcast::error::RecvError::Closed)) => {
-                    bail!("subagent activity stream closed")
-                }
-                Err(_) => return Ok(None),
-            }
-        }
-    }
-
     /// Execute one model collaboration tool against this typed lifecycle.
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value> {
         let root_session_id = self.table.lock().await.root_session_id;
@@ -5956,9 +5944,8 @@ impl SubagentCoordinator {
             }
             "wait_agent" => {
                 let args: WaitAgentArgs = serde_json::from_value(arguments)?;
-                Ok(json!({
-                    "activity": self.wait(Duration::from_millis(args.timeout_ms.unwrap_or(30_000))).await?
-                }))
+                self.wait_for(actor_session_id, args.timeout(), WaitSignals::default())
+                    .await
             }
             other => bail!("unknown subagent tool: {other}"),
         }
@@ -6207,11 +6194,16 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "wait_agent",
-            "Wait for a child lifecycle or session update.",
+            "Block until your child agents give you something to act on, then report it. This is how to wait for children: one call covers a whole assignment, so never poll with shell sleeps or repeated list_agents. Returns early when a child finishes, fails, stops or needs approval, when a child or teammate messages you, or when human or team input is waiting for you (answer that first); otherwise at timeout_ms. Each change is reported once, so a child that finished earlier does not end later waits. With no child working it returns after a few seconds instead of blocking. The result gives the reason, the changes with each finished child's final text, messages, and a compact status line for every child.",
             json!({
                 "type": "object",
                 "properties": {
-                    "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 60000 }
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 100,
+                        "maximum": 1800000,
+                        "description": "Longest wait in milliseconds; default 600000 (10 minutes), maximum 1800000 (30 minutes)."
+                    }
                 },
                 "additionalProperties": false
             }),
@@ -7720,6 +7712,13 @@ struct WaitAgentArgs {
     timeout_ms: Option<u64>,
 }
 
+impl WaitAgentArgs {
+    fn timeout(&self) -> Duration {
+        self.timeout_ms
+            .map_or(wait::DEFAULT_WAIT, Duration::from_millis)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EnqueueRuntimeJobArgs {
@@ -8472,40 +8471,6 @@ fn project_child_state(snapshot: &mut SubagentSnapshot, state: &crate::SessionSt
     };
 }
 
-fn significant_activity(activity: &SubagentActivity) -> bool {
-    match activity {
-        SubagentActivity::Started { .. }
-        | SubagentActivity::Stopped { .. }
-        | SubagentActivity::Failed { .. }
-        | SubagentActivity::Completed { .. } => true,
-        SubagentActivity::SessionEvent { event, .. } => matches!(
-            event.kind,
-            SessionEventKind::ApprovalRequested { .. }
-                | SessionEventKind::StatusChanged {
-                    status: SessionStatus::Failed | SessionStatus::Stopped,
-                    ..
-                }
-        ),
-    }
-}
-
-fn ready_session_id(activity: &SubagentActivity) -> Option<Uuid> {
-    match activity {
-        SubagentActivity::SessionEvent { event, .. }
-            if matches!(
-                event.kind,
-                SessionEventKind::StatusChanged {
-                    status: SessionStatus::Ready | SessionStatus::Completed,
-                    ..
-                }
-            ) =>
-        {
-            Some(event.session_id)
-        }
-        _ => None,
-    }
-}
-
 async fn finish_agent(
     table: &Arc<Mutex<SubagentTable>>,
     session_id: Uuid,
@@ -8551,6 +8516,8 @@ fn lift_runtime_value_attachments(mut result: Value) -> Value {
 
 #[cfg(test)]
 mod tests;
+mod wait;
+use wait::WaitSignals;
 
 /// Unix domain sockets have a hard limit on their path: `sun_path` is 104 bytes
 /// on macOS and the BSDs, 108 on Linux. The session runtime directory can

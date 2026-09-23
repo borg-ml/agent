@@ -5974,3 +5974,194 @@ fn a_child_surface_is_the_director_surface_minus_the_documented_exceptions() {
         }
     }
 }
+
+async fn waiting_team() -> (
+    tempfile::TempDir,
+    crate::session_store::postgres::testing::ScratchDatabase,
+    SubagentCoordinator,
+    Uuid,
+    Uuid,
+) {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        3,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+    let worker = {
+        let mut table = coordinator.table.lock().await;
+        let worker = table.reserve("worker", &launch()).unwrap();
+        table
+            .entries
+            .get_mut(&worker.session_id)
+            .unwrap()
+            .snapshot
+            .status = SubagentStatus::Running;
+        worker.session_id
+    };
+    bind_test_team(directory.path(), store.as_ref(), root, &[worker]).await;
+    (directory, scratch, coordinator, root, worker)
+}
+
+/// Apply a child event to the table and publish it, as the child actor does.
+async fn child_event(coordinator: &SubagentCoordinator, child: Uuid, kind: SessionEventKind) {
+    let event = SessionEvent::new(child, 1, kind);
+    update_from_session_event(&coordinator.table, child, &event).await;
+    let _ = coordinator
+        .activity_tx
+        .send(SubagentActivity::SessionEvent {
+            parent_session_id: coordinator.root_session_id,
+            task_name: "worker".to_string(),
+            event,
+        });
+}
+
+#[tokio::test]
+async fn wait_agent_blocks_until_a_child_finishes_and_reports_it_once() {
+    let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
+    let waiting = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .wait_for(root, Duration::from_secs(1800), WaitSignals::default())
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !waiting.is_finished(),
+        "a working child must not end the wait"
+    );
+    let finished = Instant::now();
+    child_event(
+        &coordinator,
+        worker,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: crate::EventActor::Assistant,
+            text: "done: 3 files fixed".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    )
+    .await;
+    child_event(
+        &coordinator,
+        worker,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: None,
+        },
+    )
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("a finished child ends the wait promptly")
+        .unwrap()
+        .unwrap();
+    assert!(finished.elapsed() < Duration::from_secs(3));
+    assert_eq!(result["reason"], "child_update");
+    assert_eq!(result["changes"][0]["status"], "ready");
+    assert_eq!(result["changes"][0]["final_text"], "done: 3 files fixed");
+    assert_eq!(result["agents"][0]["task_name"], "/root/worker");
+
+    // The same completion is not news on the next wait: before this fix every
+    // later wait returned it immediately and parents fell back to sleeping.
+    let again = coordinator
+        .wait_for(root, Duration::from_millis(300), WaitSignals::default())
+        .await
+        .unwrap();
+    assert_eq!(again["reason"], "timeout");
+    assert_eq!(again["changes"], json!([]));
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn wait_agent_returns_on_a_child_report_and_on_waiting_input() {
+    let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
+    let waiting = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .wait_for(root, Duration::from_secs(1800), WaitSignals::default())
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    coordinator
+        .send_message_as(worker, "/root", "blocked on an API decision")
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("a child report ends the wait promptly")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result["reason"], "child_update");
+    assert_eq!(result["messages"][0]["from"], "/root/worker");
+    assert_eq!(result["messages"][0]["text"], "blocked on an API decision");
+    assert_eq!(result["agents"][0]["status"], "running");
+
+    let (input, input_pending) = tokio::sync::watch::channel(false);
+    let waiting = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .wait_for(
+                    root,
+                    Duration::from_secs(1800),
+                    WaitSignals {
+                        cancel: None,
+                        input_pending: Some(input_pending),
+                    },
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !waiting.is_finished(),
+        "a delivered report is not reported twice"
+    );
+    input.send(true).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .expect("waiting human input ends the wait")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result["reason"], "input_pending");
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn wait_agent_times_out_with_a_status_line_per_child_and_accepts_long_waits() {
+    let (_directory, scratch, coordinator, root, _worker) = waiting_team().await;
+    let started = Instant::now();
+    let result = coordinator
+        .wait_for(root, Duration::from_millis(400), WaitSignals::default())
+        .await
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    assert_eq!(result["reason"], "timeout");
+    assert_eq!(result["agents"][0]["status"], "running");
+    assert!(result["agents"][0]["quiet_s"].is_u64());
+
+    let spec = subagent_tool_specs(CodingProvider::Codex)
+        .into_iter()
+        .find(|tool| tool["name"] == "wait_agent")
+        .unwrap();
+    let timeout = &spec["inputSchema"]["properties"]["timeout_ms"];
+    assert_eq!(timeout["maximum"], 1_800_000);
+    let args: WaitAgentArgs = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(args.timeout(), Duration::from_secs(600));
+    scratch.discard().await;
+}
