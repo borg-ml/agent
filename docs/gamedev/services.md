@@ -31,7 +31,11 @@ below are currently required by the v0 Rust wire contract):
 `idle`, and `active` are `Hook {argv:[...],timeout_ms:number}`; restore argv
 receives `{owner}` (the lease holder participant UUID). `idle_after_ms`
 controls the idle hook. `adapter_enforces_leases` defaults to false. Memory
-cap covers the transient systemd user unit; no systemd means start fails closed
+cap covers the transient systemd user unit. **Current limitation:**
+`admission` is parsed but not yet reserved atomically against other service or
+job budgets in the lane journal; `MemoryMax` is a unit cap, not host headroom.
+Do not claim service capacity admission until the planned lane reservation
+and cross-service budget test pass. No systemd means start fails closed
 rather than launching an orphanable process tree. The unit uses
 `KillMode=control-group` and `Delegate=yes`; each backend generation runs in
 its own delegated subgroup. Stop kills that subgroup and verifies
@@ -118,3 +122,8 @@ delegated backend cgroup, yield returned `Yielded` with no backend/client and
 its child gone, proxy returned JSON 503, and resume became Healthy on a new
 PID. User-unit `MemoryCurrent` was 20.7 MiB with backend and 9.8 MiB after
 yield (one fake HTTP service; not a steady-state Unreal footprint).
+
+Crash-subtree production smoke: fake `/childexit` spawned a detached `setsid`
+child in the backend subgroup and exited its leader. Recovery verified the
+child gone, restarted on the alternate port (`restarts=1`), then the owned
+fixture was stopped; its unit was inactive and subgroup removed.
