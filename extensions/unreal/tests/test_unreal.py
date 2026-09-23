@@ -158,6 +158,11 @@ class AdapterTests(unittest.TestCase):
         self.assertNotEqual(next_tmp, private_tmp)
         self.assertEqual(next_mapping, next_tmp / 'uba-mappings')
         self.assertFalse(next_tmp.exists())
+        metrics = json.loads(log.with_suffix('.metrics.json').read_text())
+        self.assertEqual(metrics['exit_code'], 0)
+        self.assertGreater(metrics['ubt_wall_seconds'], 0)
+        self.assertGreater(metrics['ubt_child_max_rss_bytes'], 0)
+        self.assertIn('scope_memory_peak_bytes', metrics)
         library = self.project.parent / 'Binaries/Linux/libGame.so'
         self.assertEqual(json.loads(manifest.read_text()), [str(library)])
         debug = library.with_suffix('.debug')
@@ -221,6 +226,14 @@ class AdapterTests(unittest.TestCase):
             record = next(r for r in json.loads(status.stdout)
                           if r['job']['id'] == stages[-1]['job_id'])
             self.assertIn('.scope', record['scope_cgroup'])
+            metrics_dir = Path(self.env['XDG_RUNTIME_DIR']) / 'borg/unreal' / hashlib.sha256(
+                str(self.project).encode()).hexdigest()[:16]
+            metrics_files = list(metrics_dir.glob('*.ubt.metrics.json'))
+            self.assertEqual(len(metrics_files), 1)
+            metrics = json.loads(metrics_files[0].read_text())
+            self.assertEqual(metrics['exit_code'], 0)
+            self.assertGreater(metrics['ubt_child_max_rss_bytes'], 0)
+            self.assertGreater(metrics['scope_memory_peak_bytes'], 0)
 
     @unittest.skipUnless(os.environ.get('BORG_UNREAL_TEST_SERVICE_CLI'),
                          'set BORG_UNREAL_TEST_SERVICE_CLI for the fake service smoke')

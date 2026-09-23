@@ -6,6 +6,7 @@ import argparse
 import fcntl
 import json
 import os
+import resource
 import subprocess
 import sys
 import tempfile
@@ -73,6 +74,7 @@ def main(argv: list[str]) -> int:
                 os.close(fd)
             return proc.wait()
 
+    started_at = time.monotonic()
     rc = start_once()
     if rc and log_path.exists():
         tail = log_path.read_bytes()[-200_000:]
@@ -80,6 +82,29 @@ def main(argv: list[str]) -> int:
             # Another direct UBT may not take our lock. The retry is narrow
             # and only runs for this known early-startup collision.
             rc = start_once()
+    # The job's transient systemd unit may be gone by `job wait`. Capture
+    # bounded process/cgroup evidence while this helper still holds its scope.
+    child_rss = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    scope_peak = None
+    if sys.platform == 'linux':
+        try:
+            group = next(line.split('::', 1)[1] for line in
+                         Path('/proc/self/cgroup').read_text().splitlines()
+                         if line.startswith('0::'))
+            scope_peak = int((Path('/sys/fs/cgroup') / group.lstrip('/') /
+                              'memory.peak').read_text())
+        except (OSError, ValueError, StopIteration):
+            pass
+    metrics = log_path.with_suffix('.metrics.json')
+    temporary = metrics.with_suffix('.tmp')
+    temporary.write_text(json.dumps({
+        'exit_code': rc, 'ubt_wall_seconds': time.monotonic() - started_at,
+        # ru_maxrss is KiB on Linux, bytes on macOS; this is one child maximum,
+        # not concurrent aggregate RSS. memory.peak includes page cache.
+        'ubt_child_max_rss_bytes': child_rss * (1024 if sys.platform == 'linux' else 1),
+        'scope_memory_peak_bytes': scope_peak,
+    }))
+    os.replace(temporary, metrics)
     if rc == 0 and symbols_enabled:
         changed = [name for name, info in libraries(root, 'Linux').items() if before.get(name) != info]
         for name in changed:
