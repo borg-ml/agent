@@ -7516,7 +7516,7 @@ impl BorgTerminal {
         } else if is_launch_screen {
             1
         } else {
-            controls_height + 1
+            controls_height
         };
         let composer_text_width = composer_area_width
             .saturating_sub(if is_launch_screen { 5 } else { 4 })
@@ -7625,10 +7625,10 @@ impl BorgTerminal {
                 PickerKind::Commands | PickerKind::MessageActions | PickerKind::Goal
             )
         }) {
-            let content_height = usize::from(composer_height.saturating_sub(2));
+            let content_height = usize::from(composer_height.saturating_sub(1));
             picker.scroll_offset(content_height, composer_line_count) as u16
         } else {
-            (composer_cursor.0 as u16).saturating_sub(composer_height.saturating_sub(3))
+            (composer_cursor.0 as u16).saturating_sub(composer_height.saturating_sub(2))
         };
         let transcript_viewport_height = if is_launch_screen {
             0
@@ -14501,7 +14501,7 @@ fn composer_panel_height(
             .max(cursor_row.saturating_add(1))
             .clamp(1, max_content_height)
     };
-    (content_height.min(u16::MAX as usize) as u16).saturating_add(2)
+    (content_height.min(u16::MAX as usize) as u16).saturating_add(1)
 }
 
 /// The launch composition lives inside the first root chunk, so its composer
