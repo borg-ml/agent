@@ -267,3 +267,13 @@ producer-aware watch. See `docs/watcher-yield.md` and runtime `watch.rs`.
   reacquire. A pre-hook that runs *after* grant is too late to prove this
   ordering. No editor+exclusive parity claim until both owners demonstrate
   this handshake under crash/restart and identical canonical root/key.
+- D12: on Linux production jobs need a verified systemd-owned scope/cgroup.
+  An opt-in degraded/test-only process-group fallback may signal a group only
+  while its recorded leader PID, start ticks and PGID match. If the leader
+  vanished or ownership cannot be proved, quarantine conflicting keys and
+  require manual resolution; do not kill a guessed descendant or readmit the
+  next job. No unsupported host silently gains production recovery claims.
+- D13: a native adapter's requested disk reservation (e.g. 24 GiB) is an
+  admission estimate; the current workspace per-agent cap/whole-worktree GC
+  do not implement a per-target byte quota or targeted cleanup. Document
+  this limitation rather than treating free-space checks as hard quotas.
