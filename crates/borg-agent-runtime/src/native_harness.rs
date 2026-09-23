@@ -29,7 +29,7 @@ use crate::{
 
 mod cache_warming;
 
-use crate::prompt_context::DeclarationTransport;
+use crate::prompt_context::{ContextSlot, DeclarationTransport, record_prompt_context};
 use cache_warming::{
     CacheWarmRequest, CacheWarmer, CacheWarmingMode, Economics, Ineligible,
     PromptCacheRefreshClient, RefreshSupport,
@@ -533,30 +533,24 @@ impl NativeHarness {
             messages.push(message);
             confirm_steers(acks);
         }
-        // This is the head the previous turn was shown. Recorded as prompt
-        // context, which replay rebuilds per turn rather than retaining,
-        // because it is derived from the live runtime.
-        if !varying_instructions.trim().is_empty() {
-            let context_message = ModelMessage::user(varying_instructions);
-            record_native_prompt_context(&events, turn.provider, &context_message).await?;
-            messages.push(context_message);
-        }
+        // Runtime context that varies between turns (usage percentages, MCP
+        // availability, harness state) trails the prompt instead of sitting in
+        // the head, and stays in history once sent, so a change only extends
+        // the cached prefix.
         let harness_prompt_appendix = turn.agent_tools.harness_prompt_appendix().await?;
-        if !harness_prompt_appendix.is_empty() {
-            let context_message = ModelMessage::user(harness_prompt_appendix);
-            record_native_prompt_context(&events, turn.provider, &context_message).await?;
-            messages.push(context_message);
-        }
-        // Provider admission status carries live usage percentages and reset
-        // timestamps, so it differs between turns. In the system prompt it sat
-        // ahead of the entire conversation and invalidated the provider prefix
-        // cache on every tick. Recording it as durable trailing context instead
-        // keeps the prefix byte-identical: the previous turn's status stays in
-        // history and the current one is appended after it.
-        if !turn.volatile_system_prompt_appendix.is_empty() {
-            let context_message = ModelMessage::user(turn.volatile_system_prompt_appendix.clone());
-            record_native_prompt_context(&events, turn.provider, &context_message).await?;
-            messages.push(context_message);
+        for (slot, current) in [
+            (ContextSlot::Instructions, varying_instructions),
+            (ContextSlot::Harness, harness_prompt_appendix),
+            (
+                ContextSlot::ProviderStatus,
+                turn.volatile_system_prompt_appendix.clone(),
+            ),
+        ] {
+            let previous = turn.prompt_context_base.get(&slot).map(String::as_str);
+            if let Some(content) = slot.next(previous, current) {
+                record_prompt_context(&events, turn.provider, slot, &content).await?;
+                messages.push(ModelMessage::user(content));
+            }
         }
         canonicalize_native_messages(&mut messages);
         let provider_session_id = format!("borg-session:{}", turn.session_id);
@@ -3556,22 +3550,6 @@ async fn record_native_message(
         .map_err(|_| anyhow::anyhow!("session actor stopped while recording native conversation"))
 }
 
-pub(crate) async fn record_native_prompt_context(
-    events: &mpsc::Sender<SessionEventKind>,
-    provider: crate::CodingProvider,
-    message: &ModelMessage,
-) -> Result<()> {
-    let payload = serde_json::to_value(message)?;
-    events
-        .send(SessionEventKind::ProviderEvent {
-            provider,
-            kind: "native_prompt_context".to_string(),
-            payload,
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("session actor stopped while recording prompt context"))
-}
-
 async fn send(events: &mpsc::Sender<SessionEventKind>, event: SessionEventKind) {
     let _ = events.send(event).await;
 }
@@ -4382,9 +4360,11 @@ struct ReadSkillArgs {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use super::*;
+    use crate::SessionEvent;
 
     #[test]
     fn only_a_blind_sleep_earns_the_wait_agent_hint() {
@@ -4787,6 +4767,7 @@ mod tests {
             root.path().to_path_buf(),
             Uuid::new_v4(),
             conversation,
+            HashMap::new(),
             "continue",
             "",
             "",
@@ -5301,6 +5282,7 @@ mod tests {
                 extension_api: Default::default(),
                 system_prompt_appendix: String::new(),
                 declaration_base: None,
+                prompt_context_base: Default::default(),
                 claude_native_subagents: false,
                 volatile_system_prompt_appendix: String::new(),
             };
@@ -6731,9 +6713,9 @@ mod tests {
 
     struct PrefixTurn {
         rounds: Vec<Vec<ModelMessage>>,
-        /// The conversation the next turn replays, rebuilt from the durable
-        /// events this turn emitted in the order `session.rs` replays them.
-        durable: Vec<ModelMessage>,
+        /// Every turn so far as the session journal keeps it for replay:
+        /// only durable, context-relevant events survive.
+        journal: Vec<SessionEvent>,
         completed: bool,
     }
 
@@ -6745,6 +6727,7 @@ mod tests {
         cwd: PathBuf,
         session_id: Uuid,
         conversation: Vec<ModelMessage>,
+        prompt_context_base: HashMap<ContextSlot, String>,
         prompt: &str,
         volatile: &str,
         system_prompt_appendix: &str,
@@ -6807,6 +6790,7 @@ mod tests {
             extension_api: Default::default(),
             system_prompt_appendix: system_prompt_appendix.to_string(),
             declaration_base: None,
+            prompt_context_base,
             claude_native_subagents: false,
             volatile_system_prompt_appendix: volatile.to_string(),
         };
@@ -6826,42 +6810,62 @@ mod tests {
         .expect("the harness turn finished inside the timeout")
     }
 
+    /// Run one turn on top of `journal`, replaying it exactly as the session
+    /// does, and return the journal extended by what this turn kept.
     async fn run_prefix_turn(
         cwd: PathBuf,
         session_id: Uuid,
-        conversation: Vec<ModelMessage>,
+        mut journal: Vec<SessionEvent>,
         prompt: &str,
         volatile: &str,
         truncate_forever: bool,
         system_prompt_appendix: &str,
     ) -> PrefixTurn {
+        let provider = crate::CodingProvider::OpenRouter;
         let client = Arc::new(PrefixClient {
             rounds: Mutex::new(Vec::new()),
             truncate_forever,
         });
-        let mut durable = conversation.clone();
         let (events, completed) = run_turn_events(
             client.clone(),
             cwd,
             session_id,
-            conversation,
+            crate::session::native_conversation(&journal, provider).unwrap(),
+            crate::session::prompt_context_base(&journal),
             prompt,
             volatile,
             system_prompt_appendix,
         )
         .await;
+        let message_id = Uuid::new_v4();
+        let mut keep = |kind: SessionEventKind| {
+            let sequence = journal.len() as u64 + 1;
+            journal.push(SessionEvent::new(session_id, sequence, kind));
+        };
+        keep(SessionEventKind::TurnStarted {
+            message_id,
+            provider,
+            model: None,
+            effort: None,
+            fast: false,
+        });
         for event in events {
-            if let SessionEventKind::ProviderEvent { kind, payload, .. } = event
-                && (kind == "native_prompt_context" || kind == "native_model_message")
-                && let Ok(message) = serde_json::from_value::<ModelMessage>(payload)
+            if event.persistence() == crate::session_store::EventPersistence::Durable
+                && event.is_context_relevant()
             {
-                durable.push(message);
+                keep(event);
             }
         }
+        keep(SessionEventKind::TurnCompleted {
+            message_id,
+            provider_session_id: None,
+            final_text: String::new(),
+            error: None,
+        });
         let rounds = client.rounds.lock().unwrap().clone();
         PrefixTurn {
             rounds,
-            durable,
+            journal,
             completed,
         }
     }
@@ -6936,6 +6940,7 @@ mod tests {
             cwd,
             Uuid::new_v4(),
             conversation,
+            HashMap::new(),
             "go",
             "",
             "",
@@ -7000,6 +7005,7 @@ mod tests {
             root.path().to_path_buf(),
             Uuid::new_v4(),
             vec![ModelMessage::user("x".repeat(40_000))],
+            HashMap::new(),
             "go",
             "",
             "",
@@ -7072,6 +7078,7 @@ mod tests {
             root.path().to_path_buf(),
             Uuid::new_v4(),
             Vec::new(),
+            HashMap::new(),
             "read",
             "",
             "",
@@ -7185,6 +7192,7 @@ mod tests {
             cwd,
             Uuid::new_v4(),
             vec![ModelMessage::user("x".repeat(200_000))],
+            HashMap::new(),
             "go",
             "",
             "",
@@ -7246,7 +7254,7 @@ mod tests {
         let second = run_prefix_turn(
             cwd.clone(),
             session_id,
-            first.durable.clone(),
+            first.journal.clone(),
             "still checking",
             "usage available: 5-hour 12% left (resets 2026-01-02T00:00:00Z)",
             false,
@@ -7278,6 +7286,24 @@ mod tests {
         assert!(tail(first_messages).contains("65% left"));
         assert!(tail(second_messages).contains("12% left"));
         assert!(!tail(second_messages).contains("65% left"));
+
+        // Status the model already holds is not appended again.
+        let third = run_prefix_turn(
+            cwd,
+            session_id,
+            second.journal.clone(),
+            "and again",
+            "usage available: 5-hour 12% left (resets 2026-01-02T00:00:00Z)",
+            false,
+            "",
+        )
+        .await;
+        let third_messages = third.rounds.first().expect("a third model round");
+        assert_eq!(
+            json(&third_messages[..second_messages.len()]),
+            json(second_messages)
+        );
+        assert_eq!(tail(third_messages), "and again");
     }
 
     /// The skills/MCP text is not part of the immutable instructions head. On a
@@ -7499,6 +7525,7 @@ mod tests {
                 extension_api: Default::default(),
                 system_prompt_appendix: String::new(),
                 declaration_base: None,
+                prompt_context_base: Default::default(),
                 claude_native_subagents: false,
                 volatile_system_prompt_appendix: String::new(),
             };
@@ -7736,6 +7763,7 @@ mod tests {
                 extension_api: Default::default(),
                 system_prompt_appendix: String::new(),
                 declaration_base: None,
+                prompt_context_base: Default::default(),
                 claude_native_subagents: false,
                 volatile_system_prompt_appendix: String::new(),
             };
@@ -8192,6 +8220,7 @@ mod tests {
                 extension_api: Default::default(),
                 system_prompt_appendix: String::new(),
                 declaration_base: None,
+                prompt_context_base: Default::default(),
                 claude_native_subagents: false,
                 volatile_system_prompt_appendix: String::new(),
             };
