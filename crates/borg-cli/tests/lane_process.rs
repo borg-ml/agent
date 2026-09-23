@@ -376,6 +376,65 @@ fn jobs_are_abandoned_only_once_nobody_waits_for_them() {
     lane.until(|| cancelled(&running).then_some(()));
 }
 
+/// Failure mode: a lock keeper cannot learn that its workload started, a
+/// bounded wait cannot give up (or ends the job when it does), or a script
+/// cannot read why a job ended or is still waiting.
+#[test]
+fn wait_until_started_and_timeout_leave_the_job_alone() {
+    let lane = Lane::new();
+    let mut long = lane.spec("long", "exec sleep 30");
+    long.timeout_ms = 60_000;
+    let long = lane.submit(&long);
+    let started = lane.cli(&["job", "wait", &long, "--until", "started"], None);
+    assert!(started.status.success(), "{}", describe(&started));
+    let value: Value = serde_json::from_slice(&started.stdout).unwrap();
+    assert!(value["state"]["Running"].is_object(), "{value}");
+
+    let queued = lane.submit(&lane.spec("queued", "true"));
+    let timed = lane.cli(
+        &[
+            "job",
+            "wait",
+            &queued,
+            "--until",
+            "started",
+            "--timeout",
+            "1",
+        ],
+        None,
+    );
+    assert_eq!(timed.status.code(), Some(124), "{}", describe(&timed));
+    assert!(
+        String::from_utf8_lossy(&timed.stderr)
+            .contains(&format!("timed out waiting for job {queued}"))
+    );
+    let value: Value = serde_json::from_slice(&timed.stdout).unwrap();
+    assert_eq!(value["timed_out"], true);
+    let status: Value = lane.json(&["job", "status", &queued]);
+    assert_eq!(status["state"], "Queued", "{status}");
+    assert!(
+        status["wait_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("busy")),
+        "{status}"
+    );
+
+    lane.json::<Value>(&["job", "cancel", &long]);
+    let out = lane.cli(&["job", "wait", &long], None);
+    assert_eq!(out.status.code(), Some(CANCELLED), "{}", describe(&out));
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["reason"], "cancelled by requester");
+    assert!(value["exit_code"].is_null());
+    assert!(
+        value["evidence"]
+            .as_str()
+            .is_some_and(|e| e.contains("cancelled"))
+    );
+    let done = lane.wait(&queued, 0);
+    assert_eq!(done["exit_code"], 0, "{done}");
+    assert!(done.as_object().unwrap().contains_key("wait_reason"));
+}
+
 /// Several agents submit a mixed workload concurrently. Judged only from the
 /// CLI's own status records: jobs holding the same exclusive key never
 /// overlap, a shared host capacity is never over-admitted, and every job ends.
