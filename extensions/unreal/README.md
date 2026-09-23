@@ -61,6 +61,10 @@ Each helper-launched UBT process (including a startup retry) also receives
 its own private `TMPDIR` and `UBA_FILE_MAPPING_DIR`; they are removed after
 that process exits. This isolates Borg jobs from concurrent Abundance-lane
 UBA mappings without copying the Abundance queue into the adapter.
+The helper also writes an adjacent per-revision `.metrics.json` before exiting:
+UBT wall time, max RSS of any directly waited-for child (not aggregate), and
+Linux scope `memory.peak` when available (includes cache, not pure RSS). A
+missing peak is reported as missing, not inferred from a dead systemd unit.
 When installed Linux symbol tools are present, UBT uses `-NoDumpSyms` and the
 core post-hook regenerates symbols for changed libraries. The post-hook is not
 an authority for job admission. Generated outputs and intermediates remain
