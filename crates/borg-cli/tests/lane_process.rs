@@ -7,7 +7,7 @@ mod support;
 
 use std::process::Command;
 
-use borg_lanes::lanes::{Access, Hook, ResourceKey, ResourceRequest, ResourceScope};
+use borg_lanes::lanes::{Access, Hook, JobState, ResourceKey, ResourceRequest, ResourceScope};
 use serde_json::Value;
 use support::{BORG, CANCELLED, Lane, describe, lines, position, traced};
 
@@ -337,6 +337,43 @@ fn processes_left_by_a_workload_die_before_the_next_holder_starts() {
         evidence.contains(&format!("killed leftover pids [{}]", pid.trim())),
         "{evidence}"
     );
+}
+
+/// Failure mode: a job whose requester went away (its `job wait` killed,
+/// a shell closed) still queueing or running a build nobody wants; or a
+/// job that someone does wait for being abandoned.
+#[test]
+fn jobs_are_abandoned_only_once_nobody_waits_for_them() {
+    let lane = Lane::new();
+    let state = |id: &str| {
+        lane.record(id)
+            .and_then(|record| record.job)
+            .map(|job| job.state)
+    };
+    let cancelled = |id: &str| matches!(state(id), Some(JobState::Cancelled { ref reason }) if reason == "abandoned: no requester");
+    let mut kept = lane.spec("kept", "sleep 1.5");
+    kept.abandon_after_ms = Some(500);
+    let kept = lane.submit(&kept);
+    lane.wait(&kept, 0);
+
+    let mut running = lane.spec("running", "exec sleep 30");
+    running.timeout_ms = 60_000;
+    running.abandon_after_ms = Some(500);
+    let running = lane.submit(&running);
+    let mut waiter = lane.command(&["job", "wait", &running]).spawn().unwrap();
+    lane.until(|| matches!(state(&running), Some(JobState::Running { .. })).then_some(()));
+    // Queued behind `running`, and nobody waits for it.
+    let mut queued = lane.spec("queued", "true");
+    queued.abandon_after_ms = Some(500);
+    let queued = lane.submit(&queued);
+    lane.until(|| cancelled(&queued).then_some(()));
+    assert!(
+        matches!(state(&running), Some(JobState::Running { .. })),
+        "a job with a live waiter was abandoned"
+    );
+    waiter.kill().unwrap();
+    waiter.wait().unwrap();
+    lane.until(|| cancelled(&running).then_some(()));
 }
 
 /// Several agents submit a mixed workload concurrently. Judged only from the

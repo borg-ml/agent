@@ -891,6 +891,7 @@ pub(crate) mod tests {
         JobSpec {
             foreign_client_grace_ms: 0,
             foreign_client_grace_by_resource: vec![],
+            abandon_after_ms: None,
             fingerprint: JobFingerprint("fp".into()),
             lease: LeaseRequest {
                 resources: vec![ResourceRequest {
