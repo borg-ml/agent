@@ -172,6 +172,16 @@ lane job submit|wait ID|status ID|logs ID|cancel ID|recover --dry-run`,
 supervisor event notification, with queue timeout and a terminal exit code.
 Do not block a model tool call indefinitely to wait for a job.
 
+Lanes worker's **implementation draft** uses `borg lane job submit --spec
+SPEC.json --json` (or `--spec -` for stdin), `borg lane job wait JOB_ID
+--json`, `borg lane job status [JOB_ID] --json`, and global `--state-dir` /
+`BORG_LANE_DIR`. `SPEC.json` is serialized `JobSpec`; shell adapter paths
+should construct/validate it, never forward raw model argv. The earlier
+`--adapter/--template` CLI shorthand is future validated-template sugar, **not**
+part of the draft CLI. `wait` blocks on a kernel lock and returns job exit
+status, so a model-facing workflow submits first and watches the CLI wait
+command rather than invoking a long synchronous workflow.
+
 Proposed MCP tools and minimal JSON schemas (required shown, optional in
 brackets): `lane_submit_job {adapter:string,template:string,project:string,
 inputs:object,[idempotency_key:string]} → {job_id,ticket,state,log_path}`;
@@ -233,3 +243,9 @@ producer-aware watch. See `docs/watcher-yield.md` and runtime `watch.rs`.
 - D8: VCS-native binary asset locks (P4, UVCS, Git LFS, etc.) remain
   authoritative for edit checkout; host lane resources do not replace them.
   Adapters must gate mutating asset actions against project VCS policy.
+
+- D9: lanes owner fixed draft CLI as JSON `JobSpec` via `--spec` and a
+  blocking `job wait ID` command; adapters must not assume `--adapter` and
+  `--template` shorthand until validated template admission is implemented.
+  Model-facing tools must validate/admit named templates rather than accept
+  untrusted arbitrary process argv.
