@@ -82,6 +82,10 @@ cli:
     set -euo pipefail
     install_root="${BORG_CLI_INSTALL_ROOT:-$HOME/.local}"
     cargo install --root "$install_root" --path crates/borg-cli --locked --force --bin borg
+    if [[ "$(uname -s)" == "Linux" ]]; then
+      # The computer-use private display; the helper finds it next to borg.
+      cargo install --root "$install_root" --path crates/borg-display --locked --force --bin borg-display
+    fi
     hash -r
     installed="$install_root/bin/borg"
     resolved="$(command -v borg)"
