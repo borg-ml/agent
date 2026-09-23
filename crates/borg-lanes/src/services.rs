@@ -24,7 +24,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::lanes::{AdmissionBudget, Holder, Hook, ResourceRequest};
+use crate::lanes::{
+    Access, AdmissionBudget, Holder, Hook, LaneStore, Lease, LeaseRequest, ResourceRequest,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HealthCheck {
@@ -192,16 +194,7 @@ fn unix_ms() -> u64 {
 
 /// The runtime root can be private to a test, user, or installation. IDs never become paths unchecked.
 pub fn service_root() -> PathBuf {
-    std::env::var_os("BORG_LANES_ROOT")
-        .or_else(|| std::env::var_os("BORG_LANE_DIR"))
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("XDG_RUNTIME_DIR").map(|p| PathBuf::from(p).join("borg/lanes"))
-        })
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("borg-lanes-{}", unsafe { libc::geteuid() }))
-        })
-        .join("services")
+    crate::lanes::LaneStore::default_root().join("services")
 }
 
 fn service_dir(root: &Path, id: &str) -> Result<PathBuf> {
@@ -263,6 +256,10 @@ fn valid_spec(spec: &ServiceSpec) -> Result<()> {
     ensure!(
         !spec.argv.is_empty() && !spec.argv[0].is_empty() && spec.cwd.is_dir(),
         "service needs argv and existing cwd"
+    );
+    ensure!(
+        !spec.resources.is_empty(),
+        "service must bind at least one lane resource"
     );
     ensure!(
         spec.health.timeout_ms > 0 && spec.health.interval_ms > 0 && spec.readiness_timeout_ms > 0,
@@ -781,6 +778,53 @@ async fn restore_client(spec: &ServiceSpec, lease: &ClientLease, port: Option<u1
     Ok(())
 }
 
+/// The held lane lease spans every live backend and candidate. Admission is
+/// serialized with exclusive Preparing/Granted under the lane state.lock.
+struct ServiceGate {
+    store: LaneStore,
+    request: LeaseRequest,
+    lease: Option<Lease>,
+}
+impl ServiceGate {
+    fn new(root: &Path, spec: &ServiceSpec) -> Result<Self> {
+        let id = Uuid::new_v5(&Uuid::NAMESPACE_OID, spec.id.as_bytes());
+        Ok(Self {
+            store: LaneStore::new(root.parent().context("service root has no lane parent")?)?,
+            request: LeaseRequest {
+                resources: spec
+                    .resources
+                    .iter()
+                    .map(|r| ResourceRequest {
+                        key: r.key.clone(),
+                        access: Access::Shared { slots: 1 },
+                    })
+                    .collect(),
+                holder: Holder {
+                    participant_id: id,
+                    session_id: id,
+                    host_pid: Some(std::process::id()),
+                    purpose: format!("service:{}", spec.id),
+                },
+                queue_timeout_ms: None,
+            },
+            lease: None,
+        })
+    }
+    fn acquire(&mut self) -> Result<bool> {
+        if self.lease.is_none() {
+            self.lease = self.store.try_acquire_service(self.request.clone())?;
+        }
+        Ok(self.lease.is_some())
+    }
+    fn release(&mut self) -> Result<()> {
+        if let Some(lease) = &self.lease {
+            self.store.release_lease(lease)?;
+            self.lease = None;
+        }
+        Ok(())
+    }
+}
+
 /// Run in the private transient user unit (or in a detached setsid process). The lock FD
 /// outlives this task; a second process cannot attach a competing backend or public port.
 pub async fn supervise(root: &Path, id: &str) -> Result<()> {
@@ -789,6 +833,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
     let spec: ServiceSpec = read_json(&dir.join("spec.json"))?;
     ensure!(spec.id == id, "service spec identity mismatch");
     valid_spec(&spec)?;
+    let mut gate = ServiceGate::new(root, &spec)?;
     use std::os::unix::fs::OpenOptionsExt;
     let log = OpenOptions::new()
         .create(true)
@@ -908,6 +953,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                 stop_child(&mut b.child, &spec, b.port).await;
             }
             status.backend_pid = None;
+            gate.release()?;
             transition(
                 &dir,
                 &mut status,
@@ -941,6 +987,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                                 &mut stopping,
                                 &mut last_activity,
                                 &mut idle,
+                                &mut gate,
                             )
                             .await
                             .map(|_| serde_json::to_value(&status).unwrap_or_default()),
@@ -974,6 +1021,25 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
         }
         if status.yields.is_empty() && active.is_none() && candidate.is_none() && now >= next_launch
         {
+            if !gate.acquire()? {
+                if !matches!(status.state, ServiceState::Degraded { .. })
+                    || status.reason != "waiting for lane resource admission"
+                {
+                    transition(
+                        &dir,
+                        &mut status,
+                        &front,
+                        ServiceState::Degraded {
+                            reason: "waiting for lane resource admission".into(),
+                        },
+                        "waiting for lane resource admission",
+                        None,
+                    )
+                    .await?;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
             let port = next_port_after(&spec, last_port);
             last_port = port;
             match spawn_backend(&spec, port, &log) {
@@ -1190,6 +1256,9 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                 }
             }
         }
+        if active.is_none() && candidate.is_none() {
+            gate.release()?;
+        }
         if status.yields.is_empty()
             && active.is_some()
             && status.clients.is_empty()
@@ -1219,6 +1288,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
     if let Some(mut b) = active {
         stop_child(&mut b.child, &spec, b.port).await;
     }
+    gate.release()?;
     for lease in status.clients.clone() {
         restore_client(&spec, &lease, None).await?;
     }
@@ -1248,6 +1318,7 @@ async fn handle_request(
     stopping: &mut bool,
     last_activity: &mut u64,
     idle: &mut bool,
+    gate: &mut ServiceGate,
 ) -> Result<()> {
     let now = unix_ms();
     match request {
@@ -1268,6 +1339,7 @@ async fn handle_request(
                 stop_child(&mut b.child, spec, b.port).await;
             }
             status.backend_pid = None;
+            gate.release()?;
             *stopping = true;
             publish(dir, status)?;
         }
@@ -1337,6 +1409,7 @@ async fn handle_request(
                 stop_child(&mut b.child, spec, b.port).await;
             }
             status.backend_pid = None;
+            gate.release()?;
             transition(
                 dir,
                 status,
@@ -1826,6 +1899,72 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
     }
 
     #[tokio::test]
+    async fn expired_yield_and_restart_cannot_spawn_during_exclusive_lease() {
+        use crate::lanes::{LaneCoordinator, TicketState};
+        let (root, manager, front, task) = setup().await;
+        let store = LaneStore::new(root.path()).unwrap();
+        assert!(
+            store
+                .snapshot()
+                .unwrap()
+                .iter()
+                .any(|r| r.service_lease && matches!(r.state, TicketState::Granted(_)))
+        );
+        manager
+            .send(
+                "fake",
+                ServiceRequest::Yield {
+                    by: "job".into(),
+                    reason: "exclusive".into(),
+                    ttl_ms: 200,
+                },
+                Duration::from_secs(8),
+            )
+            .await
+            .unwrap();
+        let ticket = store
+            .enqueue_lease(LeaseRequest {
+                resources: vec![ResourceRequest {
+                    key: ResourceKey {
+                        scope: ResourceScope::Host,
+                        name: "fake-exclusive".into(),
+                    },
+                    access: Access::Exclusive,
+                }],
+                holder: owner(),
+                queue_timeout_ms: Some(2_000),
+            })
+            .unwrap();
+        let exclusive = store.wait(&ticket).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        manager
+            .send(
+                "fake",
+                ServiceRequest::Restart {
+                    reason: "during exclusive".into(),
+                    force: true,
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        assert!(manager.read_status("fake").unwrap().backend_pid.is_none());
+        assert!(
+            get(front, "/health")
+                .await
+                .unwrap()
+                .contains("503 Service Unavailable")
+        );
+        store.release(&exclusive).await.unwrap();
+        state(&manager, |s| {
+            matches!(s.state, ServiceState::Healthy { .. })
+        })
+        .await;
+        cleanup(&manager, task).await;
+    }
+
+    #[tokio::test]
     async fn active_lease_restored_before_yield_and_owner_controls_resume() {
         let (root, manager, front, task) = setup().await;
         let holder = owner();
@@ -1986,8 +2125,7 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
         tokio::time::sleep(Duration::from_millis(25)).await;
         let _ = stream
             .write_all(b"POST /bad HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
-            .await
-            .unwrap();
+            .await;
         let mut reply = Vec::new();
         tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut reply))
             .await
