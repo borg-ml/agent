@@ -55,6 +55,9 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.cli('editor', 'spec').returncode, 2)
 
     def test_build_project_alias_normalized_and_conflicts_rejected(self):
+        # Pin -MaxParallelActions despite host MemAvailable changing mid-test.
+        (self.project.parent / '.borg-unreal.toml').write_text(
+            '[build]\ngb_per_action = 0.01\nreserve_ram_gb = 0\n')
         canonical = json.loads(self.cli('build', '--spec', 'GameEditor', 'Linux',
                                         'Development', str(self.project)).stdout)
         alias = str(self.project.parent / '..' / 'Game' / 'Game.uproject')
@@ -205,7 +208,7 @@ class AdapterTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get('BORG_UNREAL_TEST_SERVICE_CLI'),
                          'set BORG_UNREAL_TEST_SERVICE_CLI for the fake service smoke')
     def test_isolated_core_service_with_fake_editor(self):
-        """Fake MCP health/proxy/stop, not live Unreal or D11 handoff."""
+        """Fake MCP health, test-only exclusive handoff and stop; not real UE."""
         binary = Path(os.environ['BORG_UNREAL_TEST_SERVICE_CLI']).resolve(strict=True)
         runtime = os.environ.get('XDG_RUNTIME_DIR')
         bus = os.environ.get('DBUS_SESSION_BUS_ADDRESS')
@@ -260,7 +263,10 @@ HTTPServer(('127.0.0.1', port), Handler).serve_forever()
         (self.project.parent / '.borg-unreal.toml').write_text(
             '[editor]\nport = {}\nbackend_ports = [{}, {}]\n'
             'memory_max_gb = 1\nmin_available_ram_gb = 0\nreserve_ram_gb = 0\n'
-            'min_free_disk_gb = 0\nreserve_disk_gb = 0\n'.format(*ports))
+            'min_free_disk_gb = 0\nreserve_disk_gb = 0\n'
+            '[run]\nmemory_max_gb = 1\nmin_available_ram_gb = 0\n'
+            'reserve_ram_gb = 0\nmin_free_disk_gb = 0\n'
+            'reserve_disk_gb = 0\n'.format(*ports))
         generated = self.cli('editor', 'spec')
         self.assertEqual(generated.returncode, 0, generated.stderr)
         definition = json.loads(generated.stdout)
@@ -285,6 +291,57 @@ HTTPServer(('127.0.0.1', port), Handler).serve_forever()
                 urllib.request.urlopen(request, timeout=4).read()
             self.assertEqual(denied.exception.code, 403)
             denied.exception.close()
+            before = json.loads(status.stdout)['backend_pid']
+            marker = self.root / 'exclusive-observed'
+            # This test submits a spec directly to core; the public adapter
+            # deliberately still refuses non-spec exclusive runs.
+            probe = ("import socket, urllib.request, urllib.error\n"
+                     "from pathlib import Path\n"
+                     f"ports = {ports!r}\n"
+                     "for port in ports[1:]:\n"
+                     "    with socket.socket() as sock:\n"
+                     "        assert sock.connect_ex(('127.0.0.1', port)) != 0\n"
+                     "try:\n"
+                     "    urllib.request.urlopen(f'http://127.0.0.1:{ports[0]}/mcp', timeout=4)\n"
+                     "except urllib.error.HTTPError as error:\n"
+                     "    assert error.code == 503, error.code\n"
+                     "else:\n"
+                     "    raise AssertionError('fenced proxy routed during exclusive job')\n"
+                     f"Path({str(marker)!r}).write_text('fenced')\n")
+            generated = self.cli('run', 'commandlet', '--spec', '--',
+                                 sys.executable, '-c', probe)
+            self.assertEqual(generated.returncode, 0, generated.stderr)
+            spec = json.loads(generated.stdout)
+            self.assertEqual(spec['lease']['resources'][0]['key'],
+                             definition['resources'][0]['key'])
+            submit = subprocess.run([str(binary), 'lane', 'job', 'submit',
+                                     '--spec', '-', '--json'], input=json.dumps(spec),
+                                    env=self.env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(submit.returncode, 0, submit.stderr)
+            job = json.loads(submit.stdout)['job_id']
+            done = subprocess.run([str(binary), 'lane', 'job', 'wait', job,
+                                   '--json'], env=self.env, capture_output=True,
+                                  text=True, timeout=30)
+            result = json.loads(done.stdout)
+            log_path = Path(result['log_path'])
+            log = log_path.read_text() if log_path.is_file() else '(missing job log)'
+            self.assertEqual(done.returncode, 0, done.stderr + done.stdout + log)
+            self.assertEqual(result['state'], {'Finished': {'exit_code': 0}}, log)
+            self.assertEqual(marker.read_text(), 'fenced')
+            # The core resumes asynchronously after the job releases its key.
+            events = self.root / 'service-lane/services' / service
+            record = {}
+            for _ in range(4):
+                resumed = self.cli('editor', 'status')
+                self.assertEqual(resumed.returncode, 0, resumed.stderr)
+                record = json.loads(resumed.stdout)
+                if record.get('backend_pid') and 'Healthy' in record.get('state', {}):
+                    break
+                subprocess.run(['inotifywait', '-q', '-t', '2', '-e', 'moved_to',
+                                str(events)], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=3)
+            self.assertIn('Healthy', str(record['state']))
+            self.assertNotEqual(record['backend_pid'], before)
         finally:
             if attempted:
                 stopped = self.cli('editor', 'stop')
