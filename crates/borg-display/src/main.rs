@@ -10,6 +10,11 @@ mod control;
 
 #[cfg(target_os = "linux")]
 fn main() {
+    // The self-updater verifies a staged compositor against the release version.
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("borg-display {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if let Err(error) = compositor::run() {
         eprintln!("borg-display: {error:#}");
         std::process::exit(1);
