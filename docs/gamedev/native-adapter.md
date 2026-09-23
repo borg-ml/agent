@@ -85,6 +85,19 @@ database passwords in job specs.
   released its lease, and left the service Healthy with zero clients and zero
   `borg_native_%` databases. A prior malformed Cargo invocation returned exit
   1 but also cleaned up its lease and database.
+- Rebased only nine native commits onto final compatible `gamedev/services`
+  @`e29b2af` (it descends from rebased design and final productivity base).
+  Native `3432b79` built its own CLI through capped lane job `631fe619-...`
+  (`Finished(exit_code=0)`, 3m27s compile). The rebased CLI restarted the
+  owned peer-only `test-postgres` fixture as Healthy. An initial leased Cargo
+  run `785729d1-...` passed 885, failed 1, ignored 9, filtered 2: the
+  unrelated, intermittent `native_mcp::tests::startup_failure_reports_the_server_exit_status_and_stderr`
+  lost subprocess stderr (4/4 isolated checks passed on the rebased binary;
+  1/3 failed on an older binary). A separate leased retry `97ddd78f-...`
+  passed 886/0, ignored 9, filtered 2 in 28.70 s. Each run confirmed terminal
+  status and left zero client leases and zero `borg_native_%` databases. The
+  rebased CTest lane job `20e24604-...` passed `cave-network-tests` 1/1 in
+  1.20 s. The two pre-existing filtered tests remain unclaimed.
 - Borg SQLx Postgres coverage through peer-compatible socket URL
   `postgresql://shulgin@localhost/postgres?host=/tmp/gd-native-pg-benchmark&port=55471`:
   `workspace_conformance::the_shared_read_surface_answers_identically`
