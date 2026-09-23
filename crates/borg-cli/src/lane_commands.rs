@@ -192,7 +192,10 @@ pub(crate) async fn run(args: LaneArgs) -> Result<()> {
                     JobState::Finished { exit_code } if exit_code != 0 => {
                         std::process::exit(exit_code.clamp(1, 255))
                     }
-                    JobState::Cancelled { .. } => std::process::exit(125),
+                    JobState::Cancelled { reason } => {
+                        eprintln!("job {id} cancelled: {reason}");
+                        std::process::exit(125)
+                    }
                     _ => {}
                 }
             }
@@ -238,8 +241,16 @@ pub(crate) async fn run(args: LaneArgs) -> Result<()> {
             }
             JobCommand::Cancel { id } => {
                 store.cancel_ticket(id, "cancelled by requester")?;
+                // A queued job is cancelled at once; a running one when its
+                // supervisor has killed the workload (`job wait` reports it).
+                let state = match store.job_status(id)?.state {
+                    JobState::Cancelled { .. } => "cancelled",
+                    _ => "cancel_requested",
+                };
                 if json {
-                    println!("{}", serde_json::json!({"job_id":id,"state":"cancelled"}));
+                    println!("{}", serde_json::json!({"job_id": id, "state": state}));
+                } else {
+                    println!("{id} {state}");
                 }
             }
             JobCommand::Recover(args) => recover(&store, args, json)?,
