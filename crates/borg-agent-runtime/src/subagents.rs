@@ -4504,29 +4504,38 @@ impl SubagentCoordinator {
                     .entries
                     .get_mut(&session_id)
                     .with_context(|| format!("unknown subagent session {session_id}"))?;
-                anyhow::ensure!(
-                    !entry.snapshot.status.is_terminal(),
-                    "subagent {} is not running",
-                    entry.snapshot.task_name
-                );
+                let terminal = entry.snapshot.status.is_terminal();
                 if entry.commands.is_some() {
-                    return Ok(());
-                }
-                if entry.dormant {
+                    if !terminal {
+                        return Ok(());
+                    }
+                    // A stopping actor still owns its channel; wait for it to
+                    // exit before starting a fresh actor on the same session.
+                    None
+                } else if entry.dormant || terminal {
+                    // Stopped and Failed only mean "no live actor and no
+                    // automatic resume". An explicit follow-up, wake or prompt
+                    // is the owner asking for this worker again, so start it on
+                    // its existing session and journal instead of refusing.
                     anyhow::ensure!(
                         active < max_children,
                         "subagent concurrency limit reached ({max_children})"
                     );
+                    let previous = (entry.snapshot.status, entry.snapshot.detail.clone());
                     entry.dormant = false;
                     entry.snapshot.status = SubagentStatus::Starting;
                     entry.snapshot.updated_at = Utc::now();
-                    entry.snapshot.detail = Some("Waking after parent resume".to_string());
-                    Some(entry.snapshot.clone())
+                    entry.snapshot.detail = Some(if terminal {
+                        "Waking stopped subagent after explicit follow-up".to_string()
+                    } else {
+                        "Waking after parent resume".to_string()
+                    });
+                    Some((entry.snapshot.clone(), terminal.then_some(previous)))
                 } else {
                     None
                 }
             };
-            if let Some(snapshot) = wake {
+            if let Some((snapshot, revived_from)) = wake {
                 let mut launch = self.root_launch.clone();
                 launch.request_id = Uuid::new_v4();
                 launch.initial_prompt = None;
@@ -4538,8 +4547,17 @@ impl SubagentCoordinator {
                 if let Err(error) = self.start_reserved(snapshot.clone(), launch, false).await {
                     let mut table = self.table.lock().await;
                     if let Some(entry) = table.entries.get_mut(&session_id) {
-                        entry.dormant = true;
-                        entry.snapshot.status = SubagentStatus::Ready;
+                        entry.commands = None;
+                        match revived_from {
+                            Some((status, _)) => {
+                                entry.dormant = false;
+                                entry.snapshot.status = status;
+                            }
+                            None => {
+                                entry.dormant = true;
+                                entry.snapshot.status = SubagentStatus::Ready;
+                            }
+                        }
                         entry.snapshot.detail = Some(format!("Could not wake: {error:#}"));
                     }
                     return Err(error);
@@ -5006,13 +5024,11 @@ impl SubagentCoordinator {
         options: TeamMessageOptions,
     ) -> Result<RoutedTeamMessage> {
         let message = required_message(message)?;
-        let (actor, local_id, root_session_id, status) = {
+        let (actor, local_id, root_session_id) = {
             let table = self.table.lock().await;
             let actor = table.task_name(actor_session_id)?;
             let id = table.resolve(target).ok();
-            let status =
-                id.and_then(|id| table.entries.get(&id).map(|entry| entry.snapshot.status));
-            (actor, id, table.root_session_id, status)
+            (actor, id, table.root_session_id)
         };
         let id = match local_id {
             Some(id) => id,
@@ -5035,9 +5051,6 @@ impl SubagentCoordinator {
             id != actor_session_id,
             "message recipient must differ from its author"
         );
-        if status.is_some_and(SubagentStatus::is_terminal) {
-            bail!("subagent {target} is not running");
-        }
         let (inbox_message, receipt) = self
             .persist_team_message(
                 actor_session_id,
@@ -5120,13 +5133,11 @@ impl SubagentCoordinator {
             .entries
             .get_mut(&id)
             .expect("resolved subagent exists");
-        if entry.snapshot.status.is_terminal() {
-            bail!("subagent {} is not running", entry.snapshot.task_name);
-        }
         if matches!(
             entry.snapshot.status,
             SubagentStatus::Running | SubagentStatus::WaitingForApproval | SubagentStatus::Starting
-        ) {
+        ) && entry.commands.is_some()
+        {
             send_prompt(entry, id, inbox_message).await?;
         } else {
             entry.inbox.push(inbox_message);
@@ -5210,9 +5221,6 @@ impl SubagentCoordinator {
             id != actor_session_id,
             "message recipient must differ from its author"
         );
-        if status.is_some_and(SubagentStatus::is_terminal) {
-            bail!("subagent {target} is not running");
-        }
         let (inbox_message, receipt) = self
             .persist_team_message(
                 actor_session_id,
@@ -5220,7 +5228,11 @@ impl SubagentCoordinator {
                 &actor,
                 &message,
                 PromptDelivery::Steer,
-                if local_id.is_none() || status == Some(SubagentStatus::Ready) {
+                if local_id.is_none()
+                    || status.is_some_and(|status| {
+                        status == SubagentStatus::Ready || status.is_terminal()
+                    })
+                {
                     DeliveryMode::Wake
                 } else {
                     DeliveryMode::Boundary
