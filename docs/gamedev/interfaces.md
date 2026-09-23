@@ -266,7 +266,10 @@ producer-aware watch. See `docs/watcher-yield.md` and runtime `watch.rs`.
   becomes Granted; the exclusive holder releases before service resume can
   reacquire. A pre-hook that runs *after* grant is too late to prove this
   ordering. No editor+exclusive parity claim until both owners demonstrate
-  this handshake under crash/restart and identical canonical root/key.
+  this handshake under crash/restart and identical canonical root/key. A
+  timed yield must not expire into a service restart while the exclusive
+  lease still exists; all service startup/resume paths recheck the gate
+  atomically, including after supervisor crash.
 - D12: on Linux production jobs need a verified systemd-owned scope/cgroup.
   An opt-in degraded/test-only process-group fallback may signal a group only
   while its recorded leader PID, start ticks and PGID match. If the leader
