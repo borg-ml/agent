@@ -626,6 +626,27 @@ impl LaneStore {
         self.root.join("jobs").join(id.to_string())
     }
 
+    /// Drop expired terminal records (see `expired_records`) with their job
+    /// directories and lock files. Runs whenever a ticket is created, which
+    /// is the only way the journal grows.
+    fn prune(&self, state: &mut Journal) {
+        let max_age_ms = std::env::var("BORG_LANE_RETAIN_SECONDS")
+            .ok()
+            .and_then(|seconds| seconds.parse::<u64>().ok())
+            .unwrap_or(RETAIN_SECONDS)
+            .saturating_mul(1000);
+        let expired = expired_records(state, milliseconds(), max_age_ms, RETAIN_RECORDS);
+        if expired.is_empty() {
+            return;
+        }
+        state.records.retain(|r| !expired.contains(&r.ticket.id));
+        for id in expired {
+            let _ = fs::remove_dir_all(self.job_dir(id));
+            let _ = fs::remove_file(self.ticket_path(id));
+            let _ = fs::remove_file(self.root.join("locks").join(format!("resume-{id}.flock")));
+        }
+    }
+
     fn validate(request: &LeaseRequest, capacities: &[Capacity]) -> Result<()> {
         ensure!(
             !request.resources.is_empty(),
@@ -658,6 +679,7 @@ impl LaneStore {
         request: LeaseRequest,
         spec: Option<JobSpec>,
     ) -> Result<(Ticket, Option<JobHandle>)> {
+        self.prune(state);
         Self::validate(&request, &state.capacities)?;
         if let Some(ref spec) = spec {
             let mut grace_keys = HashSet::new();
@@ -1367,9 +1389,11 @@ impl LaneStore {
                     Ok(true)
                 }
                 TicketState::Preparing | TicketState::Granted(_) if record.job.is_some() => {
-                    record
-                        .cancel_requested
-                        .get_or_insert_with(|| reason.to_owned());
+                    if record.cancel_requested.is_none() {
+                        record.cancel_requested = Some(reason.to_owned());
+                        // A running supervisor watches this file, not the journal.
+                        fs::write(self.job_dir(id).join(CANCEL_MARKER), reason)?;
+                    }
                     Ok(false)
                 }
                 _ => bail!("cannot cancel a completed ticket or a service lease"),
@@ -1381,6 +1405,16 @@ impl LaneStore {
         Ok(())
     }
 }
+
+/// The file in a job's directory whose presence (holding the reason) asks
+/// its running supervisor to cancel it.
+const CANCEL_MARKER: &str = "cancel";
+
+/// Finished and cancelled records are kept for this long by default
+/// (`BORG_LANE_RETAIN_SECONDS`)...
+const RETAIN_SECONDS: u64 = 86_400;
+/// ...and at most this many of the newest are kept regardless of age.
+const RETAIN_RECORDS: usize = 2000;
 
 /// The evidence label for the processes `recover` killed.
 const RECOVER_KILLED: &str = "recover killed pids";
@@ -1427,6 +1461,49 @@ pub struct ResumeOutcome {
     /// `pending` (no attempt finished before the wait timed out).
     pub outcome: &'static str,
     pub error: Option<String>,
+}
+
+/// Finished or cancelled records past retention: older than `max_age_ms`
+/// or beyond the newest `keep` terminal records. Quarantined records, those
+/// with a service resume pending and those whose finish hook is still due
+/// or running are kept.
+fn expired_records(state: &Journal, now_ms: u64, max_age_ms: u64, keep: usize) -> HashSet<Uuid> {
+    let ended_ms = |r: &LaneRecord| r.finished_ms.unwrap_or(r.created_ms);
+    let mut terminal: Vec<&LaneRecord> = state
+        .records
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.state,
+                TicketState::Finished | TicketState::Cancelled { .. }
+            )
+        })
+        .collect();
+    terminal.sort_by_key(|r| std::cmp::Reverse((ended_ms(r), r.ticket.sequence)));
+    terminal
+        .into_iter()
+        .enumerate()
+        .filter(|(rank, r)| *rank >= keep || now_ms.saturating_sub(ended_ms(r)) > max_age_ms)
+        .filter(|(_, r)| {
+            !r.quarantined
+                && r.resume_pending.is_empty()
+                && !finish_hook_unclaimed(r)
+                && !finish_hook_running(r, now_ms)
+        })
+        .map(|(_, r)| r.ticket.id)
+        .collect()
+}
+
+/// A claimed finish hook with no outcome yet, within its time limit.
+fn finish_hook_running(row: &LaneRecord, now_ms: u64) -> bool {
+    let (Some(started), None, Some(hook)) = (
+        row.finish_hook_started_ms,
+        &row.finish_hook_outcome,
+        row.spec.as_ref().and_then(|spec| spec.finish_hook.as_ref()),
+    ) else {
+        return false;
+    };
+    now_ms.saturating_sub(started) < hook.timeout_ms.saturating_add(FINISH_HOOK_GRACE_MS)
 }
 
 /// An ended job whose finish hook was never claimed.
@@ -2366,6 +2443,12 @@ impl LaneStore {
         let mut last_progress = started;
         let mut last_size = 0;
         let mut last_cpu = 0.0;
+        // Progress reaches the journal at most once a second and only when
+        // it changed; otherwise the loop neither locks nor reads the journal
+        // and learns of a cancel from its marker file.
+        let mut journalled: Option<(u64, f64)> = None;
+        let mut journalled_at: Option<Instant> = None;
+        let cancel_marker = self.job_dir(id).join(CANCEL_MARKER);
         let leader = child.id();
         let (end, note) = loop {
             if let Some(status) = child.try_wait()? {
@@ -2382,16 +2465,22 @@ impl LaneStore {
             if self.abandoned(&spec, id, &mut last_requester_ms) {
                 self.cancel_ticket(id, ABANDONED)?;
             }
-            let cancel = self.locked(|state| {
-                let record = state
-                    .records
-                    .iter_mut()
-                    .find(|r| r.ticket.id == id)
-                    .context("job vanished")?;
-                record.progress = Some(format!("{} bytes", size));
-                record.cpu_seconds = Some(cpu);
-                Ok(record.cancel_requested.clone())
-            })?;
+            let due = journalled_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
+            if due && journalled != Some((size, cpu)) {
+                self.locked(|state| {
+                    let record = state
+                        .records
+                        .iter_mut()
+                        .find(|r| r.ticket.id == id)
+                        .context("job vanished")?;
+                    record.progress = Some(format!("{size} bytes"));
+                    record.cpu_seconds = Some(cpu);
+                    Ok(())
+                })?;
+                journalled = Some((size, cpu));
+                journalled_at = Some(Instant::now());
+            }
+            let cancel = fs::read_to_string(&cancel_marker).ok();
             let timed_out = started.elapsed() > Duration::from_millis(spec.timeout_ms);
             let stalled = spec
                 .stall_timeout_ms
@@ -3274,6 +3363,73 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// Failure mode: a journal that grows forever, or retention that drops a
+    /// record still needed (a quarantine, a pending service resume, a
+    /// finish hook not yet run, a live ticket).
+    #[test]
+    fn retention_expires_only_settled_terminal_records() {
+        let day = 86_400_000;
+        let now = 10 * day;
+        let ended = |seq: u64, age: u64| {
+            let mut row = record(seq, TicketState::Finished, vec![]);
+            row.finished_ms = Some(now - age);
+            row
+        };
+        let with_hook = |mut row: LaneRecord| {
+            row.spec = Some(JobSpec {
+                finish_hook: Some(Hook {
+                    argv: vec!["true".into()],
+                    timeout_ms: 1000,
+                }),
+                ..coalescing_spec(Path::new("/"), None)
+            });
+            row
+        };
+        let mut quarantined = ended(2, 2 * day);
+        quarantined.quarantined = true;
+        let mut resuming = ended(3, 2 * day);
+        resuming.resume_pending.push("editor".into());
+        let unclaimed = with_hook(ended(4, 2 * day));
+        let mut hook_running = with_hook(ended(5, 2 * day));
+        hook_running.finish_hook_started_ms = Some(now - 500);
+        let mut hook_lost = with_hook(ended(6, 2 * day));
+        hook_lost.finish_hook_started_ms = Some(now - day);
+        let mut hook_done = with_hook(ended(7, 2 * day));
+        hook_done.finish_hook_started_ms = Some(now - day);
+        hook_done.finish_hook_outcome = Some("exited 0".into());
+        let mut cancelled = ended(8, 2 * day);
+        cancelled.state = TicketState::Cancelled {
+            reason: "stop".into(),
+        };
+        let mut queued = record(9, TicketState::Queued, vec![]);
+        queued.created_ms = now - 2 * day;
+        let state = Journal {
+            records: vec![
+                ended(1, 2 * day),
+                quarantined,
+                resuming,
+                unclaimed,
+                hook_running,
+                hook_lost,
+                hook_done,
+                cancelled,
+                queued,
+                ended(10, 1000),
+            ],
+            ..Journal::default()
+        };
+        let ids =
+            |seqs: &[u128]| -> HashSet<Uuid> { seqs.iter().map(|s| Uuid::from_u128(*s)).collect() };
+        assert_eq!(expired_records(&state, now, day, 2000), ids(&[1, 6, 7, 8]));
+        // Past the newest `keep` terminal records, age no longer matters.
+        let recent = Journal {
+            records: (1..=5).map(|seq| ended(seq, 1000 * (10 - seq))).collect(),
+            ..Journal::default()
+        };
+        assert_eq!(expired_records(&recent, now, day, 3), ids(&[1, 2]));
+        assert!(expired_records(&recent, now, day, 5).is_empty());
     }
 
     /// Failure mode: a finish hook (the caller's cleanup) skipped on some

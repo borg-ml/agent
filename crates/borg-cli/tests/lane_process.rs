@@ -530,6 +530,112 @@ fn a_build_waiting_for_its_tree_does_not_hold_back_another_tree() {
     lane.wait(&behind, 0);
 }
 
+/// How many times the journal lock (taken by every journal read and write)
+/// was opened while `during` ran. Opens and closes alternate, so inotify
+/// does not coalesce them.
+fn journal_accesses(lane: &Lane, during: impl FnOnce()) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+    let path =
+        std::ffi::CString::new(lane.state().join("state.lock").as_os_str().as_bytes()).unwrap();
+    // SAFETY: a private inotify descriptor, read into a local buffer and
+    // closed before returning.
+    unsafe {
+        let fd = libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC);
+        assert!(fd >= 0);
+        assert!(libc::inotify_add_watch(fd, path.as_ptr(), libc::IN_OPEN | libc::IN_CLOSE) >= 0);
+        during();
+        let mut opens = 0;
+        let mut buffer = [0_u8; 1 << 16];
+        loop {
+            let read = libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len());
+            if read <= 0 {
+                break;
+            }
+            let mut offset = 0;
+            while offset < read as usize {
+                let event = buffer
+                    .as_ptr()
+                    .add(offset)
+                    .cast::<libc::inotify_event>()
+                    .read_unaligned();
+                if event.mask & libc::IN_OPEN != 0 {
+                    opens += 1;
+                }
+                offset += std::mem::size_of::<libc::inotify_event>() + event.len as usize;
+            }
+        }
+        libc::close(fd);
+        opens
+    }
+}
+
+/// Failure mode: every running job re-reading and rewriting the whole
+/// journal ten times a second (a lock keeper runs for hours), or a job
+/// that no longer notices its cancel once it stops reading the journal.
+#[test]
+fn running_jobs_touch_the_journal_only_when_progress_changes() {
+    let lane = Lane::new();
+    let run = |name: &str, script: &str| {
+        let mut spec = lane.spec(name, script);
+        spec.timeout_ms = 60_000;
+        let job = lane.submit(&spec);
+        let started = lane.cli(&["job", "wait", &job, "--until", "started"], None);
+        assert!(started.status.success(), "{}", describe(&started));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        job
+    };
+    let idle = run("idle", "exec sleep 30");
+    let quiet = journal_accesses(&lane, || {
+        std::thread::sleep(std::time::Duration::from_millis(1500))
+    });
+    assert_eq!(quiet, 0, "an idle running job touched the journal");
+    lane.json::<Value>(&["job", "cancel", &idle]);
+    lane.wait(&idle, CANCELLED);
+
+    let busy = run("busy", "while :; do echo tick; sleep 0.05; done");
+    let writes = journal_accesses(&lane, || {
+        std::thread::sleep(std::time::Duration::from_millis(2000))
+    });
+    assert!(
+        (1..=4).contains(&writes),
+        "{writes} journal accesses in 2 s"
+    );
+    lane.json::<Value>(&["job", "cancel", &busy]);
+    lane.wait(&busy, CANCELLED);
+    let progress = lane.record(&busy).unwrap().progress.unwrap_or_default();
+    assert!(
+        progress.ends_with(" bytes") && progress != "0 bytes",
+        "{progress}"
+    );
+}
+
+/// Failure mode: a journal that keeps every finished record forever (one
+/// keeper job per automation run adds thousands a day).
+#[test]
+fn finished_records_expire_with_their_job_directories() {
+    let lane = Lane::new();
+    let old = lane.submit(&lane.spec("old", "true"));
+    lane.wait(&old, 0);
+    let old_dir = lane.state().join("jobs").join(&old);
+    assert!(old_dir.is_dir());
+    let spec = lane.root.join("new.json");
+    std::fs::write(
+        &spec,
+        serde_json::to_vec(&lane.spec("new", "true")).unwrap(),
+    )
+    .unwrap();
+    let out = lane
+        .command(&["job", "submit", "--spec", spec.to_str().unwrap()])
+        .env("BORG_LANE_RETAIN_SECONDS", "0")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", describe(&out));
+    let new: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(lane.record(&old).is_none(), "expired record kept");
+    assert!(!old_dir.exists(), "expired job directory kept");
+    lane.wait(new["job_id"].as_str().unwrap(), 0);
+}
+
 /// A hook that appends its phase and the job's ending to `<root>/<name>.<phase>`.
 fn reporting_hook(lane: &Lane, name: &str, phase: &str) -> Hook {
     let out = lane.root.join(format!("{name}.{phase}"));
