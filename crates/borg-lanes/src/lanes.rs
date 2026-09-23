@@ -5057,7 +5057,6 @@ mod tests {
             .unwrap();
     }
 
-
     fn barrier_request(names: &[&str]) -> LeaseRequest {
         LeaseRequest {
             resources: names
@@ -5253,6 +5252,9 @@ mod tests {
     /// same key; neither may ever see the other granted beside it.
     #[test]
     fn restart_barrier_races_build_admission_without_overlap() {
+        // Grants per side. With the barrier's check and grant split over two
+        // lock acquisitions this failed 10/10 runs (3/10 at 10 rounds).
+        const ROUNDS: usize = 40;
         let dir = tempfile::tempdir().unwrap();
         let store = LaneStore::new(dir.path()).unwrap();
         let overlap = |store: &LaneStore| {
@@ -5268,8 +5270,8 @@ mod tests {
             let store = store.clone();
             std::thread::spawn(move || {
                 let mut held = 0;
-                for _ in 0..2000 {
-                    if held == 10 {
+                for _ in 0..20 * ROUNDS {
+                    if held == ROUNDS {
                         break;
                     }
                     if let RestartBarrier::Held(lease) = store
@@ -5277,29 +5279,36 @@ mod tests {
                         .unwrap()
                     {
                         held += 1;
-                        assert!(!overlap(&store), "a build was granted beside the barrier");
+                        // Release before asserting, so a failure cannot
+                        // leave the other thread spinning behind a barrier.
+                        let clash = overlap(&store);
                         store.release_lease(&lease).unwrap();
+                        assert!(!clash, "a build was granted beside the barrier");
                     }
                 }
                 held
             })
         };
         let mut builds = 0;
-        for _ in 0..2000 {
-            if builds == 10 {
+        for _ in 0..20 * ROUNDS {
+            if builds == ROUNDS {
                 break;
             }
             let ticket = store
                 .enqueue_lease(exclusive_lease(&["main-build"]))
                 .unwrap();
-            if store.try_grant(ticket.id).unwrap().is_some() {
-                builds += 1;
-                assert!(!overlap(&store), "the barrier was granted beside a build");
-            }
+            let granted = store.try_grant(ticket.id).unwrap().is_some();
+            let clash = granted && overlap(&store);
             store.finish(ticket.id, 0, "test").unwrap();
+            assert!(!clash, "the barrier was granted beside a build");
+            builds += usize::from(granted);
         }
         let held = restarts.join().unwrap();
-        assert_eq!((held, builds), (10, 10), "barriers and builds granted");
+        assert_eq!(
+            (held, builds),
+            (ROUNDS, ROUNDS),
+            "barriers and builds granted"
+        );
     }
 
     /// Failure mode: a service supervisor lost mid-restart (its old or new
@@ -5323,8 +5332,10 @@ mod tests {
         let recovered = LaneStore::new(dir.path()).unwrap();
         let actions = recovered.recover(false).unwrap();
         assert!(
-            actions.iter().any(|action| action
-                .starts_with(&format!("restart barrier {} lost supervisor", barrier.ticket.id))),
+            actions.iter().any(|action| action.starts_with(&format!(
+                "restart barrier {} lost supervisor",
+                barrier.ticket.id
+            ))),
             "{actions:?}"
         );
         let row = recovered.record(barrier.ticket.id).unwrap();
@@ -5348,7 +5359,10 @@ mod tests {
         );
         assert_eq!(
             reason,
-            format!("main-build (host) quarantined by ticket {}", barrier.ticket.id)
+            format!(
+                "main-build (host) quarantined by ticket {}",
+                barrier.ticket.id
+            )
         );
     }
 }
