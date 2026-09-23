@@ -627,6 +627,7 @@ class BorgDisplay:
                              "or set BORG_DISPLAY_BIN")
         if not runtime or not os.path.isdir(runtime):
             raise ValueError("XDG_RUNTIME_DIR is required for the private display sockets")
+        self.sweep(runtime)
         self.directory = tempfile.mkdtemp(prefix="borg-display-", dir=runtime)
         control = os.path.join(self.directory, "control")
         command = [binary, "--socket", "borg-private-" + uuid.uuid4().hex[:12], "--control", control,
@@ -655,6 +656,19 @@ class BorgDisplay:
         self.socket.settimeout(20)
         self.socket.connect(control)
         self.reader = self.socket.makefile("rb")
+
+    @staticmethod
+    def sweep(runtime):
+        """Remove directories of displays whose helper was killed: the compositor
+        deletes its control socket on exit, so only logs remain."""
+        import glob
+        for directory in glob.glob(os.path.join(runtime, "borg-display-*")):
+            try:
+                if not os.path.exists(os.path.join(directory, "control")) and \
+                        time.time() - os.stat(directory).st_mtime > 60:
+                    shutil.rmtree(directory, ignore_errors=True)
+            except OSError:
+                pass
 
     def running(self):
         return self.process.poll() is None
