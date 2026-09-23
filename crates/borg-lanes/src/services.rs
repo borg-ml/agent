@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::lanes::{
     Access, AdmissionBudget, Holder, Hook, LaneStore, Lease, LeaseRequest, ResourceKey,
-    ResourceRequest, ResourceScope, TicketState,
+    ResourceRequest, RestartBarrier,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -85,9 +85,15 @@ pub struct RestartPolicy {
     /// `max_restarts` (`restarts` still counts it).
     #[serde(default)]
     pub transient_exit_codes: Vec<i32>,
-    /// A pending restart (warm or cold) waits while any Granted or
-    /// Preparing lane ticket other than this service's own lease holds one
-    /// of these keys, so it never lands during, say, a build of the tree.
+    /// Keys a backend launch (a warm or cold restart, a relaunch after a
+    /// crash or failure, or the first start) waits for, so it never lands
+    /// during, say, a build of the tree. Before it starts a replacement (or,
+    /// cold, stops the running backend) the supervisor claims them all
+    /// exclusively in one lane transaction: it waits while any ticket holds,
+    /// is queued for or quarantines one, and no ticket needing one is
+    /// admitted until the new backend is healthy (and a warm restart's old
+    /// backend stopped) or has failed. The service's own resource keys are
+    /// left out: its lease already holds them.
     #[serde(default)]
     pub defer_while: Vec<ResourceKey>,
 }
@@ -404,8 +410,14 @@ fn valid_spec(spec: &ServiceSpec) -> Result<()> {
     for resource in &spec.resources {
         resource.key.validate_canonical()?;
     }
-    for key in &spec.restart.defer_while {
+    for (index, key) in spec.restart.defer_while.iter().enumerate() {
         key.validate_canonical()?;
+        ensure!(!key.name.trim().is_empty(), "empty restart deferral key");
+        ensure!(
+            !spec.restart.defer_while[..index].contains(key),
+            "duplicate restart deferral key: {}",
+            key.name
+        );
     }
     if let ClientMode::Shared { max_clients } = spec.client_mode {
         ensure!(
@@ -1311,15 +1323,44 @@ async fn restore_clients(
 
 /// The held lane lease spans every live backend and candidate. Admission is
 /// serialized with exclusive Preparing/Granted under the lane state.lock.
+/// A launch additionally holds the restart barrier on `defer_while` from
+/// before it starts (or, cold, stops) a backend until that is ready or failed.
 struct ServiceGate {
     store: LaneStore,
     request: LeaseRequest,
     budget: AdmissionBudget,
     lease: Option<Lease>,
+    /// The `defer_while` keys less the service's own; None when empty.
+    barrier_request: Option<LeaseRequest>,
+    barrier: Option<Lease>,
 }
 impl ServiceGate {
     fn new(root: &Path, spec: &ServiceSpec) -> Result<Self> {
         let id = Uuid::new_v5(&Uuid::NAMESPACE_OID, spec.id.as_bytes());
+        let holder = Holder {
+            participant_id: id,
+            session_id: id,
+            host_pid: Some(std::process::id()),
+            purpose: format!("service:{}", spec.id),
+        };
+        let barrier_keys: Vec<ResourceRequest> = spec
+            .restart
+            .defer_while
+            .iter()
+            .filter(|key| !spec.resources.iter().any(|own| own.key == **key))
+            .map(|key| ResourceRequest {
+                key: key.clone(),
+                access: Access::Exclusive,
+            })
+            .collect();
+        let barrier_request = (!barrier_keys.is_empty()).then(|| LeaseRequest {
+            resources: barrier_keys,
+            holder: Holder {
+                purpose: format!("restart:{}", spec.id),
+                ..holder.clone()
+            },
+            queue_timeout_ms: None,
+        });
         Ok(Self {
             store: LaneStore::new(root.parent().context("service root has no lane parent")?)?,
             request: LeaseRequest {
@@ -1331,16 +1372,13 @@ impl ServiceGate {
                         access: Access::Shared { slots: 1 },
                     })
                     .collect(),
-                holder: Holder {
-                    participant_id: id,
-                    session_id: id,
-                    host_pid: Some(std::process::id()),
-                    purpose: format!("service:{}", spec.id),
-                },
+                holder,
                 queue_timeout_ms: None,
             },
             budget: spec.admission.clone(),
             lease: None,
+            barrier_request,
+            barrier: None,
         })
     }
     fn acquire(&mut self) -> Result<bool> {
@@ -1364,48 +1402,39 @@ impl ServiceGate {
             .and_then(|r| r.wait_reason.clone())
             .unwrap_or_else(|| "waiting for lane resource admission".into()))
     }
-    /// Why a pending restart must wait: the first Granted or Preparing
-    /// ticket, other than this service's own lease, holding one of `keys`.
-    fn restart_deferral(&self, keys: &[ResourceKey]) -> Result<Option<String>> {
-        if keys.is_empty() {
+    /// Claim the restart barrier before launching (or, cold, stopping) a
+    /// backend: None once it is held or there is nothing to defer to, else
+    /// the ticket and key the launch waits for. Idempotent while held.
+    fn reserve_launch(&mut self) -> Result<Option<String>> {
+        let Some(request) = &self.barrier_request else {
+            return Ok(None);
+        };
+        if self.barrier.is_some() {
             return Ok(None);
         }
-        let own = self.request.holder.participant_id;
-        Ok(self.store.snapshot()?.iter().find_map(|record| {
-            let holds = matches!(
-                record.state,
-                TicketState::Granted(_) | TicketState::Preparing
-            );
-            let ours = record.service_lease && record.request.holder.participant_id == own;
-            let key = record
-                .request
-                .resources
-                .iter()
-                .find(|held| keys.contains(&held.key))?;
-            (holds && !ours).then(|| {
-                format!(
-                    "restart deferred: {} held by ticket {}",
-                    key_label(&key.key),
-                    record.ticket.id
-                )
-            })
-        }))
+        match self.store.try_acquire_restart_barrier(request.clone())? {
+            RestartBarrier::Held(lease) => {
+                self.barrier = Some(lease);
+                Ok(None)
+            }
+            RestartBarrier::Deferred(reason) => Ok(Some(reason)),
+        }
+    }
+    /// The launch the barrier covered is ready or has failed.
+    fn release_launch(&mut self) -> Result<()> {
+        if let Some(lease) = &self.barrier {
+            self.store.release_lease(lease)?;
+            self.barrier = None;
+        }
+        Ok(())
     }
     fn release(&mut self) -> Result<()> {
+        self.release_launch()?;
         if let Some(lease) = &self.lease {
             self.store.release_lease(lease)?;
             self.lease = None;
         }
         Ok(())
-    }
-}
-
-/// A resource key for status reasons: its name and scope.
-fn key_label(key: &ResourceKey) -> String {
-    match &key.scope {
-        ResourceScope::Host => format!("{} (host)", key.name),
-        ResourceScope::Project(path) => format!("{} (project {})", key.name, path.display()),
-        ResourceScope::Worktree(path) => format!("{} (worktree {})", key.name, path.display()),
     }
 }
 
@@ -1606,7 +1635,28 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
         }
         if status.yields.is_empty() && active.is_none() && candidate.is_none() && now >= next_launch
         {
+            // A relaunch (after a crash, or a cold restart whose replacement
+            // failed) is a restart too: never beside a build of the tree.
+            if let Some(deferred) = gate.reserve_launch()? {
+                let reason = format!("launch deferred: {deferred}");
+                if status.reason != reason {
+                    transition(
+                        &dir,
+                        &mut status,
+                        &front,
+                        ServiceState::Degraded {
+                            reason: reason.clone(),
+                        },
+                        reason,
+                        None,
+                    )
+                    .await?;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
             if !gate.acquire()? {
+                gate.release_launch()?;
                 let reason = gate.denial_reason()?;
                 if status.reason != reason {
                     transition(
@@ -1648,6 +1698,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                     .await?;
                 }
                 Err(error) => {
+                    gate.release_launch()?;
                     failures += 1;
                     next_launch = now + backoff(&spec, failures);
                     transition(
@@ -1670,6 +1721,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             if exit.is_some() || overdue {
                 stop_child(&mut b.child, &spec, b.port, b.scope.as_deref()).await?;
                 candidate = None;
+                gate.release_launch()?;
                 let transient = spec.restart.transient(exit);
                 next_launch = match transient {
                     Some(_) => now + spec.restart.backoff_ms,
@@ -1747,6 +1799,8 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                         status.restarts += 1;
                         publish(&dir, &status)?;
                     }
+                    // Only now, with one ready backend, may a build start.
+                    gate.release_launch()?;
                 }
             }
         }
@@ -1836,7 +1890,10 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             && now.saturating_sub(*requested) >= spec.restart.debounce_ms
             && now >= next_launch
         {
-            if let Some(deferred) = gate.restart_deferral(&spec.restart.defer_while)? {
+            // The barrier is claimed atomically with build admission, and
+            // held from before the cold stop or warm launch to readiness.
+            if let Some(deferred) = gate.reserve_launch()? {
+                let deferred = format!("restart deferred: {deferred}");
                 if status.reason != deferred {
                     transition(
                         &dir,
@@ -1893,8 +1950,10 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                         .await?;
                     }
                     Err(error) => {
+                        gate.release_launch()?;
                         if cold {
-                            // Nothing runs now; the ordinary launch path retries.
+                            // Nothing runs now; the ordinary launch path retries
+                            // once it has claimed the barrier again.
                             failures += 1;
                             next_launch = now + backoff(&spec, failures);
                         } else {
@@ -3882,7 +3941,7 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
                 .snapshot()
                 .unwrap()
                 .into_iter()
-                .find(|r| r.service_lease && matches!(r.state, TicketState::Granted(_)))
+                .find(|r| r.service_lease && matches!(r.state, crate::lanes::TicketState::Granted(_)))
                 .map(|r| r.ticket.id)
         };
         let held = lease().expect("service lease");
@@ -3990,6 +4049,225 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
         })
         .await;
         assert_ne!(restarted.backend_pid, before.backend_pid);
+        cleanup(&manager, task).await;
+    }
+
+    fn build_on(keys: &[&ResourceKey]) -> LeaseRequest {
+        LeaseRequest {
+            resources: keys
+                .iter()
+                .map(|key| ResourceRequest {
+                    key: (*key).clone(),
+                    access: Access::Exclusive,
+                })
+                .collect(),
+            holder: owner(),
+            queue_timeout_ms: None,
+        }
+    }
+    fn launch_count(root: &Path) -> usize {
+        fs::read_to_string(root.join("launches"))
+            .unwrap()
+            .lines()
+            .count()
+    }
+    async fn request_restart(manager: &ServiceManager) {
+        manager
+            .send(
+                "fake",
+                ServiceRequest::Restart {
+                    reason: "rebuilt".into(),
+                    force: false,
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Failure mode (C10): a build of the tree admitted while a warm or cold
+    /// restart is under way: between the restart's deferral check and its
+    /// replacement's readiness, or while a warm restart's old backend runs.
+    #[tokio::test]
+    async fn a_build_waits_until_a_restarted_backend_is_ready() {
+        for mode in [RestartMode::Warm, RestartMode::Cold] {
+            let key = ResourceKey {
+                scope: ResourceScope::Host,
+                name: "build".into(),
+            };
+            let (root, manager, _front, task) = setup_with(|spec| {
+                spec.restart.mode = mode;
+                spec.restart.defer_while = vec![key.clone()];
+                spec.restart.debounce_ms = 50;
+                spec.readiness_timeout_ms = 5_000;
+                // Every replacement takes 0.8 s to serve.
+                spec.argv[3] = FAKE_HTTP.replace(
+                    "class Handler",
+                    "if len(open(record).readlines()) > 1: time.sleep(.8)\nclass Handler",
+                );
+            })
+            .await;
+            let lanes = LaneStore::new(root.path()).unwrap();
+            let old = manager.read_status("fake").unwrap().backend_pid.unwrap();
+            request_restart(&manager).await;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while launch_count(root.path()) < 2 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{mode:?}: no replacement"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // During: the replacement is not ready yet.
+            let ticket = lanes.enqueue_lease(build_on(&[&key])).unwrap();
+            let waiting = lanes.clone();
+            let queued = ticket.clone();
+            let mut build = tokio::spawn(async move {
+                crate::lanes::LaneCoordinator::wait(&waiting, &queued).await
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), &mut build)
+                    .await
+                    .is_err(),
+                "{mode:?}: build admitted while the restart was unready"
+            );
+            let lease = tokio::time::timeout(Duration::from_secs(5), build)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            // Just after: admitted only once the replacement serves alone.
+            let ready = manager.read_status("fake").unwrap();
+            assert!(
+                matches!(ready.state, ServiceState::Healthy { .. })
+                    && ready.backend_pid.is_some_and(|pid| pid != old),
+                "{mode:?}: build admitted before readiness: {ready:?}"
+            );
+            assert!(
+                !Path::new(&format!("/proc/{old}")).exists(),
+                "{mode:?}: build admitted while old backend {old} ran"
+            );
+            assert!(
+                !lanes.snapshot().unwrap().iter().any(|r| r.restart_barrier
+                    && matches!(r.state, crate::lanes::TicketState::Granted(_))),
+                "{mode:?}: barrier outlived the restart"
+            );
+            // And the next restart waits for that build.
+            request_restart(&manager).await;
+            let deferred = state(&manager, |s| {
+                s.reason
+                    == format!(
+                        "restart deferred: build (host) held by ticket {}",
+                        ticket.id
+                    )
+            })
+            .await;
+            assert!(matches!(deferred.state, ServiceState::RestartPending));
+            assert_eq!(launch_count(root.path()), 2, "{mode:?}");
+            lanes.release_lease(&lease).unwrap();
+            state(&manager, |s| {
+                s.restarts == 2
+                    && matches!(s.state, ServiceState::Healthy { .. })
+                    && s.backend_pid != ready.backend_pid
+            })
+            .await;
+            cleanup(&manager, task).await;
+        }
+    }
+
+    /// Failure mode (C10): a warm or cold restart jumping a build that was
+    /// queued before it (the build then running beside the relaunch), or
+    /// landing while that build runs.
+    #[tokio::test]
+    async fn a_restart_waits_for_a_build_queued_before_it() {
+        for mode in [RestartMode::Warm, RestartMode::Cold] {
+            let key = ResourceKey {
+                scope: ResourceScope::Host,
+                name: "build".into(),
+            };
+            let tree = ResourceKey {
+                scope: ResourceScope::Host,
+                name: "tree".into(),
+            };
+            let (root, manager, _front, task) = setup_with(|spec| {
+                spec.restart.mode = mode;
+                spec.restart.defer_while = vec![key.clone()];
+                spec.restart.debounce_ms = 50;
+            })
+            .await;
+            let lanes = LaneStore::new(root.path()).unwrap();
+            let before = manager.read_status("fake").unwrap();
+            // Queued (held back by another key), not yet running.
+            let blocker = lanes.enqueue_lease(build_on(&[&tree])).unwrap();
+            let blocker = crate::lanes::LaneCoordinator::wait(&lanes, &blocker)
+                .await
+                .unwrap();
+            let ticket = lanes.enqueue_lease(build_on(&[&key, &tree])).unwrap();
+            request_restart(&manager).await;
+            let queued = state(&manager, |s| {
+                s.reason
+                    == format!(
+                        "restart deferred: build (host) queued for ticket {}",
+                        ticket.id
+                    )
+            })
+            .await;
+            assert!(matches!(queued.state, ServiceState::RestartPending));
+            lanes.release_lease(&blocker).unwrap();
+            let lease = tokio::time::timeout(
+                Duration::from_secs(3),
+                crate::lanes::LaneCoordinator::wait(&lanes, &ticket),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            state(&manager, |s| s.reason.ends_with(&format!("held by ticket {}", ticket.id))).await;
+            assert_eq!(launch_count(root.path()), 1, "{mode:?}");
+            assert_eq!(
+                manager.read_status("fake").unwrap().backend_pid,
+                before.backend_pid
+            );
+            lanes.release_lease(&lease).unwrap();
+            state(&manager, |s| {
+                matches!(s.state, ServiceState::Healthy { .. }) && s.backend_pid != before.backend_pid
+            })
+            .await;
+            cleanup(&manager, task).await;
+        }
+    }
+
+    /// Failure mode: a backend relaunched after a crash (the same path as a
+    /// cold restart whose replacement failed) starting beside a build.
+    #[tokio::test]
+    async fn a_relaunch_waits_while_a_deferring_key_is_held() {
+        let key = ResourceKey {
+            scope: ResourceScope::Host,
+            name: "build".into(),
+        };
+        let (root, manager, front, task) =
+            setup_with(|spec| spec.restart.defer_while = vec![key.clone()]).await;
+        let lanes = LaneStore::new(root.path()).unwrap();
+        let ticket = lanes.enqueue_lease(build_on(&[&key])).unwrap();
+        let lease = crate::lanes::LaneCoordinator::wait(&lanes, &ticket)
+            .await
+            .unwrap();
+        let before = manager.read_status("fake").unwrap();
+        let _ = get(front, "/crash").await; // exits 11
+        let deferred = state(&manager, |s| {
+            s.reason == format!("launch deferred: build (host) held by ticket {}", ticket.id)
+        })
+        .await;
+        assert!(matches!(deferred.state, ServiceState::Degraded { .. }));
+        assert_eq!(deferred.backend_pid, None);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(launch_count(root.path()), 1);
+        lanes.release_lease(&lease).unwrap();
+        state(&manager, |s| {
+            matches!(s.state, ServiceState::Healthy { .. })
+                && s.backend_pid.is_some_and(|pid| Some(pid) != before.backend_pid)
+        })
+        .await;
+        assert_eq!(launch_count(root.path()), 2);
         cleanup(&manager, task).await;
     }
 
