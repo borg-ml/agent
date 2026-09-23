@@ -128,6 +128,16 @@ same journal lock. A leader PID exiting alone does not prove descendants
 are gone; unknown ownership quarantines the key rather than admitting a
 headless job behind a live editor. The two-service real-CLI regression in
 `integration.md` is a v0 release gate, not a benchmark-only demonstration.
+A foreign client lease must also delay the Preparing-to-yield transition
+until it ends or its configurable grace expires (five minutes by default,
+zero for indefinite wait); the requester's own lease does not block. This
+needs an atomic client-lease/journal boundary, not a bridge snapshot:
+`ServiceRequest::Lease` currently updates supervisor `status.clients`
+outside the lane state lock. Foreign-wait, own-lease and late-arrival races
+need real-CLI regressions before model-facing exclusive is enabled. If that
+cannot be completed safely for v0, disable only model-facing exclusive with
+a clear coordination/CLI message; keep nonexclusive, lease and read actions
+and track the atomic preemption policy as v0.1.
 
 Worktree GC is a destructive operation: default dry-run; check dirty status,
 active locks, git references and owner confirmation before removal. Cache

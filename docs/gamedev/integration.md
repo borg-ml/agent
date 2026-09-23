@@ -117,10 +117,22 @@ parent requires D11 atomic editor/exclusive handoff and real-CLI proof.
    post-hook failure quarantine, stopped-supervisor resume recovery, and
    ACK-then-unhealthy backend recovery. Project/Worktree alias protection
    passed on pinned `011c4ba9…`. **Remaining v0 gates:** session-derived
-   editor owner/fencing at the model MCP boundary and rerun every gate on
-   the final integrated binary. Real UE runtime parity is a migration
+   editor owner/fencing plus the atomic foreign-client-lease policy (or
+   explicit model-exclusive disablement) at the model MCP boundary, then
+   rerun every gate on the final integrated binary. Real UE runtime parity is a migration
    acceptance test, not a Borg branch v0 gate.
 
+
+**New model-exclusive policy decision (not yet verified):** shared CLI/MCP
+Preparing must wait on a foreign active service client lease until release or
+configurable grace (default five minutes; zero indefinite), expose the wait,
+and let the requester's own lease pass. Supervisor `status.clients` is mutated
+outside the lane journal lock; a bridge precheck or lane snapshot is not an
+atomic admission mechanism. Prove foreign wait, own lease, and a late-lease
+race on the public CLI, or disable model-facing exclusive for v0 with a clear
+`use borg lane run --exclusive after coordinating` message. Nonexclusive
+jobs, lease and read tools remain; real UE runtime parity is still a migration
+acceptance test.
 
 Draft CLI reminder: `--spec` accepts serialized `JobSpec`, not adapter/template
 shorthand. A model-facing caller must not construct arbitrary process argv
