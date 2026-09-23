@@ -826,6 +826,12 @@ impl LaneStore {
     }
 
     fn service_status(&self, service_id: &str) -> Result<crate::services::ServiceStatus> {
+        #[cfg(test)]
+        if service_id == "test" && self.root.join("fake-service-status.json").exists() {
+            return Ok(serde_json::from_slice(&fs::read(
+                self.root.join("fake-service-status.json"),
+            )?)?);
+        }
         let executable = std::env::var_os("BORG_LANE_EXECUTABLE")
             .map(PathBuf::from)
             .unwrap_or(std::env::current_exe()?);
@@ -2197,6 +2203,61 @@ mod tests {
         store.resume_services(id).unwrap();
         assert!(store.record(id).unwrap().resume_pending.is_empty());
         assert!(store.record(id).unwrap().resume_error.is_none());
+    }
+
+    #[test]
+    fn acknowledged_resume_waits_for_health_then_recover_clears_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let id = Uuid::new_v4();
+        store
+            .locked(|state| {
+                let mut row = record(
+                    1,
+                    TicketState::Finished,
+                    vec![resource("project", Access::Exclusive)],
+                );
+                row.ticket.id = id;
+                row.yield_services.push("test".into());
+                row.resume_pending.push("test".into());
+                state.records.push(row);
+                Ok(())
+            })
+            .unwrap();
+        let status_file = dir.path().join("fake-service-status.json");
+        // The service ACKed Resume (yield token gone), then failed readiness.
+        fs::write(
+            &status_file,
+            serde_json::to_vec(&serde_json::json!({
+                "id":"test", "state":{"Failed":{"reason":"health probe failed"}},
+                "endpoint":null, "clients":[], "reason":"health probe failed", "yields":{}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(store.resume_services(id).is_err());
+        let row = store.record(id).unwrap();
+        assert_eq!(row.resume_pending, ["test"]);
+        assert!(
+            row.resume_error
+                .unwrap()
+                .contains("not healthy after resume")
+        );
+        // A later healthy status lets recover clear the row without sending
+        // Resume a second time (its yield token is already gone).
+        fs::write(
+            &status_file,
+            serde_json::to_vec(&serde_json::json!({
+                "id":"test", "state":{"Healthy":{"backend":null}},
+                "endpoint":null, "clients":[], "reason":"ready", "yields":{}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        store.resume_services(id).unwrap();
+        let row = store.record(id).unwrap();
+        assert!(row.resume_pending.is_empty());
+        assert!(row.resume_error.is_none());
     }
 
     #[test]
