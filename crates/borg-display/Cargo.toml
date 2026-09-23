@@ -1,0 +1,25 @@
+[package]
+name = "borg-display"
+description = "Agent-private headless Wayland display for Borg computer use"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "borg-display"
+path = "src/main.rs"
+
+# A separate binary so the main `borg` executable never links the graphics
+# stack (EGL is loaded at runtime; xkbcommon is linked here only).
+[target.'cfg(target_os = "linux")'.dependencies]
+anyhow.workspace = true
+calloop = { version = "0.14", features = ["signals"] }
+libc.workspace = true
+png = "0.18"
+serde_json.workspace = true
+smithay = { version = "0.7", default-features = false, features = ["backend_drm", "backend_egl", "renderer_gl", "desktop", "wayland_frontend"] }

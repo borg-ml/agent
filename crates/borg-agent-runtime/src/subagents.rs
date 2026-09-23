@@ -202,6 +202,9 @@ pub struct AgentToolDispatcher {
     provider: CodingProvider,
     actor_session_id: Uuid,
     consultation_enabled: bool,
+    /// Only the top-level session may use the user's desktop through
+    /// computer_use; a sub-agent is confined to a private display.
+    desktop_enabled: bool,
     team_policy: Option<crate::TeamPolicy>,
     self_service: crate::self_service::SelfServiceContext,
     autonomy: Option<Arc<dyn crate::autonomy::AutonomyStore>>,
@@ -222,6 +225,9 @@ pub struct AgentToolDispatcher {
     runtime_mcp: Arc<Mutex<RuntimeMcpState>>,
     harness_lock: Arc<Mutex<()>>,
     web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
+    /// Whether human or team input is queued behind the running turn. A
+    /// blocking `wait_agent` returns on it so the parent answers promptly.
+    input_pending: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 #[derive(Default)]
@@ -293,6 +299,7 @@ pub struct AgentToolServer {
     provider: CodingProvider,
     subagents_enabled: bool,
     consultation_enabled: bool,
+    desktop_enabled: bool,
     shared_work_enabled: bool,
     web_search_enabled: bool,
     watcher_yield_enabled: bool,
@@ -362,6 +369,7 @@ impl AgentToolServer {
         let provider = dispatcher.provider;
         let subagents_enabled = dispatcher.subagents_enabled;
         let consultation_enabled = dispatcher.consultation_enabled();
+        let desktop_enabled = dispatcher.desktop_enabled;
         let shared_work_enabled = dispatcher.shared_work.is_some();
         let web_search_enabled = dispatcher.web_search.is_some();
         let watcher_yield_enabled = dispatcher.watcher_yield_enabled;
@@ -393,6 +401,7 @@ impl AgentToolServer {
             provider,
             subagents_enabled,
             consultation_enabled,
+            desktop_enabled,
             shared_work_enabled,
             web_search_enabled,
             watcher_yield_enabled,
@@ -420,6 +429,7 @@ impl AgentToolServer {
         let provider = dispatcher.provider;
         let subagents_enabled = dispatcher.subagents_enabled;
         let consultation_enabled = dispatcher.consultation_enabled();
+        let desktop_enabled = dispatcher.desktop_enabled;
         let shared_work_enabled = dispatcher.shared_work.is_some();
         let web_search_enabled = dispatcher.web_search.is_some();
         let watcher_yield_enabled = dispatcher.watcher_yield_enabled;
@@ -453,6 +463,7 @@ impl AgentToolServer {
             provider,
             subagents_enabled,
             consultation_enabled,
+            desktop_enabled,
             shared_work_enabled,
             web_search_enabled,
             watcher_yield_enabled,
@@ -492,6 +503,10 @@ impl AgentToolServer {
             self.consultation_enabled.to_string(),
         );
         env.insert(
+            "BORG_AGENT_DESKTOP_ENABLED".to_string(),
+            self.desktop_enabled.to_string(),
+        );
+        env.insert(
             "BORG_AGENT_WATCHER_YIELD_ENABLED".to_string(),
             self.watcher_yield_enabled.to_string(),
         );
@@ -510,14 +525,18 @@ impl AgentToolServer {
             command: agent_mcp_executable()?.to_string_lossy().into_owned(),
             args: vec!["__agent-mcp".to_string()],
             env,
-            allowed_tools: agent_tool_specs_with_capabilities_and_consultation_and_search(
+            allowed_tools: agent_tool_specs_for_surface(
                 self.provider,
-                self.subagents_enabled,
-                self.shared_work_enabled,
+                ToolSurface {
+                    subagents: self.subagents_enabled,
+                    shared_work: self.shared_work_enabled,
+                    consultation: self.consultation_enabled,
+                    desktop: self.desktop_enabled,
+                    web_search: self.web_search_enabled,
+                    watcher_yield: self.watcher_yield_enabled,
+                    ..ToolSurface::director()
+                },
                 self.team_policy.as_ref(),
-                self.consultation_enabled,
-                self.web_search_enabled,
-                self.watcher_yield_enabled,
             )
             .into_iter()
             .filter_map(|tool| {
@@ -744,9 +763,11 @@ impl AgentToolDispatcher {
         permission: crate::PermissionMode,
         web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
     ) -> Self {
-        let consultation_enabled = subagents
+        let root_session = subagents
             .as_ref()
             .is_none_or(|team| team.is_root_session(actor_session_id));
+        let consultation_enabled = root_session;
+        let desktop_enabled = root_session;
         let runtime_root = cwd.clone();
         let execution_provider: Arc<dyn crate::ExecutionProvider> = Arc::new(
             crate::LocalExecutionProvider::with_process_manager(workflow_processes.clone()),
@@ -792,6 +813,7 @@ impl AgentToolDispatcher {
             provider,
             actor_session_id,
             consultation_enabled,
+            desktop_enabled,
             team_policy,
             self_service: crate::self_service::SelfServiceContext::new(cwd),
             autonomy,
@@ -808,6 +830,7 @@ impl AgentToolDispatcher {
             runtime_mcp: Arc::new(Mutex::new(RuntimeMcpState::default())),
             harness_lock: Arc::new(Mutex::new(())),
             web_search,
+            input_pending: Arc::new(tokio::sync::watch::Sender::new(false)),
         }
     }
 
@@ -819,6 +842,25 @@ impl AgentToolDispatcher {
     pub(crate) fn with_watcher_yield(mut self, enabled: bool) -> Self {
         self.watcher_yield_enabled = enabled;
         self
+    }
+
+    /// Whether this session has a child that is still starting or running.
+    pub(crate) async fn has_working_children(&self) -> bool {
+        match &self.subagents {
+            Some(subagents) if self.subagents_enabled => {
+                subagents.has_working_children(self.actor_session_id).await
+            }
+            _ => false,
+        }
+    }
+
+    /// Published by the session loop while input waits for the running turn.
+    pub(crate) fn set_input_pending(&self, pending: bool) {
+        self.input_pending.send_if_modified(|current| {
+            let changed = *current != pending;
+            *current = pending;
+            changed
+        });
     }
 
     pub(crate) fn configure_tool_approvals(&self, approvals: crate::session::SessionToolApprovals) {
@@ -940,6 +982,7 @@ impl AgentToolDispatcher {
             self.shared_work.is_some(),
             self.team_policy.as_ref(),
             self.consultation_enabled,
+            self.desktop_enabled,
             self.watcher_yield_enabled,
         );
         if self.web_search.is_some() {
@@ -1715,6 +1758,9 @@ impl AgentToolDispatcher {
                         || workflow_approved,
                     "computer use requires Full Access or explicit approval, including observation"
                 );
+                if !self.desktop_enabled {
+                    crate::computer_use::ensure_private_display_only(&arguments)?;
+                }
                 let cancel = workflow_cancel.unwrap_or_default();
                 tokio::select! {
                     biased;
@@ -1916,9 +1962,24 @@ impl AgentToolDispatcher {
                 if !self.subagents_enabled {
                     bail!("subagent tools are disabled by session capabilities");
                 }
-                self.subagents
+                let subagents = self
+                    .subagents
                     .as_ref()
-                    .context("subagent coordinator is disabled")?
+                    .context("subagent coordinator is disabled")?;
+                if name == "wait_agent" {
+                    let args: WaitAgentArgs = serde_json::from_value(arguments)?;
+                    return subagents
+                        .wait_for(
+                            self.actor_session_id,
+                            args.timeout(),
+                            WaitSignals {
+                                cancel: workflow_cancel,
+                                input_pending: Some(self.input_pending.subscribe()),
+                            },
+                        )
+                        .await;
+                }
+                subagents
                     .call_tool_as(self.actor_session_id, name, arguments)
                     .await
             }
@@ -2652,6 +2713,10 @@ struct SubagentEntry {
     /// action wakes them. This prevents resuming an idle root from silently
     /// starting providers in the background.
     dormant: bool,
+    /// The agent whose `interrupt_agent` stopped this child's last turn. Its
+    /// next follow-up resumes the child; a stop the human made is not
+    /// recorded here and still holds against agent wakes.
+    interrupted_by: Option<Uuid>,
 }
 
 struct SubagentTable {
@@ -2665,7 +2730,9 @@ impl SubagentTable {
     fn reserve(&mut self, task_name: &str, launch: &LaunchSession) -> Result<SubagentSnapshot> {
         let task_name = canonical_task_name(task_name)?;
         if self.task_names.contains_key(&task_name) {
-            bail!("subagent task name already exists: {task_name}");
+            bail!(
+                "subagent task name already exists: {task_name}; use followup_task to give it more work"
+            );
         }
         let active = self
             .entries
@@ -2700,6 +2767,7 @@ impl SubagentTable {
                 inbox: Vec::new(),
                 assignment_claimed: false,
                 dormant: false,
+                interrupted_by: None,
             },
         );
         Ok(snapshot)
@@ -2807,6 +2875,7 @@ pub struct SubagentCoordinator {
     root_message_dispatches: Arc<Mutex<HashMap<Uuid, Instant>>>,
     projected_root_messages: Arc<Mutex<HashSet<Uuid>>>,
     consultation_lock: Arc<Mutex<()>>,
+    wait_cursors: Arc<Mutex<HashMap<Uuid, wait::WaitCursor>>>,
 }
 
 impl SubagentCoordinator {
@@ -2842,6 +2911,7 @@ impl SubagentCoordinator {
             root_message_dispatches: Arc::new(Mutex::new(HashMap::new())),
             projected_root_messages: Arc::new(Mutex::new(HashSet::new())),
             consultation_lock: Arc::new(Mutex::new(())),
+            wait_cursors: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -3284,72 +3354,108 @@ impl SubagentCoordinator {
         session_id: Uuid,
         message_id: Uuid,
     ) -> Result<()> {
+        self.acknowledge_messages_for_session(session_id, &[message_id])
+            .await
+    }
+
+    /// Acknowledge several team messages, reading the pending set once.
+    pub(crate) async fn acknowledge_messages_for_session(
+        &self,
+        session_id: Uuid,
+        message_ids: &[Uuid],
+    ) -> Result<()> {
         anyhow::ensure!(
             self.root_launch.capabilities.multiplayer,
             "team acknowledgements require multiplayer capability"
         );
+        if message_ids.is_empty() {
+            return Ok(());
+        }
         let binding = self
             .store
             .workspace_binding(session_id)
             .await?
             .context("team session has no workspace")?;
         let store = self.workspace_store().await?;
-        let mut addressed_workspace_id = None;
+        let mut pending_in = HashMap::new();
         for workspace in store
             .list_workspaces_for_participant(binding.participant_id)
             .await?
         {
-            if store
+            for (event, _) in store
                 .pending_message_events(workspace.id, binding.participant_id, 10_000)
                 .await?
-                .into_iter()
-                .any(|(event, _)| matches!(&event.kind, WorkspaceEventKind::Message { message, .. } if message.id == message_id))
             {
-                addressed_workspace_id = Some(workspace.id);
-                break;
+                if let WorkspaceEventKind::Message { message, .. } = &event.kind {
+                    pending_in.entry(message.id).or_insert(workspace.id);
+                }
             }
         }
-        // The session projection admits a team message as soon as the child
-        // journals it complete, so a worker acknowledging work it really did
-        // usually finds its delivery already out of the pending set. Resolve
-        // the addressed workspace from the delivery itself before deciding
-        // the message does not exist: acknowledging twice is ordinary, and
-        // reporting "not found" to a worker that followed instructions turns
-        // a settled message into a phantom.
-        let delivery = store
-            .message_deliveries(message_id)
-            .await?
-            .into_iter()
-            .find(|delivery| delivery.recipient_id == binding.participant_id);
-        let workspace_id = match (addressed_workspace_id, &delivery) {
-            (Some(workspace_id), _) => workspace_id,
-            (None, Some(delivery)) => delivery.workspace_id,
-            (None, None) => bail!("unread team message not found"),
-        };
-        // Walk only the edges the store allows. `Admitted` is skipped when the
-        // projection already recorded it, and an acknowledged delivery is left
-        // exactly as it is rather than being pushed backwards.
-        if delivery.is_none_or(|delivery| delivery.state == crate::DeliveryState::Pending) {
+        for &message_id in message_ids {
+            // The session projection admits a team message as soon as the
+            // child journals it complete, so a worker acknowledging work it
+            // really did usually finds its delivery already out of the pending
+            // set. Resolve the addressed workspace from the delivery itself
+            // before deciding the message does not exist: acknowledging twice
+            // is ordinary, and reporting "not found" to a worker that followed
+            // instructions turns a settled message into a phantom.
+            let delivery = store
+                .message_deliveries(message_id)
+                .await?
+                .into_iter()
+                .find(|delivery| delivery.recipient_id == binding.participant_id);
+            let workspace_id = match (pending_in.get(&message_id), &delivery) {
+                (Some(workspace_id), _) => *workspace_id,
+                (None, Some(delivery)) => delivery.workspace_id,
+                (None, None) => bail!("unread team message not found: {message_id}"),
+            };
+            // Walk only the edges the store allows. `Admitted` is skipped when
+            // the projection already recorded it, and an acknowledged delivery
+            // is left exactly as it is rather than being pushed backwards.
+            if delivery.is_none_or(|delivery| delivery.state == crate::DeliveryState::Pending) {
+                store
+                    .transition_message_delivery(
+                        workspace_id,
+                        message_id,
+                        binding.participant_id,
+                        crate::DeliveryState::Admitted,
+                        None,
+                    )
+                    .await?;
+            }
             store
                 .transition_message_delivery(
                     workspace_id,
                     message_id,
                     binding.participant_id,
-                    crate::DeliveryState::Admitted,
+                    crate::DeliveryState::Acknowledged,
                     None,
                 )
                 .await?;
         }
-        store
-            .transition_message_delivery(
-                workspace_id,
-                message_id,
-                binding.participant_id,
-                crate::DeliveryState::Acknowledged,
-                None,
-            )
-            .await?;
+        if self.is_root_session(session_id) {
+            // Read here, so the idle boundary must not hand them over again.
+            self.root_inbox
+                .lock()
+                .await
+                .retain(|message| !message_ids.contains(&message.message_id));
+        }
         Ok(())
+    }
+
+    /// Display name of a message sender: a child's task name, else the
+    /// participant's name.
+    async fn sender_label(&self, sender: Uuid) -> String {
+        if let Ok(task_name) = self.task_name_for_session(sender).await {
+            return task_name;
+        }
+        let participant = match self.workspace_store().await {
+            Ok(store) => store.participant(sender).await.ok().flatten(),
+            Err(_) => None,
+        };
+        participant
+            .map(|participant| participant.display_name)
+            .unwrap_or_else(|| sender.to_string())
     }
 
     /// Rebuild the coordinator projection from the durable parent event
@@ -3461,6 +3567,7 @@ impl SubagentCoordinator {
                         inbox: Vec::new(),
                         assignment_claimed: false,
                         dormant: !snapshot.status.is_terminal() && !recovery_failed,
+                        interrupted_by: None,
                     },
                 );
             }
@@ -3650,7 +3757,7 @@ impl SubagentCoordinator {
             let mut table = self.table.lock().await;
             anyhow::ensure!(
                 !table.task_names.contains_key(&assignment_name),
-                "subagent task name already exists: {assignment_name}"
+                "subagent task name already exists: {assignment_name}; use followup_task to give it more work"
             );
             // Claim and rename under one lock. The name is what the roster,
             // `resolve`, and child-report attribution all key on, so a reused
@@ -5303,6 +5410,26 @@ impl SubagentCoordinator {
         }
         let mut messages = std::mem::take(&mut entry.inbox);
         messages.push(inbox_message);
+        self.mark_seen(actor_session_id, &entry.snapshot).await;
+        if entry.interrupted_by == Some(actor_session_id)
+            && let Some(commands) = &entry.commands
+        {
+            commands
+                .send(HostCommand::ResumeFromInterrupt { session_id: id })
+                .await
+                .map_err(|_| anyhow::anyhow!("subagent command channel closed"))?;
+            entry.interrupted_by = None;
+            // Measured live: a resumed child read the interrupt as the human
+            // rejecting its work and refused its parent's follow-up as a peer
+            // wake that a human stop overrides. Say what actually happened.
+            if let Some(message) = messages.last_mut() {
+                message.text = format!(
+                    "{actor} (your parent) interrupted your previous turn itself; the human did \
+                     not stop you. This follow-up resumes you: the stop is lifted, so act on it.\n\n{}",
+                    message.text
+                );
+            }
+        }
         for message in messages {
             send_prompt(entry, id, message).await?;
         }
@@ -5453,9 +5580,22 @@ impl SubagentCoordinator {
         })
     }
 
+    /// Interrupt as the human (the UI path). `interrupt_agent` records its
+    /// caller afterwards; here any earlier agent interrupt is forgotten, so a
+    /// later human stop is never lifted by that agent's follow-up.
     pub async fn interrupt(&self, target: &str) -> Result<()> {
+        self.forget_interrupter(target).await;
         self.send_command(target, |session_id| HostCommand::Interrupt { session_id })
             .await
+    }
+
+    async fn forget_interrupter(&self, target: &str) {
+        let mut table = self.table.lock().await;
+        if let Ok(id) = table.resolve(target)
+            && let Some(entry) = table.entries.get_mut(&id)
+        {
+            entry.interrupted_by = None;
+        }
     }
 
     pub async fn flush_pending_input(&self, target: &str) -> Result<()> {
@@ -5466,6 +5606,9 @@ impl SubagentCoordinator {
     }
 
     pub async fn stop(&self, target: &str) -> Result<()> {
+        // A stopped child may be revived by an explicit follow-up; that must
+        // not be announced as a parent lifting its own interrupt.
+        self.forget_interrupter(target).await;
         self.send_command(target, |session_id| HostCommand::Stop { session_id })
             .await
     }
@@ -5572,48 +5715,6 @@ impl SubagentCoordinator {
             session_id,
         })
         .await
-    }
-
-    pub async fn wait(&self, timeout: Duration) -> Result<Option<SubagentActivity>> {
-        let timeout = timeout.clamp(Duration::from_millis(100), Duration::from_secs(60));
-        if let Some(agent) = self
-            .table
-            .lock()
-            .await
-            .snapshots()
-            .into_iter()
-            .find(|agent| agent.status == SubagentStatus::Ready && agent.final_text.is_some())
-        {
-            return Ok(Some(SubagentActivity::Completed { agent }));
-        }
-        let mut receiver = self.subscribe();
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, receiver.recv()).await {
-                Ok(Ok(activity)) => {
-                    if let Some(session_id) = ready_session_id(&activity)
-                        && let Some(agent) = self
-                            .table
-                            .lock()
-                            .await
-                            .entries
-                            .get(&session_id)
-                            .map(|entry| entry.snapshot.clone())
-                    {
-                        return Ok(Some(SubagentActivity::Completed { agent }));
-                    }
-                    if significant_activity(&activity) {
-                        return Ok(Some(activity));
-                    }
-                }
-                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
-                Ok(Err(broadcast::error::RecvError::Closed)) => {
-                    bail!("subagent activity stream closed")
-                }
-                Err(_) => return Ok(None),
-            }
-        }
     }
 
     /// Execute one model collaboration tool against this typed lifecycle.
@@ -5893,14 +5994,70 @@ impl SubagentCoordinator {
                     "relay_pending": relay_pending,
                 }))
             }
-            "list_unread_team_messages" => Ok(serde_json::to_value(
-                self.unread_messages_for_session(actor_session_id).await?,
-            )?),
+            "list_unread_team_messages" => {
+                let args: ListUnreadArgs = if arguments.is_null() {
+                    ListUnreadArgs::default()
+                } else {
+                    serde_json::from_value(arguments)?
+                };
+                let messages = self.unread_messages_for_session(actor_session_id).await?;
+                if args.ack {
+                    let ids = messages
+                        .iter()
+                        .map(|message| message.message_id)
+                        .collect::<Vec<_>>();
+                    self.acknowledge_messages_for_session(actor_session_id, &ids)
+                        .await?;
+                }
+                if !args.compact {
+                    return Ok(serde_json::to_value(messages)?);
+                }
+                let mut compact = Vec::with_capacity(messages.len());
+                for message in &messages {
+                    let mut lines = message.report_text.trim().lines();
+                    let first = lines.next().unwrap_or_default();
+                    let mut first_line = first.chars().take(200).collect::<String>();
+                    if lines.next().is_some() || first_line.len() < first.len() {
+                        first_line.push('…');
+                    }
+                    compact.push(json!({
+                        "message_id": message.message_id,
+                        "from": self.sender_label(message.sender_session_id).await,
+                        "first_line": first_line,
+                    }));
+                }
+                Ok(Value::Array(compact))
+            }
             "acknowledge_team_message" => {
-                let args: AcknowledgeMessageArgs = serde_json::from_value(arguments)?;
-                self.acknowledge_message_for_session(actor_session_id, args.message_id)
+                let args: AcknowledgeMessagesArgs = serde_json::from_value(arguments)?;
+                let mut ids = args.message_id.into_iter().collect::<Vec<_>>();
+                ids.extend(args.message_ids);
+                if args.all || args.up_to.is_some() {
+                    let unread = self.unread_messages_for_session(actor_session_id).await?;
+                    let take = match args.up_to {
+                        _ if args.all => unread.len(),
+                        Some(up_to) => {
+                            unread
+                                .iter()
+                                .position(|message| message.message_id == up_to)
+                                .with_context(|| {
+                                    format!("up_to {up_to} is not an unread message")
+                                })?
+                                + 1
+                        }
+                        None => 0,
+                    };
+                    ids.extend(unread.iter().take(take).map(|message| message.message_id));
+                }
+                ensure!(
+                    !ids.is_empty() || args.all,
+                    "name message_id, message_ids, up_to, or set all:true"
+                );
+                let mut seen = HashSet::new();
+                ids.retain(|id| seen.insert(*id));
+                self.acknowledge_messages_for_session(actor_session_id, &ids)
                     .await?;
-                Ok(json!({ "acknowledged": true }))
+                Ok(json!({ "acknowledged": true, "count": ids.len(), "message_ids": ids }))
             }
             "get_message_status" => {
                 let args: AcknowledgeMessageArgs = serde_json::from_value(arguments)?;
@@ -5929,13 +6086,16 @@ impl SubagentCoordinator {
             "interrupt_agent" => {
                 let args: TargetArgs = serde_json::from_value(arguments)?;
                 self.interrupt(&args.target).await?;
+                let id = self.table.lock().await.resolve(&args.target)?;
+                if let Some(entry) = self.table.lock().await.entries.get_mut(&id) {
+                    entry.interrupted_by = Some(actor_session_id);
+                }
                 Ok(json!({ "accepted": true }))
             }
             "wait_agent" => {
                 let args: WaitAgentArgs = serde_json::from_value(arguments)?;
-                Ok(json!({
-                    "activity": self.wait(Duration::from_millis(args.timeout_ms.unwrap_or(30_000))).await?
-                }))
+                self.wait_for(actor_session_id, args.timeout(), WaitSignals::default())
+                    .await
             }
             other => bail!("unknown subagent tool: {other}"),
         }
@@ -6164,13 +6324,21 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "list_unread_team_messages",
-            "List unread team messages for this participant.",
-            json!({"type":"object","properties":{},"additionalProperties":false}),
+            "List unread team messages for this participant, oldest first. compact:true returns only id, sender and first line for triage; ack:true acknowledges exactly the returned messages in the same call. Messages already shown by wait_agent are acknowledged and not listed again.",
+            json!({"type":"object","properties":{
+                "compact":{"type":"boolean","description":"Return message_id, from and first_line only."},
+                "ack":{"type":"boolean","description":"Acknowledge the returned messages."}
+            },"additionalProperties":false}),
         ),
         tool(
             "acknowledge_team_message",
-            "Acknowledge one unread team message.",
-            json!({"type":"object","properties":{"message_id":{"type":"string"}},"required":["message_id"],"additionalProperties":false}),
+            "Acknowledge unread team messages in one call: message_id, message_ids, up_to (every unread message through that id, oldest first), or all:true. Returns the acknowledged ids.",
+            json!({"type":"object","properties":{
+                "message_id":{"type":"string"},
+                "message_ids":{"type":"array","items":{"type":"string"}},
+                "up_to":{"type":"string","description":"Acknowledge every unread message up to and including this id."},
+                "all":{"type":"boolean","description":"Acknowledge every unread message."}
+            },"additionalProperties":false}),
         ),
         tool(
             "get_message_status",
@@ -6179,16 +6347,21 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "interrupt_agent",
-            "Interrupt a child agent's current turn.",
+            "Interrupt a child agent's current turn. The child then stays idle and ignores ordinary wakes until you give it more work: your next followup_task (or send_message with wake:true) to it resumes it.",
             target_schema(),
         ),
         tool(
             "wait_agent",
-            "Wait for a child lifecycle or session update.",
+            "Block until your child agents give you something to act on, then report it. This is how to wait for children: one call covers a whole assignment, so never poll with shell sleeps or repeated list_agents. Returns early when a child finishes, fails, stops or needs approval, when a child or teammate messages you, or when human or team input is waiting for you (answer that first); otherwise at timeout_ms. Each change is reported once, so a child that finished earlier does not end later waits. With no child working it returns after a few seconds instead of blocking. The result gives the reason (child_settled, child_message, child_update for both, input_pending, no_active_children, timeout), the changes with each finished child's final text, messages, and a compact status line for every child.",
             json!({
                 "type": "object",
                 "properties": {
-                    "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 60000 }
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 100,
+                        "maximum": 1800000,
+                        "description": "Longest wait in milliseconds; default 600000 (10 minutes), maximum 1800000 (30 minutes)."
+                    }
                 },
                 "additionalProperties": false
             }),
@@ -6347,6 +6520,10 @@ pub struct ToolSurface {
     /// Interactive prompting of the human. A child reports back to its parent
     /// instead: sixty children must not interrogate one person.
     pub human_prompt: bool,
+    /// The user's desktop seat through computer_use (desktop windows and
+    /// screenshots, input that reaches the user's focus). A child's
+    /// computer_use is confined to its own private display instead.
+    pub desktop: bool,
     /// Parent steering and watcher lifecycle. A child managing the parent
     /// watcher set or yield on its behalf is a deadlock.
     pub parent_control: bool,
@@ -6363,17 +6540,19 @@ impl ToolSurface {
             shared_work: true,
             web_search: true,
             human_prompt: true,
+            desktop: true,
             parent_control: true,
             watcher_yield: false,
         }
     }
 
-    /// A child gets the director surface minus the three documented
-    /// exceptions. Anything else the director gains reaches children too.
+    /// A child gets the director surface minus the documented exceptions.
+    /// Anything else the director gains reaches children too.
     pub fn for_child(self) -> Self {
         Self {
             consultation: false,
             human_prompt: false,
+            desktop: false,
             parent_control: false,
             watcher_yield: false,
             ..self
@@ -6448,6 +6627,7 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
     shared_work_enabled: bool,
     team_policy: Option<&crate::TeamPolicy>,
     consultation_enabled: bool,
+    desktop_enabled: bool,
     watcher_yield_enabled: bool,
 ) -> Vec<Value> {
     agent_tool_specs_for_surface(
@@ -6456,6 +6636,7 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
             subagents: subagents_enabled,
             shared_work: shared_work_enabled,
             consultation: consultation_enabled,
+            desktop: desktop_enabled,
             watcher_yield: watcher_yield_enabled,
             // Search is added by the runtime when it has a search service, so
             // this surface never carries it implicitly.
@@ -6466,28 +6647,7 @@ pub fn agent_tool_specs_with_capabilities_and_consultation(
     )
 }
 
-fn agent_tool_specs_with_capabilities_and_consultation_and_search(
-    provider: CodingProvider,
-    subagents_enabled: bool,
-    shared_work_enabled: bool,
-    team_policy: Option<&crate::TeamPolicy>,
-    consultation_enabled: bool,
-    web_search_enabled: bool,
-    watcher_yield_enabled: bool,
-) -> Vec<Value> {
-    agent_tool_specs_for_surface(
-        provider,
-        ToolSurface {
-            subagents: subagents_enabled,
-            shared_work: shared_work_enabled,
-            consultation: consultation_enabled,
-            web_search: web_search_enabled,
-            watcher_yield: watcher_yield_enabled,
-            ..ToolSurface::director()
-        },
-        team_policy,
-    )
-}
+const SUB_AGENT_COMPUTER_USE: &str = "Sub-agent computer use, confined to a private headless GPU display; the user's desktop, windows and seat are refused. Requires Full Access or approval. launch (argv, optional env, cwd, x11=true for X11-only apps, wait, width/height on first start) starts your own display on demand, reused for your session and torn down with it; attach_display with a display_id from your parent shares its display instead (detaching kills only your apps). list_windows needs display=private and returns pd: window ids; observe, screenshot (display=private scope=desktop, or scope=window), click, set_value, type_text, key, pointer_click, pointer_move (relative dx, dy; exact relative motion when the app locks the pointer), scroll and drag all take a pd: window_id; screenshots take cursor=true to draw the pointer; pointer x,y are private display pixels (coordinate_space=window for window-relative). Acting on a consequential control (send, pay, delete, publish, security, credentials) is refused until the human has confirmed that exact action through your parent and you pass confirmed=true.";
 
 /// The one builder. Every surface, director or child, comes from here.
 pub fn agent_tool_specs_for_surface(
@@ -6534,16 +6694,33 @@ pub fn agent_tool_specs_for_surface(
     let mut specs = vec![
         tool(
             "computer_use",
-            "Native desktop access, including sensitive screen contents; requires Full Access or approval. Query capabilities first: it reports the platform backend (Linux AT-SPI2, macOS AXUIElement, Windows UI Automation), permissions and capture scopes. Operations: list_windows, bounded observe (optional since diff, optional screenshot=true with screenshot_scope), explicit screenshots (scope=desktop, or scope=window with window_id where supported), semantic click and set_value, and input injection where the backend supports it: type_text (text), key (keys like cmd+s), pointer_click (element_id+observation_id or x,y; button, count), scroll (dx, dy), drag (from_x, from_y, to_x, to_y). Injection raises the target window (a focus change). Prefer semantic click/set_value for element targeting; on Linux Wayland an element-targeted pointer_click/scroll fails with a clear error when the window origin is unknown, so fall back to click/set_value or to raw x,y read from a desktop screenshot. Actions require window_id, element_id and the latest observation_id; inspect returned state to verify effects. Acting on a consequential control (send, pay, delete, publish, security, credentials) is refused until the human has confirmed that exact action and you pass confirmed=true. No coordinate/clipboard fallback.",
+            "Native desktop access, including sensitive screen contents; requires Full Access or approval. Query capabilities first: it reports the platform backend (Linux AT-SPI2, macOS AXUIElement, Windows UI Automation), the window backend, permissions, capture scopes and limitations. Operations: list_windows (on Linux also compositor-listed windows without an accessibility tree, e.g. games or Unreal, marked accessible=false with compositor geometry/workspace/pid), bounded observe (optional since diff, optional screenshot=true with screenshot_scope), explicit screenshots (scope=desktop, or scope=window with window_id where supported), semantic click and set_value, and input injection where the backend supports it: type_text (text), key (keys like cmd+s or a bare modifier; hold_ms holds it, e.g. w for 2000 ms), pointer_click (element_id+observation_id or x,y; button, count), scroll (dx, dy), drag (from_x, from_y, to_x, to_y), pointer_move (Linux: relative mouse motion dx, dy for mouse-look, optional steps, duration_ms and hold_keys held during the motion). x,y are desktop screenshot pixels unless coordinate_space=window, which targets pixels of the latest scope=window screenshot of that window. Injection focuses the target window (a focus change; restore_focus=true hands focus back afterwards). Prefer semantic click/set_value for element targeting; element-targeted pointer ops fail with a clear error when the window origin cannot be determined. Actions require window_id, element_id and the latest observation_id; inspect returned state to verify effects. Acting on a consequential control (send, pay, delete, publish, security, credentials) is refused until the human has confirmed that exact action and you pass confirmed=true. No coordinate/clipboard fallback. Linux private display (prefer it for testing apps and games): launch (argv, optional env, cwd, x11=true for X11-only apps, wait seconds, width/height on first start) runs the app on a session-owned headless GPU display that is started on demand, reused, and torn down with the session; list_windows with display=private returns pd: window ids; every op then works on those ids (screenshot display=private scope=desktop for the whole display, or scope=window), and its input never touches the user's seat, pointer or focused window. Pointer x,y are private display pixels (coordinate_space=window for window-relative); pointer_move takes relative dx, dy, which reach games that lock the pointer as exact relative motion; type_text accepts any Unicode; screenshots take cursor=true to draw the pointer. start_display/stop_display control the display explicitly, and its display_id lets a sub-agent attach_display to share it; capabilities.private_display reports availability, GPU acceleration and limitations.",
             json!({
                 "type": "object",
                 "properties": {
-                    "op": {"type": "string", "enum": ["capabilities", "list_windows", "observe", "screenshot", "click", "set_value", "type_text", "key", "pointer_click", "scroll", "drag"]},
+                    "op": {"type": "string", "enum": ["capabilities", "list_windows", "observe", "screenshot", "click", "set_value", "type_text", "key", "pointer_click", "pointer_move", "scroll", "drag", "launch", "start_display", "stop_display", "attach_display"]},
+                    "display_id": {"type": "string", "description": "attach_display: the display_id another session's private display reports (share a parent's display)."},
+                    "display": {"type": "string", "enum": ["desktop", "private"], "description": "Target the user's desktop (default) or this session's private display; pd: window ids imply private."},
+                    "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 256, "description": "launch: program and arguments, run on the private display."},
+                    "env": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "cwd": {"type": "string"},
+                    "x11": {"type": "boolean", "description": "launch: provide an X11 DISPLAY through xwayland-satellite."},
+                    "detached": {"type": "boolean", "description": "launch: do not kill the app at teardown (it still loses the display)."},
+                    "wait": {"type": "number", "minimum": 0, "maximum": 10, "description": "launch: seconds to wait for the app's first window (default 5)."},
+                    "width": {"type": "integer", "minimum": 64, "maximum": 8192},
+                    "height": {"type": "integer", "minimum": 64, "maximum": 8192},
                     "keys": {"type": "string", "maxLength": 64},
                     "x": {"type": "number"}, "y": {"type": "number"},
                     "button": {"type": "string", "enum": ["left", "right", "middle"]},
                     "count": {"type": "integer", "minimum": 1, "maximum": 2},
                     "dx": {"type": "number"}, "dy": {"type": "number"},
+                    "coordinate_space": {"type": "string", "enum": ["desktop", "window"], "description": "Space of x,y and drag points: desktop screenshot pixels (default) or pixels of the latest scope=window screenshot of window_id."},
+                    "hold_ms": {"type": "integer", "minimum": 0, "maximum": 10000, "description": "key: hold the key down this long before releasing."},
+                    "cursor": {"type": "boolean", "description": "screenshot on the private display: draw the pointer (the app's cursor, or a crosshair)."},
+                    "steps": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "pointer_move: number of relative motion events."},
+                    "duration_ms": {"type": "integer", "minimum": 0, "maximum": 10000, "description": "pointer_move: spread the motion over this duration."},
+                    "hold_keys": {"type": "string", "maxLength": 64, "description": "pointer_move: key combination held during the motion, e.g. w or shift+w."},
+                    "restore_focus": {"type": "boolean", "description": "After injecting, give focus back to the previously focused window."},
                     "from_x": {"type": "number"}, "from_y": {"type": "number"},
                     "to_x": {"type": "number"}, "to_y": {"type": "number"},
                     "window_id": {"type": "string"},
@@ -7002,12 +7179,18 @@ pub fn agent_tool_specs_for_surface(
     // person to decide; a child reports to its parent instead, or sixty
     // children interrogate one human.
     if !surface.human_prompt {
-        specs.retain(|spec| {
-            !matches!(
-                spec["name"].as_str(),
-                Some("computer_use" | "update_agent_settings")
-            )
-        });
+        specs.retain(|spec| spec["name"] != "update_agent_settings");
+    }
+    // Exception: the user's desktop. A child's computer_use drives only its
+    // own private display (or one it attaches to); the dispatcher enforces it.
+    if !surface.desktop
+        && let Some(spec) = specs.iter_mut().find(|spec| spec["name"] == "computer_use")
+    {
+        spec["description"] = Value::String(SUB_AGENT_COMPUTER_USE.to_string());
+        spec["inputSchema"]["properties"]["display"]["enum"] = json!(["private"]);
+        if let Some(properties) = spec["inputSchema"]["properties"].as_object_mut() {
+            properties.remove("restore_focus");
+        }
     }
     // Exception: the parent yield, steering and watcher lifecycle. A child
     // holding the parent yield on its behalf is a deadlock.
@@ -7677,6 +7860,24 @@ struct AcknowledgeMessageArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AcknowledgeMessagesArgs {
+    message_id: Option<Uuid>,
+    #[serde(default)]
+    message_ids: Vec<Uuid>,
+    #[serde(default)]
+    all: bool,
+    up_to: Option<Uuid>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ListUnreadArgs {
+    ack: bool,
+    compact: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TargetArgs {
     target: String,
 }
@@ -7685,6 +7886,13 @@ struct TargetArgs {
 #[serde(deny_unknown_fields)]
 struct WaitAgentArgs {
     timeout_ms: Option<u64>,
+}
+
+impl WaitAgentArgs {
+    fn timeout(&self) -> Duration {
+        self.timeout_ms
+            .map_or(wait::DEFAULT_WAIT, Duration::from_millis)
+    }
 }
 
 #[derive(Deserialize)]
@@ -8336,6 +8544,11 @@ async fn update_from_session_event(
             entry.snapshot.provider = *provider;
             entry.snapshot.model = model.clone();
             entry.snapshot.effort = effort.clone();
+            if matches!(event.kind, SessionEventKind::TurnStarted { .. }) {
+                // A new turn by any route ends that interrupt. Not a Running
+                // status: the interrupt itself records Running ("cancelling").
+                entry.interrupted_by = None;
+            }
         }
         SessionEventKind::StatusChanged { status, detail } => {
             entry.assignment_claimed = false;
@@ -8439,40 +8652,6 @@ fn project_child_state(snapshot: &mut SubagentSnapshot, state: &crate::SessionSt
     };
 }
 
-fn significant_activity(activity: &SubagentActivity) -> bool {
-    match activity {
-        SubagentActivity::Started { .. }
-        | SubagentActivity::Stopped { .. }
-        | SubagentActivity::Failed { .. }
-        | SubagentActivity::Completed { .. } => true,
-        SubagentActivity::SessionEvent { event, .. } => matches!(
-            event.kind,
-            SessionEventKind::ApprovalRequested { .. }
-                | SessionEventKind::StatusChanged {
-                    status: SessionStatus::Failed | SessionStatus::Stopped,
-                    ..
-                }
-        ),
-    }
-}
-
-fn ready_session_id(activity: &SubagentActivity) -> Option<Uuid> {
-    match activity {
-        SubagentActivity::SessionEvent { event, .. }
-            if matches!(
-                event.kind,
-                SessionEventKind::StatusChanged {
-                    status: SessionStatus::Ready | SessionStatus::Completed,
-                    ..
-                }
-            ) =>
-        {
-            Some(event.session_id)
-        }
-        _ => None,
-    }
-}
-
 async fn finish_agent(
     table: &Arc<Mutex<SubagentTable>>,
     session_id: Uuid,
@@ -8518,6 +8697,8 @@ fn lift_runtime_value_attachments(mut result: Value) -> Value {
 
 #[cfg(test)]
 mod tests;
+mod wait;
+use wait::WaitSignals;
 
 /// Unix domain sockets have a hard limit on their path: `sun_path` is 104 bytes
 /// on macOS and the BSDs, 108 on Linux. The session runtime directory can

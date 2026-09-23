@@ -16,7 +16,14 @@ Linux requires the desktop session bus, Python 3, PyGObject and AT-SPI2.
 Input injection additionally requires python-evdev, a writable `/dev/uinput`
 (the `input` group or a udev rule) and `wtype` on Wayland or `xdotool` on X11.
 
-- `list_windows`: window IDs are scoped to the helper lifetime.
+- `list_windows`: window IDs are scoped to the helper lifetime. On Linux the
+  AT-SPI windows are merged with the compositor's own window list (niri IPC,
+  sway, Hyprland, X11 EWMH, or `lswt` for other wlroots compositors), so windows
+  with no accessibility tree — Unreal Editor, SDL games, XWayland apps — appear
+  too, as `accessible: false` with ids like `niri:18`. Entries carry a
+  `compositor` object (backend, native id, app_id, pid, workspace, output,
+  focused, floating, visible, geometry, size); AT-SPI windows get it when they
+  correlate unambiguously by pid/title. `list_windows` reports `window_backend`.
 - `observe`: `window_id`, optional `max_nodes` (1–1000), optional `since` for
   a diff from the immediately preceding observation. Trees and text are bounded.
 - `click`: semantic AT-SPI action, not an inferred coordinate click.
@@ -25,10 +32,14 @@ Input injection additionally requires python-evdev, a writable `/dev/uinput`
   Handles are checked against the window ancestry and observed state. An attempted
   effect consumes its observation. Results contain a new tree and a bounded
   tree-settling indicator, **not** a guarantee of application-level completion.
-- `screenshot` requires `scope: "desktop"`. It uses `grim` on supported Wayland
-  compositors, returns bounded inline PNG attachments, and explicitly captures the
-  entire visible desktop. For tree plus image, use `observe` with `screenshot: true`
-  and `screenshot_scope: "desktop"`. There is no silent whole-screen fallback.
+- `screenshot` requires an explicit scope. `scope: "desktop"` uses `grim` and
+  captures the entire visible desktop. `scope: "window"` with `window_id`
+  captures one compositor-listed window (see below). Both return bounded inline
+  PNG attachments (window captures over 4 MiB are downscaled and report `scale`).
+  For tree plus image, use `observe` with `screenshot: true` and
+  `screenshot_scope`. Observing a window without an accessibility tree returns
+  an empty tree plus the requested screenshot. There is no silent whole-screen
+  fallback.
 
 Consequential controls are gated in the dispatcher on every platform: after an
 observation, a `click` or `set_value` whose target name contains a word such as
@@ -53,10 +64,91 @@ Raw `x,y` targets are in screenshot/screen pixel space (Linux, Windows) or AX
 screen points (macOS) and are flagged `coordinate_click: true`; they bypass
 name-based confirmation gating because no element is named.
 
-Linux caveat: AT-SPI extents on GTK Wayland are window-relative and the
-compositor may not expose the window origin, so element-targeted
-`pointer_click`/`scroll` return a clear error there instead of guessing; use
-`click`/`set_value` or a raw coordinate read from a desktop screenshot.
+Linux: on Wayland, observed `bounds` are AT-SPI window-relative coordinates
+(GTK4 reports its screen extents as 0,0), which match `scope: "window"`
+screenshot pixels at scale 1. Element-targeted `pointer_click`/`scroll` map them
+through the window's desktop origin (below) and fail with a clear error when it
+cannot be determined. Pointer ops and `drag` take `coordinate_space: "window"`
+to target pixels of the latest window screenshot. Every injection op (and
+`click`/`set_value`) takes `restore_focus: true` to give focus back to the
+window the human had before Borg started moving focus.
+
+### Linux compositor windows, window capture and games
+
+- Window capture on niri (verified on niri 26.04): `niri msg action
+  screenshot-window` over the niri socket renders only that window's surfaces,
+  even on another workspace or scrolled off-screen, without a focus change.
+  niri 26.04 has no per-toplevel capture protocol (wlr-screencopy is
+  output/region only; no ext-image-copy-capture; upstream main added it for
+  outputs and cursors only), so this is the only isolated capture. Its side
+  effects are real: niri copies every capture to the clipboard and shows a
+  transient "Screenshot captured" notification. The helper snapshots the
+  clipboard (one MIME type, via wl-clipboard), waits until niri's image
+  selection lands, and restores it — unless it changed again meanwhile.
+- Window capture elsewhere: `grim -T` when the compositor exposes an
+  ext-foreign-toplevel identifier; sway/Hyprland crop the composited desktop to
+  the IPC geometry (overlapping windows show; hidden windows are briefly brought
+  into view and prior focus restored); X11 uses ImageMagick `import -window`.
+- Window → desktop mapping: sway, Hyprland and X11 give absolute geometry, as
+  does niri for floating windows (`tile_pos_in_workspace_view`), which is used
+  first and needs no capture. niri exposes no scroll position for tiled windows,
+  so the fallback locates the window by matching textured strips of a fresh
+  window capture in a desktop capture (python-numpy + python-pillow). It
+  requires the same position over 300 ms (focus changes animate the view),
+  refuses ties such as two identical-looking windows, and re-checks the
+  position right before pressing a button, aborting if the window moved.
+- Input to compositor windows focuses them through the compositor IPC and
+  verifies the focus before injecting.
+- `pointer_move {window_id, dx, dy, steps?, duration_ms?, hold_keys?, x?, y?}`
+  emits relative REL_X/REL_Y motion from a second Borg uinput device ("Borg
+  virtual mouse", a plain mouse to libinput). Wayland sends motion and grants
+  pointer lock only to the surface under the pointer, so the first move into a
+  window places the pointer at its centre (or at `x`,`y`). Pointer-locked apps
+  (SDL relative mode, games) receive the exact unaccelerated counts; the
+  visible cursor follows compositor acceleration. `key` takes `hold_ms` (up to
+  10 s) and bare modifiers; `hold_keys` holds keys during a `pointer_move`.
+
+Verified live on niri 26.04 with SDL3 test windows (no AT-SPI tree, native
+Wayland and XWayland) and a GTK4 window: listing, isolated capture of a window
+on a hidden workspace, a held W key (1503 ms measured by the app), window-space
+clicks landing on the requested pixel, element-targeted clicks on GTK4 buttons,
+pointer-locked relative motion arriving as 10-count deltas, and focus restored
+to the human's window. The X11 EWMH path was verified in Xvfb (listing and
+`import -window` capture only; uinput reaches the real seat, not Xvfb).
+
+### Linux private display (preferred for testing apps and games)
+
+`launch {argv, env?, cwd?, x11?, wait?, width?, height?}` runs an app on a
+session-owned headless display served by `borg-display`, a small Borg
+compositor shipped beside `borg`. The display starts on demand, is reused for
+the session, and is torn down with it (also when the helper is killed); apps
+launched into it are killed at teardown unless `detached`.
+
+- Rendering is on the GPU: GLES on the boot VGA render node, with dmabuf so
+  Vulkan/GL clients render directly. X11-only apps (`x11: true`) run through
+  xwayland-satellite with GPU glamor. `capabilities.private_display` reports
+  the renderer, whether it is hardware-accelerated, and its limitations.
+- `list_windows {display: "private"}` returns `pd:` window ids; every op then
+  works on them. `screenshot {display: "private", scope: "desktop"}` captures
+  the display, `scope: "window"` one window, and `cursor: true` draws the
+  pointer. Pointer x,y are private display pixels.
+- All input goes through the compositor's private seat, never uinput or the
+  user's focused window. `type_text` types any Unicode (characters outside
+  the layout go through a temporary keymap). Apps can lock or confine the
+  pointer (`zwp_pointer_constraints_v1`); `pointer_move` dx/dy then arrive as
+  exact relative motion while the pointer stays put.
+- Sub-agents may use only a private display: desktop windows, desktop
+  screenshots and seat input are refused for them. Each child gets its own
+  display; `attach_display {display_id}` shares a parent's instead, and
+  detaching kills only the child's apps.
+- Without `borg-display` (for example an older install), the private display is
+  reported unavailable with how to get it: update or reinstall Borg, or set
+  `BORG_DISPLAY_BIN`.
+
+Verified live on niri 26.04 with an AMD RX 7900 GRE: vkcube (RADV) and
+glxgears over X11 rendering on the GPU, GTK typing and clicks, an SDL3 app in
+relative mouse mode receiving exact deltas, ✓ and é typed into SDL3 and GTK,
+and the human's focused window, pointer and input devices unchanged.
 
 ### Linux input backend (implemented, test-only verification)
 
@@ -76,8 +168,8 @@ for any non-zero request) and reports them. Wayland compositors may refuse
 focus stealing, so instead of raising blindly the helper checks the AT-SPI
 `ACTIVE` state after a `grab_focus` attempt and refuses with a clear error when
 the target window is not active — injected events always reach the focused
-window. Element-targeted `pointer_click`/`scroll` work only on X11 sessions,
-where AT-SPI screen extents are real screen pixels. Key names match the other
+window. Element-targeted `pointer_click`/`scroll` use AT-SPI screen extents on X11
+and window-relative extents plus the compositor's window origin on Wayland. Key names match the other
 platforms (`delete` is backspace, `forwarddelete` deletes forward; modifiers
 `ctrl`/`alt`/`shift`/`cmd`|`super`); uinput key codes are physical, so the
 compositor's keyboard layout applies. Verified so far without live desktop
@@ -85,7 +177,7 @@ actions: key parsing, axis mapping, capability reporting, error paths, and
 device creation/udev classification with no events emitted.
 
 Python code mode: `cua.capabilities()`, `cua.list_windows()`,
-`cua.observe(window_id)`, `cua.screenshot("desktop")`,
+`cua.observe(window_id)`, `cua.screenshot("desktop")` or `cua.screenshot("window", window_id)`, `cua.pointer_move(window_id, dx, dy)`,
 `cua.click(window_id, element_id, observation_id)`, and
 `cua.set_value(window_id, element_id, observation_id, text)`.
 Bun exposes the same methods as promises; use `await`. Return the screenshot
@@ -106,9 +198,8 @@ passed capability and screenshot-attachment checks. Ten runtime tests plus the
 permission regression pass, including image bounds and no replay of host effects
 after a Bun runtime error.
 
-AT-SPI coordinates on Wayland are **not** assumed to be screenshot coordinates.
-The local Niri compositor omitted visible-window geometry and rejected isolated
-`grim -T` capture. Those experiments are not advertised as supported window capture.
+AT-SPI coordinates on Wayland are **not** assumed to be desktop coordinates;
+they are mapped through the compositor window origin as described above.
 
 ## macOS (verified on a real host)
 

@@ -17,6 +17,9 @@ use crate::cli::UpdateArgs;
 const REPOSITORY: &str = "borg-ml/agent";
 const MAX_DOWNLOAD_BYTES: usize = 128 * 1024 * 1024;
 const MAX_UPDATE_ERROR_CHARS: usize = 512;
+/// The Linux private-display compositor ships beside `borg`. Older release
+/// archives and other platforms do not carry it.
+const DISPLAY_EXECUTABLE: &str = "borg-display";
 static BACKGROUND_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Deserialize)]
@@ -140,11 +143,16 @@ async fn update(check_only: bool, quiet: bool) -> Result<UpdateOutcome> {
     let temporary = tempfile::tempdir().context("failed to create update staging directory")?;
     let candidate = temporary.path().join(executable_name());
     let provider_candidate = temporary.path().join("providers/claude");
+    let display_candidate = temporary.path().join(DISPLAY_EXECUTABLE);
     extract_executable(&archive, &candidate)?;
     extract_native_provider(&archive, &provider_candidate)?;
+    let display = extract_display(&archive, &display_candidate)?.then_some(display_candidate);
     validate_candidate(&candidate, &latest)?;
     validate_native_provider(&provider_candidate)?;
-    install_candidate(&candidate, &provider_candidate, &latest)?;
+    if let Some(display) = &display {
+        validate_display_candidate(display, &latest)?;
+    }
+    install_candidate(&candidate, &provider_candidate, display.as_deref(), &latest)?;
     clear_background_failure();
     Ok(UpdateOutcome::Installed(latest))
 }
@@ -221,6 +229,16 @@ fn extract_executable(archive: &[u8], destination: &Path) -> Result<()> {
 
 #[cfg(unix)]
 fn extract_unix_executable(archive: &[u8], destination: &Path, name: &str) -> Result<()> {
+    anyhow::ensure!(
+        extract_unix_entry(archive, destination, name)?,
+        "Borg release archive does not contain `{name}`"
+    );
+    Ok(())
+}
+
+/// Extract a top-level archive entry; `false` when the archive lacks it.
+#[cfg(unix)]
+fn extract_unix_entry(archive: &[u8], destination: &Path, name: &str) -> Result<bool> {
     use flate2::read::GzDecoder;
     let mut tar = tar::Archive::new(GzDecoder::new(Cursor::new(archive)));
     for entry in tar.entries().context("invalid Borg release archive")? {
@@ -230,10 +248,20 @@ fn extract_unix_executable(archive: &[u8], destination: &Path, name: &str) -> Re
                 fs::File::create(destination).context("failed to stage Borg update")?;
             std::io::copy(&mut entry, &mut output).context("failed to extract Borg update")?;
             output.sync_all().context("failed to sync Borg update")?;
-            return Ok(());
+            return Ok(true);
         }
     }
-    bail!("Borg release archive does not contain `{name}`")
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn extract_display(archive: &[u8], destination: &Path) -> Result<bool> {
+    extract_unix_entry(archive, destination, DISPLAY_EXECUTABLE)
+}
+
+#[cfg(windows)]
+fn extract_display(_archive: &[u8], _destination: &Path) -> Result<bool> {
+    Ok(false)
 }
 
 #[cfg(unix)]
@@ -345,6 +373,31 @@ fn validate_candidate(candidate: &Path, expected: &Version) -> Result<()> {
     Ok(())
 }
 
+/// The staged compositor must run and report the release version, exactly as
+/// the staged `borg` must.
+fn validate_display_candidate(candidate: &Path, expected: &Version) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(candidate, fs::Permissions::from_mode(0o755))
+            .context("failed to make staged borg-display executable")?;
+    }
+    let output = std::process::Command::new(candidate)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .context("failed to run staged borg-display")?;
+    anyhow::ensure!(output.status.success(), "staged borg-display did not run");
+    let version =
+        String::from_utf8(output.stdout).context("invalid staged borg-display version output")?;
+    anyhow::ensure!(
+        version.trim() == format!("{DISPLAY_EXECUTABLE} {expected}"),
+        "staged borg-display version did not match release metadata"
+    );
+    Ok(())
+}
+
 fn validate_native_provider(provider: &Path) -> Result<()> {
     for name in [
         native_provider_executable_name(),
@@ -360,16 +413,123 @@ fn validate_native_provider(provider: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn install_candidate(candidate: &Path, provider: &Path, _version: &Version) -> Result<()> {
+fn install_candidate(
+    candidate: &Path,
+    provider: &Path,
+    display: Option<&Path>,
+    _version: &Version,
+) -> Result<()> {
     let executable = std::env::current_exe().context("failed to locate installed Borg")?;
     let target = native_provider_target(&executable)?;
-    let swap = stage_native_provider(provider, &target)?;
-    if let Err(error) = install_candidate_at(candidate, &executable) {
-        swap.rollback()
+    install_release_at(candidate, provider, display, &executable, &target)
+}
+
+/// Install the provider, then borg-display beside `borg`, then `borg` last;
+/// a failure at any step restores everything installed before it.
+#[cfg(unix)]
+fn install_release_at(
+    candidate: &Path,
+    provider: &Path,
+    display: Option<&Path>,
+    executable: &Path,
+    provider_target: &Path,
+) -> Result<()> {
+    let provider_swap = stage_native_provider(provider, provider_target)?;
+    let display_swap = match display {
+        None => None,
+        Some(display) => {
+            let target = executable
+                .parent()
+                .context("installed Borg has no parent")?
+                .join(DISPLAY_EXECUTABLE);
+            match stage_display(display, &target) {
+                Ok(swap) => Some(swap),
+                Err(error) => {
+                    provider_swap.rollback().context(
+                        "failed to roll back native provider after borg-display update failure",
+                    )?;
+                    return Err(error);
+                }
+            }
+        }
+    };
+    if let Err(error) = install_candidate_at(candidate, executable) {
+        if let Some(swap) = display_swap {
+            swap.rollback()
+                .context("failed to roll back borg-display after binary update failure")?;
+        }
+        provider_swap
+            .rollback()
             .context("failed to roll back native provider after binary update failure")?;
         return Err(error);
     }
-    swap.commit()
+    if let Some(swap) = display_swap {
+        swap.commit()?;
+    }
+    provider_swap.commit()
+}
+
+/// A single-file replacement that can still be undone: the previous file is
+/// kept as a hard link, so the target path is never missing.
+#[cfg(unix)]
+struct FileSwap {
+    target: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+#[cfg(unix)]
+impl FileSwap {
+    fn commit(self) -> Result<()> {
+        if let Some(backup) = self.backup {
+            fs::remove_file(backup).context("failed to remove the previous borg-display")?;
+        }
+        Ok(())
+    }
+
+    fn rollback(self) -> Result<()> {
+        match self.backup {
+            Some(backup) => fs::rename(backup, &self.target)
+                .context("failed to restore the previous borg-display"),
+            None => fs::remove_file(&self.target)
+                .context("failed to remove the partially installed borg-display"),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn stage_display(candidate: &Path, target: &Path) -> Result<FileSwap> {
+    use std::os::unix::fs::PermissionsExt;
+    let parent = target
+        .parent()
+        .context("borg-display destination has no parent")?;
+    let staged = parent.join(format!(".borg-display-update-{}", std::process::id()));
+    let backup = parent.join(format!(".borg-display-backup-{}", std::process::id()));
+    for stale in [&staged, &backup] {
+        if stale.exists() {
+            fs::remove_file(stale).context("failed to clear stale borg-display staging")?;
+        }
+    }
+    fs::copy(candidate, &staged).context("failed to stage borg-display beside Borg")?;
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))
+        .context("failed to make staged borg-display executable")?;
+    fs::File::open(&staged)
+        .and_then(|file| file.sync_all())
+        .context("failed to sync staged borg-display")?;
+    let had_target = target.exists();
+    if had_target {
+        fs::hard_link(target, &backup).context("failed to keep the previous borg-display")?;
+    }
+    if let Err(error) = fs::rename(&staged, target) {
+        let _ = fs::remove_file(&staged);
+        if had_target {
+            let _ = fs::remove_file(&backup);
+        }
+        return Err(error).context("failed to atomically install borg-display");
+    }
+    Ok(FileSwap {
+        target: target.to_path_buf(),
+        backup: had_target.then_some(backup),
+    })
 }
 
 #[cfg(unix)]
@@ -492,7 +652,12 @@ fn stage_native_provider(provider: &Path, target: &Path) -> Result<NativeProvide
 }
 
 #[cfg(windows)]
-fn install_candidate(candidate: &Path, provider: &Path, version: &Version) -> Result<()> {
+fn install_candidate(
+    candidate: &Path,
+    provider: &Path,
+    _display: Option<&Path>,
+    version: &Version,
+) -> Result<()> {
     use std::os::windows::process::CommandExt;
     let executable = std::env::current_exe().context("failed to locate installed Borg")?;
     let parent = executable
@@ -864,6 +1029,139 @@ mod tests {
             fs::read(installed_provider.join("claude")).unwrap(),
             b"new-claude"
         );
+    }
+
+    #[cfg(unix)]
+    fn release_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        let mut archive = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::fast()));
+        for (name, bytes) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, name, Cursor::new(*bytes))
+                .unwrap();
+        }
+        archive.into_inner().unwrap().finish().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn write_provider(directory: &Path, claude: &[u8]) {
+        fs::create_dir_all(directory).unwrap();
+        fs::write(directory.join("claude"), claude).unwrap();
+        fs::write(directory.join("manifest.json"), b"{}").unwrap();
+        fs::write(directory.join("package.json"), b"{}").unwrap();
+    }
+
+    /// Failure mode: an update from a release built before borg-display
+    /// shipped (or on a platform without it) failing instead of installing.
+    #[cfg(unix)]
+    #[test]
+    fn release_archives_without_borg_display_still_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join(DISPLAY_EXECUTABLE);
+        let older = release_archive(&[("borg", b"borg-binary")]);
+        assert!(!extract_display(&older, &destination).unwrap());
+        assert!(!destination.exists());
+        let current =
+            release_archive(&[("borg", b"borg-binary"), (DISPLAY_EXECUTABLE, b"display")]);
+        assert!(extract_display(&current, &destination).unwrap());
+        assert_eq!(fs::read(&destination).unwrap(), b"display");
+    }
+
+    /// Failure mode: a failed update leaving borg-display and borg from
+    /// different releases (the helper and compositor share a protocol), or a
+    /// successful one leaving staging files beside borg.
+    #[cfg(unix)]
+    #[test]
+    fn borg_display_is_installed_and_rolled_back_with_the_borg_binary() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let executable = root.join("bin/borg");
+        let display = root.join("bin").join(DISPLAY_EXECUTABLE);
+        let provider_target = root.join("bin/providers/claude");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(&executable, b"old-borg").unwrap();
+        fs::write(&display, b"old-display").unwrap();
+        write_provider(&provider_target, b"old-claude");
+        let staged = root.join("staged");
+        write_provider(&staged.join("provider"), b"new-claude");
+        fs::write(staged.join("borg"), b"new-borg").unwrap();
+        fs::write(staged.join(DISPLAY_EXECUTABLE), b"new-display").unwrap();
+
+        // The borg binary fails to install: everything before it is undone.
+        install_release_at(
+            &staged.join("missing-borg"),
+            &staged.join("provider"),
+            Some(&staged.join(DISPLAY_EXECUTABLE)),
+            &executable,
+            &provider_target,
+        )
+        .unwrap_err();
+        assert_eq!(fs::read(&display).unwrap(), b"old-display");
+        assert_eq!(
+            fs::read(provider_target.join("claude")).unwrap(),
+            b"old-claude"
+        );
+        assert_eq!(fs::read(&executable).unwrap(), b"old-borg");
+
+        install_release_at(
+            &staged.join("borg"),
+            &staged.join("provider"),
+            Some(&staged.join(DISPLAY_EXECUTABLE)),
+            &executable,
+            &provider_target,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&display).unwrap(), b"new-display");
+        assert_eq!(
+            fs::read(provider_target.join("claude")).unwrap(),
+            b"new-claude"
+        );
+        assert_eq!(fs::read(&executable).unwrap(), b"new-borg");
+        let mut left: Vec<String> = fs::read_dir(root.join("bin"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["borg", DISPLAY_EXECUTABLE, "providers"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_first_borg_display_install_is_removed_when_the_update_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let executable = root.join("borg");
+        fs::write(&executable, b"old-borg").unwrap();
+        write_provider(&root.join("providers/claude"), b"old-claude");
+        write_provider(&root.join("staged-provider"), b"new-claude");
+        fs::write(root.join("staged-display"), b"new-display").unwrap();
+        install_release_at(
+            &root.join("missing-borg"),
+            &root.join("staged-provider"),
+            Some(&root.join("staged-display")),
+            &executable,
+            &root.join("providers/claude"),
+        )
+        .unwrap_err();
+        assert!(!root.join(DISPLAY_EXECUTABLE).exists());
+    }
+
+    /// Failure mode: installing a borg-display from another release, or one
+    /// that does not run, beside a verified borg.
+    #[cfg(unix)]
+    #[test]
+    fn a_staged_borg_display_must_report_the_release_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let candidate = directory.path().join(DISPLAY_EXECUTABLE);
+        fs::write(&candidate, "#!/bin/sh\necho 'borg-display 1.2.3'\n").unwrap();
+        validate_display_candidate(&candidate, &Version::new(1, 2, 3)).unwrap();
+        let error = validate_display_candidate(&candidate, &Version::new(1, 2, 4)).unwrap_err();
+        assert!(error.to_string().contains("did not match"), "{error}");
     }
 
     #[cfg(unix)]

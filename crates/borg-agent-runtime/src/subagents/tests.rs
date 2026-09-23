@@ -3602,6 +3602,7 @@ fn persistent_peer_tool_is_root_only_and_not_recursive() {
         false,
         None,
         true,
+        true,
         false,
     )
     .into_iter()
@@ -3615,6 +3616,7 @@ fn persistent_peer_tool_is_root_only_and_not_recursive() {
         true,
         false,
         None,
+        false,
         false,
         false,
     )
@@ -4556,6 +4558,8 @@ async fn computer_use_requires_approval_even_for_observation() {
         "screenshot",
         "click",
         "set_value",
+        "launch",
+        "start_display",
     ] {
         let error = dispatcher
             .call("computer_use", json!({"op": op}))
@@ -4631,10 +4635,208 @@ async fn computer_use_live_desktop_clients() {
         );
         assert!(result["value"].get("borg_attachments").is_none());
     }
+    // The concatenated helper (compositor prologue + AT-SPI worker) boots and
+    // lists windows through the dispatcher and both code-mode clients.
+    for (runtime, code) in [
+        ("python", "cua.list_windows()"),
+        ("javascript", "await cua.list_windows()"),
+    ] {
+        let result = dispatcher
+            .call("runtime_exec", json!({"runtime": runtime, "code": code}))
+            .await
+            .unwrap();
+        assert!(result["value"]["windows"].is_array());
+        assert!(result["value"].get("window_backend").is_some());
+    }
     dispatcher
         .persistent_runtimes
         .stop_session(session_id)
         .await;
+}
+
+/// Failure mode: a sub-agent reading or driving the user's desktop through
+/// computer_use -- listing desktop windows, capturing the screen, or injecting
+/// input into the user's focused window -- instead of its private display.
+#[tokio::test]
+async fn a_sub_agent_computer_use_is_confined_to_a_private_display() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        3,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        Arc::new(store),
+    )
+    .unwrap();
+    let dispatcher_for = |actor| {
+        AgentToolDispatcher::new(
+            SessionGoalTools::disconnected(),
+            SessionTodoTools::disconnected(),
+            Some(coordinator.clone()),
+            crate::LspService::new(directory.path()),
+            CodingProvider::Codex,
+            actor,
+            true,
+            None,
+            None,
+            directory.path().to_path_buf(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::native_process::ProcessManager::default(),
+            PermissionMode::FullAccess,
+        )
+    };
+    let display_enum = |dispatcher: &AgentToolDispatcher| {
+        dispatcher
+            .specs()
+            .into_iter()
+            .find(|spec| spec["name"] == "computer_use")
+            .expect("computer_use is advertised")["inputSchema"]["properties"]["display"]["enum"]
+            .clone()
+    };
+    const REFUSAL: &str = "sub-agents may only use their private display";
+    let child = dispatcher_for(Uuid::new_v4());
+    assert_eq!(display_enum(&child), json!(["private"]));
+    let child_properties = child
+        .specs()
+        .into_iter()
+        .find(|spec| spec["name"] == "computer_use")
+        .expect("computer_use is advertised")["inputSchema"]["properties"]
+        .clone();
+    assert!(
+        child_properties.get("restore_focus").is_none(),
+        "a child cannot move the user's desktop focus"
+    );
+    for desktop in [
+        json!({"op": "list_windows"}),
+        json!({"op": "screenshot", "scope": "desktop"}),
+        json!({"op": "observe", "window_id": "a1b2:3"}),
+        json!({"op": "type_text", "window_id": "niri:17", "text": "x"}),
+        json!({"op": "pointer_click", "x": 10, "y": 10}),
+        json!({"op": "screenshot", "scope": "window", "window_id": "niri:17"}),
+        json!({"op": "pointer_move", "window_id": "niri:17", "dx": 40, "dy": 0}),
+    ] {
+        let error = child
+            .call("computer_use", desktop.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(REFUSAL), "{desktop}: {error}");
+    }
+    // Private-display ops pass the confinement (the helper may still be
+    // unavailable on a host without a desktop session).
+    if let Err(error) = child
+        .call(
+            "computer_use",
+            json!({"op": "list_windows", "display": "private"}),
+        )
+        .await
+    {
+        assert!(!error.to_string().contains(REFUSAL), "{error}");
+    }
+    child
+        .persistent_runtimes
+        .stop_session(child.actor_session_id)
+        .await;
+
+    let director = dispatcher_for(root);
+    assert_eq!(display_enum(&director), json!(["desktop", "private"]));
+    if let Err(error) = director
+        .call("computer_use", json!({"op": "capabilities"}))
+        .await
+    {
+        assert!(!error.to_string().contains(REFUSAL), "{error}");
+    }
+    director
+        .persistent_runtimes
+        .stop_session(director.actor_session_id)
+        .await;
+}
+
+/// Failure mode: private-display input or lifetime leaking onto the user's
+/// machine -- an app driven through the uinput seat, or an app and its
+/// compositor outliving the session that launched them.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+#[ignore = "requires a GPU render node, borg-display (BORG_DISPLAY_BIN or PATH), AT-SPI2 and vkcube"]
+async fn computer_use_live_private_display() {
+    let directory = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        session_id,
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    let call = |arguments: Value| dispatcher.call("computer_use", arguments);
+    let launched = call(
+        json!({"op": "launch", "argv": ["vkcube", "--wsi", "wayland"],
+        "width": 800, "height": 600}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(launched["display"]["gpu_accelerated"], true, "{launched}");
+    let pid = launched["pid"].as_i64().unwrap() as i32;
+    let window_id = launched["windows"][0]["id"].as_str().unwrap().to_string();
+    assert!(window_id.starts_with("pd:"), "{launched}");
+    let clicked = call(json!({"op": "pointer_click", "window_id": window_id, "x": 400, "y": 300}))
+        .await
+        .unwrap();
+    assert_eq!(clicked["dispatched"], true);
+    let shot = call(json!({"op": "screenshot", "scope": "window", "window_id": window_id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        (shot["width"].as_u64(), shot["height"].as_u64()),
+        (Some(800), Some(600))
+    );
+    assert_eq!(shot["borg_attachments"][0]["media_type"], "image/png");
+    for (runtime, code) in [
+        ("python", "cua.list_windows('private')"),
+        ("javascript", "await cua.list_windows('private')"),
+    ] {
+        let listed = dispatcher
+            .call("runtime_exec", json!({"runtime": runtime, "code": code}))
+            .await
+            .unwrap();
+        assert_eq!(
+            listed["value"]["windows"][0]["id"],
+            window_id.as_str(),
+            "{listed}"
+        );
+    }
+    let devices = std::fs::read_to_string("/proc/bus/input/devices").unwrap();
+    assert!(
+        !devices.contains("Borg virtual input"),
+        "private input used uinput"
+    );
+    dispatcher
+        .persistent_runtimes
+        .stop_session(session_id)
+        .await;
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "launched app survived the session"
+    );
 }
 
 /// Settling a delivery at the session projection must not turn a worker's own
@@ -5693,12 +5895,11 @@ fn a_message_without_images_serializes_without_an_attachments_field() {
 /// providers while the runtime admitted eleven, fixed in 5a38ea2).
 #[test]
 fn a_child_surface_is_the_director_surface_minus_the_documented_exceptions() {
-    // The three documented exceptions, by tool name.
+    // The documented exceptions, by tool name.
     let exceptions = [
         "consult_model",
         "consult_peer",
         "rotate_peer",
-        "computer_use",
         "update_agent_settings",
         "watch",
         "list_watchers",
@@ -5745,7 +5946,20 @@ fn a_child_surface_is_the_director_surface_minus_the_documented_exceptions() {
             expected,
             "{provider:?} child surface is not the director surface minus the documented exceptions"
         );
+        // computer_use is kept but confined to a private display: only the
+        // description and the display enum differ.
+        let confined = child
+            .iter()
+            .find(|spec| spec["name"] == "computer_use")
+            .expect("a child keeps private-display computer use");
+        assert_eq!(
+            confined["inputSchema"]["properties"]["display"]["enum"],
+            json!(["private"])
+        );
         for name in names(&child) {
+            if name == "computer_use" {
+                continue;
+            }
             let in_director = director
                 .iter()
                 .find(|spec| spec["name"] == name.as_str())
@@ -5760,4 +5974,458 @@ fn a_child_surface_is_the_director_surface_minus_the_documented_exceptions() {
             );
         }
     }
+}
+
+async fn waiting_team() -> (
+    tempfile::TempDir,
+    crate::session_store::postgres::testing::ScratchDatabase,
+    SubagentCoordinator,
+    Uuid,
+    Uuid,
+) {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        3,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+    let worker = {
+        let mut table = coordinator.table.lock().await;
+        let worker = table.reserve("worker", &launch()).unwrap();
+        table
+            .entries
+            .get_mut(&worker.session_id)
+            .unwrap()
+            .snapshot
+            .status = SubagentStatus::Running;
+        worker.session_id
+    };
+    bind_test_team(directory.path(), store.as_ref(), root, &[worker]).await;
+    (directory, scratch, coordinator, root, worker)
+}
+
+/// Apply a child event to the table and publish it, as the child actor does.
+async fn child_event(coordinator: &SubagentCoordinator, child: Uuid, kind: SessionEventKind) {
+    let event = SessionEvent::new(child, 1, kind);
+    update_from_session_event(&coordinator.table, child, &event).await;
+    let _ = coordinator
+        .activity_tx
+        .send(SubagentActivity::SessionEvent {
+            parent_session_id: coordinator.root_session_id,
+            task_name: "worker".to_string(),
+            event,
+        });
+}
+
+#[tokio::test]
+async fn wait_agent_blocks_until_a_child_finishes_and_reports_it_once() {
+    let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
+    let waiting = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .wait_for(root, Duration::from_secs(1800), WaitSignals::default())
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !waiting.is_finished(),
+        "a working child must not end the wait"
+    );
+    let finished = Instant::now();
+    child_event(
+        &coordinator,
+        worker,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: crate::EventActor::Assistant,
+            text: "done: 3 files fixed".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    )
+    .await;
+    child_event(
+        &coordinator,
+        worker,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: None,
+        },
+    )
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("a finished child ends the wait promptly")
+        .unwrap()
+        .unwrap();
+    assert!(finished.elapsed() < Duration::from_secs(3));
+    assert_eq!(result["reason"], "child_settled");
+    assert_eq!(result["changes"][0]["status"], "ready");
+    assert_eq!(result["changes"][0]["final_text"], "done: 3 files fixed");
+    assert_eq!(result["agents"][0]["task_name"], "/root/worker");
+
+    // The same completion is not news on the next wait: before this fix every
+    // later wait returned it immediately and parents fell back to sleeping.
+    let again = coordinator
+        .wait_for(root, Duration::from_millis(300), WaitSignals::default())
+        .await
+        .unwrap();
+    assert_eq!(again["reason"], "timeout");
+    assert_eq!(again["changes"], json!([]));
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn wait_agent_returns_on_a_child_report_and_on_waiting_input() {
+    let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
+    let waiting = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .wait_for(root, Duration::from_secs(1800), WaitSignals::default())
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    coordinator
+        .send_message_as(worker, "/root", "blocked on an API decision")
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("a child report ends the wait promptly")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result["reason"], "child_message");
+    assert_eq!(result["messages"][0]["from"], "/root/worker");
+    assert_eq!(result["messages"][0]["text"], "blocked on an API decision");
+    assert_eq!(result["agents"][0]["status"], "running");
+    assert!(
+        coordinator
+            .unread_messages_for_session(root)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a report wait_agent returned is read"
+    );
+
+    let (input, input_pending) = tokio::sync::watch::channel(false);
+    let waiting = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .wait_for(
+                    root,
+                    Duration::from_secs(1800),
+                    WaitSignals {
+                        cancel: None,
+                        input_pending: Some(input_pending),
+                    },
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !waiting.is_finished(),
+        "a delivered report is not reported twice"
+    );
+    input.send(true).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .expect("waiting human input ends the wait")
+        .unwrap()
+        .unwrap();
+    assert_eq!(result["reason"], "input_pending");
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn wait_agent_times_out_with_a_status_line_per_child_and_accepts_long_waits() {
+    let (_directory, scratch, coordinator, root, _worker) = waiting_team().await;
+    let started = Instant::now();
+    let result = coordinator
+        .wait_for(root, Duration::from_millis(400), WaitSignals::default())
+        .await
+        .unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(400));
+    assert_eq!(result["reason"], "timeout");
+    assert_eq!(result["agents"][0]["status"], "running");
+    assert!(result["agents"][0]["quiet_s"].is_u64());
+
+    let spec = subagent_tool_specs(CodingProvider::Codex)
+        .into_iter()
+        .find(|tool| tool["name"] == "wait_agent")
+        .unwrap();
+    let timeout = &spec["inputSchema"]["properties"]["timeout_ms"];
+    assert_eq!(timeout["maximum"], 1_800_000);
+    let args: WaitAgentArgs = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(args.timeout(), Duration::from_secs(600));
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn only_the_interrupting_agent_resumes_an_interrupted_child() {
+    let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
+    let (commands, mut received) = mpsc::channel(8);
+    coordinator
+        .table
+        .lock()
+        .await
+        .entries
+        .get_mut(&worker)
+        .unwrap()
+        .commands = Some(commands);
+    let followup = |message: &'static str| {
+        let coordinator = coordinator.clone();
+        async move {
+            coordinator
+                .call_tool_as(
+                    root,
+                    "followup_task",
+                    json!({"target": "worker", "message": message}),
+                )
+                .await
+                .unwrap();
+        }
+    };
+
+    // A human stop (the UI path) is not released by an agent's follow-up.
+    coordinator.interrupt("worker").await.unwrap();
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::Interrupt { .. })
+    ));
+    followup("keep going").await;
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::TeamPrompt { .. })
+    ));
+
+    coordinator
+        .call_tool_as(root, "interrupt_agent", json!({"target": "worker"}))
+        .await
+        .unwrap();
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::Interrupt { .. })
+    ));
+    // A real child records Running ("cancelling") while it winds down.
+    child_event(
+        &coordinator,
+        worker,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Running,
+            detail: Some("cancelling".to_string()),
+        },
+    )
+    .await;
+    // The interrupt leaves the child idle with its last narration. The parent
+    // is about to act on that, so the follow-up's wait must not end on it.
+    child_event(
+        &coordinator,
+        worker,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: crate::EventActor::Assistant,
+            text: "Running the full suite now".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    )
+    .await;
+    child_event(
+        &coordinator,
+        worker,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: Some("Interrupted".to_string()),
+        },
+    )
+    .await;
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::ReleaseRetainedContext { .. })
+    ));
+    followup("resume with the smaller fix").await;
+    let waited = coordinator
+        .wait_for(root, Duration::from_millis(300), WaitSignals::default())
+        .await
+        .unwrap();
+    assert_eq!(waited["changes"], json!([]), "{waited}");
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::ResumeFromInterrupt { session_id }) if session_id == worker
+    ));
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::TeamPrompt { text, .. }) if text.contains("the stop is lifted")
+    ));
+    followup("one more thing").await;
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::TeamPrompt { .. })
+    ));
+    assert!(received.try_recv().is_err());
+    scratch.discard().await;
+}
+
+/// Failure mode: the parent interrupts a child, the human then stops it too,
+/// and the parent's next follow-up lifts the human's stop.
+#[tokio::test]
+async fn a_human_stop_after_an_agent_interrupt_still_holds() {
+    let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
+    let (commands, mut received) = mpsc::channel(8);
+    coordinator
+        .table
+        .lock()
+        .await
+        .entries
+        .get_mut(&worker)
+        .unwrap()
+        .commands = Some(commands);
+    coordinator
+        .call_tool_as(root, "interrupt_agent", json!({"target": "worker"}))
+        .await
+        .unwrap();
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::Interrupt { .. })
+    ));
+    coordinator.interrupt("worker").await.unwrap();
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::Interrupt { .. })
+    ));
+    coordinator
+        .call_tool_as(
+            root,
+            "followup_task",
+            json!({"target": "worker", "message": "keep going"}),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::TeamPrompt { text, .. }) if !text.contains("the stop is lifted")
+    ));
+    assert!(received.try_recv().is_err());
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn team_messages_can_be_triaged_and_acknowledged_in_batches() {
+    let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
+    for text in ["first\nwith detail", "second", "third", "fourth"] {
+        coordinator
+            .send_message_as(worker, "/root", text)
+            .await
+            .unwrap();
+    }
+    let unread = |args: Value| {
+        let coordinator = coordinator.clone();
+        async move {
+            coordinator
+                .call_tool_as(root, "list_unread_team_messages", args)
+                .await
+                .unwrap()
+        }
+    };
+    let ack = |args: Value| {
+        let coordinator = coordinator.clone();
+        async move {
+            coordinator
+                .call_tool_as(root, "acknowledge_team_message", args)
+                .await
+                .unwrap()
+        }
+    };
+
+    let compact = unread(json!({"compact": true})).await;
+    let ids = compact
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["message_id"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 4);
+    assert_eq!(compact[0]["from"], "/root/worker");
+    assert_eq!(compact[0]["first_line"], "first…");
+    assert!(compact[0].get("text").is_none());
+
+    assert_eq!(ack(json!({"message_ids": [ids[0]]})).await["count"], 1);
+    assert_eq!(ack(json!({"up_to": ids[2]})).await["count"], 2);
+    let last = unread(json!({"ack": true})).await;
+    assert_eq!(last.as_array().unwrap().len(), 1);
+    assert_eq!(last[0]["message_id"], ids[3]);
+    assert_eq!(unread(json!({})).await, json!([]));
+    assert_eq!(ack(json!({"all": true})).await["count"], 0);
+    // The one-message form keeps working, including a repeat acknowledgement.
+    assert_eq!(
+        ack(json!({"message_id": ids[0]})).await["acknowledged"],
+        true
+    );
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn an_idle_child_does_not_end_waits_for_a_running_one() {
+    let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
+    {
+        let mut table = coordinator.table.lock().await;
+        let idle = table.reserve("audit", &launch()).unwrap();
+        let entry = table.entries.get_mut(&idle.session_id).unwrap();
+        entry.snapshot.status = SubagentStatus::Ready;
+        entry.snapshot.final_text = Some("audit finished earlier".to_string());
+    }
+    let wait = || {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .wait_for(root, Duration::from_secs(1800), WaitSignals::default())
+                .await
+                .unwrap()
+        })
+    };
+    // Shown once, because this parent has not seen it yet...
+    let first = wait().await.unwrap();
+    assert_eq!(first["changes"][0]["task_name"], "/root/audit");
+    // ...and then never again: the parent live-reported three identical
+    // immediate returns here before the fix.
+    let waiting = wait();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !waiting.is_finished(),
+        "an idle child must not end the wait"
+    );
+    child_event(
+        &coordinator,
+        worker,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Failed,
+            detail: Some("tests failed".to_string()),
+        },
+    )
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("the running child's change ends the wait")
+        .unwrap();
+    let changes = result["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["task_name"], "/root/worker");
+    assert_eq!(changes[0]["status"], "failed");
+    scratch.discard().await;
 }
