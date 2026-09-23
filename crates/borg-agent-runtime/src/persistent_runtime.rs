@@ -1002,8 +1002,8 @@ class RlmHandle:
     def send(self, message):
         return self.borg.tool("send_message", {"target": self.task_name or self.session_id, "message": message})
 
-    def wait(self, timeout_ms=30000):
-        return self.borg.tool("wait_agent", {"timeout_ms": timeout_ms})
+    def wait(self, timeout_ms=None):
+        return self.borg.tool("wait_agent", {} if timeout_ms is None else {"timeout_ms": timeout_ms})
 
 
 class Rlm:
@@ -1033,11 +1033,27 @@ class ComputerUse:
     def capabilities(self):
         return self("capabilities")
 
-    def list_windows(self):
-        return self("list_windows")
+    def list_windows(self, display=None):
+        return self("list_windows", **({"display": display} if display else {}))
 
-    def screenshot(self, scope, window_id=None):
-        return self("screenshot", scope=scope, **({"window_id": window_id} if window_id else {}))
+    def screenshot(self, scope, window_id=None, display=None):
+        return self("screenshot", scope=scope, **({"window_id": window_id} if window_id else {}),
+                    **({"display": display} if display else {}))
+
+    def launch(self, argv, **options):
+        return self("launch", argv=list(argv), **options)
+
+    def start_display(self, **options):
+        return self("start_display", **options)
+
+    def stop_display(self):
+        return self("stop_display")
+
+    def attach_display(self, display_id):
+        return self("attach_display", display_id=display_id)
+
+    def pointer_move(self, window_id, dx=0, dy=0, **options):
+        return self("pointer_move", window_id=window_id, dx=dx, dy=dy, **options)
 
     def observe(self, window_id, **options):
         return self("observe", window_id=window_id, **options)
@@ -1051,8 +1067,8 @@ class ComputerUse:
     def type_text(self, window_id, text):
         return self("type_text", window_id=window_id, text=text)
 
-    def key(self, window_id, keys):
-        return self("key", window_id=window_id, keys=keys)
+    def key(self, window_id, keys, **options):
+        return self("key", window_id=window_id, keys=keys, **options)
 
     def pointer_click(self, window_id, **options):
         return self("pointer_click", window_id=window_id, **options)
@@ -1324,7 +1340,8 @@ const rlm = async (message, options = {}) => {
     followup: message_ => borg.tool("followup_task", {target, message: message_}),
     send: message_ => borg.tool("send_message", {target, message: message_}),
     interrupt: () => borg.tool("interrupt_agent", {target}),
-    wait: (timeout_ms = 30000) => borg.tool("wait_agent", {timeout_ms}),
+    wait: (timeout_ms = undefined) =>
+      borg.tool("wait_agent", timeout_ms === undefined ? {} : {timeout_ms}),
   };
 };
 rlm.list = async (pathPrefix = undefined) => (await borg.tool("list_agents", pathPrefix === undefined ? {} : {path_prefix: pathPrefix})).agents || [];
@@ -1334,13 +1351,18 @@ borg.rlm = rlm;
 context.borg = borg;
 const cua = (op, arguments_ = {}) => borg.tool("computer_use", {...arguments_, op});
 cua.capabilities = () => cua("capabilities");
-cua.list_windows = () => cua("list_windows");
-cua.screenshot = (scope, window_id) => cua("screenshot", window_id ? {scope, window_id} : {scope});
+cua.list_windows = (display) => cua("list_windows", display ? {display} : {});
+cua.screenshot = (scope, window_id, display) => cua("screenshot", {scope, ...(window_id ? {window_id} : {}), ...(display ? {display} : {})});
+cua.launch = (argv, options = {}) => cua("launch", {...options, argv});
+cua.start_display = (options = {}) => cua("start_display", options);
+cua.stop_display = () => cua("stop_display");
+cua.attach_display = (display_id) => cua("attach_display", {display_id});
+cua.pointer_move = (window_id, dx = 0, dy = 0, options = {}) => cua("pointer_move", {...options, window_id, dx, dy});
 cua.observe = (window_id, options = {}) => cua("observe", {...options, window_id});
 cua.click = (window_id, element_id, observation_id, options = {}) => cua("click", {...options, window_id, element_id, observation_id});
 cua.set_value = (window_id, element_id, observation_id, text, options = {}) => cua("set_value", {...options, window_id, element_id, observation_id, text});
 cua.type_text = (window_id, text) => cua("type_text", {window_id, text});
-cua.key = (window_id, keys) => cua("key", {window_id, keys});
+cua.key = (window_id, keys, options = {}) => cua("key", {...options, window_id, keys});
 cua.pointer_click = (window_id, options = {}) => cua("pointer_click", {...options, window_id});
 cua.scroll = (window_id, dx = 0, dy = 0, options = {}) => cua("scroll", {...options, window_id, dx, dy});
 cua.drag = (window_id, from_x, from_y, to_x, to_y, options = {}) => cua("drag", {...options, window_id, from_x, from_y, to_x, to_y});

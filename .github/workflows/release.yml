@@ -78,6 +78,12 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build Borg Agent
         run: cargo build --locked --release --target ${{ matrix.target }} -p borg
+      - name: Build the Linux private display
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev
+          cargo build --locked --release --target ${{ matrix.target }} -p borg-display
       - uses: ./.github/actions/test-postgres
       - name: Run native Borg Agent core-flow tests
         run: cargo test --locked --target ${{ matrix.target }} -p borg --no-fail-fast -- --test-threads=4
@@ -90,6 +96,9 @@ jobs:
           fi
           "$binary" --version
           "$binary" --help >/dev/null
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            "target/${{ matrix.target }}/release/borg-display" --version
+          fi
       - name: Install pinned native Claude payload
         shell: bash
         run: |
@@ -102,6 +111,13 @@ jobs:
           package_dir="borg-${{ matrix.target }}"
           mkdir "$package_dir"
           cp "target/${{ matrix.target }}/release/borg" "$package_dir/"
+          binaries=(borg)
+          # Linux archives must carry the computer-use private display; the
+          # self-updater installs it beside borg.
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            cp "target/${{ matrix.target }}/release/borg-display" "$package_dir/"
+            binaries+=(borg-display)
+          fi
           native_package=""
           for candidate in packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk-*; do
             if [[ -x "$candidate/claude" ]]; then
@@ -122,7 +138,7 @@ jobs:
           cp configs/extension.example.toml "$package_dir/configs/"
           cp include/borg_extension.h "$package_dir/include/"
           cp LICENSE NOTICE.md README.md "$package_dir/"
-          tar -C "$package_dir" -czf "$PWD/$asset" borg providers docs configs include LICENSE NOTICE.md README.md
+          tar -C "$package_dir" -czf "$PWD/$asset" "${binaries[@]}" providers docs configs include LICENSE NOTICE.md README.md
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$asset" >"$asset.sha256"
           else

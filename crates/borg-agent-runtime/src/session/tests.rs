@@ -18145,3 +18145,249 @@ fn test_watches(session_id: Uuid) -> crate::watch::Watches {
         session_id,
     )
 }
+
+/// Blocks its turn in `wait_agent`, the way an orchestrator waits on children.
+struct WaitingParentExecutor {
+    turn_started: Arc<Notify>,
+    waited: Arc<std::sync::Mutex<Option<(Duration, serde_json::Value)>>>,
+    wait_returned: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for WaitingParentExecutor {
+    fn uses_native_harness(&self, _provider: CodingProvider) -> bool {
+        true
+    }
+
+    async fn execute(
+        &self,
+        turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        self.turn_started.notify_one();
+        let started = std::time::Instant::now();
+        let result = turn
+            .agent_tools
+            .call("wait_agent", json!({ "timeout_ms": 1_800_000 }))
+            .await?;
+        *self.waited.lock().unwrap() = Some((started.elapsed(), result));
+        self.wait_returned.notify_one();
+        let mut controls = controls.expect("active turn has controls");
+        while let Some(control) = controls.recv().await {
+            match control {
+                AgentTurnControl::Steer { admission, ack, .. } => {
+                    assert!(admission.accept());
+                    let _ = ack.send(Ok(()));
+                }
+                AgentTurnControl::Interrupt => break,
+                _ => {}
+            }
+        }
+        Ok(AgentTurnResult {
+            provider_session_id: None,
+            final_text: String::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_human_steer_ends_a_blocking_wait_agent() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, _event_rx) = mpsc::channel(256);
+    let turn_started = Arc::new(Notify::new());
+    let wait_returned = Arc::new(Notify::new());
+    let waited = Arc::new(std::sync::Mutex::new(None));
+    let executor = Arc::new(WaitingParentExecutor {
+        turn_started: Arc::clone(&turn_started),
+        waited: Arc::clone(&waited),
+        wait_returned: Arc::clone(&wait_returned),
+    });
+    let actor = tokio::spawn({
+        let cwd = root.path().to_path_buf();
+        let store = Arc::clone(&store);
+        async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd,
+                    provider: CodingProvider::OpenRouter,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                store,
+            )
+            .await
+        }
+    });
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "wait for the team".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
+        .await
+        .expect("turn starts");
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "status?".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Steer,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(4), wait_returned.notified())
+        .await
+        .expect("the steer ends the wait instead of waiting out the timeout");
+    let (elapsed, result) = waited.lock().unwrap().take().unwrap();
+    assert_eq!(result["reason"], "input_pending", "{result}");
+    assert!(elapsed < Duration::from_secs(4));
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(30), actor).await;
+    scratch.discard().await;
+}
+
+/// Runs each turn until it is interrupted.
+struct InterruptibleExecutor {
+    turn_started: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for InterruptibleExecutor {
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        self.turn_started.notify_one();
+        let mut controls = controls.expect("active turn has controls");
+        while !matches!(
+            controls.recv().await,
+            Some(AgentTurnControl::Interrupt) | None
+        ) {}
+        Ok(AgentTurnResult {
+            provider_session_id: None,
+            final_text: String::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn resume_from_interrupt_lets_the_parents_follow_up_start_a_turn() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, _event_rx) = mpsc::channel(256);
+    let turn_started = Arc::new(Notify::new());
+    let executor = Arc::new(InterruptibleExecutor {
+        turn_started: Arc::clone(&turn_started),
+    });
+    let actor = tokio::spawn({
+        let cwd = root.path().to_path_buf();
+        let store = Arc::clone(&store);
+        async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd,
+                    provider: CodingProvider::OpenRouter,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: None,
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                store,
+            )
+            .await
+        }
+    });
+    let team_prompt = |text: &str| HostCommand::TeamPrompt {
+        session_id,
+        message_id: Uuid::new_v4(),
+        text: text.to_string(),
+        attachments: Vec::new(),
+        output_schema: None,
+        delivery: PromptDelivery::Steer,
+    };
+    command_tx.send(team_prompt("first task")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
+        .await
+        .expect("the first task runs");
+    command_tx
+        .send(HostCommand::Interrupt { session_id })
+        .await
+        .unwrap();
+    command_tx
+        .send(team_prompt("background wake"))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), turn_started.notified())
+            .await
+            .is_err(),
+        "an interrupt still holds against an ordinary team wake"
+    );
+    command_tx
+        .send(HostCommand::ResumeFromInterrupt { session_id })
+        .await
+        .unwrap();
+    command_tx.send(team_prompt("resume")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), turn_started.notified())
+        .await
+        .expect("the interrupting parent's follow-up starts a turn");
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(30), actor).await;
+    scratch.discard().await;
+}

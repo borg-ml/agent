@@ -2,6 +2,8 @@
 //! runtimes, session store, subagents, autonomy, orchestration, LSP, and the
 //! plugin/extension machinery. Split out of `borg-remote`, which now owns only
 //! enrollment, transport, and relay and depends on this crate.
+// The computer_use tool schema is one large `json!` literal.
+#![recursion_limit = "256"]
 
 mod agent;
 mod autonomy;

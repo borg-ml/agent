@@ -29,6 +29,8 @@ if [[ -f "$repo_root/.github/workflows/release.yml" ]]; then
   fi
   grep -Fq 'providers/claude' "$release_workflow" ||
     fail "release archive does not package the native Claude payload"
+  grep -Fq 'release/borg-display" "$package_dir/"' "$release_workflow" ||
+    fail "Linux release archives do not package borg-display"
   grep -Fq 'components: rustfmt, clippy' "$release_workflow" ||
     fail "release validation does not install rustfmt and clippy"
   grep -Fq 'workflow_dispatch:' "$release_workflow" ||

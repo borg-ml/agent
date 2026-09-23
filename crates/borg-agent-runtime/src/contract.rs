@@ -1482,6 +1482,13 @@ pub enum HostCommand {
     ReleaseRetainedContext {
         session_id: Uuid,
     },
+    /// The agent that interrupted this child is giving it new work, which
+    /// releases the stop latch that interrupt engaged. Host-local: only the
+    /// team coordinator sends it, immediately ahead of that follow-up. A stop
+    /// the human made is not released this way.
+    ResumeFromInterrupt {
+        session_id: Uuid,
+    },
     Stop {
         session_id: Uuid,
     },
@@ -1527,6 +1534,7 @@ impl HostCommand {
             | Self::Compact { session_id }
             | Self::ClearContext { session_id }
             | Self::ReleaseRetainedContext { session_id }
+            | Self::ResumeFromInterrupt { session_id }
             | Self::Stop { session_id } => Some(*session_id),
             Self::WorkspaceFilesystem { .. }
             | Self::CancelWorkspaceFilesystem { .. }

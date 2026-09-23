@@ -2233,7 +2233,8 @@ impl NativeToolRuntime {
         args: ExecCommandArgs,
         cancellation: Option<CancellationToken>,
     ) -> Result<Value> {
-        Ok(serde_json::to_value(
+        let sleep_seconds = bare_sleep_seconds(&args.cmd);
+        let mut result = serde_json::to_value(
             self.execution_provider
                 .command(ExecutionCommandRequest {
                     owner_session_id: self.session_id,
@@ -2251,7 +2252,20 @@ impl NativeToolRuntime {
                     cancellation,
                 })
                 .await?,
-        )?)
+        )?;
+        // Measured orchestrators spent hours in `sleep 300; echo waited` while
+        // children worked. Not refused, since a timed pause can be legitimate,
+        // but pointed at the wait that returns on the child's own progress.
+        if sleep_seconds.is_some_and(|seconds| seconds >= 60)
+            && self.agent_tools.has_working_children().await
+            && let Some(result) = result.as_object_mut()
+        {
+            result.insert(
+                "hint".to_string(),
+                json!("Child agents are working. Wait for them with `wait_agent` instead of shell sleeps: one call blocks up to 30 minutes and returns as soon as a child finishes, fails, or messages you."),
+            );
+        }
+        Ok(result)
     }
 
     async fn write_stdin(&self, args: WriteStdinArgs) -> Result<Value> {
@@ -3417,6 +3431,22 @@ fn accept_tool_boundary_control(control: AgentTurnControl) -> Result<Option<Capt
     }
 }
 
+/// Seconds slept by a command that does nothing but sleep, optionally
+/// followed by an `echo`: the blind-wait shape, not a pause inside real work.
+fn bare_sleep_seconds(command: &str) -> Option<u64> {
+    static BARE_SLEEP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^\s*sleep\s+(\d+)([smh]?)\s*(?:(?:;|&&)\s*echo\b[^;&|]*)?;?\s*$")
+            .expect("valid sleep pattern")
+    });
+    let captures = BARE_SLEEP.captures(command)?;
+    let amount = captures[1].parse::<u64>().ok()?;
+    Some(match &captures[2] {
+        "m" => amount.saturating_mul(60),
+        "h" => amount.saturating_mul(3600),
+        _ => amount,
+    })
+}
+
 fn skipped_tool_result() -> (String, bool) {
     (
         json!({"error": "Tool not executed: cancelled after user steering."}).to_string(),
@@ -4296,6 +4326,16 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+
+    #[test]
+    fn only_a_blind_sleep_earns_the_wait_agent_hint() {
+        assert_eq!(bare_sleep_seconds("sleep 300; echo waited"), Some(300));
+        assert_eq!(bare_sleep_seconds("  sleep 5m && echo done"), Some(300));
+        assert_eq!(bare_sleep_seconds("sleep 240"), Some(240));
+        assert_eq!(bare_sleep_seconds("sleep 300 && cargo test"), None);
+        assert_eq!(bare_sleep_seconds("sleep 60; echo x; rm -rf build"), None);
+        assert_eq!(bare_sleep_seconds("make && sleep 300"), None);
+    }
 
     #[test]
     fn mutating_builtins_are_gated_read_only_builtins_are_not() {

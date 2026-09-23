@@ -80,6 +80,44 @@ const CONSEQUENTIAL_WORDS: &[&str] = &[
     "iban",
 ];
 
+/// Sub-agents drive only a private display: refuse anything that would read
+/// or act on the user's desktop (desktop windows, desktop screenshots, or
+/// input that reaches the user's seat). Private window ids start with `pd:`.
+pub(crate) fn ensure_private_display_only(arguments: &Value) -> Result<()> {
+    let op = arguments
+        .get("op")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let private_display = arguments.get("display").and_then(Value::as_str) == Some("private");
+    let private_window = arguments
+        .get("window_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id.starts_with("pd:"));
+    ensure!(
+        arguments
+            .get("display")
+            .is_none_or(|display| display == "private"),
+        "sub-agents may only use their private display (display=\"private\"); the user's desktop is reserved for the top-level session"
+    );
+    ensure!(
+        arguments
+            .get("restore_focus")
+            .is_none_or(|restore| matches!(restore, Value::Bool(false))),
+        "sub-agents may not use restore_focus: it moves focus on the user's desktop"
+    );
+    let allowed = match op {
+        "capabilities" | "start_display" | "stop_display" | "attach_display" | "launch" => true,
+        "list_windows" => private_display,
+        "screenshot" => private_display || private_window,
+        _ => private_window,
+    };
+    ensure!(
+        allowed,
+        "sub-agents may only use their private display: {op} needs display=\"private\" or a pd: window_id from list_windows with display=private; launch the app there first"
+    );
+    Ok(())
+}
+
 /// Whether an effect on this element needs explicit human confirmation.
 pub(crate) fn action_is_consequential(op: &str, element: &ObservedElement) -> bool {
     if !matches!(op, "click" | "set_value" | "pointer_click" | "type_text") {
@@ -109,14 +147,28 @@ fn element_from_node(node: &Value) -> Option<(String, ObservedElement)> {
 }
 
 struct DesktopProcess {
-    _child: Child,
+    child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
 }
 
 impl ComputerUse {
+    /// Close the helper's stdin so it tears down any private display and the
+    /// apps launched into it, then kill it if it does not exit promptly.
     pub(crate) async fn stop(&self) {
-        self.process.lock().await.take();
+        let Some(DesktopProcess {
+            mut child, stdin, ..
+        }) = self.process.lock().await.take()
+        else {
+            return;
+        };
+        drop(stdin);
+        if tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .is_err()
+        {
+            let _ = child.kill().await;
+        }
     }
 
     pub(crate) async fn call(&self, arguments: Value) -> Result<Value> {
@@ -143,8 +195,13 @@ impl ComputerUse {
                     | "type_text"
                     | "key"
                     | "pointer_click"
+                    | "pointer_move"
                     | "scroll"
                     | "drag"
+                    | "start_display"
+                    | "stop_display"
+                    | "attach_display"
+                    | "launch"
             ),
             "unsupported computer-use operation `{op}`"
         );
@@ -180,11 +237,19 @@ impl ComputerUse {
                             .take()
                             .context("desktop helper stdout unavailable")?,
                     ),
-                    _child: child,
+                    child,
                 }
             }
         };
-        let response: Value = tokio::time::timeout(Duration::from_secs(15), async {
+        // Starting a private display, launching into it and tearing it down
+        // wait on child processes; everything else is a bounded desktop call.
+        let limit = match op {
+            "start_display" | "launch" | "stop_display" | "attach_display" => {
+                Duration::from_secs(45)
+            }
+            _ => Duration::from_secs(15),
+        };
+        let response: Value = tokio::time::timeout(limit, async {
             process.stdin.write_all(&request).await?;
             process.stdin.flush().await?;
             let mut line = Vec::new();
@@ -290,7 +355,7 @@ const HELPER_REQUIREMENTS: &str = if cfg!(target_os = "macos") {
 } else if cfg!(target_os = "windows") {
     "Windows computer use requires Windows PowerShell 5.1+ (or pwsh) in the interactive user session"
 } else {
-    "Linux computer use requires python3, PyGObject and AT-SPI2 on the desktop session bus; input injection also needs python-evdev, a writable /dev/uinput and wtype (Wayland) or xdotool (X11)"
+    "Linux computer use requires python3, PyGObject and AT-SPI2 on the desktop session bus; desktop input injection also needs python-evdev, a writable /dev/uinput and wtype (Wayland) or xdotool (X11); the private display needs the borg-display binary"
 };
 
 /// Platform helper process. Linux runs the AT-SPI worker under the system
@@ -321,11 +386,26 @@ async fn helper_command() -> Result<Command> {
         return Ok(command);
     }
     let mut command = Command::new("python3");
-    command.args(["-I", "-u", "-c", include_str!("computer_use/linux.py")]);
+    command.args(["-I", "-u", "-c", LINUX_HELPER_SOURCE]);
+    // Release archives ship the private-display compositor next to borg.
+    if let Some(display) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("borg-display")))
+        .filter(|path| path.is_file())
+    {
+        command.env("BORG_DISPLAY_BIN", display);
+    }
     Ok(command)
 }
 
 const MACOS_HELPER_SOURCE: &str = include_str!("computer_use/macos.swift");
+/// Compositor window parsing/mapping is a separate AT-SPI-free module so it can
+/// be unit tested; it runs as the prologue of the Linux worker.
+const LINUX_HELPER_SOURCE: &str = concat!(
+    include_str!("computer_use/linux_windows.py"),
+    "\n",
+    include_str!("computer_use/linux.py")
+);
 const WINDOWS_HELPER_SOURCE: &str = include_str!("computer_use/windows.ps1");
 
 fn which_in_path(program: &str) -> bool {
@@ -458,6 +538,77 @@ mod tests {
             "pointer_click",
             &element("AXButton", "Pay now")
         ));
+    }
+
+    #[test]
+    fn sub_agents_are_confined_to_the_private_display() {
+        for allowed in [
+            json!({"op": "capabilities"}),
+            json!({"op": "launch", "argv": ["vkcube"]}),
+            json!({"op": "attach_display", "display_id": "0123456789abcdef"}),
+            json!({"op": "list_windows", "display": "private"}),
+            json!({"op": "screenshot", "display": "private", "scope": "desktop"}),
+            json!({"op": "screenshot", "scope": "window", "window_id": "pd:2"}),
+            json!({"op": "observe", "window_id": "pd:2"}),
+            json!({"op": "pointer_click", "window_id": "pd:2", "x": 1, "y": 1}),
+            json!({"op": "key", "window_id": "pd:2", "keys": "ctrl+s"}),
+            json!({"op": "key", "window_id": "pd:2", "keys": "w", "hold_ms": 2000}),
+            json!({"op": "pointer_move", "window_id": "pd:2", "dx": 40, "dy": -10, "hold_keys": "shift+w"}),
+            json!({"op": "pointer_click", "window_id": "pd:2", "coordinate_space": "window", "x": 5, "y": 5}),
+            json!({"op": "observe", "window_id": "pd:2", "screenshot": true, "screenshot_scope": "window"}),
+        ] {
+            ensure_private_display_only(&allowed)
+                .unwrap_or_else(|error| panic!("{allowed}: {error}"));
+        }
+        for refused in [
+            json!({"op": "list_windows"}),
+            json!({"op": "list_windows", "display": "desktop"}),
+            json!({"op": "screenshot", "scope": "desktop"}),
+            json!({"op": "screenshot", "scope": "window", "window_id": "niri:17"}),
+            json!({"op": "observe", "window_id": "a1b2:3"}),
+            json!({"op": "type_text", "window_id": "niri:17", "text": "x"}),
+            json!({"op": "pointer_click", "x": 10, "y": 10}),
+            json!({"op": "click", "window_id": "pd:2", "display": "desktop"}),
+            // Desktop window capture, relative motion, holds and focus moves.
+            json!({"op": "screenshot", "scope": "window", "window_id": "x11:0x2c00007"}),
+            json!({"op": "observe", "window_id": "niri:17", "screenshot": true, "screenshot_scope": "window"}),
+            json!({"op": "pointer_move", "window_id": "niri:17", "dx": 40, "dy": -10}),
+            json!({"op": "pointer_move", "dx": 40, "dy": -10}),
+            json!({"op": "key", "window_id": "niri:17", "keys": "w", "hold_ms": 2000}),
+            json!({"op": "pointer_click", "window_id": "niri:17", "coordinate_space": "window", "x": 5, "y": 5}),
+            json!({"op": "drag", "window_id": "sway:41", "coordinate_space": "window", "from_x": 1, "from_y": 1, "to_x": 9, "to_y": 9}),
+            json!({"op": "key", "window_id": "pd:2", "keys": "w", "restore_focus": true}),
+            json!({"op": "click", "window_id": "pd:2", "element_id": "e", "observation_id": "o", "restore_focus": true}),
+        ] {
+            assert!(
+                ensure_private_display_only(&refused).is_err(),
+                "{refused} must be refused for a sub-agent"
+            );
+        }
+    }
+
+    /// Compositor window parsing and window-to-desktop mapping decide where
+    /// injected clicks land, so a regression would click the wrong pixels.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_window_backends_parse_and_map_coordinates() {
+        let source = concat!(
+            include_str!("computer_use/linux_windows.py"),
+            "\n",
+            include_str!("computer_use/linux_windows_test.py")
+        );
+        let Ok(output) = std::process::Command::new("python3")
+            .args(["-I", "-c", source])
+            .output()
+        else {
+            eprintln!("python3 unavailable; skipping the Linux helper unit tests");
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[tokio::test]
