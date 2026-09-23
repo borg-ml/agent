@@ -691,7 +691,7 @@ impl LaneStore {
         }
         state.sequence += 1;
         let ticket = Ticket {
-            id: Uuid::new_v4(),
+            id: Uuid::now_v7(),
             sequence: state.sequence,
         };
         let job = spec.as_ref().map(|s| JobHandle {
@@ -3892,6 +3892,31 @@ mod tests {
             JobState::Cancelled { ref reason } if reason == "stop"
         ));
         assert!(store.cancel_ticket(running, "again").is_err());
+    }
+
+    /// Failure mode: callers that name job directories and scopes by job id,
+    /// and pick "the newest job" by id, getting an arbitrary order.
+    #[test]
+    fn ticket_ids_are_time_ordered() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let tickets: Vec<Ticket> = (0..20)
+            .map(|_| {
+                store
+                    .enqueue_lease(LeaseRequest {
+                        resources: vec![resource("build", Access::Shared { slots: 1 })],
+                        holder: holder(),
+                        queue_timeout_ms: None,
+                    })
+                    .unwrap()
+            })
+            .collect();
+        assert!(tickets.iter().all(|t| t.id.get_version_num() == 7));
+        assert!(
+            tickets
+                .windows(2)
+                .all(|pair| pair[0].id < pair[1].id && pair[0].sequence < pair[1].sequence)
+        );
     }
 
     #[test]
