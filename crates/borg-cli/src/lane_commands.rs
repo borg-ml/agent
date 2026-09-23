@@ -1,7 +1,7 @@
 //! Engine-neutral lane CLI. An adapter supplies a validated JobSpec; no shell interpolation.
 use anyhow::{Context, Result, ensure};
 use borg_lanes::lanes::{
-    Capacity, JobHandle, JobSpec, JobState, LaneStore, ResourceKey, ResourceScope,
+    Capacity, JobHandle, JobSpec, JobState, LaneRecord, LaneStore, ResourceKey, ResourceScope,
 };
 use clap::{Args, Subcommand};
 use std::io::Read;
@@ -51,6 +51,13 @@ pub(crate) enum JobCommand {
     /// Block on the supervisor's kernel completion lock, without polling.
     Wait {
         id: Uuid,
+        /// `started` returns 0 once the workload has spawned (terminal states
+        /// map as usual).
+        #[arg(long, value_enum)]
+        until: Option<WaitUntil>,
+        /// Give up after SECONDS: exit 124 and leave the job running.
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
     },
     Status {
         id: Option<Uuid>,
@@ -76,6 +83,11 @@ pub(crate) struct RecoverArgs {
     wait: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub(crate) enum WaitUntil {
+    Started,
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum ResourceCommand {
     List,
@@ -88,6 +100,28 @@ pub(crate) enum ResourceCommand {
         #[arg(long)]
         scope: Option<PathBuf>,
     },
+}
+
+/// A job's outcome for scripts: its state, exit code, why it was cancelled
+/// or what the supervisor recorded, and why it is still waiting.
+fn job_json(record: &LaneRecord) -> serde_json::Value {
+    let state = record.job.as_ref().map(|job| &job.state);
+    serde_json::json!({
+        "job_id": record.ticket.id,
+        "ticket": record.ticket,
+        "state": state,
+        "log_path": record.job.as_ref().map(|job| &job.log_path),
+        "exit_code": match state {
+            Some(JobState::Finished { exit_code }) => Some(*exit_code),
+            _ => None,
+        },
+        "reason": match state {
+            Some(JobState::Cancelled { reason }) => Some(reason.as_str()),
+            _ => None,
+        },
+        "evidence": record.evidence,
+        "wait_reason": record.wait_reason,
+    })
 }
 
 fn print_job(job: &JobHandle, json: bool) -> Result<()> {
@@ -185,9 +219,40 @@ pub(crate) async fn run(args: LaneArgs) -> Result<()> {
                 }
                 print_job(&store.enqueue_job(spec)?, json)?;
             }
-            JobCommand::Wait { id } => {
-                let job = tokio::task::spawn_blocking(move || store.wait_job(id)).await??;
-                print_job(&job, json)?;
+            JobCommand::Wait { id, until, timeout } => {
+                let waiter = store.clone();
+                let waiting = tokio::task::spawn_blocking(move || match until {
+                    Some(WaitUntil::Started) => waiter.wait_started(id),
+                    None => waiter.wait_job(id),
+                });
+                let job = match timeout {
+                    None => waiting.await??,
+                    Some(seconds) => {
+                        match tokio::time::timeout(std::time::Duration::from_secs(seconds), waiting)
+                            .await
+                        {
+                            Ok(job) => job??,
+                            Err(_) => {
+                                eprintln!("timed out waiting for job {id}");
+                                if json {
+                                    println!(
+                                        "{}",
+                                        serde_json::json!({"job_id": id, "timed_out": true})
+                                    );
+                                }
+                                std::process::exit(124);
+                            }
+                        }
+                    }
+                };
+                match store
+                    .snapshot()?
+                    .iter()
+                    .find(|record| record.ticket.id == id)
+                {
+                    Some(record) if json => println!("{}", job_json(record)),
+                    _ => print_job(&job, json)?,
+                }
                 match job.state {
                     JobState::Finished { exit_code } if exit_code != 0 => {
                         std::process::exit(exit_code.clamp(1, 255))
@@ -202,16 +267,23 @@ pub(crate) async fn run(args: LaneArgs) -> Result<()> {
             JobCommand::Status { id } => {
                 if let Some(id) = id {
                     if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string(
-                                &store
-                                    .snapshot()?
-                                    .into_iter()
-                                    .find(|r| r.ticket.id == id)
-                                    .context("unknown job")?
-                            )?
-                        );
+                        let record = store
+                            .snapshot()?
+                            .into_iter()
+                            .find(|r| r.ticket.id == id)
+                            .context("unknown job")?;
+                        // The full record, plus the same summary `job wait` prints.
+                        let mut value = serde_json::to_value(&record)?;
+                        if let (Some(fields), serde_json::Value::Object(summary)) =
+                            (value.as_object_mut(), job_json(&record))
+                        {
+                            for key in ["exit_code", "reason"] {
+                                if let Some(field) = summary.get(key) {
+                                    fields.insert(key.to_owned(), field.clone());
+                                }
+                            }
+                        }
+                        println!("{value}");
                     } else {
                         print_job(&store.job_status(id)?, false)?;
                     }
