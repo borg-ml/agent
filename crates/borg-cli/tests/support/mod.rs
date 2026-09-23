@@ -118,6 +118,7 @@ impl Lane {
         JobSpec {
             foreign_client_grace_ms: 300_000,
             foreign_client_grace_by_resource: Vec::new(),
+            abandon_after_ms: None,
             fingerprint: JobFingerprint(name.into()),
             lease: LeaseRequest {
                 resources: vec![ResourceRequest {
