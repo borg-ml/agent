@@ -8436,19 +8436,16 @@ impl BorgTerminal {
                     }
                 }
             }
-            if self.picker.is_none() && cursor_visible {
-                let (cursor_row, cursor_column) = composer_cursor;
-                frame.set_cursor_position(Position {
-                    x: composer_area
-                        .x
-                        .saturating_add(composer_cursor_x_offset(is_launch_screen))
-                        .saturating_add(cursor_column as u16),
-                    y: composer_area
-                        .y
-                        .saturating_add(if is_launch_screen { 0 } else { 1 })
-                        .saturating_add((cursor_row as u16).saturating_sub(composer_scroll))
-                        .min(composer_area.bottom().saturating_sub(1)),
-                });
+            if self.picker.is_none()
+                && cursor_visible
+                && let Some(cursor) = composer_frame_cursor(
+                    composer_area,
+                    composer_cursor,
+                    composer_scroll,
+                    is_launch_screen,
+                )
+            {
+                frame.set_cursor_position(cursor);
             }
             let status_highlight = self.status_hovered && status_is_interruptible;
             let status_duration = if session_is_active {
@@ -15087,6 +15084,27 @@ fn composer_cursor_position_in_ranges(
 
 fn composer_cursor_x_offset(is_launch_screen: bool) -> u16 {
     u16::from(is_launch_screen) + 3
+}
+
+fn composer_frame_cursor(
+    area: Rect,
+    (row, column): (usize, usize),
+    scroll: u16,
+    is_launch_screen: bool,
+) -> Option<Position> {
+    let x = area
+        .x
+        .saturating_add(composer_cursor_x_offset(is_launch_screen));
+    let y = area.y.saturating_add(u16::from(!is_launch_screen));
+    // A collapsed composer has no text cell; its preceding row is the statusline.
+    if x >= area.right() || y >= area.bottom() {
+        return None;
+    }
+    Some(Position {
+        x: x.saturating_add(column as u16).min(area.right() - 1),
+        y: y.saturating_add((row as u16).saturating_sub(scroll))
+            .min(area.bottom() - 1),
+    })
 }
 
 fn splash_logo_line(elapsed: Duration, seed: u64) -> Line<'static> {
