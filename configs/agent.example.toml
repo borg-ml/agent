@@ -32,10 +32,6 @@ auto_resume_usage_limits = true
 # Codex answers on its own). `true` selects this default set, `false` always
 # delivers the bare text; e.g. ["claude"] frames every Claude model.
 steer_reply_prompt = ["claude-fable-5-1"]
-# Let Claude sessions use Claude Code's own Agent tool. Its subagents run inside
-# the session's Claude process (a few MB each) instead of each starting another
-# Claude runtime; they appear as Agent tool rows rather than Borg team members.
-claude_native_subagents = false
 # `borg` is the default shell-first harness; `native` exposes direct tools.
 harness = "borg"
 # `shared_work`, `presence`, `cloud_sync`, `web_relay`, and `telemetry` are

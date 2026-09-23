@@ -146,27 +146,6 @@ fn provider_native_orchestration_tool(name: &str) -> bool {
     )
 }
 
-/// Whether this turn may use Claude Code's own Agent tool. Every other
-/// provider-native delegation stays forbidden.
-fn native_subagents_enabled(turn: &AgentTurn) -> bool {
-    turn.claude_native_subagents && turn.provider == CodingProvider::Claude
-}
-
-/// The base prompt forbids provider-native delegation. A session that opted
-/// into Claude Code's in-process subagents gets guidance on when to use them.
-const NATIVE_DELEGATION_RULE: &str = "Never invoke provider-native delegation tools such as `subAgentActivity`, `collabAgentToolCall`, `Agent`, or `Task`; delegate only through `mcp__borg_agent__spawn_agent`. ";
-const CLAUDE_NATIVE_SUBAGENT_RULE: &str = "Claude Code's Agent tool is enabled here and its subagents run inside this process: prefer it for short, self-contained subtasks whose result you need back in this turn, such as parallel search, reading, or review. Use `mcp__borg_agent__spawn_agent` for long-running, durable, independently steerable, or cross-provider work. Never invoke other provider-native delegation tools such as `subAgentActivity` or `collabAgentToolCall`. ";
-
-fn coding_system_prompt(turn: &AgentTurn) -> std::borrow::Cow<'static, str> {
-    if native_subagents_enabled(turn) {
-        CODING_SYSTEM_PROMPT
-            .replacen(NATIVE_DELEGATION_RULE, CLAUDE_NATIVE_SUBAGENT_RULE, 1)
-            .into()
-    } else {
-        CODING_SYSTEM_PROMPT.into()
-    }
-}
-
 #[derive(Clone)]
 pub struct AgentTurn {
     pub session_id: Uuid,
@@ -233,8 +212,6 @@ pub struct AgentTurn {
     /// reused process keeps the snapshot it started with; the prompt already
     /// directs the model to `get_provider_capabilities` for fresh numbers.
     pub volatile_system_prompt_appendix: String,
-    /// Claude only: offer Claude Code's in-process Agent tool this turn.
-    pub claude_native_subagents: bool,
     /// Declarations in force at the end of the replayed journal: the base for
     /// this context generation folded with every recorded change.
     ///
@@ -1546,8 +1523,8 @@ fn direct_chat_stream_request(
         effort: turn.effort.clone(),
         fast: turn.fast.unwrap_or(false),
         system_prompt: match response_language_instruction {
-            Some(instruction) => format!("{}\n\n{instruction}", coding_system_prompt(turn)),
-            None => coding_system_prompt(turn).into_owned(),
+            Some(instruction) => format!("{CODING_SYSTEM_PROMPT}\n\n{instruction}"),
+            None => CODING_SYSTEM_PROMPT.to_string(),
         } + if turn.system_prompt_appendix.is_empty() {
             ""
         } else {
@@ -1568,7 +1545,6 @@ fn direct_chat_stream_request(
         persist_session: Some(false),
         web_search_allowed: true,
         resume_unavailable_prompt: None,
-        native_subagents: native_subagents_enabled(turn),
     }
 }
 
@@ -1834,8 +1810,6 @@ async fn run_borg_provider_turn(
     let mut final_output = String::new();
     let mut completed_segment = false;
     let mut last_text_emit = Instant::now() - Duration::from_millis(50);
-    let native_subagent_tools =
-        turn.claude_native_subagents && turn.provider == CodingProvider::Claude;
     let mut provider_session_id = turn.provider_session_id;
     let mut first_model_output = true;
     let mut terminal_seen = false;
@@ -2077,8 +2051,7 @@ async fn run_borg_provider_turn(
             }
             ChatStreamEvent::ToolCall { id, name, input } => {
                 anyhow::ensure!(
-                    !provider_native_orchestration_tool(&name)
-                        || (native_subagent_tools && matches!(name.as_str(), "Agent" | "Task")),
+                    !provider_native_orchestration_tool(&name),
                     "{:?} exposed a forbidden provider-native agent tool: {name}",
                     turn.provider
                 );
@@ -2755,7 +2728,6 @@ mod tests {
             system_prompt_appendix: "extension context".to_string(),
             declaration_base: None,
             prompt_context_base: Default::default(),
-            claude_native_subagents: false,
             volatile_system_prompt_appendix: "usage: 5-hour 65% left".to_string(),
         }
     }
@@ -3083,20 +3055,6 @@ mod tests {
         assert!(!provider_native_orchestration_tool(
             "mcp__borg_agent__spawn_agent"
         ));
-    }
-
-    #[test]
-    fn native_subagent_opt_in_replaces_the_delegation_rule_for_claude_only() {
-        let root = tempfile::tempdir().unwrap();
-        let mut turn = lifecycle_test_turn(root.path());
-        turn.provider = CodingProvider::Claude;
-        assert_eq!(coding_system_prompt(&turn), CODING_SYSTEM_PROMPT);
-        turn.claude_native_subagents = true;
-        let prompt = coding_system_prompt(&turn);
-        assert!(!prompt.contains(NATIVE_DELEGATION_RULE));
-        assert!(prompt.contains(CLAUDE_NATIVE_SUBAGENT_RULE));
-        turn.provider = CodingProvider::Codex;
-        assert_eq!(coding_system_prompt(&turn), CODING_SYSTEM_PROMPT);
     }
 
     #[test]
