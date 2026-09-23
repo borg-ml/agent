@@ -7163,8 +7163,30 @@ async fn run_local_agent_session(
                     None => remote_open = false,
                 }
             }
-            _ = tokio::signal::ctrl_c(), if interactive => {
-                if repeated_ctrl_c(&mut last_ctrl_c, std::time::Instant::now()) {
+            _ = tokio::signal::ctrl_c() => {
+                // Without a handler the default action killed Borg outright,
+                // and the provider runtime in its own process group kept
+                // working unattended. Stop the session; a second Ctrl-C still
+                // forces the exit.
+                if !interactive {
+                    if stop_sent {
+                        force_quit(
+                            &mut terminal,
+                            &crash_context.tui_active,
+                            (!args.ephemeral).then_some(session_id),
+                        );
+                    }
+                    stop_sent = true;
+                    user_requested_exit = true;
+                    exit_notice = Some(
+                        "Interrupted; Borg stopped the local session. Press Ctrl-C again to exit at once."
+                            .to_string(),
+                    );
+                    dispatch_host_command_without_blocking(
+                        &session_command_tx,
+                        HostCommand::Stop { session_id },
+                    );
+                } else if repeated_ctrl_c(&mut last_ctrl_c, std::time::Instant::now()) {
                     force_quit(
                             &mut terminal,
                             &crash_context.tui_active,

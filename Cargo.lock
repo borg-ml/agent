@@ -1584,9 +1584,10 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "claude-agents"
 version = "0.1.0"
-source = "git+https://github.com/borg-ml/claude-agents.git?rev=25dc075b14615a3fa95309c6a31af83cc8d1f1a8#25dc075b14615a3fa95309c6a31af83cc8d1f1a8"
+source = "git+https://github.com/borg-ml/claude-agents.git?rev=10cb2c65cab6da5dd5c9057ed8572caa99284d9b#10cb2c65cab6da5dd5c9057ed8572caa99284d9b"
 dependencies = [
  "anyhow",
+ "nix 0.31.3",
  "serde",
  "serde_json",
  "tempfile",
