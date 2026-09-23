@@ -17879,6 +17879,13 @@ async fn recovery_corrects_only_verified_team_prompts_without_acknowledging_them
         crate::DeliveryMode::NextTurn,
     )
     .await;
+    let retried_team_id = append_team_message(
+        &workspace_store,
+        &binding,
+        "retry the handoff",
+        crate::DeliveryMode::NextTurn,
+    )
+    .await;
     let human_id = Uuid::new_v4();
     let store: Arc<dyn SessionStore> = session_store.clone();
     let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new(), true)
@@ -17924,9 +17931,32 @@ async fn recovery_corrects_only_verified_team_prompts_without_acknowledging_them
         ))
         .await
         .unwrap();
-    let mut pending = recover_queued_prompts(&store.read(session_id).await.unwrap());
+    for status in [
+        MessageStatus::Queued,
+        MessageStatus::InProgress,
+        MessageStatus::Queued,
+    ] {
+        runtime
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id: retried_team_id,
+                    actor: EventActor::User,
+                    text: "Team message from /root/worker:\n\nretry the handoff".to_string(),
+                    attachments: Vec::new(),
+                    status,
+                    delivery: Some(PromptDelivery::Queue),
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    let history = store.read(session_id).await.unwrap();
+    let mut pending = recover_queued_prompts(&history);
     let (events, mut received) = mpsc::channel(8);
-    let durable_admissions = HashSet::from([active_team_id]);
+    let durable_admissions = recovered_durable_admissions(&history, &pending);
+    assert_eq!(durable_admissions, HashSet::from([active_team_id]));
 
     repair_recovered_team_prompt_provenance(
         &mut pending,
@@ -17938,21 +17968,25 @@ async fn recovery_corrects_only_verified_team_prompts_without_acknowledging_them
     )
     .await
     .unwrap();
-    assert_eq!(pending.len(), 3);
+    assert_eq!(pending.len(), 4);
     assert_eq!(pending[0].actor, EventActor::System);
     assert!(!pending[0].interrupt_batch);
     assert_eq!(pending[1].actor, EventActor::User);
     assert_eq!(pending[2].actor, EventActor::User);
-    let correction = received.try_recv().unwrap();
-    assert!(matches!(
-        correction.kind,
-        SessionEventKind::Message {
-            message_id,
-            actor: EventActor::System,
-            status: MessageStatus::Queued,
-            ..
-        } if message_id == team_id
-    ));
+    assert_eq!(pending[3].actor, EventActor::System);
+    let corrected_ids = [received.try_recv().unwrap(), received.try_recv().unwrap()]
+        .into_iter()
+        .map(|event| match event.kind {
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::System,
+                status: MessageStatus::Queued,
+                ..
+            } => message_id,
+            other => panic!("unexpected correction: {other:?}"),
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(corrected_ids, HashSet::from([team_id, retried_team_id]));
     assert!(received.try_recv().is_err());
     assert_eq!(
         delivery_state(&workspace_store, &binding, team_id).await,
@@ -17962,6 +17996,7 @@ async fn recovery_corrects_only_verified_team_prompts_without_acknowledging_them
     assert_eq!(recovered[0].actor, EventActor::System);
     assert_eq!(recovered[1].actor, EventActor::User);
     assert_eq!(recovered[2].actor, EventActor::User);
+    assert_eq!(recovered[3].actor, EventActor::System);
 
     repair_recovered_team_prompt_provenance(
         &mut pending,

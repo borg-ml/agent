@@ -2046,18 +2046,6 @@ async fn run_agent_session_store_kernel_inner(
     // skipped: a resumed prompt has one, at its original timestamp, and
     // announcing it again dates the message to the restart. A prompt that
     // was merely queued has none and still has to be announced.
-    let mut durable_admissions = recovery
-        .queue_events
-        .iter()
-        .filter_map(|event| match &event.kind {
-            SessionEventKind::Message {
-                message_id,
-                status: MessageStatus::InProgress,
-                ..
-            } => Some(*message_id),
-            _ => None,
-        })
-        .collect::<HashSet<Uuid>>();
     for action in recovered_actions {
         if let Some(prompt) = queued_prompt_from_action(&action)
             && !pending
@@ -2067,6 +2055,7 @@ async fn run_agent_session_store_kernel_inner(
             pending.push_back(prompt);
         }
     }
+    let mut durable_admissions = recovered_durable_admissions(&recovery.queue_events, &pending);
     if let Some(projection) = &workspace_projection {
         repair_recovered_team_prompt_provenance(
             &mut pending,
@@ -8830,6 +8819,31 @@ fn recover_prompts_on_resume(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> 
     // every unresolved entry and let the normal boundary drain admit it
     // without interrupting any provider turn that may still be running.
     recover_queued_prompts(events)
+}
+
+fn recovered_durable_admissions(
+    events: &[SessionEvent],
+    pending: &VecDeque<QueuedPrompt>,
+) -> HashSet<Uuid> {
+    let mut unresolved = pending
+        .iter()
+        .map(|prompt| prompt.message_id)
+        .collect::<HashSet<_>>();
+    let mut admitted = HashSet::new();
+    for event in events.iter().rev() {
+        if let SessionEventKind::Message {
+            message_id,
+            actor: EventActor::User | EventActor::System,
+            status,
+            ..
+        } = &event.kind
+            && unresolved.remove(message_id)
+            && *status == MessageStatus::InProgress
+        {
+            admitted.insert(*message_id);
+        }
+    }
+    admitted
 }
 
 /// An older child wake replayed durable team inbox entries as ordinary user
