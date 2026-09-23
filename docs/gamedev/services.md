@@ -129,11 +129,9 @@ child in the backend subgroup and exited its leader. Recovery verified the
 child gone, restarted on the alternate port (`restarts=1`), then the owned
 fixture was stopped; its unit was inactive and subgroup removed.
 
-Independent no-hook two-service scoped gate (bench script, SHA256
+Historical no-hook two-service scoped gate (external probe, pre-alias-fix CLI SHA256
 `4022be198a99c3e8f8cac3069387f222bd2cb4e1bfdfb7a4135e8048c19a34b2`):
-`python3 scripts/gamedev_service_probe.py --borg PATH --atomic-descendant`
-exited 0 on a real
-systemd-user job; both backend PIDs, detached descendants and delegated
+the test exited 0 on a real systemd-user job; both backend PIDs, detached descendants and delegated
 subgroups were gone before exclusive grant, both proxies returned 503, a
 client was restored, restart attempts remained fenced, and both services
 auto-resumed on release. See `/tmp/gd-two-service-scoped.log`. No real Unreal
@@ -143,3 +141,49 @@ An owned-unit supervisor-crash smoke SIGKILLed only the test supervisor main
 process; `KillMode=control-group` killed its detached backend child and the
 unit became inactive. The lack of a safe non-systemd process-tree scope still
 prevents a standalone `setsid` production fallback.
+
+Production two-service disk capacity smoke on pre-alias-fix CLI SHA256
+`73aed7d927988e189b245d631aa7f67830094c6b41e1f2975da29bb190c88e59`:
+service A became Healthy with 10.8 GB reserved disk; separate service B on
+the same filesystem stayed Degraded with no backend and the exact "disk
+admission queued" reason. Yielding A admitted B to Healthy; both owned
+systemd-user units stopped inactive/dead with empty control groups. See
+`/tmp/gd-real-capacity-probe.log` (synthetic HTTP, not Unreal).
+
+Pre-readiness-fix canonical-key public-CLI gate (integrated lane+service binary SHA256
+`011c4ba94835500d40910d3dab6096533d245a55f0ea7f72c1112b1450e5e99d`):
+Project `..` and symlink aliases, and Worktree `..` and symlink aliases, were
+rejected before admission. A canonical Project same-key exclusive job then
+yielded its active service before grant, restored its client, fenced restart
+and returned 503 until auto-resume on release. On the same binary, two
+independent services on disjoint Host keys each requested ~60% of available
+RAM: the second had no backend with an explicit "RAM admission queued" reason,
+then became Healthy after the first yielded. These are fake-service CLI probes,
+not a live Unreal editor or authenticated mutating MCP adapter. The earlier
+pre-alias-fix scoped and disk-budget smokes remain useful evidence for those
+individual behaviors but do not establish canonical Project-key safety by
+themselves.
+
+Post-resume-readiness public-CLI gates on freshly rebuilt binary SHA256
+`61ece6c173170b080933c821b81658a3d8ad422b1a5601d9550f8a30c4d7d4ac`:
+- Real systemd-user two-service no-hook exclusive job: both detached backend
+  descendants and delegated subgroups empty before grant, both proxies 503,
+  client restore/restart fenced, both backends healthy after release
+  (`/tmp/gd-two-service-scoped-readiness.log`).
+- Distinct Host keys and disk paths on the same filesystem each reserved
+  ~60% of free space: B had no backend with "disk admission queued" reason,
+  then became Healthy when A yielded; both owned units stopped inactive/dead
+  (`/tmp/gd-real-capacity-probe-readiness.log`, isolated probe
+  `/tmp/gd-real-capacity-probe.py`).
+- Project path aliases rejected before grant, canonical same-key handoff
+  retained (`/tmp/gd-alias-readiness.log`).
+- Stopped-supervisor resume kept `resume_pending` and journalled an error
+  until recovery (`/tmp/gd-failed-resume-readiness.log`). More importantly,
+  an ACKed Resume followed by failed backend health left `resume_pending`
+  and a readiness error, with the yield token removed; after health returned,
+  recovery cleared pending without a second Resume
+  (`/tmp/gd-ack-unhealthy-readiness2.log`).
+
+These are fake HTTP services and pinned local binaries, not a live Unreal editor.
+The earlier SHA `011c4ba9…` gates do not establish the newer resume-readiness
+semantics.
