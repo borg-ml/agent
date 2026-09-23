@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import socket
 import subprocess
 import sys
@@ -48,14 +49,28 @@ def wait_for_exit(pid: int, port: int, identity: tuple[str, str] | None, deadlin
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument('--port', type=int, required=True)
-    parser.add_argument('--pid', type=int, required=True)
+    parser.add_argument('--pid', type=int)
+    parser.add_argument('--pid-file', type=Path)
     parser.add_argument('--timeout-seconds', type=float, default=85)
     args = parser.parse_args()
-    if not 1 <= args.port <= 65535 or args.pid <= 0 or args.timeout_seconds <= 0:
-        parser.error('invalid port, pid or timeout')
+    if not 1 <= args.port <= 65535 or args.timeout_seconds <= 0:
+        parser.error('invalid port or timeout')
+    if args.pid_file:
+        record = json.loads(args.pid_file.read_text())
+        pid, recorded_start = int(record['pid']), record['start']
+    elif args.pid:
+        pid, recorded_start = args.pid, None
+    else:
+        parser.error('pass --pid or --pid-file')
+    if pid <= 0:
+        parser.error('invalid pid')
     deadline = time.monotonic() + args.timeout_seconds  # Within the core's 90 s hook bound.
-    identity = process_state(args.pid)
-    if exited(args.pid, identity) and port_closed(args.port):
+    identity = process_state(pid)
+    if recorded_start is not None and identity is not None and identity[1] != recorded_start:
+        if port_closed(args.port):
+            return 0  # Stale file from an exited generation; no active backend.
+        raise RuntimeError('backend PID start identity changed; refusing to call MCP')
+    if exited(pid, identity) and port_closed(args.port):
         return 0
     client = Client(f'http://127.0.0.1:{args.port}/mcp', timeout=10)
     try:
@@ -67,8 +82,8 @@ def main() -> int:
         client.call(LANE_TOOLS, 'exec_console', {'command': 'QUIT_EDITOR', 'owner': 'lane-supervisor'})
     finally:
         client.close()
-    if not wait_for_exit(args.pid, args.port, identity, deadline):
-        print(f'editor {args.pid} did not exit and close MCP port {args.port} before timeout',
+    if not wait_for_exit(pid, args.port, identity, deadline):
+        print(f'editor {pid} did not exit and close MCP port {args.port} before timeout',
               file=sys.stderr)
         return 1  # Core will terminate only its tracked backend cgroup.
     return 0

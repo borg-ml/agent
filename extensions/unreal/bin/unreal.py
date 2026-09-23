@@ -205,8 +205,11 @@ def service_spec(project: Path, engine: Path, cfg: dict) -> dict:
     extension_args = cfg.get('editor', {}).get('args', [])
     if not isinstance(extension_args, list) or not all(isinstance(a, str) for a in extension_args):
         raise ValueError('editor.args must be an array of arguments')
+    state = Path(os.environ.get('XDG_RUNTIME_DIR') or '/tmp') / 'borg' / 'unreal' / project_id(project)
+    pid_file = state / 'backend-{port}.pid'
     return {'id': f'unreal-{project_id(project)}', 'cwd': str(project.parent),
-            'argv': [str(editor_bin), str(project), '-RenderOffscreen', '-unattended', '-nosplash',
+            'argv': [sys.executable, str(ROOT / 'editor/launch.py'), '--pid-file',
+                     str(pid_file), '--', str(editor_bin), str(project), '-RenderOffscreen', '-unattended', '-nosplash',
                      '-nosound', '-nop4', '-saveddirsuffix=BorgEditorLane',
                      '-ModelContextProtocolStartServer', '-ModelContextProtocolPort={port}',
                      '-ini:Engine:[HTTPServer.Listeners]:DefaultBindAddress=127.0.0.1',
@@ -221,7 +224,8 @@ def service_spec(project: Path, engine: Path, cfg: dict) -> dict:
             'endpoint': {'listen': f'127.0.0.1:{front}', 'backend_ports': backend},
             'restore': None, 'adapter_enforces_leases': False,
             'readiness_timeout_ms': 900_000,
-            'graceful_stop': {'argv': [sys.executable, str(ROOT / 'editor/quit.py'), '--port', '{port}'],
+            'graceful_stop': {'argv': [sys.executable, str(ROOT / 'editor/quit.py'), '--port', '{port}',
+                                     '--pid-file', str(pid_file)],
                               'timeout_ms': 90_000}}
 
 
