@@ -366,7 +366,39 @@ impl RuntimeEventBatch {
 fn relay_event_batch_payload(events: &[SessionEvent]) -> Result<serde_json::Value> {
     let mut payload = serde_json::to_value(RuntimeEventBatch::from_events(events))?;
     rewrite_relay_permission_modes(&mut payload);
+    rewrite_relay_session_titles(&mut payload);
     Ok(payload)
+}
+
+/// Deployed relays predate `session_titled` and reject the whole batch on an
+/// unknown variant, which pauses replay. Carry the title as an opaque provider
+/// event instead: its sequence stays contiguous and it has no projection effect.
+fn rewrite_relay_session_titles(payload: &mut serde_json::Value) {
+    let Some(events) = payload
+        .get_mut("events")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for kind in events
+        .iter_mut()
+        .filter_map(|envelope| envelope.pointer_mut("/event/kind"))
+    {
+        if kind.get("type").and_then(serde_json::Value::as_str) != Some("session_titled") {
+            continue;
+        }
+        let mut title = kind.take();
+        if let Some(object) = title.as_object_mut() {
+            object.remove("type");
+        }
+        *kind = serde_json::json!({
+            "type": "provider_event",
+            // Required by the older schema; this kind has no provider meaning.
+            "provider": "codex",
+            "kind": "session_titled",
+            "payload": title,
+        });
+    }
 }
 
 fn rewrite_relay_permission_modes(value: &mut serde_json::Value) {
@@ -7585,6 +7617,35 @@ mod tests {
             serde_json::to_value(&events[1].kind).unwrap()["permission_mode"],
             "manual"
         );
+    }
+
+    #[test]
+    fn relay_event_batches_carry_titles_in_a_variant_older_relays_accept() {
+        let session_id = Uuid::new_v4();
+        let events = [SessionEvent::new(
+            session_id,
+            7,
+            crate::SessionEventKind::SessionTitled {
+                title: "Fix the relay".to_string(),
+                generated: true,
+                usage_tokens: Some(19),
+            },
+        )];
+
+        let payload = relay_event_batch_payload(&events).unwrap();
+        let event = &payload["events"][0]["event"];
+        assert_eq!(event["sequence"], 7);
+        assert_eq!(
+            event["kind"],
+            serde_json::json!({
+                "type": "provider_event",
+                "provider": "codex",
+                "kind": "session_titled",
+                "payload": {"title": "Fix the relay", "generated": true, "usage_tokens": 19},
+            })
+        );
+        // The rewritten event still parses with the current schema.
+        serde_json::from_value::<crate::SessionEventKind>(event["kind"].clone()).unwrap();
     }
 
     #[test]
