@@ -1309,6 +1309,7 @@ impl NativeHarness {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn compact_with_window(
         &self,
         provider: crate::CodingProvider,
@@ -1327,10 +1328,7 @@ impl NativeHarness {
         // a provider switch. Render and fold bounded, provider-neutral chunks;
         // replaying historical tool protocol in a summarization request can
         // also make the target provider reject an otherwise valid transcript.
-        let input_chars = context_window_tokens
-            .max(1)
-            .min(1_024_000)
-            .saturating_div(2) as usize;
+        let input_chars = context_window_tokens.clamp(1, 1_024_000).saturating_div(2) as usize;
         let summary_chars = (input_chars / 8).min(32 * 1024);
         let wrapper_chars = crate::session::COMPACTION_SUMMARY_PROMPT.chars().count() + 160;
         let chunk_chars = input_chars.saturating_sub(summary_chars + wrapper_chars);
