@@ -15,6 +15,7 @@ mod extensions;
 mod image_delivery;
 mod importer;
 mod inspect;
+mod lane_commands;
 mod limits;
 mod protection;
 mod remote_commands;
@@ -110,6 +111,7 @@ async fn run() -> Result<()> {
         .init();
     match command {
         Command::Import(args) => importer::run(args).await,
+        Command::Lane(args) => lane_commands::run(args).await,
         Command::Agent(args) => run_local_agent(args).await,
         Command::Resume { session } => run_local_agent(LocalAgentCliArgs::resume(session)).await,
         Command::Login {

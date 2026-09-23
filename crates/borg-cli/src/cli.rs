@@ -70,6 +70,7 @@ impl Cli {
                 | "doctor"
                 | "bug"
                 | "limits"
+                | "lane"
                 | "help"
                 | "__agent-mcp"
                 | "-h"
@@ -126,6 +127,8 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    /// Queue and supervise engine-neutral jobs and resource leases.
+    Lane(crate::lane_commands::LaneArgs),
     /// Check for or install the latest Borg Agent release.
     #[command(visible_alias = "install")]
     Update(UpdateArgs),

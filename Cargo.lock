@@ -1024,6 +1024,7 @@ dependencies = [
  "borg-agent-runtime",
  "borg-core",
  "borg-dictation",
+ "borg-lanes",
  "borg-provider",
  "borg-remote",
  "borg-tui",
