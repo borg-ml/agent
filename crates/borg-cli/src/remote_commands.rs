@@ -1436,7 +1436,9 @@ async fn ensure_detached_session_host(
         diagnostics_file.set_len(0)?;
     }
     let diagnostics_start = diagnostics_file.metadata()?.len();
-    let executable = std::env::current_exe().context("failed to locate the Borg executable")?;
+    let executable = detached_host_executable(
+        &std::env::current_exe().context("failed to locate the Borg executable")?,
+    )?;
     let mut command = TokioCommand::new(&executable);
     command
         .arg("__agent")
@@ -1476,6 +1478,38 @@ async fn ensure_detached_session_host(
         }
     });
     result
+}
+
+fn detached_host_executable(current: &Path) -> Result<PathBuf> {
+    if current.is_file() {
+        return Ok(current.to_path_buf());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // An atomic update unlinks the running inode. Linux then reports its
+        // old path with a literal ` (deleted)` suffix, which cannot be spawned.
+        if let Some(replacement) = current
+            .to_string_lossy()
+            .strip_suffix(" (deleted)")
+            .map(PathBuf::from)
+            .filter(|path| path.is_file())
+        {
+            return Ok(replacement);
+        }
+
+        // If the original path has not been replaced, the live inode can
+        // still start a child while this process remains alive.
+        let live_executable = PathBuf::from("/proc/self/exe");
+        if live_executable.is_file() {
+            return Ok(live_executable);
+        }
+    }
+
+    anyhow::bail!(
+        "Borg cannot start a detached session host because its executable is unavailable at {}",
+        current.display()
+    )
 }
 
 fn session_host_diagnostics(path: &Path, launch_offset: u64) -> String {
