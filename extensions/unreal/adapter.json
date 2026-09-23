@@ -1,0 +1,19 @@
+{
+  "version": 0,
+  "id": "unreal",
+  "project_markers": ["*.uproject"],
+  "description": "Descriptive adapter policy, not an executable Blu v1 lanes manifest",
+  "resources": [
+    {"name": "unreal-build-output", "scope": "worktree", "access": "exclusive"},
+    {"name": "unreal-project-run", "scope": "project", "access": "exclusive"},
+    {"name": "unreal-run-ram", "scope": "host", "access": "exclusive"}
+  ],
+  "jobs": {
+    "build": {"core_type": "JobSpec", "enabled_when": "integrated Borg lane job CLI", "ubt_startup_lock": "Unreal-specific helper only"},
+    "run": {"core_type": "JobSpec", "enabled_when": "atomic core editor-yield plus exclusive job admission; spec-only until then"}
+  },
+  "services": {
+    "editor": {"core_type": "ServiceSpec", "health": "mcp_initialize", "owner_enforcement": false, "raw_mcp": "blocked"}
+  },
+  "caches": {"ZenDDC": "shared-native", "Intermediate": "worktree-private", "Binaries": "worktree-private"}
+}
