@@ -2608,54 +2608,57 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
 
     #[tokio::test]
     async fn restart_waits_while_selected_key_is_granted() {
-        let key = ResourceKey {
-            scope: ResourceScope::Host,
-            name: format!("build-{}", Uuid::new_v4()),
-        };
-        let (root, manager, _front, task) = setup_with(|spec| {
-            spec.restart.defer_while.push(key.clone());
-            spec.restart.debounce_ms = 50;
-        })
-        .await;
-        let original = manager.read_status("fake").unwrap().backend_pid;
-        let store = LaneStore::new(root.path()).unwrap();
-        let ticket = store
-            .enqueue_lease(LeaseRequest {
-                resources: vec![ResourceRequest {
-                    key,
-                    access: Access::Exclusive,
-                }],
-                holder: owner(),
-                queue_timeout_ms: Some(2_000),
+        for mode in [RestartMode::Warm, RestartMode::Cold] {
+            let key = ResourceKey {
+                scope: ResourceScope::Host,
+                name: format!("build-{}", Uuid::new_v4()),
+            };
+            let (root, manager, _front, task) = setup_with(|spec| {
+                spec.restart.defer_while.push(key.clone());
+                spec.restart.mode = mode;
+                spec.restart.debounce_ms = 50;
             })
-            .unwrap();
-        let lease = store.wait(&ticket).await.unwrap();
-        manager
-            .send(
-                "fake",
-                ServiceRequest::Restart {
-                    reason: "build completed".into(),
-                    force: false,
-                },
-                Duration::from_secs(3),
-            )
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        assert_eq!(manager.read_status("fake").unwrap().backend_pid, original);
-        assert_eq!(
-            fs::read_to_string(root.path().join("launches"))
-                .unwrap()
-                .lines()
-                .count(),
-            1
-        );
-        store.release_lease(&lease).unwrap();
-        state(&manager, |s| {
-            matches!(s.state, ServiceState::Healthy { .. }) && s.backend_pid != original
-        })
-        .await;
-        cleanup(&manager, task).await;
+            .await;
+            let original = manager.read_status("fake").unwrap().backend_pid;
+            let store = LaneStore::new(root.path()).unwrap();
+            let ticket = store
+                .enqueue_lease(LeaseRequest {
+                    resources: vec![ResourceRequest {
+                        key,
+                        access: Access::Exclusive,
+                    }],
+                    holder: owner(),
+                    queue_timeout_ms: Some(2_000),
+                })
+                .unwrap();
+            let lease = store.wait(&ticket).await.unwrap();
+            manager
+                .send(
+                    "fake",
+                    ServiceRequest::Restart {
+                        reason: "build completed".into(),
+                        force: false,
+                    },
+                    Duration::from_secs(3),
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            assert_eq!(manager.read_status("fake").unwrap().backend_pid, original);
+            assert_eq!(
+                fs::read_to_string(root.path().join("launches"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            store.release_lease(&lease).unwrap();
+            state(&manager, |s| {
+                matches!(s.state, ServiceState::Healthy { .. }) && s.backend_pid != original
+            })
+            .await;
+            cleanup(&manager, task).await;
+        }
     }
 
     #[tokio::test]
