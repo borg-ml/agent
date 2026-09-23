@@ -1,5 +1,5 @@
 //! CLI for host-local shared services; the internal supervisor command runs outside an agent session.
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use borg_lanes::{
     lanes::{Holder, LaneStore},
     services::{self, ServiceManager, ServiceRequest, ServiceSpec, ServiceState, ServiceStatus},
@@ -155,6 +155,9 @@ pub(crate) async fn run(args: ServiceArgs) -> Result<()> {
                         status.reason
                     );
                     break;
+                }
+                if let Some(unit) = manager.supervisor_exited(&id)? {
+                    bail!("service supervisor exited; see `journalctl --user -u {unit}`");
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }

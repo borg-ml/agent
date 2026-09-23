@@ -373,6 +373,15 @@ fn stopped(id: &str) -> ServiceStatus {
         yields: BTreeMap::new(),
     }
 }
+/// `dir/control.sock` addressed through the directory's descriptor, so a deep
+/// lane root or long service id cannot exceed the 108-byte `sun_path` limit.
+/// Keep the returned `File` open while the path is used.
+fn control_socket(dir: &Path) -> Result<(File, PathBuf)> {
+    let dir = File::open(dir)?;
+    let path = PathBuf::from(format!("/proc/self/fd/{}/control.sock", dir.as_raw_fd()));
+    Ok((dir, path))
+}
+
 fn is_running(dir: &Path) -> Result<bool> {
     use std::os::unix::fs::OpenOptionsExt;
     let fd = OpenOptions::new()
@@ -400,8 +409,8 @@ pub async fn service_request(
 ) -> Result<ServiceStatus> {
     let dir = service_dir(root, id)?;
     ensure!(is_running(&dir)?, "service {id} is not running");
-    let mut stream =
-        tokio::time::timeout(timeout, UnixStream::connect(dir.join("control.sock"))).await??;
+    let (_dir, socket) = control_socket(&dir)?;
+    let mut stream = tokio::time::timeout(timeout, UnixStream::connect(&socket)).await??;
     let body = serde_json::to_vec(&request)?;
     ensure!(body.len() <= 8192, "service request too large");
     stream.write_all(&body).await?;
@@ -426,6 +435,20 @@ impl ServiceManager {
     }
     pub fn current() -> Result<Self> {
         Ok(Self::new(service_root(), std::env::current_exe()?))
+    }
+    /// The launched supervisor unit has already exited, so its service can
+    /// never become ready.
+    pub fn supervisor_exited(&self, id: &str) -> Result<Option<String>> {
+        let dir = service_dir(&self.root, id)?;
+        if is_running(&dir)? {
+            return Ok(None);
+        }
+        let unit = format!("{}.service", read_json::<String>(&dir.join("unit.json"))?);
+        let active = std::process::Command::new("systemctl")
+            .args(["--user", "is-active", "--quiet", &unit])
+            .status()
+            .is_ok_and(|s| s.success());
+        Ok((!active).then_some(unit))
     }
     pub fn read_status(&self, id: &str) -> Result<ServiceStatus> {
         let dir = service_dir(&self.root, id)?;
@@ -1283,7 +1306,8 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
     }
     let socket = dir.join("control.sock");
     let _ = fs::remove_file(&socket); // Only the holder of supervisor.lock may replace a stale socket.
-    let control = UnixListener::bind(&socket)?;
+    let (_dir_fd, short) = control_socket(&dir)?;
+    let control = UnixListener::bind(&short)?;
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     let front = Arc::new(RwLock::new(FrontState {
