@@ -7,6 +7,7 @@ from contextlib import contextmanager
 import json
 import os
 import signal
+import select
 from pathlib import Path
 import shutil
 import socket
@@ -205,15 +206,34 @@ def cleanup_test_children(child_markers: Path) -> bool:
     for marker in child_markers.glob("*.json"):
         record = json.loads(marker.read_text())
         if live_test_child(record):
-            cmdline = Path(f"/proc/{record['pid']}/cmdline").read_bytes()
+            try:
+                cmdline = Path(f"/proc/{record['pid']}/cmdline").read_bytes()
+            except FileNotFoundError:
+                continue
             if b"gamedev_fake_service.py" not in cmdline or b"--detached-child" not in cmdline:
                 raise RuntimeError(f"refusing to signal ambiguous PID {record['pid']}")
-            os.kill(record["pid"], signal.SIGTERM)
-            leaked = True
+            try:
+                os.kill(record["pid"], signal.SIGTERM)
+                leaked = True
+            except ProcessLookupError:
+                pass
     return leaked
 
 
-def run_atomic(binary: Path, descendant: bool = False) -> dict:
+def post_hook_barrier(started: Path, fifo: Path, done: Path) -> None:
+    """Mark hook start, then block on kernel FIFO readiness until test releases it."""
+    fd = os.open(fifo, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        started.write_text("hook-blocked")
+        ready, _, _ = select.select([fd], [], [], 15)
+        if not ready or os.read(fd, 1) != b"x":
+            raise RuntimeError("post-hook release marker missing")
+        done.write_text("hook-completed")
+    finally:
+        os.close(fd)
+
+
+def run_atomic(binary: Path, descendant: bool = False, post_barrier: bool = False) -> dict:
     binary = binary.resolve(strict=True)
     backend = Path(__file__).with_name("gamedev_fake_service.py").resolve()
     with isolated_root() as root:
@@ -225,6 +245,11 @@ def run_atomic(binary: Path, descendant: bool = False) -> dict:
         project = root / "project"
         project.mkdir()
         child_markers = root / "detached-children"
+        hook_started = root / "post-hook-started"
+        hook_done = root / "post-hook-done"
+        hook_fifo = root / "post-hook-release"
+        if post_barrier:
+            os.mkfifo(hook_fifo)
         if descendant:
             child_markers.mkdir()
         # Host scope is isolated by a unique name; both services share precisely R.
@@ -275,11 +300,50 @@ def run_atomic(binary: Path, descendant: bool = False) -> dict:
                 "admission": admission,
                 # This is essential: no adapter-provided yield/resume hook can mask
                 # failure to auto-discover ALL services bound to R.
-                "pre_hook": None, "post_hook": None,
-                "timeout_ms": 10000, "stall_timeout_ms": None, "coalesce": False}
+                "pre_hook": None,
+                "post_hook": {"argv": [sys.executable, str(Path(__file__).resolve()),
+                                        "--borg", str(binary), "--post-hook",
+                                        str(hook_started), str(hook_fifo), str(hook_done)],
+                              "timeout_ms": 20000} if post_barrier else None,
+                "timeout_ms": 20000 if post_barrier else 10000, "stall_timeout_ms": None, "coalesce": False}
             submitted = lane(binary, root, "job", "submit", "--spec", "-", input_data=job_spec)
             job_id = submitted["job_id"]
-            done = lane(binary, root, "job", "wait", job_id, timeout=20, allow_failure=True)
+            if post_barrier:
+                wait_env = {**os.environ, "BORG_LANES_ROOT": str(root), "BORG_LANE_DIR": str(root),
+                            "BORG_LANE_SCOPE": "1", "BORG_LANE_DEGRADED": "0",
+                            "BORG_LANE_EXECUTABLE": str(binary)}
+                waiter = subprocess.Popen([str(binary), "lane", "--json", "job", "wait", job_id],
+                                          env=wait_env, text=True, stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE)
+                deadline = time.monotonic() + 10
+                while not hook_started.exists() and time.monotonic() < deadline:
+                    # Multiple own files may be created before the hook marker;
+                    # wait on filesystem notifications, never a sleep/status loop.
+                    subprocess.run(["inotifywait", "-q", "-t", "2", "-e", "create,moved_to", str(root)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+                if not hook_started.exists():
+                    raise RuntimeError(f"post-hook never reached barrier for job {job_id}")
+                for i, service_id in enumerate(started):
+                    current = command(binary, root, "status", service_id)
+                    if current.get("backend_pid") is not None or job_id not in (current.get("yields") or {}):
+                        raise RuntimeError(f"{service_id} lost fencing before post-hook: {current!r}")
+                    try:
+                        health_at(ports[i])
+                    except HTTPError as exc:
+                        if exc.code != 503:
+                            raise RuntimeError(f"post-hook proxy expected 503, got {exc.code}") from exc
+                    else:
+                        raise RuntimeError(f"{service_id} proxy routed during post-hook")
+                with hook_fifo.open("wb", buffering=0) as release:
+                    release.write(b"x")
+                out, err = waiter.communicate(timeout=15)
+                if waiter.returncode:
+                    raise RuntimeError(f"job wait failed after post-hook: {waiter.returncode} {err} {out}")
+                if not hook_done.exists():
+                    raise RuntimeError("job completed before post-hook reported completion")
+                done = json.loads(out)
+            else:
+                done = lane(binary, root, "job", "wait", job_id, timeout=20, allow_failure=True)
             state = done.get("state", {})
             if not isinstance(state, dict) or state.get("Finished", {}).get("exit_code") != 0 or not marker.exists():
                 raise RuntimeError(f"D11 no-hook exclusive did not complete: {done!r}")
@@ -289,8 +353,16 @@ def run_atomic(binary: Path, descendant: bool = False) -> dict:
                 health_at(ports[i])
             return {"mode": "D11-atomic-cli", "job_id": job_id, "backend_before": before,
                     "checks": json.loads(marker.read_text()), "backend_after": after,
-                    "auto_resumed": True, "job_hooks": False, "scoped_descendants": descendant}
+                    "auto_resumed": True, "job_hooks": post_barrier,
+                    "post_hook_before_resume": post_barrier, "scoped_descendants": descendant}
         finally:
+            if post_barrier and hook_started.exists() and not hook_done.exists():
+                try:
+                    release_fd = os.open(hook_fifo, os.O_WRONLY | os.O_NONBLOCK)
+                    os.write(release_fd, b"x")
+                    os.close(release_fd)
+                except OSError:
+                    pass
             if job_id is not None:
                 try:
                     status = lane(binary, root, "job", "status", job_id)
@@ -301,36 +373,53 @@ def run_atomic(binary: Path, descendant: bool = False) -> dict:
                         lane(binary, root, "job", "wait", job_id, allow_failure=True)
                 except Exception:
                     pass  # Preserve this test-owned state for diagnosis.
+            cleanup_errors = []
             for service_id in reversed(started):
-                current = command(binary, root, "status", service_id)
-                stopped = command(binary, root, "stop", service_id) if current.get("supervisor_pid") else current
-                if stopped.get("state") != "Stopped":
-                    raise RuntimeError(f"synthetic {service_id} did not stop: {stopped!r}")
-            if descendant and cleanup_test_children(child_markers):
-                raise RuntimeError("backend scope leaked a detached test child after stop")
+                try:
+                    current = command(binary, root, "status", service_id)
+                    stopped = command(binary, root, "stop", service_id) if current.get("supervisor_pid") else current
+                    if stopped.get("state") != "Stopped":
+                        cleanup_errors.append(f"{service_id} did not stop: {stopped!r}")
+                except Exception as exc:
+                    cleanup_errors.append(f"{service_id} stop failed: {exc}")
+            if descendant:
+                try:
+                    if cleanup_test_children(child_markers):
+                        cleanup_errors.append("backend scope leaked a detached test child after stop")
+                except Exception as exc:
+                    cleanup_errors.append(f"child cleanup failed: {exc}")
+            if cleanup_errors:
+                raise RuntimeError("; ".join(cleanup_errors))
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--borg", required=True, type=Path)
     ap.add_argument("--atomic", action="store_true", help="run degraded-mode D11 coordination gate")
+    ap.add_argument("--atomic-post-hook", action="store_true",
+                    help="systemd-only post-hook completion before service resume gate")
+    ap.add_argument("--post-hook", nargs=3, metavar=("STARTED", "FIFO", "DONE"))
     ap.add_argument("--atomic-descendant", action="store_true",
                     help="systemd-only two-service gate with detached child cgroup assertions")
     ap.add_argument("--atomic-worker", nargs=4, metavar=("ROOT", "PORT", "MARKER", "CHILD_DIR"))
     args = ap.parse_args()
-    if args.atomic_worker:
+    if args.post_hook:
+        post_hook_barrier(*(Path(value) for value in args.post_hook))
+    elif args.atomic_worker:
         root, port, marker, child_dir = args.atomic_worker
         atomic_worker(args.borg, Path(root), [int(p) for p in port.split(",")], Path(marker),
                       Path(child_dir) if child_dir != "-" else None)
     else:
-        if args.atomic_descendant:
+        if args.atomic_descendant or args.atomic_post_hook:
             manager = subprocess.run(["systemctl", "--user", "show-environment"],
                                      capture_output=True, timeout=3)
             if manager.returncode:
                 raise RuntimeError("systemd user manager unavailable; cannot test cgroup gate")
             os.environ["BORG_BENCH_REQUIRE_SCOPE"] = "1"
-        print(json.dumps(run_atomic(args.borg, descendant=args.atomic_descendant)
-                         if args.atomic or args.atomic_descendant else run(args.borg), indent=2))
+        print(json.dumps(run_atomic(args.borg, descendant=args.atomic_descendant,
+                                    post_barrier=args.atomic_post_hook)
+                         if args.atomic or args.atomic_descendant or args.atomic_post_hook
+                         else run(args.borg), indent=2))
 
 
 if __name__ == "__main__":
