@@ -565,7 +565,7 @@ impl SubscriptionPoolRegistry {
     fn for_host() -> Self {
         #[cfg(test)]
         {
-            return Self::default();
+            Self::default()
         }
         #[cfg(not(test))]
         Self {
