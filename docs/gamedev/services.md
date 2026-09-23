@@ -119,6 +119,33 @@ stops A. A failed B leaves A serving. When no backend is ready, HTTP returns
 503 JSON with state/reason/Retry-After. Backends alternate ports to avoid
 TIME_WAIT collisions. Crash/hang recovery has bounded exponential backoff.
 
+### Restart, health and memory options
+
+All optional and serde-defaulted, so an existing definition keeps its behavior:
+
+- `restart.mode`: `"warm"` (default; the A/B restart above) or `"cold"`. Cold
+  stops the running backend first (`graceful_stop`, then its cgroup is killed
+  and verified empty), the front answers 503 with state `Restarting`, and only
+  then launches the replacement on the next port. For backends too large to
+  run twice. The service keeps its lane lease throughout.
+- `restart.transient_exit_codes`: `[int]`. An active or candidate backend
+  exiting with one of these is relaunched after `backoff_ms` without counting
+  toward `max_restarts`; `restarts` still counts it.
+- `restart.defer_while`: `[ResourceKey]`. A backend launch or restart waits
+  while a lane ticket other than the service's own holds one of these keys
+  (for example a build of the project tree); the status reason names the key
+  and ticket.
+- `health.unhealthy_after_ms`: a running backend is declared hung only after
+  its probes have failed continuously this long (default three
+  `timeout_ms`). Each probe is still cut off at `timeout_ms`.
+- `memory_swap_max_bytes`: `MemorySwapMax=` on the service unit, beside
+  `MemoryMax`.
+
+A `service` request (`stop`, `yield`, `restart`, also the yield a lane job
+asks for) waits for the supervisor up to max(120 s, 3 × (`graceful_stop`
+timeout + 10 s) + `restore` timeout × max clients + 30 s), so a slow graceful
+stop does not time out the caller.
+
 ## Safety and integration boundaries
 
 The generic proxy defaults to **403 on every backend request**, including
