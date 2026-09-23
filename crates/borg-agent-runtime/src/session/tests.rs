@@ -12902,6 +12902,126 @@ async fn reusable_subscription_pool_does_not_compact_large_durable_replay() {
     scratch.discard().await;
 }
 
+/// Failure mode: a non-waking team message settled while the root was idle is
+/// in the durable transcript, but a resumed provider session only receives
+/// each turn's own input, so the model never saw the peer's reply.
+#[tokio::test]
+async fn resumed_provider_turn_receives_team_messages_settled_while_idle() {
+    let root = tempdir().unwrap();
+    let journal_path = root.path().join("session.lock");
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (first_id, team_id, second_id) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+    let executor = Arc::new(ReusableContextExecutor {
+        prompt_lengths: Arc::new(Mutex::new(Vec::new())),
+        called: Arc::new(Notify::new()),
+    });
+    let actor_store = Arc::clone(&store);
+    let actor = tokio::spawn(async move {
+        run_session_actor(
+            &journal_path,
+            session_id,
+            LaunchSession {
+                request_id: Uuid::new_v4(),
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Claude,
+                model: None,
+                effort: None,
+                fast: Some(false),
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+                name: None,
+                initial_prompt: None,
+                capabilities: Default::default(),
+                subagent_concurrency_limit: None,
+                extension_skill_roots: Vec::new(),
+                team_policy: None,
+            },
+            command_rx,
+            event_tx,
+            executor,
+            actor_store,
+        )
+        .await
+    });
+    let prompt = |message_id, text: &str| HostCommand::Prompt {
+        session_id,
+        message_id,
+        text: text.to_string(),
+        attachments: Vec::new(),
+        output_schema: None,
+        delivery: PromptDelivery::Queue,
+    };
+    let mut wait_for = async |mut done: Box<dyn FnMut(&SessionEventKind) -> bool>| {
+        let mut prompts = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("session makes progress")
+                .expect("session remains open");
+            if let SessionEventKind::ProviderEvent { kind, payload, .. } = &event.kind
+                && kind == crate::PROVIDER_PROMPT_EVENT_KIND
+            {
+                prompts.push(payload.clone());
+            }
+            if done(&event.kind) {
+                return prompts;
+            }
+        }
+    };
+
+    command_tx.send(prompt(first_id, "first")).await.unwrap();
+    wait_for(Box::new(move |kind| {
+        matches!(kind, SessionEventKind::TurnCompleted { message_id, .. } if *message_id == first_id)
+    }))
+    .await;
+
+    command_tx
+        .send(HostCommand::TeamPrompt {
+            session_id,
+            message_id: team_id,
+            text: "Team message from /root:\n\npeer reply".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    wait_for(Box::new(move |kind| {
+        matches!(
+            kind,
+            SessionEventKind::Message { message_id, status: MessageStatus::Complete, .. }
+                if *message_id == team_id
+        )
+    }))
+    .await;
+
+    command_tx.send(prompt(second_id, "second")).await.unwrap();
+    let prompts = wait_for(Box::new(move |kind| {
+        matches!(kind, SessionEventKind::TurnCompleted { message_id, .. } if *message_id == second_id)
+    }))
+    .await;
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert_eq!(prompts[0]["provider_context_reused"], true, "{prompts:?}");
+    let sent = prompts[0]["prompt"].as_str().unwrap();
+    assert!(
+        sent.contains("peer reply") && sent.contains("second"),
+        "{sent}"
+    );
+    assert!(sent.find("peer reply") < sent.find("second"), "{sent}");
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
+    scratch.discard().await;
+}
+
 #[tokio::test]
 async fn same_provider_model_switch_does_not_compact_reusable_context() {
     let root = tempdir().unwrap();
