@@ -118,6 +118,7 @@ async fn opencode_generates_before_complete_arguments_and_finishes() -> anyhow::
             persist_session: Some(false),
             web_search_allowed: false,
             resume_unavailable_prompt: None,
+            native_subagents: false,
         };
         let mut events = run_opencode_local_chat_stream(request, permission);
         let mut generations = 0;

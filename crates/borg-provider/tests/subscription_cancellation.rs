@@ -100,5 +100,6 @@ fn request(root: &std::path::Path) -> ChatStreamRequest {
         persist_session: Some(false),
         web_search_allowed: false,
         resume_unavailable_prompt: None,
+        native_subagents: false,
     }
 }

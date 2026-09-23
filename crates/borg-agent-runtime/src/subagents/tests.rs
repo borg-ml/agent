@@ -5347,6 +5347,7 @@ async fn forwarded_image_reaches_the_recipient_model_as_pixels() {
         extension_api: Default::default(),
         system_prompt_appendix: String::new(),
         declaration_base: None,
+        claude_native_subagents: false,
         volatile_system_prompt_appendix: String::new(),
     };
 

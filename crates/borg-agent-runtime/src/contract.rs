@@ -1029,6 +1029,10 @@ pub struct SessionCapabilities {
     /// Opt in to subscription-funded Luna titles for new non-Codex threads.
     #[serde(default)]
     pub luna_titles_for_all_providers: bool,
+    /// Let Claude sessions use Claude Code's Agent tool, whose subagents run
+    /// inside the session's Claude process, alongside Borg-managed children.
+    #[serde(default)]
+    pub claude_native_subagents: bool,
     /// Populated by an enrolled host after fetching the authenticated Web
     /// context grant. It is intentionally omitted from serialized launch
     /// state so short-lived credentials never enter the relay journal.
@@ -1078,6 +1082,7 @@ impl Default for SessionCapabilities {
             steer_reply_prompt: SteerReplyPrompt::default(),
             provider_capabilities: Vec::new(),
             luna_titles_for_all_providers: false,
+            claude_native_subagents: false,
             runtime_mcp_context: None,
             runtime_provider_context: None,
             system_prompt_appendix: None,

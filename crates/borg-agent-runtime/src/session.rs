@@ -3362,6 +3362,7 @@ async fn run_agent_session_store_kernel_inner(
                                             .clone()
                                             .unwrap_or_default(),
                                         declaration_base: None,
+                                        claude_native_subagents: false,
                                         volatile_system_prompt_appendix:
                                             crate::provider_capabilities_prompt(
                                                 &launch.capabilities.provider_capabilities,
@@ -4445,6 +4446,8 @@ async fn run_agent_session_store_kernel_inner(
             declaration_base: native_provider
                 .then(|| native_declarations(journal.context_events()))
                 .flatten(),
+            claude_native_subagents: launch.provider == CodingProvider::Claude
+                && launch.capabilities.claude_native_subagents,
             volatile_system_prompt_appendix: crate::provider_capabilities_prompt(
                 &launch.capabilities.provider_capabilities,
             ),
@@ -7532,6 +7535,7 @@ async fn run_retained_compaction(
             extension_api: crate::ExtensionApiSnapshot::default(),
             system_prompt_appendix: RETAINED_COMPACTION_SYSTEM_PROMPT.to_string(),
             declaration_base: None,
+            claude_native_subagents: false,
             volatile_system_prompt_appendix: crate::provider_capabilities_prompt(
                 &launch.capabilities.provider_capabilities,
             ),
