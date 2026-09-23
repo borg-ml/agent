@@ -15976,6 +15976,7 @@ fn running_shimmer_phase() -> u128 {
         % RUNNING_SHIMMER_CYCLE_MILLIS
 }
 
+#[cfg(test)]
 fn apply_running_activity_pulse(line: &mut Line<'static>, phase: u128) {
     let content_width = running_activity_content_width(line);
     apply_running_activity_pulse_with_width(line, phase, content_width);
