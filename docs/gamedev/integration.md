@@ -53,8 +53,8 @@ parent requires D11 atomic editor/exclusive handoff and real-CLI proof.
 | Branch | Observed checkpoint | Contract/API consistency and evidence | Remaining review |
 | --- | --- | --- | --- |
 | `gamedev/design` | rebased on final `4e01e0e` | Offline skeleton check, clippy `--all-targets -D warnings`, fmt/tests and Rust LSP (173 files, zero diagnostics) passed; public types only, no scheduler. | Design-only review passed; parent owns integrated release decision and remaining post-hook/capacity gates. |
-| `gamedev/lanes` | `b8ac616` service-budget + canonical-key process checkpoint | Independently ran `cargo test -p borg-lanes lanes::tests --offline`: 6 passed (0.34 s), plus `python3 crates/borg-cli/tests/test_lane_process.py target/debug/borg`: 5 passed (2.084 s), including isolated killed-supervisor systemd scope recovery. Shared service lease, Preparing and same-lock grant recheck added. | Automatic all-active-service discovery/yield implemented; independent real-systemd two-service no-hook scoped-descendant gate passed on exact built binary SHA256 `4022be198a99…` (job `2ad29092`). Independent real-systemd two-service FIFO post-hook success-path barrier passed on same pinned binary (job `27038d8c`); failure quarantine/retry still unproved. Atomic service RAM/disk reservation committed; owner public-CLI RAM deferral passed once on rebuilt SHA `011c4ba9…`, but independent repeat was nondeterministic as host available RAM rose; a deterministic capacity gate remains. |
-| `gamedev/services` | `1e822c3` services + delegated subgroup/crash cleanup | Independently reran `CARGO_BUILD_JOBS=6 nice -n 10 cargo test -p borg-lanes services::tests --offline`: 8 passed again (1.56 s after compile); unit cfg bypasses production delegated cgroup path, including active-lease restoration, unfenced proxy default-deny and exclusive-lease restart refusal; service holds a shared lane lease during backend lifetime and scopes each backend generation under delegated supervisor unit; real CLI isolated explicit-yield and leader-crash smoke with detached child cleanup reported by owner; combined scoped no-hook probe independently passed on lane-integrated binary. Earlier A/B probe unavailable 0 / 327 ms. MCP initialize validation, active-client restore on yield and default-deny unfenced proxy (audited allowlist pending), UnixStream control, `KillMode=control-group`, no-systemd fail-closed, raw proxy mutations denied by default. | owner reports isolated real-systemd supervisor-crash detached-child cleanup; deterministic public-CLI atomic resident-service capacity regression and session-derived model MCP owner/fence enforcement remain. Scoped two-service CLI regression passed on recorded prebudget binary. |
+| `gamedev/lanes` | `2d347be` service-budget + Healthy-resume checkpoint | Independently ran `cargo test -p borg-lanes lanes::tests --offline`: 6 passed (0.34 s), plus `python3 crates/borg-cli/tests/test_lane_process.py target/debug/borg`: 5 passed (2.084 s), including isolated killed-supervisor systemd scope recovery. Shared service lease, Preparing and same-lock grant recheck added. | Automatic all-active-service discovery/yield implemented; independent real-systemd two-service no-hook scoped-descendant gate passed on exact built binary SHA256 `4022be198a99…` (job `2ad29092`). Independent real-systemd two-service FIFO post-hook success-path barrier passed on same pinned binary (job `27038d8c`); failing bound post-hook quarantine independently passed on `011c4ba9…`; failed-resume retry passed on `61ece6…`, ACK-then-unhealthy pending. Deterministic same-device disk budget gate independently passed on `61ece6…`; original RAM fixture was volatile. |
+| `gamedev/services` | `a326462` services + delegated subgroup/crash cleanup | Independently reran `CARGO_BUILD_JOBS=6 nice -n 10 cargo test -p borg-lanes services::tests --offline`: 8 passed again (1.56 s after compile); unit cfg bypasses production delegated cgroup path, including active-lease restoration, unfenced proxy default-deny and exclusive-lease restart refusal; service holds a shared lane lease during backend lifetime and scopes each backend generation under delegated supervisor unit; real CLI isolated explicit-yield and leader-crash smoke with detached child cleanup reported by owner; combined scoped no-hook probe independently passed on lane-integrated binary. Earlier A/B probe unavailable 0 / 327 ms. MCP initialize validation, active-client restore on yield and default-deny unfenced proxy (audited allowlist pending), UnixStream control, `KillMode=control-group`, no-systemd fail-closed, raw proxy mutations denied by default. | owner reports isolated real-systemd supervisor-crash detached-child cleanup; independent same-device public-CLI disk-capacity gate passed on SHA `61ece6…`; model MCP owner/fence enforcement remains. Scoped two-service CLI regression passed on recorded prebudget binary. |
 | `gamedev/workspace` | `d96869e` workspace checkpoint | Independently ran `CARGO_BUILD_JOBS=6 nice -n 10 cargo test -p borg-lanes workspace:: --offline`: 7 passed (0.11 s), including dirty/live GC exclusion and ack/clean-path freeze; owner reports clippy/fmt. Moved inventory/budget/GC/freeze into `borg-lanes::workspace::hygiene`, Borg GC dry-run 14 listed/0 eligible (3.482 s); Abundance 10/0 (2.742 s); target-status two over 24 GiB, no cleanup. Freeze checks acks/clean trees but does not acquire project lane gate: advisory only (MCP validates claim; core helper/CLI require caller coordination). Trait `WorkspaceCoordinator` still skeleton; helper owns separate richer record, machine budget API wired in lanes; per-agent job cap helper exists but dispatch wiring pending. Bridge GC now static-verified dry-run-only, no model apply/confirmed fields. CLI apply requires TTY per-path confirmation and journal owner-exit recheck. Freeze now checks work_id claim; still advisory without project gate. | align public trait/record or document partial implementation; bridge CLI integration still conflicts with lanes-owned entry; wire one admission authority and enforce freeze lane gate before claiming lock. |
 | `gamedev/unreal` | `3d08113` thin `extensions/unreal/` Blu adapter | Independently ran `python3 -m unittest discover -s extensions/unreal/tests -v`: 5 passed (0.948 s); stable revision/policy paths permit pending coalescing, including fake UBT/symbols tools and exclusive fail-closed. Copied scheduler/editor supervisor removed; build emits core JobSpec, exclusive run/raw MCP blocked; owner reports scoped fake build and fake MCP service tests (7/7 optional, default 5 passed/2 skipped) with no real Unreal runtime or D11 editor parity. | validate real CLI/spec and service entrypoint integration; no real Unreal runtime or editor parity claim. |
 | `gamedev/native` | `3693157` native Blu package | Independently ran `python3 -m unittest discover -s extensions/native/tests -v`: 10 passed (0.010 s), including nonzero response preservation. Terminal-unknown fixture keeps DB+lease, untracked source disables coalescing; owner reports real lane CMake 1/1, cargo runtime 877 passing after filtering two known failing upstream cases; native adapter fail-closed if CLI absent; service CLI is wired in combined lane branch but native does not use it. | align exact submit JSON/async watcher semantics; independently reproduce installed doctor and real-CLI smoke; GC `--apply` needs human confirmation. |
@@ -112,12 +112,15 @@ parent requires D11 atomic editor/exclusive handoff and real-CLI proof.
    many FIFO slots. Workspace exposes a per-agent cap helper, not integrated
    job dispatch enforcement. Bench should report per-agent waits/fairness;
    wire an agent-aware reservation/fairness policy in v0.1.
-9. The mandatory remaining v0 gates are a rebuilt combined CLI with atomic
-   two-service budget admission, tested failure-path post-hook quarantine
-   and failed-resume surfacing/retry, and session-derived editor owner/fencing
-   at the model MCP boundary. Canonical Project/Worktree identity passed on
-   pinned binary `011c4ba9…`; repeat every gate on the final integrated binary.
-   Real UE runtime parity is a migration acceptance test, not a Borg v0 gate.
+9. Pinned post-readiness CLI `61ece6…` independently passed the deterministic
+   two-service disk budget gate; pinned `011c4ba9…` passed failed bound
+   post-hook quarantine and canonical Project/Worktree identity. Stopped-
+   supervisor resume error/recover passed on `61ece6…`. **Remaining v0 gates:**
+   ACK-then-unhealthy backend readiness/retry; session-derived editor
+   owner/fencing at the model MCP boundary; rerun every gate on the final
+   integrated binary. Real UE runtime parity is a project migration
+   acceptance test, not a Borg branch v0 gate.
+
 
 Draft CLI reminder: `--spec` accepts serialized `JobSpec`, not adapter/template
 shorthand. A model-facing caller must not construct arbitrary process argv
@@ -184,18 +187,40 @@ initial `MemAvailable` ≈11.5 GB), but host free RAM rose above 15 GB before
 second admission; journal retained both reservations, so the snapshot policy
 legitimately admitted both. No missing reservation is established. The
 original percent-of-initial-RAM probe is nondeterministic on this host;
-replace it with a stable disk-backed or measured-bound gate and rerun.
+replace it with a stable disk-backed or measured-bound gate and rerun
+(the deterministic disk-backed pass is recorded below).
 Log `/tmp/gd-service-budget-pass.log`, retained own isolated fixture
 `/tmp/borg-service-bench-p8e7c0sh` (test-owned units stopped). Do not mark
-the combined capacity gate green on the single volatile passing run.
+the combined capacity gate green on the single volatile RAM passing run;
+use the independent deterministic disk-backed result below.
 
-**Resume-readiness gate:** service owner found that a Resume control RPC can
-acknowledge `Starting` before the backend becomes `Healthy`. The existing
-lane path can clear `resume_pending` on that early ACK, concealing a later
-failed restart. Lanes owner is adding bounded Healthy observation and durable
-status/error/recover retry before marking resume complete. The older
-SHA `011c4ba9…` and earlier success-path probes do **not** prove this
-failure path. Rebuild and test explicit failed-resume/recovery after the fix.
+I independently ran the service owner's **same-filesystem disk** fixture
+`/tmp/gd-real-capacity-probe.py` (SHA256
+`6552f8d4639bfa2da5c14bd50e22a14dd149d582929185d3f1bd9be541e84a39`)
+on post-readiness CLI SHA256
+`61ece6c173170b080933c821b81658a3d8ad422b1a5601d9550f8a30c4d7d4ac`
+unchanged before/after. Exit 0: two services on **disjoint Host keys**,
+separate disk paths on the **same device**, each requested 10,729,463,808
+bytes from initially 17,882,439,680 free; first Healthy, second no backend
+with `disk admission queued`, then Healthy after first yielded. Both
+test-owned units stopped. Log `/tmp/gd-real-capacity-probe-independent.log`.
+This clears the service disk-capacity gate on that binary; RAM admission is
+unit-tested but the percentage-of-initial-free public probe is volatile.
+
+**Resume-readiness gate:** service owner found Resume RPC can acknowledge
+`Starting` before `Healthy`. Old SHA `011c4ba9…` could clear
+`resume_pending` early and conceal failure. Lane source `2d347be` now retains
+pending until bounded Healthy observation and journals retryable errors. On
+rebuilt SHA `61ece6…` I independently passed the public stopped-supervisor
+failure/recover probe: job `e80b3280-c867-456c-bbbc-e7749a2d6c4a`
+retained `resume_pending=[bench-editor-a]` and explicit `resume_error`;
+restarting the test-owned service plus `lane job recover` cleared both and
+returned two Healthy backends. Copied WIP probe SHA256
+`a67aca149d1b8a17774bc72952bcbc3c863f9550e69f2c5c1e2d550b90343215`,
+log `/tmp/gd-resume-retry.log`. **ACK-then-unhealthy** is a distinct
+remaining gate: force Resume to ACK Starting, then health to fail; verify
+pending/error persists and recovery clears only after Healthy without
+duplicate Resume.
 
 **D11 scoped evidence (2026-09-23):** a stale worktree executable
 that predated delegated backend cgroups let a detached child survive yield
@@ -244,8 +269,10 @@ cross-module test with an active client lease, backend gone before job start,
 no restart during, and resume afterward. The scoped no-hook two-service
 case above and the successful ordered post-hook barrier pass on the pinned
 binary are scoped successes. The Project path-alias fail-open is fixed and
-independently passed on the newer pinned binary above; finish failed-resume readiness/retry, combined budget admission, and
-session-derived editor owner fencing, then rerun the gates on the final integrated binary before
+independently passed on the newer pinned binary above; disk admission
+and stopped-supervisor resume recovery also passed on `61ece6…`. Finish
+ACK-then-unhealthy resume readiness/retry and session-derived editor owner
+fencing, then rerun all gates on the final integrated binary before
 any v0 release. Fake Unreal adapters still do not establish real UE parity.
 
 Native adapter disk reservation is an estimate, **not** target-only quota/GC;
