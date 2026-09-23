@@ -5405,8 +5405,14 @@ impl BorgTerminal {
         let (title, options) = match self.transcript.order.get(index) {
             Some(TranscriptEntry::Message {
                 actor: EventActor::User,
+                complete: true,
                 ..
             }) => ("Message actions", vec!["Revert to here", "Copy message"]),
+            // Not yet admitted by the provider, so there is nothing to revert to.
+            Some(TranscriptEntry::Message {
+                actor: EventActor::User,
+                ..
+            }) => ("Message actions", vec!["Copy message"]),
             Some(TranscriptEntry::Message {
                 actor: EventActor::Assistant,
                 ..
