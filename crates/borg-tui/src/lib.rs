@@ -8166,11 +8166,30 @@ impl BorgTerminal {
                             let Some(image) = attachments::load_preview_image(&slot.path) else {
                                 continue;
                             };
+                            // Downscale here with a real filter. The library's
+                            // default is nearest-neighbour, which at a scale like
+                            // 0.95 drops whole pixel rows and columns and tears
+                            // the strokes out of text in a screenshot.
+                            let cell = picker.font_size();
+                            let (max_width, max_height) = (
+                                u32::from(area.width) * u32::from(cell.width),
+                                slot.rows as u32 * u32::from(cell.height),
+                            );
+                            let image = if image.width() > max_width || image.height() > max_height
+                            {
+                                image.resize(
+                                    max_width,
+                                    max_height,
+                                    image::imageops::FilterType::CatmullRom,
+                                )
+                            } else {
+                                image
+                            };
                             let Ok(protocol) = SlicedProtocol::new_with_resize(
                                 picker,
                                 image,
                                 ratatui::layout::Size::new(area.width, slot.rows as u16),
-                                Resize::Fit(None),
+                                Resize::Fit(Some(image::imageops::FilterType::CatmullRom)),
                             ) else {
                                 continue;
                             };
