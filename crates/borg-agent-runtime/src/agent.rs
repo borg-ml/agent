@@ -23,6 +23,10 @@ use crate::{
     SessionEventKind, SessionStatus, WorkflowRuntime, native_harness::NativeHarness,
 };
 
+#[path = "host_claude_pool.rs"]
+mod host_claude_pool;
+use host_claude_pool::{HostClaudePoolRegistry, HostIdleLease};
+
 pub(crate) const CODING_SYSTEM_PROMPT: &str = "\
 You are Borg, a practical agent working in the user's local project. \
 Inspect before changing, keep solutions small, preserve user work, explain consequential actions, \
@@ -108,9 +112,9 @@ separate action-summary narration item.";
 /// never be resumed. Bump this whenever the provider-facing behavioral
 /// contract changes in a way that stale native context could preserve.
 pub(crate) const PROVIDER_CONTEXT_CONTRACT_VERSION: u32 = 1;
-const MAX_IDLE_CLAUDE_POOLS: usize = 4;
+const MAX_IDLE_CLAUDE_POOLS: usize = host_claude_pool::MAX_IDLE_POOLS;
 const CLAUDE_POOL_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
-const CLAUDE_POOL_REAP_INTERVAL: Duration = Duration::from_secs(60);
+const CLAUDE_POOL_REAP_INTERVAL: Duration = Duration::from_secs(3);
 
 /// A Claude turn built as a delta assumes the pooled process still holds the
 /// whole conversation. Claude sessions are not resumable from disk here, so
@@ -496,7 +500,7 @@ impl Default for LocalAgentTurnExecutor {
             opencode_session_native: false,
             runtime_extensions: Arc::new(RwLock::new(RuntimeExtensions::default())),
             runtime_extension_loader: None,
-            subscription_pools: Arc::new(SubscriptionPoolRegistry::default()),
+            subscription_pools: Arc::new(SubscriptionPoolRegistry::for_host()),
             web_search,
             provider_context: crate::RuntimeProviderContext::default(),
             #[cfg(feature = "profiling")]
@@ -527,6 +531,7 @@ struct RuntimeExtensions {
 struct SubscriptionPoolRegistry {
     slots: Arc<Mutex<HashMap<Uuid, SubscriptionPoolSlot>>>,
     idle_reaper_running: Arc<AtomicBool>,
+    host_registry: Option<Arc<HostClaudePoolRegistry>>,
 }
 
 struct SubscriptionPoolSlot {
@@ -536,6 +541,7 @@ struct SubscriptionPoolSlot {
     epoch: u64,
     healthy: bool,
     idle_since: Option<Instant>,
+    host_lease: Option<HostIdleLease>,
     pool: ClaudeSubscriptionPool,
 }
 
@@ -556,6 +562,43 @@ struct SubscriptionTurnInput {
 }
 
 impl SubscriptionPoolRegistry {
+    fn for_host() -> Self {
+        #[cfg(test)]
+        {
+            return Self::default();
+        }
+        #[cfg(not(test))]
+        Self {
+            host_registry: Some(Arc::new(HostClaudePoolRegistry::for_host())),
+            ..Self::default()
+        }
+    }
+
+    async fn has_context(&self, session_id: Uuid) -> bool {
+        let mut slots = self.slots.lock().await;
+        let Some(slot) = slots.get(&session_id).filter(|slot| slot.healthy) else {
+            return false;
+        };
+        let token = slot.host_lease.as_ref().map(|lease| lease.token);
+        let Some(registry) = self.host_registry.as_ref() else {
+            return true;
+        };
+        let allowed = match registry.allowed_tokens() {
+            Ok(allowed) => allowed,
+            Err(error) => {
+                tracing::warn!(%session_id, %error, "Claude idle lease check failed; replaying journal");
+                Default::default()
+            }
+        };
+        if token.is_some_and(|token| allowed.contains(&token)) {
+            return true;
+        }
+        let evicted = slots.remove(&session_id);
+        drop(slots);
+        drop(evicted);
+        false
+    }
+
     async fn prepare(
         &self,
         session_id: Uuid,
@@ -579,8 +622,28 @@ impl SubscriptionPoolRegistry {
                 epoch: 0,
                 healthy: false,
                 idle_since: None,
+                host_lease: None,
                 pool: ClaudeSubscriptionPool::default(),
             });
+        let lease_allowed = if slot.healthy {
+            match (self.host_registry.as_ref(), slot.host_lease.as_ref()) {
+                (Some(registry), Some(lease)) => match registry.allowed_tokens() {
+                    Ok(tokens) => tokens.contains(&lease.token),
+                    Err(error) => {
+                        tracing::warn!(%session_id, %error, "Claude idle lease check failed; replaying journal");
+                        false
+                    }
+                },
+                (Some(_), None) => false,
+                (None, _) => true,
+            }
+        } else {
+            false
+        };
+        if slot.healthy && !lease_allowed {
+            slot.healthy = false;
+            slot.pool = ClaudeSubscriptionPool::default();
+        }
         let append = slot.provider == provider
             && slot.healthy
             && slot.context_generation == context_generation
@@ -588,6 +651,7 @@ impl SubscriptionPoolRegistry {
         // If execution is aborted, replay the journal on the next turn.
         slot.healthy = false;
         slot.idle_since = None;
+        let prior_lease = slot.host_lease.take();
         if !append {
             slot.epoch = slot.epoch.saturating_add(1);
             slot.provider = provider;
@@ -597,13 +661,16 @@ impl SubscriptionPoolRegistry {
         }
         let resume_unavailable_prompt = (append && prompt != prompt_delta).then(|| prompt.clone());
         let effective_key = format!("{lifecycle_key}#epoch={}", slot.epoch);
-        PreparedSubscriptionTurn {
+        let prepared = PreparedSubscriptionTurn {
             prompt: if append { prompt_delta } else { prompt.clone() },
             lifecycle_key: effective_key,
             pool: slot.pool.clone(),
             reused: append,
             resume_unavailable_prompt,
-        }
+        };
+        drop(slots);
+        drop(prior_lease);
+        prepared
     }
 
     async fn mark(&self, session_id: Uuid, provider: CodingProvider, healthy: bool) {
@@ -614,8 +681,24 @@ impl SubscriptionPoolRegistry {
         else {
             return;
         };
+        let host_lease = if healthy {
+            match self.host_registry.as_ref() {
+                Some(registry) => match registry.register(session_id) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        tracing::warn!(%session_id, %error, "Claude idle lease unavailable; releasing pooled process");
+                        None
+                    }
+                },
+                None => None,
+            }
+        } else {
+            None
+        };
+        let healthy = healthy && (self.host_registry.is_none() || host_lease.is_some());
         slot.healthy = healthy;
         slot.idle_since = healthy.then(Instant::now);
+        let prior_lease = std::mem::replace(&mut slot.host_lease, host_lease);
         if !healthy {
             slot.epoch = slot.epoch.saturating_add(1);
             slot.pool = ClaudeSubscriptionPool::default();
@@ -632,10 +715,12 @@ impl SubscriptionPoolRegistry {
             .filter_map(|(session_id, _)| slots.remove(&session_id))
             .collect::<Vec<_>>();
         drop(slots);
+        drop(prior_lease);
         drop(evicted);
         if healthy && !self.idle_reaper_running.swap(true, Ordering::AcqRel) {
             let slots = Arc::downgrade(&self.slots);
             let running = Arc::downgrade(&self.idle_reaper_running);
+            let host_registry = self.host_registry.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(CLAUDE_POOL_REAP_INTERVAL).await;
@@ -643,13 +728,28 @@ impl SubscriptionPoolRegistry {
                         break;
                     };
                     let mut slots = slots.lock().await;
+                    let allowed = host_registry
+                        .as_ref()
+                        .map(|registry| registry.allowed_tokens());
+                    if let Some(Err(error)) = allowed.as_ref() {
+                        tracing::warn!(%error, "Claude idle lease check failed; releasing pooled processes");
+                    }
                     let now = Instant::now();
                     let expired = slots
                         .iter()
                         .filter_map(|(session_id, slot)| {
-                            slot.idle_since
-                                .filter(|since| now.duration_since(*since) >= CLAUDE_POOL_IDLE_TTL)
-                                .map(|_| *session_id)
+                            let since = slot.idle_since?;
+                            let revoked = match &allowed {
+                                Some(Ok(tokens)) => slot
+                                    .host_lease
+                                    .as_ref()
+                                    .is_none_or(|lease| !tokens.contains(&lease.token)),
+                                Some(Err(_)) => true,
+                                None => false,
+                            };
+                            let stale =
+                                now.duration_since(since) >= CLAUDE_POOL_IDLE_TTL || revoked;
+                            stale.then_some(*session_id)
                         })
                         .collect::<Vec<_>>();
                     let evicted = expired
@@ -1073,12 +1173,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         if provider != CodingProvider::Claude {
             return true;
         }
-        self.subscription_pools
-            .slots
-            .lock()
-            .await
-            .get(&session_id)
-            .is_some_and(|slot| slot.healthy)
+        self.subscription_pools.has_context(session_id).await
     }
 
     fn extension_workflow_snapshot(
@@ -3229,6 +3324,98 @@ mod tests {
             .await;
         assert!(!replay.reused);
         assert_eq!(replay.prompt, "canonical history + second");
+    }
+
+    #[tokio::test]
+    async fn host_eviction_replays_before_the_owner_reaper_runs() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = SubscriptionPoolRegistry {
+            host_registry: Some(Arc::new(HostClaudePoolRegistry::new(
+                directory.path().to_path_buf(),
+            ))),
+            ..SubscriptionPoolRegistry::default()
+        };
+        let second = SubscriptionPoolRegistry {
+            host_registry: Some(Arc::new(HostClaudePoolRegistry::new(
+                directory.path().to_path_buf(),
+            ))),
+            ..SubscriptionPoolRegistry::default()
+        };
+        let first_session = Uuid::new_v4();
+        first
+            .prepare(
+                first_session,
+                SubscriptionTurnInput {
+                    context_generation: 0,
+                    provider: CodingProvider::Claude,
+                    prompt: "canonical history + first".to_string(),
+                    prompt_delta: "first".to_string(),
+                    lifecycle_key: "stable-config".to_string(),
+                },
+            )
+            .await;
+        first
+            .mark(first_session, CodingProvider::Claude, true)
+            .await;
+        for _ in 0..MAX_IDLE_CLAUDE_POOLS {
+            let session_id = Uuid::new_v4();
+            second
+                .prepare(
+                    session_id,
+                    SubscriptionTurnInput {
+                        context_generation: 0,
+                        provider: CodingProvider::Claude,
+                        prompt: "first".to_string(),
+                        prompt_delta: "first".to_string(),
+                        lifecycle_key: "stable-config".to_string(),
+                    },
+                )
+                .await;
+            second.mark(session_id, CodingProvider::Claude, true).await;
+        }
+
+        let replay = first
+            .prepare(
+                first_session,
+                SubscriptionTurnInput {
+                    context_generation: 0,
+                    provider: CodingProvider::Claude,
+                    prompt: "canonical history + second".to_string(),
+                    prompt_delta: "second".to_string(),
+                    lifecycle_key: "stable-config".to_string(),
+                },
+            )
+            .await;
+        assert!(!replay.reused);
+        assert_eq!(replay.prompt, "canonical history + second");
+    }
+
+    #[tokio::test]
+    async fn unavailable_host_lease_discards_the_idle_claude_pool() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = directory.path().join("not-a-directory");
+        std::fs::write(&blocked, b"blocked").unwrap();
+        let registry = SubscriptionPoolRegistry {
+            host_registry: Some(Arc::new(HostClaudePoolRegistry::new(blocked))),
+            ..SubscriptionPoolRegistry::default()
+        };
+        let session_id = Uuid::new_v4();
+        registry
+            .prepare(
+                session_id,
+                SubscriptionTurnInput {
+                    context_generation: 0,
+                    provider: CodingProvider::Claude,
+                    prompt: "first".to_string(),
+                    prompt_delta: "first".to_string(),
+                    lifecycle_key: "stable-config".to_string(),
+                },
+            )
+            .await;
+        registry
+            .mark(session_id, CodingProvider::Claude, true)
+            .await;
+        assert!(!registry.slots.lock().await[&session_id].healthy);
     }
 
     #[tokio::test]
