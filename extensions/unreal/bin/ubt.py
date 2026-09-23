@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -46,23 +47,31 @@ def main(argv: list[str]) -> int:
     start_lock = Path(os.environ.get('UE_UBT_START_LOCK', '/tmp/borg-unreal-ubt-start.lock'))
     start_lock.parent.mkdir(parents=True, exist_ok=True)
     def start_once():
-        fd = os.open(start_lock, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            started = time.time_ns()
-            proc = subprocess.Popen(command, close_fds=True)
-            # Release startup key when the private UBT log opens, not after compile.
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline and proc.poll() is None:
-                try:
-                    if log_path.stat().st_mtime_ns >= started:
-                        break
-                except FileNotFoundError:
-                    pass
-                time.sleep(0.1)
-        finally:
-            os.close(fd)
-        return proc.wait()
+        # UBA's shared-memory GC is unsafe when two builds share its mapping
+        # directory. Give each UBT process (including a startup retry) private
+        # paths, even if the Borg helper inherited a lane's TMPDIR or UBA env.
+        with tempfile.TemporaryDirectory(prefix='borg-unreal-ubt-') as private_tmp:
+            mapping = Path(private_tmp) / 'uba-mappings'
+            mapping.mkdir(mode=0o700)
+            child_env = dict(os.environ, TMPDIR=private_tmp,
+                             UBA_FILE_MAPPING_DIR=str(mapping))
+            fd = os.open(start_lock, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                started = time.time_ns()
+                proc = subprocess.Popen(command, close_fds=True, env=child_env)
+                # Release startup key when the private UBT log opens, not after compile.
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and proc.poll() is None:
+                    try:
+                        if log_path.stat().st_mtime_ns >= started:
+                            break
+                    except FileNotFoundError:
+                        pass
+                    time.sleep(0.1)
+            finally:
+                os.close(fd)
+            return proc.wait()
 
     rc = start_once()
     if rc and log_path.exists():

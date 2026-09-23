@@ -57,6 +57,10 @@ admission, memory/time limits, and coalescing of **pending** identical inputs.
 The adapter calculates a source/toolchain fingerprint, a per-revision/policy UBT log (reset at job start),
 RAM-derived `-MaxParallelActions`, and `-NoMutex`; a narrow UBT-start lock in
 the Unreal-specific helper protects Trace.uba startup, not build scheduling.
+Each helper-launched UBT process (including a startup retry) also receives
+its own private `TMPDIR` and `UBA_FILE_MAPPING_DIR`; they are removed after
+that process exits. This isolates Borg jobs from concurrent Abundance-lane
+UBA mappings without copying the Abundance queue into the adapter.
 When installed Linux symbol tools are present, UBT uses `-NoDumpSyms` and the
 core post-hook regenerates symbols for changed libraries. The post-hook is not
 an authority for job admission. Generated outputs and intermediates remain
