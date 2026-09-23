@@ -2,7 +2,7 @@
 
 User-visible changes. Release pages on GitHub also list every merged change.
 
-## Unreleased
+## Unreleased (since 0.10.0)
 
 ### Computer use
 
@@ -40,8 +40,12 @@ User-visible changes. Release pages on GitHub also list every merged change.
 - **Batch team-message handling.** `acknowledge_team_message` takes several
   ids, `up_to` or `all`, and `list_unread_team_messages` takes `compact` and
   `ack`. Reports already shown by `wait_agent` are acknowledged automatically.
-- **Resume after interrupt.** The agent that interrupted a child can restart
-  it with `followup_task`. A stop made by the human in the UI still holds.
+- **Resume after interrupt.** 0.10.0 lets an explicit follow-up restart a
+  stopped or failed child. Now the agent that interrupted a live child with
+  `interrupt_agent` can also resume it with `followup_task`, and the child is
+  told its parent lifted the stop. Other agents can't lift it, and an
+  interrupt or stop the human makes in the UI still holds, even after an
+  agent's interrupt.
 
 ### Install and update
 
