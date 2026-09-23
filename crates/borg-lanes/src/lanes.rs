@@ -203,6 +203,9 @@ pub struct LaneRecord {
     pub quarantined: bool,
     #[serde(default)]
     pub service_lease: bool,
+    /// Active service IDs captured atomically when this exclusive enters Preparing.
+    #[serde(default)]
+    pub yield_services: Vec<String>,
     pub evidence: Option<String>,
 }
 
@@ -332,6 +335,19 @@ impl LaneStore {
                 .iter()
                 .all(|r| matches!(r.access, Access::Shared { .. })),
             "service resource claims must be shared"
+        );
+        let service_id = request
+            .holder
+            .purpose
+            .strip_prefix("service:")
+            .context("service holder must have service:<id> purpose")?;
+        ensure!(
+            !service_id.is_empty()
+                && service_id.len() <= 100
+                && service_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "invalid service holder id"
         );
         let mut held: Option<File> = None;
         let lease = self.locked(|state| {
@@ -502,6 +518,7 @@ impl LaneStore {
             post_scope: None,
             quarantined: false,
             service_lease: false,
+            yield_services: vec![],
             evidence: None,
         });
         Ok((ticket, job))
@@ -595,7 +612,7 @@ impl LaneStore {
     }
 
     pub fn finish(&self, id: Uuid, exit_code: i32, evidence: &str) -> Result<()> {
-        self.locked(|state| {
+        let services = self.locked(|state| {
             let record = state
                 .records
                 .iter_mut()
@@ -607,8 +624,41 @@ impl LaneStore {
             if let Some(job) = record.job.as_mut() {
                 job.state = JobState::Finished { exit_code };
             }
-            Ok(())
-        })
+            Ok(record.yield_services.clone())
+        })?;
+        if !services.is_empty() && !cfg!(test) {
+            // Recovery also invokes finish; resume is a detached control task
+            // so it cannot change job exit status or hold the completion FD.
+            let executable = std::env::var_os("BORG_LANE_EXECUTABLE")
+                .map(PathBuf::from)
+                .unwrap_or(std::env::current_exe()?);
+            Command::new(executable)
+                .args(["lane", "--state-dir"])
+                .arg(&self.root)
+                .args(["__resume_services"])
+                .arg(id.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .context("starting service resume control")?;
+        }
+        Ok(())
+    }
+
+    pub fn resume_services(&self, id: Uuid) -> Result<()> {
+        let record = self.record(id)?;
+        ensure!(
+            matches!(
+                record.state,
+                TicketState::Finished | TicketState::Cancelled { .. }
+            ),
+            "cannot resume service before job finishes"
+        );
+        for service in &record.yield_services {
+            self.service_control(service, id, "resume", 0)?;
+        }
+        Ok(())
     }
 
     pub fn cancel_ticket(&self, id: Uuid, reason: &str) -> Result<()> {
@@ -699,15 +749,14 @@ fn dispatch_reason(state: &Journal, id: Uuid) -> Result<Option<String>> {
                     Access::Shared { slots } => slots,
                 })
             });
-        let preparable_service_holder =
-            me.spec.as_ref().is_some_and(|spec| spec.pre_hook.is_some())
-                && matches!(requested.access, Access::Exclusive)
-                && state
-                    .records
-                    .iter()
-                    .filter(|r| matches!(r.state, TicketState::Granted(_)))
-                    .filter(|r| r.request.resources.iter().any(|r| r.key == requested.key))
-                    .all(|r| r.service_lease);
+        let preparable_service_holder = me.spec.is_some()
+            && matches!(requested.access, Access::Exclusive)
+            && state
+                .records
+                .iter()
+                .filter(|r| matches!(r.state, TicketState::Granted(_)))
+                .filter(|r| r.request.resources.iter().any(|r| r.key == requested.key))
+                .all(|r| r.service_lease);
         if preparable_service_holder {
             continue;
         }
@@ -897,6 +946,36 @@ impl LaneStore {
                     .as_ref()
                     .and_then(|spec| budget_reason(state, spec))
             });
+            let request = state
+                .records
+                .iter()
+                .find(|r| r.ticket.id == id)
+                .context("ticket disappeared")?
+                .request
+                .resources
+                .clone();
+            let mut services = state
+                .records
+                .iter()
+                .filter(|r| r.service_lease && matches!(r.state, TicketState::Granted(_)))
+                .filter(|r| {
+                    r.request.resources.iter().any(|resource| {
+                        request.iter().any(|requested| {
+                            matches!(requested.access, Access::Exclusive)
+                                && requested.key == resource.key
+                        })
+                    })
+                })
+                .filter_map(|r| {
+                    r.request
+                        .holder
+                        .purpose
+                        .strip_prefix("service:")
+                        .map(str::to_owned)
+                })
+                .collect::<Vec<_>>();
+            services.sort();
+            services.dedup();
             let entry = state
                 .records
                 .iter_mut()
@@ -906,16 +985,18 @@ impl LaneStore {
                 entry.wait_reason = Some(reason);
                 return Ok(None);
             }
-            if entry
+            if (entry
                 .spec
                 .as_ref()
                 .is_some_and(|spec| spec.pre_hook.is_some())
+                || !services.is_empty())
                 && entry
                     .request
                     .resources
                     .iter()
                     .any(|r| matches!(r.access, Access::Exclusive))
             {
+                entry.yield_services = services;
                 entry.state = TicketState::Preparing;
                 entry.wait_reason = Some("waiting for synchronous pre-exclusive yield".to_owned());
                 return Ok(None);
@@ -935,6 +1016,12 @@ impl LaneStore {
             let record = self.record(id)?;
             if matches!(record.state, TicketState::Preparing) {
                 let spec = record.spec.context("preparing ticket has no job")?;
+                // All active service bindings are journalled as shared leases.
+                // Request EVERY bound service to yield, regardless of optional
+                // adapter hooks; no backend may restart past Preparing/Granted.
+                for service_id in &record.yield_services {
+                    self.service_control(service_id, id, "yield", spec.timeout_ms)?;
+                }
                 if let Some(hook) = &spec.pre_hook
                     && let Err(error) = self.run_hook(hook, &spec, id, "pre-exclusive", true)
                 {
@@ -961,9 +1048,7 @@ impl LaneStore {
                     pending.state = TicketState::Queued;
                     // Disable the service-holder exception: actual release is
                     // required before the exclusive claim is granted.
-                    if let Some(spec) = pending.spec.as_mut() {
-                        spec.pre_hook = None;
-                    }
+                    pending.spec = None;
                     ensure!(
                         dispatch_reason(&check, id)?.is_none(),
                         "service did not release resource before exclusive grant"
@@ -992,6 +1077,50 @@ impl LaneStore {
             // the snapshot) cannot miss an already-committed transition.
             event.wait(Duration::from_secs(2))?;
         }
+    }
+
+    /// The service CLI sends an authenticated local supervisor request and
+    /// returns only after the backend stopped, its proxy went 503, and its
+    /// shared lease was released. Never interpret a hook's exit as this ack.
+    fn service_control(
+        &self,
+        service_id: &str,
+        id: Uuid,
+        verb: &str,
+        timeout_ms: u64,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if service_id == "test" {
+            return Ok(());
+        }
+        let executable = std::env::var_os("BORG_LANE_EXECUTABLE")
+            .map(PathBuf::from)
+            .unwrap_or(std::env::current_exe()?);
+        let seconds = (timeout_ms / 1000).saturating_add(600).clamp(600, 86_400);
+        let mut cmd = Command::new(executable);
+        cmd.args(["lane", "--json", "--state-dir"])
+            .arg(&self.root)
+            .args(["service", verb, service_id, "--by"])
+            .arg(id.to_string());
+        if verb == "yield" {
+            cmd.args(["--for-seconds", &seconds.to_string()]);
+        }
+        let output = cmd
+            .output()
+            .with_context(|| format!("requesting {verb} from service {service_id}"))?;
+        ensure!(
+            output.status.success(),
+            "service {service_id} {verb} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if verb == "yield" {
+            let status: crate::services::ServiceStatus = serde_json::from_slice(&output.stdout)?;
+            ensure!(
+                matches!(status.state, crate::services::ServiceState::Yielded),
+                "service {service_id} did not acknowledge a stopped backend"
+            );
+        }
+        Ok(())
     }
 
     fn run_hook(
@@ -1547,6 +1676,12 @@ mod tests {
             purpose: "test".into(),
         }
     }
+    fn service_holder() -> Holder {
+        Holder {
+            purpose: "service:test".into(),
+            ..holder()
+        }
+    }
     fn record(seq: u64, state: TicketState, resources: Vec<ResourceRequest>) -> LaneRecord {
         LaneRecord {
             ticket: Ticket {
@@ -1575,6 +1710,7 @@ mod tests {
             post_scope: None,
             quarantined: false,
             service_lease: false,
+            yield_services: vec![],
             evidence: None,
         }
     }
@@ -1679,7 +1815,7 @@ mod tests {
         let store = LaneStore::new(dir.path()).unwrap();
         let service_request = LeaseRequest {
             resources: vec![resource("project", Access::Shared { slots: 1 })],
-            holder: holder(),
+            holder: service_holder(),
             queue_timeout_ms: None,
         };
         let service = store
@@ -1763,13 +1899,64 @@ mod tests {
     }
 
     #[test]
+    fn exclusive_discovers_all_service_bindings_without_adapter_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let held = store
+            .try_acquire_service(LeaseRequest {
+                resources: vec![resource("project", Access::Shared { slots: 1 })],
+                holder: service_holder(),
+                queue_timeout_ms: None,
+            })
+            .unwrap()
+            .unwrap();
+        let spec = JobSpec {
+            fingerprint: JobFingerprint("auto-bound".into()),
+            lease: LeaseRequest {
+                resources: vec![resource("project", Access::Exclusive)],
+                holder: holder(),
+                queue_timeout_ms: None,
+            },
+            argv: vec!["true".into()],
+            cwd: dir.path().into(),
+            env: vec![],
+            memory_max_bytes: None,
+            admission: AdmissionBudget {
+                min_available_ram_bytes: 0,
+                reserve_ram_bytes: 0,
+                min_free_disk_bytes: 0,
+                reserve_disk_bytes: 0,
+                disk_path: dir.path().into(),
+            },
+            pre_hook: None,
+            post_hook: None,
+            timeout_ms: 2000,
+            stall_timeout_ms: None,
+            coalesce: false,
+        };
+        let id = store
+            .locked(|state| {
+                Ok(store
+                    .enqueue_record(state, spec.lease.clone(), Some(spec))?
+                    .0
+                    .id)
+            })
+            .unwrap();
+        assert!(store.try_grant(id).unwrap().is_none());
+        let row = store.record(id).unwrap();
+        assert!(matches!(row.state, TicketState::Preparing));
+        assert_eq!(row.yield_services, vec!["test"]);
+        store.finish(id, 125, "test").unwrap();
+        store.release_lease(&held).unwrap();
+    }
+    #[test]
     fn pre_hook_success_without_yield_does_not_grant() {
         let dir = tempfile::tempdir().unwrap();
         let store = LaneStore::new(dir.path()).unwrap();
         let held = store
             .try_acquire_service(LeaseRequest {
                 resources: vec![resource("project", Access::Shared { slots: 1 })],
-                holder: holder(),
+                holder: service_holder(),
                 queue_timeout_ms: None,
             })
             .unwrap()
