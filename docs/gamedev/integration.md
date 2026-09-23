@@ -117,16 +117,17 @@ services branch: only status should be exposed until registered spec policy
 and actual session-derived owner/fencing enforcement are audited. A tool
 argument `confirmed: true` is not a durable human approval for workspace GC.
 
-**Open fail-open regression (2026-09-23):** on the combined lane binary
-`a26778e` with the older service stop path (before delegated backend subgroup
-fix `6337cf5`), bench `--atomic-descendant` ran two services and a no-hook
+**Stale-executable negative regression (2026-09-23):** bench
+`--atomic-descendant` ran against a lane worktree binary that **predated** the
+delegated backend subgroup source fix (`6337cf5`), despite a newer branch HEAD.
+The test ran two services and a no-hook
 exclusive job under a real user systemd manager. A detached backend child
 (PID 1434445, verified by start ticks) survived yield, yet job `821d209b`
 **started** and exited 1 only after the in-job assertion detected the child.
 The test stopped its own services and cleaned only its verified fake child.
-The newer service fix is *not* vindicated by this negative result: integrate
-`6337cf5`/`430d2ee` and rerun the same scoped descendant test; absent a pass,
-D11 blocks v0. Separate degraded two-service no-hook mechanics probe passed
+This proves the old executable was unsafe, **not** that the newer source is
+unsafe. Record the fresh binary build identity, integrate `6337cf5`/`430d2ee`,
+and rerun the scoped descendant test; absent a fresh pass, D11 blocks v0. Separate degraded two-service no-hook mechanics probe passed
 independently (job `6abb6869`), but it cannot substitute for this scope proof.
 
 **Critical v0 release gate (parent decision):** lanes enters `Preparing` for
