@@ -1131,7 +1131,7 @@ dependencies = [
 
 [[package]]
 name = "borg-display"
-version = "0.9.5"
+version = "0.10.0"
 dependencies = [
  "anyhow",
  "calloop 0.14.4",
