@@ -46,7 +46,7 @@ working first-party CLI/MCP.
 | --- | --- | --- | --- |
 | `gamedev/design` | `1a1a540` | skeleton `cargo check -p borg-lanes --offline` and `cargo clippy -p borg-lanes --offline -- -D warnings` passed; fmt and diff check clean. Public types only, no scheduler. | Market review edits and integration doc pending commit. |
 | `gamedev/lanes` | Uncommitted scheduler/CLI draft on `1a1a540` | CLI shape published: `borg lane job submit --spec SPEC.json --json`, `wait ID --json`, `status [ID] --json`. Reviewer found unsafe no-systemd process-tree fallback, running coalesce lacks revision recheck, recovery lock-error ambiguity, and async post-hook unscoped; owner notified. | do not merge until safety fixes and real FIFO/coalesce/recovery/wait tests pass. |
-| `gamedev/services` | `39807be` plus uncommitted repairs | Owner reports 3/3 fake HTTP tests and 0 failed requests / 329 ms A/B restart. UnixStream control, `KillMode=control-group`, no-systemd fail-closed, raw mutating proxy denied by default unless adapter enforces lease. | verify committed repair, supervisor-crash cgroup cleanup, clippy/CLI integration, owner/fence enforcement. |
+| `gamedev/services` | `39807be`, `9ae34dc` | Independently ran `CARGO_BUILD_JOBS=6 nice -n 10 cargo test -p borg-lanes services::tests --offline -- --nocapture`: 3 passed (5.47 s), A/B probe unavailable 0 / 327 ms. UnixStream control, `KillMode=control-group`, no-systemd fail-closed, raw proxy mutations denied by default. | verify supervisor-crash cgroup cleanup, actual shared lane gate, clippy/CLI wiring, owner/fence enforcement. |
 | `gamedev/workspace` | `0ef939c` plus uncommitted move to `borg-lanes/src/workspace/hygiene.rs` | Owner reports 3/3 crate tests; freeze requires relevant acks and refuses dirty trees. CLI/MCP wiring being split. Review found MCP `confirmed: true` alone is not human deletion approval; owner asked to make model-facing GC dry-run-only. | inspect core/bridge commits, GC permissions and single worktree authority. |
 | `gamedev/unreal` | Uncommitted `extensions/unreal/` draft | Engine discovery and tests exist, but copied `build_lane.py` (~1,883 lines), editor lane (~741 lines) and run guard duplicate core scheduling/supervision. Owner asked to pivot to thin policy/CLI adapter. | do not merge duplicated default authority; validate trust, CLI schema, editor owner-gating and fake-engine tests. |
 | `gamedev/native` | `ccfdeab` native Blu package | Three planner tests: `python3 -m unittest discover -s extensions/native/tests -q` OK (0.001 s); owner reports isolated Abundance CMake targeted build/ctest, doctor active. Script fails closed if CLI absent. | align exact submit JSON/async watcher semantics; independently reproduce install doctor and smoke when CLI exists; GC `--apply` needs human confirmation. |
@@ -116,3 +116,9 @@ stopped before exclusive job". Require one canonical root/key, a service-held
 shared resource relinquished before exclusive grant (or equivalent
 pre-admission barrier), and crash-tested reacquisition after exclusive
 release; otherwise exclude editor/exclusive integration from release claims.
+
+Native adapter disk reservation is an estimate, **not** target-only quota/GC;
+workspace currently considers whole-worktree cleanup with owner protection.
+Process-group fallback is test/degraded mode only; if leader ownership is
+unprovable, quarantine affected keys and never infer cleanup from a vanished
+PID. Production Linux requires a scope/cgroup and crash tests.
