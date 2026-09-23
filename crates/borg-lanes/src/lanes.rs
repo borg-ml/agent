@@ -736,6 +736,20 @@ impl LaneStore {
             "resource quarantined: automatic service resume refused"
         );
         for service in &record.resume_pending {
+            #[cfg(test)]
+            let result: Result<()> =
+                if service == "test" && self.root.join("fake-resume-ok").exists() {
+                    Ok(())
+                } else {
+                    self.service_status(service).and_then(|status| {
+                        if status.yields.contains_key(&id.to_string()) {
+                            self.service_control(service, id, "resume", 0)
+                        } else {
+                            Ok(())
+                        }
+                    })
+                };
+            #[cfg(not(test))]
             let result = self.service_status(service).and_then(|status| {
                 if status.yields.contains_key(&id.to_string()) {
                     self.service_control(service, id, "resume", 0)
@@ -1528,13 +1542,19 @@ impl LaneStore {
             }
             std::thread::sleep(Duration::from_millis(100));
         };
+        self.run_post_for_job(&spec, id, exclusive)?;
+        let _ = lease;
+        Ok(code)
+    }
+
+    fn run_post_for_job(&self, spec: &JobSpec, id: Uuid, exclusive: bool) -> Result<()> {
         // Bound services must remain stopped until the post hook completes.
         // Unbound jobs keep their independently scoped asynchronous hook.
         if let Some(post) = &spec.post_hook {
             let bound = !self.record(id)?.yield_services.is_empty();
             if let Err(error) = self.run_hook(
                 post,
-                &spec,
+                spec,
                 id,
                 if exclusive { "post-exclusive" } else { "post" },
                 bound,
@@ -1553,8 +1573,7 @@ impl LaneStore {
                 })?;
             }
         }
-        let _ = lease;
-        Ok(code)
+        Ok(())
     }
 
     fn log_recovery(&self, id: Uuid, reason: &str) -> Result<()> {
@@ -1981,6 +2000,110 @@ mod tests {
                 .contains("ram")
         );
     }
+    #[test]
+    fn failing_bound_post_quarantines_without_changing_workload_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let spec = JobSpec {
+            fingerprint: JobFingerprint("post-fail".into()),
+            lease: LeaseRequest {
+                resources: vec![resource("project", Access::Exclusive)],
+                holder: holder(),
+                queue_timeout_ms: None,
+            },
+            argv: vec!["true".into()],
+            cwd: dir.path().into(),
+            env: vec![],
+            memory_max_bytes: None,
+            admission: test_budget(dir.path()),
+            pre_hook: None,
+            post_hook: Some(Hook {
+                argv: vec!["false".into()],
+                timeout_ms: 1000,
+            }),
+            timeout_ms: 2000,
+            stall_timeout_ms: None,
+            coalesce: false,
+        };
+        let id = store
+            .locked(|state| {
+                let (ticket, _) =
+                    store.enqueue_record(state, spec.lease.clone(), Some(spec.clone()))?;
+                let row = state
+                    .records
+                    .iter_mut()
+                    .find(|r| r.ticket.id == ticket.id)
+                    .unwrap();
+                row.yield_services.push("test".into());
+                grant_entry(row);
+                Ok(ticket.id)
+            })
+            .unwrap();
+        store.run_post_for_job(&spec, id, true).unwrap();
+        store.finish(id, 0, "workload succeeded").unwrap();
+        let row = store.record(id).unwrap();
+        assert!(row.quarantined);
+        assert!(
+            row.evidence
+                .as_deref()
+                .unwrap()
+                .contains("post hook failed")
+        );
+        assert!(matches!(
+            row.job.unwrap().state,
+            JobState::Finished { exit_code: 0 }
+        ));
+        assert!(row.resume_pending.is_empty());
+        // A late service restart must not pass the quarantine.
+        assert!(
+            store
+                .try_acquire_service(
+                    LeaseRequest {
+                        resources: vec![resource("project", Access::Shared { slots: 1 })],
+                        holder: service_holder(),
+                        queue_timeout_ms: None,
+                    },
+                    &test_budget(dir.path())
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failed_resume_remains_visible_and_retry_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let id = Uuid::new_v4();
+        store
+            .locked(|state| {
+                let mut row = record(
+                    1,
+                    TicketState::Finished,
+                    vec![resource("project", Access::Exclusive)],
+                );
+                row.ticket.id = id;
+                row.yield_services.push("test".into());
+                row.resume_pending.push("test".into());
+                state.records.push(row);
+                Ok(())
+            })
+            .unwrap();
+        assert!(store.resume_services(id).is_err());
+        let failed = store.record(id).unwrap();
+        assert_eq!(failed.resume_pending, vec!["test"]);
+        assert!(
+            failed
+                .resume_error
+                .unwrap()
+                .contains("service test resume pending")
+        );
+        fs::write(dir.path().join("fake-resume-ok"), b"ok").unwrap();
+        store.resume_services(id).unwrap();
+        assert!(store.record(id).unwrap().resume_pending.is_empty());
+        assert!(store.record(id).unwrap().resume_error.is_none());
+    }
+
     #[test]
     fn service_disk_reservation_is_atomic_and_shared_with_jobs() {
         let dir = tempfile::tempdir().unwrap();
