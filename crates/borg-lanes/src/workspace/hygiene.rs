@@ -216,6 +216,50 @@ fn tree_owner(tree: &Path) -> Option<Uuid> {
         .map(|owner| owner.session)
 }
 
+fn disk_usage_bytes(path: &Path) -> Result<u64> {
+    let output = Command::new("du")
+        .args(["-skx", "--"])
+        .arg(path)
+        .output()
+        .with_context(|| format!("measure {}", path.display()))?;
+    ensure!(
+        output.status.success(),
+        "cannot measure {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout)?;
+    let kilobytes = text
+        .split_whitespace()
+        .next()
+        .context("du returned no size")?
+        .parse::<u64>()?;
+    Ok(kilobytes.saturating_mul(1024))
+}
+
+/// A configured worktree root can contain trees from several repositories.
+/// Count all Borg-managed worktrees owned by this session across that root.
+fn owned_root_usage(root: &Path, owner: Uuid) -> Result<u64> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_dir() || !path.join(".git").exists() {
+            continue;
+        }
+        let marker = git_dir(&path)?.join("borg-worktree-owner.json");
+        if !marker.exists() {
+            continue;
+        }
+        let recorded: Owner = serde_json::from_slice(&fs::read(&marker)?)
+            .with_context(|| format!("invalid Borg owner marker {}", marker.display()))?;
+        if recorded.session == owner {
+            total = total.saturating_add(disk_usage_bytes(&path)?);
+        }
+    }
+    Ok(total)
+}
+
 /// `active` is an authoritative list of local session owners, obtained from the
 /// workspace journal. Unknown owners are not interpreted as dead.
 pub fn inventory(repo: &Path, active: &[(Uuid, PathBuf)]) -> Result<Vec<WorktreeRecord>> {
@@ -269,16 +313,7 @@ pub fn inventory(repo: &Path, active: &[(Uuid, PathBuf)]) -> Result<Vec<Worktree
                 .is_ok_and(|out| out.status.success());
         let is_primary = git_dir(&path).is_ok_and(|dir| dir == primary);
         let owner_gone = false; // only the caller with journal exit evidence can set this
-        let size_bytes = Command::new("du")
-            .args(["-skx", "--"])
-            .arg(&path)
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .and_then(|out| String::from_utf8(out.stdout).ok())
-            .and_then(|text| text.split_whitespace().next()?.parse::<u64>().ok())
-            .unwrap_or(0)
-            .saturating_mul(1024);
+        let size_bytes = disk_usage_bytes(&path)?;
         let last_activity_unix = fs::metadata(&path)
             .ok()
             .and_then(|m| m.modified().ok())
@@ -352,10 +387,7 @@ pub fn create_worktree(
         "task must be 1-64 ASCII letters, digits, '-' or '_'"
     );
     fs::create_dir_all(root)?;
-    let agent_disk_used = inventory(repo, &[])?
-        .into_iter()
-        .filter(|tree| tree.owner == Some(owner))
-        .fold(0u64, |total, tree| total.saturating_add(tree.size_bytes));
+    let agent_disk_used = owned_root_usage(root, owner)?;
     let admission = assess_admission(
         budgets,
         disk_available(root)?,
@@ -430,25 +462,16 @@ pub struct TargetUsage {
 /// this cap is exceeded; cleaning is a separate owner-approved job.
 pub fn target_usage(trees: &[WorktreeRecord], cap_bytes: u64) -> Result<Vec<TargetUsage>> {
     ensure!(cap_bytes > 0, "target cap must be positive");
-    Ok(trees
+    trees
         .iter()
         .map(|tree| {
             let target = tree.path.join("target");
             let bytes = if target.is_dir() {
-                Command::new("du")
-                    .args(["-skx", "--"])
-                    .arg(&target)
-                    .output()
-                    .ok()
-                    .filter(|out| out.status.success())
-                    .and_then(|out| String::from_utf8(out.stdout).ok())
-                    .and_then(|text| text.split_whitespace().next()?.parse::<u64>().ok())
-                    .unwrap_or(0)
-                    .saturating_mul(1024)
+                disk_usage_bytes(&target)?
             } else {
                 0
             };
-            TargetUsage {
+            Ok(TargetUsage {
                 tree: tree.path.clone(),
                 target,
                 bytes,
@@ -456,9 +479,9 @@ pub fn target_usage(trees: &[WorktreeRecord], cap_bytes: u64) -> Result<Vec<Targ
                 over_cap: bytes > cap_bytes,
                 owner: tree.owner,
                 owner_live: tree.owner_live,
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Only an explicit, journal-confirmed exited owner allows removal. Dirty trees
@@ -834,6 +857,38 @@ pub fn finish_freeze(repo: &Path, id: Uuid, owner: Uuid, abort: bool) -> Result<
 #[cfg(test)]
 mod safety_tests {
     use super::*;
+
+    #[test]
+    fn root_usage_counts_owned_trees_from_multiple_repositories() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let owner = Uuid::new_v4();
+        for (name, session) in [
+            ("first", owner),
+            ("second", owner),
+            ("other", Uuid::new_v4()),
+        ] {
+            let tree = root.path().join(name);
+            fs::create_dir(&tree)?;
+            let status = Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .arg(&tree)
+                .status()?;
+            ensure!(status.success(), "git init failed");
+            fs::write(
+                git_dir(&tree)?.join("borg-worktree-owner.json"),
+                serde_json::to_vec(&Owner { session })?,
+            )?;
+            fs::write(tree.join("payload"), vec![b'x'; 8192])?;
+        }
+        let expected = disk_usage_bytes(&root.path().join("first"))?
+            .saturating_add(disk_usage_bytes(&root.path().join("second"))?);
+        assert_eq!(owned_root_usage(root.path(), owner)?, expected);
+        assert!(disk_usage_bytes(&root.path().join("missing")).is_err());
+        let bad = root.path().join("other");
+        fs::write(git_dir(&bad)?.join("borg-worktree-owner.json"), "not JSON")?;
+        assert!(owned_root_usage(root.path(), owner).is_err());
+        Ok(())
+    }
 
     #[test]
     fn gc_never_removes_live_or_dirty_without_force() {
