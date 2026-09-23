@@ -412,6 +412,7 @@ impl Fixture {
             env,
             resources,
             memory_max_bytes: Some(128 << 20),
+            memory_swap_max_bytes: None,
             admission: no_budget(cwd),
             health: HealthCheck {
                 argv: vec!["/health".into()],
@@ -695,6 +696,39 @@ fn front_port_survives_lease_restart_and_yield() {
     serves(ports[0]);
 }
 
+/// Failure mode: an editor service swapping the host to a halt because its
+/// unit has no swap limit.
+#[test]
+fn service_unit_caps_swap() {
+    let f = Fixture::scoped();
+    let ports = free_ports(3);
+    let name = unique("swap-service");
+    f.capacity(&name, 1);
+    let mut spec = f.service(
+        "swap-editor",
+        f.root(),
+        [ports[0], ports[1], ports[2]],
+        vec![shared(host(&name))],
+        Vec::new(),
+    );
+    spec.memory_swap_max_bytes = Some(64 << 20);
+    f.start(&spec, &[]);
+    let unit_file = f.lane.state().join("services/swap-editor/unit.json");
+    let unit: String = serde_json::from_slice(&std::fs::read(unit_file).unwrap()).unwrap();
+    let out = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            &format!("{unit}.service"),
+            "-p",
+            "MemorySwapMax",
+            "--value",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "67108864");
+}
+
 /// Health by MCP initialize against an editor-shaped reply that leaves the
 /// connection open: the service must become Healthy, and every probe's MCP
 /// session must be deleted.
@@ -941,6 +975,7 @@ fn run_atomic(o: Atomic) {
         abandon_after_ms: None,
         unit_prefix: None,
         finish_hook: None,
+        memory_swap_max_bytes: None,
         fingerprint: JobFingerprint("bench-D11-exclusive".into()),
         lease: LeaseRequest {
             resources,
@@ -1659,6 +1694,7 @@ fn shared_clients_restore_before_an_exclusive_and_failed_restores_fence_it() {
         abandon_after_ms: None,
         unit_prefix: None,
         finish_hook: None,
+        memory_swap_max_bytes: None,
         fingerprint: JobFingerprint(unique("shared-client-exclusive")),
         lease: LeaseRequest {
             resources: vec![exclusive(resource.clone())],

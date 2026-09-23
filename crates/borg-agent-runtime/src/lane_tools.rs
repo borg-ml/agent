@@ -894,6 +894,7 @@ pub(crate) mod tests {
             abandon_after_ms: None,
             unit_prefix: None,
             finish_hook: None,
+            memory_swap_max_bytes: None,
             fingerprint: JobFingerprint("fp".into()),
             lease: LeaseRequest {
                 resources: vec![ResourceRequest {
