@@ -56,8 +56,8 @@ Git comparison.
   compaction stops without replacing the source history with a degraded
   summary; recovery also restores history behind older degraded boundaries.
 - **Claude process use is bounded across sessions.** Active turns stay live,
-  while the host retains at most four idle Claude processes for up to 15
-  minutes. An idle session rebuilds its context when needed again.
+  while the host retains at most four idle Claude processes for up to one hour.
+  An idle session rebuilds its context when needed again.
 - **Opus 5.5 and Fable 5.1 effort switches can keep Claude's prompt cache.**
   The pinned Claude Code payload now supports this on direct subscription and
   API-key routes. Borg waits for the next usage report instead of predicting a
