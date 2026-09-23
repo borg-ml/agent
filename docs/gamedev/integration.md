@@ -220,6 +220,16 @@ SHA256 `7644a9674069229d6c81c1e68104f32b022878402ef9fdf2255cfb372493756d`
 unchanged during run, log `/tmp/gd-two-service-posthook.log`. The bench
 script was subsequently committed unchanged at bench `b0d4ea6`. This proves
 successful ordered post-hook/resume, not failure quarantine or durable retry.
+On newer pinned SHA `011c4ba9…`, I independently ran an opt-in public-CLI
+**failing bound post-hook** probe: job
+`2491f786-15ad-42fe-839f-863fe5543d5d` workload finished exit 0,
+post hook exited 42, record showed `quarantined=true` and explicit failure
+evidence, and both bound services remained fenced with backend stopped and
+proxy 503 rather than auto-resuming. Exit 0, binary hash stable, copied WIP
+probe SHA256
+`116ebd3b7e3ff06f5319053ac839b786ec3e17ebf8153c744c0ef606996871fd`,
+log `/tmp/gd-post-hook-fail.log`. This clears hook-failure quarantine for
+that binary; failed-resume readiness/recovery still needs a new build.
 
 **Critical v0 release gate (parent decision):** lanes enters `Preparing` for
 exclusive project key R before grant; blocks new shared grants and synchronously
@@ -234,9 +244,8 @@ cross-module test with an active client lease, backend gone before job start,
 no restart during, and resume afterward. The scoped no-hook two-service
 case above and the successful ordered post-hook barrier pass on the pinned
 binary are scoped successes. The Project path-alias fail-open is fixed and
-independently passed on the newer pinned binary above; finish post-hook
-failure/resume-retry, combined budget admission, and session-derived editor
-owner fencing, then rerun the gates on the final integrated binary before
+independently passed on the newer pinned binary above; finish failed-resume readiness/retry, combined budget admission, and
+session-derived editor owner fencing, then rerun the gates on the final integrated binary before
 any v0 release. Fake Unreal adapters still do not establish real UE parity.
 
 Native adapter disk reservation is an estimate, **not** target-only quota/GC;
