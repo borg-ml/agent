@@ -873,6 +873,26 @@ impl LaneStore {
         now.saturating_sub(*last_seen_ms) >= after
     }
 
+    /// Block, as a requester, until the workload has started (Running) or the
+    /// job ended. A free ticket lock means its supervisor died: recover first.
+    pub fn wait_started(&self, id: Uuid) -> Result<JobHandle> {
+        let _requester = self.hold_as_requester(id)?;
+        let events = StateEvents::new(&self.root)?;
+        loop {
+            let job = self.job_status(id)?;
+            if !matches!(job.state, JobState::Queued) {
+                return Ok(job);
+            }
+            let lock = stable_file(&self.ticket_path(id))?;
+            if lock.try_lock_shared().is_ok() {
+                drop(lock);
+                self.recover(false)?;
+                return self.job_status(id);
+            }
+            events.wait(Duration::from_secs(2))?;
+        }
+    }
+
     /// Block on the kernel-owned completion lock; an exited supervisor wakes
     /// every waiter immediately even if it never wrote a terminal event.
     pub fn wait_job(&self, id: Uuid) -> Result<JobHandle> {
