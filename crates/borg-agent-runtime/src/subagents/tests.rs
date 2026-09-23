@@ -6281,6 +6281,49 @@ async fn only_the_interrupting_agent_resumes_an_interrupted_child() {
     scratch.discard().await;
 }
 
+/// Failure mode: the parent interrupts a child, the human then stops it too,
+/// and the parent's next follow-up lifts the human's stop.
+#[tokio::test]
+async fn a_human_stop_after_an_agent_interrupt_still_holds() {
+    let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
+    let (commands, mut received) = mpsc::channel(8);
+    coordinator
+        .table
+        .lock()
+        .await
+        .entries
+        .get_mut(&worker)
+        .unwrap()
+        .commands = Some(commands);
+    coordinator
+        .call_tool_as(root, "interrupt_agent", json!({"target": "worker"}))
+        .await
+        .unwrap();
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::Interrupt { .. })
+    ));
+    coordinator.interrupt("worker").await.unwrap();
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::Interrupt { .. })
+    ));
+    coordinator
+        .call_tool_as(
+            root,
+            "followup_task",
+            json!({"target": "worker", "message": "keep going"}),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::TeamPrompt { text, .. }) if !text.contains("the stop is lifted")
+    ));
+    assert!(received.try_recv().is_err());
+    scratch.discard().await;
+}
+
 #[tokio::test]
 async fn team_messages_can_be_triaged_and_acknowledged_in_batches() {
     let (_directory, scratch, coordinator, root, worker) = waiting_team().await;

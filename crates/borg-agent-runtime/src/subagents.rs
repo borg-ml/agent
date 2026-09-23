@@ -5580,9 +5580,22 @@ impl SubagentCoordinator {
         })
     }
 
+    /// Interrupt as the human (the UI path). `interrupt_agent` records its
+    /// caller afterwards; here any earlier agent interrupt is forgotten, so a
+    /// later human stop is never lifted by that agent's follow-up.
     pub async fn interrupt(&self, target: &str) -> Result<()> {
+        self.forget_interrupter(target).await;
         self.send_command(target, |session_id| HostCommand::Interrupt { session_id })
             .await
+    }
+
+    async fn forget_interrupter(&self, target: &str) {
+        let mut table = self.table.lock().await;
+        if let Ok(id) = table.resolve(target)
+            && let Some(entry) = table.entries.get_mut(&id)
+        {
+            entry.interrupted_by = None;
+        }
     }
 
     pub async fn flush_pending_input(&self, target: &str) -> Result<()> {
@@ -5593,6 +5606,9 @@ impl SubagentCoordinator {
     }
 
     pub async fn stop(&self, target: &str) -> Result<()> {
+        // A stopped child may be revived by an explicit follow-up; that must
+        // not be announced as a parent lifting its own interrupt.
+        self.forget_interrupter(target).await;
         self.send_command(target, |session_id| HostCommand::Stop { session_id })
             .await
     }
