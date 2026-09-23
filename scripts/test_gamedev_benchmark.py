@@ -4,6 +4,7 @@ from pathlib import Path
 import unittest
 
 spec = importlib.util.spec_from_file_location("bench", Path(__file__).with_name("gamedev_benchmark.py"))
+assert spec is not None and spec.loader is not None
 bench = importlib.util.module_from_spec(spec)
 import sys
 sys.modules[spec.name] = bench
