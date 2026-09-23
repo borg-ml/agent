@@ -2075,12 +2075,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
 http.server.ThreadingHTTPServer.allow_reuse_address = True
 http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
 "#;
+    /// A free loopback port that stays free until the supervisor or backend
+    /// binds it. A released `bind(0)` port is in the kernel's ephemeral range,
+    /// where a concurrent test's own `bind(0)` or outgoing connection can take
+    /// it first. Ports below that range are never assigned automatically, and a
+    /// per-process counter (random start) never hands one out twice.
     fn port() -> u16 {
-        StdTcpListener::bind(("127.0.0.1", 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port()
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: std::sync::OnceLock<(u32, u32, AtomicU32)> = std::sync::OnceLock::new();
+        let (floor, span, next) = NEXT.get_or_init(|| {
+            let range =
+                fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range").unwrap_or_default();
+            let mut bounds = range.split_whitespace().map(|v| v.parse::<u32>().ok());
+            let (low, high) = match (bounds.next().flatten(), bounds.next().flatten()) {
+                (Some(low), Some(high)) => (low, high),
+                _ => (32_768, 60_999),
+            };
+            // The larger unprivileged gap outside the ephemeral range.
+            let (floor, ceiling) = if low.saturating_sub(10_000) >= 65_535u32.saturating_sub(high) {
+                (10_000, low.max(10_001))
+            } else {
+                (high + 1, 65_536)
+            };
+            let start = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+                ^ std::process::id();
+            (floor, ceiling - floor, AtomicU32::new(start))
+        });
+        loop {
+            let candidate = floor + next.fetch_add(1, Ordering::Relaxed) % span;
+            if StdTcpListener::bind(("127.0.0.1", candidate as u16)).is_ok() {
+                return candidate as u16;
+            }
+        }
     }
     fn spec(root: &Path) -> ServiceSpec {
         let front = port();
@@ -2197,24 +2226,35 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
         let root = tempfile::tempdir().unwrap();
         let mut spec = spec(root.path());
         configure(&mut spec);
-        let front = spec
-            .endpoint
-            .as_ref()
-            .unwrap()
-            .listen
-            .parse::<SocketAddr>()
-            .unwrap()
-            .port();
         let services = root.path().join("services");
         let dir = service_dir(&services, "fake").unwrap();
-        write_json(&dir.join("spec.json"), &spec).unwrap();
         let manager = ServiceManager::new(services.clone(), PathBuf::new());
-        let task = tokio::spawn(async move { supervise(&services, "fake").await });
-        state(&manager, |s| {
-            matches!(s.state, ServiceState::Healthy { .. })
-        })
-        .await;
-        (root, manager, front, task)
+        // Another process can still bind a port between allocation and the
+        // supervisor's bind; the supervisor then exits at once. Retry that on
+        // fresh ports, and report any other early exit instead of timing out.
+        for attempt in 1..=3 {
+            write_json(&dir.join("spec.json"), &spec).unwrap();
+            let services = services.clone();
+            let mut task = tokio::spawn(async move { supervise(&services, "fake").await });
+            tokio::select! {
+                _ = state(&manager, |s| matches!(s.state, ServiceState::Healthy { .. })) => {
+                    let front = spec.endpoint.as_ref().unwrap().listen.parse::<SocketAddr>();
+                    return (root, manager, front.unwrap().port(), task);
+                }
+                ended = &mut task => {
+                    let ended = format!("{ended:?}");
+                    assert!(
+                        attempt < 3 && ended.contains("busy"),
+                        "supervisor exited before Healthy: {ended}"
+                    );
+                    spec.endpoint = Some(Endpoint {
+                        listen: format!("127.0.0.1:{}", port()),
+                        backend_ports: [port(), port()],
+                    });
+                }
+            }
+        }
+        unreachable!("the last attempt returns or panics")
     }
     pub(crate) async fn cleanup(
         manager: &ServiceManager,
