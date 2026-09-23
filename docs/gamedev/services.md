@@ -144,8 +144,16 @@ All optional and serde-defaulted, so an existing definition keeps its behavior:
   or a warm one starts the replacement, until the new backend is healthy
   (warm: and the old one is stopped) or has failed, no ticket needing one of
   the keys is admitted, not even a job that could make the service yield.
-  A barrier whose supervisor was lost is quarantined by `lane recover`, since
-  nothing proves its backend stopped. Keys must be unique.
+  Keys must be unique.
+- **A killed supervisor** (SIGKILL, OOM, `systemctl --user stop`) leaves its
+  service lease and any restart barrier behind. They are released, with the
+  proof in their evidence and `recovery.jsonl`, as soon as the owner is
+  provably gone: its service unit cgroup (the supervisor and its backends)
+  is gone or empty, or, for a claim recorded without one, its pid has exited
+  or now names another process. `lane recover` does this, as do the next
+  service lease or barrier claim (so the next `service start`) and every
+  build waiting for a key. Until then `lane recover` quarantines the keys,
+  and it lifts that quarantine once the proof holds; no reboot is needed.
 - `health.unhealthy_after_ms`: a running backend is declared hung only after
   its probes have failed continuously this long (default three
   `timeout_ms`). Each probe is still cut off at `timeout_ms`.
