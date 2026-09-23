@@ -1138,6 +1138,7 @@ def inject(args):
 PRIVATE_PREFIX = "pd:"
 PRIVATE = None  # the running private display backend
 PRIVATE_APPS = {}  # pid -> Popen for session-owned apps (killed at teardown)
+PRIVATE_POINTER = {"window": None}  # private window the pointer was last placed in
 EVDEV_CODES = {
     "BTN_LEFT": 272, "BTN_RIGHT": 273, "BTN_MIDDLE": 274, "KEY_ESC": 1, "KEY_MINUS": 12, "KEY_EQUAL": 13,
     "KEY_BACKSPACE": 14, "KEY_TAB": 15, "KEY_LEFTBRACE": 26, "KEY_RIGHTBRACE": 27, "KEY_ENTER": 28,
@@ -1683,15 +1684,37 @@ def private_inject(args):
             raise ValueError("steps must be an integer between 1 and 1000")
         if not isinstance(duration, int) or isinstance(duration, bool) or not 0 <= duration <= 10000:
             raise ValueError("duration_ms must be an integer between 0 and 10000")
+        held = parse_keys(args["hold_keys"]) if args.get("hold_keys") is not None else None
         backend.focus(info["id"])
-        for _ in range(steps):
-            backend.pointer_relative(dx / steps, dy / steps)
-            time.sleep(duration / 1000 / steps)
-        extra.update({"relative": {"dx": dx, "dy": dy}, "steps": steps})
+        # Motion reaches only the surface under the pointer: enter the window
+        # (at x, y when given, else its centre) before moving relatively.
+        if args.get("x") is not None or args.get("y") is not None:
+            (px, py), _ = private_point(args, info, accessible)
+        elif PRIVATE_POINTER.get("window") != info["id"]:
+            bounds = info["bounds"]
+            px, py = bounds["x"] + bounds["width"] / 2, bounds["y"] + bounds["height"] / 2
+        else:
+            px = py = None
+        if px is not None:
+            backend.pointer_move(px, py)
+            PRIVATE_POINTER["window"] = info["id"]
+            extra["placement"] = {"x": px, "y": py}
+        codes = [EVDEV_CODES[name] for name in held[0]] + [EVDEV_CODES[held[1]]] if held else []
+        for code in codes:
+            backend.key(code, True)
+        try:
+            for _ in range(steps):
+                backend.pointer_relative(dx / steps, dy / steps)
+                time.sleep(duration / 1000 / steps)
+        finally:
+            for code in reversed(codes):
+                backend.key(code, False)
+        extra.update({"relative": {"dx": dx, "dy": dy}, "steps": steps, "hold_keys": args.get("hold_keys")})
     elif op in ("pointer_click", "scroll"):
         (x, y), coordinate = private_point(args, info, accessible)
         backend.focus(info["id"])
         backend.pointer_move(x, y)
+        PRIVATE_POINTER["window"] = info["id"]
         extra.update({"coordinate_click": coordinate, "point": {"x": x, "y": y}})
         if op == "pointer_click":
             count = args.get("count", 1)
