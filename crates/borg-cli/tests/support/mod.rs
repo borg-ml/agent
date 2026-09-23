@@ -145,6 +145,7 @@ impl Lane {
             post_hook: None,
             timeout_ms: 10_000,
             stall_timeout_ms: None,
+            scope_unit_prefix: None,
             coalesce: true,
         }
     }
