@@ -188,17 +188,17 @@ fn unix_ms() -> u64 {
 
 /// The runtime root can be private to a test, user, or installation. IDs never become paths unchecked.
 pub fn service_root() -> PathBuf {
-    std::env::var_os("BORG_LANES_ROOT")
+    std::env::var_os("BORG_LANE_DIR")
         .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_RUNTIME_DIR").map(|p| PathBuf::from(p).join("borg/lanes"))
+        })
         .unwrap_or_else(|| {
-            std::env::var_os("XDG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(format!("borg-{}", unsafe { libc::geteuid() }))
-                .join("lanes")
+            std::env::temp_dir().join(format!("borg-lanes-{}", unsafe { libc::geteuid() }))
         })
         .join("services")
 }
+
 fn service_dir(root: &Path, id: &str) -> Result<PathBuf> {
     ensure!(
         !id.is_empty()
@@ -417,7 +417,7 @@ impl ServiceManager {
                 command.args(["-p", &format!("MemoryMax={bytes}")]);
             }
             command.arg(format!(
-                "--setenv=BORG_LANES_ROOT={}",
+                "--setenv=BORG_LANE_DIR={}",
                 self.root.parent().context("invalid root")?.display()
             ));
             command.arg(&self.executable).args(args);
