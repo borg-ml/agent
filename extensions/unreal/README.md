@@ -71,7 +71,11 @@ integrating `borg lane service` CLI. A disposable **fake** editor with an MCP
 initialize endpoint reached Healthy through the services-owner debug CLI; its
 unfenced front proxy denied POST with 403 and stop closed all private ports.
 This does **not** validate a real Unreal editor or the D11 atomic handoff;
-do not use the live shared project's editor or its port. The stock
+do not use the live shared project's editor or its port. The architect's
+`docs/gamedev/integration.md` records a scoped detached-child **fail-open** on
+an older combined core binary: a child survived yield yet an exclusive job
+started. A newer service fix must pass the same real-CLI regression before
+Unreal editor/exclusive interoperability can be enabled. The stock
 Unreal MCP backend lacks owner enforcement. The service spec explicitly sets
 `adapter_enforces_leases=false`; `mcp ...` intentionally fails closed rather
 than exposing raw backend access. Only enable client access once an adapter
