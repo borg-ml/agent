@@ -28,6 +28,47 @@ impl Default for WorkspaceBudgets {
     }
 }
 
+impl WorkspaceBudgets {
+    /// Machine/agent limits are explicit and fail closed on malformed overrides.
+    /// A zero or overflowing cap is not treated as "unlimited".
+    pub fn from_env() -> Result<Self> {
+        let defaults = Self::default();
+        Ok(Self {
+            disk_reserve_bytes: budget_gib(
+                "BORG_WORKTREE_DISK_RESERVE_GIB",
+                defaults.disk_reserve_bytes,
+            )?,
+            ram_reserve_bytes: budget_gib(
+                "BORG_WORKTREE_RAM_RESERVE_GIB",
+                defaults.ram_reserve_bytes,
+            )?,
+            agent_disk_limit_bytes: budget_gib(
+                "BORG_WORKTREE_AGENT_DISK_GIB",
+                defaults.agent_disk_limit_bytes,
+            )?,
+            agent_ram_limit_bytes: budget_gib(
+                "BORG_WORKTREE_AGENT_RAM_GIB",
+                defaults.agent_ram_limit_bytes,
+            )?,
+        })
+    }
+}
+
+fn budget_gib(name: &str, default: u64) -> Result<u64> {
+    match std::env::var_os(name) {
+        None => Ok(default),
+        Some(value) => parse_budget_gib(name, &value.to_string_lossy()),
+    }
+}
+
+fn parse_budget_gib(name: &str, value: &str) -> Result<u64> {
+    let gib: u64 = value
+        .parse()
+        .with_context(|| format!("{name} must be a positive integer GiB value"))?;
+    ensure!((1..=4096).contains(&gib), "{name} must be 1..4096 GiB");
+    Ok(gib * GIB)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceAdmission {
     pub admitted: bool,
@@ -62,28 +103,48 @@ pub fn assess_admission(
                 ram_available, requested_ram, budgets.ram_reserve_bytes
             ),
         ),
-        (
-            agent_disk_used.saturating_add(requested_disk) > budgets.agent_disk_limit_bytes,
-            format!(
-                "agent disk cap: {} used + {} requested > {}",
-                agent_disk_used, requested_disk, budgets.agent_disk_limit_bytes
-            ),
-        ),
-        (
-            agent_ram_used.saturating_add(requested_ram) > budgets.agent_ram_limit_bytes,
-            format!(
-                "agent RAM cap: {} used + {} requested > {}",
-                agent_ram_used, requested_ram, budgets.agent_ram_limit_bytes
-            ),
-        ),
     ];
+    let reason = reasons
+        .into_iter()
+        .find_map(|(blocked, reason)| blocked.then_some(reason))
+        .or_else(|| {
+            agent_budget_reason(
+                budgets,
+                agent_disk_used,
+                agent_ram_used,
+                requested_disk,
+                requested_ram,
+            )
+        });
     WorkspaceAdmission {
-        admitted: !reasons.iter().any(|(blocked, _)| *blocked),
-        reason: reasons
-            .into_iter()
-            .find_map(|(blocked, reason)| blocked.then_some(reason)),
+        admitted: reason.is_none(),
+        reason,
         disk_available_bytes: disk_available,
         ram_available_bytes: ram_available,
+    }
+}
+
+/// Per-owner cap decision for lane dispatch. Call under the lane admission
+/// lock with reserved bytes from this holder's granted and preparing jobs.
+pub fn agent_budget_reason(
+    budgets: &WorkspaceBudgets,
+    used_disk: u64,
+    used_ram: u64,
+    requested_disk: u64,
+    requested_ram: u64,
+) -> Option<String> {
+    if used_disk.saturating_add(requested_disk) > budgets.agent_disk_limit_bytes {
+        Some(format!(
+            "agent disk cap: {used_disk} used + {requested_disk} requested > {}",
+            budgets.agent_disk_limit_bytes
+        ))
+    } else if used_ram.saturating_add(requested_ram) > budgets.agent_ram_limit_bytes {
+        Some(format!(
+            "agent RAM cap: {used_ram} used + {requested_ram} requested > {}",
+            budgets.agent_ram_limit_bytes
+        ))
+    } else {
+        None
     }
 }
 
@@ -175,6 +236,50 @@ fn tree_owner(tree: &Path) -> Option<Uuid> {
         .map(|owner| owner.session)
 }
 
+fn disk_usage_bytes(path: &Path) -> Result<u64> {
+    let output = Command::new("du")
+        .args(["-skx", "--"])
+        .arg(path)
+        .output()
+        .with_context(|| format!("measure {}", path.display()))?;
+    ensure!(
+        output.status.success(),
+        "cannot measure {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout)?;
+    let kilobytes = text
+        .split_whitespace()
+        .next()
+        .context("du returned no size")?
+        .parse::<u64>()?;
+    Ok(kilobytes.saturating_mul(1024))
+}
+
+/// A configured worktree root can contain trees from several repositories.
+/// Count all Borg-managed worktrees owned by this session across that root.
+pub fn owned_root_usage(root: &Path, owner: Uuid) -> Result<u64> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_dir() || !path.join(".git").exists() {
+            continue;
+        }
+        let marker = git_dir(&path)?.join("borg-worktree-owner.json");
+        if !marker.exists() {
+            continue;
+        }
+        let recorded: Owner = serde_json::from_slice(&fs::read(&marker)?)
+            .with_context(|| format!("invalid Borg owner marker {}", marker.display()))?;
+        if recorded.session == owner {
+            total = total.saturating_add(disk_usage_bytes(&path)?);
+        }
+    }
+    Ok(total)
+}
+
 /// `active` is an authoritative list of local session owners, obtained from the
 /// workspace journal. Unknown owners are not interpreted as dead.
 pub fn inventory(repo: &Path, active: &[(Uuid, PathBuf)]) -> Result<Vec<WorktreeRecord>> {
@@ -228,16 +333,7 @@ pub fn inventory(repo: &Path, active: &[(Uuid, PathBuf)]) -> Result<Vec<Worktree
                 .is_ok_and(|out| out.status.success());
         let is_primary = git_dir(&path).is_ok_and(|dir| dir == primary);
         let owner_gone = false; // only the caller with journal exit evidence can set this
-        let size_bytes = Command::new("du")
-            .args(["-skx", "--"])
-            .arg(&path)
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .and_then(|out| String::from_utf8(out.stdout).ok())
-            .and_then(|text| text.split_whitespace().next()?.parse::<u64>().ok())
-            .unwrap_or(0)
-            .saturating_mul(1024);
+        let size_bytes = disk_usage_bytes(&path)?;
         let last_activity_unix = fs::metadata(&path)
             .ok()
             .and_then(|m| m.modified().ok())
@@ -311,10 +407,7 @@ pub fn create_worktree(
         "task must be 1-64 ASCII letters, digits, '-' or '_'"
     );
     fs::create_dir_all(root)?;
-    let agent_disk_used = inventory(repo, &[])?
-        .into_iter()
-        .filter(|tree| tree.owner == Some(owner))
-        .fold(0u64, |total, tree| total.saturating_add(tree.size_bytes));
+    let agent_disk_used = owned_root_usage(root, owner)?;
     let admission = assess_admission(
         budgets,
         disk_available(root)?,
@@ -389,25 +482,16 @@ pub struct TargetUsage {
 /// this cap is exceeded; cleaning is a separate owner-approved job.
 pub fn target_usage(trees: &[WorktreeRecord], cap_bytes: u64) -> Result<Vec<TargetUsage>> {
     ensure!(cap_bytes > 0, "target cap must be positive");
-    Ok(trees
+    trees
         .iter()
         .map(|tree| {
             let target = tree.path.join("target");
             let bytes = if target.is_dir() {
-                Command::new("du")
-                    .args(["-skx", "--"])
-                    .arg(&target)
-                    .output()
-                    .ok()
-                    .filter(|out| out.status.success())
-                    .and_then(|out| String::from_utf8(out.stdout).ok())
-                    .and_then(|text| text.split_whitespace().next()?.parse::<u64>().ok())
-                    .unwrap_or(0)
-                    .saturating_mul(1024)
+                disk_usage_bytes(&target)?
             } else {
                 0
             };
-            TargetUsage {
+            Ok(TargetUsage {
                 tree: tree.path.clone(),
                 target,
                 bytes,
@@ -415,9 +499,9 @@ pub fn target_usage(trees: &[WorktreeRecord], cap_bytes: u64) -> Result<Vec<Targ
                 over_cap: bytes > cap_bytes,
                 owner: tree.owner,
                 owner_live: tree.owner_live,
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Only an explicit, journal-confirmed exited owner allows removal. Dirty trees
@@ -538,6 +622,30 @@ pub fn freeze_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn agent_caps_include_running_reservations() {
+        let limits = WorkspaceBudgets::default();
+        assert_eq!(agent_budget_reason(&limits, 0, 15 * GIB, 0, GIB), None);
+        assert!(
+            agent_budget_reason(&limits, 0, 15 * GIB, 0, 2 * GIB)
+                .unwrap()
+                .contains("agent RAM cap")
+        );
+        assert!(
+            agent_budget_reason(&limits, 31 * GIB, 0, 2 * GIB, 0)
+                .unwrap()
+                .contains("agent disk cap")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_budget_configuration() {
+        assert!(parse_budget_gib("reserve", "0").is_err());
+        assert!(parse_budget_gib("reserve", "-1").is_err());
+        assert!(parse_budget_gib("reserve", "4097").is_err());
+        assert_eq!(parse_budget_gib("reserve", "24").unwrap(), 24 * GIB);
+    }
+
     #[test]
     fn budget_refusal_is_actionable_and_saturates() {
         let b = WorkspaceBudgets::default();
@@ -785,6 +893,38 @@ pub fn finish_freeze(repo: &Path, id: Uuid, owner: Uuid, abort: bool) -> Result<
 #[cfg(test)]
 mod safety_tests {
     use super::*;
+
+    #[test]
+    fn root_usage_counts_owned_trees_from_multiple_repositories() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let owner = Uuid::new_v4();
+        for (name, session) in [
+            ("first", owner),
+            ("second", owner),
+            ("other", Uuid::new_v4()),
+        ] {
+            let tree = root.path().join(name);
+            fs::create_dir(&tree)?;
+            let status = Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .arg(&tree)
+                .status()?;
+            ensure!(status.success(), "git init failed");
+            fs::write(
+                git_dir(&tree)?.join("borg-worktree-owner.json"),
+                serde_json::to_vec(&Owner { session })?,
+            )?;
+            fs::write(tree.join("payload"), vec![b'x'; 8192])?;
+        }
+        let expected = disk_usage_bytes(&root.path().join("first"))?
+            .saturating_add(disk_usage_bytes(&root.path().join("second"))?);
+        assert_eq!(owned_root_usage(root.path(), owner)?, expected);
+        assert!(disk_usage_bytes(&root.path().join("missing")).is_err());
+        let bad = root.path().join("other");
+        fs::write(git_dir(&bad)?.join("borg-worktree-owner.json"), "not JSON")?;
+        assert!(owned_root_usage(root.path(), owner).is_err());
+        Ok(())
+    }
 
     #[test]
     fn gc_never_removes_live_or_dirty_without_force() {
