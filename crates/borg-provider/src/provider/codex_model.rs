@@ -21,6 +21,8 @@ use super::{
 
 const ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 const API_ENDPOINT: &str = "https://api.openai.com/v1/responses";
+/// Issued on a turn's first response and replayed for the rest of the turn.
+const TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const MODELS_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/models";
 const MAX_STREAM_BYTES: usize = 128 * 1024 * 1024;
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
@@ -613,18 +615,32 @@ impl CodexModelProvider {
         if let Some(id) = &request.session_id {
             http = http.header("session_id", id);
         }
+        // Sticky routing for the rest of the turn: without it every request
+        // looks like a new turn to the backend and is routed afresh.
+        if let Some(token) = request.turn_routing.get() {
+            http = http.header(TURN_STATE_HEADER, token);
+        }
         if let Some(id) = &request.request_id {
             http = http.header("X-Client-Request-Id", id);
         }
         let rejected_token = access.token.clone();
         let auth_file = access.auth_file.clone();
-        access
+        let response = access
             .send_with_recovery(
                 apply_provider_request_timeout(http),
                 expected_account,
                 SubscriptionAccess::read_with(auth_file, Some(rejected_token)),
             )
-            .await
+            .await?;
+        if response.status().is_success()
+            && let Some(token) = response
+                .headers()
+                .get(TURN_STATE_HEADER)
+                .and_then(|value| value.to_str().ok())
+        {
+            request.turn_routing.record(token);
+        }
+        Ok(response)
     }
 
     async fn read_stream(
@@ -1191,6 +1207,7 @@ mod tests {
                 request_id: None,
                 session_id: Some("same-borg-session".into()),
                 prompt_cache_key: None,
+                turn_routing: Default::default(),
                 tools: vec![],
                 output_schema: None,
                 messages: vec![
@@ -1338,6 +1355,72 @@ mod tests {
                     "no extra retry or changed-account request may reach the endpoint");
             }
         }).await.expect("authentication recovery must remain bounded");
+    }
+
+    #[tokio::test]
+    async fn turn_state_is_replayed_within_a_turn_and_never_into_the_next() {
+        // Failure mode: a turn's requests stop sharing the routing slot, so each
+        // looks like a new turn to the backend and is routed afresh.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/responses", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut sent = Vec::new();
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut bytes = [0; 1024];
+                    let count = socket.read(&mut bytes).await.unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&bytes[..count]);
+                }
+                let headers = String::from_utf8_lossy(&request).to_lowercase();
+                sent.push(headers.lines().find_map(|line| {
+                    line.strip_prefix("x-codex-turn-state: ")
+                        .map(str::to_string)
+                }));
+                socket.write_all(b"HTTP/1.1 200 OK\r\nx-codex-turn-state: sticky\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            }
+            sent
+        });
+        let provider = CodexModelProvider {
+            model: "test-model".into(),
+            effort: "low".into(),
+        };
+        let mut access = SubscriptionAccess {
+            token: "token".into(),
+            account_id: "account".into(),
+            auth_file: None,
+        };
+        let account = access.identity();
+        let request = || ModelTurnRequest {
+            fast: false,
+            request_id: None,
+            session_id: None,
+            prompt_cache_key: None,
+            turn_routing: Default::default(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            output_schema: None,
+        };
+        let turn = request();
+        for request in [&turn, &turn.clone(), &request()] {
+            provider
+                .send(
+                    &reqwest::Client::new(),
+                    &endpoint,
+                    &mut access,
+                    &account,
+                    request,
+                    &json!({}),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            server.await.unwrap(),
+            [None, Some("sticky".to_string()), None]
+        );
     }
 
     #[tokio::test]
@@ -1526,6 +1609,7 @@ mod tests {
             request_id: None,
             session_id: None,
             prompt_cache_key: None,
+            turn_routing: Default::default(),
             messages: vec![ModelMessage::user("test")],
             tools: Vec::new(),
             output_schema: None,
@@ -1564,6 +1648,7 @@ mod tests {
             request_id: None,
             session_id: None,
             prompt_cache_key: None,
+            turn_routing: Default::default(),
             messages: vec![ModelMessage::user("test")],
             tools: Vec::new(),
             output_schema: None,
@@ -1635,6 +1720,7 @@ mod tests {
             request_id: None,
             session_id: Some("session".into()),
             prompt_cache_key: None,
+            turn_routing: Default::default(),
             messages: vec![ModelMessage::user("private context")],
             tools: Vec::new(),
             output_schema: None,
@@ -1739,7 +1825,8 @@ mod tests {
             });
             let provider = CodexModelProvider { model: "gpt-6-astra".into(), effort: "low".into() };
             let mut request = ModelTurnRequest { fast: true, request_id: Some("request".into()), session_id: Some("session".into()),
-                prompt_cache_key: Some("cache".into()), messages: vec![ModelMessage::user("Inspect.")],
+                prompt_cache_key: Some("cache".into()),
+                turn_routing: Default::default(), messages: vec![ModelMessage::user("Inspect.")],
                 tools: vec![super::super::ModelToolDefinition::new("inspect", "Inspect", json!({"type":"object"})).unwrap()], output_schema: None };
             let mut access = SubscriptionAccess { token: "test-token".into(), account_id: "test-account".into(), auth_file: None };
             let account = access.identity();

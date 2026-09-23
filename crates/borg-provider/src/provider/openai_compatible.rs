@@ -2265,6 +2265,7 @@ mod tests {
                     request_id: Some("kimi-test".to_string()),
                     session_id: None,
                     prompt_cache_key: None,
+                    turn_routing: Default::default(),
                     messages: vec![ModelMessage::user("inspect")],
                     tools: Vec::new(),
                     output_schema: Some(json!({
@@ -2733,6 +2734,7 @@ mod tests {
                     request_id: Some("openrouter-test".to_string()),
                     session_id: Some("borg-session:stable".to_string()),
                     prompt_cache_key: Some("borg-prefix:test".to_string()),
+                    turn_routing: Default::default(),
                     messages: vec![ModelMessage::user("inspect the repository")],
                     tools: vec![
                         super::super::ModelToolDefinition::new(

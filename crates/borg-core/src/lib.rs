@@ -15,7 +15,7 @@ pub use compaction::{
 };
 pub use model::{
     ModelFunctionCall, ModelInputAttachment, ModelMessage, ModelProviderState, ModelToolCall,
-    ModelToolDefinition, ModelTurnRequest,
+    ModelToolDefinition, ModelTurnRequest, TurnRouting,
 };
 pub use usage::{CostBasis, ProviderCallUsage, ProviderChannel};
 pub use warming::CacheWarmingMode;
