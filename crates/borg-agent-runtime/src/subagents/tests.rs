@@ -2048,6 +2048,16 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
         .await
         .unwrap_err();
     assert!(unauthorized.to_string().contains("only the director"));
+    assert!(coordinator
+        .configure_child("/root", Some(CodingProvider::Codex), None, None)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("not a child agent"));
+    assert!(coordinator
+        .configure_child(target, None, None, Some("invalid".into()))
+        .await
+        .is_err());
 
     let configured = coordinator
         .call_tool_as(

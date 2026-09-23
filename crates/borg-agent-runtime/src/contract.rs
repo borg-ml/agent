@@ -3017,6 +3017,38 @@ mod tests {
     }
 
     #[test]
+    fn child_configuration_control_has_a_correlated_cross_process_shape() {
+        let parent_session_id = Uuid::nil();
+        let request_id = Uuid::from_u128(3);
+        let command = HostCommand::Subagent {
+            session_id: parent_session_id,
+            action: SubagentAction::Configure {
+                request_id,
+                target: "/root/worker".into(),
+                provider: Some(CodingProvider::Codex),
+                model: Some("gpt-6-sol".into()),
+                effort: Some("max".into()),
+            },
+        };
+        let wire = serde_json::to_value(&command).unwrap();
+        assert_eq!(wire["action"]["type"], "configure");
+        assert_eq!(wire["action"]["request_id"], request_id.to_string());
+        assert_eq!(wire["action"]["target"], "/root/worker");
+        assert_eq!(wire["action"]["provider"], "codex");
+        assert_eq!(wire["action"]["model"], "gpt-6-sol");
+        assert_eq!(wire["action"]["effort"], "max");
+        let decoded: HostCommand = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.session_id(), Some(parent_session_id));
+        assert!(matches!(
+            decoded,
+            HostCommand::Subagent {
+                action: SubagentAction::Configure { request_id: id, .. },
+                ..
+            } if id == request_id
+        ));
+    }
+
+    #[test]
     fn focused_child_prompt_preserves_human_input_identity_and_delivery() {
         let parent_session_id = Uuid::nil();
         let child_session_id = Uuid::from_u128(2);
