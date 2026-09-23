@@ -112,8 +112,9 @@ parent requires D11 atomic editor/exclusive handoff and real-CLI proof.
    many FIFO slots. Workspace exposes a per-agent cap helper, not integrated
    job dispatch enforcement. Bench should report per-agent waits/fairness;
    wire an agent-aware reservation/fairness policy in v0.1.
-9. The mandatory remaining v0 gates are a rebuilt combined binary proving
-   atomic two-service budget admission, failure-path post-hook quarantine and
+9. The mandatory remaining v0 gates are canonical Project/Worktree key
+   identity (alias fail-open above), a rebuilt combined binary proving atomic
+   two-service budget admission, failure-path post-hook quarantine and
    failed-resume surfacing/retry, and session-derived editor owner/fencing at
    the model MCP boundary. Real UE runtime parity is a project migration
    acceptance test, not a Borg branch v0 gate.
@@ -127,6 +128,23 @@ Model-facing service MCP owner is **final parent integration**, not the
 services branch: only status should be exposed until registered spec policy
 and actual session-derived owner/fencing enforcement are audited. A tool
 argument `confirmed: true` is not a durable human approval for workspace GC.
+
+**NEW D11 canonical-key blocker (2026-09-23):** the committed Host-key
+two-service pass below is **not** Project-key parity. On pinned binary
+SHA256 `4022be198a99…`, the bench owner reported a public JSON CLI
+probe binding an
+active service to `Project(/tmp/.../project)`, then submitted an exclusive
+job for `Project(/tmp/.../project/../project)` with the same resource name.
+Both resolve to the same directory, yet job `48f18f43` **started** while
+service status stayed Healthy (backend PID 1585338, active client, no yield).
+The in-job assertion exited 1. Isolated test state
+`/tmp/borg-service-bench-_nsr0djs` was retained for diagnosis; test helper
+flag `--atomic-project-alias` is in-flight. This violates the canonical
+project identity contract and blocks v0 despite the Host-key scope passes.
+Normalize or reject noncanonical Project/Worktree paths at **every** lane,
+service and capacity entrypoint before key equality; rebuild and prove the
+path-alias regression and ordinary canonical path on the combined CLI. No
+integration/merge approval while this fail-open exists.
 
 **D11 scoped evidence (2026-09-23):** a stale worktree executable
 that predated delegated backend cgroups let a detached child survive yield
@@ -149,8 +167,8 @@ services remained fenced (no backend PID, proxy 503), then confirmed the hook
 completion marker before Healthy/front 200 auto-resume. Exit 0; test script
 SHA256 `7644a9674069229d6c81c1e68104f32b022878402ef9fdf2255cfb372493756d`
 unchanged during run, log `/tmp/gd-two-service-posthook.log`. The bench
-script was subsequently committed unchanged at bench `b0d4ea6`. This proves successful ordered
-post-hook/resume, not failure quarantine or durable retry.
+script was subsequently committed unchanged at bench `b0d4ea6`. This proves
+successful ordered post-hook/resume, not failure quarantine or durable retry.
 
 **Critical v0 release gate (parent decision):** lanes enters `Preparing` for
 exclusive project key R before grant; blocks new shared grants and synchronously
@@ -164,8 +182,9 @@ services owns yield ack/start refusal/resume. Bench has a passing real-CLI
 cross-module test with an active client lease, backend gone before job start,
 no restart during, and resume afterward. The scoped no-hook two-service
 case above and the successful ordered post-hook barrier pass on the pinned
-binary; finish review of post-hook failure/resume-retry, combined budget
-admission, and session-derived editor owner fencing before
+binary; **the Project path-alias fail-open above still blocks v0.** Fix
+canonical key identity, then finish post-hook failure/resume-retry, combined
+budget admission, and session-derived editor owner fencing before
 any v0 release. Fake Unreal adapters still do not establish real UE parity.
 
 Native adapter disk reservation is an estimate, **not** target-only quota/GC;
