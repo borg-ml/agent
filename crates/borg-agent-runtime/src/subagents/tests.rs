@@ -4964,15 +4964,50 @@ async fn lane_jobs_run_from_registered_templates_as_the_calling_session() {
     assert!(event.contains("Finished"), "{event}");
 }
 
+/// Backend for the live lane-service test below: this test binary re-executed
+/// as a minimal HTTP server; `/` reports its pid, other paths answer `ok`.
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "fake HTTP backend; launched by lane_service_leases_belong_to_the_calling_session_live"]
+fn fake_http_backend() {
+    use std::io::{BufRead, Write};
+    if std::env::var_os("BORG_TEST_FAKE_HTTP_BACKEND").is_none() {
+        return;
+    }
+    let port: u16 = std::env::args().next_back().unwrap().parse().unwrap();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    for mut stream in listener.incoming().flatten() {
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            let _ = reader.read_line(&mut request);
+            let mut header = String::new();
+            while reader.read_line(&mut header).is_ok_and(|read| read > 2) {
+                header.clear();
+            }
+            let body = if request.split_whitespace().nth(1) == Some("/") {
+                format!("pid={}\n", std::process::id())
+            } else {
+                "ok\n".to_string()
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.0 200 OK\r\ncontent-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+        });
+    }
+}
+
 /// Failure mode: a real supervised service accepting one session's lease,
 /// restart or capture read on behalf of another.
 #[tokio::test]
 #[cfg(target_os = "linux")]
-#[ignore = "requires BORG_LANE_EXECUTABLE (a built borg) and BORG_TEST_FAKE_SERVICE (gamedev_fake_service.py)"]
+#[ignore = "requires BORG_LANE_EXECUTABLE (a built borg)"]
 async fn lane_service_leases_belong_to_the_calling_session_live() {
     use crate::lane_tools::tests::fixture_tools;
     let executable = std::path::PathBuf::from(std::env::var_os("BORG_LANE_EXECUTABLE").unwrap());
-    let backend = std::env::var("BORG_TEST_FAKE_SERVICE").unwrap();
+    let backend = std::env::current_exe().unwrap();
     let (_lanes_dir, lanes, project) = fixture_tools();
     let lanes =
         crate::lane_tools::LaneTools::new(lanes.root, lanes.templates, Some(executable.clone()));
@@ -5012,8 +5047,10 @@ async fn lane_service_leases_belong_to_the_calling_session_live() {
         "1",
     ]);
     let spec = json!({
-        "id": "editor", "argv": ["/usr/bin/python3", backend, "{port}"],
-        "cwd": project, "env": [],
+        "id": "editor",
+        "argv": [backend, "--exact", "subagents::tests::fake_http_backend",
+                 "--include-ignored", "--quiet", "{port}"],
+        "cwd": project, "env": [["BORG_TEST_FAKE_HTTP_BACKEND", "1"]],
         "resources": [{"key": {"scope": "Host", "name": resource}, "access": {"Shared": {"slots": 1}}}],
         "adapter_enforces_leases": false, "read_only_paths": ["/", "/health"],
         "memory_max_bytes": 134217728,

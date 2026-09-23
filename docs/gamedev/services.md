@@ -245,7 +245,9 @@ The earlier SHA `011c4ba9…` gates do not establish the newer resume-readiness
 semantics.
 
 Shared-client real CLI gate on synthetic HTTP with the systemd-user manager:
-`python3 scripts/gamedev_shared_service_probe.py --borg PATH` passed against
+the former `scripts/gamedev_shared_service_probe.py` (now
+`shared_clients_restore_before_an_exclusive_and_failed_restores_fence_it` in
+`crates/borg-cli/tests/lane_services.rs`) passed against
 newly built `gamedev/services-shared` CLI SHA256
 `7904ca9704209d4ea7424d29ebdc6e66332cc4ae9d8529dc9de87bbe78834939`.
 Two independent owners held distinct IDs; the third was denied at
