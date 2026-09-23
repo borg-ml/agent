@@ -7037,6 +7037,9 @@ pub fn agent_tool_specs_for_surface(
     {
         spec["description"] = Value::String(SUB_AGENT_COMPUTER_USE.to_string());
         spec["inputSchema"]["properties"]["display"]["enum"] = json!(["private"]);
+        if let Some(properties) = spec["inputSchema"]["properties"].as_object_mut() {
+            properties.remove("restore_focus");
+        }
     }
     // Exception: the parent yield, steering and watcher lifecycle. A child
     // holding the parent yield on its behalf is a deadlock.
