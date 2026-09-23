@@ -7961,6 +7961,7 @@ async fn crash_reconciled_child_stop_is_durable_before_resumed_ready() {
                 detail: Some("turn phase: provider active".to_string()),
                 final_text: None,
                 usage: Default::default(),
+                interrupted_by: None,
             },
             event: None,
         },
@@ -14051,6 +14052,7 @@ async fn crash_resume_replays_native_compaction_without_subagent_inflation() {
                 detail: Some("historical agent card".repeat(20_000)),
                 final_text: Some("historical agent output".repeat(20_000)),
                 usage: Default::default(),
+                interrupted_by: None,
             },
             event: None,
         },
@@ -14664,6 +14666,7 @@ async fn parent_journal_preserves_full_child_transcript_events() {
         detail: None,
         final_text: None,
         usage: Default::default(),
+        interrupted_by: None,
     };
     coordinator
         .restore_from_events(&[SessionEvent::new(
@@ -18963,6 +18966,7 @@ fn watched_child(session_id: Uuid) -> crate::SubagentSnapshot {
         detail: None,
         final_text: None,
         usage: Default::default(),
+        interrupted_by: None,
     }
 }
 

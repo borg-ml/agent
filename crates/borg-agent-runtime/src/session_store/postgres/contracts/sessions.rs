@@ -650,6 +650,7 @@ fn persistence_and_fork_rules_are_typed_rust_contracts() {
         detail: None,
         final_text: None,
         usage: crate::SubagentUsage::default(),
+        interrupted_by: None,
     };
     let mirrored = |kind: SessionEventKind| SessionEventKind::SubagentActivity {
         activity: crate::SubagentActivityKind::Updated,

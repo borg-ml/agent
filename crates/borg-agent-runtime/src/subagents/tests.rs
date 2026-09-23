@@ -3927,6 +3927,7 @@ async fn durable_parent_activity_restores_child_topology() {
         detail: None,
         final_text: None,
         usage: SubagentUsage::default(),
+        interrupted_by: None,
     };
     let started = SessionEvent::new(
         root,
@@ -4235,6 +4236,9 @@ async fn a_child_restored_after_a_host_crash_is_still_addressable_in_the_team_wo
                 detail: None,
                 final_text: None,
                 usage: SubagentUsage::default(),
+                // The parent's own interrupt_agent stopped it before the
+                // crash; the restart must not turn that into a human stop.
+                interrupted_by: Some(root),
             },
             event: None,
         },
@@ -4259,16 +4263,16 @@ async fn a_child_restored_after_a_host_crash_is_still_addressable_in_the_team_wo
         session_store,
     )
     .unwrap();
+    // A restart reads the journal back, so restore what the store would.
+    let started: SessionEvent =
+        serde_json::from_value(serde_json::to_value(&started).unwrap()).unwrap();
     coordinator.restore_from_events(&[started]).await.unwrap();
 
-    assert_eq!(
-        coordinator
-            .resolve_snapshot("/root/worker")
-            .await
-            .unwrap()
-            .status,
-        SubagentStatus::Ready
-    );
+    let restored = coordinator.resolve_snapshot("/root/worker").await.unwrap();
+    assert_eq!(restored.status, SubagentStatus::Ready);
+    // Only the interrupter's follow-up can lift a parent interrupt; losing it
+    // on restart left three interrupted workers deaf to every wake.
+    assert_eq!(restored.interrupted_by, Some(root));
     coordinator
         .send_message("/root/worker", "resume the port")
         .await
@@ -4315,6 +4319,7 @@ async fn restore_mirrors_a_child_stop_journaled_before_the_parent_crashed() {
                 detail: Some("turn phase: provider active".into()),
                 final_text: None,
                 usage: SubagentUsage::default(),
+                interrupted_by: None,
             },
             event: None,
         },
@@ -4402,6 +4407,7 @@ async fn restored_live_child_stays_dormant_and_stops_with_its_root() {
         detail: None,
         final_text: Some("ready".into()),
         usage: SubagentUsage::default(),
+        interrupted_by: None,
     };
     let parent_event = SessionEvent::new(
         root,
@@ -6704,6 +6710,16 @@ async fn only_the_interrupting_agent_resumes_an_interrupted_child() {
         received.recv().await,
         Some(HostCommand::Interrupt { .. })
     ));
+    // The child's stop report journals this snapshot; it must name the
+    // interrupter so a restarted parent can still resume the child.
+    assert_eq!(
+        coordinator
+            .resolve_snapshot("worker")
+            .await
+            .unwrap()
+            .interrupted_by,
+        Some(root)
+    );
     // A real child records Running ("cancelling") while it winds down.
     child_event(
         &coordinator,

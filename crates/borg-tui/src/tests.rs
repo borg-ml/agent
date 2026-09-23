@@ -204,6 +204,7 @@ fn older_root_history_hides_agent_cards_and_preserves_authoritative_roster_state
         detail: Some("turn phase: provider active".to_string()),
         final_text: None,
         usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
     };
     let stale_parent_event = SessionEvent::new(
         root,
@@ -260,6 +261,7 @@ fn bootstrap_subagent_recovery_updates_do_not_become_root_cards() {
         usage: borg_remote::SubagentUsage::default(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        interrupted_by: None,
     };
     let recovery = SessionEventKind::SubagentActivity {
         activity: SubagentActivityKind::Completed,
@@ -3903,6 +3905,7 @@ fn large_resume_ingest_and_transcript_scroll_profile() {
             usage: Default::default(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            interrupted_by: None,
         };
         let child_event = SessionEvent::new(
             child_id,
@@ -4064,6 +4067,7 @@ fn projection_only_events_keep_the_transcript_layout_cache() {
         usage: Default::default(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
+        interrupted_by: None,
     };
     assert!(!session_event_changes_transcript(
         &SessionEventKind::SubagentActivity {
@@ -6621,6 +6625,7 @@ fn subagent_roster_shows_full_model_ids() {
         detail: None,
         final_text: None,
         usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
     };
 
     assert_eq!(
@@ -6757,6 +6762,7 @@ fn persistent_peers_follow_ordinary_agent_visibility() {
         detail: None,
         final_text: None,
         usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
     };
     let mut transcript = Transcript::default();
     transcript.upsert_subagent_snapshot(&peer);
@@ -6808,6 +6814,7 @@ fn agent_roster_contains_only_currently_working_children() {
         detail: None,
         final_text: None,
         usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
     };
     let agents = [
         snapshot("z_live", SubagentStatus::Running, 20),
@@ -6951,6 +6958,7 @@ fn subagent_activity_keeps_lifecycle_separate_from_agent_message() {
         detail: None,
         final_text: None,
         usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
     };
     let activity = |sequence, activity, agent: &SubagentSnapshot, event| {
         SessionEvent::new(
@@ -7117,6 +7125,7 @@ fn subagent_activity_updates_roster_without_transcript_rows_by_default() {
         detail: None,
         final_text: None,
         usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
     };
     let activity = |sequence, activity, event| {
         SessionEvent::new(
@@ -7252,6 +7261,7 @@ fn ready_subagent_status_updates_roster_without_notifying_the_director() {
         detail: None,
         final_text: None,
         usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
     };
     let activity = |agent: &SubagentSnapshot, event| {
         SessionEvent::new(
@@ -7329,6 +7339,7 @@ fn ready_subagent_with_provider_isolation_is_shown_as_a_failed_turn() {
         detail: Some(detail.to_string()),
         final_text: Some("I will inspect the code.".to_string()),
         usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
     };
     let child_event = SessionEvent::new(
         child_id,

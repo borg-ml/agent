@@ -68,6 +68,7 @@ async fn mirrored_child_provider_audit_events_are_live_only() {
         detail: None,
         final_text: None,
         usage: crate::SubagentUsage::default(),
+        interrupted_by: None,
     };
     let mirrored = |kind: SessionEventKind| SessionEventKind::SubagentActivity {
         activity: crate::SubagentActivityKind::Updated,
@@ -350,6 +351,7 @@ async fn dropping_live_only_child_rows_does_not_change_the_reconstructed_roster(
             total_tokens,
             ..Default::default()
         },
+        interrupted_by: None,
     };
     let row = |agent: crate::SubagentSnapshot, child: Option<SessionEventKind>| {
         SessionEventKind::SubagentActivity {
