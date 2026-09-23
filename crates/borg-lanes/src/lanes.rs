@@ -78,9 +78,13 @@ pub struct Lease {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TicketState {
     Queued,
+    /// FIFO reservation; pre-exclusive yield has not completed, so no lease is granted.
+    Preparing,
     Granted(Lease),
     Finished,
-    Cancelled { reason: String },
+    Cancelled {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -187,10 +191,22 @@ pub struct LaneRecord {
     pub progress: Option<String>,
     pub parallelism_hint: Option<u32>,
     pub cpu_seconds: Option<f64>,
+    #[serde(default)]
+    pub workload_pid: Option<u32>,
+    #[serde(default)]
+    pub workload_start_ticks: Option<u64>,
+    #[serde(default)]
+    pub scope_cgroup: Option<String>,
+    #[serde(default)]
+    pub post_scope: Option<String>,
+    #[serde(default)]
+    pub quarantined: bool,
+    #[serde(default)]
+    pub service_lease: bool,
     pub evidence: Option<String>,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct Journal {
     sequence: u64,
     records: Vec<LaneRecord>,
@@ -213,12 +229,13 @@ fn milliseconds() -> u64 {
 }
 
 fn stable_file(path: &Path) -> Result<File> {
-    Ok(OpenOptions::new()
+    OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .open(path)
-        .with_context(|| format!("opening stable lane lock {}", path.display()))?)
+        .with_context(|| format!("opening stable lane lock {}", path.display()))
 }
 
 impl LaneStore {
@@ -240,15 +257,15 @@ impl LaneStore {
     }
 
     pub fn default_root() -> PathBuf {
-        let base = std::env::var_os("BORG_LANE_DIR")
+        std::env::var_os("BORG_LANE_DIR")
+            .or_else(|| std::env::var_os("BORG_LANES_ROOT"))
             .map(PathBuf::from)
             .or_else(|| {
                 std::env::var_os("XDG_RUNTIME_DIR").map(|p| PathBuf::from(p).join("borg/lanes"))
             })
             .unwrap_or_else(|| {
                 std::env::temp_dir().join(format!("borg-lanes-{}", unsafe { libc::geteuid() }))
-            });
-        base
+            })
     }
 
     pub fn root(&self) -> &Path {
@@ -305,6 +322,70 @@ impl LaneStore {
         f(&serde_json::from_slice(&fs::read(path)?)?)
     }
 
+    /// Nonblocking shared claim by the long-lived service supervisor. The
+    /// returned lease is valid only while this LaneStore instance retains its
+    /// kernel FD; a service restart must acquire a NEW token before backend start.
+    pub fn try_acquire_service(&self, request: LeaseRequest) -> Result<Option<Lease>> {
+        ensure!(
+            request
+                .resources
+                .iter()
+                .all(|r| matches!(r.access, Access::Shared { .. })),
+            "service resource claims must be shared"
+        );
+        let mut held: Option<File> = None;
+        let lease = self.locked(|state| {
+            let (ticket, _) = self.enqueue_record(state, request, None)?;
+            let lock = stable_file(&self.ticket_path(ticket.id))?;
+            lock.lock()?;
+            held = Some(lock);
+            if dispatch_reason(state, ticket.id)?.is_some() {
+                state.records.retain(|r| r.ticket.id != ticket.id);
+                return Ok(None);
+            }
+            let entry = state
+                .records
+                .iter_mut()
+                .find(|r| r.ticket.id == ticket.id)
+                .context("service ticket missing")?;
+            entry.service_lease = true;
+            Ok(Some(grant_entry(entry)))
+        })?;
+        if let Some(lease) = &lease {
+            self.held
+                .lock()
+                .unwrap()
+                .insert(lease.ticket.id, held.context("service FD missing")?);
+        }
+        Ok(lease)
+    }
+
+    /// Reject a stale token before dropping the owner FD. Expired/restarted
+    /// services cannot release a newer generation.
+    pub fn release_lease(&self, lease: &Lease) -> Result<()> {
+        ensure!(
+            self.held.lock().unwrap().contains_key(&lease.ticket.id),
+            "lease is not held by this process"
+        );
+        self.locked(|state| {
+            let record = state
+                .records
+                .iter_mut()
+                .find(|r| r.ticket.id == lease.ticket.id)
+                .context("lease vanished")?;
+            ensure!(
+                matches!(&record.state, TicketState::Granted(current)
+                if current.id == lease.id && current.generation == lease.generation),
+                "lease token mismatch"
+            );
+            record.state = TicketState::Finished;
+            record.finished_ms = Some(milliseconds());
+            Ok(())
+        })?;
+        self.held.lock().unwrap().remove(&lease.ticket.id);
+        Ok(())
+    }
+
     pub fn snapshot(&self) -> Result<Vec<LaneRecord>> {
         self.reading(|state| Ok(state.records.clone()))
     }
@@ -356,8 +437,8 @@ impl LaneStore {
                 "job cwd does not exist: {}",
                 spec.cwd.display()
             );
-            if spec.coalesce {
-                if let Some(existing) = state.records.iter().find(|r| {
+            if spec.coalesce
+                && let Some(existing) = state.records.iter().find(|r| {
                     let Some(other) = r.spec.as_ref() else {
                         return false;
                     };
@@ -379,9 +460,9 @@ impl LaneStore {
                         && spec.memory_max_bytes == other.memory_max_bytes
                         && spec.timeout_ms == other.timeout_ms
                         && spec.stall_timeout_ms == other.stall_timeout_ms
-                }) {
-                    return Ok((existing.ticket.clone(), existing.job.clone()));
-                }
+                })
+            {
+                return Ok((existing.ticket.clone(), existing.job.clone()));
             }
         }
         state.sequence += 1;
@@ -415,6 +496,12 @@ impl LaneStore {
             progress: None,
             parallelism_hint: None,
             cpu_seconds: None,
+            workload_pid: None,
+            workload_start_ticks: None,
+            scope_cgroup: None,
+            post_scope: None,
+            quarantined: false,
+            service_lease: false,
             evidence: None,
         });
         Ok((ticket, job))
@@ -571,12 +658,25 @@ fn dispatch_reason(state: &Journal, id: Uuid) -> Result<Option<String>> {
     if !matches!(me.state, TicketState::Queued) {
         bail!("ticket is not queued");
     }
+    for quarantined in state.records.iter().filter(|r| r.quarantined) {
+        if quarantined
+            .request
+            .resources
+            .iter()
+            .any(|a| me.request.resources.iter().any(|b| conflicts(a, b)))
+        {
+            return Ok(Some(format!(
+                "resource quarantined after unverified orphan {}",
+                quarantined.ticket.id
+            )));
+        }
+    }
     for earlier in state
         .records
         .iter()
         .filter(|r| r.ticket.sequence < me.ticket.sequence)
     {
-        if matches!(earlier.state, TicketState::Queued)
+        if matches!(earlier.state, TicketState::Queued | TicketState::Preparing)
             && earlier
                 .request
                 .resources
@@ -590,7 +690,7 @@ fn dispatch_reason(state: &Journal, id: Uuid) -> Result<Option<String>> {
         let used = state
             .records
             .iter()
-            .filter(|r| matches!(r.state, TicketState::Granted(_)))
+            .filter(|r| matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
             .flat_map(|r| &r.request.resources)
             .filter(|r| r.key == requested.key)
             .fold(0_u32, |n, r| {
@@ -599,6 +699,18 @@ fn dispatch_reason(state: &Journal, id: Uuid) -> Result<Option<String>> {
                     Access::Shared { slots } => slots,
                 })
             });
+        let preparable_service_holder =
+            me.spec.as_ref().is_some_and(|spec| spec.pre_hook.is_some())
+                && matches!(requested.access, Access::Exclusive)
+                && state
+                    .records
+                    .iter()
+                    .filter(|r| matches!(r.state, TicketState::Granted(_)))
+                    .filter(|r| r.request.resources.iter().any(|r| r.key == requested.key))
+                    .all(|r| r.service_lease);
+        if preparable_service_holder {
+            continue;
+        }
         if used > 0 && matches!(requested.access, Access::Exclusive) {
             return Ok(Some(format!(
                 "exclusive resource {} busy",
@@ -619,6 +731,32 @@ fn dispatch_reason(state: &Journal, id: Uuid) -> Result<Option<String>> {
         }
     }
     Ok(None)
+}
+
+fn grant_entry(entry: &mut LaneRecord) -> Lease {
+    let lease = Lease {
+        id: Uuid::new_v4(),
+        generation: entry.ticket.sequence,
+        ticket: entry.ticket.clone(),
+        resources: entry.request.resources.clone(),
+        holder: entry.request.holder.clone(),
+    };
+    entry.state = TicketState::Granted(lease.clone());
+    entry.started_ms = Some(milliseconds());
+    entry.wait_reason = None;
+    if let Some(spec) = entry.spec.as_ref() {
+        let available = mem_available().unwrap_or(0);
+        let free = available.saturating_sub(spec.admission.reserve_ram_bytes);
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        entry.parallelism_hint =
+            Some(((free / (1024 * 1024 * 1024)) as usize).clamp(1, cores) as u32);
+    }
+    if let Some(job) = entry.job.as_mut() {
+        job.state = JobState::Running {
+            scope: String::new(),
+        };
+    }
+    lease
 }
 
 fn mem_available() -> Option<u64> {
@@ -644,7 +782,7 @@ fn disk_available(path: &Path) -> Option<u64> {
             return None;
         }
         let stat = unsafe { stat.assume_init() };
-        return Some(stat.f_bavail.saturating_mul(stat.f_frsize));
+        Some(stat.f_bavail.saturating_mul(stat.f_frsize))
     }
     #[cfg(not(unix))]
     {
@@ -657,14 +795,14 @@ fn budget_reason(state: &Journal, spec: &JobSpec) -> Option<String> {
     let reserved_ram: u64 = state
         .records
         .iter()
-        .filter(|r| matches!(r.state, TicketState::Granted(_)))
+        .filter(|r| matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
         .filter_map(|r| r.spec.as_ref())
         .map(|s| s.admission.reserve_ram_bytes)
         .sum();
     let reserved_disk: u64 = state
         .records
         .iter()
-        .filter(|r| matches!(r.state, TicketState::Granted(_)))
+        .filter(|r| matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
         .filter_map(|r| r.spec.as_ref())
         .filter(|s| s.admission.disk_path == spec.admission.disk_path)
         .map(|s| s.admission.reserve_disk_bytes)
@@ -674,12 +812,12 @@ fn budget_reason(state: &Journal, spec: &JobSpec) -> Option<String> {
         .min_available_ram_bytes
         .saturating_add(spec.admission.reserve_ram_bytes)
         .saturating_add(reserved_ram);
-    if let Some(available) = mem_available() {
-        if available < ram_needed {
-            return Some(format!(
-                "waiting for RAM: MemAvailable {available} bytes, need {ram_needed} bytes including {reserved_ram} reserved"
-            ));
-        }
+    if let Some(available) = mem_available()
+        && available < ram_needed
+    {
+        return Some(format!(
+            "waiting for RAM: MemAvailable {available} bytes, need {ram_needed} bytes including {reserved_ram} reserved"
+        ));
     }
     let disk_needed = spec
         .admission
@@ -697,6 +835,37 @@ fn budget_reason(state: &Journal, spec: &JobSpec) -> Option<String> {
         )),
         _ => None,
     }
+}
+
+fn proc_start_ticks(pid: u32) -> Option<u64> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    text.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+fn systemd_available() -> bool {
+    Command::new("systemd-run")
+        .args(["--user", "--scope", "--quiet", "--collect", "true"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn scope_control_group(unit: &str) -> Option<String> {
+    let output = Command::new("systemctl")
+        .args(["--user", "show", unit, "-p", "ControlGroup", "--value"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    if path.is_empty() { None } else { Some(path) }
 }
 
 fn proc_cpu(pid: u32) -> Option<f64> {
@@ -737,29 +906,21 @@ impl LaneStore {
                 entry.wait_reason = Some(reason);
                 return Ok(None);
             }
-            let lease = Lease {
-                id: Uuid::new_v4(),
-                generation: entry.ticket.sequence,
-                ticket: entry.ticket.clone(),
-                resources: entry.request.resources.clone(),
-                holder: entry.request.holder.clone(),
-            };
-            entry.state = TicketState::Granted(lease.clone());
-            entry.started_ms = Some(milliseconds());
-            entry.wait_reason = None;
-            if let Some(spec) = entry.spec.as_ref() {
-                let available = mem_available().unwrap_or(0);
-                let free = available.saturating_sub(spec.admission.reserve_ram_bytes);
-                let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-                entry.parallelism_hint =
-                    Some(((free / (1024 * 1024 * 1024)) as usize).clamp(1, cores) as u32);
+            if entry
+                .spec
+                .as_ref()
+                .is_some_and(|spec| spec.pre_hook.is_some())
+                && entry
+                    .request
+                    .resources
+                    .iter()
+                    .any(|r| matches!(r.access, Access::Exclusive))
+            {
+                entry.state = TicketState::Preparing;
+                entry.wait_reason = Some("waiting for synchronous pre-exclusive yield".to_owned());
+                return Ok(None);
             }
-            if let Some(job) = entry.job.as_mut() {
-                job.state = JobState::Running {
-                    scope: String::new(),
-                };
-            }
-            Ok(Some(lease))
+            Ok(Some(grant_entry(entry)))
         })
     }
 
@@ -772,11 +933,60 @@ impl LaneStore {
                 return Ok(lease);
             }
             let record = self.record(id)?;
-            if let Some(limit) = record.request.queue_timeout_ms {
-                if entered.elapsed().as_millis() >= u128::from(limit) {
-                    self.cancel_ticket(id, "queue timeout")?;
-                    bail!("queue timeout for ticket {id}");
+            if matches!(record.state, TicketState::Preparing) {
+                let spec = record.spec.context("preparing ticket has no job")?;
+                if let Some(hook) = &spec.pre_hook
+                    && let Err(error) = self.run_hook(hook, &spec, id, "pre-exclusive", true)
+                {
+                    // Yield may have partially succeeded. Resume the service
+                    // through the post hook even though no lease was granted.
+                    if let Some(post) = &spec.post_hook {
+                        let _ = self.run_hook(post, &spec, id, "post-exclusive", false);
+                    }
+                    return Err(error);
                 }
+                // The hook requesting yield is not proof of release. Recheck
+                // under the SAME journal lock used for service startup.
+                let granted = self.locked(|state| {
+                    let mut check = state.clone();
+                    let pending = check
+                        .records
+                        .iter_mut()
+                        .find(|r| r.ticket.id == id)
+                        .context("ticket disappeared")?;
+                    ensure!(
+                        matches!(pending.state, TicketState::Preparing),
+                        "ticket lost pre-grant reservation"
+                    );
+                    pending.state = TicketState::Queued;
+                    // Disable the service-holder exception: actual release is
+                    // required before the exclusive claim is granted.
+                    if let Some(spec) = pending.spec.as_mut() {
+                        spec.pre_hook = None;
+                    }
+                    ensure!(
+                        dispatch_reason(&check, id)?.is_none(),
+                        "service did not release resource before exclusive grant"
+                    );
+                    let entry = state
+                        .records
+                        .iter_mut()
+                        .find(|r| r.ticket.id == id)
+                        .context("ticket disappeared")?;
+                    Ok(grant_entry(entry))
+                });
+                if granted.is_err() {
+                    if let Some(post) = &spec.post_hook {
+                        let _ = self.run_hook(post, &spec, id, "post-exclusive", false);
+                    }
+                }
+                return granted;
+            }
+            if let Some(limit) = record.request.queue_timeout_ms
+                && entered.elapsed().as_millis() >= u128::from(limit)
+            {
+                self.cancel_ticket(id, "queue timeout")?;
+                bail!("queue timeout for ticket {id}");
             }
             // Snapshot followed by a subscribed notification (armed before
             // the snapshot) cannot miss an already-committed transition.
@@ -803,7 +1013,47 @@ impl LaneStore {
                 "BORG_LANE_RESOURCE",
                 spec.lease.resources.first().map_or("", |r| &r.key.name),
             )
-            .env("BORG_LANE_LOG", self.job_dir(id).join("output.log"));
+            .env("BORG_LANE_LOG", self.job_dir(id).join("output.log"))
+            .env("BORG_LANES_ROOT", &self.root);
+        if !sync {
+            let unit = format!("borg-lane-hook-{id}-{phase}.scope");
+            self.locked(|state| {
+                let entry = state
+                    .records
+                    .iter_mut()
+                    .find(|r| r.ticket.id == id)
+                    .context("post hook job missing")?;
+                entry.post_scope = Some(unit.clone());
+                Ok(())
+            })?;
+            if !systemd_available() {
+                bail!("asynchronous post hook requires a systemd user scope");
+            }
+            let mut scoped = Command::new("systemd-run");
+            scoped
+                .args([
+                    "--user",
+                    "--scope",
+                    "--quiet",
+                    "--collect",
+                    "--expand-environment=no",
+                ])
+                .arg(format!("--unit={unit}"))
+                .args(["-p", "MemoryMax=2G", "--"])
+                .arg(&hook.argv[0])
+                .args(&hook.argv[1..]);
+            command = scoped;
+            command
+                .current_dir(&spec.cwd)
+                .env("BORG_LANES_ROOT", &self.root)
+                .env("BORG_LANE_JOB", id.to_string())
+                .env("BORG_LANE_PHASE", phase)
+                .env(
+                    "BORG_LANE_RESOURCE",
+                    spec.lease.resources.first().map_or("", |r| &r.key.name),
+                )
+                .env("BORG_LANE_LOG", self.job_dir(id).join("output.log"));
+        }
         let mut child = command.stdin(Stdio::null()).spawn()?;
         if !sync {
             return Ok(());
@@ -864,6 +1114,13 @@ impl LaneStore {
     }
 
     fn supervise_job(&self, id: Uuid) -> Result<i32> {
+        let scoped = std::env::var_os("BORG_LANE_SCOPE").as_deref()
+            != Some(std::ffi::OsStr::new("0"))
+            && systemd_available();
+        ensure!(
+            scoped || std::env::var("BORG_LANE_DEGRADED").as_deref() == Ok("1"),
+            "lane requires a systemd user manager (set BORG_LANE_DEGRADED=1 only for explicit unscoped testing)"
+        );
         let lease = self.wait_grant(id)?;
         let spec = self.record(id)?.spec.context("job spec missing")?;
         let exclusive = spec
@@ -871,15 +1128,11 @@ impl LaneStore {
             .resources
             .iter()
             .any(|r| matches!(r.access, Access::Exclusive));
-        if let Some(pre) = &spec.pre_hook {
-            // A failed yield must prevent an exclusive command from starting.
-            self.run_hook(
-                pre,
-                &spec,
-                id,
-                if exclusive { "pre-exclusive" } else { "pre" },
-                true,
-            )?;
+        if let Some(pre) = &spec.pre_hook
+            && !exclusive
+        {
+            // Exclusive hooks already ran before the grant as a FIFO barrier.
+            self.run_hook(pre, &spec, id, "pre", true)?;
         }
         let log = OpenOptions::new()
             .create(true)
@@ -887,15 +1140,7 @@ impl LaneStore {
             .open(self.job_dir(id).join("output.log"))?;
         let stderr = log.try_clone()?;
         let unit = format!("borg-lane-{id}.scope");
-        let mut command = if std::env::var_os("BORG_LANE_SCOPE").as_deref()
-            != Some(std::ffi::OsStr::new("0"))
-            && Command::new("systemd-run")
-                .args(["--user", "--scope", "--quiet", "--collect", "true"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-        {
+        let mut command = if scoped {
             let mut command = Command::new("systemd-run");
             command
                 .args([
@@ -924,6 +1169,11 @@ impl LaneStore {
         } else {
             let mut command = Command::new(&spec.argv[0]);
             command.args(&spec.argv[1..]);
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
             command
         };
         command
@@ -935,15 +1185,34 @@ impl LaneStore {
         let mut child = command
             .spawn()
             .with_context(|| format!("starting job {id}"))?;
+        let mut group = if scoped {
+            scope_control_group(&unit)
+        } else {
+            None
+        };
+        if scoped {
+            for _ in 0..20 {
+                if group.is_some() || child.try_wait()?.is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+                group = scope_control_group(&unit);
+            }
+        }
         self.locked(|state| {
             let record = state
                 .records
                 .iter_mut()
                 .find(|r| r.ticket.id == id)
                 .context("job vanished")?;
+            record.workload_pid = Some(child.id());
+            record.workload_start_ticks = proc_start_ticks(child.id());
+            if scoped {
+                record.scope_cgroup = group;
+            }
             if let Some(job) = record.job.as_mut() {
                 job.state = JobState::Running {
-                    scope: unit.clone(),
+                    scope: if scoped { unit.clone() } else { String::new() },
                 };
             }
             Ok(())
@@ -992,8 +1261,13 @@ impl LaneStore {
                         .stderr(Stdio::null())
                         .status();
                 }
-                // Without a scope, the supervisor can kill only the child it
-                // started and can still wait on; never sweep names or PIDs.
+                // Degraded mode may signal only its own verified live process group.
+                if !scoped && self.record(id)?.workload_start_ticks == proc_start_ticks(child.id())
+                {
+                    unsafe {
+                        libc::kill(-(child.id() as i32), libc::SIGKILL);
+                    }
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 break if reason == "timeout" { 124 } else { 125 };
@@ -1029,16 +1303,19 @@ impl LaneStore {
         let mut actions = Vec::new();
         // Avoid nested metadata locks: test each kernel lock before journalling.
         for record in self.snapshot()? {
-            if !matches!(record.state, TicketState::Granted(_) | TicketState::Queued)
-                || record.job.is_none()
+            if !matches!(
+                record.state,
+                TicketState::Granted(_) | TicketState::Queued | TicketState::Preparing
+            ) || (record.job.is_none() && !record.service_lease)
             {
                 continue;
             }
             let lock = stable_file(&self.ticket_path(record.ticket.id))?;
-            if lock.try_lock_shared().is_err() {
-                continue;
+            match lock.try_lock_shared() {
+                Ok(()) => drop(lock),
+                Err(std::fs::TryLockError::WouldBlock) => continue,
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
             }
-            drop(lock);
             let note = format!(
                 "job {} lost supervisor pid {:?} while {:?}",
                 record.ticket.id, record.supervisor_pid, record.state
@@ -1047,18 +1324,57 @@ impl LaneStore {
             if dry_run {
                 continue;
             }
+            let mut verified = !record.service_lease;
             if let Some(JobHandle {
                 state: JobState::Running { scope },
                 ..
             }) = &record.job
             {
-                if scope == &format!("borg-lane-{}.scope", record.ticket.id) {
-                    let _ = Command::new("systemctl")
-                        .args(["--user", "kill", "--signal=SIGKILL", scope])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
+                if !scope.is_empty() {
+                    let expected = format!("borg-lane-{}.scope", record.ticket.id);
+                    let current = scope_control_group(scope);
+                    if scope != &expected
+                        || !current
+                            .as_ref()
+                            .is_some_and(|c| c.ends_with(&format!("/{expected}")))
+                        || record
+                            .scope_cgroup
+                            .as_ref()
+                            .is_some_and(|recorded| Some(recorded) != current.as_ref())
+                    {
+                        verified = false;
+                    } else {
+                        verified = Command::new("systemctl")
+                            .args(["--user", "kill", "--signal=SIGKILL", scope])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status()
+                            .is_ok_and(|s| s.success());
+                    }
+                } else if let (Some(pid), Some(ticks)) =
+                    (record.workload_pid, record.workload_start_ticks)
+                {
+                    if proc_start_ticks(pid) == Some(ticks) {
+                        verified = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } == 0;
+                    } else {
+                        verified = false;
+                    }
+                } else {
+                    verified = false;
                 }
+            }
+            if !verified {
+                self.locked(|state| {
+                    let entry = state
+                        .records
+                        .iter_mut()
+                        .find(|r| r.ticket.id == record.ticket.id)
+                        .context("recovery job missing")?;
+                    entry.quarantined = true;
+                    entry.evidence =
+                        Some(format!("unverified owner; resource quarantined: {note}"));
+                    Ok(())
+                })?;
             }
             self.log_recovery(record.ticket.id, &note)?;
             self.finish(record.ticket.id, 125, &note)?;
@@ -1090,24 +1406,7 @@ impl LaneCoordinator for LaneStore {
         .await?
     }
     async fn release(&self, lease: &Lease) -> Result<()> {
-        ensure!(
-            self.held.lock().unwrap().remove(&lease.ticket.id).is_some(),
-            "lease is not held by this process"
-        );
-        self.locked(|state| {
-            let record = state
-                .records
-                .iter_mut()
-                .find(|r| r.ticket.id == lease.ticket.id)
-                .context("lease vanished")?;
-            ensure!(
-                matches!(&record.state, TicketState::Granted(current) if current.id == lease.id && current.generation == lease.generation),
-                "lease token mismatch"
-            );
-            record.state = TicketState::Finished;
-            record.finished_ms = Some(milliseconds());
-            Ok(())
-        })
+        self.release_lease(lease)
     }
     async fn ticket_status(&self, ticket: &Ticket) -> Result<TicketState> {
         self.ticket_state(ticket)
@@ -1131,6 +1430,80 @@ impl JobCoordinator for LaneStore {
     }
     async fn cancel(&self, id: Uuid) -> Result<()> {
         self.cancel_ticket(id, "cancelled by requester")
+    }
+}
+
+/// Cross-process journal change notification. Install the watch before taking
+/// the first snapshot, then drain after each wake. The timeout only rechecks
+/// external RAM/disk changes that have no journal event.
+struct StateEvents {
+    #[cfg(target_os = "linux")]
+    fd: std::os::fd::OwnedFd,
+}
+impl StateEvents {
+    fn new(path: &Path) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::ffi::CString;
+            use std::os::fd::FromRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+            let name = CString::new(path.as_os_str().as_bytes())?;
+            let watch = unsafe {
+                libc::inotify_add_watch(
+                    std::os::fd::AsRawFd::as_raw_fd(&fd),
+                    name.as_ptr(),
+                    libc::IN_MOVED_TO,
+                )
+            };
+            if watch < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(Self { fd })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            Ok(Self {})
+        }
+    }
+    fn wait(&self, timeout: Duration) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut poll = libc::pollfd {
+                fd: self.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe {
+                libc::poll(
+                    &mut poll,
+                    1,
+                    timeout.as_millis().min(i32::MAX as u128) as i32,
+                )
+            };
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if rc > 0 {
+                let mut bytes = [0u8; 4096];
+                while unsafe {
+                    libc::read(self.fd.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len())
+                } > 0
+                {}
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::thread::sleep(timeout);
+            Ok(())
+        }
     }
 }
 
@@ -1180,6 +1553,12 @@ mod tests {
             progress: None,
             parallelism_hint: None,
             cpu_seconds: None,
+            workload_pid: None,
+            workload_start_ticks: None,
+            scope_cgroup: None,
+            post_scope: None,
+            quarantined: false,
+            service_lease: false,
             evidence: None,
         }
     }
@@ -1279,6 +1658,149 @@ mod tests {
         );
     }
     #[test]
+    fn service_lease_yields_before_exclusive_grant_and_blocks_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let service_request = LeaseRequest {
+            resources: vec![resource("project", Access::Shared { slots: 1 })],
+            holder: holder(),
+            queue_timeout_ms: None,
+        };
+        let service = store
+            .try_acquire_service(service_request.clone())
+            .unwrap()
+            .unwrap();
+        let spec = JobSpec {
+            fingerprint: JobFingerprint("yield-r1".into()),
+            lease: LeaseRequest {
+                resources: vec![resource("project", Access::Exclusive)],
+                holder: holder(),
+                queue_timeout_ms: None,
+            },
+            argv: vec!["true".into()],
+            cwd: dir.path().into(),
+            env: vec![],
+            memory_max_bytes: None,
+            admission: AdmissionBudget {
+                min_available_ram_bytes: 0,
+                reserve_ram_bytes: 0,
+                min_free_disk_bytes: 0,
+                reserve_disk_bytes: 0,
+                disk_path: dir.path().into(),
+            },
+            pre_hook: Some(Hook {
+                argv: vec!["sh".into(), "-c".into(), "sleep 0.3".into()],
+                timeout_ms: 2000,
+            }),
+            post_hook: None,
+            timeout_ms: 2000,
+            stall_timeout_ms: None,
+            coalesce: false,
+        };
+        let job = store.enqueue_job(spec).unwrap();
+        let waiting = store.clone();
+        let task = std::thread::spawn(move || waiting.wait_grant(job.id));
+        let started = std::time::Instant::now();
+        loop {
+            if matches!(
+                store.ticket_state(&job.ticket).unwrap(),
+                TicketState::Preparing
+            ) {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "exclusive did not prepare"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Preparing blocks a new backend even before the old backend yields.
+        assert!(
+            store
+                .try_acquire_service(service_request.clone())
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            store.ticket_state(&job.ticket).unwrap(),
+            TicketState::Preparing
+        ));
+        store.release_lease(&service).unwrap();
+        let exclusive = task.join().unwrap().unwrap();
+        assert!(matches!(
+            store.ticket_state(&job.ticket).unwrap(),
+            TicketState::Granted(_)
+        ));
+        // Timed resume/crash restart must fail until this exclusive is finished.
+        assert!(
+            store
+                .try_acquire_service(service_request.clone())
+                .unwrap()
+                .is_none()
+        );
+        store
+            .finish(exclusive.ticket.id, 0, "test complete")
+            .unwrap();
+        let resumed = store.try_acquire_service(service_request).unwrap().unwrap();
+        assert!(resumed.generation > service.generation);
+        store.release_lease(&resumed).unwrap();
+    }
+
+    #[test]
+    fn pre_hook_success_without_yield_does_not_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let held = store
+            .try_acquire_service(LeaseRequest {
+                resources: vec![resource("project", Access::Shared { slots: 1 })],
+                holder: holder(),
+                queue_timeout_ms: None,
+            })
+            .unwrap()
+            .unwrap();
+        let spec = JobSpec {
+            fingerprint: JobFingerprint("no-yield".into()),
+            lease: LeaseRequest {
+                resources: vec![resource("project", Access::Exclusive)],
+                holder: holder(),
+                queue_timeout_ms: None,
+            },
+            argv: vec!["true".into()],
+            cwd: dir.path().into(),
+            env: vec![],
+            memory_max_bytes: None,
+            admission: AdmissionBudget {
+                min_available_ram_bytes: 0,
+                reserve_ram_bytes: 0,
+                min_free_disk_bytes: 0,
+                reserve_disk_bytes: 0,
+                disk_path: dir.path().into(),
+            },
+            pre_hook: Some(Hook {
+                argv: vec!["true".into()],
+                timeout_ms: 1000,
+            }),
+            post_hook: None,
+            timeout_ms: 2000,
+            stall_timeout_ms: None,
+            coalesce: false,
+        };
+        let job = store.enqueue_job(spec).unwrap();
+        assert!(
+            store
+                .wait_grant(job.id)
+                .unwrap_err()
+                .to_string()
+                .contains("did not release")
+        );
+        assert!(!matches!(
+            store.ticket_state(&job.ticket).unwrap(),
+            TicketState::Granted(_)
+        ));
+        store.finish(job.id, 125, "failed yield").unwrap();
+        store.release_lease(&held).unwrap();
+    }
+    #[test]
     fn pending_coalesces_only_matching_workload_and_options() {
         let dir = tempfile::tempdir().unwrap();
         let store = LaneStore::new(dir.path()).unwrap();
@@ -1329,79 +1851,5 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-    }
-}
-
-/// Cross-process journal change notification. Install the watch before taking
-/// the first snapshot, then drain after each wake. The timeout only rechecks
-/// external RAM/disk changes that have no journal event.
-struct StateEvents {
-    #[cfg(target_os = "linux")]
-    fd: std::os::fd::OwnedFd,
-}
-impl StateEvents {
-    fn new(path: &Path) -> Result<Self> {
-        #[cfg(target_os = "linux")]
-        {
-            use std::ffi::CString;
-            use std::os::fd::FromRawFd;
-            use std::os::unix::ffi::OsStrExt;
-            let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
-            let name = CString::new(path.as_os_str().as_bytes())?;
-            let watch = unsafe {
-                libc::inotify_add_watch(
-                    std::os::fd::AsRawFd::as_raw_fd(&fd),
-                    name.as_ptr(),
-                    libc::IN_MOVED_TO,
-                )
-            };
-            if watch < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            Ok(Self { fd })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = path;
-            Ok(Self {})
-        }
-    }
-    fn wait(&self, timeout: Duration) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            let mut poll = libc::pollfd {
-                fd: self.fd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let rc = unsafe {
-                libc::poll(
-                    &mut poll,
-                    1,
-                    timeout.as_millis().min(i32::MAX as u128) as i32,
-                )
-            };
-            if rc < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            if rc > 0 {
-                let mut bytes = [0u8; 4096];
-                while unsafe {
-                    libc::read(self.fd.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len())
-                } > 0
-                {}
-            }
-            Ok(())
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            std::thread::sleep(timeout);
-            Ok(())
-        }
     }
 }
