@@ -338,6 +338,7 @@ impl SessionEventKind {
         matches!(
             self,
             Self::SessionStarted
+                | Self::SessionTitled { .. }
                 | Self::SessionConfigured { .. }
                 | Self::ProviderCapabilitiesUpdated { .. }
                 | Self::EffectiveCapabilitiesUpdated { .. }
@@ -359,6 +360,7 @@ impl SessionEventKind {
             Self::ProviderSessionLinked { .. }
                 | Self::ProviderCapabilitiesUpdated { .. }
                 | Self::EffectiveCapabilitiesUpdated { .. }
+                | Self::SessionTitled { .. }
                 | Self::TurnStarted { .. }
                 | Self::StatusChanged { .. }
                 // A fork is a fresh human-initiated branch and never inherits
@@ -475,7 +477,8 @@ impl SessionEventKind {
             Self::ProviderCapabilitiesUpdated { .. }
             | Self::EffectiveCapabilitiesUpdated { .. }
             | Self::ContextWindowUpdated { .. }
-            | Self::UsageUpdated { .. } => false,
+            | Self::UsageUpdated { .. }
+            | Self::SessionTitled { .. } => false,
             // Entering an active state is the user starting work; a terminal
             // mark is the host tidying up, and any real work that preceded it
             // already moved the clock moments earlier.
@@ -716,6 +719,9 @@ pub struct SessionState {
     pub status_detail: Option<String>,
     pub imported_from: Option<String>,
     pub imported_title: Option<String>,
+    pub title: Option<String>,
+    pub title_generated: bool,
+    pub title_usage_tokens: Option<u64>,
     pub active_processes: BTreeSet<Uuid>,
     pub provider_session_id: Option<String>,
     /// Instruction contract of the last acknowledged native provider thread.
@@ -789,6 +795,17 @@ impl SessionState {
         }
         match &event.kind {
             SessionEventKind::SessionStarted => self.started_at = Some(event.created_at),
+            SessionEventKind::SessionTitled {
+                title,
+                generated,
+                usage_tokens,
+            } => {
+                if !self.title_generated {
+                    self.title = Some(title.clone());
+                    self.title_generated = *generated;
+                    self.title_usage_tokens = *usage_tokens;
+                }
+            }
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "conversation_imported" =>
             {

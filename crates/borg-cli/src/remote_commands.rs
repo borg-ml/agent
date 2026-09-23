@@ -2229,6 +2229,8 @@ async fn run_local_agent_session(
         "{provider:?} requires --model or BORG_OPENAI_COMPATIBLE_MODEL"
     );
     let mut capabilities = borg_remote::SessionCapabilities::from(&agent_config.capabilities);
+    capabilities.luna_titles_for_all_providers =
+        editor_preferences.interaction.luna_titles_for_all_providers;
     let provider_probe_started = std::time::Instant::now();
     capabilities.provider_capabilities = probe_provider_admission_capabilities().await;
     let provider_probe_ms = provider_probe_started.elapsed().as_millis() as u64;
@@ -2399,10 +2401,8 @@ async fn run_local_agent_session(
         fast,
         response_language,
         permission_mode,
-        name: cwd
-            .file_name()
-            .and_then(|value| value.to_str())
-            .map(str::to_string),
+        // The directory is a workspace label, not an explicit thread title.
+        name: None,
         initial_prompt,
         capabilities,
         subagent_concurrency_limit: Some(agent_config.subagent_concurrency_limit()),
@@ -2666,6 +2666,9 @@ async fn run_local_agent_session(
             editor_preferences.interaction.completion_sound,
         );
         terminal.set_auto_copy_selection(editor_preferences.interaction.auto_copy_selection);
+        terminal.set_luna_titles_for_all_providers(
+            editor_preferences.interaction.luna_titles_for_all_providers,
+        );
         terminal.set_transcript_labels(
             editor_preferences.transcript.user_label.clone(),
             editor_preferences.transcript.assistant_label.clone(),
@@ -3764,6 +3767,9 @@ async fn run_local_agent_session(
                                 );
                                 terminal.set_auto_copy_selection(
                                     editor_preferences.interaction.auto_copy_selection,
+                                );
+                                terminal.set_luna_titles_for_all_providers(
+                                    editor_preferences.interaction.luna_titles_for_all_providers,
                                 );
                                 terminal.set_transcript_labels(
                                     editor_preferences.transcript.user_label.clone(),
@@ -5410,6 +5416,19 @@ async fn run_local_agent_session(
                         terminal.set_notice(format!(
                             "Completion notifications: {}",
                             completion_alert_policy_name(policy)
+                        ));
+                    }
+                    UiAction::SetLunaTitlesForAllProviders(enabled) => {
+                        editor_preferences.interaction.luna_titles_for_all_providers = enabled;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_luna_titles_for_all_providers(enabled);
+                        terminal.set_notice(format!(
+                            "Luna titles across providers: {} · applies to new threads with an available Codex subscription",
+                            if enabled { "on" } else { "off" }
                         ));
                     }
                     UiAction::SetAutoCopySelection(enabled) => {
@@ -8153,7 +8172,11 @@ async fn recent_session_options(
                 .as_ref()
                 .map(|source| format!("from {source}")),
             Some(prompt_summary(
-                state.imported_title.as_deref().unwrap_or(&primary_preview),
+                state
+                    .imported_title
+                    .as_deref()
+                    .or(state.title.as_deref())
+                    .unwrap_or(&primary_preview),
                 56,
             )),
         ]
@@ -8182,6 +8205,9 @@ async fn recent_session_options(
                 .imported_title
                 .as_ref()
                 .map(|title| format!("**Original title:** {title}")),
+            state.title_usage_tokens.map(|tokens| {
+                format!("**Title model:** `gpt-6-luna@low` · {tokens} tokens (subscription)")
+            }),
             cwd.map(|cwd| format!("**Directory:** `{cwd}`")),
             model.map(|model| format!("**Model:** `{model}`")),
         ]

@@ -316,6 +316,7 @@ impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
             watcher_yield: value.watcher_yield,
             steer_reply_prompt: value.steer_reply_prompt.clone(),
             provider_capabilities: Vec::new(),
+            luna_titles_for_all_providers: false,
             runtime_mcp_context: None,
             runtime_provider_context: None,
             system_prompt_appendix: None,
