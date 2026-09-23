@@ -203,6 +203,44 @@ fn supervisor_crash_recovers_only_the_owned_scope() {
     assert!(!lane.record(&job).unwrap().quarantined);
 }
 
+/// Failure mode: Ctrl-C on the submitting terminal (a signal to its process
+/// group) killing the job supervisor, which recovery then turns into a
+/// killed build; and a workload that cannot name its own job.
+#[test]
+fn sigint_to_the_submitters_process_group_does_not_stop_the_job() {
+    use std::os::unix::process::CommandExt;
+    let lane = Lane::new();
+    let marker = lane.root.join("finished");
+    let spec = lane.spec(
+        "detached",
+        &format!(
+            "sleep 1; echo \"$BORG_LANE_JOB $BORG_LANES_ROOT\" > '{}'",
+            marker.display()
+        ),
+    );
+    let mut submit = lane.command(&["job", "submit", "--spec", "-"]);
+    submit.process_group(0).stdin(std::process::Stdio::piped());
+    let mut child = submit.spawn().unwrap();
+    let group = child.id();
+    serde_json::to_writer(child.stdin.take().unwrap(), &spec).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", describe(&out));
+    let job = serde_json::from_slice::<Value>(&out.stdout).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // What a terminal's Ctrl-C sends to its foreground process group. With a
+    // detached supervisor the group may already be empty.
+    let _ = Command::new("kill")
+        .args(["-INT", "--", &format!("-{group}")])
+        .status();
+    lane.wait(&job, 0);
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap().trim(),
+        format!("{job} {}", lane.state().display())
+    );
+}
+
 /// Several agents submit a mixed workload concurrently. Judged only from the
 /// CLI's own status records: jobs holding the same exclusive key never
 /// overlap, a shared host capacity is never over-admitted, and every job ends.
