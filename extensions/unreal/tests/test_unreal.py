@@ -127,6 +127,8 @@ class AdapterTests(unittest.TestCase):
                          'for arg; do case "$arg" in -Log=*) log="${arg#-Log=}";; esac; done\n'
                          'echo "[1/1] Compile" > "$log"\n'
                          'test -d "$TMPDIR" && test -d "$UBA_FILE_MAPPING_DIR" || exit 92\n'
+                         'test -z "${UBA_FILE_MAPPING_MEMFD:-}" && '
+                         'test -z "${UnrealBuildTool_TMP:-}" || exit 93\n'
                          'printf "%s\n%s\n" "$TMPDIR" "$UBA_FILE_MAPPING_DIR" > "' +
                          str(self.root / 'uba-env.txt') + '"\n'
                          'mkdir -p "' + str(self.project.parent / 'Binaries/Linux') + '"\n'
@@ -139,7 +141,8 @@ class AdapterTests(unittest.TestCase):
         log = self.root / 'build.log'
         ambient_mapping = self.root / 'shared-uba'
         env = dict(self.env, UE_UBT_START_LOCK=str(self.root / 'ubt.lock'),
-                   TMPDIR=str(self.root), UBA_FILE_MAPPING_DIR=str(ambient_mapping))
+                   TMPDIR=str(self.root), UBA_FILE_MAPPING_DIR=str(ambient_mapping),
+                   UBA_FILE_MAPPING_MEMFD='1', UnrealBuildTool_TMP=str(self.root))
         proc = subprocess.run([sys.executable, str(ROOT / 'bin/ubt.py'),
                                '--symbols', str(manifest), '--', str(build),
                                'GameEditor', 'Linux', 'Development', str(self.project),
