@@ -2413,10 +2413,22 @@ async fn run_local_agent_session(
     }
     let mut history_start_reached = session_state.latest_sequence == 0
         || history.first().is_some_and(|event| event.sequence <= 1);
-    let (team_history, team_snapshots) = if can_prompt && !fallback_terminal {
+    let (team_history, tail_team_snapshots) = if can_prompt && !fallback_terminal {
         subagent_state_from_history(&history)
     } else {
         (Vec::new(), Vec::new())
+    };
+    // The root transcript needs the complete child identity set before its
+    // first replay. The recovery projection contains only the latest activity
+    // per child, so this read is small even for a long-running team session.
+    let team_snapshots = if resuming && can_prompt && !fallback_terminal {
+        let team = store
+            .recovery_parts(session_id, RecoveryParts::SUBAGENTS)
+            .await
+            .context("failed to restore the team roster before transcript replay")?;
+        latest_subagent_snapshots(&team.subagent_events)
+    } else {
+        tail_team_snapshots
     };
     // The initial host prompt keeps its admission key across startup retries.
     let request_id = if args.session_host.is_some() {
@@ -2655,9 +2667,6 @@ async fn run_local_agent_session(
     if let Some(terminal) = terminal.as_mut() {
         terminal.set_configured_model_entries(agent_config.configured_model_entries());
         terminal.set_extension_commands(extension_catalog.api_snapshot().commands);
-        if resuming {
-            terminal.begin_team_history_hydration();
-        }
         terminal.seed_team_roster(&team_snapshots);
         terminal.seed_history(&history);
         terminal.seed_session_state(&display_session_state);
@@ -3518,11 +3527,6 @@ async fn run_local_agent_session(
                                 &team_snapshots,
                                 &child_histories,
                             );
-                            if transcript_live_tail {
-                                transcript_rebuild_pending = true;
-                            } else {
-                                terminal.replace_history(&history);
-                            }
                             terminal_dirty = true;
                         }
                     }
@@ -3530,11 +3534,6 @@ async fn run_local_agent_session(
                         tracing::warn!(%error, "could not hydrate subagent history after first paint");
                         if let Some(terminal) = terminal.as_mut() {
                             terminal.finish_child_history_hydration();
-                            if transcript_live_tail {
-                                transcript_rebuild_pending = true;
-                            } else {
-                                terminal.replace_history(&history);
-                            }
                             terminal_dirty = true;
                         }
                     }
@@ -3542,11 +3541,6 @@ async fn run_local_agent_session(
                         tracing::warn!(%error, "subagent history hydration task failed");
                         if let Some(terminal) = terminal.as_mut() {
                             terminal.finish_child_history_hydration();
-                            if transcript_live_tail {
-                                transcript_rebuild_pending = true;
-                            } else {
-                                terminal.replace_history(&history);
-                            }
                             terminal_dirty = true;
                         }
                     }
@@ -4101,18 +4095,16 @@ async fn run_local_agent_session(
                     if event.sequence == 0 && coalesced_transcript_event(&event.kind) {
                         transcript_live_tail = true;
                     }
-                    if history
-                        .last()
-                        .is_none_or(|loaded| loaded.sequence < event.sequence)
+                    if event.sequence > 0
+                        && history
+                            .last()
+                            .is_none_or(|loaded| loaded.sequence < event.sequence)
                     {
                         history.push(event.clone());
                     }
-                    if matches!(
-                        &event.kind,
-                        SessionEventKind::TurnCompleted { error: None, .. }
-                    ) {
-                        // A successful durable turn boundary supersedes its
-                        // coalesced streaming snapshots.
+                    if matches!(&event.kind, SessionEventKind::TurnCompleted { .. }) {
+                        // The store retires coalesced live state at every
+                        // terminal turn boundary, including interruption.
                         if history_has_coalesced_events {
                             history.retain(|event| event.sequence > 0);
                             history_has_coalesced_events = false;
