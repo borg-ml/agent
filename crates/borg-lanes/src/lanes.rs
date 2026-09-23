@@ -133,12 +133,23 @@ fn default_foreign_client_grace_ms() -> u64 {
     300_000
 }
 
+/// Override a job's foreign-client wait for one exclusive resource key.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ForeignClientGrace {
+    pub resource: ResourceKey,
+    /// Zero means wait indefinitely for clients on this resource.
+    pub grace_ms: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JobSpec {
     /// Foreign client leases delay preemption for this many milliseconds.
     /// Zero waits indefinitely; default is five minutes.
     #[serde(default = "default_foreign_client_grace_ms")]
     pub foreign_client_grace_ms: u64,
+    /// Per-exclusive-resource grace; unspecified resources use the job-wide default.
+    #[serde(default)]
+    pub foreign_client_grace_by_resource: Vec<ForeignClientGrace>,
     pub fingerprint: JobFingerprint,
     pub lease: LeaseRequest,
     pub argv: Vec<String>,
@@ -603,6 +614,22 @@ impl LaneStore {
     ) -> Result<(Ticket, Option<JobHandle>)> {
         Self::validate(&request, &state.capacities)?;
         if let Some(ref spec) = spec {
+            let mut grace_keys = HashSet::new();
+            for override_ in &spec.foreign_client_grace_by_resource {
+                ensure!(
+                    spec.lease.resources.iter().any(|resource| {
+                        resource.key == override_.resource
+                            && matches!(resource.access, Access::Exclusive)
+                    }),
+                    "foreign-client grace override requires a requested exclusive resource: {}",
+                    override_.resource.name
+                );
+                ensure!(
+                    grace_keys.insert(&override_.resource),
+                    "duplicate foreign-client grace override: {}",
+                    override_.resource.name
+                );
+            }
             ensure!(!spec.argv.is_empty(), "a job needs a command");
             ensure!(spec.cwd.is_absolute(), "job cwd must be absolute");
             ensure!(
@@ -632,6 +659,9 @@ impl LaneStore {
                         && serde_json::to_value(&spec.post_hook).ok()
                             == serde_json::to_value(&other.post_hook).ok()
                         && spec.memory_max_bytes == other.memory_max_bytes
+                        && spec.foreign_client_grace_ms == other.foreign_client_grace_ms
+                        && spec.foreign_client_grace_by_resource
+                            == other.foreign_client_grace_by_resource
                         && spec.timeout_ms == other.timeout_ms
                         && spec.stall_timeout_ms == other.stall_timeout_ms
                         // Only the existing ticket's supervisor enforces a
@@ -1279,20 +1309,41 @@ impl LaneStore {
         let spec = row.spec.as_ref().context("preparing ticket has no job")?;
         let now = milliseconds();
         let since = row.preparing_since_ms.unwrap_or(now);
-        if spec.foreign_client_grace_ms != 0
-            && now.saturating_sub(since) >= spec.foreign_client_grace_ms
-        {
-            return Ok(None);
-        }
         for service_id in &row.yield_services {
             // Already stopped/yielded services cannot have a running editor
             // holding new client settings; avoid waiting on stale status.
             let tag = format!("service:{service_id}");
-            if !state.records.iter().any(|holder| {
+            let Some(bound) = state.records.iter().find(|holder| {
                 holder.service_lease
                     && holder.request.holder.purpose == tag
                     && matches!(holder.state, TicketState::Granted(_))
-            }) {
+            }) else {
+                continue;
+            };
+            // Yielding a service bound to several exclusive keys affects all
+            // of them. Honor the longest relevant grace (zero is indefinite).
+            let mut grace_ms: Option<u64> = None;
+            for bound_resource in &bound.request.resources {
+                if !spec.lease.resources.iter().any(|request| {
+                    request.key == bound_resource.key && matches!(request.access, Access::Exclusive)
+                }) {
+                    continue;
+                }
+                let grace = spec
+                    .foreign_client_grace_by_resource
+                    .iter()
+                    .find(|override_| override_.resource == bound_resource.key)
+                    .map(|override_| override_.grace_ms)
+                    .unwrap_or(spec.foreign_client_grace_ms);
+                grace_ms = Some(match grace_ms {
+                    Some(0) => 0,
+                    Some(_) if grace == 0 => 0,
+                    Some(previous) => previous.max(grace),
+                    None => grace,
+                });
+            }
+            let Some(grace_ms) = grace_ms else { continue };
+            if grace_ms != 0 && now.saturating_sub(since) >= grace_ms {
                 continue;
             }
             ensure!(
@@ -1317,12 +1368,10 @@ impl LaneStore {
                     && (client.owner.participant_id != row.request.holder.participant_id
                         || client.owner.session_id != row.request.holder.session_id)
                 {
-                    let grace = if spec.foreign_client_grace_ms == 0 {
+                    let grace = if grace_ms == 0 {
                         "indefinite".to_owned()
                     } else {
-                        since
-                            .saturating_add(spec.foreign_client_grace_ms)
-                            .to_string()
+                        since.saturating_add(grace_ms).to_string()
                     };
                     return Ok(Some(format!(
                         "foreign client lease: service {service_id} holder {}/{} until {} or grace {grace}",
@@ -2283,6 +2332,7 @@ mod tests {
         let store = LaneStore::new(dir.path()).unwrap();
         let spec = JobSpec {
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
+            foreign_client_grace_by_resource: vec![],
             fingerprint: JobFingerprint("post-fail".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -2632,6 +2682,7 @@ mod tests {
         test_service_status(dir.path(), std::slice::from_ref(&foreign));
         let spec = JobSpec {
             foreign_client_grace_ms: 0, // Forever until explicit release/expiry.
+            foreign_client_grace_by_resource: vec![],
             fingerprint: JobFingerprint("foreign-client".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -2755,7 +2806,10 @@ mod tests {
         let service = store
             .try_acquire_service(
                 LeaseRequest {
-                    resources: vec![resource("project", Access::Shared { slots: 1 })],
+                    resources: vec![
+                        resource("project", Access::Shared { slots: 1 }),
+                        resource("editor", Access::Shared { slots: 1 }),
+                    ],
                     holder: service_holder(),
                     queue_timeout_ms: None,
                 },
@@ -2777,9 +2831,16 @@ mod tests {
         test_service_status(dir.path(), &[foreign]);
         let spec = JobSpec {
             foreign_client_grace_ms: 500,
+            foreign_client_grace_by_resource: vec![ForeignClientGrace {
+                resource: resource("editor", Access::Exclusive).key,
+                grace_ms: 0,
+            }],
             fingerprint: JobFingerprint("grace-client".into()),
             lease: LeaseRequest {
-                resources: vec![resource("project", Access::Exclusive)],
+                resources: vec![
+                    resource("project", Access::Exclusive),
+                    resource("editor", Access::Exclusive),
+                ],
                 holder: holder(),
                 queue_timeout_ms: None,
             },
@@ -2794,6 +2855,21 @@ mod tests {
             stall_timeout_ms: None,
             coalesce: false,
         };
+        let mut invalid = spec.clone();
+        invalid
+            .foreign_client_grace_by_resource
+            .push(ForeignClientGrace {
+                resource: resource("editor", Access::Exclusive).key,
+                grace_ms: 5,
+            });
+        assert!(
+            store
+                .locked(|state| {
+                    store.enqueue_record(state, invalid.lease.clone(), Some(invalid.clone()))
+                })
+                .is_err(),
+            "duplicate resource grace override was accepted"
+        );
         let job = store
             .locked(|state| {
                 Ok(store
@@ -2814,10 +2890,27 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        // A new LaneStore (e.g. after supervisor recovery) sees durable grace.
+        // A new LaneStore (e.g. after supervisor recovery) sees the
+        // indefinite editor grace even though project grace has expired.
         let recovered = LaneStore::new(dir.path()).unwrap();
         recovered
             .locked(|state| {
+                assert!(
+                    recovered
+                        .foreign_client_wait(state, job.id)?
+                        .unwrap()
+                        .contains("indefinite")
+                );
+                state
+                    .records
+                    .iter_mut()
+                    .find(|r| r.ticket.id == job.id)
+                    .unwrap()
+                    .spec
+                    .as_mut()
+                    .unwrap()
+                    .foreign_client_grace_by_resource[0]
+                    .grace_ms = 500;
                 assert!(recovered.foreign_client_wait(state, job.id)?.is_none());
                 Ok(())
             })
@@ -2841,6 +2934,7 @@ mod tests {
         test_service_status(dir.path(), &[]);
         let spec = JobSpec {
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
+            foreign_client_grace_by_resource: vec![],
             fingerprint: JobFingerprint("yield-r1".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -2945,6 +3039,7 @@ mod tests {
             .unwrap();
         let spec = JobSpec {
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
+            foreign_client_grace_by_resource: vec![],
             fingerprint: JobFingerprint("auto-bound".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3001,6 +3096,7 @@ mod tests {
         test_service_status(dir.path(), &[]);
         let spec = JobSpec {
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
+            foreign_client_grace_by_resource: vec![],
             fingerprint: JobFingerprint("no-yield".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3054,6 +3150,7 @@ mod tests {
     fn coalescing_spec(dir: &Path, queue_timeout_ms: Option<u64>) -> JobSpec {
         JobSpec {
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
+            foreign_client_grace_by_resource: vec![],
             fingerprint: JobFingerprint("source-r1".into()),
             lease: LeaseRequest {
                 resources: vec![resource("build", Access::Exclusive)],
@@ -3093,6 +3190,22 @@ mod tests {
                     .enqueue_record(state, spec.lease.clone(), Some(spec.clone()))?
                     .0;
                 assert_eq!(first.id, joined.id);
+                let mut changed_grace = spec.clone();
+                changed_grace.foreign_client_grace_by_resource = vec![ForeignClientGrace {
+                    resource: resource("build", Access::Exclusive).key,
+                    grace_ms: 0,
+                }];
+                assert_ne!(
+                    first.id,
+                    store
+                        .enqueue_record(
+                            state,
+                            changed_grace.lease.clone(),
+                            Some(changed_grace.clone()),
+                        )?
+                        .0
+                        .id
+                );
                 let changed = JobSpec {
                     argv: vec!["false".into()],
                     ..spec.clone()

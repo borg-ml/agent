@@ -1613,12 +1613,10 @@ async fn handle_request(
                 ttl_ms > 0 && ttl_ms <= 86_400_000,
                 "lease ttl must be within 1..86400000 ms"
             );
-            if *idle {
-                if let Some(h) = &spec.active {
-                    hook(h, spec, active.as_ref().and_then(|b| b.port), None).await?;
-                }
-                *idle = false;
-            }
+            // The active hook must not run for a late client rejected by a
+            // Preparing exclusive ticket. A failing hook restores the exact
+            // pre-request lease state under the same journal lock.
+            let previous_clients = status.clients.clone();
             // The lane job's Preparing decision and all client intake share
             // state.lock. Publishing the client file inside this transaction
             // makes the job's under-lock read an atomic authority check.
@@ -1660,6 +1658,22 @@ async fn handle_request(
                     }
                     publish(dir, status)
                 })?;
+            if *idle
+                && let Some(h) = &spec.active
+                && let Err(error) = hook(h, spec, active.as_ref().and_then(|b| b.port), None).await
+            {
+                gate.store.service_client_change(
+                    &spec.id,
+                    &gate.request.resources,
+                    false,
+                    || {
+                        status.clients = previous_clients;
+                        publish(dir, status)
+                    },
+                )?;
+                return Err(error);
+            }
+            *idle = false;
             *last_activity = now;
         }
         ServiceRequest::Release { lease_id, owner } => {
@@ -2537,6 +2551,55 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
                 .take(2)
                 .collect::<Vec<_>>(),
             vec!["idle", "active"]
+        );
+        cleanup(&manager, task).await;
+    }
+
+    #[tokio::test]
+    async fn failed_active_hook_does_not_leave_client_lease() {
+        let (root, manager, _front, task) = setup_with(|spec| {
+            spec.idle_after_ms = 200;
+            spec.idle = Some(Hook {
+                argv: vec![
+                    "python3".into(),
+                    "-c".into(),
+                    "import sys; open(sys.argv[1], 'w').write('idle')".into(),
+                    spec.cwd.join("idle-marker").display().to_string(),
+                ],
+                timeout_ms: 1000,
+            });
+            spec.active = Some(Hook {
+                argv: vec!["python3".into(), "-c".into(), "raise SystemExit(42)".into()],
+                timeout_ms: 1000,
+            });
+        })
+        .await;
+        let marker = root.path().join("idle-marker");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("service never entered idle state");
+        let denied = manager
+            .send(
+                "fake",
+                ServiceRequest::Lease {
+                    owner: owner(),
+                    purpose: "failed activation".into(),
+                    ttl_ms: 5000,
+                },
+                Duration::from_secs(3),
+            )
+            .await;
+        assert!(
+            denied.is_err(),
+            "failing active hook granted a client lease"
+        );
+        assert!(
+            manager.read_status("fake").unwrap().clients.is_empty(),
+            "failing active hook left a ghost client lease"
         );
         cleanup(&manager, task).await;
     }
