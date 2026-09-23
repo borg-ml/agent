@@ -7,7 +7,10 @@ scheduler is added to Borg core. Its five workflow commands submit jobs and
 return IDs immediately. To await a submitted job, run `borg lane job wait ID
 --json` in a shell, or use a Borg command watch (`notify_on=exit`). The adapter
 CLI works from the source package (`python3 extensions/native/native.py ...`)
-or the installed package (`python3 .borg/extensions/native/native.py ...`).
+or the installed package (`python3 .borg/extensions/native/native.py ...`). After
+reviewing any local differences, refresh an existing owned install with
+`borg extensions install ./extensions/native --project --force --json`; without
+`--force`, Borg retains the older installed files rather than updating them.
 
 Cargo `check`, `build`, `test` use a worktree-private `target`, debug profile,
 `-j` sized from MemAvailable (8 GiB reserve plus 2 GiB fixed job overhead,
@@ -39,6 +42,10 @@ database passwords in job specs.
 - `python3 -m unittest discover -s extensions/native/tests -v`: twelve pass.
 - `borg extensions install ./extensions/native --project --json`: active,
   five Blu workflows registered; `borg extensions doctor --json`: active.
+  After subsequent source edits, refreshed the owned installed copy with
+  `--force` after comparing directories. Its Python/skill files now match source;
+  installed `native.py` dry runs emit a two-job, 13 GiB Cargo admission request
+  and a private CMake build resource. Its installed unit suite passes 12/12.
 - In the isolated `/home/shulgin/abundance-wt/gd-native` checkout, explicit
   `--probe-direct cmake configure`: completed, private build directory.
   `--probe-direct cmake build --target cave-network-tests`: built;
