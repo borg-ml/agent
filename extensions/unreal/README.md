@@ -83,6 +83,12 @@ required before executing these templates. Never run an exclusive commandlet
 against an active editor or infer safety from a JSON spec alone.
 
 Validate without UE using `python3 -m unittest discover -s extensions/unreal/tests -v`.
-These tests use a fake engine and do not establish that an integrated Borg CLI,
-real Unreal build, or editor service works. Consult `docs/gamedev/interfaces.md`
+Default tests use a fake engine and do not establish real Unreal build or
+editor service readiness. An optional integration smoke uses only an isolated
+fake project/engine and lane state: set `BORG_UNREAL_TEST_CLI` to an already-built
+Borg binary with the lane job CLI, then run the same unittest command. That
+opt-in test sets `BORG_LANE_DEGRADED=1` and `BORG_LANE_SCOPE=0` **only for the
+fake job**; do not use degraded/unscoped execution for production builds.
+Without a systemd user manager, this host's core supervisor refused a scoped
+fake job with exit 125; the isolated opt-in fake build finished with exit 0. Consult `docs/gamedev/interfaces.md`
 for core contracts and rollout prerequisites.

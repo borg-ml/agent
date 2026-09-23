@@ -120,6 +120,31 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(library.with_suffix('.sym').read_text(), 'raw\n')
 
+    @unittest.skipUnless(os.environ.get('BORG_UNREAL_TEST_CLI'),
+                         'set BORG_UNREAL_TEST_CLI to an integrated Borg lane binary')
+    def test_isolated_core_job_with_fake_engine(self):
+        """Explicit test-only unscoped core smoke; never run against real UE."""
+        binary = Path(os.environ['BORG_UNREAL_TEST_CLI']).resolve(strict=True)
+        self.assertTrue(binary.is_file())
+        builder = self.engine / 'Engine/Build/BatchFiles/Linux/Build.sh'
+        builder.write_text('#!/bin/sh\n'
+                           'for arg; do case "$arg" in -Log=*) log="${arg#-Log=}";; esac; done\n'
+                           'printf "[1/1] Fake compile\\n" > "$log"\n'
+                           'echo fake-compiler-finished\n')
+        self.project.parent.joinpath('.borg-unreal.toml').write_text(
+            '[build]\nmin_available_ram_gb=0\nreserve_ram_gb=0\n'
+            'min_free_disk_gb=0\nreserve_disk_gb=0\n')
+        self.env.update(BORG_AGENT_CLI=str(binary),
+                        BORG_LANE_DIR=str(self.root / 'isolated-lane-state'),
+                        BORG_LANE_SCOPE='0', BORG_LANE_DEGRADED='1')
+        result = self.cli('build', '--wait')
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        stages = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(len(stages), 2)
+        self.assertEqual(stages[-1]['state'], {'Finished': {'exit_code': 0}})
+        self.assertEqual(stages[0]['job_id'], stages[-1]['job_id'])
+        self.assertTrue(Path(stages[-1]['log_path']).is_file())
+
     def test_exclusive_template_fails_closed_and_service_spec(self):
         result = self.cli('run', 'commandlet', '--spec', '--', sys.executable, '-c', 'print("ok")')
         self.assertEqual(result.returncode, 0, result.stderr)
