@@ -66,12 +66,15 @@ TIME_WAIT collisions. Crash/hang recovery has bounded exponential backoff.
 
 ## Safety and integration boundaries
 
-The generic proxy returns **403 on POST/PUT/PATCH/DELETE** by default, including
-MCP initialize: merely having a client lease does not authorize a raw MCP
-mutation. An adapter may set `adapter_enforces_leases=true` only when it
+The generic proxy defaults to **403 on every backend request**, including
+arbitrary GET and MCP initialize POST: a GET path or query can also mutate.
+`read_only_paths` optionally lists exact, audited no-query GET/HEAD paths;
+only these paths may be forwarded unfenced, one request per connection, with no
+pipelined or later client writes. The Unreal adapter does not opt in. Merely
+having a client lease does not authorize a raw MCP mutation. An adapter may set `adapter_enforces_leases=true` only when it
 actually validates owner and monotone lease generation for **every** mutating
 upstream call and rejects stale sessions after expiry, yield and restart.
-Without that adapter, the endpoint is read-only; do not advertise editor MCP
+Without that adapter, the endpoint is closed except audited status paths; do not advertise editor MCP
 mutations as working. CLI `--owner` is a local operator claim, not model-facing
 authorization. Service `start` accepts arbitrary argv from a local file and
 must never be exposed as a model tool without a pre-registered validated spec.

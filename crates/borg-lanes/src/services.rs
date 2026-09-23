@@ -81,6 +81,10 @@ pub struct ServiceSpec {
     /// Adapter explicitly enforces owner+generation for *every* mutating request.
     #[serde(default)]
     pub adapter_enforces_leases: bool,
+    /// Only explicitly audited, exact GET/HEAD paths can bypass adapter fencing.
+    /// No path is forwarded by default (in particular not Unreal MCP paths).
+    #[serde(default)]
+    pub read_only_paths: Vec<String>,
     #[serde(default = "default_idle_after_ms")]
     pub idle_after_ms: u64,
 }
@@ -287,6 +291,14 @@ fn valid_spec(spec: &ServiceSpec) -> Result<()> {
             "HTTP/MCP probe needs endpoint"
         );
     }
+    ensure!(
+        spec.read_only_paths.iter().all(|path| path.starts_with('/')
+            && path.len() <= 200
+            && path
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"/-_.".contains(&c))),
+        "read-only paths must be exact audited paths without query or fragment"
+    );
     if matches!(spec.health.kind, HealthKind::Command) {
         ensure!(
             !spec.health.argv.is_empty(),
@@ -417,10 +429,9 @@ impl ServiceManager {
             if let Some(bytes) = spec.memory_max_bytes {
                 command.args(["-p", &format!("MemoryMax={bytes}")]);
             }
-            command.arg(format!(
-                "--setenv=BORG_LANES_ROOT={}",
-                self.root.parent().context("invalid root")?.display()
-            ));
+            let lane_root = self.root.parent().context("invalid root")?.display();
+            command.arg(format!("--setenv=BORG_LANE_DIR={lane_root}"));
+            command.arg(format!("--setenv=BORG_LANES_ROOT={lane_root}"));
             command.arg(&self.executable).args(args);
             ensure!(
                 command.status().context("systemd-run failed")?.success(),
@@ -532,7 +543,12 @@ struct FrontState {
     state: ServiceState,
     reason: String,
 }
-async fn front_connection(mut client: TcpStream, front: Arc<RwLock<FrontState>>, fenced: bool) {
+async fn front_connection(
+    mut client: TcpStream,
+    front: Arc<RwLock<FrontState>>,
+    fenced: bool,
+    read_only_paths: Arc<Vec<String>>,
+) {
     // A generic proxy cannot validate engine-specific mutating MCP calls. Fail closed
     // unless a trusted adapter explicitly provides owner+generation fencing upstream.
     let mut request = vec![0; 8192];
@@ -580,8 +596,10 @@ async fn front_connection(mut client: TcpStream, front: Arc<RwLock<FrontState>>,
             let mut lines = text.split("\r\n");
             let first = lines.next()?;
             let mut parts = first.split(' ');
-            if !matches!(parts.next()?, "GET" | "HEAD")
-                || !parts.next()?.starts_with('/')
+            let method = parts.next()?;
+            let path = parts.next()?;
+            if !matches!(method, "GET" | "HEAD")
+                || !read_only_paths.iter().any(|allowed| allowed == path)
                 || !matches!(parts.next()?, "HTTP/1.0" | "HTTP/1.1")
                 || parts.next().is_some()
             {
@@ -654,9 +672,20 @@ async fn front_connection(mut client: TcpStream, front: Arc<RwLock<FrontState>>,
     );
     let _ = client.write_all(response.as_bytes()).await;
 }
-async fn front_server(listener: TcpListener, front: Arc<RwLock<FrontState>>, fenced: bool) {
+async fn front_server(
+    listener: TcpListener,
+    front: Arc<RwLock<FrontState>>,
+    fenced: bool,
+    read_only_paths: Vec<String>,
+) {
+    let read_only_paths = Arc::new(read_only_paths);
     while let Ok((client, _)) = listener.accept().await {
-        tokio::spawn(front_connection(client, front.clone(), fenced));
+        tokio::spawn(front_connection(
+            client,
+            front.clone(),
+            fenced,
+            read_only_paths.clone(),
+        ));
     }
 }
 fn publish(dir: &Path, status: &ServiceStatus) -> Result<()> {
@@ -809,6 +838,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             listener,
             front.clone(),
             spec.adapter_enforces_leases,
+            spec.read_only_paths.clone(),
         ));
     }
     transition(
@@ -1268,10 +1298,14 @@ async fn handle_request(
                 !by.is_empty() && ttl_ms > 0 && ttl_ms <= 86_400_000,
                 "invalid yield owner/duration"
             );
-            ensure!(
-                status.clients.is_empty(),
-                "service has an active client lease; yield refused"
-            );
+            // An exclusive job cannot inherit a client's editor settings. Restore
+            // every leased change before acknowledging the pre-grant barrier.
+            // Failure keeps the service lease/backend intact and blocks the job.
+            for lease in status.clients.clone() {
+                restore_client(spec, &lease, active.as_ref().and_then(|b| b.port)).await?;
+                status.clients.retain(|l| l.id != lease.id);
+                publish(dir, status)?;
+            }
             // The caller supplies a lane job ID; no other owner can resume this yield.
             let expires = now.saturating_add(ttl_ms);
             let prior = status
@@ -1602,6 +1636,7 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
             idle: None,
             active: None,
             adapter_enforces_leases: false,
+            read_only_paths: vec!["/health".into(), "/crash".into()],
             idle_after_ms: 1000,
         }
     }
@@ -1791,7 +1826,7 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
     }
 
     #[tokio::test]
-    async fn lease_expiry_restores_and_yield_requires_owner_and_stops_backend() {
+    async fn active_lease_restored_before_yield_and_owner_controls_resume() {
         let (root, manager, front, task) = setup().await;
         let holder = owner();
         let lease = manager
@@ -1808,27 +1843,6 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
             .unwrap()
             .clients
             .remove(0);
-        assert!(
-            manager
-                .send(
-                    "fake",
-                    ServiceRequest::Yield {
-                        by: "job".into(),
-                        reason: "exclusive".into(),
-                        ttl_ms: 5000
-                    },
-                    Duration::from_secs(3)
-                )
-                .await
-                .is_err()
-        );
-        state(&manager, |s| s.clients.is_empty()).await;
-        assert!(
-            fs::read_to_string(root.path().join("restored"))
-                .unwrap()
-                .contains(&holder.participant_id.to_string())
-        );
-        assert_ne!(lease.id, Uuid::nil());
         manager
             .send(
                 "fake",
@@ -1841,6 +1855,13 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
             )
             .await
             .unwrap();
+        state(&manager, |s| s.clients.is_empty()).await;
+        assert!(
+            fs::read_to_string(root.path().join("restored"))
+                .unwrap()
+                .contains(&holder.participant_id.to_string())
+        );
+        assert_ne!(lease.id, Uuid::nil());
         let yielded = manager.read_status("fake").unwrap();
         assert!(matches!(yielded.state, ServiceState::Yielded));
         assert!(yielded.backend_pid.is_none());
@@ -1929,6 +1950,18 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
             fs::read_to_string(root.path().join("restored"))
                 .unwrap()
                 .contains(&second.participant_id.to_string())
+        );
+        cleanup(&manager, task).await;
+    }
+
+    #[tokio::test]
+    async fn proxy_defaults_to_no_unfenced_backend_paths() {
+        let (_root, manager, front, task) = setup_with(|s| s.read_only_paths.clear()).await;
+        assert!(
+            get(front, "/health")
+                .await
+                .unwrap()
+                .starts_with("HTTP/1.1 403")
         );
         cleanup(&manager, task).await;
     }
