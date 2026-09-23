@@ -36,6 +36,9 @@ pub(crate) enum LaneCommand {
     Supervise { id: Uuid },
     #[command(name = "__resume_services", hide = true)]
     ResumeServices { id: Uuid },
+    /// Runs an ended job's claimed finish hook (started detached by Borg).
+    #[command(name = "__finish_hook", hide = true)]
+    FinishHook { id: Uuid },
 }
 
 #[derive(Debug, Subcommand)]
@@ -190,6 +193,7 @@ pub(crate) async fn run(args: LaneArgs) -> Result<()> {
             crate::lane_service_commands::run(service).await?;
         }
         LaneCommand::ResumeServices { id } => store.resume_services(id)?,
+        LaneCommand::FinishHook { id } => store.run_finish_hook(id)?,
         LaneCommand::Supervise { id } => {
             let code = store.supervise(id)?;
             if code != 0 {

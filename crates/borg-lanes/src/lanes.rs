@@ -158,6 +158,11 @@ pub struct JobSpec {
     /// Must match `[a-z][a-z0-9-]{0,23}`; None means `borg-lane`.
     #[serde(default)]
     pub unit_prefix: Option<String>,
+    /// Runs once, detached and bounded by its timeout, after the job ended
+    /// on any path: finished, cancelled queued or running, queue timeout,
+    /// abandoned, or recovered from a lost supervisor.
+    #[serde(default)]
+    pub finish_hook: Option<Hook>,
     pub fingerprint: JobFingerprint,
     pub lease: LeaseRequest,
     pub argv: Vec<String>,
@@ -292,6 +297,13 @@ pub struct LaneRecord {
     /// workload and ends the record Cancelled with this reason.
     #[serde(default)]
     pub cancel_requested: Option<String>,
+    /// When the finish hook was claimed; journalled before it is spawned,
+    /// so it never runs twice.
+    #[serde(default)]
+    pub finish_hook_started_ms: Option<u64>,
+    /// How the finish hook ended (`exited 0`, `timed out after …`, …).
+    #[serde(default)]
+    pub finish_hook_outcome: Option<String>,
     pub evidence: Option<String>,
 }
 
@@ -698,6 +710,8 @@ impl LaneStore {
                             == serde_json::to_value(&other.pre_hook).ok()
                         && serde_json::to_value(&spec.post_hook).ok()
                             == serde_json::to_value(&other.post_hook).ok()
+                        && serde_json::to_value(&spec.finish_hook).ok()
+                            == serde_json::to_value(&other.finish_hook).ok()
                         && spec.memory_max_bytes == other.memory_max_bytes
                         && spec.foreign_client_grace_ms == other.foreign_client_grace_ms
                         && spec.foreign_client_grace_by_resource
@@ -762,6 +776,8 @@ impl LaneStore {
             resume_error: None,
             resume_attempts: 0,
             cancel_requested: None,
+            finish_hook_started_ms: None,
+            finish_hook_outcome: None,
             evidence: None,
         });
         Ok((ticket, job))
@@ -958,7 +974,7 @@ impl LaneStore {
                 record.state,
                 TicketState::Finished | TicketState::Cancelled { .. }
             ) {
-                return Ok(Vec::new());
+                return Ok(None);
             }
             record.finished_ms = Some(milliseconds());
             let earlier = record.evidence.take();
@@ -983,8 +999,11 @@ impl LaneStore {
             if !record.quarantined {
                 record.resume_pending = record.yield_services.clone();
             }
-            Ok(record.resume_pending.clone())
+            Ok(Some(record.resume_pending.clone()))
         })?;
+        let Some(services) = services else {
+            return Ok(());
+        };
         if !services.is_empty() && !cfg!(test) {
             // Recovery also invokes finish; resume is a detached control task
             // so it cannot change job exit status or hold the completion FD.
@@ -1002,7 +1021,183 @@ impl LaneStore {
                 .spawn()
                 .context("starting service resume control")?;
         }
+        self.start_finish_hook(id)
+    }
+
+    /// Claim an ended job's finish hook and start its detached runner. The
+    /// claim is journalled first, so racing callers (the supervisor, a
+    /// canceller, recovery) start it at most once; a job without a finish
+    /// hook, or whose hook was already claimed, is left alone.
+    fn start_finish_hook(&self, id: Uuid) -> Result<()> {
+        let hook = self.locked(|state| {
+            let Some(row) = state.records.iter_mut().find(|r| r.ticket.id == id) else {
+                return Ok(None);
+            };
+            let ended = matches!(
+                row.state,
+                TicketState::Finished | TicketState::Cancelled { .. }
+            );
+            let Some(hook) = row.spec.as_ref().and_then(|spec| spec.finish_hook.clone()) else {
+                return Ok(None);
+            };
+            if !ended || row.finish_hook_started_ms.is_some() {
+                return Ok(None);
+            }
+            row.finish_hook_started_ms = Some(milliseconds());
+            Ok(Some(hook))
+        })?;
+        let Some(hook) = hook else {
+            return Ok(());
+        };
+        if let Err(error) = self.spawn_finish_hook(id, &hook) {
+            self.set_finish_hook_outcome(id, format!("not started: {error:#}"))?;
+        }
         Ok(())
+    }
+
+    /// The runner is `borg lane __finish_hook ID` in a session of its own
+    /// and, with a user manager, a scope that systemd stops at the hook's
+    /// deadline even if the runner itself is killed.
+    fn spawn_finish_hook(&self, id: Uuid, hook: &Hook) -> Result<()> {
+        if cfg!(test) {
+            let store = self.clone();
+            std::thread::spawn(move || store.run_finish_hook(id));
+            return Ok(());
+        }
+        let executable = std::env::var_os("BORG_LANE_EXECUTABLE")
+            .map(PathBuf::from)
+            .unwrap_or(std::env::current_exe()?);
+        let mut command = if workload_scoped() {
+            let mut command = Command::new("systemd-run");
+            command
+                .args([
+                    "--user",
+                    "--scope",
+                    "--quiet",
+                    "--collect",
+                    "--expand-environment=no",
+                ])
+                .arg(format!("--unit=borg-lane-hook-{id}-finish.scope"))
+                .args([
+                    "-p",
+                    &format!(
+                        "RuntimeMaxSec={}ms",
+                        hook.timeout_ms.saturating_add(FINISH_HOOK_GRACE_MS)
+                    ),
+                    "--",
+                ])
+                .arg(&executable);
+            command
+        } else {
+            Command::new(&executable)
+        };
+        command
+            .args(["lane", "--state-dir"])
+            .arg(&self.root)
+            .arg("__finish_hook")
+            .arg(id.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().context("starting the finish hook runner")?;
+        // Reap it without making a long-lived caller wait for the hook.
+        std::thread::spawn(move || child.wait());
+        Ok(())
+    }
+
+    /// Run an ended job's claimed finish hook, bounded by its timeout, and
+    /// journal how it ended. Nothing it started outlives it.
+    pub fn run_finish_hook(&self, id: Uuid) -> Result<()> {
+        let record = self.record(id)?;
+        let spec = record.spec.as_ref().context("job spec missing")?;
+        let hook = spec
+            .finish_hook
+            .as_ref()
+            .context("job has no finish hook")?;
+        ensure!(
+            record.finish_hook_started_ms.is_some() && record.finish_hook_outcome.is_none(),
+            "finish hook of job {id} is not claimed or already ran"
+        );
+        let end = match record.job.as_ref().map(|job| &job.state) {
+            Some(JobState::Finished { exit_code }) => JobEnd::Exited(*exit_code),
+            Some(JobState::Cancelled { reason }) => JobEnd::Cancelled(reason.clone()),
+            _ => bail!("job {id} has not ended"),
+        };
+        let outcome = self
+            .run_bounded_hook(
+                hook,
+                spec,
+                id,
+                &end.hook_env(record.evidence.as_deref().unwrap_or_default()),
+            )
+            .unwrap_or_else(|error| format!("failed: {error:#}"));
+        self.set_finish_hook_outcome(id, outcome)
+    }
+
+    fn run_bounded_hook(
+        &self,
+        hook: &Hook,
+        spec: &JobSpec,
+        id: Uuid,
+        end: &[(&str, String)],
+    ) -> Result<String> {
+        ensure!(!hook.argv.is_empty(), "empty finish hook");
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.job_dir(id).join("finish-hook.log"))?;
+        let mut command = Command::new(&hook.argv[0]);
+        command.args(&hook.argv[1..]);
+        self.hook_env(&mut command, spec, id, "finish", end);
+        use std::os::unix::process::CommandExt;
+        let mut child = command
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log))
+            .spawn()?;
+        let group = child.id();
+        let started = Instant::now();
+        let outcome = loop {
+            if let Some(status) = child.try_wait()? {
+                break match (status.code(), status.signal()) {
+                    (Some(code), _) => format!("exited {code}"),
+                    (None, signal) => format!("killed by signal {}", signal.unwrap_or(0)),
+                };
+            }
+            if started.elapsed() > Duration::from_millis(hook.timeout_ms) {
+                unsafe {
+                    libc::kill(-(group as i32), libc::SIGKILL);
+                }
+                let _ = child.wait();
+                break format!("timed out after {}ms", hook.timeout_ms);
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        };
+        if !process_group_pids(group).is_empty() {
+            unsafe {
+                libc::kill(-(group as i32), libc::SIGKILL);
+            }
+        }
+        Ok(outcome)
+    }
+
+    fn set_finish_hook_outcome(&self, id: Uuid, outcome: String) -> Result<()> {
+        self.locked(|state| {
+            if let Some(row) = state.records.iter_mut().find(|r| r.ticket.id == id) {
+                row.finish_hook_outcome = Some(outcome);
+            }
+            Ok(())
+        })
     }
 
     /// The detached control process is idempotent and holds a per-job lock.
@@ -1144,7 +1339,7 @@ impl LaneStore {
     /// running) gets a cancel request that its supervisor carries out: it
     /// kills the workload, runs the post hook and ends the job Cancelled.
     pub fn cancel_ticket(&self, id: Uuid, reason: &str) -> Result<()> {
-        self.locked(|state| {
+        let ended = self.locked(|state| {
             let record = state
                 .records
                 .iter_mut()
@@ -1161,18 +1356,26 @@ impl LaneStore {
                         };
                     }
                     record.finished_ms = Some(milliseconds());
+                    Ok(true)
                 }
                 TicketState::Preparing | TicketState::Granted(_) if record.job.is_some() => {
                     record
                         .cancel_requested
                         .get_or_insert_with(|| reason.to_owned());
+                    Ok(false)
                 }
                 _ => bail!("cannot cancel a completed ticket or a service lease"),
             }
-            Ok(())
-        })
+        })?;
+        if ended {
+            self.start_finish_hook(id)?;
+        }
+        Ok(())
     }
 }
+
+/// The evidence label for the processes `recover` killed.
+const RECOVER_KILLED: &str = "recover killed pids";
 
 /// The cancel reason when no requester is left (`abandon_after_ms`).
 const ABANDONED: &str = "abandoned: no requester";
@@ -1182,6 +1385,29 @@ enum JobEnd {
     Exited(i32),
     Cancelled(String),
 }
+
+impl JobEnd {
+    /// What post and finish hooks learn about the ending: its state, the
+    /// exit code of a finished job and the reason (a cancelled job's
+    /// reason, otherwise the supervisor's note).
+    fn hook_env(&self, note: &str) -> Vec<(&'static str, String)> {
+        match self {
+            JobEnd::Exited(code) => vec![
+                ("BORG_LANE_STATE", "finished".to_owned()),
+                ("BORG_LANE_EXIT_CODE", code.to_string()),
+                ("BORG_LANE_REASON", note.to_owned()),
+            ],
+            JobEnd::Cancelled(reason) => vec![
+                ("BORG_LANE_STATE", "cancelled".to_owned()),
+                ("BORG_LANE_REASON", reason.clone()),
+            ],
+        }
+    }
+}
+
+/// How long a finish hook's scope may outlive its timeout before systemd
+/// stops it, in case its runner was killed.
+const FINISH_HOOK_GRACE_MS: u64 = 30_000;
 
 /// Where one finished job's service resume stands after `recover --wait`.
 #[derive(Clone, Debug, Serialize)]
@@ -1193,6 +1419,18 @@ pub struct ResumeOutcome {
     /// `pending` (no attempt finished before the wait timed out).
     pub outcome: &'static str,
     pub error: Option<String>,
+}
+
+/// An ended job whose finish hook was never claimed.
+fn finish_hook_unclaimed(row: &LaneRecord) -> bool {
+    matches!(
+        row.state,
+        TicketState::Finished | TicketState::Cancelled { .. }
+    ) && row.finish_hook_started_ms.is_none()
+        && row
+            .spec
+            .as_ref()
+            .is_some_and(|spec| spec.finish_hook.is_some())
 }
 
 /// A job that ended either way (Finished or Cancelled) returns the services
@@ -1715,12 +1953,21 @@ impl LaneStore {
                     self.service_control(service_id, id, "yield", spec.timeout_ms)?;
                 }
                 if let Some(hook) = &spec.pre_hook
-                    && let Err(error) = self.run_hook(hook, &spec, id, "pre-exclusive", true)
+                    && let Err(error) = self.run_hook(hook, &spec, id, "pre-exclusive", true, &[])
                 {
                     // Yield may have partially succeeded. Resume the service
                     // through the post hook even though no lease was granted.
                     if let Some(post) = &spec.post_hook {
-                        let _ = self.run_hook(post, &spec, id, "post-exclusive", false);
+                        let end = self.failed_end(id)?;
+                        let note = format!("pre hook failed: {error:#}");
+                        let _ = self.run_hook(
+                            post,
+                            &spec,
+                            id,
+                            "post-exclusive",
+                            false,
+                            &end.hook_env(&note),
+                        );
                     }
                     return Err(error);
                 }
@@ -1752,10 +1999,18 @@ impl LaneStore {
                         .context("ticket disappeared")?;
                     Ok(grant_entry(entry))
                 });
-                if granted.is_err()
+                if let Err(error) = &granted
                     && let Some(post) = &spec.post_hook
                 {
-                    let _ = self.run_hook(post, &spec, id, "post-exclusive", false);
+                    let end = self.failed_end(id)?;
+                    let _ = self.run_hook(
+                        post,
+                        &spec,
+                        id,
+                        "post-exclusive",
+                        false,
+                        &end.hook_env(&format!("{error:#}")),
+                    );
                 }
                 return granted;
             }
@@ -1815,18 +2070,17 @@ impl LaneStore {
         Ok(())
     }
 
-    fn run_hook(
+    /// The environment every hook gets, plus how the job ended (`end`) for
+    /// post and finish hooks.
+    fn hook_env(
         &self,
-        hook: &Hook,
+        command: &mut Command,
         spec: &JobSpec,
         id: Uuid,
         phase: &str,
-        sync: bool,
-    ) -> Result<()> {
-        ensure!(!hook.argv.is_empty(), "empty {phase} hook");
-        let mut command = Command::new(&hook.argv[0]);
+        end: &[(&str, String)],
+    ) {
         command
-            .args(&hook.argv[1..])
             .current_dir(&spec.cwd)
             .env("BORG_LANE_JOB", id.to_string())
             .env("BORG_LANE_PHASE", phase)
@@ -1835,7 +2089,23 @@ impl LaneStore {
                 spec.lease.resources.first().map_or("", |r| &r.key.name),
             )
             .env("BORG_LANE_LOG", self.job_dir(id).join("output.log"))
-            .env("BORG_LANES_ROOT", &self.root);
+            .env("BORG_LANES_ROOT", &self.root)
+            .envs(end.iter().map(|(key, value)| (*key, value)));
+    }
+
+    fn run_hook(
+        &self,
+        hook: &Hook,
+        spec: &JobSpec,
+        id: Uuid,
+        phase: &str,
+        sync: bool,
+        end: &[(&str, String)],
+    ) -> Result<()> {
+        ensure!(!hook.argv.is_empty(), "empty {phase} hook");
+        let mut command = Command::new(&hook.argv[0]);
+        command.args(&hook.argv[1..]);
+        self.hook_env(&mut command, spec, id, phase, end);
         let scoped_post = phase.starts_with("post") && systemd_available();
         if phase.starts_with("post") && !scoped_post {
             ensure!(
@@ -1871,16 +2141,7 @@ impl LaneStore {
                 .arg(&hook.argv[0])
                 .args(&hook.argv[1..]);
             command = scoped;
-            command
-                .current_dir(&spec.cwd)
-                .env("BORG_LANES_ROOT", &self.root)
-                .env("BORG_LANE_JOB", id.to_string())
-                .env("BORG_LANE_PHASE", phase)
-                .env(
-                    "BORG_LANE_RESOURCE",
-                    spec.lease.resources.first().map_or("", |r| &r.key.name),
-                )
-                .env("BORG_LANE_LOG", self.job_dir(id).join("output.log"));
+            self.hook_env(&mut command, spec, id, phase, end);
         }
         let mut child = command.stdin(Stdio::null()).spawn()?;
         if !sync {
@@ -1930,8 +2191,8 @@ impl LaneStore {
         let result = self.supervise_job(id);
         let requested = self.record(id)?.cancel_requested;
         let (end, evidence) = match (result, requested) {
-            (Ok(JobEnd::Exited(code)), _) => (JobEnd::Exited(code), "finished".to_owned()),
-            (Ok(JobEnd::Cancelled(reason)), _) => {
+            (Ok((JobEnd::Exited(code), note)), _) => (JobEnd::Exited(code), note),
+            (Ok((JobEnd::Cancelled(reason), _)), _) => {
                 let evidence = format!("cancelled: {reason}");
                 (JobEnd::Cancelled(reason), evidence)
             }
@@ -1950,7 +2211,9 @@ impl LaneStore {
         Ok(code)
     }
 
-    fn supervise_job(&self, id: Uuid) -> Result<JobEnd> {
+    /// The job's end and the supervisor's note on it: `finished`, `timeout`
+    /// or the stall.
+    fn supervise_job(&self, id: Uuid) -> Result<(JobEnd, String)> {
         let scoped = workload_scoped();
         ensure!(
             scoped || std::env::var("BORG_LANE_DEGRADED").as_deref() == Ok("1"),
@@ -1968,11 +2231,13 @@ impl LaneStore {
             && !exclusive
         {
             // Exclusive hooks already ran before the grant as a FIFO barrier.
-            self.run_hook(pre, &spec, id, "pre", true)?;
+            self.run_hook(pre, &spec, id, "pre", true, &[])?;
         }
         if let Some(reason) = self.record(id)?.cancel_requested {
-            self.run_post_for_job(&spec, id, exclusive)?;
-            return Ok(JobEnd::Cancelled(reason));
+            let end = JobEnd::Cancelled(reason);
+            let note = "cancelled before start".to_owned();
+            self.run_post_for_job(&spec, id, exclusive, &end, &note)?;
+            return Ok((end, note));
         }
         let log = OpenOptions::new()
             .create(true)
@@ -2056,9 +2321,10 @@ impl LaneStore {
         let mut last_size = 0;
         let mut last_cpu = 0.0;
         let leader = child.id();
-        let end = loop {
+        let (end, note) = loop {
             if let Some(status) = child.try_wait()? {
-                break JobEnd::Exited(status.code().unwrap_or(128 + status.signal().unwrap_or(9)));
+                let code = status.code().unwrap_or(128 + status.signal().unwrap_or(9));
+                break (JobEnd::Exited(code), "finished".to_owned());
             }
             let size = fs::metadata(self.job_dir(id).join("output.log")).map_or(0, |m| m.len());
             let cpu = proc_cpu(leader).unwrap_or(0.0);
@@ -2095,9 +2361,9 @@ impl LaneStore {
                 let _ = child.kill();
                 let _ = child.wait();
                 break match cancel {
-                    Some(reason) => JobEnd::Cancelled(reason),
-                    None if timed_out => JobEnd::Exited(124),
-                    None => JobEnd::Exited(125),
+                    Some(cancelled) => (JobEnd::Cancelled(cancelled), reason),
+                    None if timed_out => (JobEnd::Exited(124), reason),
+                    None => (JobEnd::Exited(125), reason),
                 };
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -2105,9 +2371,18 @@ impl LaneStore {
         // The leader is gone; no process of this workload may outlive it into
         // the next holder's lease (a compiler it started, for example).
         self.kill_workload(id, &unit, scoped, leader, "killed leftover pids")?;
-        self.run_post_for_job(&spec, id, exclusive)?;
+        self.run_post_for_job(&spec, id, exclusive, &end, &note)?;
         let _ = lease;
-        Ok(end)
+        Ok((end, note))
+    }
+
+    /// How a job that failed before its workload ran will end: cancelled
+    /// when that was requested, otherwise finished 125.
+    fn failed_end(&self, id: Uuid) -> Result<JobEnd> {
+        Ok(match self.record(id)?.cancel_requested {
+            Some(reason) => JobEnd::Cancelled(reason),
+            None => JobEnd::Exited(125),
+        })
     }
 
     /// SIGKILL every process left in the job's scope (degraded: its own
@@ -2181,7 +2456,14 @@ impl LaneStore {
         Ok(killed)
     }
 
-    fn run_post_for_job(&self, spec: &JobSpec, id: Uuid, exclusive: bool) -> Result<()> {
+    fn run_post_for_job(
+        &self,
+        spec: &JobSpec,
+        id: Uuid,
+        exclusive: bool,
+        end: &JobEnd,
+        note: &str,
+    ) -> Result<()> {
         // Bound services must remain stopped until the post hook completes.
         // Unbound jobs keep their independently scoped asynchronous hook.
         if let Some(post) = &spec.post_hook {
@@ -2192,6 +2474,7 @@ impl LaneStore {
                 id,
                 if exclusive { "post-exclusive" } else { "post" },
                 bound,
+                &end.hook_env(note),
             ) {
                 self.locked(|state| {
                     let row = state
@@ -2309,6 +2592,18 @@ impl LaneStore {
         }
         // Avoid nested metadata locks: test each kernel lock before journalling.
         for record in self.snapshot()? {
+            // A job that ended without starting its finish hook (its ender
+            // died in between) gets it now; the claim keeps it to once.
+            if finish_hook_unclaimed(&record) {
+                let id = record.ticket.id;
+                if dry_run {
+                    actions.push(format!("job {id}: would start its finish hook"));
+                } else {
+                    actions.push(format!("job {id}: starting its finish hook"));
+                    self.start_finish_hook(id)?;
+                }
+                continue;
+            }
             if !matches!(
                 record.state,
                 TicketState::Granted(_) | TicketState::Queued | TicketState::Preparing
@@ -2370,18 +2665,15 @@ impl LaneStore {
                     {
                         verified = false;
                     } else {
-                        verified = Command::new("systemctl")
-                            .args(["--user", "kill", "--signal=SIGKILL", scope])
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status()
-                            .is_ok_and(|s| s.success());
+                        // Kills the verified scope, waits for it to empty
+                        // and records the killed PIDs (quarantine if not).
+                        self.kill_workload(record.ticket.id, scope, true, 0, RECOVER_KILLED)?;
                     }
                 } else if let (Some(pid), Some(ticks)) =
                     (record.workload_pid, record.workload_start_ticks)
                 {
                     if proc_start_ticks(pid) == Some(ticks) {
-                        verified = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } == 0;
+                        self.kill_workload(record.ticket.id, "", false, pid, RECOVER_KILLED)?;
                     } else {
                         verified = false;
                     }
@@ -2607,6 +2899,8 @@ mod tests {
             resume_error: None,
             resume_attempts: 0,
             cancel_requested: None,
+            finish_hook_started_ms: None,
+            finish_hook_outcome: None,
             evidence: None,
         }
     }
@@ -2767,6 +3061,7 @@ mod tests {
             foreign_client_grace_by_resource: vec![],
             abandon_after_ms: None,
             unit_prefix: None,
+            finish_hook: None,
             fingerprint: JobFingerprint("post-fail".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -2801,7 +3096,9 @@ mod tests {
                 Ok(ticket.id)
             })
             .unwrap();
-        store.run_post_for_job(&spec, id, true).unwrap();
+        store
+            .run_post_for_job(&spec, id, true, &JobEnd::Exited(0), "finished")
+            .unwrap();
         store.finish(id, 0, "workload succeeded").unwrap();
         let row = store.record(id).unwrap();
         assert!(row.quarantined);
@@ -2830,6 +3127,157 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// Failure mode: a finish hook (the caller's cleanup) skipped on some
+    /// ending (a queued cancel, a recovery), run twice when two callers end
+    /// the same job, told the wrong outcome, or left running past its limit.
+    #[test]
+    fn finish_hook_runs_once_whichever_way_the_job_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let submit = |name: &str, script: &str, timeout_ms: u64| {
+            let out = dir.path().join(format!("{name}.out"));
+            let spec = JobSpec {
+                argv: vec![format!("run-{name}")],
+                finish_hook: Some(Hook {
+                    argv: vec![
+                        "sh".into(),
+                        "-c".into(),
+                        format!("{{ {script}; }} >> '{}'", out.display()),
+                    ],
+                    timeout_ms,
+                }),
+                ..coalescing_spec(dir.path(), None)
+            };
+            let id = store
+                .locked(|state| {
+                    Ok(store
+                        .enqueue_record(state, spec.lease.clone(), Some(spec))?
+                        .0
+                        .id)
+                })
+                .unwrap();
+            (id, out)
+        };
+        let outcome = |id: Uuid| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(outcome) = store.record(id).unwrap().finish_hook_outcome {
+                    return outcome;
+                }
+                assert!(Instant::now() < deadline, "finish hook of {id} never ended");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let lines = |path: &Path| -> Vec<String> {
+            fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        };
+        let report = r#"echo "$BORG_LANE_PHASE $BORG_LANE_STATE ${BORG_LANE_EXIT_CODE:-none} $BORG_LANE_REASON""#;
+
+        // A queued cancel; queue timeouts and abandonment end the same way.
+        let (queued, queued_out) = submit("queued", report, 5_000);
+        store.cancel_ticket(queued, "stop").unwrap();
+        assert_eq!(outcome(queued), "exited 0");
+
+        // The supervisor's ending, then a late second ender.
+        let (ended, ended_out) = submit("ended", report, 5_000);
+        store
+            .locked(|state| {
+                grant_entry(
+                    state
+                        .records
+                        .iter_mut()
+                        .find(|r| r.ticket.id == ended)
+                        .unwrap(),
+                );
+                Ok(())
+            })
+            .unwrap();
+        store
+            .conclude(ended, JobEnd::Exited(3), "finished")
+            .unwrap();
+        store.finish(ended, 125, "late").unwrap();
+        assert_eq!(outcome(ended), "exited 0");
+
+        // Its ender died before starting the hook: recovery starts it.
+        let (orphan, orphan_out) = submit("orphan", report, 5_000);
+        store
+            .locked(|state| {
+                let row = state
+                    .records
+                    .iter_mut()
+                    .find(|r| r.ticket.id == orphan)
+                    .unwrap();
+                row.state = TicketState::Finished;
+                row.job.as_mut().unwrap().state = JobState::Finished { exit_code: 0 };
+                row.evidence = Some("finished".into());
+                Ok(())
+            })
+            .unwrap();
+        let planned = store.recover(true).unwrap();
+        assert!(
+            planned
+                .iter()
+                .any(|action| action.contains("would start its finish hook")),
+            "{planned:?}"
+        );
+        assert!(
+            store
+                .record(orphan)
+                .unwrap()
+                .finish_hook_started_ms
+                .is_none()
+        );
+        store.recover(false).unwrap();
+        assert_eq!(outcome(orphan), "exited 0");
+
+        // Enders racing while the hook still runs start it once.
+        let (raced, raced_out) = submit("raced", "echo run; sleep 0.3", 5_000);
+        store.cancel_ticket(raced, "stop").unwrap();
+        store.start_finish_hook(raced).unwrap();
+        store.recover(false).unwrap();
+        assert_eq!(outcome(raced), "exited 0");
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(lines(&raced_out), ["run"]);
+
+        // A hook past its timeout dies with what it started.
+        let child = dir.path().join("child.pid");
+        let (slow, _) = submit(
+            "slow",
+            &format!("sleep 30 & echo $! > '{}'; wait", child.display()),
+            300,
+        );
+        let started = Instant::now();
+        store.cancel_ticket(slow, "stop").unwrap();
+        assert_eq!(outcome(slow), "timed out after 300ms");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let pid = fs::read_to_string(&child).unwrap().trim().to_owned();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|stat| !stat.contains(") Z "))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "finish hook child {pid} outlived it"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Nothing starts any of them again, not even a racing ender.
+        for id in [queued, ended, orphan] {
+            store.start_finish_hook(id).unwrap();
+        }
+        store.recover(false).unwrap();
+        assert!(store.cancel_ticket(queued, "again").is_err());
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(lines(&queued_out), ["finish cancelled none stop"]);
+        assert_eq!(lines(&ended_out), ["finish finished 3 finished"]);
+        assert_eq!(lines(&orphan_out), ["finish finished 0 finished"]);
     }
 
     /// Failure mode: services that yielded to a job stay stopped when the
@@ -3291,6 +3739,7 @@ mod tests {
             foreign_client_grace_by_resource: vec![],
             abandon_after_ms: None,
             unit_prefix: None,
+            finish_hook: None,
             fingerprint: JobFingerprint("foreign-client".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3442,6 +3891,7 @@ mod tests {
                 foreign_client_grace_by_resource: vec![],
                 abandon_after_ms: None,
                 unit_prefix: None,
+                finish_hook: None,
                 fingerprint: JobFingerprint("shared-foreign".into()),
                 lease: LeaseRequest {
                     resources: vec![resource("fake-exclusive", Access::Exclusive)],
@@ -3576,6 +4026,7 @@ mod tests {
             foreign_client_grace_ms: 500,
             abandon_after_ms: None,
             unit_prefix: None,
+            finish_hook: None,
             foreign_client_grace_by_resource: vec![ForeignClientGrace {
                 resource: resource("editor", Access::Exclusive).key,
                 grace_ms: 0,
@@ -3682,6 +4133,7 @@ mod tests {
             foreign_client_grace_by_resource: vec![],
             abandon_after_ms: None,
             unit_prefix: None,
+            finish_hook: None,
             fingerprint: JobFingerprint("yield-r1".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3789,6 +4241,7 @@ mod tests {
             foreign_client_grace_by_resource: vec![],
             abandon_after_ms: None,
             unit_prefix: None,
+            finish_hook: None,
             fingerprint: JobFingerprint("auto-bound".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3848,6 +4301,7 @@ mod tests {
             foreign_client_grace_by_resource: vec![],
             abandon_after_ms: None,
             unit_prefix: None,
+            finish_hook: None,
             fingerprint: JobFingerprint("no-yield".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3904,6 +4358,7 @@ mod tests {
             foreign_client_grace_by_resource: vec![],
             abandon_after_ms: None,
             unit_prefix: None,
+            finish_hook: None,
             fingerprint: JobFingerprint("source-r1".into()),
             lease: LeaseRequest {
                 resources: vec![resource("build", Access::Exclusive)],
