@@ -1454,8 +1454,12 @@ fn conflicts(left: &ResourceRequest, right: &ResourceRequest) -> bool {
     left.key == right.key
 }
 
-/// Pure FIFO decision: an earlier conflicting ticket is never overtaken,
-/// while disjoint keys can run concurrently. All keys grant atomically.
+/// FIFO decision. A later ticket never overtakes an earlier conflicting
+/// one, unless that earlier ticket is itself held back by a key the later
+/// one does not request (busy, full or quarantined), so a build queued
+/// behind its own busy tree does not hold another tree's build off a free
+/// slot. An earlier ticket that could run keeps its turn. Disjoint keys
+/// run concurrently, and all keys grant atomically.
 fn dispatch_reason(state: &Journal, id: Uuid) -> Result<Option<String>> {
     let me = state
         .records
@@ -1465,78 +1469,112 @@ fn dispatch_reason(state: &Journal, id: Uuid) -> Result<Option<String>> {
     if !matches!(me.state, TicketState::Queued) {
         bail!("ticket is not queued");
     }
-    for quarantined in state.records.iter().filter(|r| r.quarantined) {
-        if quarantined
-            .request
-            .resources
-            .iter()
-            .any(|a| me.request.resources.iter().any(|b| conflicts(a, b)))
-        {
-            return Ok(Some(format!(
-                "resource quarantined after unverified orphan {}",
-                quarantined.ticket.id
-            )));
-        }
+    if let Some(quarantined) = me
+        .request
+        .resources
+        .iter()
+        .find_map(|requested| quarantined_by(state, requested))
+    {
+        return Ok(Some(format!(
+            "resource quarantined after unverified orphan {}",
+            quarantined.ticket.id
+        )));
     }
     for earlier in state
         .records
         .iter()
         .filter(|r| r.ticket.sequence < me.ticket.sequence)
     {
-        if matches!(earlier.state, TicketState::Queued | TicketState::Preparing)
-            && earlier
+        if !matches!(earlier.state, TicketState::Queued | TicketState::Preparing)
+            || !earlier
                 .request
                 .resources
                 .iter()
                 .any(|a| me.request.resources.iter().any(|b| conflicts(a, b)))
         {
+            continue;
+        }
+        let held_back = earlier
+            .request
+            .resources
+            .iter()
+            .filter(|theirs| {
+                !me.request
+                    .resources
+                    .iter()
+                    .any(|mine| conflicts(theirs, mine))
+            })
+            .any(|theirs| {
+                quarantined_by(state, theirs).is_some()
+                    || key_reason(state, earlier, theirs).is_some()
+            });
+        if !held_back {
             return Ok(Some(format!("FIFO ticket {} ahead", earlier.ticket.id)));
         }
     }
-    for requested in &me.request.resources {
-        let used = state
-            .records
-            .iter()
-            .filter(|r| matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
-            .flat_map(|r| &r.request.resources)
-            .filter(|r| r.key == requested.key)
-            .fold(0_u32, |n, r| {
-                n.saturating_add(match r.access {
-                    Access::Exclusive => capacity(&state.capacities, &r.key),
-                    Access::Shared { slots } => slots,
-                })
-            });
-        let preparable_service_holder = me.spec.is_some()
-            && matches!(requested.access, Access::Exclusive)
-            && state
-                .records
+    Ok(me
+        .request
+        .resources
+        .iter()
+        .find_map(|requested| key_reason(state, me, requested)))
+}
+
+/// The quarantined record that holds `requested`'s key, if any.
+fn quarantined_by<'a>(state: &'a Journal, requested: &ResourceRequest) -> Option<&'a LaneRecord> {
+    state.records.iter().find(|r| {
+        r.quarantined
+            && r.request
+                .resources
                 .iter()
-                .filter(|r| matches!(r.state, TicketState::Granted(_)))
-                .filter(|r| r.request.resources.iter().any(|r| r.key == requested.key))
-                .all(|r| r.service_lease);
-        if preparable_service_holder {
-            continue;
-        }
-        if used > 0 && matches!(requested.access, Access::Exclusive) {
-            return Ok(Some(format!(
-                "exclusive resource {} busy",
-                requested.key.name
-            )));
-        }
-        if used.saturating_add(match requested.access {
-            Access::Shared { slots } => slots,
-            Access::Exclusive => capacity(&state.capacities, &requested.key),
-        }) > capacity(&state.capacities, &requested.key)
-        {
-            return Ok(Some(format!(
-                "resource {} capacity {}/{}",
-                requested.key.name,
-                used,
-                capacity(&state.capacities, &requested.key)
-            )));
-        }
+                .any(|held| conflicts(held, requested))
+    })
+}
+
+/// Why `ticket` cannot take `requested` beside the current Granted and
+/// Preparing holders (other than itself); None when it fits. A job may
+/// claim an exclusive key held only by granted service leases: it enters
+/// Preparing and has them yield.
+fn key_reason(state: &Journal, ticket: &LaneRecord, requested: &ResourceRequest) -> Option<String> {
+    let holders: Vec<&LaneRecord> = state
+        .records
+        .iter()
+        .filter(|r| r.ticket.id != ticket.ticket.id)
+        .filter(|r| matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
+        .filter(|r| {
+            r.request
+                .resources
+                .iter()
+                .any(|held| conflicts(held, requested))
+        })
+        .collect();
+    let preparable_service_holder = ticket.spec.is_some()
+        && matches!(requested.access, Access::Exclusive)
+        && holders
+            .iter()
+            .all(|r| r.service_lease && matches!(r.state, TicketState::Granted(_)));
+    if preparable_service_holder {
+        return None;
     }
-    Ok(None)
+    let slots = capacity(&state.capacities, &requested.key);
+    let used = holders
+        .iter()
+        .flat_map(|r| &r.request.resources)
+        .filter(|held| conflicts(held, requested))
+        .fold(0_u32, |n, held| {
+            n.saturating_add(match held.access {
+                Access::Exclusive => slots,
+                Access::Shared { slots } => slots,
+            })
+        });
+    if used > 0 && matches!(requested.access, Access::Exclusive) {
+        return Some(format!("exclusive resource {} busy", requested.key.name));
+    }
+    let wanted = match requested.access {
+        Access::Shared { slots } => slots,
+        Access::Exclusive => slots,
+    };
+    (used.saturating_add(wanted) > slots)
+        .then(|| format!("resource {} capacity {used}/{slots}", requested.key.name))
 }
 
 fn grant_entry(entry: &mut LaneRecord) -> Lease {
@@ -3002,6 +3040,107 @@ mod tests {
                 .contains("exclusive")
         );
     }
+    /// Failure mode: a build queued behind its busy tree holding back every
+    /// later build on another tree that fits a free slot; or that relief
+    /// letting a later build take the slot an earlier eligible one is due,
+    /// or two exclusive claims on one key.
+    #[test]
+    fn fifo_blocked_tickets_do_not_hold_back_later_tickets_on_free_keys() {
+        use TicketState::{Preparing, Queued};
+        let build = |tree: &str| {
+            vec![
+                resource(tree, Access::Exclusive),
+                resource("slots", Access::Shared { slots: 1 }),
+            ]
+        };
+        let journal = |records| Journal {
+            client_revision: 0,
+            sequence: 9,
+            capacities: vec![Capacity {
+                key: key("slots"),
+                slots: 2,
+            }],
+            records,
+        };
+        let reason = |state: &Journal, seq: u128| {
+            dispatch_reason(state, Uuid::from_u128(seq))
+                .unwrap()
+                .unwrap_or_default()
+        };
+        // running(A), pending(A), pending(C): C takes the free slot.
+        let state = journal(vec![
+            granted(1, build("a")),
+            record(2, Queued, build("a")),
+            record(3, Queued, build("c")),
+        ]);
+        assert!(reason(&state, 2).contains("busy"));
+        assert_eq!(reason(&state, 3), "");
+        // running(A), pending(B), pending(C): B is due the free slot first.
+        let state = journal(vec![
+            granted(1, build("a")),
+            record(2, Queued, build("b")),
+            record(3, Queued, build("c")),
+        ]);
+        assert_eq!(reason(&state, 2), "");
+        assert!(reason(&state, 3).contains("FIFO"));
+        // running(A), pending(A), pending(A): the third waits.
+        let state = journal(vec![
+            granted(1, build("a")),
+            record(2, Queued, build("a")),
+            record(3, Queued, build("a")),
+        ]);
+        assert!(reason(&state, 3).contains("FIFO"));
+        // A tree quarantined by an unverified orphan relieves the same way.
+        let mut orphan = record(
+            1,
+            TicketState::Finished,
+            vec![resource("a", Access::Exclusive)],
+        );
+        orphan.quarantined = true;
+        let state = journal(vec![
+            orphan,
+            record(2, Queued, build("a")),
+            record(3, Queued, build("c")),
+        ]);
+        assert!(reason(&state, 2).contains("quarantined"));
+        assert_eq!(reason(&state, 3), "");
+        // Once its tree is free, the overtaken build is due the next slot.
+        let state = journal(vec![
+            granted(3, build("c")),
+            record(2, Queued, build("a")),
+            record(4, Queued, build("d")),
+        ]);
+        assert_eq!(reason(&state, 2), "");
+        assert!(reason(&state, 4).contains("FIFO"));
+        // A key both request never relieves: a writer still is not starved.
+        let state = journal(vec![
+            granted(1, vec![resource("slots", Access::Shared { slots: 1 })]),
+            record(2, Queued, vec![resource("slots", Access::Exclusive)]),
+            record(
+                3,
+                Queued,
+                vec![resource("slots", Access::Shared { slots: 1 })],
+            ),
+        ]);
+        assert!(reason(&state, 3).contains("FIFO"));
+        // A later job that overtook on the editor and is still Preparing (its
+        // services yielding) keeps the earlier job off that exclusive key.
+        let job = |seq: u64, state: TicketState, tree: &str| {
+            let mut row = record(
+                seq,
+                state,
+                vec![
+                    resource("editor", Access::Exclusive),
+                    resource(tree, Access::Exclusive),
+                ],
+            );
+            row.spec = Some(coalescing_spec(Path::new("/"), None));
+            row
+        };
+        let state = journal(vec![job(2, Queued, "a"), job(3, Preparing, "b")]);
+        assert!(reason(&state, 2).contains("editor busy"));
+    }
+
     #[test]
     fn disjoint_jobs_admit_without_waiting_for_blocked_tree() {
         let state = Journal {
