@@ -1,0 +1,30 @@
+manifest_version = 1
+id = "unreal"
+name = "Unreal development lanes"
+version = "0.1.0"
+description = "Project-agnostic Unreal templates for Borg jobs and editor services (exclusive runs spec-only)."
+enabled = true
+runtime_access = "trusted"
+skill_roots = ["skills"]
+
+[config.project]
+type = "string"
+description = "Absolute path to a .uproject (or discover from current directory)"
+required = false
+
+[config.engine_root]
+type = "string"
+description = "Absolute installed or source Unreal engine root; autodiscover if unset"
+required = false
+
+[workflows.discover]
+runtime = "python"
+entrypoint = "workflows/dispatch.py"
+description = "Discover Unreal project and engine configuration"
+
+[api]
+version = 1
+
+[api.commands.unreal]
+workflow = "discover"
+description = "Discover an Unreal engine and project; use project SKILL for lane commands"
