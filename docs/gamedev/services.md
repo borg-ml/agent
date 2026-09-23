@@ -150,7 +150,7 @@ admission queued" reason. Yielding A admitted B to Healthy; both owned
 systemd-user units stopped inactive/dead with empty control groups. See
 `/tmp/gd-real-capacity-probe.log` (synthetic HTTP, not Unreal).
 
-Final canonical-key public-CLI gate (integrated lane+service binary SHA256
+Pre-readiness-fix canonical-key public-CLI gate (integrated lane+service binary SHA256
 `011c4ba94835500d40910d3dab6096533d245a55f0ea7f72c1112b1450e5e99d`):
 Project `..` and symlink aliases, and Worktree `..` and symlink aliases, were
 rejected before admission. A canonical Project same-key exclusive job then
@@ -163,3 +163,27 @@ not a live Unreal editor or authenticated mutating MCP adapter. The earlier
 pre-alias-fix scoped and disk-budget smokes remain useful evidence for those
 individual behaviors but do not establish canonical Project-key safety by
 themselves.
+
+Post-resume-readiness public-CLI gates on freshly rebuilt binary SHA256
+`61ece6c173170b080933c821b81658a3d8ad422b1a5601d9550f8a30c4d7d4ac`:
+- Real systemd-user two-service no-hook exclusive job: both detached backend
+  descendants and delegated subgroups empty before grant, both proxies 503,
+  client restore/restart fenced, both backends healthy after release
+  (`/tmp/gd-two-service-scoped-readiness.log`).
+- Distinct Host keys and disk paths on the same filesystem each reserved
+  ~60% of free space: B had no backend with "disk admission queued" reason,
+  then became Healthy when A yielded; both owned units stopped inactive/dead
+  (`/tmp/gd-real-capacity-probe-readiness.log`, isolated probe
+  `/tmp/gd-real-capacity-probe.py`).
+- Project path aliases rejected before grant, canonical same-key handoff
+  retained (`/tmp/gd-alias-readiness.log`).
+- Stopped-supervisor resume kept `resume_pending` and journalled an error
+  until recovery (`/tmp/gd-failed-resume-readiness.log`). More importantly,
+  an ACKed Resume followed by failed backend health left `resume_pending`
+  and a readiness error, with the yield token removed; after health returned,
+  recovery cleared pending without a second Resume
+  (`/tmp/gd-ack-unhealthy-readiness2.log`).
+
+These are fake HTTP services and pinned local binaries, not a live Unreal editor.
+The earlier SHA `011c4ba9…` gates do not establish the newer resume-readiness
+semantics.
