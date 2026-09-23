@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,12 +37,23 @@ def state_done(state: object) -> bool:
     return isinstance(state, dict) and state.get("Finished", {}).get("exit_code") == 0
 
 
+@contextmanager
+def isolated_root():
+    root = Path(tempfile.mkdtemp(prefix="borg-bench-"))
+    try:
+        yield root
+    except BaseException:
+        print(f"Failed CLI probe retained for diagnosis: {root}", file=sys.stderr)
+        raise
+    else:
+        shutil.rmtree(root)
+
+
 def run(binary: Path, agents: int, jobs: int, scale: float, seed: int) -> dict:
     tasks = workloads(agents, jobs, seed)
     binary = binary.resolve(strict=True)
     script = Path(__file__).with_name("gamedev_benchmark.py").resolve()
-    with tempfile.TemporaryDirectory(prefix="borg-bench-") as tmp:
-        root = Path(tmp)
+    with isolated_root() as root:
         lane = root / "lanes"
         project = root / "project"
         project.mkdir()
@@ -99,8 +112,9 @@ def run(binary: Path, agents: int, jobs: int, scale: float, seed: int) -> dict:
                 for job_id in ids:
                     try:
                         cli(binary, lane, "job", "cancel", job_id)
+                        cli(binary, lane, "job", "wait", job_id, timeout=5)
                     except Exception:
-                        pass
+                        pass  # Preserve the state directory for manual recovery.
                 raise
         statuses: list[dict] = []
         for job_id in sorted(ids):
