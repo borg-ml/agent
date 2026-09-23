@@ -380,7 +380,7 @@ async fn helper_command() -> Result<Command> {
         return Ok(command);
     }
     let mut command = Command::new("python3");
-    command.args(["-I", "-u", "-c", include_str!("computer_use/linux.py")]);
+    command.args(["-I", "-u", "-c", LINUX_HELPER_SOURCE]);
     // Release archives ship the private-display compositor next to borg.
     if let Some(display) = std::env::current_exe()
         .ok()
@@ -393,6 +393,13 @@ async fn helper_command() -> Result<Command> {
 }
 
 const MACOS_HELPER_SOURCE: &str = include_str!("computer_use/macos.swift");
+/// Compositor window parsing/mapping is a separate AT-SPI-free module so it can
+/// be unit tested; it runs as the prologue of the Linux worker.
+const LINUX_HELPER_SOURCE: &str = concat!(
+    include_str!("computer_use/linux_windows.py"),
+    "\n",
+    include_str!("computer_use/linux.py")
+);
 const WINDOWS_HELPER_SOURCE: &str = include_str!("computer_use/windows.ps1");
 
 fn which_in_path(program: &str) -> bool {
@@ -558,6 +565,30 @@ mod tests {
                 "{refused} must be refused for a sub-agent"
             );
         }
+    }
+
+    /// Compositor window parsing and window-to-desktop mapping decide where
+    /// injected clicks land, so a regression would click the wrong pixels.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_window_backends_parse_and_map_coordinates() {
+        let source = concat!(
+            include_str!("computer_use/linux_windows.py"),
+            "\n",
+            include_str!("computer_use/linux_windows_test.py")
+        );
+        let Ok(output) = std::process::Command::new("python3")
+            .args(["-I", "-c", source])
+            .output()
+        else {
+            eprintln!("python3 unavailable; skipping the Linux helper unit tests");
+            return;
+        };
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[tokio::test]
