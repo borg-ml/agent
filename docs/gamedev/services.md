@@ -31,12 +31,13 @@ below are currently required by the v0 Rust wire contract):
 `idle`, and `active` are `Hook {argv:[...],timeout_ms:number}`; restore argv
 receives `{owner}` (the lease holder participant UUID). `idle_after_ms`
 controls the idle hook. `adapter_enforces_leases` defaults to false. Memory
-cap covers the transient systemd user unit. **Current limitation:**
-`admission` is parsed but not yet reserved atomically against other service or
-job budgets in the lane journal; `MemoryMax` is a unit cap, not host headroom.
-Do not claim service capacity admission until the planned lane reservation
-and cross-service budget test pass. No systemd means start fails closed
-rather than launching an orphanable process tree. The unit uses
+cap covers the transient systemd user unit. The service's `admission`
+reservation is evaluated with active job and service RAM/per-filesystem disk
+reservations under the same lane journal lock before backend spawn. A denied
+service stays unavailable with the lane's RAM/disk reason and retries; yield
+and stop release the reservation. `MemoryMax` is a separate per-unit ceiling,
+not a substitute for the host admission check. Without systemd, start fails
+closed rather than launching an orphanable process tree. The unit uses
 `KillMode=control-group` and `Delegate=yes`; each backend generation runs in
 its own delegated subgroup. Stop kills that subgroup and verifies
 `cgroup.events: populated 0` before yield or lane-lease release. Only
@@ -80,11 +81,11 @@ arbitrary GET and MCP initialize POST: a GET path or query can also mutate.
 `read_only_paths` optionally lists exact, audited no-query GET/HEAD paths;
 only these paths may be forwarded unfenced, one request per connection, with no
 pipelined or later client writes. The Unreal adapter does not opt in. Merely
-having a client lease does not authorize a raw MCP mutation. An adapter may set `adapter_enforces_leases=true` only when it
-actually validates owner and monotone lease generation for **every** mutating
+having a client lease does not authorize a raw MCP mutation. An adapter
+may set `adapter_enforces_leases=true` only when it actually validates owner and monotone lease generation for **every** mutating
 upstream call and rejects stale sessions after expiry, yield and restart.
-Without that adapter, the endpoint is closed except audited status paths; do not advertise editor MCP
-mutations as working. CLI `--owner` is a local operator claim, not model-facing
+Without that adapter, the endpoint is closed except audited status paths; do
+not advertise editor MCP mutations as working. CLI `--owner` is a local operator claim, not model-facing
 authorization. Service `start` accepts arbitrary argv from a local file and
 must never be exposed as a model tool without a pre-registered validated spec.
 
@@ -96,24 +97,24 @@ caller-supplied owner, spec, argv, or `confirmed`. Until the parent integrator
 reviews and wires those checks, **there is no registered MCP tool**. `borg lane
 service` remains a host-local CLI for operators and approved Blu workflows.
 
-**Full exclusive lane gate is not yet proven:** the supervisor does hold a
-`LaneStore` shared resource lease through backend lifetime. The lane job must
-enter a pre-admission `Preparing` barrier, yield **every** service bound to
-its exclusive resource before it becomes `Granted`, and resume only after
-release. The service TTL-expiry regression proves it cannot relaunch while an
-exclusive lease is `Granted`. Automatic all-service discovery/yield and a
-cross-CLI regression are still pending lane-side; no editor/exclusive parity
-claim until they pass. The lack of a safe non-systemd scope equivalent also
-means the requested `setsid` fallback is deferred, not silently unsafe.
+**Exclusive lane gate (fake services verified):** the supervisor holds a
+`LaneStore` shared lease during the backend lifetime. A lane job requesting
+that resource enters `Preparing`, discovers and synchronously yields every
+bound service, verifies they released their backend scopes and leases, then
+grants exclusivity under the same lane lock. New/restarted services cannot
+launch while that exclusive lease remains `Preparing` or `Granted`, even after
+TTL expiry; post-release they resume. This was verified with two fake services,
+not a live Unreal editor.
 
 ## Evidence (fake HTTP backend, not Unreal)
 
 `CARGO_BUILD_JOBS=6 nice -n 10 cargo test -p borg-lanes services::tests -- --nocapture`:
-8 passed, including crash/hang restart, A/B debounced restart, active-client
+10 passed, including two-service atomic RAM/disk reservation denial and
+yield-to-admit handoff, crash/hang restart, A/B debounced restart, active-client
 restoration before yield, expired-yield and forced-restart denial under a
 `Granted` exclusive lane lease, default-deny proxy and pipelining guards,
 wrong-owner resume, idle/active hooks, and readiness checks. Warm A/B restart
-sampled the proxy continuously: **0 unavailable requests, ~310–330 ms** on
+sampled the proxy continuously: **0 unavailable requests, ~310–410 ms** on
 the fake backend (not an Unreal timing).
 
 Production fake HTTP CLI smoke (local systemd user unit, not Unreal): start
@@ -127,3 +128,18 @@ Crash-subtree production smoke: fake `/childexit` spawned a detached `setsid`
 child in the backend subgroup and exited its leader. Recovery verified the
 child gone, restarted on the alternate port (`restarts=1`), then the owned
 fixture was stopped; its unit was inactive and subgroup removed.
+
+Independent no-hook two-service scoped gate (bench script, SHA256
+`4022be198a99c3e8f8cac3069387f222bd2cb4e1bfdfb7a4135e8048c19a34b2`):
+`python3 scripts/gamedev_service_probe.py --borg PATH --atomic-descendant`
+exited 0 on a real
+systemd-user job; both backend PIDs, detached descendants and delegated
+subgroups were gone before exclusive grant, both proxies returned 503, a
+client was restored, restart attempts remained fenced, and both services
+auto-resumed on release. See `/tmp/gd-two-service-scoped.log`. No real Unreal
+editor, engine-specific mutating MCP or model-facing registration was tested.
+
+An owned-unit supervisor-crash smoke SIGKILLed only the test supervisor main
+process; `KillMode=control-group` killed its detached backend child and the
+unit became inactive. The lack of a safe non-systemd process-tree scope still
+prevents a standalone `setsid` production fallback.
