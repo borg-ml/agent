@@ -1835,19 +1835,55 @@ fn scope_control_group(unit: &str) -> Option<String> {
     if path.is_empty() { None } else { Some(path) }
 }
 
-fn proc_cpu(pid: u32) -> Option<f64> {
+/// CPU seconds of `pid`, plus those of the children it has reaped when
+/// `with_children`.
+fn proc_cpu(pid: u32, with_children: bool) -> Option<f64> {
     let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let tail = text
         .rsplit_once(") ")?
         .1
         .split_whitespace()
         .collect::<Vec<_>>();
-    let ticks: u64 = tail
-        .get(11)?
-        .parse::<u64>()
-        .ok()?
-        .saturating_add(tail.get(12)?.parse().ok()?);
+    // utime, stime, cutime, cstime
+    let fields = if with_children { 11..15 } else { 11..13 };
+    let mut ticks = 0_u64;
+    for field in fields {
+        ticks = ticks.saturating_add(tail.get(field)?.parse().ok()?);
+    }
     Some(ticks as f64 / unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64)
+}
+
+/// CPU seconds a job's workload has used so far. Scoped: its scope's
+/// cgroup, which counts every process it started, exited ones included.
+/// Unscoped: the live members of its own process group, each with the
+/// children it has reaped. A scoped job whose cgroup is unknown falls
+/// back to its leader alone.
+fn workload_cpu(cgroup: Option<&str>, scoped: bool, leader: u32) -> f64 {
+    if let Some(usec) = cgroup.and_then(cgroup_cpu_usec) {
+        return usec as f64 / 1_000_000.0;
+    }
+    if scoped {
+        return proc_cpu(leader, false).unwrap_or(0.0);
+    }
+    process_group_pids(leader)
+        .into_iter()
+        .filter_map(|pid| proc_cpu(pid, true))
+        .sum()
+}
+
+/// `usage_usec` from a cgroup v2 group's cpu.stat.
+fn cgroup_cpu_usec(path: &str) -> Option<u64> {
+    fs::read_to_string(
+        Path::new("/sys/fs/cgroup")
+            .join(path.trim_start_matches('/'))
+            .join("cpu.stat"),
+    )
+    .ok()?
+    .lines()
+    .find_map(|line| line.strip_prefix("usage_usec "))?
+    .trim()
+    .parse()
+    .ok()
 }
 
 impl LaneStore {
@@ -2421,6 +2457,7 @@ impl LaneStore {
             }
             group = group.or_else(|| scope_control_group(&unit));
         }
+        let cpu_cgroup = group.clone();
         self.locked(|state| {
             let record = state
                 .records
@@ -2442,12 +2479,15 @@ impl LaneStore {
         let started = std::time::Instant::now();
         let mut last_progress = started;
         let mut last_size = 0;
-        let mut last_cpu = 0.0;
+        // CPU at the last progress mark: a stall is no log growth and under
+        // 50 ms of CPU across the whole workload since then.
+        let mut progress_cpu = 0.0;
         // Progress reaches the journal at most once a second and only when
         // it changed; otherwise the loop neither locks nor reads the journal
         // and learns of a cancel from its marker file.
         let mut journalled: Option<(u64, f64)> = None;
         let mut journalled_at: Option<Instant> = None;
+        let mut latest = (0, 0.0);
         let cancel_marker = self.job_dir(id).join(CANCEL_MARKER);
         let leader = child.id();
         let (end, note) = loop {
@@ -2456,17 +2496,23 @@ impl LaneStore {
                 break (JobEnd::Exited(code), "finished".to_owned());
             }
             let size = fs::metadata(self.job_dir(id).join("output.log")).map_or(0, |m| m.len());
-            let cpu = proc_cpu(leader).unwrap_or(0.0);
-            if size != last_size || cpu > last_cpu + 0.05 {
+            let cpu = workload_cpu(cpu_cgroup.as_deref(), scoped, leader);
+            if size != last_size || cpu > progress_cpu + 0.05 {
                 last_progress = std::time::Instant::now();
+                progress_cpu = cpu;
             }
+            // Exited unreaped processes drop out of an unscoped sum.
+            progress_cpu = progress_cpu.min(cpu);
             last_size = size;
-            last_cpu = cpu;
             if self.abandoned(&spec, id, &mut last_requester_ms) {
                 self.cancel_ticket(id, ABANDONED)?;
             }
             let due = journalled_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
-            if due && journalled != Some((size, cpu)) {
+            // Journalled at the 10 ms resolution of /proc CPU ticks, so the
+            // microsecond cgroup counter of an idle job does not rewrite it.
+            let cpu = (cpu * 100.0).round() / 100.0;
+            latest = (size, cpu);
+            if due && journalled != Some(latest) {
                 self.locked(|state| {
                     let record = state
                         .records
@@ -2503,6 +2549,17 @@ impl LaneStore {
             }
             std::thread::sleep(Duration::from_millis(100));
         };
+        // The last reading while the workload lived (an unscoped group is
+        // gone once its leader is reaped).
+        if journalled != Some(latest) {
+            self.locked(|state| {
+                if let Some(record) = state.records.iter_mut().find(|r| r.ticket.id == id) {
+                    record.progress = Some(format!("{} bytes", latest.0));
+                    record.cpu_seconds = Some(latest.1);
+                }
+                Ok(())
+            })?;
+        }
         // The leader is gone; no process of this workload may outlive it into
         // the next holder's lease (a compiler it started, for example).
         self.kill_workload(id, &unit, scoped, leader, "killed leftover pids")?;
