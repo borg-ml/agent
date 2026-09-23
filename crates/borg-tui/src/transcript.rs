@@ -237,9 +237,9 @@ struct ToolBodyCache {
 /// columns show nothing a reader can use.
 const GLYPH_PREVIEW_TILE_WIDTH: usize = 48;
 const GLYPH_PREVIEW_TILE_ROWS: usize = 24;
-/// Rows a graphics preview may reserve. Two screens is enough for a full-size
-/// screenshot and keeps one image from burying the transcript around it.
-const MAX_GRAPHICS_PREVIEW_ROWS: usize = 120;
+/// Rows a graphics preview may reserve. A larger image is scaled down to fit,
+/// so one screenshot cannot bury the transcript; its link opens it full size.
+const MAX_GRAPHICS_PREVIEW_ROWS: usize = 24;
 
 impl Default for Transcript {
     fn default() -> Self {
@@ -4102,13 +4102,12 @@ impl Transcript {
                     link_rows.extend(message_lines.links);
                     lines.extend(message_lines.lines);
                     let available = width.saturating_sub(MESSAGE_HORIZONTAL_PADDING).max(1);
-                    // A preview is only as legible as the resolution it is drawn
-                    // at. A graphics terminal draws the image at the tile pixel
-                    // size, so the tile takes the whole transcript width and the
-                    // rows the image needs at that width: a screenshot keeps its
-                    // own resolution and the text inside it stays readable. A
-                    // glyph tile packs two pixels into one cell, so it stays
-                    // small - and its caption says the text cannot be read there.
+                    // A graphics terminal draws the image at the tile pixel
+                    // size: the tile takes the transcript width and the rows the
+                    // image needs at that width, up to a cap that scales a large
+                    // image down. A glyph tile packs two pixels into one cell,
+                    // so it stays small - and its caption says the text cannot
+                    // be read there.
                     //
                     // A graphics tile also carries a gutter bar down its left
                     // edge: a screenshot of this interface drawn at its own

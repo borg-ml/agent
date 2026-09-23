@@ -15077,9 +15077,9 @@ fn attachment_transcript(path: &Path, cell: Option<(u16, u16)>) -> Transcript {
 }
 
 #[test]
-fn graphics_terminal_reserves_the_resolution_an_image_preview_needs() {
-    // Failure mode: a graphics-capable terminal showing a screenshot squeezed
-    // into the glyph tile, which is a thumbnail no reader can read text in.
+fn graphics_preview_is_scaled_down_to_a_bounded_tile() {
+    // Failure mode: a screenshot drawn at its own resolution fills the
+    // terminal and buries the transcript around it.
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("shot.png");
     image::RgbImage::from_pixel(1600, 900, image::Rgb([10, 20, 30]))
@@ -15087,18 +15087,17 @@ fn graphics_terminal_reserves_the_resolution_an_image_preview_needs() {
         .unwrap();
 
     let rendered = attachment_transcript(&path, Some((8, 16))).render(200, None, None, None);
-    let (rows, width) = preview_rows_for(&rendered, &path);
+    let (rows, _) = preview_rows_for(&rendered, &path);
 
-    // 200 columns carry 1600 pixels, so the image is drawn at its own size: one
-    // cell per 16 rows of a 900 pixel image.
-    assert!(rows >= 50, "reserved {rows} rows for a 900px image");
-    assert!(width >= 150, "preview width {width} columns");
+    // At its own size the 900px image would take 57 rows; the label row is
+    // counted too.
+    assert_eq!(rows, 25, "reserved {rows} rows for a 900px image");
     assert!(
         !rendered
             .0
             .iter()
             .any(|line| line.to_string().contains("not readable")),
-        "a graphics terminal must not claim the preview is unreadable"
+        "a graphics terminal must not fall back to the glyph caption"
     );
 }
 
