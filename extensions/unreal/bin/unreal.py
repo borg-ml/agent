@@ -307,7 +307,7 @@ def main(argv: list[str]) -> int:
                 print(json.dumps(spec, indent=2))
                 return 0
             if opts.command == 'run':
-                raise ValueError('exclusive run requires a core service yield tied to the project; use --spec until the integrated core CLI exposes atomic yield+job admission')
+                raise ValueError('exclusive run is not wired to verified editor yield, post-hook resume and owner fencing; use --spec only')
             return submit(spec, opts.wait)
         if opts.command == 'editor':
             definition = service_spec(project, engine, cfg)
