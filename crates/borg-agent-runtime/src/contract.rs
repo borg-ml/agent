@@ -2463,6 +2463,8 @@ pub enum SessionEventKind {
         stderr_omitted_bytes: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changes: Vec<crate::CommandChange>,
     },
     /// Durable lifecycle for an embedded Blu workflow. These events are
     /// runtime journal entries rather than model transcript content.

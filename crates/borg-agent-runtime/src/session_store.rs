@@ -1998,6 +1998,86 @@ pub fn deferred_text_payload(value: &str, payload: &SessionPayloadRef) -> String
     )
 }
 
+/// Keep a command's change list visible in a deferred tool result. The full
+/// output, including each diff, remains in the payload and loads on inspection.
+pub fn deferred_tool_output_payload(value: &str, payload: &SessionPayloadRef) -> String {
+    if !value.contains("\"changes\"") {
+        return deferred_text_payload(value, payload);
+    }
+    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(value) else {
+        return deferred_text_payload(value, payload);
+    };
+    let nested = parsed
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|content| {
+            content
+                .iter()
+                .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+                .find_map(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        });
+    let Some(changes) = parsed
+        .get("changes")
+        .or_else(|| parsed.pointer("/structuredContent/changes"))
+        .or_else(|| nested.as_ref().and_then(|inner| inner.get("changes")))
+        .and_then(serde_json::Value::as_array)
+        .filter(|changes| !changes.is_empty())
+    else {
+        return deferred_text_payload(value, payload);
+    };
+
+    let mut visible = Vec::new();
+    let mut added = 0_u64;
+    let mut removed = 0_u64;
+    for change in changes {
+        added = added.saturating_add(
+            change
+                .get("added")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+        removed = removed.saturating_add(
+            change
+                .get("removed")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+        if visible.len() < 64
+            && let Some(path) = change.get("path").and_then(serde_json::Value::as_str)
+        {
+            let mut chars = path.chars();
+            let mut path = chars.by_ref().take(128).collect::<String>();
+            if chars.next().is_some() {
+                path.push('…');
+            }
+            visible.push(serde_json::json!({
+                "path": path,
+                "added": change.get("added").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                "removed": change.get("removed").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            }));
+        }
+    }
+    if visible.is_empty() {
+        return deferred_text_payload(value, payload);
+    }
+    let mut preview = deferred_json_payload(payload);
+    let fields = preview
+        .as_object_mut()
+        .expect("deferred payload marker is an object");
+    fields.insert("changes".to_string(), serde_json::Value::Array(visible));
+    fields.insert(
+        "changes_deferred".to_string(),
+        serde_json::Value::Bool(true),
+    );
+    fields.insert(
+        "changes_count".to_string(),
+        serde_json::json!(changes.len()),
+    );
+    fields.insert("changes_added".to_string(), serde_json::json!(added));
+    fields.insert("changes_removed".to_string(), serde_json::json!(removed));
+    preview.to_string()
+}
+
 /// The inline marker left where a native provider payload used to be. The
 /// reference rides inside the marker because a `ProviderEvent` has no
 /// reference field of its own, so this is the only place replay can find it.

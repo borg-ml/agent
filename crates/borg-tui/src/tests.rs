@@ -2107,6 +2107,290 @@ fn completed_tool_keeps_output_in_the_expandable_body_and_summarizes_the_header(
 }
 
 #[test]
+fn command_changes_become_a_separate_replay_stable_edit_action() {
+    let session_id = Uuid::new_v4();
+    let started = SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "rewrite".to_string(),
+            name: "exec_command".to_string(),
+            input: serde_json::json!({"cmd": "python3 rewrite.py"}),
+            input_ref: None,
+        },
+    );
+    let later = SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "later".to_string(),
+            name: "exec_command".to_string(),
+            input: serde_json::json!({"cmd": "cargo check"}),
+            input_ref: None,
+        },
+    );
+    let completed = SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "rewrite".to_string(),
+            output: serde_json::json!({
+                "command": "python3 rewrite.py",
+                "stdout": "rewrote src/lib.rs\n",
+                "exit_code": 0,
+                "running": false,
+                "changes": [{
+                    "path": "src/lib.rs",
+                    "added": 1,
+                    "removed": 1,
+                    "diff": "@@ -1 +1 @@\n-old\n+new"
+                }]
+            })
+            .to_string(),
+            output_ref: None,
+            is_error: false,
+            input: Some(serde_json::json!({"cmd": "python3 rewrite.py"})),
+            input_ref: None,
+        },
+    );
+    let mut transcript = Transcript::default();
+    transcript.apply(&started);
+    transcript.apply(&later);
+    transcript.selected = Some(1);
+    transcript.apply(&completed);
+    transcript.apply(&completed);
+
+    assert_eq!(
+        transcript.order.len(),
+        3,
+        "replayed completion must not duplicate the edit"
+    );
+    assert_eq!(
+        transcript.selected,
+        Some(1),
+        "the later action keeps its selection"
+    );
+    assert_eq!(transcript.tools.get("later"), Some(&1));
+    assert!(matches!(
+        &transcript.order[0],
+        TranscriptEntry::Tool {
+            name,
+            code_view: Some((language, command)),
+            output_view: Some((_, output)),
+            ..
+        } if name == "Run" && language == "command" && command == "python3 rewrite.py"
+            && output.contains("rewrote src/lib.rs") && !output.contains("@@ -1")
+    ));
+    assert!(matches!(
+        &transcript.order[1],
+        TranscriptEntry::Tool { code_view: Some((_, command)), .. }
+            if command == "cargo check"
+    ));
+    assert!(matches!(
+        &transcript.order[2],
+        TranscriptEntry::Tool {
+            name,
+            code_view: Some((language, diff)),
+            expanded: true,
+            ..
+        } if name == "Edit" && language == "diff:rs" && diff.contains("+new")
+    ));
+
+    let mut replay = Transcript::default();
+    for event in [&started, &later, &completed] {
+        replay.apply(event);
+    }
+    assert_eq!(replay.order.len(), 3);
+    assert!(matches!(
+        &replay.order[2],
+        TranscriptEntry::Tool { name, code_view: Some((_, diff)), .. }
+            if name == "Edit" && diff.contains("+new")
+    ));
+}
+
+#[test]
+fn deferred_command_change_hydrates_its_edit_action() {
+    let session_id = Uuid::new_v4();
+    let payload = SessionPayloadRef {
+        id: Uuid::new_v4(),
+        kind: SessionPayloadKind::ToolOutput,
+        byte_len: 100_000,
+    };
+    let full_output = serde_json::json!({
+        "command": "python3 rewrite.py",
+        "stdout": "rewrote src/lib.rs\n",
+        "exit_code": 0,
+        "running": false,
+        "changes": [{
+            "path": "src/lib.rs",
+            "added": 1,
+            "removed": 1,
+            "diff": "@@ -1 +1 @@\n-old\n+new"
+        }]
+    })
+    .to_string();
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "rewrite".to_string(),
+            name: "exec_command".to_string(),
+            input: serde_json::json!({"cmd": "python3 rewrite.py"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "rewrite".to_string(),
+            output: serde_json::json!({
+                "changes_deferred": true,
+                "changes": [{"path": "src/lib.rs", "added": 1, "removed": 1}],
+                "borg_payload_deferred": true,
+                "payload_id": payload.id,
+                "byte_len": payload.byte_len
+            })
+            .to_string(),
+            output_ref: Some(payload.clone()),
+            is_error: false,
+            input: None,
+            input_ref: None,
+        },
+    ));
+    assert!(matches!(
+        &transcript.order[1],
+        TranscriptEntry::Tool {
+            name,
+            code_view: Some((language, _)),
+            payload_refs,
+            expanded: false,
+            ..
+        } if name == "Edit" && language == "text" && payload_refs == &[payload.clone()]
+    ));
+
+    transcript
+        .hydrate_payload(&payload, full_output.into_bytes())
+        .unwrap();
+    assert_eq!(transcript.order.len(), 2);
+    assert!(matches!(
+        &transcript.order[1],
+        TranscriptEntry::Tool {
+            code_view: Some((language, diff)),
+            payload_refs,
+            expanded: true,
+            ..
+        } if language == "diff:rs" && diff.contains("+new") && payload_refs.is_empty()
+    ));
+}
+
+#[test]
+fn background_process_change_and_terminal_poll_share_one_edit_action() {
+    let session_id = Uuid::new_v4();
+    let process_id = Uuid::new_v4();
+    let changes = vec![borg_remote::CommandChange {
+        path: "src/lib.rs".to_string(),
+        added: 1,
+        removed: 1,
+        diff: "@@ -1 +1 @@\n-old\n+new".to_string(),
+    }];
+    let mut transcript = Transcript::default();
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "run".to_string(),
+            name: "exec_command".to_string(),
+            input: serde_json::json!({"cmd": "python3 rewrite.py"}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::RuntimeProcessStarted {
+            process_id,
+            pid: 42,
+            command: "python3 rewrite.py".to_string(),
+            cwd: PathBuf::from("/workspace"),
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "run".to_string(),
+            output: serde_json::json!({"session_id": process_id, "running": true}).to_string(),
+            output_ref: None,
+            is_error: false,
+            input: None,
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        4,
+        SessionEventKind::RuntimeProcessCompleted {
+            process_id,
+            pid: 42,
+            status: borg_remote::RuntimeProcessStatus::Exited,
+            exit_code: Some(0),
+            timed_out: false,
+            stdout: "rewrote src/lib.rs".to_string(),
+            stderr: String::new(),
+            stdout_omitted_bytes: 0,
+            stderr_omitted_bytes: 0,
+            error: None,
+            changes: changes.clone(),
+        },
+    ));
+    assert_eq!(transcript.order.len(), 2);
+    assert!(matches!(
+        &transcript.order[1],
+        TranscriptEntry::Tool { name, code_view: Some((_, diff)), .. }
+            if name == "Edit" && diff.contains("+new")
+    ));
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        5,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "poll".to_string(),
+            name: "write_stdin".to_string(),
+            input: serde_json::json!({"session_id": process_id}),
+            input_ref: None,
+        },
+    ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        6,
+        SessionEventKind::ToolCompleted {
+            tool_call_id: "poll".to_string(),
+            output: serde_json::json!({
+                "session_id": process_id,
+                "running": false,
+                "stdout": "rewrote src/lib.rs",
+                "exit_code": 0,
+                "changes": changes
+            })
+            .to_string(),
+            output_ref: None,
+            is_error: false,
+            input: Some(serde_json::json!({"session_id": process_id})),
+            input_ref: None,
+        },
+    ));
+    assert_eq!(transcript.order.len(), 3);
+    assert_eq!(transcript.command_edit_rows.len(), 1);
+    assert_eq!(transcript.command_edit_rows.get("run"), Some(&1));
+    assert!(matches!(
+        &transcript.order[2],
+        TranscriptEntry::Tool { name, .. } if name != "Edit"
+    ));
+}
+
+#[test]
 fn tool_copy_uses_output_and_keeps_edit_diffs_copyable() {
     let tool = |code_view, output_view| TranscriptEntry::Tool {
         source_name: "functions.exec_command".to_string(),
