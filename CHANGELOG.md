@@ -46,8 +46,9 @@ Git comparison.
   while the host retains at most four idle Claude processes for up to 15
   minutes. An idle session rebuilds its context when needed again.
 - **Queued team updates recover and clear correctly.** Replayed sub-agent
-  messages keep their team role, appear in Pending Input, and leave the panel
-  when admitted into a turn. Older queued messages are corrected on recovery.
+  messages keep their team role and remain in the durable inbox until the next
+  turn. Older queued messages are corrected on recovery; team updates stay out
+  of the human Pending Input panel.
 - **`wait_agent` waits for real work.** One call blocks up to 30 minutes
   (default 10) and returns as soon as a child settles, reports, or human/team
   input arrives. It says what ended the wait and includes a status line per
@@ -66,9 +67,9 @@ Git comparison.
 
 ### Terminal
 
-- Pending Input can be collapsed, and team messages there have accurate
-  controls. The composer and transcript scrollbar use less space, while the
-  completion chime plays more quietly.
+- Pending Input can be collapsed and shows only queued human prompts. The
+  composer has a lighter text stripe between divider lines, the transcript
+  scrollbar uses less space, and the completion chime plays more quietly.
 - The sub-agent roster now labels the current model separately from total
   lifetime token use. Costs are marked as estimated,
   subscription-equivalent, mixed, partial, or unavailable as appropriate.
