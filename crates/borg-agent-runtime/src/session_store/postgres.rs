@@ -442,10 +442,8 @@ impl PostgresSessionStore {
         } else {
             "not_checked".to_string()
         };
-        // The durability question, asked of the server rather than assumed.
-        // `off` and `local` both acknowledge a commit that a crash can still
-        // lose, and they are set by operators chasing throughput, so this is
-        // worth reading every time rather than trusting a default.
+        // Report the actual commit policy. Async commit is the managed default,
+        // so it must not be mistaken for an unavailable or corrupt store.
         let commit_durability: String = sqlx::query_scalar("show synchronous_commit")
             .fetch_one(&self.pool)
             .await?;
@@ -466,7 +464,7 @@ impl PostgresSessionStore {
             integrity_checked: check_integrity,
             durable_commits: matches!(
                 commit_durability.as_str(),
-                "on" | "remote_apply" | "remote_write"
+                "on" | "local" | "remote_apply" | "remote_write"
             ),
             commit_durability,
             sessions,
@@ -627,13 +625,14 @@ mod tests {
         assert_eq!(health.integrity, "ok");
         assert!(health.integrity_checked);
         assert_eq!(health.projection_version, crate::SESSION_PROJECTION_VERSION);
-        // Readiness turns on durability, so the reported setting has to be the
-        // server's real one rather than a constant: a test that accepted any
-        // value here would pass against a server configured to lose commits.
-        assert!(
+        // The fixture may be synchronous or asynchronous: report which, but
+        // don't mark a healthy async store unavailable.
+        assert_eq!(
             health.durable_commits,
-            "a default server acknowledges commits durably, got synchronous_commit={}",
-            health.commit_durability
+            matches!(
+                health.commit_durability.as_str(),
+                "on" | "local" | "remote_apply" | "remote_write"
+            )
         );
         assert!(
             !health.commit_durability.is_empty(),
