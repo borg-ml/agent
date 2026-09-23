@@ -4825,11 +4825,21 @@ async fn a_sub_agent_cannot_use_its_parents_lane_or_service_identity() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("cannot be supplied"), "{error}");
+    // Another session's exclusive waits on the parent's lease: the child
+    // sees that wait, but never the parent's participant or session id.
+    crate::lane_tools::tests::plant_foreign_wait(
+        &lanes.root,
+        &crate::lane_tools::tests::caller(5),
+        &parent_identity,
+    );
     let status = child
         .call("lane_service", json!({"op": "status", "id": "editor"}))
         .await
         .unwrap();
     assert_eq!(status["clients"][0]["yours"], false);
+    let shown = status.to_string();
+    assert!(shown.contains("holder another agent "), "{shown}");
+    assert!(!shown.contains(&root.to_string()), "{shown}");
 
     // The parent's own session passes the lease check (the read then fails
     // only because no service is listening in this fixture).
@@ -4839,6 +4849,13 @@ async fn a_sub_agent_cannot_use_its_parents_lane_or_service_identity() {
         .await
         .unwrap();
     assert_eq!(status["clients"][0]["yours"], true);
+    assert!(
+        status["reason"]
+            .as_str()
+            .unwrap()
+            .contains("holder you until"),
+        "{status}"
+    );
     let error = parent
         .call(
             "lane_service",
