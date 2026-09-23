@@ -507,6 +507,21 @@ fn compaction_has_expandable_detail(summary: &str) -> bool {
     )
 }
 
+/// The collapsed row's one-line summary of a reasoning block: its first line,
+/// without the bold markers some providers wrap a summary title in. Claude
+/// returns thinking as a short summary, so this is often the whole of it.
+fn reasoning_preview(source: &str) -> String {
+    let line = source
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    line.strip_prefix("**")
+        .and_then(|line| line.strip_suffix("**"))
+        .unwrap_or(line)
+        .to_string()
+}
+
 fn tool_has_expandable_body(
     source_name: &str,
     code_view: Option<&(String, String)>,
@@ -2625,6 +2640,7 @@ impl Transcript {
         if let Some(index) = self.active_reasoning
             && let Some(TranscriptEntry::Tool {
                 code_view: Some((language, source)),
+                detail,
                 complete,
                 ..
             }) = self.order.get_mut(index)
@@ -2632,6 +2648,7 @@ impl Transcript {
             && !*complete
         {
             Self::merge_reasoning_snapshot(source, text);
+            *detail = reasoning_preview(source);
             return;
         }
         if text.trim().is_empty() {
@@ -2641,11 +2658,13 @@ impl Transcript {
         if let Some(index) = self.active_reasoning
             && let Some(TranscriptEntry::Tool {
                 code_view: Some((language, source)),
+                detail,
                 ..
             }) = self.order.get_mut(index)
             && language == "reasoning"
         {
             Self::merge_reasoning_snapshot(source, text);
+            *detail = reasoning_preview(source);
         }
     }
 
