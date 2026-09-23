@@ -28,6 +28,62 @@ pub(super) fn inherited_event_id(session_id: Uuid, source_event_id: Uuid) -> Uui
 }
 
 impl PostgresSessionStore {
+    /// Latest team activity visible at a sequence in this session's lineage.
+    /// A fork may cut inside an inherited prefix, so map that cut back into
+    /// the parent's sequence space before reading its team.
+    pub(super) fn team_events_at<'a>(
+        &'a self,
+        session_id: Uuid,
+        until: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<SessionEvent>>> + Send + 'a>> {
+        Box::pin(async move {
+            let session = self.session_row(session_id).await?;
+            let inherited_limit = until.min(session.inherited_event_count);
+            let mut events = if inherited_limit > 0 {
+                if let (Some(parent), Some(cut)) =
+                    (session.parent_session_id, session.parent_cut_sequence)
+                {
+                    let parent_until = if inherited_limit == session.inherited_event_count {
+                        cut
+                    } else {
+                        self.composed_events(parent, Some(cut))
+                            .await?
+                            .into_iter()
+                            .filter(|event| event.kind.is_fork_inheritable())
+                            .nth(usize::try_from(inherited_limit - 1).unwrap_or(usize::MAX))
+                            .map(|event| event.sequence)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "fork {session_id} has no inherited event {inherited_limit}"
+                                )
+                            })?
+                    };
+                    self.team_events_at(parent, parent_until).await?
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            let rows = sqlx::query(
+                "select latest.event_json, latest.event_body, latest.dict_id \
+                 from (select distinct on (subagent_session_id) \
+                       sequence, event_json, event_body, dict_id \
+                       from session_events \
+                       where session_id = $1 and sequence <= $2 \
+                         and event_kind = 'subagent_activity' \
+                       order by subagent_session_id, sequence desc) latest \
+                 order by latest.sequence",
+            )
+            .bind(session_id)
+            .bind(i64::try_from(until).unwrap_or(i64::MAX))
+            .fetch_all(self.pool())
+            .await?;
+            events.extend(self.decode_events(&rows).await?);
+            Ok(events)
+        })
+    }
+
     /// Every event this session authored itself, within bounds.
     async fn local_events(
         &self,
@@ -344,6 +400,13 @@ mod tests {
             .append(child(later, "/root/later", after))
             .await
             .unwrap();
+        let mut changed = child(kept, "/root/kept", before);
+        if let SessionEventKind::SubagentActivity { agent, .. } = &mut changed.kind {
+            agent.status = crate::SubagentStatus::Ready;
+            agent.updated_at = after;
+            agent.detail = Some("finished after the cut".to_string());
+        }
+        store.append(changed).await.unwrap();
 
         let fork = Uuid::new_v4();
         store.fork_before(parent, fork, cut_at).await.expect("fork");
@@ -358,7 +421,130 @@ mod tests {
         assert_eq!(agents.len(), 1, "{agents:?}");
         assert_eq!(agents[0].session_id, kept);
         assert_eq!(agents[0].parent_session_id, fork);
+        assert_eq!(agents[0].status, crate::SubagentStatus::Running);
+        assert_eq!(agents[0].detail, None);
         assert!(store.fork_team_events(parent).await.unwrap().is_empty());
+        scratch.discard().await;
+    }
+
+    /// Reverting an inherited prompt must restore the team at that prompt,
+    /// even when the intermediate fork was cut after a later status change.
+    #[tokio::test]
+    async fn nested_fork_team_uses_snapshot_before_inherited_cut() {
+        let Some(url) = test_url() else {
+            eprintln!("skipping: BORG_TEST_SESSIONS_URL is not set");
+            return;
+        };
+        let (scratch, store, parent) = conversation(&url).await;
+        let child_id = Uuid::new_v4();
+        let before = Utc::now() - chrono::Duration::minutes(1);
+        let mut agent = crate::SubagentSnapshot {
+            session_id: child_id,
+            parent_session_id: parent,
+            task_name: "/root/worker".to_string(),
+            status: crate::SubagentStatus::Running,
+            provider: crate::CodingProvider::Claude,
+            model: None,
+            effort: None,
+            cwd: std::path::PathBuf::from("/tmp"),
+            created_at: before,
+            updated_at: before,
+            detail: None,
+            final_text: None,
+            usage: crate::SubagentUsage::default(),
+            interrupted_by: None,
+        };
+        store
+            .append(SessionEvent::new(
+                parent,
+                0,
+                SessionEventKind::SubagentActivity {
+                    activity: crate::SubagentActivityKind::Started,
+                    agent: agent.clone(),
+                    event: None,
+                },
+            ))
+            .await
+            .unwrap();
+        store
+            .append(SessionEvent::new(
+                parent,
+                0,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: "before update".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ))
+            .await
+            .unwrap();
+        agent.status = crate::SubagentStatus::Ready;
+        agent.updated_at = Utc::now();
+        store
+            .append(SessionEvent::new(
+                parent,
+                0,
+                SessionEventKind::SubagentActivity {
+                    activity: crate::SubagentActivityKind::Completed,
+                    agent,
+                    event: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let after_update = store
+            .append(SessionEvent::new(
+                parent,
+                0,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: EventActor::Assistant,
+                    text: "after update".to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ))
+            .await
+            .unwrap()
+            .sequence;
+
+        let first = Uuid::new_v4();
+        store
+            .fork_before(parent, first, after_update + 1)
+            .await
+            .unwrap();
+        let inherited_after_update = store
+            .read(first)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|event| {
+                matches!(&event.kind, SessionEventKind::Message { text, .. } if text == "after update")
+            })
+            .unwrap()
+            .sequence;
+        let second = Uuid::new_v4();
+        store
+            .fork_before(first, second, inherited_after_update)
+            .await
+            .unwrap();
+
+        let team = store.fork_team_events(second).await.unwrap();
+        let agents = team
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::SubagentActivity { agent, .. } => Some(agent),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(agents.len(), 1, "{agents:?}");
+        assert_eq!(agents[0].session_id, child_id);
+        assert_eq!(agents[0].parent_session_id, second);
+        assert_eq!(agents[0].status, crate::SubagentStatus::Running);
         scratch.discard().await;
     }
 

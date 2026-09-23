@@ -10,9 +10,9 @@ use uuid::Uuid;
 use crate::session_store::postgres::PostgresSessionStore;
 use crate::session_store::postgres::testing::{ScratchDatabase, test_url};
 use crate::workspace::{
-    Audience, DeliveryMode, DeliveryState, Participant, ParticipantKind, PresenceLease, Thread,
-    Workspace, WorkspaceEvent, WorkspaceEventKind, WorkspaceMembership, WorkspaceMessage,
-    WorkspaceMessageBody, WorkspaceRole, WorkspaceStore,
+    Audience, DeliveryMode, DeliveryState, DirectoryInstance, Participant, ParticipantKind,
+    PresenceLease, Thread, Workspace, WorkspaceEvent, WorkspaceEventKind, WorkspaceMembership,
+    WorkspaceMessage, WorkspaceMessageBody, WorkspaceRole, WorkspaceStore,
 };
 use crate::workspace_postgres::PostgresWorkspaceStore;
 
@@ -1123,13 +1123,13 @@ async fn a_directory_sync_identifies_instances_and_retires_stopped_ones() {
 
         let sync = move |status: &'static str, cwd: &'static str| async move {
             store
-                .upsert_directory_instance(
-                    participant(participant_id, "remote peer"),
-                    Some(remote_host),
-                    None,
-                    Some(cwd),
-                    Some(status),
-                )
+                .upsert_directory_instances(&[DirectoryInstance {
+                    participant: participant(participant_id, "remote peer"),
+                    host_id: Some(remote_host),
+                    workspace_id: None,
+                    cwd: Some(cwd).map(str::to_string),
+                    status: Some(status).map(str::to_string),
+                }])
                 .await
         };
 
@@ -1188,13 +1188,13 @@ async fn a_directory_sync_identifies_instances_and_retires_stopped_ones() {
         // default view in numbers that swamp it.
         for index in 0..40 {
             store
-                .upsert_directory_instance(
-                    participant(Uuid::new_v4(), &format!("stopped peer {index}")),
-                    Some(remote_host),
-                    None,
-                    Some("/home/remote/checkout"),
-                    Some("stopped"),
-                )
+                .upsert_directory_instances(&[DirectoryInstance {
+                    participant: participant(Uuid::new_v4(), &format!("stopped peer {index}")),
+                    host_id: Some(remote_host),
+                    workspace_id: None,
+                    cwd: Some("/home/remote/checkout").map(str::to_string),
+                    status: Some("stopped").map(str::to_string),
+                }])
                 .await
                 .unwrap_or_else(|error| panic!("[{name}] stopped peer: {error:#}"));
         }
@@ -1270,13 +1270,13 @@ async fn a_directory_entry_never_erases_a_locally_known_identity() {
             .unwrap_or_else(|error| panic!("[{name}] register: {error:#}"));
 
         store
-            .upsert_directory_instance(
-                participant(participant_id, "local peer"),
-                Some(Uuid::new_v4()),
-                None,
-                None,
-                Some("running"),
-            )
+            .upsert_directory_instances(&[DirectoryInstance {
+                participant: participant(participant_id, "local peer"),
+                host_id: Some(Uuid::new_v4()),
+                workspace_id: None,
+                cwd: None,
+                status: Some("running").map(str::to_string),
+            }])
             .await
             .unwrap_or_else(|error| panic!("[{name}] directory sync: {error:#}"));
 

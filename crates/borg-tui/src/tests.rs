@@ -2264,7 +2264,11 @@ fn running_tool_uses_a_stable_marker_without_invalidating_transcript_cache() {
 }
 
 #[test]
-fn running_tool_pulse_moves_across_text_without_touching_the_gutter() {
+fn running_tool_shimmer_moves_across_text_without_touching_the_gutter() {
+    let phase_for = |width: usize, offset: usize| {
+        (RUNNING_SHIMMER_PADDING + offset) as u128 * RUNNING_SHIMMER_CYCLE_MILLIS
+            / (width + RUNNING_SHIMMER_PADDING * 2) as u128
+    };
     let resting = Style::default().fg(Color::DarkGray);
     let mut first = Line::from(vec![
         Span::styled("│ ", resting),
@@ -2272,8 +2276,8 @@ fn running_tool_pulse_moves_across_text_without_touching_the_gutter() {
     ]);
     let mut second = first.clone();
 
-    apply_running_activity_pulse(&mut first, RUNNING_PULSE_RADIUS);
-    apply_running_activity_pulse(&mut second, RUNNING_PULSE_RADIUS + 6);
+    apply_running_activity_pulse(&mut first, phase_for("running action".width(), 3));
+    apply_running_activity_pulse(&mut second, phase_for("running action".width(), 9));
 
     assert_eq!(first.spans[0].style, resting);
     assert_eq!(second.spans[0].style, resting);
@@ -2305,20 +2309,20 @@ fn running_tool_pulse_moves_across_text_without_touching_the_gutter() {
         Span::styled("│ ", resting),
         Span::styled("white action", Style::default().fg(Color::White)),
     ]);
-    apply_running_activity_pulse(&mut white, RUNNING_PULSE_RADIUS);
-    assert!(
-        white
-            .spans
-            .iter()
-            .skip(1)
-            .any(|span| span.style.fg == Some(Color::Gray))
-    );
+    apply_running_activity_pulse(&mut white, phase_for("white action".width(), 3));
     assert!(
         !white
             .spans
             .iter()
             .skip(1)
-            .any(|span| span.style.fg == Some(Color::LightYellow))
+            .any(|span| span.style.fg != Some(Color::White))
+    );
+    assert!(
+        white
+            .spans
+            .iter()
+            .skip(1)
+            .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
     );
 
     let mut paused = Line::from(vec![
@@ -2326,9 +2330,36 @@ fn running_tool_pulse_moves_across_text_without_touching_the_gutter() {
         Span::styled("running action", resting),
     ]);
     let paused_before = paused.clone();
-    let sweep_width = "running action".width() + RUNNING_PULSE_RADIUS * 2;
-    apply_running_activity_pulse(&mut paused, sweep_width + RUNNING_PULSE_PAUSE_STEPS);
+    apply_running_activity_pulse(&mut paused, 0);
     assert_eq!(paused.spans, paused_before.spans);
+
+    for (base, level) in [
+        (Color::DarkGray, 100),
+        (Color::Gray, 170),
+        (Color::Rgb(90, 130, 180), 90),
+    ] {
+        let mut gray = Line::from(vec![
+            Span::styled("│ ", resting),
+            Span::styled("running action", Style::default().fg(base)),
+        ]);
+        apply_running_activity_pulse(&mut gray, phase_for("running action".width(), 6));
+        let brighter = gray
+            .spans
+            .iter()
+            .skip(1)
+            .filter_map(|span| match span.style.fg {
+                Some(Color::Rgb(red, _, _)) if red > level => Some(red),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(brighter.len() >= 2, "{base:?} has brighter samples");
+        assert!(
+            brighter.iter().any(|red| *red != brighter[0]),
+            "{base:?} has a graded light band"
+        );
+        assert_eq!(gray.to_string(), "│ running action");
+        assert_eq!(gray.spans[0].style, resting);
+    }
 }
 
 #[test]

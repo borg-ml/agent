@@ -17,10 +17,10 @@ use uuid::Uuid;
 use std::path::Path;
 
 use crate::workspace::{
-    AgentInstance, Audience, DeliveryAttempt, DeliveryMode, DeliveryState, Participant,
-    ParticipantKind, PresenceLease, RecipientDelivery, Thread, Workspace, WorkspaceEvent,
-    WorkspaceEventKind, WorkspaceMembership, WorkspaceMessage, WorkspaceRole, WorkspaceRosterEntry,
-    WorkspaceStore, canonical_event, resolve_recipients,
+    AgentInstance, Audience, DeliveryAttempt, DeliveryMode, DeliveryState, DirectoryInstance,
+    Participant, ParticipantKind, PresenceLease, RecipientDelivery, Thread, Workspace,
+    WorkspaceEvent, WorkspaceEventKind, WorkspaceMembership, WorkspaceMessage, WorkspaceRole,
+    WorkspaceRosterEntry, WorkspaceStore, canonical_event, resolve_recipients,
 };
 
 /// The durable workspace projection, backed by PostgreSQL.
@@ -1165,14 +1165,7 @@ impl WorkspaceStore for PostgresWorkspaceStore {
         Ok(())
     }
 
-    async fn upsert_directory_instance(
-        &self,
-        participant: Participant,
-        host_id: Option<Uuid>,
-        workspace_id: Option<Uuid>,
-        cwd: Option<&str>,
-        status: Option<&str>,
-    ) -> Result<()> {
+    async fn upsert_directory_instances(&self, instances: &[DirectoryInstance]) -> Result<()> {
         // A directory entry is a thin mirror of another host's registry: it
         // carries the launch directory and the owning host's lifecycle state,
         // and it routinely leaves the workspace out. So every column it can
@@ -1183,33 +1176,35 @@ impl WorkspaceStore for PostgresWorkspaceStore {
         // installation can reach it, and the listing's reap sweep only ever
         // sees local rows, so an unretired stopped row is advertised for ever.
         let mut transaction = self.pool.begin().await?;
-        upsert_participant_row(&mut transaction, &participant).await?;
         let now = Utc::now().to_rfc3339();
-        sqlx::query(
-            "insert into agent_instances \
-             (participant_id, host_id, workspace_id, seen_at, cwd, pid, status, exited_at) \
-             values ($1, $2, $3, $4, $5, null, $6, case when $6 = 'stopped' then $4 else null end) \
-             on conflict (participant_id) do update set \
-             host_id = excluded.host_id, \
-             workspace_id = coalesce(excluded.workspace_id, agent_instances.workspace_id), \
-             seen_at = excluded.seen_at, \
-             cwd = coalesce(agent_instances.cwd, excluded.cwd), \
-             status = excluded.status, \
-             exited_at = case \
-                 when excluded.status = 'stopped' \
-                     then coalesce(agent_instances.exited_at, excluded.seen_at) \
-                 when excluded.status in ('running', 'ready', 'starting') then null \
-                 else agent_instances.exited_at \
-             end",
-        )
-        .bind(participant.id.to_string())
-        .bind(host_id.map(|id| id.to_string()))
-        .bind(workspace_id.map(|id| id.to_string()))
-        .bind(&now)
-        .bind(cwd)
-        .bind(status)
-        .execute(&mut *transaction)
-        .await?;
+        for instance in instances {
+            upsert_participant_row(&mut transaction, &instance.participant).await?;
+            sqlx::query(
+                "insert into agent_instances \
+                 (participant_id, host_id, workspace_id, seen_at, cwd, pid, status, exited_at) \
+                 values ($1, $2, $3, $4, $5, null, $6, case when $6 = 'stopped' then $4 else null end) \
+                 on conflict (participant_id) do update set \
+                 host_id = excluded.host_id, \
+                 workspace_id = coalesce(excluded.workspace_id, agent_instances.workspace_id), \
+                 seen_at = excluded.seen_at, \
+                 cwd = coalesce(agent_instances.cwd, excluded.cwd), \
+                 status = excluded.status, \
+                 exited_at = case \
+                     when excluded.status = 'stopped' \
+                         then coalesce(agent_instances.exited_at, excluded.seen_at) \
+                     when excluded.status in ('running', 'ready', 'starting') then null \
+                     else agent_instances.exited_at \
+                 end",
+            )
+            .bind(instance.participant.id.to_string())
+            .bind(instance.host_id.map(|id| id.to_string()))
+            .bind(instance.workspace_id.map(|id| id.to_string()))
+            .bind(&now)
+            .bind(instance.cwd.as_deref())
+            .bind(instance.status.as_deref())
+            .execute(&mut *transaction)
+            .await?;
+        }
         transaction.commit().await?;
         Ok(())
     }

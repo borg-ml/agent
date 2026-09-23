@@ -105,7 +105,10 @@ impl PostgresSessionStore {
         })
     }
 
-    async fn decode_events(&self, rows: &[sqlx::postgres::PgRow]) -> Result<Vec<SessionEvent>> {
+    pub(super) async fn decode_events(
+        &self,
+        rows: &[sqlx::postgres::PgRow],
+    ) -> Result<Vec<SessionEvent>> {
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
             let json: Option<serde_json::Value> = row.try_get("event_json")?;
