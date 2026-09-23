@@ -117,22 +117,26 @@ parent requires D11 atomic editor/exclusive handoff and real-CLI proof.
    post-hook failure quarantine, stopped-supervisor resume recovery, and
    ACK-then-unhealthy backend recovery. Project/Worktree alias protection
    passed on pinned `011c4ba9…`. **Remaining v0 gates:** session-derived
-   editor owner/fencing plus the atomic foreign-client-lease policy (or
-   explicit model-exclusive disablement) at the model MCP boundary, then
-   rerun every gate on the final integrated binary. Real UE runtime parity is a migration
-   acceptance test, not a Borg branch v0 gate.
+   actor-derived editor owner/fencing and explicit model-exclusive disablement
+   at the MCP boundary (unless independently verified atomic foreign-client
+   policy lands), then rerun every gate on the final integrated binary.
+   Real UE runtime parity is migration acceptance, not a Borg v0 gate.
 
 
-**New model-exclusive policy decision (not yet verified):** shared CLI/MCP
-Preparing must wait on a foreign active service client lease until release or
+**Selected v0 model-exclusive fallback (bridge enforcement not yet verified):**
+reject **all** model-facing exclusive templates with a clear
+`coordinate with the editor lease holder, then use borg lane job submit --spec <trusted-JobSpec-JSON>` message, independent of
+which service specs happen to be visible. Retain nonexclusive jobs and model
+service lease/read; disable model-facing restart unless the supervisor itself
+atomically checks the caller's active lease. The preferred shared CLI/MCP
+Preparing policy would wait on foreign active client leases until release or
 configurable grace (default five minutes; zero indefinite), expose the wait,
-and let the requester's own lease pass. Supervisor `status.clients` is mutated
-outside the lane journal lock; a bridge precheck or lane snapshot is not an
-atomic admission mechanism. Prove foreign wait, own lease, and a late-lease
-race on the public CLI, or disable model-facing exclusive for v0 with a clear
-`use borg lane run --exclusive after coordinating` message. Nonexclusive
-jobs, lease and read tools remain; real UE runtime parity is still a migration
-acceptance test.
+and exempt the requester's own lease. Supervisor `status.clients` is mutated
+outside the lane journal lock; neither a bridge precheck nor a lane snapshot
+implements that policy. Its optional v0 inclusion requires public foreign
+wait, own lease, late arrival tests and independent review before integrated
+release; otherwise it is v0.1. A shell-accessible CLI is not a security
+sandbox. Real UE runtime parity is migration acceptance, not a Borg v0 gate.
 
 Draft CLI reminder: `--spec` accepts serialized `JobSpec`, not adapter/template
 shorthand. A model-facing caller must not construct arbitrary process argv
