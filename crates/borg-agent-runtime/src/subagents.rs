@@ -7160,12 +7160,12 @@ pub fn agent_tool_specs_for_surface(
     if surface.shared_work {
         specs.push(tool(
             "lane_workspace",
-            "Manage local Git worktrees and a shared-work-linked freeze handshake. GC defaults to dry-run; confirmed deletion requires explicit apply and a journal-confirmed exited owner. Freeze is advisory until the exclusive project lane is acquired; first create/claim shared_work and communicate with affected agents.",
+            "Manage local Git worktrees and a shared-work-linked freeze handshake. GC is read-only from MCP; deletion requires a human at the local CLI terminal with journal-confirmed exited owner. Freeze is advisory until the exclusive project lane is acquired; first create/claim shared_work and communicate with affected agents.",
             json!({"type":"object", "properties": {
-                "op":{"type":"string","enum":["create","list","gc","budget","freeze_preview","freeze","freeze_status","ack","land","unfreeze","abort"]},
+                "op":{"type":"string","enum":["create","list","gc","budget","target_status","freeze_preview","freeze","freeze_status","ack","land","unfreeze","abort"]},
                 "project":{"type":"string"}, "root":{"type":"string"}, "task":{"type":"string"},
-                "shared_cargo":{"type":"boolean"}, "apply":{"type":"boolean"}, "force":{"type":"boolean"},
-                "confirmed":{"type":"boolean"}, "globs":{"type":"array","items":{"type":"string"}},
+                "shared_cargo":{"type":"boolean"}, "force":{"type":"boolean"}, "cap_gib":{"type":"integer","minimum":1},
+                "globs":{"type":"array","items":{"type":"string"}},
                 "work_id":{"type":"string","format":"uuid"}, "freeze_id":{"type":"string","format":"uuid"},
                 "reason":{"type":"string"}, "note":{"type":"string"}, "deadline_secs":{"type":"integer","minimum":1,"maximum":86400}
             },"required":["op","project"],"additionalProperties":false}),
@@ -8848,17 +8848,14 @@ struct LaneWorkspaceArgs {
     #[serde(default)]
     shared_cargo: bool,
     #[serde(default)]
-    apply: bool,
-    #[serde(default)]
     force: bool,
-    #[serde(default)]
-    confirmed: bool,
     globs: Option<Vec<String>>,
     work_id: Option<Uuid>,
     freeze_id: Option<Uuid>,
     reason: Option<String>,
     note: Option<String>,
     deadline_secs: Option<u64>,
+    cap_gib: Option<u64>,
 }
 
 impl AgentToolDispatcher {
@@ -8934,10 +8931,6 @@ impl AgentToolDispatcher {
             }
             "list" => json!(hygiene::inventory(&project, &active)?),
             "gc" => {
-                ensure!(
-                    !args.apply || args.confirmed,
-                    "GC deletion requires explicit human confirmation of this exact action"
-                );
                 let mut candidates = Vec::new();
                 for mut tree in hygiene::inventory(&project, &active)? {
                     let exit_confirmed = tree.owner.is_some_and(|id| exited.contains(&id));
@@ -8961,15 +8954,10 @@ impl AgentToolDispatcher {
                     } else {
                         "none"
                     };
-                    let removed = if args.apply && eligible {
-                        hygiene::gc(&project, &tree, &exited, true, args.force)?
-                    } else {
-                        false
-                    };
                     candidates.push(json!({"tree":tree,"owner_exit_confirmed":exit_confirmed,
-                        "eligible":eligible,"protection":protection,"removed":removed}));
+                        "eligible":eligible,"protection":protection,"removed":false}));
                 }
-                json!({"dry_run": !args.apply, "candidates":candidates})
+                json!({"dry_run": true, "candidates":candidates})
             }
             "budget" => {
                 let disk = hygiene::disk_available(&project)?;
@@ -8981,6 +8969,17 @@ impl AgentToolDispatcher {
                 }
                 json!(admission)
             }
+            "target_status" => {
+                let cap = args
+                    .cap_gib
+                    .unwrap_or(24)
+                    .checked_mul(1024 * 1024 * 1024)
+                    .context("target cap overflows u64")?;
+                json!(hygiene::target_usage(
+                    &hygiene::inventory(&project, &active)?,
+                    cap
+                )?)
+            }
             "freeze_preview" => json!(hygiene::freeze_preview(
                 &project,
                 &args.globs.context("globs required")?,
@@ -8988,6 +8987,43 @@ impl AgentToolDispatcher {
             )?),
             "freeze_status" => json!(hygiene::freeze_status(&project)?),
             "freeze" => {
+                let work_id = args
+                    .work_id
+                    .context("claimed shared_work work_id required")?;
+                // Shared work remains the durable authority. A local freeze
+                // cannot be started with an unrelated or unclaimed work ID.
+                let mut cursor = 0;
+                let mut created = false;
+                let mut claimant = None;
+                let mut exhausted = false;
+                for _ in 0..100 {
+                    let events = store
+                        .replay(binding.workspace_id, binding.participant_id, cursor, 1000)
+                        .await?;
+                    let len = events.len();
+                    for event in events {
+                        cursor = event.sequence;
+                        match event.kind {
+                            WorkspaceEventKind::WorkCreated { work, .. } if work.id == work_id => {
+                                created = true
+                            }
+                            WorkspaceEventKind::WorkClaimed { claim, .. }
+                                if claim.work_id == work_id =>
+                            {
+                                claimant = Some(claim.claimant_id)
+                            }
+                            _ => {}
+                        }
+                    }
+                    if len < 1000 {
+                        exhausted = true;
+                        break;
+                    }
+                }
+                ensure!(
+                    exhausted && created && claimant == Some(binding.participant_id),
+                    "shared_work must exist here and be claimed by the requesting participant"
+                );
                 let freeze = hygiene::request_freeze(
                     &project,
                     args.work_id

@@ -374,6 +374,52 @@ pub fn create_worktree(
         .context("new worktree not in Git inventory")
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetUsage {
+    pub tree: PathBuf,
+    pub target: PathBuf,
+    pub bytes: u64,
+    pub cap_bytes: u64,
+    pub over_cap: bool,
+    pub owner: Option<Uuid>,
+    pub owner_live: bool,
+}
+
+/// Read-only per-tree build-output report. A lane may queue a new build when
+/// this cap is exceeded; cleaning is a separate owner-approved job.
+pub fn target_usage(trees: &[WorktreeRecord], cap_bytes: u64) -> Result<Vec<TargetUsage>> {
+    ensure!(cap_bytes > 0, "target cap must be positive");
+    Ok(trees
+        .iter()
+        .map(|tree| {
+            let target = tree.path.join("target");
+            let bytes = if target.is_dir() {
+                Command::new("du")
+                    .args(["-skx", "--"])
+                    .arg(&target)
+                    .output()
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .and_then(|out| String::from_utf8(out.stdout).ok())
+                    .and_then(|text| text.split_whitespace().next()?.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    .saturating_mul(1024)
+            } else {
+                0
+            };
+            TargetUsage {
+                tree: tree.path.clone(),
+                target,
+                bytes,
+                cap_bytes,
+                over_cap: bytes > cap_bytes,
+                owner: tree.owner,
+                owner_live: tree.owner_live,
+            }
+        })
+        .collect())
+}
+
 /// Only an explicit, journal-confirmed exited owner allows removal. Dirty trees
 /// require force; force does not bypass the live-session guard.
 pub fn gc(
