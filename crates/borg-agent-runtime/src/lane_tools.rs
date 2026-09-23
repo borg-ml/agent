@@ -72,9 +72,10 @@ pub(crate) struct LaneTools {
     /// not this directory, is the sandbox.
     pub(crate) templates: PathBuf,
     pub(crate) executable: Option<PathBuf>,
-    /// (session, job) pairs submit handed out. A coalesced pending job keeps
-    /// its first submitter as holder, yet the later submitter may wait on it.
-    submitted: Arc<Mutex<HashSet<(Uuid, Uuid)>>>,
+    /// (participant, session, job) triples submit handed out. A coalesced
+    /// pending job keeps its first submitter as holder, yet the later actor
+    /// may wait on it without granting access to a different participant.
+    submitted: Arc<Mutex<HashSet<(Uuid, Uuid, Uuid)>>>,
 }
 
 impl Default for LaneTools {
@@ -279,7 +280,7 @@ impl LaneTools {
             && self
                 .submitted
                 .lock()
-                .is_ok_and(|ids| ids.contains(&(caller.session_id, id)));
+                .is_ok_and(|ids| ids.contains(&(caller.participant_id, caller.session_id, id)));
         match record {
             Some(record) if caller.owns(&record.request.holder) || submitted => Ok(record),
             _ => bail!("job {id} is not one of your session's jobs"),
@@ -304,7 +305,7 @@ impl LaneTools {
                 refuse_exclusive(&spec.lease.resources)?;
                 let job = store.job_status(self.submit(&spec).await?)?;
                 if let Ok(mut submitted) = self.submitted.lock() {
-                    submitted.insert((caller.session_id, job.id));
+                    submitted.insert((caller.participant_id, caller.session_id, job.id));
                 }
                 let watch = args.watch.then(|| self.watch_request(&job)).transpose()?;
                 Ok((job_value(&job), watch))
@@ -1082,6 +1083,50 @@ pub(crate) mod tests {
 
     /// Failure mode: reading another session's job log path, waiting on it or
     /// cancelling it by guessing its id.
+    #[tokio::test]
+    async fn coalesced_job_is_authorized_by_the_full_actor_pair() {
+        let fixture = fixture();
+        let store = fixture.tools.store().unwrap();
+        let owner = caller(2);
+        let mut request = spec(&fixture.project, Access::Shared { slots: 1 }).lease;
+        request.holder = owner.holder("first submitter");
+        let ticket = store.enqueue_lease(request).unwrap();
+        let joiner = caller(1);
+        fixture.tools.submitted.lock().unwrap().insert((
+            joiner.participant_id,
+            joiner.session_id,
+            ticket.id,
+        ));
+        assert!(
+            fixture
+                .tools
+                .authorized(&store, &joiner, ticket.id, true)
+                .is_ok()
+        );
+        assert!(
+            fixture
+                .tools
+                .authorized(&store, &joiner, ticket.id, false)
+                .is_err()
+        );
+        let different_participant = Caller {
+            participant_id: Uuid::from_u128(3),
+            session_id: joiner.session_id,
+        };
+        for op in ["status", "wait"] {
+            let error = fixture
+                .tools
+                .job(
+                    &different_participant,
+                    json!({"op": op, "job_id": ticket.id}),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("not one of your session's jobs"));
+        }
+    }
+
     #[tokio::test]
     async fn job_ids_are_not_authority() {
         let fixture = fixture();
