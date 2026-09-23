@@ -75,8 +75,13 @@ hook sent `QUIT_EDITOR` to the fake backend and stop closed all private ports.
 This does **not** validate a real Unreal editor. The architect's
 `docs/gamedev/integration.md` reports a passing real-systemd two-service,
 no-hook scoped descendant gate on that same binary, clearing the earlier
-stale-binary fail-open; ordered post-hook/resume errors, service capacity
-admission, owner fencing and real Unreal parity remain release blockers.
+stale-binary fail-open; a subsequent public CLI probe on that binary
+found a **Project path-alias fail-open** (exclusive job began while an aliased
+project's service stayed Healthy). Core must normalize/reject aliases at all
+entrypoints and re-prove handoff on a rebuilt binary. The adapter canonicalizes
+its project path and now rejects conflicting UBT project arguments, but that
+cannot repair core admission. Post-hook failure/retry, service capacity,
+owner fencing and real Unreal parity also remain blockers.
 Do not use the live shared project's editor or its port.
 
 The stock
