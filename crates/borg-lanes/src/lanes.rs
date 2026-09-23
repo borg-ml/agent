@@ -150,6 +150,10 @@ pub struct JobSpec {
     /// Per-exclusive-resource grace; unspecified resources use the job-wide default.
     #[serde(default)]
     pub foreign_client_grace_by_resource: Vec<ForeignClientGrace>,
+    /// Cancel (queued) or kill (running) the job once no `job wait` has held
+    /// it for this long since submit; None keeps it regardless.
+    #[serde(default)]
+    pub abandon_after_ms: Option<u64>,
     pub fingerprint: JobFingerprint,
     pub lease: LeaseRequest,
     pub argv: Vec<String>,
@@ -670,6 +674,7 @@ impl LaneStore {
                         && spec.foreign_client_grace_ms == other.foreign_client_grace_ms
                         && spec.foreign_client_grace_by_resource
                             == other.foreign_client_grace_by_resource
+                        && spec.abandon_after_ms == other.abandon_after_ms
                         && spec.timeout_ms == other.timeout_ms
                         && spec.stall_timeout_ms == other.stall_timeout_ms
                         // Only the existing ticket's supervisor enforces a
@@ -833,9 +838,45 @@ impl LaneStore {
         Ok(self.record(ticket.id)?.state)
     }
 
+    /// A `job wait` holds this shared lock for as long as it waits, which is
+    /// what keeps a job with `abandon_after_ms` alive.
+    fn hold_as_requester(&self, id: Uuid) -> Result<File> {
+        let file = stable_file(&self.job_dir(id).join("waiters.lock"))?;
+        file.lock_shared()?;
+        Ok(file)
+    }
+
+    fn has_requester(&self, id: Uuid) -> bool {
+        let Ok(file) = stable_file(&self.job_dir(id).join("waiters.lock")) else {
+            return true;
+        };
+        match file.try_lock() {
+            Ok(()) => {
+                let _ = file.unlock();
+                false
+            }
+            Err(_) => true,
+        }
+    }
+
+    /// Whether the job has had no requester for its abandon window; while a
+    /// requester is seen, `last_seen_ms` moves forward.
+    fn abandoned(&self, spec: &JobSpec, id: Uuid, last_seen_ms: &mut u64) -> bool {
+        let Some(after) = spec.abandon_after_ms else {
+            return false;
+        };
+        let now = milliseconds();
+        if self.has_requester(id) {
+            *last_seen_ms = now;
+            return false;
+        }
+        now.saturating_sub(*last_seen_ms) >= after
+    }
+
     /// Block on the kernel-owned completion lock; an exited supervisor wakes
     /// every waiter immediately even if it never wrote a terminal event.
     pub fn wait_job(&self, id: Uuid) -> Result<JobHandle> {
+        let _requester = self.hold_as_requester(id)?;
         let initial = self.job_status(id)?;
         if matches!(
             initial.state,
@@ -1080,6 +1121,9 @@ impl LaneStore {
         })
     }
 }
+
+/// The cancel reason when no requester is left (`abandon_after_ms`).
+const ABANDONED: &str = "abandoned: no requester";
 
 /// How a supervised job ended.
 enum JobEnd {
@@ -1555,12 +1599,21 @@ impl LaneStore {
         Ok(None)
     }
 
-    fn wait_grant(&self, id: Uuid) -> Result<Lease> {
+    /// `last_requester_ms` carries when a `job wait` was last seen into the
+    /// running phase, so abandonment counts from then, not from the grant.
+    fn wait_grant(&self, id: Uuid, last_requester_ms: &mut u64) -> Result<Lease> {
         let entered = std::time::Instant::now();
         let event = StateEvents::new(&self.root)?;
         loop {
             self.recover(false)?;
             let current = self.record(id)?;
+            if let Some(spec) = &current.spec
+                && current.cancel_requested.is_none()
+                && self.abandoned(spec, id, last_requester_ms)
+            {
+                self.cancel_ticket(id, ABANDONED)?;
+                bail!("{ABANDONED}");
+            }
             if let Some(reason) = &current.cancel_requested {
                 bail!("cancel requested: {reason}");
             }
@@ -1845,7 +1898,8 @@ impl LaneStore {
             scoped || std::env::var("BORG_LANE_DEGRADED").as_deref() == Ok("1"),
             "lane requires a systemd user manager (set BORG_LANE_DEGRADED=1 only for explicit unscoped testing)"
         );
-        let lease = self.wait_grant(id)?;
+        let mut last_requester_ms = self.record(id)?.created_ms;
+        let lease = self.wait_grant(id, &mut last_requester_ms)?;
         let spec = self.record(id)?.spec.context("job spec missing")?;
         let exclusive = spec
             .lease
@@ -1955,6 +2009,9 @@ impl LaneStore {
             }
             last_size = size;
             last_cpu = cpu;
+            if self.abandoned(&spec, id, &mut last_requester_ms) {
+                self.cancel_ticket(id, ABANDONED)?;
+            }
             let cancel = self.locked(|state| {
                 let record = state
                     .records
@@ -2304,7 +2361,7 @@ impl LaneCoordinator for LaneStore {
         tokio::task::spawn_blocking(move || {
             let lock = stable_file(&store.ticket_path(id))?;
             lock.lock()?;
-            let granted = store.wait_grant(id);
+            let granted = store.wait_grant(id, &mut 0);
             if granted.is_ok() {
                 store.held.lock().unwrap().insert(id, lock);
             }
@@ -2646,6 +2703,7 @@ mod tests {
         let spec = JobSpec {
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
             foreign_client_grace_by_resource: vec![],
+            abandon_after_ms: None,
             fingerprint: JobFingerprint("post-fail".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3134,6 +3192,7 @@ mod tests {
         let spec = JobSpec {
             foreign_client_grace_ms: 0, // Forever until explicit release/expiry.
             foreign_client_grace_by_resource: vec![],
+            abandon_after_ms: None,
             fingerprint: JobFingerprint("foreign-client".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3190,7 +3249,7 @@ mod tests {
             "{error}"
         );
         let waiter = store.clone();
-        let task = std::thread::spawn(move || waiter.wait_grant(job.id));
+        let task = std::thread::spawn(move || waiter.wait_grant(job.id, &mut 0));
         let entered = std::time::Instant::now();
         loop {
             let row = store.record(job.id).unwrap();
@@ -3283,6 +3342,7 @@ mod tests {
             let spec = JobSpec {
                 foreign_client_grace_ms: grace_ms,
                 foreign_client_grace_by_resource: vec![],
+                abandon_after_ms: None,
                 fingerprint: JobFingerprint("shared-foreign".into()),
                 lease: LeaseRequest {
                     resources: vec![resource("fake-exclusive", Access::Exclusive)],
@@ -3415,6 +3475,7 @@ mod tests {
         test_service_status(dir.path(), &[foreign]);
         let spec = JobSpec {
             foreign_client_grace_ms: 500,
+            abandon_after_ms: None,
             foreign_client_grace_by_resource: vec![ForeignClientGrace {
                 resource: resource("editor", Access::Exclusive).key,
                 grace_ms: 0,
@@ -3519,6 +3580,7 @@ mod tests {
         let spec = JobSpec {
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
             foreign_client_grace_by_resource: vec![],
+            abandon_after_ms: None,
             fingerprint: JobFingerprint("yield-r1".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3556,7 +3618,7 @@ mod tests {
         let owner_lock = stable_file(&store.ticket_path(job.id)).unwrap();
         owner_lock.lock().unwrap();
         let waiting = store.clone();
-        let task = std::thread::spawn(move || waiting.wait_grant(job.id));
+        let task = std::thread::spawn(move || waiting.wait_grant(job.id, &mut 0));
         let started = std::time::Instant::now();
         loop {
             if matches!(
@@ -3624,6 +3686,7 @@ mod tests {
         let spec = JobSpec {
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
             foreign_client_grace_by_resource: vec![],
+            abandon_after_ms: None,
             fingerprint: JobFingerprint("auto-bound".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3681,6 +3744,7 @@ mod tests {
         let spec = JobSpec {
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
             foreign_client_grace_by_resource: vec![],
+            abandon_after_ms: None,
             fingerprint: JobFingerprint("no-yield".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3719,7 +3783,7 @@ mod tests {
         owner_lock.lock().unwrap();
         assert!(
             store
-                .wait_grant(job.id)
+                .wait_grant(job.id, &mut 0)
                 .unwrap_err()
                 .to_string()
                 .contains("did not release")
@@ -3735,6 +3799,7 @@ mod tests {
         JobSpec {
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
             foreign_client_grace_by_resource: vec![],
+            abandon_after_ms: None,
             fingerprint: JobFingerprint("source-r1".into()),
             lease: LeaseRequest {
                 resources: vec![resource("build", Access::Exclusive)],
