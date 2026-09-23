@@ -98,10 +98,14 @@ pub(crate) async fn run(args: WorktreeArgs) -> Result<()> {
             serde_json::to_value(trees)?
         }
         WorktreeCommand::Gc { apply, force } => {
-            ensure!(
-                !apply || !exited.is_empty(),
-                "cannot apply GC without a journal-confirmed exited owner from a connected Borg session"
-            );
+            if apply {
+                use std::io::IsTerminal;
+                ensure!(
+                    std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+                    "GC deletion requires a human at a terminal to confirm each exact path; model tools are dry-run only"
+                );
+                ensure!(!exited.is_empty(), "no journal-confirmed exited owners");
+            }
             let trees = hygiene::inventory(&repo, &active)?;
             let mut candidates = Vec::new();
             for mut tree in trees {
@@ -109,7 +113,7 @@ pub(crate) async fn run(args: WorktreeArgs) -> Result<()> {
                 tree.owner_gone = exit_confirmed;
                 let eligible = tree.gc_reason.is_some() && exit_confirmed
                     || (force
-                        && tree.merged
+                        && (tree.merged || tree.abandoned)
                         && !tree.owner_live
                         && tree.owner.is_some()
                         && exit_confirmed);
@@ -127,7 +131,34 @@ pub(crate) async fn run(args: WorktreeArgs) -> Result<()> {
                     "none"
                 };
                 let removed = if apply && eligible {
-                    hygiene::gc(&repo, &tree, &exited, true, force)?
+                    use std::io::Write;
+                    eprintln!(
+                        "Delete worktree {} ({} bytes, dirty={})? Type its exact path:",
+                        tree.path.display(),
+                        tree.size_bytes,
+                        tree.dirty
+                    );
+                    std::io::stderr().flush()?;
+                    let mut response = String::new();
+                    std::io::stdin().read_line(&mut response)?;
+                    ensure!(
+                        response.trim_end_matches(['\r', '\n']) == tree.path.to_string_lossy(),
+                        "GC cancelled: typed path does not match"
+                    );
+                    let (fresh_active, fresh_exited) = local_instances().await;
+                    ensure!(
+                        tree.owner.is_some_and(|id| fresh_exited.contains(&id)),
+                        "owner exit is no longer confirmed"
+                    );
+                    let fresh = hygiene::inventory(&repo, &fresh_active)?
+                        .into_iter()
+                        .find(|record| record.path == tree.path)
+                        .context("worktree disappeared")?;
+                    ensure!(
+                        !fresh.owner_live,
+                        "a session became active in this worktree"
+                    );
+                    hygiene::gc(&repo, &fresh, &fresh_exited, true, force)?
                 } else {
                     false
                 };
@@ -137,6 +168,12 @@ pub(crate) async fn run(args: WorktreeArgs) -> Result<()> {
             serde_json::json!({"dry_run": !apply, "candidates":candidates})
         }
         WorktreeCommand::Monitor { .. } => unreachable!("handled before discovery"),
+        WorktreeCommand::TargetStatus { cap_gib } => serde_json::to_value(hygiene::target_usage(
+            &hygiene::inventory(&repo, &active)?,
+            cap_gib
+                .checked_mul(1024 * 1024 * 1024)
+                .context("cap overflows u64")?,
+        )?)?,
         WorktreeCommand::Budget => {
             let available = hygiene::disk_available(&repo)?;
             let ram = hygiene::ram_available()?;
