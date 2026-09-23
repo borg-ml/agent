@@ -1625,6 +1625,7 @@ pub struct BorgTerminal {
     thread_find: Option<ThreadFindState>,
     completion_notifications: CompletionAlertPolicy,
     completion_sound: CompletionAlertPolicy,
+    completion_alert_pending: bool,
     auto_copy_selection: bool,
     luna_titles_for_all_providers: bool,
     horizontal_margin: u16,
@@ -2859,6 +2860,7 @@ impl BorgTerminal {
             thread_find: None,
             completion_notifications: CompletionAlertPolicy::Unfocused,
             completion_sound: CompletionAlertPolicy::Unfocused,
+            completion_alert_pending: false,
             auto_copy_selection: true,
             luna_titles_for_all_providers: false,
             horizontal_margin: HORIZONTAL_MARGIN,
@@ -3637,7 +3639,9 @@ impl BorgTerminal {
                 _ => {}
             }
         }
-        if !self.replaying_history && matches!(event.kind, SessionEventKind::TurnCompleted { .. }) {
+        if !self.replaying_history
+            && completion_alert_due(&mut self.completion_alert_pending, &event.kind)
+        {
             let notification =
                 completion_alert_enabled(self.completion_notifications, self.window_focused);
             let sound = completion_alert_enabled(self.completion_sound, self.window_focused);
@@ -10232,6 +10236,27 @@ fn start_completion_sound(mut command: Command) -> bool {
         let _ = child.wait();
     });
     true
+}
+
+/// Whether this live event is the moment work stopped: a turn completed and the
+/// session then went idle. A goal or queued prompt starts the next turn at once,
+/// and a watcher yield resumes on its own, so neither is a stop.
+fn completion_alert_due(pending: &mut bool, kind: &SessionEventKind) -> bool {
+    match kind {
+        SessionEventKind::TurnCompleted { .. } => *pending = true,
+        SessionEventKind::TurnStarted { .. } => *pending = false,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready | SessionStatus::Stopped | SessionStatus::Failed,
+            detail,
+        } => {
+            return std::mem::take(pending)
+                && !detail
+                    .as_deref()
+                    .is_some_and(ready_detail_is_waiting_on_watchers);
+        }
+        _ => {}
+    }
+    false
 }
 
 fn completion_alert_enabled(policy: CompletionAlertPolicy, window_focused: bool) -> bool {
