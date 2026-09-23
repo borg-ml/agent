@@ -70,7 +70,8 @@ Git comparison.
   controls. The composer and transcript scrollbar use less space, while the
   completion chime plays more quietly.
 - The sub-agent roster now labels the current model separately from total
-  token use and marks estimated, subscription-equivalent, or mixed costs.
+  lifetime token use. Costs are marked as estimated,
+  subscription-equivalent, mixed, partial, or unavailable as appropriate.
 - Codex's Ultra effort selection maps to an accepted provider value.
 
 ### Install and update

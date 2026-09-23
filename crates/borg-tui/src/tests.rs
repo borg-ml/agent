@@ -4494,6 +4494,11 @@ fn collapsed_composer_never_places_the_hardware_cursor_on_the_statusline() {
         None
     );
     assert_eq!(
+        composer_frame_cursor(Rect::new(0, 6, 80, 2), (0, 0), 0, false),
+        None,
+        "the hardware cursor must not appear on the lower separator"
+    );
+    assert_eq!(
         composer_frame_cursor(Rect::new(0, 6, 3, 3), (0, 0), 0, false),
         None
     );
@@ -6538,7 +6543,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
             model: "gpt-5.6-sol".to_string(),
             effort: "xhigh".to_string(),
             state: "main thread".to_string(),
-            usage: "472.7m · $133.11 (sub)".to_string(),
+            usage: "472.7m · ~$133.11 (sub eq.)".to_string(),
             child_id: None,
         },
         AgentRosterEntry {
@@ -6562,8 +6567,8 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
     let model_column = column(&rows[0], "MODEL NOW").expect("model header");
     assert_eq!(column(&rows[1], "gpt-5.6-sol"), Some(model_column));
     assert_eq!(column(&rows[2], "gpt-5.6-luna"), Some(model_column));
-    assert!(rows[0].contains("TOTAL TOKENS · PRICED $"));
-    assert!(rows[1].contains("$133.11 (sub)"));
+    assert!(rows[0].contains("LIFETIME TOKENS · COST"));
+    assert!(rows[1].contains("~$133.11 (sub eq.)"));
     assert!(rows.iter().all(|row| row.width() <= 90));
 
     let narrow = team_roster_table_lines(&entries, 28, None, None, UiLanguage::English)
@@ -6585,7 +6590,7 @@ fn subagent_selector_shows_cumulative_usage_without_a_redundant_unit_suffix() {
     };
 
     let label = format_subagent_usage(&usage);
-    assert_eq!(label, "  800.0k");
+    assert_eq!(label, "  800.0k · cost unavailable");
     assert_eq!(
         format_subagent_usage(&borg_remote::SubagentUsage {
             context_tokens: Some(84_600),
@@ -6634,10 +6639,18 @@ fn subagent_subscription_cost_is_marked_as_api_equivalent() {
     let usage = borg_remote::SubagentUsage {
         cost_microusd: Some(1_234_567),
         cost_basis: "subscription_equivalent".to_string(),
+        cost_complete: Some(true),
         ..Default::default()
     };
 
-    assert_eq!(format_subagent_usage(&usage), "  $1.23 (sub)");
+    assert_eq!(format_subagent_usage(&usage), "  ~$1.23 (sub eq.)");
+    assert_eq!(
+        format_subagent_usage(&borg_remote::SubagentUsage {
+            cost_complete: None,
+            ..usage
+        }),
+        "  ~$1.23 (sub eq., unverified)"
+    );
 }
 
 #[test]
@@ -6657,6 +6670,7 @@ fn director_roster_preserves_historical_cost_basis_across_model_switches() {
             total_tokens: 472_696_660,
             cost_microusd: Some(133_107_927),
             cost_basis: "subscription_equivalent".to_string(),
+            cost_complete: Some(true),
             ..Default::default()
         },
         ..Default::default()
@@ -6686,7 +6700,7 @@ fn director_roster_preserves_historical_cost_basis_across_model_switches() {
     ));
     let director = &transcript.agent_roster_entries()[0];
     assert_eq!(director.model, "gpt-6-sol");
-    assert_eq!(director.usage, "474.7m · $133.11 (sub)");
+    assert_eq!(director.usage, "474.7m · ~$133.11 (sub eq., partial)");
 
     transcript.apply(&SessionEvent::new(
         session_id,
@@ -6695,8 +6709,35 @@ fn director_roster_preserves_historical_cost_basis_across_model_switches() {
     ));
     assert_eq!(
         transcript.agent_roster_entries()[0].usage,
-        "474.7m · ~$133.61 (mix)"
+        "474.7m · ~$133.61 (mix, partial)"
     );
+
+    let mut cache_only = Transcript::default();
+    cache_only.apply(&SessionEvent::new(
+        session_id,
+        3,
+        SessionEventKind::UsageUpdated {
+            provider_duration_ms: 1,
+            turn_id: None,
+            provider_context_reused: None,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_input_tokens: 100,
+            cache_creation_input_tokens: 0,
+            total_tokens: 0,
+            cost_microusd: None,
+            cost_basis: "unavailable".to_string(),
+            cost_usd: None,
+            context_tokens: None,
+            context_window_tokens: None,
+        },
+    ));
+    cache_only.apply(&SessionEvent::new(
+        session_id,
+        4,
+        usage(0, Some(500_000), "provider_reported"),
+    ));
+    assert_eq!(cache_only.session_usage.cost_complete, Some(false));
 }
 
 #[test]
@@ -9124,7 +9165,7 @@ fn agent_message_is_visible_while_stopped_once_on_replay_and_never_human_pending
 }
 
 #[test]
-fn internal_team_delivery_is_pending_until_settled_but_not_in_user_history() {
+fn internal_team_delivery_stays_out_of_pending_input_and_user_history() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     let text = "Team message from /root/worker:\n\nchild result".to_string();
@@ -9177,9 +9218,8 @@ fn internal_team_delivery_is_pending_until_settled_but_not_in_user_history() {
         },
         &mut None,
     );
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].actor, EventActor::System);
-    assert_eq!(pending[0].message_id, message_id);
+    assert!(pending.is_empty());
+    assert_eq!(queued_prompt_panel_height(&pending, 80, true), 0);
     assert!(!has_recallable_queued_prompts("", &pending));
     update_queued_prompts(&mut pending, &current.kind, &mut None);
     assert!(pending.is_empty());
@@ -9444,24 +9484,16 @@ fn team_message_actor_correction_survives_child_hydration() {
     };
     let legacy = message(1, EventActor::User, MessageStatus::Queued);
     let corrected = message(2, EventActor::System, MessageStatus::Queued);
-    let mut pending = pending_prompt_projection_from_events(&[legacy, corrected]);
+    let mut pending = pending_prompt_projection_from_events(std::slice::from_ref(&legacy));
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].actor, EventActor::System);
-
-    let optimistic = vec![PendingPromptProjection {
-        actor: EventActor::User,
-        ..pending[0].clone()
-    }];
-    restore_optimistic_pending_prompts(&mut pending, &[], optimistic);
-    assert_eq!(pending[0].actor, EventActor::System);
+    assert!(pending_prompt_projection_from_events(&[legacy.clone(), corrected.clone()]).is_empty());
+    let optimistic = pending.clone();
+    update_queued_prompts(&mut pending, &corrected.kind, &mut None);
+    assert!(pending.is_empty());
+    restore_optimistic_pending_prompts(&mut pending, &[legacy, corrected], optimistic);
+    assert!(pending.is_empty());
     assert!(!has_recallable_queued_prompts("", &pending));
-    let rendered = queued_prompt_lines(&pending, 80, None)
-        .into_iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(rendered.contains("queued updates wait for the next turn"));
-    assert!(!rendered.contains("esc send"));
+    assert_eq!(queued_prompt_panel_height(&pending, 80, true), 0);
 
     update_queued_prompts(
         &mut pending,
@@ -9472,13 +9504,13 @@ fn team_message_actor_correction_survives_child_hydration() {
 }
 
 #[test]
-fn human_admission_does_not_hide_older_team_message() {
+fn team_message_stays_out_of_pending_input_next_to_human_prompt() {
     let system_id = Uuid::new_v4();
     let user_id = Uuid::new_v4();
     let mut pending = Vec::new();
-    let mut apply = |message_id, actor, status| {
+    let apply = |pending: &mut Vec<PendingPromptProjection>, message_id, actor, status| {
         update_queued_prompts(
-            &mut pending,
+            pending,
             &SessionEventKind::Message {
                 message_id,
                 actor,
@@ -9490,12 +9522,27 @@ fn human_admission_does_not_hide_older_team_message() {
             &mut None,
         );
     };
-    apply(system_id, EventActor::System, MessageStatus::Queued);
-    apply(user_id, EventActor::User, MessageStatus::Queued);
-    apply(user_id, EventActor::User, MessageStatus::Complete);
+    apply(
+        &mut pending,
+        system_id,
+        EventActor::System,
+        MessageStatus::Queued,
+    );
+    apply(
+        &mut pending,
+        user_id,
+        EventActor::User,
+        MessageStatus::Queued,
+    );
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].message_id, system_id);
-    assert_eq!(pending[0].actor, EventActor::System);
+    assert_eq!(pending[0].message_id, user_id);
+    apply(
+        &mut pending,
+        user_id,
+        EventActor::User,
+        MessageStatus::Complete,
+    );
+    assert!(pending.is_empty());
 }
 
 #[test]
@@ -10370,7 +10417,10 @@ fn projected_session_state_restores_status_config_outside_the_history_tail() {
     assert_eq!(statuses.billing, None);
     assert_eq!(statuses.cwd, format!("{separator}w{separator}borg"));
     assert_eq!(transcript.context_remaining_percent, 77);
-    assert_eq!(transcript.agent_roster_entries()[0].usage, "123.0k");
+    assert_eq!(
+        transcript.agent_roster_entries()[0].usage,
+        "123.0k · cost unavailable"
+    );
 }
 
 #[test]
