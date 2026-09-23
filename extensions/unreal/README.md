@@ -75,13 +75,13 @@ hook sent `QUIT_EDITOR` to the fake backend and stop closed all private ports.
 This does **not** validate a real Unreal editor. The architect's
 `docs/gamedev/integration.md` reports a passing real-systemd two-service,
 no-hook scoped descendant gate on that same binary, clearing the earlier
-stale-binary fail-open; a subsequent public CLI probe on that binary
-found a **Project path-alias fail-open** (exclusive job began while an aliased
-project's service stayed Healthy). Core must normalize/reject aliases at all
-entrypoints and re-prove handoff on a rebuilt binary. The adapter canonicalizes
-its project path and now rejects conflicting UBT project arguments, but that
-cannot repair core admission. Post-hook failure/retry, service capacity,
-owner fencing and real Unreal parity also remain blockers.
+stale-binary fail-open. A later public CLI probe found a **Project
+path-alias fail-open** on that old binary. A newly rebuilt combined binary,
+SHA256 `011c4ba9…`, independently rejected aliased Project/Worktree keys and
+passed a canonical Project service handoff; the final integrated binary must
+repeat this gate. The adapter canonicalizes its project path and rejects
+conflicting UBT project arguments. Post-hook failure/retry, deterministic
+service capacity, owner fencing and real Unreal parity remain blockers.
 Do not use the live shared project's editor or its port.
 
 The stock
@@ -117,7 +117,15 @@ Borg binary with `lane service` and requires the same working user bus. It
 launches a fake MCP editor on disposable high loopback ports in isolated lane
 state through `unreal.py editor start/status/stop`, checks Healthy and the
 unfenced front proxy's HTTP 403 on POST, observes the default graceful hook's
-`QUIT_EDITOR` request, then checks port cleanup. Real Unreal/editor ownership
-and D11 two-service interoperability are not exercised by this test.
+`QUIT_EDITOR` request, then checks port cleanup. Ownership of a real
+Unreal editor is not exercised by this test. The opt-in fake service test
+also submits an adapter-generated exclusive JobSpec directly to Borg and checks
+that its one fake backend is gone, proxy returns 503 during the job, and the
+service auto-resumes. This **does not enable** non-spec adapter exclusive runs
+or prove the two-service, failure-path or real-editor gates. Both opt-in
+smokes passed on a private copy of debug binary SHA256 `61ece6c1…` (8/8 tests,
+hash stable during execution). The lanes worktree had uncommitted source
+changes at copy time, so this is adapter compatibility evidence, **not** a
+final-source release or integrated-binary gate.
 Consult `docs/gamedev/interfaces.md` for core contracts and rollout
 prerequisites.
