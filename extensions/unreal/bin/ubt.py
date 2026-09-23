@@ -56,6 +56,8 @@ def main(argv: list[str]) -> int:
             mapping.mkdir(mode=0o700)
             child_env = dict(os.environ, TMPDIR=private_tmp,
                              UBA_FILE_MAPPING_DIR=str(mapping))
+            child_env.pop('UBA_FILE_MAPPING_MEMFD', None)
+            child_env.pop('UnrealBuildTool_TMP', None)
             fd = os.open(start_lock, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX)
