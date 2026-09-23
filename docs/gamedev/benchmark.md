@@ -16,7 +16,7 @@ Each agent issues jobs sequentially with a fixed seed and independent 0/0.2/0.4 
 
 - `naive`: one global nonblocking lock, refusals retry every 10 *unscaled* seconds. Delay from original arrival, including retry overshoot, counts as wait.
 - `fifo`: one global blocking FIFO, no polling; baseline for isolating scheduling from avoiding polling.
-- `borg`: per-project/worktree key FIFO, concurrent disjoint keys subject to global RAM reservation, same-input build coalescing, persistent editor with exclusive import yield/restart. This models the intended contract, **not** proof that the Borg CLI has implemented it. The model does not simulate crashes, path aliasing, disk pressure, compiler scaling under contention, or systemd recovery.
+- `borg`: per-project/worktree key FIFO, concurrent disjoint keys subject to global RAM reservation, **pending-only** same-input build coalescing, persistent editor with exclusive import yield/restart. This models safe v0 policy, **not** proof that the Borg CLI has implemented it. `--coalesce-running` models the intended future optimization only with independent revision revalidation; the v0 JobSpec fingerprint alone cannot establish this, so running joins are disabled by default. The model does not simulate crashes, path aliasing, disk pressure, compiler scaling under contention, or systemd recovery.
 
 `agent_wait_hours` is aggregate *scaled* queue delay (including time spent waiting for a joined build's result), not actual agent billable time. `unscaled_wait_hours` in JSON extrapolates the scenario back to nominal durations. `makespan_seconds` is scaled wall clock. `cpu_utilization` integrates modeled requested CPU cores, capped at host core count, divided by makespan × host cores; actual operating-system utilization may differ. `oom` counts capacity over-admissions; `failures` counts simulated process failures (currently none are injected). `fairness_jain` is Jain's index on each agent's solo job seconds ÷ elapsed wall time, 0–1 (higher more equal), not a guarantee of no starvation. Coalesced joiners wait for the same result without a new launch. Score policies on the **same seeded jobs**, not separate random draws.
 
@@ -28,9 +28,9 @@ Each agent issues jobs sequentially with a fixed seed and independent 0/0.2/0.4 
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | naive | 0.146 | 177.7 | 9.1% | 0/0 | 0.574 | 48/0 | 525/0 |
 | global FIFO | 0.228 | 174.9 | 9.2% | 0/0 | 0.821 | 48/0 | 0/0 |
-| Borg lanes (modeled) | 0.052 | 56.4 | 22.9% | 0/0 | 0.816 | 44/4 | 0/2 |
+| Borg lanes v0 (modeled) | 0.054 | 57.4 | 22.8% | 0/0 | 0.816 | 46/2 | 0/2 |
 
-FIFO can accumulate *more aggregate queue time* than opportunistic poll retries while still eliminating 525 failed poll attempts and improving fairness. Borg's 3.15× makespan gain here is a model prediction, not an observed performance result; policies also differ in cold-start cost. Dedicated real-CLI comparisons must separate scheduling, caching/warmth and CPU contention.
+FIFO can accumulate *more aggregate queue time* than opportunistic poll retries while still eliminating 525 failed poll attempts and improving fairness. Borg's 3.10× modeled makespan gain here is a model prediction, not an observed performance result; policies also differ in cold-start cost. The hypothetical `--policy borg --coalesce-running` variant has 44 launches/4 joins and 56.4 s makespan, but cannot be safely implemented from v0 JobSpec alone. Dedicated real-CLI comparisons must separate scheduling, caching/warmth and CPU contention.
 
 ## Bounded fake-process replay
 
@@ -54,13 +54,13 @@ The job driver submits the **same seeded workload generator** as the simulator t
 
 ### Observed lane CLI (fake processes, not Unreal)
 
-Executed 2026-09-23 using the owner-built binary from `gamedev/lanes` at `37c5ee8`, with `BORG_LANE_SCOPE=0`, `--scale 200` and a fresh isolated temp directory per run. These results include per-command CLI/process startup, the 0.5 s minimum first-build time, 0.04 s later minimum and 16 MiB/model GiB touched memory, so **do not compare their makespan to the analytic model as a lane speedup**.
+Executed 2026-09-23 using the owner-built binary from `gamedev/lanes` at `37c5ee8` (checkpoint **before** the owner disabled unsafe running joins), with `BORG_LANE_SCOPE=0`, `--scale 200` and a fresh isolated temp directory per run. These results include per-command CLI/process startup, the 0.5 s minimum first-build time, 0.04 s later minimum and 16 MiB/model GiB touched memory, so **do not compare their makespan to the analytic model as a lane speedup**.
 
 | workload | requests | unique launches / joins | observed wall s | aggregate wait h | peak reserved GiB / cap | measured CPU utilisation (8 cores) | failures / OOM |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 3 agents × 3 jobs | 9 | 7 / 2 | 2.831 | 0.00088 | 6 / 20 | 3.44% | 0 / 0 |
 | 6 agents × 8 jobs | 48 | 44 / 4 | 8.635 | 0.00996 | 10 / 20 | 3.21% | 0 / 0 |
 
-The real driver verifies no exclusive-key overlaps and no over-capacity spans using public `job status --json` timestamps; an invariant failure aborts the test and retains its `/tmp/borg-bench-*` state path for diagnosis. `cpu_utilization_8_cores` sums status `cpu_seconds` over unique jobs, divided by wall × 8; these 0.25-CPU fake jobs are deliberately light. A second 6×8 run under different host load took 13.081 s; its 44 terminal `status --json` calls took median 16.97 ms, p95 20.91 ms (subprocess startup and JSON included). Runs have timing variance from the shared host, so no single-run confidence interval is claimed.
+The pre-fix binary could join a running job by trusting a stale caller fingerprint; these observed join counts must be refreshed against the pending-only fix before calling them v0 results. The real driver verifies no exclusive-key overlaps and no over-capacity spans using public `job status --json` timestamps; an invariant failure aborts the test and retains its `/tmp/borg-bench-*` state path for diagnosis. `cpu_utilization_8_cores` sums status `cpu_seconds` over unique jobs, divided by wall × 8; these 0.25-CPU fake jobs are deliberately light. A second 6×8 run under different host load took 13.081 s; its 44 terminal `status --json` calls took median 16.97 ms, p95 20.91 ms (subprocess startup and JSON included). Runs have timing variance from the shared host, so no single-run confidence interval is claimed.
 
 The low-disk regression requests more free space than `/tmp` has and sets a 500 ms queue deadline. Public `job wait` exited **125**, `job status` showed no start timestamp, and the recorded reason was `waiting for disk ... free 18373660672, need 19374127616 bytes`. This is an expected budget refusal, not an OOM. The test never allocates that disk space or launches its fake worker. Crash-owned scope handling and fingerprint mutation mid-build remain untested here; exercise those only in an isolated test host with an explicit scope ownership fixture, not by killing another agent's processes.
