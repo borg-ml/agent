@@ -2869,6 +2869,79 @@ async fn sibling_messages_use_the_shared_team_directory() {
 }
 
 #[tokio::test]
+async fn waking_a_child_preserves_queued_team_message_provenance() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let executor = RecordingPeerExecutor::default();
+    let mut child_launch = launch();
+    child_launch.cwd = directory.path().to_path_buf();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        child_launch.clone(),
+        2,
+        Arc::new(executor.clone()),
+        store.clone(),
+    )
+    .unwrap();
+    let child = {
+        let mut table = coordinator.table.lock().await;
+        let child = table.reserve("worker", &child_launch).unwrap();
+        table
+            .entries
+            .get_mut(&child.session_id)
+            .unwrap()
+            .snapshot
+            .status = SubagentStatus::Ready;
+        child
+    };
+    bind_test_team(directory.path(), store.as_ref(), root, &[child.session_id]).await;
+    let message_id = coordinator
+        .route_message_with_options_as(
+            root,
+            "worker",
+            "the paused worker's report",
+            TeamMessageOptions::default(),
+        )
+        .await
+        .unwrap()
+        .receipt
+        .unwrap()
+        .message_id;
+    let mut activity = coordinator.subscribe();
+
+    coordinator
+        .start_reserved(child.clone(), child_launch, false)
+        .await
+        .unwrap();
+    let actor = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let item = activity.recv().await;
+            if let Ok(SubagentActivity::SessionEvent { event, .. }) = item
+                && let SessionEventKind::Message {
+                    message_id: id,
+                    actor,
+                    ..
+                } = event.kind
+                && id == message_id
+            {
+                break actor;
+            }
+        }
+    })
+    .await
+    .expect("the awakened child journals its queued inbox");
+    assert_eq!(actor, EventActor::System);
+    assert!(executor.prompts.lock().unwrap().is_empty());
+
+    coordinator.stop_all().await;
+    scratch.discard().await;
+}
+
+#[tokio::test]
 async fn a_cross_participant_message_names_a_reply_target_the_recipient_can_reach() {
     // "/root" resolves to the reader's OWN root in every process, so telling a
     // peer to reply there addressed it back to itself and failed as "message

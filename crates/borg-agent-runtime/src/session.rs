@@ -495,7 +495,7 @@ impl WorkspaceProjection {
         matches!(
             &event.kind,
             SessionEventKind::Message {
-                actor: EventActor::User,
+                actor: EventActor::User | EventActor::System,
                 status: MessageStatus::Complete,
                 ..
             } | SessionEventKind::PromptRecalled { .. }
@@ -556,19 +556,16 @@ impl WorkspaceProjection {
         attempt: Option<crate::DeliveryAttempt>,
     ) -> Result<()> {
         use crate::DeliveryState;
-        let Some(current) = self
+        let Some(delivery) = self
             .store
             .message_deliveries(message_id)
             .await?
             .into_iter()
-            .find(|delivery| {
-                delivery.workspace_id == self.workspace_id
-                    && delivery.recipient_id == self.agent_participant_id
-            })
-            .map(|delivery| delivery.state)
+            .find(|delivery| delivery.recipient_id == self.agent_participant_id)
         else {
             return Ok(());
         };
+        let current = delivery.state;
         // Only forward edges the store already allows. Anything else --
         // already at or past the target, or settled as failed/recalled -- is a
         // quiet no-op so a replay cannot drag an acknowledged delivery back to
@@ -591,7 +588,7 @@ impl WorkspaceProjection {
             let attempt = (index == 0).then(|| attempt.clone()).flatten();
             self.store
                 .transition_message_delivery(
-                    self.workspace_id,
+                    delivery.workspace_id,
                     message_id,
                     self.agent_participant_id,
                     step,
@@ -2069,6 +2066,17 @@ async fn run_agent_session_store_kernel_inner(
         {
             pending.push_back(prompt);
         }
+    }
+    if let Some(projection) = &workspace_projection {
+        repair_recovered_team_prompt_provenance(
+            &mut pending,
+            &durable_admissions,
+            projection,
+            &mut journal,
+            &events,
+            session_id,
+        )
+        .await?;
     }
     if user_stop {
         snapshot_stale_user_prompts(&mut stale_user_prompts, &pending);
@@ -8824,6 +8832,49 @@ fn recover_prompts_on_resume(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> 
     recover_queued_prompts(events)
 }
 
+/// An older child wake replayed durable team inbox entries as ordinary user
+/// prompts. Their workspace delivery rows prove who was addressed even after
+/// acknowledgement, so a restart can restore their original priority and
+/// correct the visible pending-input projection without changing the mail.
+async fn repair_recovered_team_prompt_provenance(
+    pending: &mut VecDeque<QueuedPrompt>,
+    durable_admissions: &HashSet<Uuid>,
+    projection: &WorkspaceProjection,
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+) -> Result<()> {
+    let mut corrections = Vec::new();
+    for prompt in pending {
+        // An interrupted in-progress turn keeps its original admission and
+        // priority until its continuation finishes. Reclassifying it here
+        // would merge new reports into the resumed prompt as past work.
+        if prompt.actor != EventActor::User
+            || prompt.delivery != PromptDelivery::Queue
+            || durable_admissions.contains(&prompt.message_id)
+        {
+            continue;
+        }
+        let addressed_to_session = projection
+            .store
+            .message_deliveries(prompt.message_id)
+            .await?
+            .iter()
+            .any(|delivery| delivery.recipient_id == projection.agent_participant_id);
+        if addressed_to_session {
+            prompt.actor = EventActor::System;
+            prompt.interrupt_batch = false;
+            corrections.extend(
+                prompt
+                    .batch_entries()
+                    .into_iter()
+                    .map(|entry| (entry, MessageStatus::Queued, PromptDelivery::Queue)),
+            );
+        }
+    }
+    record_prompt_statuses(journal, events, session_id, corrections).await
+}
+
 fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
     let mut pending = VecDeque::<QueuedPrompt>::new();
     // A crashed actor can leave an older in-progress snapshot after the
@@ -8861,7 +8912,9 @@ fn recover_queued_prompts(events: &[SessionEvent]) -> VecDeque<QueuedPrompt> {
                     // that promotion as a duplicate no-op.
                     prompt.text = text.clone();
                     prompt.attachments = attachments.clone();
+                    prompt.actor = *actor;
                     prompt.delivery = delivery;
+                    prompt.interrupt_batch = *actor == EventActor::User;
                 } else {
                     pending.push_back(QueuedPrompt {
                         message_id: *message_id,
@@ -9046,6 +9099,7 @@ fn recall_withdrawable_steers(
                 PendingSteerState::AwaitingAcknowledgement
                     | PendingSteerState::RetryAtBoundary { .. }
             ) && steer.prompt.visible
+                && steer.prompt.actor == EventActor::User
                 && message_id.is_none_or(|target| target == steer.prompt.message_id)
                 && steer.admission.recall())
             .then_some(steer.acknowledgement_id)
@@ -9056,6 +9110,7 @@ fn recall_withdrawable_steers(
     while let Some(mut steer) = pending_steers.pop_front() {
         if cancelled.contains(&steer.acknowledgement_id) {
             if steer.prompt.visible
+                && steer.prompt.actor == EventActor::User
                 && message_id.is_none_or(|target| target == steer.prompt.message_id)
             {
                 recalled.push(steer.prompt);
