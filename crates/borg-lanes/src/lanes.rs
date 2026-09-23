@@ -273,6 +273,11 @@ pub struct LaneRecord {
     /// workload and ends the record Cancelled with this reason.
     #[serde(default)]
     pub cancel_requested: Option<String>,
+    /// Fenced under the journal lock: a recovery/supervisor race never launches two hooks.
+    #[serde(default)]
+    pub post_hook_started: bool,
+    #[serde(default)]
+    pub post_hook_completed: bool,
     pub evidence: Option<String>,
 }
 
@@ -286,34 +291,29 @@ struct Journal {
     client_revision: u64,
 }
 
-// Keep a bounded history in the admission snapshot. Quarantined rows and
-// pending service resumes are recovery authorities and must never be pruned.
+// Keep a bounded history in the admission snapshot. Quarantines, pending
+// service resumes, and terminal hooks still needing delivery must not be pruned.
 const TERMINAL_HISTORY_LIMIT: usize = 2048;
+fn prunable(row: &LaneRecord) -> bool {
+    matches!(
+        row.state,
+        TicketState::Finished | TicketState::Cancelled { .. }
+    ) && !row.quarantined
+        && row.resume_pending.is_empty()
+        && (row
+            .spec
+            .as_ref()
+            .is_none_or(|spec| spec.post_hook.is_none())
+            || row.post_hook_completed)
+}
 impl Journal {
     fn prune_terminal(&mut self) {
-        let mut eligible = self
-            .records
-            .iter()
-            .filter(|row| {
-                matches!(
-                    row.state,
-                    TicketState::Finished | TicketState::Cancelled { .. }
-                ) && !row.quarantined
-                    && row.resume_pending.is_empty()
-            })
-            .count();
+        let mut eligible = self.records.iter().filter(|row| prunable(row)).count();
         if eligible <= TERMINAL_HISTORY_LIMIT {
             return;
         }
         self.records.retain(|row| {
-            if eligible > TERMINAL_HISTORY_LIMIT
-                && matches!(
-                    row.state,
-                    TicketState::Finished | TicketState::Cancelled { .. }
-                )
-                && !row.quarantined
-                && row.resume_pending.is_empty()
-            {
+            if eligible > TERMINAL_HISTORY_LIMIT && prunable(row) {
                 eligible -= 1;
                 false
             } else {
@@ -778,6 +778,8 @@ impl LaneStore {
             resume_error: None,
             resume_attempts: 0,
             cancel_requested: None,
+            post_hook_started: false,
+            post_hook_completed: false,
             evidence: None,
         });
         Ok((ticket, job))
@@ -942,12 +944,17 @@ impl LaneStore {
     /// every waiter immediately even if it never wrote a terminal event.
     pub fn wait_job(&self, id: Uuid) -> Result<JobHandle> {
         let _requester = self.hold_as_requester(id)?;
-        let initial = self.job_status(id)?;
+        let row = self.record(id)?;
         if matches!(
-            initial.state,
-            JobState::Finished { .. } | JobState::Cancelled { .. }
-        ) {
-            return Ok(initial);
+            row.state,
+            TicketState::Finished | TicketState::Cancelled { .. }
+        ) && (row
+            .spec
+            .as_ref()
+            .is_none_or(|spec| spec.post_hook.is_none())
+            || row.post_hook_completed)
+        {
+            return row.job.context("job record missing handle");
         }
         let lock = stable_file(&self.ticket_path(id))?;
         lock.lock_shared()?;
@@ -964,6 +971,51 @@ impl LaneStore {
     /// Cancelled with a reason. An already terminal record is left as it is.
     /// Yielded services are resumed either way.
     fn conclude(&self, id: Uuid, end: JobEnd, evidence: &str) -> Result<()> {
+        // Run the hook before releasing a granted lease or resuming services.
+        // This is also reached by queued cancellation, supervisor spawn failure
+        // and lost-supervisor recovery, rather than only the happy workload path.
+        let hook = self.locked(|state| {
+            let record = state
+                .records
+                .iter_mut()
+                .find(|r| r.ticket.id == id)
+                .context("unknown job")?;
+            if record.post_hook_completed
+                || record
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.post_hook.as_ref())
+                    .is_none()
+            {
+                return Ok(None);
+            }
+            record.post_hook_started = true;
+            let effective = match &record.state {
+                TicketState::Cancelled { reason } => JobEnd::Cancelled(reason.clone()),
+                _ => match &end {
+                    JobEnd::Exited(code) => JobEnd::Exited(*code),
+                    JobEnd::Cancelled(reason) => JobEnd::Cancelled(reason.clone()),
+                },
+            };
+            Ok(record.spec.clone().map(|spec| (spec, effective)))
+        })?;
+        if let Some((spec, effective)) = hook {
+            let exclusive = spec
+                .lease
+                .resources
+                .iter()
+                .any(|r| matches!(r.access, Access::Exclusive));
+            self.run_post_for_job(&spec, id, exclusive, &effective, evidence)?;
+            self.locked(|state| {
+                state
+                    .records
+                    .iter_mut()
+                    .find(|r| r.ticket.id == id)
+                    .context("job vanished after post hook")?
+                    .post_hook_completed = true;
+                Ok(())
+            })?;
+        }
         let services = self.locked(|state| {
             let record = state
                 .records
@@ -1541,6 +1593,27 @@ fn workload_unit(spec: &JobSpec, id: Uuid) -> Result<String> {
     Ok(format!("{}{}.scope", scope_unit_prefix(spec)?, id))
 }
 
+fn cgroup_cpu_at(path: &Path) -> Option<f64> {
+    fs::read_to_string(path.join("cpu.stat"))
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("usage_usec ")?
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .map(|us| us as f64 / 1_000_000.0)
+        })
+}
+
+fn workload_cpu(cgroup: Option<&str>, leader: u32) -> Option<f64> {
+    cgroup
+        .and_then(|path| {
+            cgroup_cpu_at(&Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/')))
+        })
+        .or_else(|| proc_cpu(leader))
+}
+
 fn proc_cpu(pid: u32) -> Option<f64> {
     let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let tail = text
@@ -1782,13 +1855,8 @@ impl LaneStore {
                     self.service_control(service_id, id, "yield", spec.timeout_ms)?;
                 }
                 if let Some(hook) = &spec.pre_hook
-                    && let Err(error) = self.run_hook(hook, &spec, id, "pre-exclusive", true)
+                    && let Err(error) = self.run_hook(hook, &spec, id, "pre-exclusive", true, None)
                 {
-                    // Yield may have partially succeeded. Resume the service
-                    // through the post hook even though no lease was granted.
-                    if let Some(post) = &spec.post_hook {
-                        let _ = self.run_hook(post, &spec, id, "post-exclusive", false);
-                    }
                     return Err(error);
                 }
                 // The hook requesting yield is not proof of release. Recheck
@@ -1819,11 +1887,6 @@ impl LaneStore {
                         .context("ticket disappeared")?;
                     Ok(grant_entry(entry))
                 });
-                if granted.is_err()
-                    && let Some(post) = &spec.post_hook
-                {
-                    let _ = self.run_hook(post, &spec, id, "post-exclusive", false);
-                }
                 return granted;
             }
             if let Some(limit) = record.request.queue_timeout_ms
@@ -1889,6 +1952,7 @@ impl LaneStore {
         id: Uuid,
         phase: &str,
         sync: bool,
+        outcome: Option<(&str, i32, &str)>,
     ) -> Result<()> {
         ensure!(!hook.argv.is_empty(), "empty {phase} hook");
         let mut command = Command::new(&hook.argv[0]);
@@ -1903,6 +1967,12 @@ impl LaneStore {
             )
             .env("BORG_LANE_LOG", self.job_dir(id).join("output.log"))
             .env("BORG_LANES_ROOT", &self.root);
+        if let Some((state, exit_code, reason)) = outcome {
+            command
+                .env("BORG_LANE_STATE", state)
+                .env("BORG_LANE_EXIT_CODE", exit_code.to_string())
+                .env("BORG_LANE_REASON", reason);
+        }
         let scoped_post = phase.starts_with("post") && systemd_available();
         if phase.starts_with("post") && !scoped_post {
             ensure!(
@@ -1910,6 +1980,7 @@ impl LaneStore {
                 "post hook requires a systemd user scope outside explicit degraded mode"
             );
         }
+        let sync = sync || (phase.starts_with("post") && !scoped_post);
         if !sync || scoped_post {
             let unit = format!("borg-lane-hook-{id}-{phase}.scope");
             self.locked(|state| {
@@ -1948,6 +2019,12 @@ impl LaneStore {
                     spec.lease.resources.first().map_or("", |r| &r.key.name),
                 )
                 .env("BORG_LANE_LOG", self.job_dir(id).join("output.log"));
+            if let Some((state, exit_code, reason)) = outcome {
+                command
+                    .env("BORG_LANE_STATE", state)
+                    .env("BORG_LANE_EXIT_CODE", exit_code.to_string())
+                    .env("BORG_LANE_REASON", reason);
+            }
         }
         let mut child = command.stdin(Stdio::null()).spawn()?;
         if !sync {
@@ -2035,10 +2112,9 @@ impl LaneStore {
             && !exclusive
         {
             // Exclusive hooks already ran before the grant as a FIFO barrier.
-            self.run_hook(pre, &spec, id, "pre", true)?;
+            self.run_hook(pre, &spec, id, "pre", true, None)?;
         }
         if let Some(reason) = self.record(id)?.cancel_requested {
-            self.run_post_for_job(&spec, id, exclusive)?;
             return Ok(JobEnd::Cancelled(reason));
         }
         let log = OpenOptions::new()
@@ -2109,7 +2185,7 @@ impl LaneStore {
             record.workload_pid = Some(child.id());
             record.workload_start_ticks = proc_start_ticks(child.id());
             if scoped {
-                record.scope_cgroup = group;
+                record.scope_cgroup = group.clone();
             }
             if let Some(job) = record.job.as_mut() {
                 job.state = JobState::Running {
@@ -2129,7 +2205,10 @@ impl LaneStore {
                 break JobEnd::Exited(status.code().unwrap_or(128 + status.signal().unwrap_or(9)));
             }
             let size = fs::metadata(self.job_dir(id).join("output.log")).map_or(0, |m| m.len());
-            let cpu = proc_cpu(leader).unwrap_or(0.0);
+            if scoped && group.is_none() {
+                group = process_scope(leader, &unit).or_else(|| scope_control_group(&unit));
+            }
+            let cpu = workload_cpu(group.as_deref(), leader).unwrap_or(0.0);
             if size != last_size || cpu > last_cpu + 0.05 {
                 last_progress = std::time::Instant::now();
             }
@@ -2186,8 +2265,8 @@ impl LaneStore {
         // The leader is gone; no process of this workload may outlive it into
         // the next holder's lease (a compiler it started, for example).
         self.kill_workload(id, &unit, scoped, leader, "killed leftover pids")?;
-        self.run_post_for_job(&spec, id, exclusive)?;
-        let _ = lease;
+        let _ = (lease, exclusive);
+
         Ok(end)
     }
 
@@ -2262,17 +2341,29 @@ impl LaneStore {
         Ok(killed)
     }
 
-    fn run_post_for_job(&self, spec: &JobSpec, id: Uuid, exclusive: bool) -> Result<()> {
+    fn run_post_for_job(
+        &self,
+        spec: &JobSpec,
+        id: Uuid,
+        exclusive: bool,
+        end: &JobEnd,
+        evidence: &str,
+    ) -> Result<()> {
         // Bound services must remain stopped until the post hook completes.
         // Unbound jobs keep their independently scoped asynchronous hook.
         if let Some(post) = &spec.post_hook {
             let bound = !self.record(id)?.yield_services.is_empty();
+            let (state, code, reason) = match end {
+                JobEnd::Exited(code) => ("finished", *code, evidence),
+                JobEnd::Cancelled(reason) => ("cancelled", 125, reason.as_str()),
+            };
             if let Err(error) = self.run_hook(
                 post,
                 spec,
                 id,
                 if exclusive { "post-exclusive" } else { "post" },
                 bound,
+                Some((state, code, reason)),
             ) {
                 self.locked(|state| {
                     let row = state
@@ -2280,7 +2371,10 @@ impl LaneStore {
                         .iter_mut()
                         .find(|r| r.ticket.id == id)
                         .context("job vanished")?;
-                    row.evidence = Some(format!("post hook failed: {error:#}"));
+                    row.evidence = Some(match row.evidence.take() {
+                        Some(previous) => format!("{previous}; post hook failed: {error:#}"),
+                        None => format!("post hook failed: {error:#}"),
+                    });
                     if bound {
                         row.quarantined = true;
                     }
@@ -2390,10 +2484,19 @@ impl LaneStore {
         }
         // Avoid nested metadata locks: test each kernel lock before journalling.
         for record in self.snapshot()? {
-            if !matches!(
+            let pending_hook = matches!(
+                record.state,
+                TicketState::Finished | TicketState::Cancelled { .. }
+            ) && record
+                .spec
+                .as_ref()
+                .is_some_and(|spec| spec.post_hook.is_some())
+                && !record.post_hook_completed;
+            if (!matches!(
                 record.state,
                 TicketState::Granted(_) | TicketState::Queued | TicketState::Preparing
-            ) || (record.job.is_none() && !record.service_lease)
+            ) && !pending_hook)
+                || (record.job.is_none() && !record.service_lease)
             {
                 continue;
             }
@@ -2416,6 +2519,24 @@ impl LaneStore {
                         )
                 }))
             })?;
+            if pending_hook {
+                let note = format!(
+                    "job {} terminal hook pending after supervisor exit",
+                    record.ticket.id
+                );
+                actions.push(note.clone());
+                if !dry_run {
+                    let end = match &record.state {
+                        TicketState::Cancelled { reason } => JobEnd::Cancelled(reason.clone()),
+                        _ => JobEnd::Exited(match &record.job.as_ref().unwrap().state {
+                            JobState::Finished { exit_code } => *exit_code,
+                            _ => 125,
+                        }),
+                    };
+                    self.conclude(record.ticket.id, end, &note)?;
+                }
+                continue;
+            }
             if !active {
                 continue;
             }
@@ -2452,18 +2573,41 @@ impl LaneStore {
                     {
                         verified = false;
                     } else {
+                        let killed = current.as_deref().map(cgroup_pids).unwrap_or_default();
                         verified = Command::new("systemctl")
                             .args(["--user", "kill", "--signal=SIGKILL", scope])
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())
                             .status()
                             .is_ok_and(|s| s.success());
+                        if verified {
+                            let deadline = Instant::now() + Duration::from_secs(10);
+                            while !current
+                                .as_deref()
+                                .map(cgroup_pids)
+                                .unwrap_or_default()
+                                .is_empty()
+                                && Instant::now() < deadline
+                            {
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            verified = current
+                                .as_deref()
+                                .map(cgroup_pids)
+                                .unwrap_or_default()
+                                .is_empty();
+                            self.log_killed(record.ticket.id, "recovery killed pids", &killed)?;
+                        }
                     }
                 } else if let (Some(pid), Some(ticks)) =
                     (record.workload_pid, record.workload_start_ticks)
                 {
                     if proc_start_ticks(pid) == Some(ticks) {
+                        let killed = process_group_pids(pid);
                         verified = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } == 0;
+                        if verified {
+                            self.log_killed(record.ticket.id, "recovery killed pids", &killed)?;
+                        }
                     } else {
                         verified = false;
                     }
@@ -2689,6 +2833,8 @@ mod tests {
             resume_error: None,
             resume_attempts: 0,
             cancel_requested: None,
+            post_hook_started: false,
+            post_hook_completed: false,
             evidence: None,
         }
     }
@@ -2859,6 +3005,21 @@ mod tests {
     }
 
     #[test]
+    fn cgroup_cpu_includes_descendants_even_when_leader_is_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("cpu.stat"),
+            "usage_usec 2400000\nuser_usec 2300000\n",
+        )
+        .unwrap();
+        assert_eq!(cgroup_cpu_at(dir.path()), Some(2.4));
+        std::fs::write(dir.path().join("cpu.stat"), "usage_usec 2600000\n").unwrap();
+        assert_eq!(cgroup_cpu_at(dir.path()), Some(2.6));
+        std::fs::write(dir.path().join("cpu.stat"), "user_usec 99\n").unwrap();
+        assert_eq!(cgroup_cpu_at(dir.path()), None);
+    }
+
+    #[test]
     fn scope_prefix_is_validated_and_affects_coalescing() {
         let dir = tempfile::tempdir().unwrap();
         let store = LaneStore::new(dir.path()).unwrap();
@@ -2998,7 +3159,9 @@ mod tests {
                 Ok(ticket.id)
             })
             .unwrap();
-        store.run_post_for_job(&spec, id, true).unwrap();
+        store
+            .run_post_for_job(&spec, id, true, &JobEnd::Exited(0), "workload succeeded")
+            .unwrap();
         store.finish(id, 0, "workload succeeded").unwrap();
         let row = store.record(id).unwrap();
         assert!(row.quarantined);
