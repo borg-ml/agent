@@ -260,3 +260,10 @@ producer-aware watch. See `docs/watcher-yield.md` and runtime `watch.rs`.
   bridge. A model-supplied `owner` or `confirmed` boolean cannot confer
   participant authority or human approval. Workspace destructive MCP GC is
   dry-run only until approval is bound to the exact deletion.
+- D11: editor service/exclusive-job mutual exclusion is a *shared lane
+  resource*, not merely a `yield` status flag. The service must stop its
+  backend and release its shared project lease before the exclusive request
+  becomes Granted; the exclusive holder releases before service resume can
+  reacquire. A pre-hook that runs *after* grant is too late to prove this
+  ordering. No editor+exclusive parity claim until both owners demonstrate
+  this handshake under crash/restart and identical canonical root/key.

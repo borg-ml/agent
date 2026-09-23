@@ -108,3 +108,11 @@ Model-facing service MCP owner is **final parent integration**, not the
 services branch: only status should be exposed until registered spec policy
 and actual session-derived owner/fencing enforcement are audited. A tool
 argument `confirmed: true` is not a durable human approval for workspace GC.
+
+**Critical cross-module gate:** at first review the service yield state is
+independent of the lane store, the subsystem roots differ, and the lane
+pre-hook executes after the exclusive grant. This cannot yet enforce "editor
+stopped before exclusive job". Require one canonical root/key, a service-held
+shared resource relinquished before exclusive grant (or equivalent
+pre-admission barrier), and crash-tested reacquisition after exclusive
+release; otherwise exclude editor/exclusive integration from release claims.
