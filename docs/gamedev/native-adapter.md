@@ -85,6 +85,12 @@ database passwords in job specs.
   released its lease, and left the service Healthy with zero clients and zero
   `borg_native_%` databases. A prior malformed Cargo invocation returned exit
   1 but also cleaned up its lease and database.
+- Read-only `borg worktree --project /home/shulgin/borg-wt/gd-native
+  target-status --cap-gib 24` reported private target sizes 16.3 GiB
+  (`gd-native`) and 13.3 GiB (`gd-native-bench`), neither over the 24 GiB
+  reporting threshold. These sizes are logical (Btrfs reflinks may share
+  physical extents); the report does not enforce a per-target cap and no GC
+  was applied. The warm targets are preserved until paired runs finish.
 - Rebased only nine native commits onto final compatible `gamedev/services`
   @`e29b2af` (it descends from rebased design and final productivity base).
   Native `3432b79` built its own CLI through capped lane job `631fe619-...`
