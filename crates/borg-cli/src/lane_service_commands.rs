@@ -123,7 +123,8 @@ pub(crate) async fn run(args: ServiceArgs) -> Result<()> {
         .unwrap_or_else(LaneStore::default_root)
         .join("services");
     let manager = ServiceManager::new(root, std::env::current_exe()?);
-    let timeout = Duration::from_secs(120);
+    // Long enough for the service's own stop and restore hooks.
+    let timeout = |id: &str| borg_lanes::services::request_timeout(&manager.root, id);
     match args.command {
         ServiceCommand::Start {
             id,
@@ -164,12 +165,14 @@ pub(crate) async fn run(args: ServiceArgs) -> Result<()> {
         }
         ServiceCommand::Status { id } => display(&manager.read_status(&id)?, args.json)?,
         ServiceCommand::Stop { id } => display(
-            &manager.send(&id, ServiceRequest::Stop, timeout).await?,
+            &manager
+                .send(&id, ServiceRequest::Stop, timeout(&id))
+                .await?,
             args.json,
         )?,
         ServiceCommand::Restart { id, reason, force } => display(
             &manager
-                .send(&id, ServiceRequest::Restart { reason, force }, timeout)
+                .send(&id, ServiceRequest::Restart { reason, force }, timeout(&id))
                 .await?,
             args.json,
         )?,
@@ -189,14 +192,14 @@ pub(crate) async fn run(args: ServiceArgs) -> Result<()> {
                             .checked_mul(1000)
                             .context("yield duration overflow")?,
                     },
-                    timeout,
+                    timeout(&id),
                 )
                 .await?,
             args.json,
         )?,
         ServiceCommand::Resume { id, by } => display(
             &manager
-                .send(&id, ServiceRequest::Resume { by }, timeout)
+                .send(&id, ServiceRequest::Resume { by }, timeout(&id))
                 .await?,
             args.json,
         )?,
@@ -217,7 +220,7 @@ pub(crate) async fn run(args: ServiceArgs) -> Result<()> {
                             .checked_mul(1000)
                             .context("lease duration overflow")?,
                     },
-                    timeout,
+                    timeout(&id),
                 )
                 .await?;
             display(&status, args.json)?;
@@ -246,14 +249,16 @@ pub(crate) async fn run(args: ServiceArgs) -> Result<()> {
                             lease_id,
                             owner: holder,
                         },
-                        timeout,
+                        timeout(&id),
                     )
                     .await?,
                 args.json,
             )?;
         }
         ServiceCommand::Touch { id } => display(
-            &manager.send(&id, ServiceRequest::Touch, timeout).await?,
+            &manager
+                .send(&id, ServiceRequest::Touch, timeout(&id))
+                .await?,
             args.json,
         )?,
         ServiceCommand::Logs { id, lines } => {
