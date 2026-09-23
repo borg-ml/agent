@@ -136,7 +136,9 @@ jobs:
           mkdir -p "$package_dir/docs" "$package_dir/configs" "$package_dir/include"
           cp docs/blu-extensions.md "$package_dir/docs/"
           cp docs/customization.md "$package_dir/docs/"
+          cp docs/terminal-setup.md "$package_dir/docs/"
           cp configs/extension.example.toml "$package_dir/configs/"
+          cp configs/ghostty-borg.conf "$package_dir/configs/"
           cp include/borg_extension.h "$package_dir/include/"
           cp LICENSE NOTICE.md README.md CHANGELOG.md "$package_dir/"
           tar -C "$package_dir" -czf "$PWD/$asset" "${binaries[@]}" providers docs configs include LICENSE NOTICE.md README.md CHANGELOG.md
@@ -166,7 +168,9 @@ jobs:
           New-Item -ItemType Directory -Path "$packageDir/docs", "$packageDir/configs", "$packageDir/include"
           Copy-Item "docs/blu-extensions.md" "$packageDir/docs/"
           Copy-Item "docs/customization.md" "$packageDir/docs/"
+          Copy-Item "docs/terminal-setup.md" "$packageDir/docs/"
           Copy-Item "configs/extension.example.toml" "$packageDir/configs/"
+          Copy-Item "configs/ghostty-borg.conf" "$packageDir/configs/"
           Copy-Item "include/borg_extension.h" "$packageDir/include/"
           Copy-Item LICENSE, NOTICE.md, README.md, CHANGELOG.md $packageDir
           Compress-Archive -Path "$packageDir/*" -DestinationPath $asset
@@ -189,7 +193,9 @@ jobs:
           test -f "$(dirname "$binary")/CHANGELOG.md"
           test -f "$(dirname "$binary")/docs/blu-extensions.md"
           test -f "$(dirname "$binary")/docs/customization.md"
+          test -f "$(dirname "$binary")/docs/terminal-setup.md"
           test -f "$(dirname "$binary")/configs/extension.example.toml"
+          test -f "$(dirname "$binary")/configs/ghostty-borg.conf"
           test -f "$(dirname "$binary")/include/borg_extension.h"
       - name: Install-smoke the Windows archive
         if: matrix.archive == 'zip'
@@ -208,7 +214,9 @@ jobs:
           if (-not (Test-Path (Join-Path $binary.DirectoryName "CHANGELOG.md"))) { throw "Changelog was not packaged" }
           if (-not (Get-ChildItem -Path $smokeDir -Recurse -Filter "blu-extensions.md")) { throw "Blu documentation was not packaged" }
           if (-not (Get-ChildItem -Path $smokeDir -Recurse -Filter "customization.md")) { throw "Customization documentation was not packaged" }
+          if (-not (Test-Path (Join-Path $binary.DirectoryName "docs/terminal-setup.md"))) { throw "Terminal setup guide was not packaged" }
           if (-not (Get-ChildItem -Path $smokeDir -Recurse -Filter "extension.example.toml")) { throw "Blu manifest example was not packaged" }
+          if (-not (Test-Path (Join-Path $binary.DirectoryName "configs/ghostty-borg.conf"))) { throw "Ghostty configuration was not packaged" }
           if (-not (Get-ChildItem -Path $smokeDir -Recurse -Filter "borg_extension.h")) { throw "Native extension header was not packaged" }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

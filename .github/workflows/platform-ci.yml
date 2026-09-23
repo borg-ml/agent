@@ -111,7 +111,9 @@ jobs:
           chmod 700 "$stage/borg-${{ matrix.target }}/providers/claude/claude"
           mkdir -p "$stage/borg-${{ matrix.target }}/docs" "$stage/borg-${{ matrix.target }}/configs" "$stage/borg-${{ matrix.target }}/include"
           cp docs/blu-extensions.md "$stage/borg-${{ matrix.target }}/docs/"
+          cp docs/terminal-setup.md "$stage/borg-${{ matrix.target }}/docs/"
           cp configs/extension.example.toml "$stage/borg-${{ matrix.target }}/configs/"
+          cp configs/ghostty-borg.conf "$stage/borg-${{ matrix.target }}/configs/"
           cp include/borg_extension.h "$stage/borg-${{ matrix.target }}/include/"
           cp CHANGELOG.md LICENSE NOTICE.md README.md "$stage/borg-${{ matrix.target }}/"
           tar -C "$stage/borg-${{ matrix.target }}" -czf "$PWD/$asset" \
@@ -121,7 +123,9 @@ jobs:
           "$extract/providers/claude/claude" --version
           test -f "$extract/providers/claude/LICENSE.md"
           test -f "$extract/docs/blu-extensions.md"
+          test -f "$extract/docs/terminal-setup.md"
           test -f "$extract/configs/extension.example.toml"
+          test -f "$extract/configs/ghostty-borg.conf"
           test -f "$extract/include/borg_extension.h"
           test -f "$extract/CHANGELOG.md"
       - name: Package and extract-smoke the Windows archive
@@ -147,7 +151,9 @@ jobs:
           Copy-Item (Join-Path $sdkPackage "package.json") "$stage/providers/claude/package.json"
           New-Item -ItemType Directory -Path "$stage/docs", "$stage/configs", "$stage/include"
           Copy-Item "docs/blu-extensions.md" "$stage/docs/"
+          Copy-Item "docs/terminal-setup.md" "$stage/docs/"
           Copy-Item "configs/extension.example.toml" "$stage/configs/"
+          Copy-Item "configs/ghostty-borg.conf" "$stage/configs/"
           Copy-Item "include/borg_extension.h" "$stage/include/"
           Copy-Item CHANGELOG.md, LICENSE, NOTICE.md, README.md $stage
           Compress-Archive -Path "$stage/*" -DestinationPath $asset
@@ -160,6 +166,8 @@ jobs:
           & $native.FullName --version
           if (-not (Test-Path (Join-Path $extract "providers/claude/LICENSE.md"))) { throw "Claude native license was not packaged" }
           if (-not (Get-ChildItem -Path $extract -Recurse -Filter "blu-extensions.md")) { throw "Blu documentation was not packaged" }
+          if (-not (Test-Path (Join-Path $extract "docs/terminal-setup.md"))) { throw "Terminal setup guide was not packaged" }
           if (-not (Get-ChildItem -Path $extract -Recurse -Filter "extension.example.toml")) { throw "Blu manifest example was not packaged" }
+          if (-not (Test-Path (Join-Path $extract "configs/ghostty-borg.conf"))) { throw "Ghostty configuration was not packaged" }
           if (-not (Get-ChildItem -Path $extract -Recurse -Filter "borg_extension.h")) { throw "Native extension header was not packaged" }
           if (-not (Test-Path (Join-Path $extract "CHANGELOG.md"))) { throw "Changelog was not packaged" }
