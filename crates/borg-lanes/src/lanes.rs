@@ -2716,6 +2716,13 @@ mod tests {
                 .unwrap()
                 .contains("foreign client lease:")
         );
+        let visible = crate::services::ServiceManager::new(
+            dir.path().join("services"),
+            std::path::PathBuf::new(),
+        )
+        .read_status("test")
+        .unwrap();
+        assert!(visible.reason.contains("foreign client lease:"));
         // The requester's own lease must not delay the same job.
         let own = ClientLease {
             owner: holder(),
