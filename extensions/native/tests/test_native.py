@@ -11,6 +11,12 @@ pg = importlib.util.module_from_spec(pg_spec)
 pg_spec.loader.exec_module(pg)
 from unittest.mock import patch
 
+SERVICE_FILE = Path(__file__).resolve().parents[1] / 'services' / 'test_postgres.py'
+service_spec = importlib.util.spec_from_file_location('native_service_spec', SERVICE_FILE)
+assert service_spec is not None and service_spec.loader is not None
+service = importlib.util.module_from_spec(service_spec)
+service_spec.loader.exec_module(service)
+
 FILE = Path(__file__).resolve().parents[1] / 'native.py'
 spec = importlib.util.spec_from_file_location('native_toolchain', FILE)
 assert spec is not None and spec.loader is not None
@@ -39,6 +45,13 @@ class NativePlannerTest(unittest.TestCase):
             with patch.dict(native.os.environ, {'BORG_NATIVE_MAX_JOBS': '2'}):
                 with self.assertRaisesRegex(RuntimeError, 'insufficient available RAM'):
                     native.jobs(2 * native.GIB)
+
+    def test_postgres_service_binds_host_resource(self):
+        definition = service.spec(Path('/tmp/native-owned/data'), 55481)
+        self.assertEqual(definition['resources'], [
+            {'key': {'scope': 'Host', 'name': 'test-postgres'},
+             'access': {'Shared': {'slots': 1}}},
+        ])
 
     def test_output_cannot_escape_worktree(self):
         with tempfile.TemporaryDirectory() as tmp:
