@@ -304,14 +304,17 @@ def run_atomic(binary: Path, descendant: bool = False, post_barrier: bool = Fals
                 if status.get("backend_pid") is None:
                     raise RuntimeError(f"{service_id} never became healthy")
                 before[service_id] = status["backend_pid"]
-            command(binary, root, "lease", "bench-editor-a", "--owner", "bench-client",
+            # The happy-path client belongs to this exclusive's holder. A future
+            # foreign-client gate must deliberately use a different owner.
+            holder_id = str(uuid.uuid4())
+            command(binary, root, "lease", "bench-editor-a", "--owner", holder_id,
                     "--ttl-seconds", "10", "--purpose", "capture")
             marker = root / "exclusive.json"
             job_key = {"scope": {"Project": str(project / ".." / "project")}, "name": name} if project_alias else resource_key
             worker_ports = ports[:1] if project_alias or canonical_project else ports[:2]
             job_spec = {"fingerprint": "bench-D11-exclusive", "lease": {
                 "resources": [{"key": job_key, "access": "Exclusive"}],
-                "holder": {"participant_id": str(uuid.uuid4()), "session_id": str(uuid.uuid4()),
+                "holder": {"participant_id": holder_id, "session_id": str(uuid.uuid4()),
                            "host_pid": None, "purpose": "atomic editor handoff probe"},
                 "queue_timeout_ms": 10000},
                 "argv": [sys.executable, str(Path(__file__).resolve()), "--borg", str(binary),
