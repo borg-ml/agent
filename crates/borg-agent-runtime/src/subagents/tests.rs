@@ -6110,6 +6110,14 @@ async fn wait_agent_returns_on_a_child_report_and_on_waiting_input() {
     assert_eq!(result["messages"][0]["from"], "/root/worker");
     assert_eq!(result["messages"][0]["text"], "blocked on an API decision");
     assert_eq!(result["agents"][0]["status"], "running");
+    assert!(
+        coordinator
+            .unread_messages_for_session(root)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a report wait_agent returned is read"
+    );
 
     let (input, input_pending) = tokio::sync::watch::channel(false);
     let waiting = {
@@ -6227,5 +6235,110 @@ async fn only_the_interrupting_agent_resumes_an_interrupted_child() {
         Some(HostCommand::TeamPrompt { .. })
     ));
     assert!(received.try_recv().is_err());
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn team_messages_can_be_triaged_and_acknowledged_in_batches() {
+    let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
+    for text in ["first\nwith detail", "second", "third", "fourth"] {
+        coordinator
+            .send_message_as(worker, "/root", text)
+            .await
+            .unwrap();
+    }
+    let unread = |args: Value| {
+        let coordinator = coordinator.clone();
+        async move {
+            coordinator
+                .call_tool_as(root, "list_unread_team_messages", args)
+                .await
+                .unwrap()
+        }
+    };
+    let ack = |args: Value| {
+        let coordinator = coordinator.clone();
+        async move {
+            coordinator
+                .call_tool_as(root, "acknowledge_team_message", args)
+                .await
+                .unwrap()
+        }
+    };
+
+    let compact = unread(json!({"compact": true})).await;
+    let ids = compact
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|message| message["message_id"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 4);
+    assert_eq!(compact[0]["from"], "/root/worker");
+    assert_eq!(compact[0]["first_line"], "first…");
+    assert!(compact[0].get("text").is_none());
+
+    assert_eq!(ack(json!({"message_ids": [ids[0]]})).await["count"], 1);
+    assert_eq!(ack(json!({"up_to": ids[2]})).await["count"], 2);
+    let last = unread(json!({"ack": true})).await;
+    assert_eq!(last.as_array().unwrap().len(), 1);
+    assert_eq!(last[0]["message_id"], ids[3]);
+    assert_eq!(unread(json!({})).await, json!([]));
+    assert_eq!(ack(json!({"all": true})).await["count"], 0);
+    // The one-message form keeps working, including a repeat acknowledgement.
+    assert_eq!(
+        ack(json!({"message_id": ids[0]})).await["acknowledged"],
+        true
+    );
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn an_idle_child_does_not_end_waits_for_a_running_one() {
+    let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
+    {
+        let mut table = coordinator.table.lock().await;
+        let idle = table.reserve("audit", &launch()).unwrap();
+        let entry = table.entries.get_mut(&idle.session_id).unwrap();
+        entry.snapshot.status = SubagentStatus::Ready;
+        entry.snapshot.final_text = Some("audit finished earlier".to_string());
+    }
+    let wait = || {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move {
+            coordinator
+                .wait_for(root, Duration::from_secs(1800), WaitSignals::default())
+                .await
+                .unwrap()
+        })
+    };
+    // Shown once, because this parent has not seen it yet...
+    let first = wait().await.unwrap();
+    assert_eq!(first["changes"][0]["task_name"], "/root/audit");
+    // ...and then never again: the parent live-reported three identical
+    // immediate returns here before the fix.
+    let waiting = wait();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !waiting.is_finished(),
+        "an idle child must not end the wait"
+    );
+    child_event(
+        &coordinator,
+        worker,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Failed,
+            detail: Some("tests failed".to_string()),
+        },
+    )
+    .await;
+    let result = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("the running child's change ends the wait")
+        .unwrap();
+    let changes = result["changes"].as_array().unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0]["task_name"], "/root/worker");
+    assert_eq!(changes[0]["status"], "failed");
     scratch.discard().await;
 }

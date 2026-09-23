@@ -3354,72 +3354,108 @@ impl SubagentCoordinator {
         session_id: Uuid,
         message_id: Uuid,
     ) -> Result<()> {
+        self.acknowledge_messages_for_session(session_id, &[message_id])
+            .await
+    }
+
+    /// Acknowledge several team messages, reading the pending set once.
+    pub(crate) async fn acknowledge_messages_for_session(
+        &self,
+        session_id: Uuid,
+        message_ids: &[Uuid],
+    ) -> Result<()> {
         anyhow::ensure!(
             self.root_launch.capabilities.multiplayer,
             "team acknowledgements require multiplayer capability"
         );
+        if message_ids.is_empty() {
+            return Ok(());
+        }
         let binding = self
             .store
             .workspace_binding(session_id)
             .await?
             .context("team session has no workspace")?;
         let store = self.workspace_store().await?;
-        let mut addressed_workspace_id = None;
+        let mut pending_in = HashMap::new();
         for workspace in store
             .list_workspaces_for_participant(binding.participant_id)
             .await?
         {
-            if store
+            for (event, _) in store
                 .pending_message_events(workspace.id, binding.participant_id, 10_000)
                 .await?
-                .into_iter()
-                .any(|(event, _)| matches!(&event.kind, WorkspaceEventKind::Message { message, .. } if message.id == message_id))
             {
-                addressed_workspace_id = Some(workspace.id);
-                break;
+                if let WorkspaceEventKind::Message { message, .. } = &event.kind {
+                    pending_in.entry(message.id).or_insert(workspace.id);
+                }
             }
         }
-        // The session projection admits a team message as soon as the child
-        // journals it complete, so a worker acknowledging work it really did
-        // usually finds its delivery already out of the pending set. Resolve
-        // the addressed workspace from the delivery itself before deciding
-        // the message does not exist: acknowledging twice is ordinary, and
-        // reporting "not found" to a worker that followed instructions turns
-        // a settled message into a phantom.
-        let delivery = store
-            .message_deliveries(message_id)
-            .await?
-            .into_iter()
-            .find(|delivery| delivery.recipient_id == binding.participant_id);
-        let workspace_id = match (addressed_workspace_id, &delivery) {
-            (Some(workspace_id), _) => workspace_id,
-            (None, Some(delivery)) => delivery.workspace_id,
-            (None, None) => bail!("unread team message not found"),
-        };
-        // Walk only the edges the store allows. `Admitted` is skipped when the
-        // projection already recorded it, and an acknowledged delivery is left
-        // exactly as it is rather than being pushed backwards.
-        if delivery.is_none_or(|delivery| delivery.state == crate::DeliveryState::Pending) {
+        for &message_id in message_ids {
+            // The session projection admits a team message as soon as the
+            // child journals it complete, so a worker acknowledging work it
+            // really did usually finds its delivery already out of the pending
+            // set. Resolve the addressed workspace from the delivery itself
+            // before deciding the message does not exist: acknowledging twice
+            // is ordinary, and reporting "not found" to a worker that followed
+            // instructions turns a settled message into a phantom.
+            let delivery = store
+                .message_deliveries(message_id)
+                .await?
+                .into_iter()
+                .find(|delivery| delivery.recipient_id == binding.participant_id);
+            let workspace_id = match (pending_in.get(&message_id), &delivery) {
+                (Some(workspace_id), _) => *workspace_id,
+                (None, Some(delivery)) => delivery.workspace_id,
+                (None, None) => bail!("unread team message not found: {message_id}"),
+            };
+            // Walk only the edges the store allows. `Admitted` is skipped when
+            // the projection already recorded it, and an acknowledged delivery
+            // is left exactly as it is rather than being pushed backwards.
+            if delivery.is_none_or(|delivery| delivery.state == crate::DeliveryState::Pending) {
+                store
+                    .transition_message_delivery(
+                        workspace_id,
+                        message_id,
+                        binding.participant_id,
+                        crate::DeliveryState::Admitted,
+                        None,
+                    )
+                    .await?;
+            }
             store
                 .transition_message_delivery(
                     workspace_id,
                     message_id,
                     binding.participant_id,
-                    crate::DeliveryState::Admitted,
+                    crate::DeliveryState::Acknowledged,
                     None,
                 )
                 .await?;
         }
-        store
-            .transition_message_delivery(
-                workspace_id,
-                message_id,
-                binding.participant_id,
-                crate::DeliveryState::Acknowledged,
-                None,
-            )
-            .await?;
+        if self.is_root_session(session_id) {
+            // Read here, so the idle boundary must not hand them over again.
+            self.root_inbox
+                .lock()
+                .await
+                .retain(|message| !message_ids.contains(&message.message_id));
+        }
         Ok(())
+    }
+
+    /// Display name of a message sender: a child's task name, else the
+    /// participant's name.
+    async fn sender_label(&self, sender: Uuid) -> String {
+        if let Ok(task_name) = self.task_name_for_session(sender).await {
+            return task_name;
+        }
+        let participant = match self.workspace_store().await {
+            Ok(store) => store.participant(sender).await.ok().flatten(),
+            Err(_) => None,
+        };
+        participant
+            .map(|participant| participant.display_name)
+            .unwrap_or_else(|| sender.to_string())
     }
 
     /// Rebuild the coordinator projection from the durable parent event
@@ -5931,14 +5967,70 @@ impl SubagentCoordinator {
                     "relay_pending": relay_pending,
                 }))
             }
-            "list_unread_team_messages" => Ok(serde_json::to_value(
-                self.unread_messages_for_session(actor_session_id).await?,
-            )?),
+            "list_unread_team_messages" => {
+                let args: ListUnreadArgs = if arguments.is_null() {
+                    ListUnreadArgs::default()
+                } else {
+                    serde_json::from_value(arguments)?
+                };
+                let messages = self.unread_messages_for_session(actor_session_id).await?;
+                if args.ack {
+                    let ids = messages
+                        .iter()
+                        .map(|message| message.message_id)
+                        .collect::<Vec<_>>();
+                    self.acknowledge_messages_for_session(actor_session_id, &ids)
+                        .await?;
+                }
+                if !args.compact {
+                    return Ok(serde_json::to_value(messages)?);
+                }
+                let mut compact = Vec::with_capacity(messages.len());
+                for message in &messages {
+                    let mut lines = message.report_text.trim().lines();
+                    let first = lines.next().unwrap_or_default();
+                    let mut first_line = first.chars().take(200).collect::<String>();
+                    if lines.next().is_some() || first_line.len() < first.len() {
+                        first_line.push('…');
+                    }
+                    compact.push(json!({
+                        "message_id": message.message_id,
+                        "from": self.sender_label(message.sender_session_id).await,
+                        "first_line": first_line,
+                    }));
+                }
+                Ok(Value::Array(compact))
+            }
             "acknowledge_team_message" => {
-                let args: AcknowledgeMessageArgs = serde_json::from_value(arguments)?;
-                self.acknowledge_message_for_session(actor_session_id, args.message_id)
+                let args: AcknowledgeMessagesArgs = serde_json::from_value(arguments)?;
+                let mut ids = args.message_id.into_iter().collect::<Vec<_>>();
+                ids.extend(args.message_ids);
+                if args.all || args.up_to.is_some() {
+                    let unread = self.unread_messages_for_session(actor_session_id).await?;
+                    let take = match args.up_to {
+                        _ if args.all => unread.len(),
+                        Some(up_to) => {
+                            unread
+                                .iter()
+                                .position(|message| message.message_id == up_to)
+                                .with_context(|| {
+                                    format!("up_to {up_to} is not an unread message")
+                                })?
+                                + 1
+                        }
+                        None => 0,
+                    };
+                    ids.extend(unread.iter().take(take).map(|message| message.message_id));
+                }
+                ensure!(
+                    !ids.is_empty() || args.all,
+                    "name message_id, message_ids, up_to, or set all:true"
+                );
+                let mut seen = HashSet::new();
+                ids.retain(|id| seen.insert(*id));
+                self.acknowledge_messages_for_session(actor_session_id, &ids)
                     .await?;
-                Ok(json!({ "acknowledged": true }))
+                Ok(json!({ "acknowledged": true, "count": ids.len(), "message_ids": ids }))
             }
             "get_message_status" => {
                 let args: AcknowledgeMessageArgs = serde_json::from_value(arguments)?;
@@ -6205,13 +6297,21 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "list_unread_team_messages",
-            "List unread team messages for this participant.",
-            json!({"type":"object","properties":{},"additionalProperties":false}),
+            "List unread team messages for this participant, oldest first. compact:true returns only id, sender and first line for triage; ack:true acknowledges exactly the returned messages in the same call. Messages already shown by wait_agent are acknowledged and not listed again.",
+            json!({"type":"object","properties":{
+                "compact":{"type":"boolean","description":"Return message_id, from and first_line only."},
+                "ack":{"type":"boolean","description":"Acknowledge the returned messages."}
+            },"additionalProperties":false}),
         ),
         tool(
             "acknowledge_team_message",
-            "Acknowledge one unread team message.",
-            json!({"type":"object","properties":{"message_id":{"type":"string"}},"required":["message_id"],"additionalProperties":false}),
+            "Acknowledge unread team messages in one call: message_id, message_ids, up_to (every unread message through that id, oldest first), or all:true. Returns the acknowledged ids.",
+            json!({"type":"object","properties":{
+                "message_id":{"type":"string"},
+                "message_ids":{"type":"array","items":{"type":"string"}},
+                "up_to":{"type":"string","description":"Acknowledge every unread message up to and including this id."},
+                "all":{"type":"boolean","description":"Acknowledge every unread message."}
+            },"additionalProperties":false}),
         ),
         tool(
             "get_message_status",
@@ -7729,6 +7829,24 @@ struct BroadcastArgs {
 #[serde(deny_unknown_fields)]
 struct AcknowledgeMessageArgs {
     message_id: Uuid,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcknowledgeMessagesArgs {
+    message_id: Option<Uuid>,
+    #[serde(default)]
+    message_ids: Vec<Uuid>,
+    #[serde(default)]
+    all: bool,
+    up_to: Option<Uuid>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ListUnreadArgs {
+    ack: bool,
+    compact: bool,
 }
 
 #[derive(Deserialize)]
