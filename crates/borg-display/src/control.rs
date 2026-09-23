@@ -13,14 +13,19 @@ use smithay::backend::allocator::Fourcc;
 use smithay::backend::input::{Axis, AxisSource, ButtonState, KeyState};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::AsRenderElements;
-use smithay::backend::renderer::element::RenderElement;
+use smithay::backend::renderer::element::solid::SolidColorRenderElement;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
+use smithay::backend::renderer::element::{Id, Kind, RenderElement};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::{Bind, ExportMem, Offscreen};
 use smithay::desktop::Window;
+use smithay::desktop::space::SpaceRenderElements;
 use smithay::desktop::space::space_render_elements;
 use smithay::input::keyboard::{FilterResult, Keycode, xkb};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
+use smithay::input::pointer::{CursorImageStatus, CursorImageSurfaceData};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 use smithay::reexports::wayland_server::Resource;
@@ -28,7 +33,7 @@ use smithay::utils::{Point, Rectangle, SERIAL_COUNTER, Scale, Size, Transform};
 use smithay::wayland::compositor::with_states;
 use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 
-use crate::compositor::State;
+use crate::compositor::{Constraint, State};
 
 const MAX_REQUEST: usize = 256 * 1024;
 const KEY_LEFTSHIFT: u32 = 42;
@@ -157,6 +162,7 @@ fn handle_request(state: &mut State, request: &Value) -> Result<Value> {
             "hardware": state.renderer_info.hardware,
             "dmabuf": state.renderer_info.dmabuf,
             "pointer": {"x": state.pointer_location.x, "y": state.pointer_location.y},
+            "pointer_constraint": constraint_name(state.active_constraint()),
         })),
         "windows" => Ok(json!({"windows": windows(state)})),
         "focus" => {
@@ -182,7 +188,10 @@ fn handle_request(state: &mut State, request: &Value) -> Result<Value> {
                 let y = number(request, "y")?;
                 move_pointer(state, x, y)?;
             }
-            Ok(json!({"pointer": {"x": state.pointer_location.x, "y": state.pointer_location.y}}))
+            Ok(json!({
+                "pointer": {"x": state.pointer_location.x, "y": state.pointer_location.y},
+                "pointer_constraint": constraint_name(state.active_constraint()),
+            }))
         }
         "button" => {
             let code = request
@@ -232,7 +241,8 @@ fn handle_request(state: &mut State, request: &Value) -> Result<Value> {
                 Some(_) => Some(window_arg(state, request)?),
                 None => None,
             };
-            screenshot(state, window.as_ref(), path)
+            let cursor = request.get("cursor").and_then(Value::as_bool) == Some(true);
+            screenshot(state, window.as_ref(), path, cursor)
         }
         _ => bail!("unsupported op {op}"),
     }
@@ -279,6 +289,29 @@ fn windows(state: &State) -> Vec<Value> {
         .collect()
 }
 
+fn constraint_name(constraint: Option<Constraint>) -> Value {
+    match constraint {
+        Some(Constraint::Locked) => json!("locked"),
+        Some(Constraint::Confined) => json!("confined"),
+        None => Value::Null,
+    }
+}
+
+/// Whether the pointer may move to `location` under the active constraint:
+/// never while locked, and only within the same surface while confined.
+fn may_move_to(state: &State, location: Point<f64, smithay::utils::Logical>) -> bool {
+    match state.active_constraint() {
+        Some(Constraint::Locked) => false,
+        Some(Constraint::Confined) => {
+            let current = state.surface_under(state.pointer_location).map(|(s, _)| s);
+            current.is_some() && state.surface_under(location).map(|(s, _)| s) == current
+        }
+        None => true,
+    }
+}
+
+/// Absolute motion. A locked or confined pointer stays put, as it would
+/// under a desktop compositor.
 fn move_pointer(state: &mut State, x: f64, y: f64) -> Result<()> {
     let (width, height) = state.size;
     ensure!(
@@ -286,6 +319,9 @@ fn move_pointer(state: &mut State, x: f64, y: f64) -> Result<()> {
         "point ({x}, {y}) is outside the {width}x{height} private display"
     );
     let location = Point::from((x, y));
+    if !may_move_to(state, location) {
+        return Ok(());
+    }
     state.pointer_location = location;
     let under = state.surface_under(location);
     let Some(pointer) = state.seat.get_pointer() else {
@@ -298,35 +334,37 @@ fn move_pointer(state: &mut State, x: f64, y: f64) -> Result<()> {
     };
     pointer.motion(state, under, &event);
     pointer.frame(state);
+    state.maybe_activate_constraint();
     Ok(())
 }
 
-/// Relative motion for pointer-locked apps (games, editor viewports): moves
-/// the pointer and emits relative-pointer events.
+/// Relative motion for games and editor viewports: always emits
+/// relative-pointer events with the exact delta, and moves the pointer only
+/// when no lock (or confinement boundary) holds it.
 fn relative_motion(state: &mut State, dx: f64, dy: f64) {
     let (width, height) = state.size;
-    let location = Point::from((
+    let target = Point::from((
         (state.pointer_location.x + dx).clamp(0.0, width as f64 - 1.0),
         (state.pointer_location.y + dy).clamp(0.0, height as f64 - 1.0),
     ));
-    state.pointer_location = location;
-    let under = state.surface_under(location);
     let Some(pointer) = state.seat.get_pointer() else {
         return;
     };
-    let time = state.now_ms();
-    pointer.motion(
-        state,
-        under.clone(),
-        &MotionEvent {
-            location,
+    let moves = may_move_to(state, target);
+    if moves {
+        state.pointer_location = target;
+        let under = state.surface_under(target);
+        let event = MotionEvent {
+            location: target,
             serial: SERIAL_COUNTER.next_serial(),
-            time,
-        },
-    );
+            time: state.now_ms(),
+        };
+        pointer.motion(state, under, &event);
+    }
+    let focus = state.surface_under(state.pointer_location);
     pointer.relative_motion(
         state,
-        under,
+        focus,
         &RelativeMotionEvent {
             delta: (dx, dy).into(),
             delta_unaccel: (dx, dy).into(),
@@ -334,6 +372,9 @@ fn relative_motion(state: &mut State, dx: f64, dy: f64) {
         },
     );
     pointer.frame(state);
+    if moves {
+        state.maybe_activate_constraint();
+    }
 }
 
 fn button(state: &mut State, code: u32, pressed: bool) {
@@ -434,14 +475,9 @@ fn layout_characters() -> HashMap<char, (u32, bool)> {
 
 fn type_text(state: &mut State, text: &str) -> Result<()> {
     let characters = layout_characters();
-    let missing: String = text
-        .chars()
-        .filter(|ch| !characters.contains_key(ch))
-        .collect();
-    ensure!(
-        missing.is_empty(),
-        "the private keyboard layout cannot type {missing:?}; use set_value for these characters"
-    );
+    if text.chars().any(|ch| !characters.contains_key(&ch)) {
+        return type_with_temporary_keymap(state, text);
+    }
     for ch in text.chars() {
         let (code, shift) = characters[&ch];
         if shift {
@@ -456,20 +492,166 @@ fn type_text(state: &mut State, text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Keys per temporary keymap; keycodes 9..=255 leave room for 247.
+const TEMPORARY_KEYS: usize = 200;
+
+/// Type text the layout cannot produce the way wtype does: upload a keymap
+/// with one key per distinct character, press those keys, then restore the
+/// default layout. Clients apply keymap and key events in order.
+fn type_with_temporary_keymap(state: &mut State, text: &str) -> Result<()> {
+    let keyboard = state
+        .seat
+        .get_keyboard()
+        .context("the private seat has no keyboard")?;
+    let chars: Vec<char> = text.chars().collect();
+    let mut start = 0;
+    while start < chars.len() {
+        let mut keys: Vec<char> = Vec::new();
+        let mut end = start;
+        while end < chars.len() && (keys.contains(&chars[end]) || keys.len() < TEMPORARY_KEYS) {
+            if !keys.contains(&chars[end]) {
+                keys.push(chars[end]);
+            }
+            end += 1;
+        }
+        keyboard
+            .set_keymap_from_string(state, temporary_keymap(&keys)?)
+            .map_err(|error| anyhow::anyhow!("uploading a temporary keymap failed: {error:?}"))?;
+        for ch in &chars[start..end] {
+            // Keycode 9 + index is evdev code 1 + index.
+            let code = 1 + keys.iter().position(|key| key == ch).unwrap_or_default() as u32;
+            key(state, code, true);
+            key(state, code, false);
+        }
+        start = end;
+    }
+    keyboard
+        .set_xkb_config(state, smithay::input::keyboard::XkbConfig::default())
+        .map_err(|error| anyhow::anyhow!("restoring the keyboard layout failed: {error:?}"))?;
+    Ok(())
+}
+
+fn temporary_keymap(keys: &[char]) -> Result<String> {
+    let mut keycodes = String::new();
+    let mut symbols = String::new();
+    for (index, ch) in keys.iter().enumerate() {
+        let name = match ch {
+            '\n' => "Return".to_string(),
+            '\t' => "Tab".to_string(),
+            _ => {
+                let sym = xkb::utf32_to_keysym(*ch as u32);
+                ensure!(sym.raw() != 0, "no keysym can type {ch:?}");
+                xkb::keysym_get_name(sym)
+            }
+        };
+        keycodes.push_str(&format!("<K{index}> = {};", index + 9));
+        symbols.push_str(&format!("key <K{index}> {{ [ {name} ] }};"));
+    }
+    Ok(format!(
+        "xkb_keymap {{ xkb_keycodes \"borg\" {{ minimum = 8; maximum = 255; {keycodes} }}; \
+         xkb_types \"borg\" {{ include \"complete\" }}; \
+         xkb_compatibility \"borg\" {{ include \"complete\" }}; \
+         xkb_symbols \"borg\" {{ {symbols} }}; }};\n"
+    ))
+}
+
+smithay::backend::renderer::element::render_elements! {
+    ShotElement<=GlesRenderer>;
+    Space=SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+    Surface=WaylandSurfaceRenderElement<GlesRenderer>,
+    Solid=SolidColorRenderElement,
+}
+
+/// The pointer as the capture would show it: the client's cursor surface at
+/// its hotspot, a crosshair when the client set none, nothing when hidden.
+fn cursor_elements(
+    state: &mut State,
+    origin: Point<i32, smithay::utils::Logical>,
+) -> (Vec<ShotElement>, Value) {
+    let at = state.pointer_location.to_i32_round::<i32>() - origin;
+    let description = json!({"x": at.x, "y": at.y});
+    match state.cursor.clone() {
+        CursorImageStatus::Hidden => (Vec::new(), json!({"drawn": "hidden", "at": description})),
+        CursorImageStatus::Surface(surface) => {
+            let hotspot = with_states(&surface, |states| {
+                states
+                    .data_map
+                    .get::<CursorImageSurfaceData>()
+                    .map(|data| data.lock().unwrap().hotspot)
+                    .unwrap_or_default()
+            });
+            let location = at - hotspot;
+            let elements = render_elements_from_surface_tree(
+                &mut state.renderer,
+                &surface,
+                (location.x, location.y),
+                1.0,
+                1.0,
+                Kind::Cursor,
+            );
+            (
+                elements.into_iter().map(ShotElement::Surface).collect(),
+                json!({"drawn": "client cursor", "at": description}),
+            )
+        }
+        CursorImageStatus::Named(_) => {
+            // White crosshair over black, front to back, centred on the hot pixel.
+            let bars = [
+                ((at.x - 6, at.y), (13, 1), [1.0, 1.0, 1.0, 1.0]),
+                ((at.x, at.y - 6), (1, 13), [1.0, 1.0, 1.0, 1.0]),
+                ((at.x - 7, at.y - 1), (15, 3), [0.0, 0.0, 0.0, 1.0]),
+                ((at.x - 1, at.y - 7), (3, 15), [0.0, 0.0, 0.0, 1.0]),
+            ];
+            let elements = bars
+                .into_iter()
+                .map(|(loc, size, color)| {
+                    ShotElement::Solid(SolidColorRenderElement::new(
+                        Id::new(),
+                        Rectangle::new(loc.into(), size.into()),
+                        CommitCounter::default(),
+                        color,
+                        Kind::Cursor,
+                    ))
+                })
+                .collect();
+            (elements, json!({"drawn": "crosshair", "at": description}))
+        }
+    }
+}
+
 /// Render the whole display, or one window's visible geometry, offscreen on
-/// the display's GPU and write it as a PNG.
-fn screenshot(state: &mut State, window: Option<&Window>, path: &str) -> Result<Value> {
-    let (size, bytes) = match window {
+/// the display's GPU and write it as a PNG, optionally with the pointer.
+fn screenshot(
+    state: &mut State,
+    window: Option<&Window>,
+    path: &str,
+    cursor: bool,
+) -> Result<Value> {
+    let origin = match window {
+        None => Point::from((0, 0)),
+        Some(window) => state
+            .space
+            .element_geometry(window)
+            .map(|geometry| geometry.loc)
+            .unwrap_or_default(),
+    };
+    let (mut elements, cursor_report) = if cursor {
+        let (elements, report) = cursor_elements(state, origin);
+        (elements, Some(report))
+    } else {
+        (Vec::new(), None)
+    };
+    let size = match window {
         None => {
-            let elements = space_render_elements::<_, Window, _>(
+            let scene = space_render_elements::<_, Window, _>(
                 &mut state.renderer,
                 [&state.space],
                 &state.output,
                 1.0,
             )
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-            let size = Size::from(state.size);
-            (size, render(&mut state.renderer, size, &elements)?)
+            elements.extend(scene.into_iter().map(ShotElement::Space));
+            Size::from(state.size)
         }
         Some(window) => {
             let geometry = window.geometry();
@@ -477,16 +659,17 @@ fn screenshot(state: &mut State, window: Option<&Window>, path: &str) -> Result<
                 geometry.size.w > 0 && geometry.size.h > 0,
                 "window has not drawn anything yet"
             );
-            let elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = window.render_elements(
+            let scene: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = window.render_elements(
                 &mut state.renderer,
                 Point::from((-geometry.loc.x, -geometry.loc.y)),
                 Scale::from(1.0),
                 1.0,
             );
-            let size = Size::from((geometry.size.w, geometry.size.h));
-            (size, render(&mut state.renderer, size, &elements)?)
+            elements.extend(scene.into_iter().map(ShotElement::Surface));
+            Size::from((geometry.size.w, geometry.size.h))
         }
     };
+    let bytes = render(&mut state.renderer, size, &elements)?;
     let file = std::fs::File::create(path).with_context(|| format!("creating {path}"))?;
     let mut encoder =
         png::Encoder::new(std::io::BufWriter::new(file), size.w as u32, size.h as u32);
@@ -496,7 +679,11 @@ fn screenshot(state: &mut State, window: Option<&Window>, path: &str) -> Result<
         .write_header()
         .and_then(|mut writer| writer.write_image_data(&bytes))
         .context("encoding PNG")?;
-    Ok(json!({"path": path, "width": size.w, "height": size.h}))
+    let mut result = json!({"path": path, "width": size.w, "height": size.h});
+    if let Some(report) = cursor_report {
+        result["cursor"] = report;
+    }
+    Ok(result)
 }
 
 fn render<E: RenderElement<GlesRenderer>>(

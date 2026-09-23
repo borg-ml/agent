@@ -1338,8 +1338,9 @@ class BorgDisplay:
     def type_text(self, text):
         self.call({"op": "type", "text": text})
 
-    def screenshot(self, path, window=None):
-        return self.call({"op": "screenshot", "path": path, **({"window": window} if window is not None else {})})
+    def screenshot(self, path, window=None, cursor=False):
+        return self.call({"op": "screenshot", "path": path, "cursor": cursor,
+                          **({"window": window} if window is not None else {})})
 
     def stop(self):
         for closeable in (self.reader, self.socket):
@@ -1606,7 +1607,8 @@ def private_screenshot(args):
     if window_id is not None and not is_private(window_id):
         raise ValueError("window capture on the private display needs a pd: window_id")
     path = os.path.join(backend.directory, f"shot-{uuid.uuid4().hex[:8]}.png")
-    shot = backend.screenshot(path, private_window(window_id)["id"] if window_id else None)
+    shot = backend.screenshot(path, private_window(window_id)["id"] if window_id else None,
+                              cursor=args.get("cursor") is True)
     try:
         with open(path, "rb") as image:
             data = image.read()
@@ -1621,6 +1623,8 @@ def private_screenshot(args):
               "borg_attachments": [{"media_type": "image/png", "data_base64": base64.b64encode(data).decode()}]}
     if window_id:
         result["window_id"] = window_id
+    if "cursor" in shot:
+        result["cursor"] = shot["cursor"]
     return result
 
 
@@ -1699,6 +1703,11 @@ def private_inject(args):
             backend.pointer_move(px, py)
             PRIVATE_POINTER["window"] = info["id"]
             extra["placement"] = {"x": px, "y": py}
+            # Games lock the pointer only once it enters them; motion sent
+            # before the lock reaches no relative-pointer object and is lost.
+            deadline = time.monotonic() + 0.3
+            while time.monotonic() < deadline and backend.info().get("pointer_constraint") is None:
+                time.sleep(0.02)
         codes = [EVDEV_CODES[name] for name in held[0]] + [EVDEV_CODES[held[1]]] if held else []
         for code in codes:
             backend.key(code, True)
@@ -1709,7 +1718,8 @@ def private_inject(args):
         finally:
             for code in reversed(codes):
                 backend.key(code, False)
-        extra.update({"relative": {"dx": dx, "dy": dy}, "steps": steps, "hold_keys": args.get("hold_keys")})
+        extra.update({"relative": {"dx": dx, "dy": dy}, "steps": steps, "hold_keys": args.get("hold_keys"),
+                      "pointer_constraint": backend.info().get("pointer_constraint")})
     elif op in ("pointer_click", "scroll"):
         (x, y), coordinate = private_point(args, info, accessible)
         backend.focus(info["id"])
@@ -1774,9 +1784,11 @@ def private_capabilities():
                   "Private apps share the user's session D-Bus and accessibility bus; single-instance apps that are "
                   "already running on the desktop (browsers, some terminals) may open their window there instead, so "
                   "launch a separate instance or profile.",
-                  "type_text covers the characters of the default keyboard layout; use set_value for others.",
+                  "type_text types any Unicode text; characters outside the default layout go through a temporary keymap.",
+                  "Games and editor viewports can lock or confine the pointer (pointer-constraints); pointer_move dx/dy "
+                  "then arrive as exact relative motion while the pointer stays put.",
                   "GTK4 reports element extents as 0,0; prefer semantic click/set_value or x,y from a private screenshot.",
-                  "Screenshots contain no cursor. X11 apps need launch x11=true and xwayland-satellite.",
+                  "Screenshots include the pointer only with cursor=true. X11 apps need launch x11=true and xwayland-satellite.",
                   "Detached apps are not killed at teardown but lose their display when it stops.",
               ]}
     if not binary:
