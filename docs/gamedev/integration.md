@@ -145,6 +145,18 @@ Normalize or reject noncanonical Project/Worktree paths at **every** lane,
 service and capacity entrypoint before key equality; rebuild and prove the
 path-alias regression and ordinary canonical path on the combined CLI. No
 integration/merge approval while this fail-open exists.
+I independently repeated the alias probe against a newly rebuilt combined
+budget CLI, SHA256
+`32f8f7b24c1d250fb498ca8ee9793abc939606eb625e99c6fe80367a92767657`
+(mtime 03:58:27+01, hash unchanged before/after): job
+`bb635ee1-596d-4940-a497-449aac6f6a2a` started and exited 1 after
+the in-job check observed a Healthy service, backend port 37519, an active
+client and no yield. A private copy of the WIP probe was stable at SHA256
+`b1be6d2531ac0204209f2f06ce9cf4ae8487e3e439d5f8c693d965e3c902a136`.
+Owned test units stopped; isolated state `/tmp/borg-service-bench-k0tsa09m`
+retained, worker output under `jobs/<job-id>/output.log` and command log
+`/tmp/gd-project-alias-negative.log`. The budget rebuild does not fix alias
+identity; do not attribute this negative to the older stale executable.
 
 **D11 scoped evidence (2026-09-23):** a stale worktree executable
 that predated delegated backend cgroups let a detached child survive yield
