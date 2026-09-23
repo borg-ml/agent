@@ -15,6 +15,8 @@ prevent_sleep = true
 # terminal alert sound after finishing a turn. Valid values: off, unfocused, always.
 completion_notifications = "unfocused"
 completion_sound = "unfocused"
+# Automatically copy selected transcript/composer text when releasing the mouse.
+auto_copy_selection = true
 
 [presentation]
 # Interface labels only; independent of the model response language selected
