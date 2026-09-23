@@ -14,6 +14,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.path not in ("/", "/health"):
             self.send_error(404)
             return
+        marker = os.environ.get("BENCH_HEALTH_FAIL_FILE")
+        if self.path == "/health" and marker and Path(marker).exists():
+            self.send_error(503, "fake backend health disabled")
+            return
         body = ("ok\n" if self.path == "/health" else f"pid={os.getpid()}\n").encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
