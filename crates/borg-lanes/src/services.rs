@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::lanes::{
-    Access, AdmissionBudget, Holder, Hook, LaneStore, Lease, LeaseRequest, ResourceRequest,
+    Access, AdmissionBudget, Holder, Hook, LaneStore, Lease, LeaseRequest, ResourceKey,
+    ResourceRequest, TicketState,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -35,6 +36,10 @@ pub struct HealthCheck {
     pub kind: HealthKind,
     pub interval_ms: u64,
     pub timeout_ms: u64,
+    /// Time from the first failed live-backend probe before declaring a hang.
+    /// Absent in older specs: retain the historical three-probe-timeout policy.
+    #[serde(default)]
+    pub unhealthy_after_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -46,11 +51,25 @@ pub enum HealthKind {
     McpInitialize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartMode {
+    #[default]
+    Warm,
+    Cold,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RestartPolicy {
     pub max_restarts: u32,
     pub backoff_ms: u64,
     pub debounce_ms: u64,
+    #[serde(default)]
+    pub mode: RestartMode,
+    #[serde(default)]
+    pub defer_while: Vec<ResourceKey>,
+    #[serde(default)]
+    pub transient_exit_codes: Vec<i32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -77,6 +96,8 @@ pub struct ServiceSpec {
     pub env: Vec<(String, String)>,
     pub resources: Vec<ResourceRequest>,
     pub memory_max_bytes: Option<u64>,
+    #[serde(default)]
+    pub memory_swap_max_bytes: Option<u64>,
     pub admission: AdmissionBudget,
     pub health: HealthCheck,
     pub restart: RestartPolicy,
@@ -311,6 +332,21 @@ fn valid_spec(spec: &ServiceSpec) -> Result<()> {
     for resource in &spec.resources {
         resource.key.validate_canonical()?;
     }
+    for key in &spec.restart.defer_while {
+        key.validate_canonical()?;
+        ensure!(!key.name.trim().is_empty(), "empty restart deferral key");
+    }
+    ensure!(
+        spec.restart
+            .transient_exit_codes
+            .iter()
+            .all(|code| (0..=255).contains(code)),
+        "transient exit codes must be in 0..=255"
+    );
+    ensure!(
+        spec.health.unhealthy_after_ms != Some(0),
+        "unhealthy_after_ms must be positive"
+    );
     if let ClientMode::Shared { max_clients } = spec.client_mode {
         ensure!(
             max_clients > 0,
@@ -515,6 +551,9 @@ impl ServiceManager {
             command.arg(format!("--setenv=BORG_SERVICE_UNIT={unit}.service"));
             if let Some(bytes) = spec.memory_max_bytes {
                 command.args(["-p", &format!("MemoryMax={bytes}")]);
+            }
+            if let Some(bytes) = spec.memory_swap_max_bytes {
+                command.args(["-p", &format!("MemorySwapMax={bytes}")]);
             }
             let lane_root = self.root.parent().context("invalid root")?.display();
             command.arg(format!("--setenv=BORG_LANE_DIR={lane_root}"));
@@ -1265,6 +1304,20 @@ impl ServiceGate {
             .and_then(|r| r.wait_reason.clone())
             .unwrap_or_else(|| "waiting for lane resource admission".into()))
     }
+    fn restart_deferred(&self, spec: &ServiceSpec) -> Result<bool> {
+        if spec.restart.defer_while.is_empty() {
+            return Ok(false);
+        }
+        Ok(self.store.snapshot()?.iter().any(|record| {
+            matches!(&record.state, TicketState::Granted(_))
+                && record.ticket.id != self.lease.as_ref().map(|l| l.ticket.id).unwrap_or_default()
+                && record
+                    .request
+                    .resources
+                    .iter()
+                    .any(|request| spec.restart.defer_while.contains(&request.key))
+        }))
+    }
     fn release(&mut self) -> Result<()> {
         if let Some(lease) = &self.lease {
             self.store.release_lease(lease)?;
@@ -1469,7 +1522,11 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             .await?;
             break;
         }
-        if status.yields.is_empty() && active.is_none() && candidate.is_none() && now >= next_launch
+        if status.yields.is_empty()
+            && active.is_none()
+            && candidate.is_none()
+            && now >= next_launch
+            && !gate.restart_deferred(&spec)?
         {
             if !gate.acquire()? {
                 let reason = gate.denial_reason()?;
@@ -1530,13 +1587,24 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             }
         }
         if let Some(b) = candidate.as_mut() {
-            let gone = b.child.try_wait()?.is_some();
+            let exit = b.child.try_wait()?;
+            let gone = exit.is_some();
             let overdue = now.saturating_sub(b.started_ms) >= spec.readiness_timeout_ms;
             if gone || overdue {
                 stop_child(&mut b.child, &spec, b.port, b.scope.as_deref()).await?;
                 candidate = None;
-                failures += 1;
-                next_launch = now + backoff(&spec, failures);
+                let transient = exit
+                    .and_then(|status| status.code())
+                    .is_some_and(|code| spec.restart.transient_exit_codes.contains(&code));
+                if !transient {
+                    failures += 1;
+                }
+                next_launch = now
+                    + if transient {
+                        spec.restart.backoff_ms.max(50)
+                    } else {
+                        backoff(&spec, failures)
+                    };
                 status.restarts += 1;
                 if failures > spec.restart.max_restarts {
                     transition(
@@ -1596,7 +1664,10 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             }
         }
         if let Some(b) = active.as_mut() {
-            if b.child.try_wait()?.is_some() {
+            if let Some(exit) = b.child.try_wait()? {
+                let transient = exit
+                    .code()
+                    .is_some_and(|code| spec.restart.transient_exit_codes.contains(&code));
                 let mut dead = active.take().expect("active present");
                 transition(
                     &dir,
@@ -1615,8 +1686,15 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                 stop_child(&mut dead.child, &spec, dead.port, dead.scope.as_deref()).await?;
                 status.backend_pid = None;
                 status.restarts += 1;
-                failures += 1;
-                next_launch = now + backoff(&spec, failures);
+                if !transient {
+                    failures += 1;
+                }
+                next_launch = now
+                    + if transient {
+                        spec.restart.backoff_ms.max(50)
+                    } else {
+                        backoff(&spec, failures)
+                    };
                 if let Err(error) =
                     restore_clients(&spec, &mut status, &dir, &gate, dead.port).await
                 {
@@ -1642,7 +1720,12 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                     b.unhealthy_since_ms = None;
                 } else {
                     let since = *b.unhealthy_since_ms.get_or_insert(now);
-                    if now.saturating_sub(since) >= spec.health.timeout_ms.saturating_mul(3) {
+                    if now.saturating_sub(since)
+                        >= spec
+                            .health
+                            .unhealthy_after_ms
+                            .unwrap_or_else(|| spec.health.timeout_ms.saturating_mul(3))
+                    {
                         transition(
                             &dir,
                             &mut status,
@@ -1670,7 +1753,27 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             && status.clients.is_empty()
             && now.saturating_sub(*requested) >= spec.restart.debounce_ms
             && now >= next_launch
+            && !gate.restart_deferred(&spec)?
         {
+            if spec.restart.mode == RestartMode::Cold {
+                transition(
+                    &dir,
+                    &mut status,
+                    &front,
+                    ServiceState::Restarting,
+                    reason.clone(),
+                    None,
+                )
+                .await?;
+                let mut old = active.take().expect("active backend for cold restart");
+                stop_child(&mut old.child, &spec, old.port, old.scope.as_deref()).await?;
+                status.backend_pid = None;
+                status.restarts += 1;
+                publish(&dir, &status)?;
+                // The next loop acquires a fresh backend only after stop_child
+                // has verified that the old cgroup is empty.
+                continue;
+            }
             let port = next_port_after(&spec, last_port);
             last_port = port;
             match spawn_backend(&spec, port, &log, &scopes) {
@@ -2113,7 +2216,7 @@ impl ServiceCoordinator for ServiceManager {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::lanes::{Access, ResourceKey, ResourceScope};
+    use crate::lanes::{Access, LaneCoordinator, ResourceKey, ResourceScope};
     use std::{net::TcpListener as StdTcpListener, os::unix::fs::PermissionsExt};
 
     const FAKE_HTTP: &str = r#"
@@ -2195,6 +2298,7 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
                 access: Access::Exclusive,
             }],
             memory_max_bytes: None,
+            memory_swap_max_bytes: None,
             admission: AdmissionBudget {
                 min_available_ram_bytes: 0,
                 reserve_ram_bytes: 0,
@@ -2207,11 +2311,15 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
                 kind: HealthKind::Http,
                 interval_ms: 50,
                 timeout_ms: 100,
+                unhealthy_after_ms: None,
             },
             restart: RestartPolicy {
                 max_restarts: 4,
                 backoff_ms: 50,
                 debounce_ms: 200,
+                mode: RestartMode::Warm,
+                defer_while: vec![],
+                transient_exit_codes: vec![],
             },
             endpoint: Some(Endpoint {
                 listen: format!("127.0.0.1:{front}"),
@@ -2434,6 +2542,197 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
             start.elapsed()
         );
         cleanup(&manager, task).await;
+    }
+
+    #[tokio::test]
+    async fn cold_restart_stops_old_backend_before_replacement_launch() {
+        let (root, manager, _front, task) = setup_with(|spec| {
+            spec.restart.mode = RestartMode::Cold;
+            spec.restart.debounce_ms = 50;
+            let launches = spec.cwd.join("launches");
+            let marker = spec.cwd.join("stopped-with-launches");
+            spec.graceful_stop = Some(Hook {
+                argv: vec!["python3".into(), "-c".into(),
+                    "import pathlib,sys,time; pathlib.Path(sys.argv[2]).write_text(str(len(pathlib.Path(sys.argv[1]).read_text().splitlines()))); time.sleep(.2)".into(),
+                    launches.display().to_string(), marker.display().to_string()],
+                timeout_ms: 1_000,
+            });
+        }).await;
+        let initial = manager.read_status("fake").unwrap().backend_pid;
+        manager
+            .send(
+                "fake",
+                ServiceRequest::Restart {
+                    reason: "cold".into(),
+                    force: false,
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        state(&manager, |s| {
+            matches!(s.state, ServiceState::Healthy { .. }) && s.backend_pid != initial
+        })
+        .await;
+        assert_eq!(
+            fs::read_to_string(root.path().join("stopped-with-launches")).unwrap(),
+            "1",
+            "the old editor must exit before its replacement is launched"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("launches"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+        cleanup(&manager, task).await;
+    }
+
+    #[tokio::test]
+    async fn unhealthy_after_is_independent_of_probe_timeout() {
+        let (root, manager, _front, task) = setup_with(|spec| {
+            spec.health.timeout_ms = 75;
+            spec.health.unhealthy_after_ms = Some(1_500);
+        })
+        .await;
+        let original = manager.read_status("fake").unwrap().backend_pid;
+        fs::write(root.path().join("hang"), "1").unwrap();
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        assert_eq!(manager.read_status("fake").unwrap().backend_pid, original);
+        fs::remove_file(root.path().join("hang")).unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(manager.read_status("fake").unwrap().backend_pid, original);
+        cleanup(&manager, task).await;
+    }
+
+    #[tokio::test]
+    async fn restart_waits_while_selected_key_is_granted() {
+        let key = ResourceKey {
+            scope: ResourceScope::Host,
+            name: format!("build-{}", Uuid::new_v4()),
+        };
+        let (root, manager, _front, task) = setup_with(|spec| {
+            spec.restart.defer_while.push(key.clone());
+            spec.restart.debounce_ms = 50;
+        })
+        .await;
+        let original = manager.read_status("fake").unwrap().backend_pid;
+        let store = LaneStore::new(root.path()).unwrap();
+        let ticket = store
+            .enqueue_lease(LeaseRequest {
+                resources: vec![ResourceRequest {
+                    key,
+                    access: Access::Exclusive,
+                }],
+                holder: owner(),
+                queue_timeout_ms: Some(2_000),
+            })
+            .unwrap();
+        let lease = store.wait(&ticket).await.unwrap();
+        manager
+            .send(
+                "fake",
+                ServiceRequest::Restart {
+                    reason: "build completed".into(),
+                    force: false,
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(manager.read_status("fake").unwrap().backend_pid, original);
+        assert_eq!(
+            fs::read_to_string(root.path().join("launches"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        store.release_lease(&lease).unwrap();
+        state(&manager, |s| {
+            matches!(s.state, ServiceState::Healthy { .. }) && s.backend_pid != original
+        })
+        .await;
+        cleanup(&manager, task).await;
+    }
+
+    #[tokio::test]
+    async fn transient_candidate_exits_do_not_exhaust_restart_limit() {
+        let (root, manager, _front, task) = setup_with(|spec| {
+            spec.restart.max_restarts = 0;
+            spec.restart.transient_exit_codes = vec![75];
+            spec.restart.backoff_ms = 50;
+            spec.argv[3] = FAKE_HTTP.replace(
+                "class Handler",
+                "if len(open(record).readlines()) < 4: sys.exit(75)\nclass Handler",
+            );
+        })
+        .await;
+        assert_eq!(
+            fs::read_to_string(root.path().join("launches"))
+                .unwrap()
+                .lines()
+                .count(),
+            4
+        );
+        assert_eq!(manager.read_status("fake").unwrap().restarts, 3);
+        cleanup(&manager, task).await;
+    }
+
+    #[tokio::test]
+    async fn transient_healthy_exits_also_relaunch_without_exhausting_limit() {
+        let (_root, manager, front, task) = setup_with(|spec| {
+            spec.restart.max_restarts = 0;
+            spec.restart.transient_exit_codes = vec![75];
+            spec.argv[3] = FAKE_HTTP.replace("os._exit(11)", "os._exit(75)");
+        })
+        .await;
+        for _ in 0..3 {
+            let prior = manager.read_status("fake").unwrap().backend_pid;
+            let _ = get(front, "/crash").await;
+            state(&manager, |s| {
+                matches!(s.state, ServiceState::Healthy { .. }) && s.backend_pid != prior
+            })
+            .await;
+        }
+        assert_eq!(manager.read_status("fake").unwrap().restarts, 3);
+        cleanup(&manager, task).await;
+    }
+
+    #[test]
+    fn service_parity_options_default_and_validate() {
+        let root = tempfile::tempdir().unwrap();
+        let original = spec(root.path());
+        let mut value = serde_json::to_value(&original).unwrap();
+        let spec_obj = value.as_object_mut().unwrap();
+        spec_obj.remove("memory_swap_max_bytes");
+        spec_obj["health"]
+            .as_object_mut()
+            .unwrap()
+            .remove("unhealthy_after_ms");
+        for field in ["mode", "defer_while", "transient_exit_codes"] {
+            spec_obj["restart"].as_object_mut().unwrap().remove(field);
+        }
+        let parsed: ServiceSpec = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.restart.mode, RestartMode::Warm);
+        assert!(parsed.restart.defer_while.is_empty());
+        assert!(parsed.restart.transient_exit_codes.is_empty());
+        assert_eq!(parsed.memory_swap_max_bytes, None);
+        assert_eq!(parsed.health.unhealthy_after_ms, None);
+        let mut swap = original.clone();
+        swap.memory_swap_max_bytes = Some(2_u64 << 30);
+        let encoded = serde_json::to_value(&swap).unwrap();
+        assert_eq!(encoded["memory_swap_max_bytes"], 2_u64 << 30);
+        let round_trip: ServiceSpec = serde_json::from_value(encoded).unwrap();
+        assert_eq!(round_trip.memory_swap_max_bytes, swap.memory_swap_max_bytes);
+        let mut invalid = original;
+        invalid.health.unhealthy_after_ms = Some(0);
+        assert!(valid_spec(&invalid).is_err());
+        invalid.health.unhealthy_after_ms = None;
+        invalid.restart.transient_exit_codes = vec![-1];
+        assert!(valid_spec(&invalid).is_err());
     }
 
     async fn budget_contenders(disk_budget: bool) {
