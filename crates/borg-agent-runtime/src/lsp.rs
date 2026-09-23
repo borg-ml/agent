@@ -4,6 +4,9 @@ use std::process::Stdio;
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+
+#[cfg(unix)]
+mod broker;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
@@ -44,6 +47,10 @@ const COMPILATION_DATABASE_SCAN_BUDGET: Duration = Duration::from_secs(2);
 pub struct LspService {
     root: PathBuf,
     path_policy: LspPathPolicy,
+    #[cfg(unix)]
+    broker_id: uuid::Uuid,
+    #[cfg(unix)]
+    broker_local: bool,
     clients: std::sync::Arc<Mutex<HashMap<LspClientKey, LspClientSlot>>>,
     reaped: std::sync::Arc<Mutex<Vec<ReapRecord>>>,
     /// Keys this service has leased.
@@ -56,7 +63,7 @@ pub struct LspService {
     leased: std::sync::Arc<Mutex<std::collections::BTreeSet<LspClientKey>>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LspPathPolicy {
     /// Local trusted sessions already have the host's normal filesystem
     /// access, so LSP should not impose a narrower artificial boundary.
@@ -157,7 +164,8 @@ struct LspClient {
     published_diagnostics: HashMap<String, Value>,
 }
 
-/// One language server per (server, workspace root). The map lock is held
+/// One language server per (server, canonical workspace root, access scope).
+/// The map lock is held
 /// only to find or create the slot; the slot's own lock serialises traffic
 /// to that server, so a slow rust-analyzer start or request never blocks a
 /// hover against gopls in the same session. The first caller to lock the
@@ -235,7 +243,9 @@ impl ReapRecord {
     }
 }
 
-/// One client pool for the process.
+/// One client pool for the process. On Unix the first process to bind the
+/// per-user LSP broker owns this pool; other Borg processes forward calls to
+/// it. If the owner exits, the next caller binds a replacement broker.
 ///
 /// A language server is identified by the workspace it indexes, so two
 /// sessions looking at the same workspace want the same server. Before this,
@@ -304,13 +314,46 @@ impl LspService {
         Self {
             root: root.into(),
             path_policy,
+            #[cfg(unix)]
+            broker_id: uuid::Uuid::new_v4(),
+            #[cfg(unix)]
+            broker_local: cfg!(test),
             clients: std::sync::Arc::clone(&pool.clients),
             reaped: std::sync::Arc::clone(&pool.reaped),
             leased: std::sync::Arc::new(Mutex::new(std::collections::BTreeSet::new())),
         }
     }
 
+    #[cfg(unix)]
+    async fn shared_request(&self, operation: broker::Operation) -> Result<Option<Value>> {
+        if self.broker_local {
+            return Ok(None);
+        }
+        broker::request(broker::Request {
+            id: self.broker_id,
+            root: self.root.clone(),
+            policy: self.path_policy.clone(),
+            operation,
+        })
+        .await
+        .map(Some)
+    }
+
     pub async fn status(&self) -> Value {
+        #[cfg(unix)]
+        if !self.broker_local {
+            return match self.shared_request(broker::Operation::Status).await {
+                Ok(Some(status)) => status,
+                Ok(None) => unreachable!("shared requests are enabled"),
+                Err(error) => json!({ "root": self.root, "broker_error": format!("{error:#}"),
+                    "active_servers": [], "active_workspaces": [],
+                    "supported_servers": supported_server_status() }),
+            };
+        }
+        self.status_local().await
+    }
+
+    async fn status_local(&self) -> Value {
         let slots = self.active_clients().await;
         let mut active = Vec::new();
         let mut active_workspaces = Vec::new();
@@ -370,6 +413,19 @@ impl LspService {
     }
 
     pub async fn diagnostics(&self, path: &Path) -> Result<Value> {
+        #[cfg(unix)]
+        if let Some(value) = self
+            .shared_request(broker::Operation::Diagnostics {
+                path: path.to_path_buf(),
+            })
+            .await?
+        {
+            return Ok(value);
+        }
+        self.diagnostics_local(path).await
+    }
+
+    async fn diagnostics_local(&self, path: &Path) -> Result<Value> {
         let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
         let shared = self.lease_client(spec, &workspace_root).await;
         let mut slot = shared.lock().await;
@@ -471,16 +527,49 @@ impl LspService {
     }
 
     pub async fn hover(&self, path: &Path, line: u32, character: u32) -> Result<Value> {
+        #[cfg(unix)]
+        if let Some(value) = self
+            .shared_request(broker::Operation::Hover {
+                path: path.to_path_buf(),
+                line,
+                character,
+            })
+            .await?
+        {
+            return Ok(value);
+        }
         self.position_request(path, "textDocument/hover", line, character, json!({}))
             .await
     }
 
     pub async fn definition(&self, path: &Path, line: u32, character: u32) -> Result<Value> {
+        #[cfg(unix)]
+        if let Some(value) = self
+            .shared_request(broker::Operation::Definition {
+                path: path.to_path_buf(),
+                line,
+                character,
+            })
+            .await?
+        {
+            return Ok(value);
+        }
         self.position_request(path, "textDocument/definition", line, character, json!({}))
             .await
     }
 
     pub async fn references(&self, path: &Path, line: u32, character: u32) -> Result<Value> {
+        #[cfg(unix)]
+        if let Some(value) = self
+            .shared_request(broker::Operation::References {
+                path: path.to_path_buf(),
+                line,
+                character,
+            })
+            .await?
+        {
+            return Ok(value);
+        }
         self.position_request(
             path,
             "textDocument/references",
@@ -492,11 +581,33 @@ impl LspService {
     }
 
     pub async fn document_symbols(&self, path: &Path) -> Result<Value> {
+        #[cfg(unix)]
+        if let Some(value) = self
+            .shared_request(broker::Operation::DocumentSymbols {
+                path: path.to_path_buf(),
+            })
+            .await?
+        {
+            return Ok(value);
+        }
         self.document_request(path, "textDocument/documentSymbol", json!({}))
             .await
     }
 
     pub async fn workspace_symbols(&self, query: &str) -> Result<Value> {
+        #[cfg(unix)]
+        if let Some(value) = self
+            .shared_request(broker::Operation::WorkspaceSymbols {
+                query: query.to_owned(),
+            })
+            .await?
+        {
+            return Ok(value);
+        }
+        self.workspace_symbols_local(query).await
+    }
+
+    async fn workspace_symbols_local(&self, query: &str) -> Result<Value> {
         let clients = self.active_clients().await;
         if clients.is_empty() {
             return Err(self.no_active_server_error().await);
@@ -523,6 +634,19 @@ impl LspService {
     /// server workspace. An optional source path can bootstrap the matching
     /// language server when this service has not been used yet.
     pub async fn workspace_diagnostics(&self, path: Option<&Path>) -> Result<Value> {
+        #[cfg(unix)]
+        if let Some(value) = self
+            .shared_request(broker::Operation::WorkspaceDiagnostics {
+                path: path.map(Path::to_path_buf),
+            })
+            .await?
+        {
+            return Ok(value);
+        }
+        self.workspace_diagnostics_local(path).await
+    }
+
+    async fn workspace_diagnostics_local(&self, path: Option<&Path>) -> Result<Value> {
         if let Some(path) = path {
             let (path, uri, spec, workspace_root) = self.resolve_document(path).await?;
             let shared = self.lease_client(spec, &workspace_root).await;
