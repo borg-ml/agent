@@ -113,7 +113,11 @@ separate action-summary narration item.";
 /// contract changes in a way that stale native context could preserve.
 pub(crate) const PROVIDER_CONTEXT_CONTRACT_VERSION: u32 = 1;
 const MAX_IDLE_CLAUDE_POOLS: usize = host_claude_pool::MAX_IDLE_POOLS;
-const CLAUDE_POOL_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+/// Claude Code writes a subscriber's prompt cache with a one-hour lifetime.
+/// An idle process released sooner discards a warm cache: the next turn
+/// replays the journal as one new message and rewrites the whole history.
+/// Memory stays bounded by the idle cap, not by this lifetime.
+const CLAUDE_POOL_IDLE_TTL: Duration = Duration::from_secs(60 * 60);
 const CLAUDE_POOL_REAP_INTERVAL: Duration = Duration::from_secs(3);
 
 /// A Claude turn built as a delta assumes the pooled process still holds the
