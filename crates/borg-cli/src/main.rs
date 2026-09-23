@@ -40,6 +40,13 @@ use crate::cli::{
 use crate::remote_commands::{print_local_workspaces, run_local_agent, run_remote_command};
 
 fn main() -> Result<()> {
+    // The Linux computer-use worker is a synchronous JSONL loop that Borg
+    // re-executes itself as; it needs no async runtime.
+    #[cfg(target_os = "linux")]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__computer-use-helper"))
+    {
+        return borg_remote::run_linux_helper();
+    }
     configure_allocator();
     spawn_allocator_trim();
     tokio::runtime::Builder::new_multi_thread()

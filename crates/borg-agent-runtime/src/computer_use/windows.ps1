@@ -1,5 +1,5 @@
 # Borg-owned Windows UI Automation worker. JSONL on stdin/stdout; diagnostics on stderr.
-# Same contract as linux.py / macos.swift: element handles live only for this process;
+# Same contract as the Linux worker (computer_use/linux.rs) / macos.swift: element handles live only for this process;
 # every effect consumes the observation it was issued against. Windows PowerShell 5.1+.
 Set-StrictMode -Version 2
 $ErrorActionPreference = 'Stop'

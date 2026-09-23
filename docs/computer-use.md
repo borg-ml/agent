@@ -12,8 +12,8 @@ Access or approval. Normal confirmation rules still apply to consequential
 application actions; approval to run code is not blanket permission to purchase,
 send, delete, or change security settings.
 
-Linux requires the desktop session bus, Python 3, PyGObject and AT-SPI2.
-Input injection additionally requires python-evdev, a writable `/dev/uinput`
+Linux requires the desktop session bus and AT-SPI2; the worker is Borg itself
+(`borg __computer-use-helper`). Input injection additionally requires a writable `/dev/uinput`
 (the `input` group or a udev rule) and `wtype` on Wayland or `xdotool` on X11.
 
 - `list_windows`: window IDs are scoped to the helper lifetime. On Linux the
@@ -93,7 +93,7 @@ window the human had before Borg started moving focus.
   does niri for floating windows (`tile_pos_in_workspace_view`), which is used
   first and needs no capture. niri exposes no scroll position for tiled windows,
   so the fallback locates the window by matching textured strips of a fresh
-  window capture in a desktop capture (python-numpy + python-pillow). It
+  window capture in a desktop capture. It
   requires the same position over 300 ms (focus changes animate the view),
   refuses ties such as two identical-looking windows, and re-checks the
   position right before pressing a button, aborting if the window moved.
@@ -152,12 +152,12 @@ and the human's focused window, pointer and input devices unchanged.
 
 ### Linux input backend (implemented, test-only verification)
 
-`computer_use/linux.py` injects through a Borg-owned evdev uinput device
+`computer_use/linux/input.rs` injects through a Borg-owned evdev uinput device
 ("Borg virtual input": keys, mouse buttons, wheel and an absolute pointer axis)
 created lazily on the first injection and owned by the helper process; Unicode
 `type_text` goes through `wtype` on Wayland or `xdotool type` on X11 (no
 `ydotool` daemon). `capabilities` lists the five injection ops only when
-python-evdev, a writable `/dev/uinput` and the typing tool are present, and
+a writable `/dev/uinput` and the typing tool are present, and
 otherwise names what is missing. Pointer coordinates are desktop screenshot
 pixels: the helper maps them onto the absolute axis using the size of the last
 `scope: "desktop"` screenshot (probed once with `grim`/`xdotool` when none was

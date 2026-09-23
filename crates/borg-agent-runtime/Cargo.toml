@@ -50,3 +50,12 @@ zstd.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+atspi = { version = "0.30", default-features = false, features = ["proxies"] }
+evdev = "0.13"
+memchr = "2"
+# Blocking proxies keep the worker a plain synchronous request loop.
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+unicode-properties = { version = "0.1.4", default-features = false, features = ["general-category"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "pnm"] }

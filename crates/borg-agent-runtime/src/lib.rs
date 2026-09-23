@@ -10,6 +10,8 @@ mod autonomy;
 pub mod autonomy_postgres;
 mod blu_workflow;
 mod computer_use;
+#[cfg(target_os = "linux")]
+pub use computer_use::run_linux_helper;
 mod contract;
 mod execution;
 mod extension_api;
