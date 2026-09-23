@@ -1,0 +1,52 @@
+manifest_version = 1
+id = "native"
+name = "Native toolchain lanes"
+version = "0.1.0"
+description = "Cargo and CMake/ctest jobs backed by Borg's engine-neutral lanes."
+enabled = true
+runtime_access = "trusted"
+borg_version = ">=0.9.5"
+skill_roots = ["skills"]
+
+[workflows.cargo_test]
+description = "Run Borg runtime tests in the native Cargo lane."
+entrypoint = "workflows/cargo_test.blu"
+
+[workflows.cmake_configure]
+description = "Configure this CMake worktree in its private build directory."
+entrypoint = "workflows/cmake_configure.blu"
+
+[workflows.cmake_build]
+description = "Build this CMake worktree with RAM-aware parallelism."
+entrypoint = "workflows/cmake_build.blu"
+
+[workflows.ctest_fast]
+description = "Run non-slow ctest cases through the native test lane."
+entrypoint = "workflows/ctest_fast.blu"
+
+[workflows.ctest_all]
+description = "Run all ctest cases through the native test lane."
+entrypoint = "workflows/ctest_all.blu"
+
+[api]
+version = 1
+
+[api.commands.cargo-test]
+workflow = "cargo_test"
+description = "Run Borg runtime tests through the Cargo lane"
+
+[api.commands.cmake-configure]
+workflow = "cmake_configure"
+description = "Configure the private CMake build directory"
+
+[api.commands.cmake-build]
+workflow = "cmake_build"
+description = "Build the private CMake build directory"
+
+[api.commands.ctest-fast]
+workflow = "ctest_fast"
+description = "Run non-slow ctest cases"
+
+[api.commands.ctest-all]
+workflow = "ctest_all"
+description = "Run the full ctest suite"
