@@ -379,7 +379,9 @@ impl LaneStore {
                 let reason = if reason.is_some() {
                     reason
                 } else {
-                    budget_reason(state, budget)?
+                    budget_reason(state, budget).unwrap_or_else(|error| {
+                        Some(format!("budget inspection unavailable: {error:#}"))
+                    })
                 };
                 if let Some(reason) = reason {
                     state.records[index].wait_reason = Some(reason.clone());
@@ -392,7 +394,8 @@ impl LaneStore {
             let lock = stable_file(&self.ticket_path(ticket.id))?;
             lock.lock()?;
             held = Some(lock);
-            let reason = dispatch_reason(state, ticket.id)?.or(budget_reason(state, budget)?);
+            let reason = dispatch_reason(state, ticket.id)?.or(budget_reason(state, budget)
+                .unwrap_or_else(|error| Some(format!("budget inspection unavailable: {error:#}"))));
             let entry = state
                 .records
                 .iter_mut()
@@ -415,6 +418,23 @@ impl LaneStore {
                 .insert(lease.ticket.id, held.context("service FD missing")?);
         }
         Ok(lease)
+    }
+
+    /// Latest nonblocking refusal for a named service; a rejected attempt has
+    /// no FIFO position but the supervisor can report its actual wait reason.
+    pub fn service_admission_reason(&self, service_id: &str) -> Result<Option<String>> {
+        self.reading(|state| {
+            Ok(state
+                .records
+                .iter()
+                .filter(|r| {
+                    r.service_lease
+                        && r.request.holder.purpose == format!("service:{service_id}")
+                        && matches!(r.state, TicketState::Cancelled { .. })
+                })
+                .max_by_key(|r| r.ticket.sequence)
+                .and_then(|r| r.wait_reason.clone()))
+        })
     }
 
     /// Reject a stale token before dropping the owner FD. Expired/restarted
@@ -923,18 +943,19 @@ fn mem_available() -> Option<u64> {
         .map(|kb| kb * 1024)
 }
 
-fn same_filesystem(left: &Path, right: &Path) -> bool {
+fn same_filesystem(left: &Path, right: &Path) -> Result<bool> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        match (fs::metadata(left), fs::metadata(right)) {
-            (Ok(a), Ok(b)) => a.dev() == b.dev(),
-            _ => left == right,
-        }
+        let a = fs::metadata(left)
+            .with_context(|| format!("inspect reserved disk {}", left.display()))?;
+        let b = fs::metadata(right)
+            .with_context(|| format!("inspect requested disk {}", right.display()))?;
+        Ok(a.dev() == b.dev())
     }
     #[cfg(not(unix))]
     {
-        left == right
+        Ok(left == right)
     }
 }
 
@@ -961,9 +982,15 @@ fn budget_reason(state: &Journal, budget: &AdmissionBudget) -> Result<Option<Str
                 .map(|s| &s.admission)
                 .or(r.service_admission.as_ref())
         })
-        .filter(|other| same_filesystem(&other.disk_path, &budget.disk_path))
-        .map(|other| other.reserve_disk_bytes)
-        .fold(0_u64, u64::saturating_add);
+        .try_fold(0_u64, |used, other| {
+            Ok::<u64, anyhow::Error>(used.saturating_add(
+                if same_filesystem(&other.disk_path, &budget.disk_path)? {
+                    other.reserve_disk_bytes
+                } else {
+                    0
+                },
+            ))
+        })?;
     match crate::workspace::assess_budget(budget, reserved_ram, reserved_disk) {
         Ok(admission) => Ok((!admission.admitted).then_some(admission.reason)),
         Err(error) => Ok(Some(format!("budget inspection unavailable: {error:#}"))),
@@ -1031,7 +1058,9 @@ impl LaneStore {
                     .find(|r| r.ticket.id == id)
                     .and_then(|r| r.spec.as_ref())
                 {
-                    Some(spec) => budget_reason(state, &spec.admission)?,
+                    Some(spec) => budget_reason(state, &spec.admission).unwrap_or_else(|error| {
+                        Some(format!("budget inspection unavailable: {error:#}"))
+                    }),
                     None => None,
                 }
             };
@@ -2036,6 +2065,58 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+    #[test]
+    fn missing_reserved_disk_path_cannot_bypass_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let active = dir.path().join("active");
+        fs::create_dir(&active).unwrap();
+        let other = dir.path().join("other");
+        fs::create_dir(&other).unwrap();
+        let store = LaneStore::new(dir.path().join("lanes")).unwrap();
+        let budget = AdmissionBudget {
+            reserve_disk_bytes: 1,
+            ..test_budget(&active)
+        };
+        let lease = store
+            .try_acquire_service(
+                LeaseRequest {
+                    resources: vec![resource("service", Access::Shared { slots: 1 })],
+                    holder: service_holder(),
+                    queue_timeout_ms: None,
+                },
+                &budget,
+            )
+            .unwrap()
+            .unwrap();
+        fs::remove_dir(&active).unwrap();
+        let error = store
+            .reading(|state| budget_reason(state, &test_budget(&other)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("reserved disk"), "{error}");
+        assert!(
+            store
+                .try_acquire_service(
+                    LeaseRequest {
+                        resources: vec![resource("unrelated", Access::Shared { slots: 1 })],
+                        holder: Holder {
+                            purpose: "service:unrelated".into(),
+                            ..holder()
+                        },
+                        queue_timeout_ms: None,
+                    },
+                    &test_budget(&other)
+                )
+                .unwrap()
+                .is_none()
+        );
+        let reason = store
+            .service_admission_reason("unrelated")
+            .unwrap()
+            .unwrap();
+        assert!(reason.contains("budget inspection unavailable"), "{reason}");
+        store.release_lease(&lease).unwrap();
     }
     #[test]
     fn service_lease_yields_before_exclusive_grant_and_blocks_restart() {
