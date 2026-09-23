@@ -4820,7 +4820,7 @@ async fn a_sub_agent_cannot_use_its_parents_lane_or_service_identity() {
     let error = child
         .call(
             "lane_service",
-            json!({"op": "restart", "id": "editor", "owner": root.to_string()}),
+            json!({"op": "lease", "id": "editor", "owner": root.to_string()}),
         )
         .await
         .unwrap_err();
@@ -5074,7 +5074,7 @@ async fn lane_service_leases_belong_to_the_calling_session_live() {
     let refused = b
         .call(
             "lane_service",
-            Value::Object(service(json!({"op": "restart"}))),
+            Value::Object(service(json!({"op": "read", "path": "/"}))),
         )
         .await
         .unwrap_err();

@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail, ensure};
 use borg_lanes::adapter::JobTemplate;
 use borg_lanes::lanes::{
-    Access, Holder, JobHandle, JobSpec, JobState, LaneRecord, LaneStore, ResourceKey, TicketState,
+    Access, Holder, JobHandle, JobSpec, JobState, LaneRecord, LaneStore, TicketState,
 };
 use borg_lanes::services::{ServiceManager, ServiceRequest, ServiceSpec, ServiceStatus};
 use serde::Deserialize;
@@ -93,9 +93,22 @@ impl Default for LaneTools {
             templates,
             std::env::var_os("BORG_LANE_EXECUTABLE")
                 .map(PathBuf::from)
-                .or_else(|| std::env::current_exe().ok()),
+                .or_else(|| std::env::current_exe().ok().and_then(installed_executable)),
         )
     }
+}
+
+/// After an in-place upgrade Linux reports the running executable with a
+/// ` (deleted)` suffix; the lane CLI is the replacement at the original path.
+fn installed_executable(current: PathBuf) -> Option<PathBuf> {
+    if current.is_file() {
+        return Some(current);
+    }
+    current
+        .to_str()
+        .and_then(|path| path.strip_suffix(" (deleted)"))
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
 }
 
 /// What the dispatcher must do after a submit asked for a watcher.
@@ -144,7 +157,6 @@ enum ServiceOp {
     Status,
     Lease,
     Release,
-    Restart,
     Read,
 }
 
@@ -155,7 +167,6 @@ struct ServiceArgs {
     id: String,
     purpose: Option<String>,
     ttl_seconds: Option<u64>,
-    reason: Option<String>,
     path: Option<String>,
 }
 
@@ -290,8 +301,8 @@ impl LaneTools {
                 let template = self.template(&adapter, &name)?;
                 let mut spec = template.spec;
                 spec.lease.holder = caller.holder(&format!("{adapter}/{name}"));
-                self.admit_exclusive(&spec.lease.resources)?;
-                let job = tokio::task::spawn_blocking(move || store.enqueue_job(spec)).await??;
+                refuse_exclusive(&spec.lease.resources)?;
+                let job = store.job_status(self.submit(&spec).await?)?;
                 if let Ok(mut submitted) = self.submitted.lock() {
                     submitted.insert((caller.session_id, job.id));
                 }
@@ -339,41 +350,41 @@ impl LaneTools {
         }
     }
 
-    /// An exclusive request pre-yields every service bound to its keys, and
-    /// a snapshot of their leases cannot be made atomic with lease grants
-    /// from here. Until lanes offers an owner-aware preemption check under
-    /// its own gate, a model may not take a key any service is bound to.
-    fn admit_exclusive(&self, resources: &[borg_lanes::lanes::ResourceRequest]) -> Result<()> {
-        let exclusive: Vec<&ResourceKey> = resources
-            .iter()
-            .filter(|request| matches!(request.access, Access::Exclusive))
-            .map(|request| &request.key)
-            .collect();
-        if exclusive.is_empty() {
-            return Ok(());
-        }
-        let Ok(entries) = std::fs::read_dir(self.root.join("services")) else {
-            return Ok(());
-        };
-        for entry in entries.flatten() {
-            let Ok(spec) = std::fs::read(entry.path().join("spec.json"))
-                .map_err(anyhow::Error::from)
-                .and_then(|bytes| Ok(serde_json::from_slice::<ServiceSpec>(&bytes)?))
-            else {
-                continue;
-            };
-            if spec
-                .resources
-                .iter()
-                .any(|request| exclusive.contains(&&request.key))
-            {
-                bail!(
-                    "this template takes a resource that service {} is bound to exclusively, which would stop it; exclusive jobs over services run from the CLI (`borg lane job submit`) for now",
-                    spec.id
-                );
-            }
-        }
-        Ok(())
+    /// Submit through the public CLI, so the supervisor is spawned by the
+    /// lane CLI exactly as for a human, whatever binary hosts this session.
+    async fn submit(&self, spec: &JobSpec) -> Result<Uuid> {
+        use tokio::io::AsyncWriteExt;
+        let executable = self
+            .executable
+            .clone()
+            .context("the borg executable is unavailable to submit lane jobs")?;
+        let mut child = tokio::process::Command::new(executable)
+            .args(["lane", "--state-dir"])
+            .arg(&self.root)
+            .args(["--json", "job", "submit", "--spec", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("failed to run `borg lane job submit`")?;
+        let mut stdin = child.stdin.take().context("lane submit has no stdin")?;
+        stdin.write_all(&serde_json::to_vec(spec)?).await?;
+        drop(stdin);
+        let output = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
+            .await
+            .context("`borg lane job submit` did not answer within 60 s")??;
+        ensure!(
+            output.status.success(),
+            "lane submit failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let submitted: Value =
+            serde_json::from_slice(&output.stdout).context("lane submit printed no job")?;
+        submitted["job_id"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .context("lane submit printed no job id")
     }
 
     fn wait_command(&self, id: Uuid) -> Result<(PathBuf, Vec<String>)> {
@@ -486,27 +497,6 @@ impl LaneTools {
                     .await?;
                 Ok(service_value(&status, caller))
             }
-            ServiceOp::Restart => {
-                ensure!(
-                    own_lease.is_some(),
-                    "restart needs a lease on {id} held by your session; lease it first"
-                );
-                let reason = args
-                    .reason
-                    .unwrap_or_else(|| "requested by its lease holder".into());
-                ensure!(reason.len() <= 200, "reason is limited to 200 bytes");
-                let status = manager
-                    .send(
-                        &id,
-                        ServiceRequest::Restart {
-                            reason,
-                            force: false,
-                        },
-                        timeout,
-                    )
-                    .await?;
-                Ok(service_value(&status, caller))
-            }
             ServiceOp::Read => {
                 ensure!(
                     own_lease.is_some(),
@@ -524,6 +514,20 @@ impl LaneTools {
             }
         }
     }
+}
+
+/// An exclusive request pre-yields services bound to its keys, and nothing
+/// here can check that atomically with other sessions' lease grants. Until
+/// lanes offers an owner-aware preemption check under its own gate, model
+/// sessions never submit exclusive jobs.
+fn refuse_exclusive(resources: &[borg_lanes::lanes::ResourceRequest]) -> Result<()> {
+    ensure!(
+        !resources
+            .iter()
+            .any(|request| matches!(request.access, Access::Exclusive)),
+        "this template takes an exclusive resource, which may stop a service another session is using; a human runs it with `borg lane job submit --spec <trusted JSON>`"
+    );
+    Ok(())
 }
 
 fn ticket_state_name(state: &TicketState) -> &'static str {
@@ -606,11 +610,15 @@ async fn read_service(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let body = response.bytes().await?;
-    ensure!(
-        body.len() <= MAX_READ_BYTES,
-        "service response exceeds {MAX_READ_BYTES} bytes"
-    );
+    let mut response = response;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            body.len() + chunk.len() <= MAX_READ_BYTES,
+            "service response exceeds {MAX_READ_BYTES} bytes"
+        );
+        body.extend_from_slice(&chunk);
+    }
     let mut value = json!({"status": code, "content_type": content_type});
     if matches!(content_type.as_str(), "image/png" | "image/jpeg") {
         use base64::Engine;
@@ -686,7 +694,7 @@ fn shell_quote(value: &str) -> String {
 pub(crate) fn lane_job_spec() -> (&'static str, &'static str, Value) {
     (
         "lane_job",
-        "Host-local build/run/test jobs through Borg lanes (FIFO admission, RAM/disk budgets, exclusive project resources). submit {adapter, template, watch?} runs a job from a template a human registered for this host (~/.config/borg/lane-templates); you never supply commands, paths or resources. It returns job_id at once; pass watch=true to be notified on exit (then await_watchers only when nothing else is actionable) or call wait {job_id, timeout_seconds?} for a bounded blocking wait. status {job_id}, list (your jobs) and cancel {job_id} (jobs you submitted). Jobs run as your own session. Exclusive jobs over a resource a service is bound to (for example an editor) run only from the CLI for now. Requires Full Access or approval, which is the real boundary: templates are a convenience a same-user shell could edit.",
+        "Host-local build/run/test jobs through Borg lanes (FIFO admission, RAM/disk budgets, exclusive project resources). submit {adapter, template, watch?} runs a job from a template a human registered for this host (~/.config/borg/lane-templates); you never supply commands, paths or resources. It returns job_id at once; pass watch=true to be notified on exit (then await_watchers only when nothing else is actionable) or call wait {job_id, timeout_seconds?} for a bounded blocking wait. status {job_id}, list (your jobs) and cancel {job_id} (jobs you submitted). Jobs run as your own session. Exclusive jobs (they may stop a service such as an editor) are for humans: `borg lane job submit --spec <trusted JSON>`. Requires Full Access or approval, which is the real boundary: templates are a convenience a same-user shell could edit.",
         json!({
             "type": "object",
             "properties": {
@@ -706,15 +714,14 @@ pub(crate) fn lane_job_spec() -> (&'static str, &'static str, Value) {
 pub(crate) fn lane_service_spec() -> (&'static str, &'static str, Value) {
     (
         "lane_service",
-        "Supervised host services started by a human or adapter (for example an editor MCP backend). status {id}; lease {id, purpose?, ttl_seconds?} takes a client lease as your own session (one owner at a time); release {id} gives yours back; restart {id, reason?} and read {id, path} (a capture-class GET of one of the service's audited read-only paths) need your lease. Start, stop, yield, resume and forced restarts are for humans through `borg lane service`. Requires Full Access or approval.",
+        "Supervised host services started by a human or adapter (for example an editor MCP backend). status {id}; lease {id, purpose?, ttl_seconds?} takes a client lease as your own session (one owner at a time); release {id} gives yours back; read {id, path} (a capture-class GET of one of the service's audited read-only paths) needs your lease. Start, stop, restart, yield and resume are for humans through `borg lane service`. Requires Full Access or approval.",
         json!({
             "type": "object",
             "properties": {
-                "op": {"type": "string", "enum": ["status", "lease", "release", "restart", "read"]},
+                "op": {"type": "string", "enum": ["status", "lease", "release", "read"]},
                 "id": {"type": "string", "maxLength": 64},
                 "purpose": {"type": "string", "maxLength": 200},
                 "ttl_seconds": {"type": "integer", "minimum": 1, "maximum": MAX_LEASE_SECONDS},
-                "reason": {"type": "string", "maxLength": 200},
                 "path": {"type": "string", "maxLength": 512}
             },
             "required": ["op", "id"],
@@ -728,7 +735,7 @@ pub(crate) mod tests {
     use super::*;
     use borg_lanes::adapter::JobKind;
     use borg_lanes::lanes::{
-        AdmissionBudget, JobFingerprint, LeaseRequest, ResourceRequest, ResourceScope,
+        AdmissionBudget, JobFingerprint, LeaseRequest, ResourceKey, ResourceRequest, ResourceScope,
     };
     use borg_lanes::services::{ClientLease, ServiceState};
 
@@ -877,7 +884,7 @@ pub(crate) mod tests {
         for arguments in [
             json!({"op": "lease", "id": "editor", "owner": someone_else}),
             json!({"op": "release", "id": "editor", "lease_id": someone_else}),
-            json!({"op": "restart", "id": "editor", "force": true}),
+            json!({"op": "read", "id": "editor", "path": "/capture", "force": true}),
             json!({"op": "status", "id": "editor", "session_id": someone_else}),
         ] {
             let error = fixture
@@ -962,10 +969,9 @@ pub(crate) mod tests {
     /// Failure mode: a model preempting a service (an editor another session
     /// may lease at any moment) with an exclusive job.
     #[tokio::test]
-    async fn exclusive_templates_over_a_bound_service_are_cli_only() {
+    async fn exclusive_templates_are_for_humans() {
         let fixture = fixture();
         register(&fixture, "run", spec(&fixture.project, Access::Exclusive));
-        bind_service(&fixture, None);
         let error = fixture
             .tools
             .job(
@@ -975,7 +981,10 @@ pub(crate) mod tests {
             .await
             .err()
             .unwrap();
-        assert!(error.to_string().contains("run from the CLI"), "{error}");
+        assert!(
+            error.to_string().contains("borg lane job submit --spec"),
+            "{error}"
+        );
     }
 
     /// Failure mode: one session acting with another's service lease
@@ -988,10 +997,7 @@ pub(crate) mod tests {
         bind_service(&fixture, Some(&holder));
         let other = caller(2);
         for (arguments, refusal) in [
-            (
-                json!({"op": "restart", "id": "editor"}),
-                "restart needs a lease",
-            ),
+            (json!({"op": "restart", "id": "editor"}), "unknown variant"),
             (
                 json!({"op": "read", "id": "editor", "path": "/capture"}),
                 "read needs a lease",
@@ -1038,6 +1044,40 @@ pub(crate) mod tests {
                 "{path}: {error}"
             );
         }
+    }
+
+    /// Failure mode: a service (or whatever answers on its endpoint) filling
+    /// the session's memory through a capture read.
+    #[tokio::test]
+    async fn capture_reads_are_bounded() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let fixture = fixture();
+        write_test_service(&fixture.tools.root, &fixture.project, Some(&caller(1)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let size = MAX_READ_BYTES + 1;
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n\r\n");
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(&vec![b'x'; size]).await;
+        });
+        let mut status = fixture.tools.services().read_status("editor").unwrap();
+        status.endpoint = Some(borg_lanes::services::Endpoint {
+            listen: address.to_string(),
+            backend_ports: [1, 2],
+        });
+        let error = read_service(
+            &fixture.tools.root.join("services"),
+            "editor",
+            &status,
+            "/capture",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds"), "{error}");
     }
 
     /// Failure mode: reading another session's job log path, waiting on it or
