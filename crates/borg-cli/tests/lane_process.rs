@@ -67,6 +67,64 @@ fn shared_slots_overlap_and_exclusive_waits_for_them() {
 }
 
 #[test]
+fn busy_tree_build_does_not_block_other_tree_on_shared_host_slots() {
+    let lane = Lane::new();
+    let tree_a = lane.root.join("tree-a");
+    let tree_b = lane.root.join("tree-b");
+    std::fs::create_dir(&tree_a).unwrap();
+    std::fs::create_dir(&tree_b).unwrap();
+    let out = lane.cli(
+        &[
+            "resource",
+            "set-capacity",
+            "--name",
+            "build-slots",
+            "--slots",
+            "2",
+        ],
+        None,
+    );
+    assert!(out.status.success(), "{}", describe(&out));
+    let with_slot = |name: &str, script: &str, tree: &std::path::Path| {
+        let mut spec = lane.spec_in(name, script, ResourceScope::Worktree(tree.to_path_buf()));
+        spec.lease.resources.push(ResourceRequest {
+            key: ResourceKey {
+                scope: ResourceScope::Host,
+                name: "build-slots".into(),
+            },
+            access: Access::Shared { slots: 1 },
+        });
+        spec.timeout_ms = 60_000;
+        spec
+    };
+    let held = lane.submit(&with_slot("busy-a", "exec sleep 30", &tree_a));
+    lane.until(|| matches!(lane.record(&held)?.job?.state, JobState::Running { .. }).then_some(()));
+    let a_marker = lane.root.join("a-finished");
+    let queued = lane.submit(&with_slot(
+        "queued-a",
+        &format!("echo a > '{}'", a_marker.display()),
+        &tree_a,
+    ));
+    lane.until(|| lane.record(&queued)?.wait_reason);
+    let b_marker = lane.root.join("b-finished");
+    let independent = lane.submit(&with_slot(
+        "independent-b",
+        &format!("echo b > '{}'", b_marker.display()),
+        &tree_b,
+    ));
+    lane.until(|| b_marker.exists().then_some(()));
+    lane.wait(&independent, 0);
+    assert!(
+        !a_marker.exists(),
+        "queued same-tree build overtook its busy tree"
+    );
+    let _: Value = lane.json(&["job", "cancel", &held]);
+    lane.wait(&held, CANCELLED);
+    lane.wait(&queued, 0);
+    assert!(a_marker.exists());
+}
+
+#[test]
 fn project_and_worktree_path_aliases_never_enter_the_journal() {
     let lane = Lane::new();
     let project = lane.root.join("project");
@@ -632,6 +690,31 @@ fn terminal_hooks_receive_exit_state_reason_for_finish_queue_timeout_and_cancel(
         lines(&marker)
             .iter()
             .any(|line| line.starts_with(&format!("{first}|7|finished|")))
+            .then_some(())
+    });
+
+    let mut timed_workload = lane.spec("running-timeout-hook", "exec sleep 30");
+    timed_workload.timeout_ms = 300;
+    timed_workload.post_hook = Some(hook.clone());
+    let timeout_id = lane.submit(&timed_workload);
+    lane.wait(&timeout_id, 124);
+    lane.until(|| {
+        lines(&marker)
+            .iter()
+            .any(|line| line.contains(&format!("{timeout_id}|124|finished|timeout")))
+            .then_some(())
+    });
+
+    let mut stalled_workload = lane.spec("running-stall-hook", "exec sleep 30");
+    stalled_workload.timeout_ms = 60_000;
+    stalled_workload.stall_timeout_ms = Some(300);
+    stalled_workload.post_hook = Some(hook.clone());
+    let stalled_id = lane.submit(&stalled_workload);
+    lane.wait(&stalled_id, CANCELLED);
+    lane.until(|| {
+        lines(&marker)
+            .iter()
+            .any(|line| line.contains(&format!("{stalled_id}|125|finished|stall:")))
             .then_some(())
     });
 

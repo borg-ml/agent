@@ -1670,6 +1670,17 @@ fn cgroup_cpu_at(path: &Path) -> Option<f64> {
         })
 }
 
+// Compare with the last *meaningful* CPU sample, not the previous 100 ms
+// tick: low-rate but continuous compiler descendants must still prevent stall.
+fn cpu_advanced(cpu: f64, checkpoint: &mut f64) -> bool {
+    if cpu > *checkpoint + 0.05 {
+        *checkpoint = cpu;
+        true
+    } else {
+        false
+    }
+}
+
 fn workload_cpu(cgroup: Option<&str>, leader: u32) -> Option<f64> {
     cgroup
         .and_then(|path| {
@@ -2138,8 +2149,11 @@ impl LaneStore {
         let result = self.supervise_job(id);
         let requested = self.record(id)?.cancel_requested;
         let (end, evidence) = match (result, requested) {
-            (Ok(JobEnd::Exited(code)), _) => (JobEnd::Exited(code), "finished".to_owned()),
-            (Ok(JobEnd::Cancelled(reason)), _) => {
+            (Ok((JobEnd::Exited(code), cause)), _) => (
+                JobEnd::Exited(code),
+                cause.unwrap_or_else(|| "finished".to_owned()),
+            ),
+            (Ok((JobEnd::Cancelled(reason), _)), _) => {
                 let evidence = format!("cancelled: {reason}");
                 (JobEnd::Cancelled(reason), evidence)
             }
@@ -2158,7 +2172,7 @@ impl LaneStore {
         Ok(code)
     }
 
-    fn supervise_job(&self, id: Uuid) -> Result<JobEnd> {
+    fn supervise_job(&self, id: Uuid) -> Result<(JobEnd, Option<String>)> {
         let scoped = workload_scoped();
         ensure!(
             scoped || std::env::var("BORG_LANE_DEGRADED").as_deref() == Ok("1"),
@@ -2179,7 +2193,7 @@ impl LaneStore {
             self.run_hook(pre, &spec, id, "pre", true, None)?;
         }
         if let Some(reason) = self.record(id)?.cancel_requested {
-            return Ok(JobEnd::Cancelled(reason));
+            return Ok((JobEnd::Cancelled(reason), None));
         }
         let log = OpenOptions::new()
             .create(true)
@@ -2264,20 +2278,22 @@ impl LaneStore {
         let mut last_cpu = 0.0;
         let mut last_journal_progress = Instant::now() - Duration::from_secs(2);
         let leader = child.id();
-        let end = loop {
+        let (end, cause) = loop {
             if let Some(status) = child.try_wait()? {
-                break JobEnd::Exited(status.code().unwrap_or(128 + status.signal().unwrap_or(9)));
+                break (
+                    JobEnd::Exited(status.code().unwrap_or(128 + status.signal().unwrap_or(9))),
+                    None,
+                );
             }
             let size = fs::metadata(self.job_dir(id).join("output.log")).map_or(0, |m| m.len());
             if scoped && group.is_none() {
                 group = process_scope(leader, &unit).or_else(|| scope_control_group(&unit));
             }
             let cpu = workload_cpu(group.as_deref(), leader).unwrap_or(0.0);
-            if size != last_size || cpu > last_cpu + 0.05 {
+            if size != last_size || cpu_advanced(cpu, &mut last_cpu) {
                 last_progress = std::time::Instant::now();
             }
             last_size = size;
-            last_cpu = cpu;
             if self.abandoned(&spec, id, &mut last_requester_ms) {
                 self.cancel_ticket(id, ABANDONED)?;
             }
@@ -2318,11 +2334,14 @@ impl LaneStore {
                 self.kill_workload(id, &unit, scoped, leader, "killed pids")?;
                 let _ = child.kill();
                 let _ = child.wait();
-                break match cancel {
-                    Some(reason) => JobEnd::Cancelled(reason),
-                    None if timed_out => JobEnd::Exited(124),
-                    None => JobEnd::Exited(125),
-                };
+                break (
+                    match cancel {
+                        Some(reason) => JobEnd::Cancelled(reason),
+                        None if timed_out => JobEnd::Exited(124),
+                        None => JobEnd::Exited(125),
+                    },
+                    Some(reason),
+                );
             }
             std::thread::sleep(Duration::from_millis(100));
         };
@@ -2331,7 +2350,7 @@ impl LaneStore {
         self.kill_workload(id, &unit, scoped, leader, "killed leftover pids")?;
         let _ = (lease, exclusive);
 
-        Ok(end)
+        Ok((end, cause))
     }
 
     /// SIGKILL every process left in the job's scope (degraded: its own
@@ -3224,6 +3243,41 @@ mod tests {
                 .unwrap()
                 .contains("FIFO")
         );
+    }
+
+    #[test]
+    fn legacy_terminal_journal_with_post_hook_does_not_repeat_or_pin_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut row = record(
+            1,
+            TicketState::Finished,
+            vec![resource("build", Access::Exclusive)],
+        );
+        row.spec = Some(coalescing_spec(dir.path(), None));
+        row.spec.as_mut().unwrap().post_hook = Some(Hook {
+            argv: vec!["false".into()],
+            timeout_ms: 100,
+        });
+        let mut json = serde_json::to_value(&row).unwrap();
+        json.as_object_mut().unwrap().remove("post_hook_completed");
+        json.as_object_mut().unwrap().remove("post_hook_started");
+        let old: LaneRecord = serde_json::from_value(json).unwrap();
+        assert!(post_hook_delivered(&old));
+        assert!(prunable(&old));
+        let mut queued = old;
+        queued.state = TicketState::Queued;
+        assert!(!post_hook_delivered(&queued));
+    }
+
+    #[test]
+    fn slow_cgroup_cpu_progress_accumulates_across_polls() {
+        let mut checkpoint = 0.0;
+        assert!(!cpu_advanced(0.02, &mut checkpoint));
+        assert!(!cpu_advanced(0.04, &mut checkpoint));
+        assert!(cpu_advanced(0.06, &mut checkpoint));
+        assert_eq!(checkpoint, 0.06);
+        assert!(!cpu_advanced(0.09, &mut checkpoint));
+        assert!(cpu_advanced(0.12, &mut checkpoint));
     }
 
     #[test]
