@@ -139,7 +139,7 @@ def simulate(tasks: list[list[Request]], policy: str, ram_limit: int = 20, cores
                 if policy != "borg":
                     break
                 continue
-            if policy == "borg" and any(other.req.key == w.req.key for other in pending if other is not w and other.arrived < w.arrived):
+            if policy == "borg" and any(other.req.key == w.req.key for other in list(pending)[:list(pending).index(w)]):
                 continue
             pending.remove(w)
             if w.req.kind == "import" and policy == "borg" and editor_warm:
@@ -191,6 +191,7 @@ def simulate(tasks: list[list[Request]], policy: str, ram_limit: int = 20, cores
             w = data
             assert isinstance(w, Work)
             running.remove(w)
+            assert w.started is not None
             for member, arrival in w.members:
                 wait[member.agent] += (w.started - arrival if member == w.req else now - arrival) / scale
                 finished_at[member.agent] = now
@@ -234,7 +235,7 @@ def materialize(spans: list[dict], ram_mib_per_gib: int = 32) -> dict:
     """Replay concurrent fake processes; cap 8 cores and 8 GiB hard."""
     if not 1 <= ram_mib_per_gib <= 64:
         raise ValueError("ram_mib_per_gib must be 1..64")
-    processes: list[subprocess.Popen] = []
+    processes: list[tuple[subprocess.Popen, int]] = []
     all_processes: list[subprocess.Popen] = []
     origin = time.monotonic()
     peak_ram = 0
@@ -243,16 +244,15 @@ def materialize(spans: list[dict], ram_mib_per_gib: int = 32) -> dict:
             wait = origin + span["start"] - time.monotonic()
             if wait > 0:
                 time.sleep(wait)
-            processes = [p for p in processes if p.poll() is None]
+            processes = [(p, mib) for p, mib in processes if p.poll() is None]
             ram = span["ram_gib"] * ram_mib_per_gib
-            live_ram = sum(getattr(p, "benchmark_ram", 0) for p in processes)
+            live_ram = sum(mib for _, mib in processes)
             peak_ram = max(peak_ram, live_ram + ram)
             if live_ram + ram > 8192 or len(processes) >= 8:
                 raise RuntimeError("materialized replay exceeded 8 GiB or 8 workers")
             p = subprocess.Popen([sys.executable, __file__, "--worker", str(span["end"]-span["start"]),
                                   str(ram), ".25"], stdout=subprocess.DEVNULL)
-            p.benchmark_ram = ram
-            processes.append(p)
+            processes.append((p, ram))
             all_processes.append(p)
         codes = [p.wait() for p in all_processes]
     finally:
