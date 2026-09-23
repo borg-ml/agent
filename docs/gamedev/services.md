@@ -13,7 +13,8 @@ below are currently required by the v0 Rust wire contract):
 ```json
 {
   "id":"my-service", "argv":["/absolute/server","--port","{port}"],
-  "cwd":"/absolute/project", "env":[], "resources":[],
+  "cwd":"/absolute/project", "env":[],
+  "resources":[{"key":{"scope":"Host","name":"my-project"},"access":"Exclusive"}],
   "memory_max_bytes":1073741824,
   "admission":{"min_available_ram_bytes":0,"reserve_ram_bytes":0,
     "min_free_disk_bytes":0,"reserve_disk_bytes":0,"disk_path":"/absolute/project"},
@@ -31,7 +32,11 @@ below are currently required by the v0 Rust wire contract):
 receives `{owner}` (the lease holder participant UUID). `idle_after_ms`
 controls the idle hook. `adapter_enforces_leases` defaults to false. Memory
 cap covers the transient systemd user unit; no systemd means start fails closed
-rather than launching an orphanable process tree. The backend receives
+rather than launching an orphanable process tree. The unit uses
+`KillMode=control-group` and `Delegate=yes`; each backend generation runs in
+its own delegated subgroup. Stop kills that subgroup and verifies
+`cgroup.events: populated 0` before yield or lane-lease release. Only
+in-process tests use an unscoped backend. The backend receives
 `BORG_SERVICE_BACKEND_PORT`; CLI start is single-instance per ID via a stable
 flock, and the supervisor outlives the starting session.
 
@@ -87,22 +92,29 @@ caller-supplied owner, spec, argv, or `confirmed`. Until the parent integrator
 reviews and wires those checks, **there is no registered MCP tool**. `borg lane
 service` remains a host-local CLI for operators and approved Blu workflows.
 
-**Exclusive lane gate is not yet proven:** the service-local yield stops its
-backend but does not itself reserve/release a `LaneStore` shared resource.
-The lane job must enter a pre-admission `Preparing` barrier, call yield before
-it becomes `Granted`, and resume only after it releases exclusivity. A
-post-grant pre-hook is not sufficient. Same canonical resource key and lane
-root are required. No editor/exclusive mutual-exclusion claim until a real
-lane-lease test passes. The lack of a safe non-systemd scope equivalent also
+**Full exclusive lane gate is not yet proven:** the supervisor does hold a
+`LaneStore` shared resource lease through backend lifetime. The lane job must
+enter a pre-admission `Preparing` barrier, yield **every** service bound to
+its exclusive resource before it becomes `Granted`, and resume only after
+release. The service TTL-expiry regression proves it cannot relaunch while an
+exclusive lease is `Granted`. Automatic all-service discovery/yield and a
+cross-CLI regression are still pending lane-side; no editor/exclusive parity
+claim until they pass. The lack of a safe non-systemd scope equivalent also
 means the requested `setsid` fallback is deferred, not silently unsafe.
 
 ## Evidence (fake HTTP backend, not Unreal)
 
 `CARGO_BUILD_JOBS=6 nice -n 10 cargo test -p borg-lanes services::tests -- --nocapture`:
-4 passed: crash and hang restart; back-to-back restart debounce; owner-scoped
-restore on lease expiry/release and refusal to yield under an active lease;
-yield 503, wrong-owner resume denial, idle/active hooks, and private socket/
-state permissions. Warm A/B restart sampled the proxy continuously:
-**0 unavailable requests, ~310–330 ms elapsed** on this fake backend.
-These numbers do not predict Unreal editor startup or memory usage. A scoped
-CLI end-to-end test and `MemoryCurrent` measurement are pending integration.
+8 passed, including crash/hang restart, A/B debounced restart, active-client
+restoration before yield, expired-yield and forced-restart denial under a
+`Granted` exclusive lane lease, default-deny proxy and pipelining guards,
+wrong-owner resume, idle/active hooks, and readiness checks. Warm A/B restart
+sampled the proxy continuously: **0 unavailable requests, ~310–330 ms** on
+the fake backend (not an Unreal timing).
+
+Production fake HTTP CLI smoke (local systemd user unit, not Unreal): start
+Healthy, an active client lease and detached `setsid sleep` child inside the
+delegated backend cgroup, yield returned `Yielded` with no backend/client and
+its child gone, proxy returned JSON 503, and resume became Healthy on a new
+PID. User-unit `MemoryCurrent` was 20.7 MiB with backend and 9.8 MiB after
+yield (one fake HTTP service; not a steady-state Unreal footprint).

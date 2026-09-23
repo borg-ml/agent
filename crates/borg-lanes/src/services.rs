@@ -425,7 +425,7 @@ impl ServiceManager {
                 "-p",
                 "Delegate=yes",
             ]);
-            command.arg(format!("--setenv=BORG_SERVICE_UNIT={unit}"));
+            command.arg(format!("--setenv=BORG_SERVICE_UNIT={unit}.service"));
             if let Some(bytes) = spec.memory_max_bytes {
                 command.args(["-p", &format!("MemoryMax={bytes}")]);
             }
