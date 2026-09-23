@@ -173,7 +173,6 @@ fn root_history_page_cannot_replace_a_focused_child_transcript() {
         &mut director,
         true,
         &[root_event],
-        false,
     ));
     assert!(matches!(
         &displayed.order[0],
@@ -233,7 +232,6 @@ fn older_root_history_hides_agent_cards_and_preserves_authoritative_roster_state
         &mut director,
         false,
         &[stale_parent_event],
-        false,
     ));
 
     assert!(displayed.order.is_empty());
@@ -248,7 +246,7 @@ fn older_root_history_hides_agent_cards_and_preserves_authoritative_roster_state
 }
 
 #[test]
-fn resumed_history_waits_for_roster_then_hides_child_reports_and_keeps_peers_in_order() {
+fn resumed_history_with_roster_hides_child_reports_and_keeps_peers_in_order() {
     let root = Uuid::new_v4();
     let child = Uuid::new_v4();
     let peer = Uuid::new_v4();
@@ -304,23 +302,13 @@ fn resumed_history_waits_for_roster_then_hides_child_reports_and_keeps_peers_in_
     let mut transcript = Transcript::default();
     let mut director = None;
 
-    // A bounded first-paint tail may contain receipts but no creation event.
-    assert!(replace_root_transcript_history(
-        &mut transcript,
-        &mut director,
-        false,
-        &history,
-        true,
-    ));
-    assert_eq!(transcript.order.len(), 2);
-
+    // The complete roster is loaded before this bounded transcript tail.
     transcript.upsert_subagent_snapshot(&child_snapshot);
     assert!(replace_root_transcript_history(
         &mut transcript,
         &mut director,
         false,
         &history,
-        false,
     ));
     let visible = transcript
         .order
@@ -8517,7 +8505,6 @@ fn detached_history_rebuild_preserves_scroll_follow_state() {
         &mut None,
         false,
         &[event],
-        false,
     ));
     assert!(!transcript.follow_tail);
 }

@@ -1714,7 +1714,6 @@ pub struct BorgTerminal {
     active_turn_followup: bool,
     child_active_turn_followups: HashSet<Uuid>,
     replaying_history: bool,
-    team_history_unresolved: bool,
     history_page_requested: bool,
     history_page_loading: bool,
     picker: Option<Picker>,
@@ -2937,7 +2936,6 @@ impl BorgTerminal {
             active_turn_followup: false,
             child_active_turn_followups: HashSet::new(),
             replaying_history: false,
-            team_history_unresolved: false,
             history_page_requested: false,
             history_page_loading: false,
             picker: None,
@@ -3094,7 +3092,6 @@ impl BorgTerminal {
         self.active_turn_followup = false;
         self.child_active_turn_followups.clear();
         self.replaying_history = false;
-        self.team_history_unresolved = false;
         self.history_page_requested = false;
         self.history_page_loading = false;
         self.picker = None;
@@ -3163,17 +3160,6 @@ impl BorgTerminal {
         self.composer.seed_session_events(&display_events);
         self.replaying_history = true;
         for event in &display_events {
-            let transcript = self
-                .director_transcript
-                .as_deref()
-                .unwrap_or(&self.transcript);
-            if historical_agent_message_awaits_roster(
-                event,
-                transcript,
-                self.team_history_unresolved,
-            ) {
-                continue;
-            }
             let _ = self.apply_session_event(event);
         }
         self.transcript.follow_tail = true;
@@ -3235,7 +3221,6 @@ impl BorgTerminal {
             &mut self.director_transcript,
             self.focused_child.is_some(),
             events,
-            self.team_history_unresolved,
         );
         if let Some(sequence) = events
             .iter()
@@ -3552,15 +3537,6 @@ impl BorgTerminal {
     }
 
     pub fn apply_session_event(&mut self, event: &SessionEvent) -> bool {
-        if !self.replaying_history && self.team_history_unresolved {
-            let transcript = self
-                .director_transcript
-                .as_deref()
-                .unwrap_or(&self.transcript);
-            if historical_agent_message_awaits_roster(event, transcript, true) {
-                return false;
-            }
-        }
         if !self.replaying_history {
             if self.connection_retry_at.is_some()
                 && matches!(
@@ -4150,6 +4126,13 @@ impl BorgTerminal {
                 .get(&child_id)
                 .unwrap_or(&self.transcript)
         };
+        let roster_updated_at = self
+            .director_transcript
+            .as_deref()
+            .unwrap_or(&self.transcript)
+            .subagent_snapshots
+            .get(&child_id)
+            .map(|agent| agent.updated_at);
         let mut transcript = fresh_transcript_like(previous);
         transcript.show_director_context_boundary();
         transcript.reserve_history(events.len());
@@ -4159,7 +4142,11 @@ impl BorgTerminal {
             .unwrap_or_default();
         self.child_pending_approvals.remove(&child_id);
         for event in &events {
-            if let Some(status) = subagent_status_from_child_event(&event.kind) {
+            // A live parent completion can arrive while the child query is in
+            // flight. Its newer roster status must survive this older tail.
+            if let Some(status) = subagent_status_from_child_event(&event.kind)
+                && roster_updated_at.is_none_or(|updated_at| event.created_at >= updated_at)
+            {
                 let status = subagent_session_status(status);
                 self.child_statuses.insert(child_id, status);
                 track_child_activity(
@@ -4206,19 +4193,10 @@ impl BorgTerminal {
     /// after this point are live-only and do not need an authoritative history
     /// query before their nested events can be projected directly.
     pub fn finish_child_history_hydration(&mut self) {
-        self.team_history_unresolved = false;
         self.child_history_hydration_complete = true;
         self.hydrated_children
             .extend(self.child_unhydrated_events.keys().copied());
         self.child_unhydrated_events.clear();
-    }
-
-    /// Defer historical agent messages with unknown senders until the full
-    /// team roster has loaded. A bounded transcript tail can omit the child's
-    /// creation event, so classifying those messages as peers on first paint
-    /// would expose an old subagent report only after resume.
-    pub fn begin_team_history_hydration(&mut self) {
-        self.team_history_unresolved = true;
     }
 
     pub fn seed_team_roster(&mut self, agents: &[SubagentSnapshot]) {
@@ -10566,19 +10544,6 @@ fn transcript_history_in_display_order(events: &[SessionEvent]) -> Vec<SessionEv
     ordered
 }
 
-fn historical_agent_message_awaits_roster(
-    event: &SessionEvent,
-    transcript: &Transcript,
-    team_history_unresolved: bool,
-) -> bool {
-    team_history_unresolved
-        && matches!(
-            &event.kind,
-            SessionEventKind::AgentMessageReceived { sender_id, .. }
-                if !transcript.subagent_snapshots.contains_key(sender_id)
-        )
-}
-
 fn reorder_queued_user_completions(events: &[SessionEvent]) -> Vec<SessionEvent> {
     let mut admission_order = HashMap::<Uuid, u64>::new();
     for (index, event) in events.iter().enumerate() {
@@ -10705,7 +10670,6 @@ fn replace_root_transcript_history(
     director_transcript: &mut Option<Box<Transcript>>,
     child_is_focused: bool,
     events: &[SessionEvent],
-    team_history_unresolved: bool,
 ) -> bool {
     let previous = if child_is_focused {
         director_transcript.as_deref().unwrap_or(&*transcript)
@@ -10725,9 +10689,6 @@ fn replace_root_transcript_history(
         replacement.upsert_subagent_snapshot(agent);
     }
     for event in &display_events {
-        if historical_agent_message_awaits_roster(event, &replacement, team_history_unresolved) {
-            continue;
-        }
         replacement.apply_history(event);
     }
     replacement.session_usage = reconciled_usage;
