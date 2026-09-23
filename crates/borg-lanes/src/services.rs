@@ -59,6 +59,16 @@ pub struct Endpoint {
     pub backend_ports: [u16; 2],
 }
 
+/// Client ownership policy. This does not authorize unfenced backend mutations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ClientMode {
+    /// One owner at a time; safe default for editor-like services.
+    #[default]
+    Exclusive,
+    /// Independent owner leases up to a fixed concurrent limit.
+    Shared { max_clients: usize },
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceSpec {
     pub id: String,
@@ -72,6 +82,8 @@ pub struct ServiceSpec {
     pub restart: RestartPolicy,
     pub endpoint: Option<Endpoint>,
     pub restore: Option<Hook>,
+    #[serde(default)]
+    pub client_mode: ClientMode,
     #[serde(default = "default_ready_timeout_ms")]
     pub readiness_timeout_ms: u64,
     #[serde(default)]
@@ -263,6 +275,12 @@ fn valid_spec(spec: &ServiceSpec) -> Result<()> {
     );
     for resource in &spec.resources {
         resource.key.validate_canonical()?;
+    }
+    if let ClientMode::Shared { max_clients } = spec.client_mode {
+        ensure!(
+            max_clients > 0,
+            "shared service max_clients must be positive"
+        );
     }
     ensure!(
         spec.health.timeout_ms > 0 && spec.health.interval_ms > 0 && spec.readiness_timeout_ms > 0,
@@ -905,6 +923,53 @@ async fn restore_client(spec: &ServiceSpec, lease: &ClientLease, port: Option<u1
     Ok(())
 }
 
+/// A failed callback keeps its lease durable and names the owner and lease ID
+/// so an operator can fix the hook and retry exactly that release.
+async fn restore_one_client(
+    spec: &ServiceSpec,
+    status: &mut ServiceStatus,
+    dir: &Path,
+    gate: &ServiceGate,
+    lease: &ClientLease,
+    port: Option<u16>,
+) -> Result<()> {
+    if let Err(error) = restore_client(spec, lease, port).await {
+        // No client-set change, so the failure notice needs no lane fence.
+        status.reason = format!(
+            "restore client owner={} lease_id={} failed: {error:#}",
+            lease.owner.participant_id, lease.id
+        );
+        publish(dir, status)?;
+        bail!("{}", status.reason);
+    }
+    gate.store
+        .service_client_change(&spec.id, &gate.request.resources, false, || {
+            status.clients.retain(|client| client.id != lease.id);
+            if status.reason.starts_with("restore client owner=")
+                && status.reason.contains(&format!("lease_id={}", lease.id))
+                && matches!(status.state, ServiceState::Healthy { .. })
+            {
+                status.reason = "client restore recovered".to_owned();
+            }
+            publish(dir, status)
+        })
+}
+
+/// Restore clients one at a time, persisting each successful removal. A failed
+/// callback must never drop other owners from crash-recovery state.
+async fn restore_clients(
+    spec: &ServiceSpec,
+    status: &mut ServiceStatus,
+    dir: &Path,
+    gate: &ServiceGate,
+    port: Option<u16>,
+) -> Result<()> {
+    for lease in status.clients.clone() {
+        restore_one_client(spec, status, dir, gate, &lease, port).await?;
+    }
+    Ok(())
+}
+
 /// The held lane lease spans every live backend and candidate. Admission is
 /// serialized with exclusive Preparing/Granted under the lane state.lock.
 struct ServiceGate {
@@ -991,19 +1056,13 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
     status.supervisor_pid = Some(std::process::id());
     status.backend_pid = None;
     // Crash recovery cannot assume that the previous backend still owns settings.
-    for lease in std::mem::take(&mut status.clients) {
-        if let Err(error) = restore_client(&spec, &lease, None).await {
-            status.state = ServiceState::Failed {
-                reason: error.to_string(),
-            };
-            status.reason = format!(
-                "restore after supervisor crash failed for {}: {error}",
-                lease.owner.participant_id
-            );
-            status.clients.push(lease);
-            publish(&dir, &status)?;
-            bail!("{}", status.reason);
-        }
+    if let Err(error) = restore_clients(&spec, &mut status, &dir, &gate, None).await {
+        status.state = ServiceState::Failed {
+            reason: error.to_string(),
+        };
+        status.reason = format!("restore after supervisor crash failed: {error:#}");
+        publish(&dir, &status)?;
+        bail!("{}", status.reason);
     }
     let socket = dir.join("control.sock");
     let _ = fs::remove_file(&socket); // Only the holder of supervisor.lock may replace a stale socket.
@@ -1058,8 +1117,15 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             .cloned()
             .collect::<Vec<_>>();
         for lease in expired {
-            if let Err(error) =
-                restore_client(&spec, &lease, active.as_ref().and_then(|b| b.port)).await
+            if let Err(error) = restore_one_client(
+                &spec,
+                &mut status,
+                &dir,
+                &gate,
+                &lease,
+                active.as_ref().and_then(|b| b.port),
+            )
+            .await
             {
                 transition(
                     &dir,
@@ -1068,18 +1134,13 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                     ServiceState::Failed {
                         reason: error.to_string(),
                     },
-                    format!("restore on lease expiry failed: {error}"),
+                    format!("restore on lease expiry failed: {error:#}"),
                     None,
                 )
                 .await?;
                 stopping = true;
                 break;
             }
-            gate.store
-                .service_client_change(&spec.id, &gate.request.resources, false, || {
-                    status.clients.retain(|l| l.id != lease.id);
-                    publish(&dir, &status)
-                })?;
         }
         status
             .yields
@@ -1315,23 +1376,21 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                 status.restarts += 1;
                 failures += 1;
                 next_launch = now + backoff(&spec, failures);
-                for lease in std::mem::take(&mut status.clients) {
-                    if let Err(error) = restore_client(&spec, &lease, dead.port).await {
-                        status.clients.push(lease);
-                        transition(
-                            &dir,
-                            &mut status,
-                            &front,
-                            ServiceState::Failed {
-                                reason: error.to_string(),
-                            },
-                            "restore after crash failed",
-                            None,
-                        )
-                        .await?;
-                        stopping = true;
-                        break;
-                    }
+                if let Err(error) =
+                    restore_clients(&spec, &mut status, &dir, &gate, dead.port).await
+                {
+                    transition(
+                        &dir,
+                        &mut status,
+                        &front,
+                        ServiceState::Failed {
+                            reason: error.to_string(),
+                        },
+                        format!("restore after crash failed: {error:#}"),
+                        None,
+                    )
+                    .await?;
+                    stopping = true;
                 }
                 publish(&dir, &status)?;
             } else if now.saturating_sub(b.last_probe_ms) >= spec.health.interval_ms
@@ -1441,11 +1500,8 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
     if let Some(mut b) = active {
         stop_child(&mut b.child, &spec, b.port, b.scope.as_deref()).await?;
     }
+    restore_clients(&spec, &mut status, &dir, &gate, None).await?;
     gate.release()?;
-    for lease in status.clients.clone() {
-        restore_client(&spec, &lease, None).await?;
-    }
-    status.clients.clear();
     status.backend_pid = None;
     publish(&dir, &status)?;
     let _ = fs::remove_file(socket);
@@ -1476,6 +1532,15 @@ async fn handle_request(
     let now = unix_ms();
     match request {
         ServiceRequest::Stop => {
+            // Preserve the backend and lane lease if any owner's restore fails.
+            restore_clients(
+                spec,
+                status,
+                dir,
+                gate,
+                active.as_ref().and_then(|b| b.port),
+            )
+            .await?;
             transition(
                 dir,
                 status,
@@ -1498,18 +1563,14 @@ async fn handle_request(
         }
         ServiceRequest::Restart { reason, force } => {
             if force {
-                for lease in status.clients.clone() {
-                    restore_client(spec, &lease, active.as_ref().and_then(|b| b.port)).await?;
-                }
-                gate.store.service_client_change(
-                    &spec.id,
-                    &gate.request.resources,
-                    false,
-                    || {
-                        status.clients.clear();
-                        publish(dir, status)
-                    },
-                )?;
+                restore_clients(
+                    spec,
+                    status,
+                    dir,
+                    gate,
+                    active.as_ref().and_then(|b| b.port),
+                )
+                .await?;
             }
             *pending = Some((now, reason.clone()));
             transition(
@@ -1534,18 +1595,14 @@ async fn handle_request(
             // An exclusive job cannot inherit a client's editor settings. Restore
             // every leased change before acknowledging the pre-grant barrier.
             // Failure keeps the service lease/backend intact and blocks the job.
-            for lease in status.clients.clone() {
-                restore_client(spec, &lease, active.as_ref().and_then(|b| b.port)).await?;
-                gate.store.service_client_change(
-                    &spec.id,
-                    &gate.request.resources,
-                    false,
-                    || {
-                        status.clients.retain(|l| l.id != lease.id);
-                        publish(dir, status)
-                    },
-                )?;
-            }
+            restore_clients(
+                spec,
+                status,
+                dir,
+                gate,
+                active.as_ref().and_then(|b| b.port),
+            )
+            .await?;
             // The caller supplies a lane job ID; no other owner can resume this yield.
             let expires = now.saturating_add(ttl_ms);
             let prior = status
@@ -1633,14 +1690,6 @@ async fn handle_request(
                         status.yields.is_empty(),
                         "service yielded for exclusive work"
                     );
-                    ensure!(
-                        status
-                            .clients
-                            .iter()
-                            .all(|lease| lease.owner.participant_id == owner.participant_id
-                                && lease.owner.session_id == owner.session_id),
-                        "service lease held by another owner"
-                    );
                     if let Some(existing) = status.clients.iter_mut().find(|lease| {
                         lease.owner.participant_id == owner.participant_id
                             && lease.owner.session_id == owner.session_id
@@ -1648,6 +1697,16 @@ async fn handle_request(
                         existing.expires_at_unix_ms = now.saturating_add(ttl_ms);
                         existing.purpose = purpose;
                     } else {
+                        match spec.client_mode {
+                            ClientMode::Exclusive => ensure!(
+                                status.clients.is_empty(),
+                                "service lease held by another owner"
+                            ),
+                            ClientMode::Shared { max_clients } => ensure!(
+                                status.clients.len() < max_clients,
+                                "service client limit reached ({max_clients})"
+                            ),
+                        }
                         status.clients.push(ClientLease {
                             id: Uuid::new_v4(),
                             service_id: spec.id.clone(),
@@ -1687,12 +1746,15 @@ async fn handle_request(
                 })
                 .context("client lease not owned by caller")?
                 .clone();
-            restore_client(spec, &lease, active.as_ref().and_then(|b| b.port)).await?;
-            gate.store
-                .service_client_change(&spec.id, &gate.request.resources, false, || {
-                    status.clients.retain(|l| l.id != lease_id);
-                    publish(dir, status)
-                })?;
+            restore_one_client(
+                spec,
+                status,
+                dir,
+                gate,
+                &lease,
+                active.as_ref().and_then(|b| b.port),
+            )
+            .await?;
         }
         ServiceRequest::Touch => {
             *last_activity = now;
@@ -1808,7 +1870,7 @@ impl ServiceCoordinator for ServiceManager {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::lanes::{Access, ResourceKey, ResourceScope};
     use std::{net::TcpListener as StdTcpListener, os::unix::fs::PermissionsExt};
@@ -1885,6 +1947,7 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
                 listen: format!("127.0.0.1:{front}"),
                 backend_ports: [a, b],
             }),
+            client_mode: ClientMode::Exclusive,
             restore: Some(Hook {
                 argv: vec![
                     "python3".into(),
@@ -1941,7 +2004,7 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
     ) {
         setup_with(|_| {}).await
     }
-    async fn setup_with(
+    pub(crate) async fn setup_with(
         configure: impl FnOnce(&mut ServiceSpec),
     ) -> (
         tempfile::TempDir,
@@ -1971,7 +2034,10 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
         .await;
         (root, manager, front, task)
     }
-    async fn cleanup(manager: &ServiceManager, task: tokio::task::JoinHandle<Result<()>>) {
+    pub(crate) async fn cleanup(
+        manager: &ServiceManager,
+        task: tokio::task::JoinHandle<Result<()>>,
+    ) {
         manager
             .send("fake", ServiceRequest::Stop, Duration::from_secs(10))
             .await
@@ -2304,6 +2370,467 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
                 .contains("503 Service Unavailable")
         );
         store.release(&exclusive).await.unwrap();
+        state(&manager, |s| {
+            matches!(s.state, ServiceState::Healthy { .. })
+        })
+        .await;
+        cleanup(&manager, task).await;
+    }
+
+    #[test]
+    fn legacy_definitions_default_to_exclusive_and_shared_limit_must_be_positive() {
+        let root = tempfile::tempdir().unwrap();
+        let mut definition = serde_json::to_value(spec(root.path())).unwrap();
+        definition.as_object_mut().unwrap().remove("client_mode");
+        let mut legacy: ServiceSpec = serde_json::from_value(definition).unwrap();
+        assert_eq!(legacy.client_mode, ClientMode::Exclusive);
+        legacy.client_mode = ClientMode::Shared { max_clients: 0 };
+        assert!(
+            valid_spec(&legacy)
+                .unwrap_err()
+                .to_string()
+                .contains("max_clients")
+        );
+    }
+
+    #[tokio::test]
+    async fn exclusive_client_mode_refuses_another_owner() {
+        let (_root, manager, _front, task) = setup().await;
+        let first = owner();
+        let second = owner();
+        let held = manager
+            .send(
+                "fake",
+                ServiceRequest::Lease {
+                    owner: first.clone(),
+                    purpose: "first".into(),
+                    ttl_ms: 5_000,
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        assert_eq!(held.clients.len(), 1);
+        assert!(
+            manager
+                .send(
+                    "fake",
+                    ServiceRequest::Lease {
+                        owner: second,
+                        purpose: "second".into(),
+                        ttl_ms: 5_000,
+                    },
+                    Duration::from_secs(3)
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("another owner")
+        );
+        assert_eq!(
+            manager.read_status("fake").unwrap().clients[0].id,
+            held.clients[0].id
+        );
+        cleanup(&manager, task).await;
+    }
+
+    #[tokio::test]
+    async fn shared_clients_have_independent_limits_release_and_expiry() {
+        let (root, manager, _front, task) = setup_with(|s| {
+            s.client_mode = ClientMode::Shared { max_clients: 2 };
+        })
+        .await;
+        let first = owner();
+        let second = owner();
+        let third = owner();
+        let first_status = manager
+            .send(
+                "fake",
+                ServiceRequest::Lease {
+                    owner: first.clone(),
+                    purpose: "first".into(),
+                    ttl_ms: 800,
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        let first_id = first_status.clients[0].id;
+        let second_status = manager
+            .send(
+                "fake",
+                ServiceRequest::Lease {
+                    owner: second.clone(),
+                    purpose: "second".into(),
+                    ttl_ms: 5_000,
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_status.clients.len(), 2);
+        let second_id = second_status
+            .clients
+            .iter()
+            .find(|l| l.owner.participant_id == second.participant_id)
+            .unwrap()
+            .id;
+        assert_ne!(first_id, second_id);
+        assert!(
+            manager
+                .send(
+                    "fake",
+                    ServiceRequest::Lease {
+                        owner: third.clone(),
+                        purpose: "third".into(),
+                        ttl_ms: 5_000,
+                    },
+                    Duration::from_secs(3)
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("client limit")
+        );
+        assert_eq!(manager.read_status("fake").unwrap().clients.len(), 2);
+        let store = LaneStore::new(root.path()).unwrap();
+        assert_eq!(
+            store
+                .snapshot()
+                .unwrap()
+                .iter()
+                .filter(|row| row.service_lease
+                    && matches!(row.state, crate::lanes::TicketState::Granted { .. }))
+                .count(),
+            1,
+            "two clients still reserve host capacity once, per service"
+        );
+        let after_expiry = state(&manager, |s| {
+            s.clients.len() == 1 && s.clients[0].id == second_id
+        })
+        .await;
+        assert!(matches!(after_expiry.state, ServiceState::Healthy { .. }));
+        let restored = fs::read_to_string(root.path().join("restored")).unwrap();
+        assert_eq!(
+            restored
+                .lines()
+                .filter(|line| *line == first.participant_id.to_string())
+                .count(),
+            1
+        );
+        assert!(!restored.contains(&second.participant_id.to_string()));
+        let third_status = manager
+            .send(
+                "fake",
+                ServiceRequest::Lease {
+                    owner: third.clone(),
+                    purpose: "third".into(),
+                    ttl_ms: 5_000,
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        let third_id = third_status
+            .clients
+            .iter()
+            .find(|l| l.owner.participant_id == third.participant_id)
+            .unwrap()
+            .id;
+        assert!(
+            manager
+                .send(
+                    "fake",
+                    ServiceRequest::Release {
+                        lease_id: second_id,
+                        owner: third.clone(),
+                    },
+                    Duration::from_secs(3)
+                )
+                .await
+                .is_err()
+        );
+        manager
+            .send(
+                "fake",
+                ServiceRequest::Release {
+                    lease_id: third_id,
+                    owner: third.clone(),
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.read_status("fake").unwrap().clients[0].id,
+            second_id
+        );
+        manager
+            .send(
+                "fake",
+                ServiceRequest::Release {
+                    lease_id: second_id,
+                    owner: second.clone(),
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        let restored = fs::read_to_string(root.path().join("restored")).unwrap();
+        for client in [&first, &second, &third] {
+            assert_eq!(
+                restored
+                    .lines()
+                    .filter(|line| *line == client.participant_id.to_string())
+                    .count(),
+                1
+            );
+        }
+        cleanup(&manager, task).await;
+    }
+
+    #[tokio::test]
+    async fn restore_failure_retains_other_clients_and_prevents_stop_release() {
+        let owners = [owner(), owner()];
+        let reject = owners[1].participant_id.to_string();
+        let (root, manager, _front, task) = setup_with(|spec| {
+            spec.client_mode = ClientMode::Shared { max_clients: 2 };
+            spec.restore = Some(Hook {
+                argv: vec![
+                    "python3".into(),
+                    "-c".into(),
+                    "import pathlib,sys; marker=pathlib.Path(sys.argv[1]); owner=sys.argv[2]; "
+                        .to_owned()
+                        + "
+if marker.exists() and owner == sys.argv[3]: sys.exit(4)"
+                        + "
+with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
+                    spec.cwd.join("restore-blocked").display().to_string(),
+                    "{owner}".into(),
+                    reject.clone(),
+                    spec.cwd.join("restored").display().to_string(),
+                ],
+                timeout_ms: 1500,
+            });
+        })
+        .await;
+        for holder in &owners {
+            manager
+                .send(
+                    "fake",
+                    ServiceRequest::Lease {
+                        owner: holder.clone(),
+                        purpose: "independent".into(),
+                        ttl_ms: 5_000,
+                    },
+                    Duration::from_secs(3),
+                )
+                .await
+                .unwrap();
+        }
+        let pid = manager.read_status("fake").unwrap().backend_pid;
+        fs::write(root.path().join("restore-blocked"), "hold second").unwrap();
+        assert!(
+            manager
+                .send("fake", ServiceRequest::Stop, Duration::from_secs(4))
+                .await
+                .is_err()
+        );
+        let after = manager.read_status("fake").unwrap();
+        assert!(matches!(after.state, ServiceState::Healthy { .. }));
+        assert_eq!(
+            after.backend_pid, pid,
+            "failed restore cannot stop a shared backend"
+        );
+        assert_eq!(
+            after.clients.len(),
+            1,
+            "successful first restore persists; failed second remains"
+        );
+        assert_eq!(
+            after.clients[0].owner.participant_id,
+            owners[1].participant_id
+        );
+        assert!(
+            after
+                .reason
+                .contains(&format!("owner={}", owners[1].participant_id))
+        );
+        assert!(
+            after
+                .reason
+                .contains(&format!("lease_id={}", after.clients[0].id))
+        );
+        let persisted: ServiceStatus = read_json(
+            &service_dir(&manager.root, "fake")
+                .unwrap()
+                .join("state.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted.clients.len(),
+            1,
+            "unrestored client remains durable"
+        );
+        assert!(
+            manager
+                .send(
+                    "fake",
+                    ServiceRequest::Yield {
+                        by: "blocked-exclusive".into(),
+                        reason: "must restore both".into(),
+                        ttl_ms: 5_000,
+                    },
+                    Duration::from_secs(4)
+                )
+                .await
+                .is_err()
+        );
+        let after_yield = manager.read_status("fake").unwrap();
+        assert!(after_yield.yields.is_empty());
+        assert_eq!(after_yield.clients.len(), 1);
+        assert_eq!(
+            after_yield.backend_pid, pid,
+            "failed restore cannot grant exclusivity"
+        );
+        assert!(
+            after_yield
+                .reason
+                .contains(&format!("owner={}", owners[1].participant_id))
+        );
+        assert!(
+            after_yield
+                .reason
+                .contains(&format!("lease_id={}", after_yield.clients[0].id))
+        );
+        // A successful release by someone else must not hide the stuck owner.
+        let other = owner();
+        let with_other = manager
+            .send(
+                "fake",
+                ServiceRequest::Lease {
+                    owner: other.clone(),
+                    purpose: "other".into(),
+                    ttl_ms: 5_000,
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        let other_id = with_other
+            .clients
+            .iter()
+            .find(|l| l.owner.participant_id == other.participant_id)
+            .unwrap()
+            .id;
+        let released_other = manager
+            .send(
+                "fake",
+                ServiceRequest::Release {
+                    lease_id: other_id,
+                    owner: other.clone(),
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        assert_eq!(released_other.clients.len(), 1);
+        assert!(
+            released_other
+                .reason
+                .contains(&format!("lease_id={}", after.clients[0].id))
+        );
+        let store = LaneStore::new(root.path()).unwrap();
+        assert!(store.snapshot().unwrap().iter().any(|row| row.service_lease
+            && matches!(row.state, crate::lanes::TicketState::Granted { .. })));
+        fs::remove_file(root.path().join("restore-blocked")).unwrap();
+        cleanup(&manager, task).await;
+        let restored = fs::read_to_string(root.path().join("restored")).unwrap();
+        for holder in &owners {
+            assert_eq!(
+                restored
+                    .lines()
+                    .filter(|line| *line == holder.participant_id.to_string())
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            restored
+                .lines()
+                .filter(|line| *line == other.participant_id.to_string())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn yielding_shared_service_restores_every_owner_before_releasing_backend() {
+        let (root, manager, front, task) = setup_with(|s| {
+            s.client_mode = ClientMode::Shared { max_clients: 2 };
+        })
+        .await;
+        let owners = [owner(), owner()];
+        for holder in &owners {
+            manager
+                .send(
+                    "fake",
+                    ServiceRequest::Lease {
+                        owner: holder.clone(),
+                        purpose: "independent client".into(),
+                        ttl_ms: 5_000,
+                    },
+                    Duration::from_secs(3),
+                )
+                .await
+                .unwrap();
+        }
+        let yielded = manager
+            .send(
+                "fake",
+                ServiceRequest::Yield {
+                    by: "exclusive-job".into(),
+                    reason: "exclusive".into(),
+                    ttl_ms: 5_000,
+                },
+                Duration::from_secs(8),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(yielded.state, ServiceState::Yielded));
+        assert!(yielded.clients.is_empty());
+        assert!(yielded.backend_pid.is_none());
+        assert!(
+            get(front, "/health")
+                .await
+                .unwrap()
+                .contains("503 Service Unavailable")
+        );
+        let restored = fs::read_to_string(root.path().join("restored")).unwrap();
+        for holder in &owners {
+            assert_eq!(
+                restored
+                    .lines()
+                    .filter(|line| *line == holder.participant_id.to_string())
+                    .count(),
+                1
+            );
+        }
+        let store = LaneStore::new(root.path()).unwrap();
+        assert!(
+            !store.snapshot().unwrap().iter().any(|row| row.service_lease
+                && matches!(row.state, crate::lanes::TicketState::Granted { .. }))
+        );
+        manager
+            .send(
+                "fake",
+                ServiceRequest::Resume {
+                    by: "exclusive-job".into(),
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
         state(&manager, |s| {
             matches!(s.state, ServiceState::Healthy { .. })
         })

@@ -2798,6 +2798,139 @@ mod tests {
         store.finish(job.id, 0, "test complete").unwrap();
     }
 
+    /// Failure mode: a Shared-mode service admits several owners, so the
+    /// client fence must still hold an exclusive on ANY foreign owner beside
+    /// the requester's own lease, refuse new owners and renewals while
+    /// Preparing, and lift only on a fenced release or grace expiry.
+    #[tokio::test]
+    async fn shared_service_foreign_client_fences_preparing_exclusive() {
+        use crate::services::tests::{cleanup, setup_with};
+        use crate::services::{ClientMode, ServiceRequest};
+        let (root, manager, _front, task) = setup_with(|spec| {
+            spec.client_mode = ClientMode::Shared { max_clients: 3 };
+        })
+        .await;
+        let store = LaneStore::new(root.path()).unwrap();
+        let someone = || Holder {
+            participant_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            ..holder()
+        };
+        let (own, foreign) = (someone(), someone());
+        let lease = |owner: Holder| ServiceRequest::Lease {
+            owner,
+            purpose: "shared".into(),
+            ttl_ms: 60_000,
+        };
+        let rpc = Duration::from_secs(3);
+        manager.send("fake", lease(own.clone()), rpc).await.unwrap();
+        manager
+            .send("fake", lease(foreign.clone()), rpc)
+            .await
+            .unwrap();
+        let prepare = |grace_ms: u64| {
+            let spec = JobSpec {
+                foreign_client_grace_ms: grace_ms,
+                foreign_client_grace_by_resource: vec![],
+                fingerprint: JobFingerprint("shared-foreign".into()),
+                lease: LeaseRequest {
+                    resources: vec![resource("fake-exclusive", Access::Exclusive)],
+                    holder: own.clone(),
+                    queue_timeout_ms: None,
+                },
+                argv: vec!["true".into()],
+                cwd: root.path().into(),
+                env: vec![],
+                memory_max_bytes: None,
+                admission: test_budget(root.path()),
+                pre_hook: None,
+                post_hook: None,
+                timeout_ms: 2000,
+                stall_timeout_ms: None,
+                coalesce: false,
+            };
+            let job = store
+                .locked(|state| {
+                    Ok(store
+                        .enqueue_record(state, spec.lease.clone(), Some(spec))?
+                        .1
+                        .unwrap())
+                })
+                .unwrap();
+            let lock = stable_file(&store.ticket_path(job.id)).unwrap();
+            lock.lock().unwrap();
+            assert!(store.try_grant(job.id).unwrap().is_none());
+            assert!(matches!(
+                store.record(job.id).unwrap().state,
+                TicketState::Preparing
+            ));
+            (job.id, lock)
+        };
+        let waiting = |id| {
+            store
+                .locked(|state| store.foreign_client_wait(state, id))
+                .unwrap()
+        };
+        let clients = || {
+            let mut rows = manager
+                .read_status("fake")
+                .unwrap()
+                .clients
+                .into_iter()
+                .map(|c| (c.owner.participant_id, c.id, c.expires_at_unix_ms))
+                .collect::<Vec<_>>();
+            rows.sort();
+            rows
+        };
+
+        let (job, _held) = prepare(0);
+        let reason = waiting(job).expect("foreign shared client must hold the exclusive");
+        assert!(
+            reason.contains(&foreign.participant_id.to_string()),
+            "{reason}"
+        );
+        let before = clients();
+        assert_eq!(before.len(), 2);
+        for late in [someone(), own.clone()] {
+            let error = manager.send("fake", lease(late), rpc).await.unwrap_err();
+            assert!(
+                error.to_string().contains("new client lease denied"),
+                "{error}"
+            );
+        }
+        assert_eq!(clients(), before, "late owner or renewal changed clients");
+        let foreign_id = before
+            .iter()
+            .find(|(owner, ..)| *owner == foreign.participant_id)
+            .unwrap()
+            .1;
+        manager
+            .send(
+                "fake",
+                ServiceRequest::Release {
+                    lease_id: foreign_id,
+                    owner: foreign.clone(),
+                },
+                rpc,
+            )
+            .await
+            .unwrap();
+        assert!(waiting(job).is_none(), "own shared lease blocked its job");
+        store.finish(job, 125, "test ends before yield").unwrap();
+
+        manager
+            .send("fake", lease(foreign.clone()), rpc)
+            .await
+            .unwrap();
+        let (job, _held) = prepare(300);
+        assert!(waiting(job).is_some());
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(waiting(job).is_none(), "grace expiry did not lift the wait");
+        assert_eq!(clients().len(), 2);
+        store.finish(job, 125, "test ends before yield").unwrap();
+        cleanup(&manager, task).await;
+    }
+
     #[test]
     fn foreign_grace_expiry_does_not_reset_after_recovery() {
         use crate::services::ClientLease;

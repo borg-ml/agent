@@ -21,9 +21,37 @@ below are currently required by the v0 Rust wire contract):
   "health":{"kind":"http","argv":["/health"],"interval_ms":1000,"timeout_ms":3000},
   "restart":{"max_restarts":5,"backoff_ms":500,"debounce_ms":3000},
   "endpoint":{"listen":"127.0.0.1:8231","backend_ports":[8241,8242]},
-  "restore":null
+  "restore":null,
+  "client_mode":"Exclusive"
 }
 ```
+
+`client_mode` is optional: omitted or `"Exclusive"` retains one-owner-at-a-time
+editor behavior. For independent clients, opt in with
+`"client_mode":{"Shared":{"max_clients":2}}` (positive limit). Each distinct
+owner/session gets its own lease UUID and TTL; the same owner/session renews
+its existing lease. Third distinct owners are refused at the limit; release
+requires the matching owner and UUID. Expiry and release restore only that
+client. Yield restores **all** clients before stopping the backend or releasing
+the shared lane lease; a failed callback refuses yield or stop and retains
+unrestored clients for recovery. RAM/disk admission remains **per running
+service**, not per client. Shared mode does not grant raw backend MCP mutation
+rights: the proxy is still deny-by-default without a validated owner/fencing
+adapter. A trusted Postgres adapter may use its own per-owner database/socket
+access control; CLI `--owner` alone is not authentication.
+
+If a client restore callback fails, `service yield` and `service stop` refuse to
+release the backend/lane lease; status retains each unrestored client and its
+`reason` names both the stuck owner UUID and lease UUID. An exclusive job that
+cannot yield records the same IDs in its failed journal `evidence` (inspect
+`borg lane resource status --json`); it does not run its command. Repair the
+callback and retry that client's owner-scoped `service release ID --owner
+OWNER --lease-id UUID`, or retry `service stop` to restore every remaining
+client. A failed exclusive ticket must be resubmitted after the callback is
+repaired; do not wipe journal/state or force grant. If the supervisor died,
+`service start ID --definition FILE` first retries persisted client restores
+before it may launch a new backend; a further callback failure keeps startup
+failed and the remaining clients recorded for manual repair.
 
 `health.kind` is `command`, `http` (argv[0] is a path), or `mcp_initialize`
 (argv[0] is `/mcp`; POST initialize). The health timeout is per attempt;
@@ -118,7 +146,9 @@ not a live Unreal editor.
 ## Evidence (fake HTTP backend, not Unreal)
 
 `CARGO_BUILD_JOBS=6 nice -n 10 cargo test -p borg-lanes services::tests -- --nocapture`:
-10 passed, including two-service atomic RAM/disk reservation denial and
+15 passed, including independent multi-owner leases, bounded shared capacity,
+per-owner TTL/release/restore, two-owner yield and failed-restore fencing,
+two-service atomic RAM/disk reservation denial and
 yield-to-admit handoff, crash/hang restart, A/B debounced restart, active-client
 restoration before yield, expired-yield and forced-restart denial under a
 `Granted` exclusive lane lease, default-deny proxy and pipelining guards,
@@ -196,3 +226,20 @@ Post-resume-readiness public-CLI gates on freshly rebuilt binary SHA256
 These are fake HTTP services and pinned local binaries, not a live Unreal editor.
 The earlier SHA `011c4ba9…` gates do not establish the newer resume-readiness
 semantics.
+
+Shared-client real CLI gate on synthetic HTTP with the systemd-user manager:
+`python3 scripts/gamedev_shared_service_probe.py --borg PATH` passed against
+newly built `gamedev/services-shared` CLI SHA256
+`7904ca9704209d4ea7424d29ebdc6e66332cc4ae9d8529dc9de87bbe78834939`.
+Two independent owners held distinct IDs; the third was denied at
+`max_clients=2`; releasing A restored only A, leaving B healthy. After A
+reacquired, a no-hook exclusive Host-key job observed both remaining clients
+restored, old backend PID gone, and proxy 503 **before** grant. After release
+the service resumed Healthy with a new backend PID. The owned test unit
+stopped inactive/dead with empty control group; see
+`/tmp/gd-shared-client-cli.log`. With the optional
+`--restore-failure-recovery` probe flag, an injected second-owner callback
+failure kept Stop/Yield fenced, and after repair a matching owner/lease-ID
+release cleared the client before Stop (`/tmp/gd-shared-recovery-cli.log`).
+The CLI is a trusted local operator interface, not session-derived owner
+authentication or real Unreal/Postgres mutation fencing.
