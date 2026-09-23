@@ -134,7 +134,19 @@ def build_spec(args: argparse.Namespace, project: Path, engine: Path, cfg: dict)
         positional = positional[1:]
     if len(positional) < 3 or any(a.startswith('--') for a in positional):
         raise ValueError('build needs TARGET PLATFORM CONFIG [UPROJECT] [UBT flags]')
-    if str(project) not in positional and not any(a.startswith('-Project=') for a in positional):
+    # The lease and UBT must name the same canonical project, even when the
+    # caller supplied a path alias. A second UBT project would bypass that tie.
+    if any(a.lower().startswith('-project=') for a in positional):
+        raise ValueError('use a single positional UPROJECT; -Project= is ambiguous')
+    project_args = [i for i, a in enumerate(positional) if a.lower().endswith('.uproject')]
+    if len(project_args) > 1:
+        raise ValueError('build accepts only one UPROJECT')
+    if project_args:
+        i = project_args[0]
+        if Path(positional[i]).resolve(strict=True) != project:
+            raise ValueError('UBT project and lane project must be identical')
+        positional[i] = str(project)
+    else:
         positional.insert(3, str(project))
     script = engine / 'Engine/Build/BatchFiles' / PLATFORM / 'Build.sh'
     state = Path(os.environ.get('XDG_RUNTIME_DIR') or '/tmp') / 'borg' / 'unreal' / project_id(project)

@@ -54,6 +54,25 @@ class AdapterTests(unittest.TestCase):
         config.write_text('[editor]\nport = 49311\nbackend_ports = [49311,49313]\n')
         self.assertEqual(self.cli('editor', 'spec').returncode, 2)
 
+    def test_build_project_alias_normalized_and_conflicts_rejected(self):
+        canonical = json.loads(self.cli('build', '--spec', 'GameEditor', 'Linux',
+                                        'Development', str(self.project)).stdout)
+        alias = str(self.project.parent / '..' / 'Game' / 'Game.uproject')
+        aliased = self.cli('build', '--spec', 'GameEditor', 'Linux', 'Development', alias)
+        self.assertEqual(aliased.returncode, 0, aliased.stderr)
+        normalized = json.loads(aliased.stdout)
+        self.assertEqual(normalized['argv'], canonical['argv'])
+        self.assertEqual(normalized['fingerprint'], canonical['fingerprint'])
+        self.assertEqual(normalized['lease']['resources'], canonical['lease']['resources'])
+        other = self.project.parent / 'Other.uproject'
+        other.write_text('{}')
+        for args in ((str(other),), (str(self.project), str(other)),
+                     ('-Project=' + str(other),)):
+            with self.subTest(args=args):
+                result = self.cli('build', '--spec', 'GameEditor', 'Linux',
+                                  'Development', *args)
+                self.assertEqual(result.returncode, 2, result.stdout)
+
     def test_build_job_core_schema_and_input_revision(self):
         # Keep RAM-derived -MaxParallelActions stable for this fingerprint test.
         (self.project.parent / '.borg-unreal.toml').write_text(
