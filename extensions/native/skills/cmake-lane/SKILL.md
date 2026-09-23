@@ -9,12 +9,12 @@ Use your own Abundance worktree (never edit or build the shared main checkout).
 Run from the worktree root:
 
 ```sh
-python3 extensions/native/native.py cmake configure
-python3 extensions/native/native.py cmake build --target worldgen-tests
-python3 extensions/native/native.py ctest test --exclude-label slow
-python3 extensions/native/native.py ctest test --label slow
-python3 extensions/native/native.py ctest test --regex worldgen
-python3 extensions/native/native.py ctest test # full gate
+python3 .borg/extensions/native/native.py cmake configure
+python3 .borg/extensions/native/native.py cmake build --target worldgen-tests
+python3 .borg/extensions/native/native.py ctest test --exclude-label slow
+python3 .borg/extensions/native/native.py ctest test --label slow
+python3 .borg/extensions/native/native.py ctest test --regex worldgen
+python3 .borg/extensions/native/native.py ctest test # full gate
 ```
 
 The adapter selects a worktree-private `build/`, Release (for native C++), and

@@ -3,10 +3,17 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+
+PG_FILE = Path(__file__).resolve().parents[1] / 'postgres.py'
+pg_spec = importlib.util.spec_from_file_location('native_pg', PG_FILE)
+assert pg_spec is not None and pg_spec.loader is not None
+pg = importlib.util.module_from_spec(pg_spec)
+pg_spec.loader.exec_module(pg)
 from unittest.mock import patch
 
 FILE = Path(__file__).resolve().parents[1] / 'native.py'
 spec = importlib.util.spec_from_file_location('native_toolchain', FILE)
+assert spec is not None and spec.loader is not None
 native = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(native)
 
@@ -26,6 +33,29 @@ class NativePlannerTest(unittest.TestCase):
                 native.inside_project(root, '../another-tree/target')
             with self.assertRaisesRegex(ValueError, 'stay in worktree'):
                 native.inside_project(root, '/tmp/shared-target')
+
+    def test_client_database_url_keeps_admin_endpoint(self):
+        self.assertEqual(pg.client_url('postgresql://me@localhost:55451/postgres', 'borg_native_123'),
+                         'postgresql://me@localhost:55451/borg_native_123')
+
+    def test_job_spec_is_immediate_and_keeps_worktree_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(native, 'fingerprint', return_value='fingerprint'):
+                value = native.job_spec(root, 'cargo-test', ['cargo', 'test', '-j', '2'],
+                                        {'CARGO_BUILD_JOBS': '2', 'CARGO_TARGET_DIR': str(root / 'target')})
+        self.assertEqual(value['lease']['resources'][0]['key']['scope'], {'Worktree': str(root)})
+        self.assertEqual(value['admission']['min_free_disk_bytes'], 60 * native.GIB)
+        self.assertEqual(value['admission']['reserve_disk_bytes'], 24 * native.GIB)
+        self.assertEqual(Path(value['argv'][-4]).name, 'cargo')
+        self.assertEqual(value['argv'][-3:], ['test', '-j', '2'])
+
+    def test_postgres_job_never_coalesces_across_clients(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict('os.environ', {'BORG_TEST_SESSIONS_URL': 'postgresql://me@localhost/db'}):
+                value = native.job_spec(Path(tmp), 'cargo-test', ['cargo', 'test', '-j', '2'],
+                                        {'CARGO_BUILD_JOBS': '2'})
+            self.assertFalse(value['coalesce'])
 
     def test_cargo_args_use_private_target_and_explicit_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
