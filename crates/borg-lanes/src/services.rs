@@ -554,16 +554,78 @@ async fn front_connection(mut client: TcpStream, front: Arc<RwLock<FrontState>>,
         let _ = client.write_all(response.as_bytes()).await;
         return;
     }
-    let first = request.split(|b| *b == b' ').next().unwrap_or(&[]);
-    if !fenced && first != b"GET" && first != b"HEAD" {
-        let body =
-            r#"{"error":"mutating proxy requests require adapter owner/fencing enforcement"}"#;
-        let response = format!(
-            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = client.write_all(response.as_bytes()).await;
-        return;
+    if !fenced {
+        // Do not forward a raw bidirectional connection: a client could pipeline or
+        // subsequently write a POST after an allowed GET on the same TCP stream.
+        let head_end = loop {
+            if let Some(i) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                break Some(i);
+            }
+            if request.len() >= 8192 {
+                break None;
+            }
+            let mut buf = [0; 1024];
+            let n = match tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf)).await
+            {
+                Ok(Ok(n)) if n > 0 => n,
+                _ => break None,
+            };
+            request.extend_from_slice(&buf[..n]);
+        };
+        let allowed = head_end.and_then(|end| {
+            if end + 4 != request.len() {
+                return None;
+            }
+            let text = std::str::from_utf8(&request[..end]).ok()?;
+            let mut lines = text.split("\r\n");
+            let first = lines.next()?;
+            let mut parts = first.split(' ');
+            if !matches!(parts.next()?, "GET" | "HEAD")
+                || !parts.next()?.starts_with('/')
+                || !matches!(parts.next()?, "HTTP/1.0" | "HTTP/1.1")
+                || parts.next().is_some()
+            {
+                return None;
+            }
+            let mut headers = Vec::new();
+            for line in lines {
+                let (key, value) = line.split_once(':')?;
+                if !key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-') {
+                    return None;
+                }
+                let key_lower = key.to_ascii_lowercase();
+                if key_lower == "transfer-encoding"
+                    || key_lower == "upgrade"
+                    || (key_lower == "content-length" && value.trim() != "0")
+                {
+                    return None;
+                }
+                if key_lower != "connection"
+                    && key_lower != "proxy-connection"
+                    && key_lower != "content-length"
+                {
+                    headers.push(line);
+                }
+            }
+            Some(
+                format!(
+                    "{}\r\nConnection: close\r\n\r\n",
+                    [vec![first], headers].concat().join("\r\n")
+                )
+                .into_bytes(),
+            )
+        });
+        let Some(safe_request) = allowed else {
+            let body =
+                r#"{"error":"mutating proxy requests require adapter owner/fencing enforcement"}"#;
+            let response = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = client.write_all(response.as_bytes()).await;
+            return;
+        };
+        request = safe_request;
     }
     if let Some(port) = snapshot.backend
         && let Ok(Ok(mut backend)) = tokio::time::timeout(
@@ -573,7 +635,13 @@ async fn front_connection(mut client: TcpStream, front: Arc<RwLock<FrontState>>,
         .await
     {
         if backend.write_all(&request).await.is_ok() {
-            let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+            if fenced {
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+            } else {
+                // Only the validated read request reaches the backend; no client writes
+                // can turn this connection into an unfenced mutating request.
+                let _ = tokio::io::copy(&mut backend, &mut client).await;
+            }
         }
         return;
     }
@@ -1454,6 +1522,7 @@ with open(record, 'a') as f: f.write(str(port) + '\n')
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args): pass
     def do_POST(self):
+        if self.path == '/bad': open(os.path.join(os.path.dirname(record), 'mutated'), 'w').write('bad')
         self.rfile.read(int(self.headers.get('Content-Length', '0')))
         data = b'{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}' if self.path == '/mcp' else b'{}'
         self.send_response(200); self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data)
@@ -1860,6 +1929,46 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
             fs::read_to_string(root.path().join("restored"))
                 .unwrap()
                 .contains(&second.participant_id.to_string())
+        );
+        cleanup(&manager, task).await;
+    }
+
+    #[tokio::test]
+    async fn unfenced_proxy_rejects_pipelined_and_late_mutations() {
+        let (root, manager, port, task) = setup().await;
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\nPOST /bad HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n").await.unwrap();
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reply.starts_with(b"HTTP/1.1 403"));
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream
+            .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        // The subsequent POST must never be passed through the established GET tunnel.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let _ = stream
+            .write_all(b"POST /bad HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            reply.starts_with(b"HTTP/1.0 200") || reply.starts_with(b"HTTP/1.1 403"),
+            "reply: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        assert_eq!(reply.windows(7).filter(|w| *w == b"HTTP/1.").count(), 1);
+        assert!(
+            !root.path().join("mutated").exists(),
+            "POST reached backend"
         );
         cleanup(&manager, task).await;
     }
