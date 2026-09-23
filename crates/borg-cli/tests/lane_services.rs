@@ -700,6 +700,108 @@ fn front_port_survives_lease_restart_and_yield() {
     serves(ports[0]);
 }
 
+/// Start service `id` deferring restarts on `defer`, request a restart
+/// whose replacement takes a minute to load (so the restart barrier on
+/// `defer` is held), and SIGKILL the supervisor, as an OOM kill would; its
+/// unit then kills the backends. Returns the spec, the file that sets the
+/// backend's start delay, and the barrier's ticket.
+fn kill_supervisor_mid_restart(
+    f: &Fixture,
+    id: &str,
+    defer: &ResourceKey,
+) -> (ServiceSpec, PathBuf, String) {
+    let ports = free_ports(3);
+    let slot = unique(&format!("{id}-slot"));
+    f.capacity(&slot, 1);
+    let slow = f.root().join(format!("{id}-start-delay"));
+    let mut spec = f.service(
+        id,
+        f.root(),
+        [ports[0], ports[1], ports[2]],
+        vec![shared(host(&slot))],
+        vec![(START_DELAY_FILE, slow.clone())],
+    );
+    spec.restart.defer_while = vec![defer.clone()];
+    f.start(&spec, &[]);
+    f.resumed(id);
+    std::fs::write(&slow, "60").unwrap();
+    f.run(&["restart", id]);
+    let barrier = until(Duration::from_secs(20), || {
+        f.lane
+            .records()
+            .into_iter()
+            .find(|r| r.restart_barrier && matches!(r.state, TicketState::Granted(_)))
+            .map(|r| r.ticket.id.to_string())
+    });
+    // This test started exactly this supervisor.
+    let supervisor = f.status(id).supervisor_pid.unwrap().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-KILL", &supervisor])
+            .status()
+            .unwrap()
+            .success()
+    );
+    until(Duration::from_secs(20), || {
+        matches!(f.status(id).state, ServiceState::Stopped).then_some(())
+    });
+    (spec, slow, barrier)
+}
+
+/// The barrier ended normally: Finished, not quarantined, released because
+/// its owner was proven gone.
+fn assert_barrier_released(f: &Fixture, barrier: &str) {
+    let row = f.lane.record(barrier).unwrap();
+    assert!(
+        matches!(row.state, TicketState::Finished)
+            && !row.quarantined
+            && row
+                .evidence
+                .as_deref()
+                .is_some_and(|evidence| evidence.contains("released: its owner is gone")),
+        "{row:?}"
+    );
+}
+
+/// Failure mode (F1): the editor's supervisor killed mid-restart (SIGKILL,
+/// OOM, `systemctl stop`) leaves its restart barrier on the tree's build
+/// key, `lane recover` quarantines it, and every later build of the tree
+/// waits until a reboot.
+#[test]
+fn a_build_runs_after_recover_frees_a_killed_restart() {
+    let f = Fixture::scoped();
+    let mut build = f.lane.spec("after-kill", "true");
+    build.timeout_ms = 30_000;
+    let defer = build.lease.resources[0].key.clone();
+    let (_, _, barrier) = kill_supervisor_mid_restart(&f, "killed-editor", &defer);
+    let out = f.lane.cli(&["job", "recover"], None);
+    assert!(out.status.success(), "{}", describe(&out));
+    let job = f.submit(&build, &[]);
+    let waited = f.lane.cli(&["job", "wait", &job, "--timeout", "60"], None);
+    f.assert_job_succeeded(&job, &waited);
+    assert_barrier_released(&f, &barrier);
+}
+
+/// Failure mode (F1): after its supervisor is killed mid-restart, starting
+/// the service again stays stuck behind its predecessor's service lease
+/// and restart barrier, and builds of the tree stay blocked.
+#[test]
+fn a_restarted_supervisor_frees_what_its_killed_predecessor_held() {
+    let f = Fixture::scoped();
+    let mut build = f.lane.spec("after-restart", "true");
+    build.timeout_ms = 30_000;
+    let defer = build.lease.resources[0].key.clone();
+    let (spec, slow, barrier) = kill_supervisor_mid_restart(&f, "restarted-editor", &defer);
+    std::fs::write(&slow, "0").unwrap();
+    // No `lane recover`: the new supervisor's own claims free them.
+    f.start(&spec, &[]);
+    f.resumed("restarted-editor");
+    assert_barrier_released(&f, &barrier);
+    let job = f.submit(&build, &[]);
+    let waited = f.lane.cli(&["job", "wait", &job, "--timeout", "60"], None);
+    f.assert_job_succeeded(&job, &waited);
+}
+
 /// Failure mode: a cold restart (an editor too big to run twice) starting
 /// the replacement while the old backend, or a process it detached, still
 /// runs in its cgroup.
