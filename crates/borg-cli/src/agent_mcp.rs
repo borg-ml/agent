@@ -633,12 +633,74 @@ fn modern_result(mut result: Value) -> Value {
     result
 }
 
-fn legacy_tool_result(value: Value) -> Value {
+/// Images a result may carry as MCP content items. Beyond this they are
+/// dropped with a note rather than growing one tool result without bound.
+const MAX_RESULT_IMAGES: usize = 8;
+/// Count of images lifted out of the metadata, matching the native harness.
+const ATTACHED_IMAGES_KEY: &str = "attached_images";
+const DROPPED_ATTACHMENTS_KEY: &str = "dropped_attachments";
+
+/// Move a result's `borg_attachments` images into MCP `image` content items.
+///
+/// MCP clients (Claude Code, Codex, OpenCode) hand `image` items to the model
+/// as pixels. Base64 left inside the JSON text is only a very long string:
+/// Claude Code measured a 1920x1080 screenshot at about 90k characters and
+/// spooled the whole result to a file, so the model never saw the image. The
+/// metadata keeps a count in place of the base64, and anything that is not a
+/// usable image is dropped with a note so the model knows why it is missing.
+fn lift_result_images(value: &mut Value, images: &mut Vec<Value>, depth: usize) {
+    if depth > MAX_ATTACHMENT_SEARCH_DEPTH {
+        return;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    // Beside the result, or nested under `value` for a runtime script.
+    if let Some(Value::Array(attachments)) = object.remove(ATTACHMENTS_KEY) {
+        let mut lifted = 0;
+        let mut dropped = Vec::new();
+        for (index, attachment) in attachments.into_iter().enumerate() {
+            let media_type = attachment.get("media_type").and_then(Value::as_str);
+            let data = attachment.get("data_base64").and_then(Value::as_str);
+            match (media_type, data) {
+                (Some(media_type), Some(data))
+                    if media_type.starts_with("image/") && !data.is_empty() =>
+                {
+                    if images.len() == MAX_RESULT_IMAGES {
+                        dropped.push(format!(
+                            "#{index}: more than {MAX_RESULT_IMAGES} images per result"
+                        ));
+                        continue;
+                    }
+                    images.push(json!({"type": "image", "data": data, "mimeType": media_type}));
+                    lifted += 1;
+                }
+                (Some(media_type), Some(_)) if !media_type.starts_with("image/") => {
+                    dropped.push(format!("#{index}: {media_type} is not an image"));
+                }
+                _ => dropped.push(format!("#{index}: not an image attachment")),
+            }
+        }
+        object.insert(ATTACHED_IMAGES_KEY.to_string(), json!(lifted));
+        if !dropped.is_empty() {
+            object.insert(DROPPED_ATTACHMENTS_KEY.to_string(), json!(dropped));
+        }
+    }
+    for (_, nested) in object.iter_mut() {
+        lift_result_images(nested, images, depth + 1);
+    }
+}
+
+fn legacy_tool_result(mut value: Value) -> Value {
+    let mut images = Vec::new();
+    lift_result_images(&mut value, &mut images, 0);
+    let mut content = vec![json!({
+        "type": "text",
+        "text": serde_json::to_string(&value).unwrap_or_default()
+    })];
+    content.extend(images);
     let mut result = json!({
-        "content": [{
-            "type": "text",
-            "text": serde_json::to_string(&value).unwrap_or_default()
-        }],
+        "content": content,
         "isError": false
     });
     // MCP requires structuredContent to be a JSON object; array results
@@ -788,6 +850,74 @@ fn rpc_error_with_data(id: Value, code: i64, message: String, data: Value) -> Va
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    /// Failure mode: a screenshot reaching an MCP client (Claude Code) as
+    /// ~90k characters of base64 inside the JSON text, which the client spools
+    /// to a file so the model never sees the pixels.
+    #[test]
+    fn tool_result_images_become_mcp_image_content() {
+        let image = "iVBORw0KGgoAAAANSUhEUg".repeat(4096);
+        for result in [
+            legacy_tool_result(json!({
+                "scope": "window", "window_id": "pd:1", "width": 1920, "height": 1080,
+                "borg_attachments": [{"media_type": "image/png", "data_base64": image}],
+            })),
+            modern_tool_result(json!({
+                "scope": "window", "window_id": "pd:1", "width": 1920, "height": 1080,
+                "borg_attachments": [{"media_type": "image/png", "data_base64": image}],
+            })),
+        ] {
+            let content = result["content"].as_array().unwrap();
+            assert_eq!(content.len(), 2, "{result}");
+            assert_eq!(content[0]["type"], "text");
+            let text = content[0]["text"].as_str().unwrap();
+            assert!(!text.contains("iVBORw0KGgo"), "base64 left in the text");
+            assert!(text.len() < 200, "metadata stays small: {text}");
+            let metadata: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(metadata["window_id"], "pd:1");
+            assert_eq!(metadata["width"], 1920);
+            assert_eq!(metadata[ATTACHED_IMAGES_KEY], 1);
+            assert!(metadata.get(ATTACHMENTS_KEY).is_none());
+            assert_eq!(result["structuredContent"], metadata);
+            assert_eq!(
+                content[1],
+                json!({"type": "image", "data": image, "mimeType": "image/png"})
+            );
+            assert_eq!(result["isError"], false);
+        }
+    }
+
+    /// Failure mode: a runtime script's nested images staying inline, or a
+    /// non-image attachment silently vanishing.
+    #[test]
+    fn nested_and_unusable_attachments_are_reported() {
+        let result = legacy_tool_result(json!({
+            "ok": true,
+            "value": {"borg_attachments": [
+                {"media_type": "image/jpeg", "data_base64": "AAAA"},
+                {"media_type": "text/plain", "data_base64": "AAAA"},
+                {"media_type": "image/png", "data_base64": ""},
+            ]},
+        }));
+        let content = result["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "{result}");
+        assert_eq!(content[1]["mimeType"], "image/jpeg");
+        let value = &result["structuredContent"]["value"];
+        assert_eq!(value[ATTACHED_IMAGES_KEY], 1);
+        assert_eq!(
+            value[DROPPED_ATTACHMENTS_KEY],
+            json!([
+                "#1: text/plain is not an image",
+                "#2: not an image attachment"
+            ])
+        );
+
+        let plain = legacy_tool_result(json!({"ok": true}));
+        assert_eq!(
+            plain["content"],
+            json!([{"type": "text", "text": "{\"ok\":true}"}])
+        );
+    }
 
     /// The reason `borg call` writes images to a spool instead of printing
     /// them: stdout is captured into a bounded buffer by `exec`, so base64
