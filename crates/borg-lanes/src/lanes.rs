@@ -197,7 +197,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LaneRecord {
@@ -766,22 +766,10 @@ impl LaneStore {
                 if service == "test" && self.root.join("fake-resume-ok").exists() {
                     Ok(())
                 } else {
-                    self.service_status(service).and_then(|status| {
-                        if status.yields.contains_key(&id.to_string()) {
-                            self.service_control(service, id, "resume", 0)
-                        } else {
-                            Ok(())
-                        }
-                    })
+                    self.complete_service_resume(service, id)
                 };
             #[cfg(not(test))]
-            let result = self.service_status(service).and_then(|status| {
-                if status.yields.contains_key(&id.to_string()) {
-                    self.service_control(service, id, "resume", 0)
-                } else {
-                    Ok(())
-                }
-            });
+            let result = self.complete_service_resume(service, id);
             self.locked(|state| {
                 let row = state
                     .records
@@ -803,6 +791,38 @@ impl LaneStore {
             result?;
         }
         Ok(())
+    }
+
+    /// A Resume RPC only removes the yield token; startup and readiness are
+    /// asynchronous. Keep journal recovery pending until the backend is
+    /// actually Healthy, and never send Resume twice after its token is gone.
+    fn complete_service_resume(&self, service: &str, id: Uuid) -> Result<()> {
+        let status = self.service_status(service)?;
+        if status.yields.contains_key(&id.to_string()) {
+            self.service_control(service, id, "resume", 0)?;
+        }
+        let started = Instant::now();
+        loop {
+            let status = self.service_status(service)?;
+            if status.yields.is_empty()
+                && matches!(status.state, crate::services::ServiceState::Healthy { .. })
+            {
+                return Ok(());
+            }
+            if matches!(
+                status.state,
+                crate::services::ServiceState::Stopped
+                    | crate::services::ServiceState::Failed { .. }
+            ) || started.elapsed() >= Duration::from_secs(30)
+            {
+                anyhow::bail!(
+                    "service {service} not healthy after resume: {:?}: {}",
+                    status.state,
+                    status.reason
+                );
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
     }
 
     fn service_status(&self, service_id: &str) -> Result<crate::services::ServiceStatus> {
