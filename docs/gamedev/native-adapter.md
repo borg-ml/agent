@@ -1,43 +1,98 @@
 # Native-toolchains Blu adapter
 
 The package in `extensions/native/` is installed with `borg extensions install
-./extensions/native --project`. It uses the same `JobSpec`, `ResourceKey` and
-`AdmissionBudget` as other game-development adapters; no native-specific
-scheduler is added to Borg core. Its five workflow commands submit jobs and
-return IDs immediately. To await a submitted job, run `borg lane job wait ID
---json` in a shell, or use a Borg command watch (`notify_on=exit`). The adapter
-CLI works from the source package (`python3 extensions/native/native.py ...`)
-or the installed package (`python3 .borg/extensions/native/native.py ...`). After
-reviewing any local differences, refresh an existing owned install with
-`borg extensions install ./extensions/native --project --force --json`; without
-`--force`, Borg retains the older installed files rather than updating them.
+./extensions/native --project`. It is pure Blu (`workflows/native.blu`,
+`runtime_access = "sandboxed"`); no Python or other interpreter is needed. It
+uses the same `JobSpec`, `ResourceKey` and `AdmissionBudget` as other
+game-development adapters; no native-specific scheduler is added to Borg core.
+Host effects go through `borg_exec`, so a run needs Full Access or an approved
+workflow call.
+
+One workflow, `native`, takes a command-line style `arguments` string. It is
+exposed as the tool `ext__native__run` (which also takes a fresh `request_id`,
+because identical tool arguments replay) and the command `/ext:native:run`:
+
+```text
+[--project DIR] [--target-dir DIR] [--build-dir DIR] [--dry-run]
+  cargo check|build|test [-p PKG]
+  cmake configure|build [--target T]
+  ctest test [--exclude-label L] [--label L] [--regex R]
+  postgres cargo test [-p PKG]
+  service show|start [--data-dir DIR] [--port N]
+  [-- raw tool flags]
+```
+
+It submits one lane job and returns the `borg lane job submit` JSON (job ID)
+immediately; `--dry-run` returns the planned argv/env/JobSpec instead. To
+await a job, run `borg lane job wait ID --json` in a shell, or use a Borg
+command watch (`notify_on=exit`). Toolchains never run outside the lane. The
+former Python CLI's `--probe-direct`, `wait` and `workspace gc` modes were
+removed; use `borg lane job wait` and `borg worktree --project ROOT gc`
+(dry-run) directly. The five preset commands (`/ext:native:cargo-test`, …)
+are replaced by `/ext:native:run <args>`. After reviewing any local
+differences, refresh an existing owned install with `borg extensions install
+./extensions/native --project --force --json`; without `--force`, Borg retains
+the older installed files.
 
 Cargo `check`, `build`, `test` use a worktree-private `target`, debug profile,
 `-j` sized from MemAvailable (8 GiB reserve plus 2 GiB fixed job overhead,
-max six actions). Set `BORG_NATIVE_MAX_JOBS=2` to lower concurrency and its
+max six actions). Set `BORG_NATIVE_MAX_JOBS=2` (1..6) to lower concurrency and its
 honest RAM reservation on a busy host; it cannot bypass the admission floor.
 CMake uses a private `build` and Release profile; ctest includes `-j`, regex
-and `-L`/`-LE`
-label selection. All output paths must remain inside the current worktree.
-Jobs request an exclusive worktree output resource, memory reserve and 60 GiB
-host disk floor. Cargo jobs reserve 24 GiB of additional disk headroom, while
-CMake/ctest reserve 6 GiB. Source/argv/env fingerprinting prevents a different
-build from joining a pending coalesced job. PostgreSQL tests never coalesce
-between client databases.
+and `-L`/`-LE` label selection. All output paths must remain inside the
+current worktree. Jobs request an exclusive worktree output resource, memory
+reserve and 60 GiB host disk floor. Cargo jobs reserve 24 GiB of additional
+disk headroom, while CMake/ctest reserve 6 GiB. Source/argv/env fingerprinting
+prevents a different build from joining a pending coalesced job. PostgreSQL
+tests never coalesce between client databases.
 
-The wrapper `extensions/native/postgres.py` leases the supervised `test-postgres`
-service, creates a client database and gives `BORG_TEST_SESSIONS_URL` to the
-Cargo job; after `borg lane job wait` it drops only that database and releases
-its own lease even if tests fail. `python3 extensions/native/services/test_postgres.py --start` initializes
-an owned throwaway `/tmp` cluster with peer-only Unix socket authentication and
-starts it through `borg lane service`. Set the printed
-`BORG_TEST_POSTGRES_ADMIN_URL` in the client environment. This requires the
-lane CLI built from the integration branch; the old `borg 0.9.5` executable
-cannot serve these commands. Set `BORG_NATIVE_BORG` to the built
-`target/debug/borg` to test without replacing the installed CLI. Do not put
-database passwords in job specs.
+`postgres cargo test ...` attaches lane hooks to the job instead of a blocking
+wrapper. The pre-hook runs only when the job reaches the head of its queue:
+it leases `test-postgres` under a per-job owner and creates a per-job
+database, whose URL the job receives as `BORG_TEST_SESSIONS_URL`. The
+post-hook drops only that database and releases that lease after the job
+finishes, fails, times out, or its pre-hook fails; a queued or cancelled job
+holds nothing. If the lane supervisor itself dies, the one-hour lease TTL
+bounds the leak. `service start` initializes an owned throwaway `/tmp`
+cluster with peer-only Unix socket authentication and starts it through
+`borg lane service`; `service show` prints the definition only. Set the
+printed `BORG_TEST_POSTGRES_ADMIN_URL` in the client environment. Set
+`BORG_NATIVE_BORG` to a built `target/debug/borg` to test without replacing
+the installed CLI. Database passwords are refused, never put in job specs.
 
-## Reproducible probes (2026-09-23)
+The Blu engine differs from stock Lua in ways that matter here: a bare `-` in
+a pattern is rejected (write `%-`), and long `..` chains inside a function
+overflow the compiler stack on the runtime's 2 MiB worker thread, so commands
+are built with `table.concat`. The runtime test
+`blu_workflow::tests::native_package_refuses_output_outside_the_worktree`
+executes the real package source to guard this.
+
+## Blu port verification (2026-09-23)
+
+- Dry-run plans from the Blu workflow matched the former `native.py` exactly
+  (argv, env, JobSpec apart from random correlators and fingerprint) for
+  `ctest test --regex --exclude-label -- --timeout 60`, `cmake build --target`,
+  `cmake configure -- -DX=1` and `cargo check -p borg-core -- --locked`.
+- Through the real Blu engine against an isolated lane (`BORG_LANE_DIR`):
+  `cmake configure`, `cmake build --target probe` and `ctest test --regex
+  ^probe$` on a scratch CMake project each submitted a job that finished with
+  exit 0 (1/1 test passed). The 60 GiB disk floor had to be lowered in a
+  scratch copy because this host had under 60 GiB free; the unmodified
+  workflow correctly refused.
+- A Blu-planned `postgres cargo test` spec, with its argv replaced by a probe
+  that prints `current_database()` and exits non-zero, ran inside
+  `borg_native_<id>`, finished with exit 1, and left `test-postgres` Healthy
+  with zero clients and zero `borg_native_%` databases. With another owner
+  holding the service lease, the pre-hook failed (exit 125, "pre-exclusive
+  hook exited"), the workload never ran, and no database was left.
+- `service start` provisioned and started a Healthy peer-auth cluster;
+  a second `service start` refused because the service was already running.
+
+## Historical probes of the former Python adapter (2026-09-23)
+
+These were measured with the removed `native.py`/`postgres.py` (see git
+history); the job-planning behaviour is unchanged by the Blu port.
+
 
 - `python3 -m unittest discover -s extensions/native/tests -v`: twelve pass.
 - `borg extensions install ./extensions/native --project --json`: active,
@@ -118,7 +173,7 @@ database passwords in job specs.
 ## Remaining integration/decisions
 
 - The present services core accepts one **distinct lease owner** per service:
-  while client A holds `test-postgres`, the stock `postgres.py` wrapper for
+  while client A holds `test-postgres`, the postgres job for
   client B (a different UUID owner) is rejected with `service lease held by
   another owner`, not queued. Therefore sequential leased test coverage above
   does **not** demonstrate two concurrent independent Postgres clients. Do not
@@ -142,7 +197,6 @@ database passwords in job specs.
   enhancement before claiming that feature.
 - Never invoke GC apply from this package. `borg worktree gc --apply` must be
   a separately reviewed/human-confirmed operation after ownership checks.
-- The `cargo_test` Blu workflow requires a leased or otherwise configured
-  `BORG_TEST_SESSIONS_URL`; the shell wrapper holds the database lease across
-  the job wait. Without a configured URL, the runtime test suite is refused
-  rather than silently skipping its Postgres tests.
+- `cargo test -p borg-agent-runtime` without `postgres` requires a leased or
+  otherwise configured `BORG_TEST_SESSIONS_URL`; without one, the runtime
+  test suite is refused rather than silently skipping its Postgres tests.

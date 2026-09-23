@@ -2078,4 +2078,38 @@ return receipt
         );
         scratch.discard().await;
     }
+
+    /// The native package keeps toolchain output private to one worktree. Run
+    /// its real source here: the Blu engine's pattern support differs from
+    /// stock Lua, so only this runtime proves the refusal still executes.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn native_package_refuses_output_outside_the_worktree() {
+        let (scratch, runner, _directory) = external_runner(PermissionMode::FullAccess).await;
+        for output in ["../shared-target", "/tmp/shared-target"] {
+            let result = runner
+                .clone()
+                .with_invocation_arguments(json!({
+                    "arguments": format!("cargo build --target-dir {output} --dry-run")
+                }))
+                .run(BluWorkflowRequest {
+                    workflow_id: Uuid::new_v4(),
+                    name: "native:native".to_string(),
+                    source: include_str!("../../../extensions/native/workflows/native.blu")
+                        .to_string(),
+                })
+                .await
+                .expect("workflow terminal record");
+            assert!(!result.success, "{result:?}");
+            assert!(
+                result
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("output must stay in worktree"),
+                "{result:?}"
+            );
+        }
+        scratch.discard().await;
+    }
 }

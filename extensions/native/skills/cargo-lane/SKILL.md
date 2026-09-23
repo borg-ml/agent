@@ -6,38 +6,43 @@ description: "Build and test Cargo worktrees with bounded RAM, private targets a
 # Cargo native lane
 
 Run from the worktree root, not the canonical dirty checkout. The adapter is
-`extensions/native/native.py` (source) or `.borg/extensions/native/native.py` (installed) and uses `cargo check|build|test`
-with `-j` (at most 6, from MemAvailable with an 8 GiB reserve plus 2 GiB fixed job overhead). It sets
-`CARGO_TARGET_DIR` to this worktree's `target/` and does not use `--release`.
-On a busy host, `BORG_NATIVE_MAX_JOBS=2` lowers both `-j` and its lane RAM
-reservation; it cannot lower the 8 GiB admission floor.
-Pass additional Cargo args **after** `--` to avoid mixing adapter flags with
-Cargo flags. To pass test-harness flags such as `--skip`, supply a second
-`--` so Cargo forwards them: `cargo test -p borg-agent-runtime -- -- --skip NAME`.
+the `native` Blu workflow (`extensions/native/workflows/native.blu`), exposed
+as the tool `ext__native__run` and the command `/ext:native:run`. It takes one
+`arguments` string and needs no Python. As a tool, also pass a fresh
+`request_id`: identical tool arguments replay the earlier result.
 
-```sh
-python3 .borg/extensions/native/native.py cargo test -p borg-agent-runtime
-python3 .borg/extensions/native/native.py cargo check -- --workspace
-python3 .borg/extensions/native/native.py workspace gc  # dry-run
+It plans `cargo check|build|test` with `-j` (at most 6, from MemAvailable with
+an 8 GiB reserve plus 2 GiB fixed job overhead), sets `CARGO_TARGET_DIR` to
+this worktree's `target/` (a `--target-dir` outside the worktree is refused)
+and does not use `--release`. `BORG_NATIVE_MAX_JOBS=2` lowers both `-j` and its
+lane RAM reservation; it cannot lower the 8 GiB admission floor. Raw Cargo
+flags go after `--`; test-harness flags need a second `--`.
+
+```text
+/ext:native:run cargo test -p borg-agent-runtime -- -- --skip NAME
+/ext:native:run cargo check -- --workspace
+/ext:native:run --dry-run cargo build          # print the JobSpec only
+/ext:native:run postgres cargo test -p borg-agent-runtime
 ```
 
-The `cargo_test` workflow requires a pre-leased `BORG_TEST_SESSIONS_URL` and submits only; it does not hold a service lease while waiting. The shell PostgreSQL wrapper below holds the lease across the job wait. The workflow and `/ext:native:cargo-test` run the Borg
-runtime package. Submit independent operations as core jobs; `borg lane job wait
-ID` blocks on the lane's notification, or use Borg `watch` on that command if
-other work can proceed. No `sleep`/status polling. Engine-neutral resources:
-host CPU/RAM slots and a worktree-private target; only shared fixtures take a
-host/service lease. Run `borg worktree --project "$PWD" budget` and preview `borg worktree --project "$PWD" gc` before any human-confirmed GC; core currently caps per-agent disk, not individual targets. Never manually delete a live agent's target.
+The workflow submits one `borg lane job` and returns its ID immediately. Toolchains
+run only inside that lane job; there is no uncoordinated mode. Await it with
+`borg lane job wait ID --json` in a shell, or a Borg `watch` on that command
+if other work can proceed. No `sleep`/status polling. Resources: host CPU/RAM
+slots and a worktree-private target; only shared fixtures take a service
+lease. Run `borg worktree --project "$PWD" budget` and preview
+`borg worktree --project "$PWD" gc` (dry-run) before any human-confirmed GC.
+Never manually delete a live agent's target.
 
-Borg runtime tests require `BORG_TEST_SESSIONS_URL` pointing at an admin
-PostgreSQL database with CREATEDB privileges; each test creates a UUID scratch
-database. Run `python3 .borg/extensions/native/postgres.py -- python3 .borg/extensions/native/native.py cargo test -p borg-agent-runtime`. The wrapper leases the `test-postgres` shared service, creates a per-client database and provides `BORG_TEST_SESSIONS_URL`; it drops only its own database and releases its lease in a finally block. A service administrator supplies `BORG_TEST_POSTGRES_ADMIN_URL` (do not commit credentials). Never stop another agent's service. Never claim PostgreSQL coverage with
-this URL missing (the suite intentionally fails). Current service core admits
-only one distinct lease owner at a time: two simultaneous `postgres.py`
-wrappers targeting one `test-postgres` service do not both get leases. Do not
-reuse an owner token across wrappers: the first release could invalidate the
-second job. See `docs/gamedev/native-adapter.md` for the explicit limitation.
-
-Normal execution requires a built CLI exposing `borg lane job submit`.
-`--dry-run` prints argv/env for verification; `--probe-direct` runs
-**uncoordinated**, only for explicit bootstrap/benchmark probes, not routine
-multi-agent work.
+`cargo test -p borg-agent-runtime` requires PostgreSQL: it is refused unless
+`BORG_TEST_SESSIONS_URL` is set or the `postgres` prefix is used. With
+`postgres`, the job's lane pre-hook leases the `test-postgres` service and
+creates a per-job database, and the job receives its URL as
+`BORG_TEST_SESSIONS_URL`. The post-hook drops that database and releases the
+lease after the job ends, including after failure, timeout, or a failed
+pre-hook. A queued job holds nothing. A service administrator supplies
+`BORG_TEST_POSTGRES_ADMIN_URL` (no passwords; they are refused).
+`/ext:native:run service start` provisions an owned peer-auth `/tmp` cluster
+and prints that URL. Never stop another agent's service. Service core admits
+one distinct lease owner at a time, so a second concurrent postgres job fails
+its pre-hook instead of queueing. See `docs/gamedev/native-adapter.md`.
