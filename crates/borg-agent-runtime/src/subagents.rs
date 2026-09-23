@@ -1882,6 +1882,10 @@ impl AgentToolDispatcher {
                         .await,
                 )
             }
+            "lane_workspace" => {
+                let args: LaneWorkspaceArgs = serde_json::from_value(arguments)?;
+                self.call_lane_workspace(args).await
+            }
             "lsp_status" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
                 Ok(self.lsp.status().await)
@@ -7153,6 +7157,20 @@ pub fn agent_tool_specs_for_surface(
             )
         });
     }
+    if surface.shared_work {
+        specs.push(tool(
+            "lane_workspace",
+            "Manage local Git worktrees and a shared-work-linked freeze handshake. GC defaults to dry-run; confirmed deletion requires explicit apply and a journal-confirmed exited owner. Freeze is advisory until the exclusive project lane is acquired; first create/claim shared_work and communicate with affected agents.",
+            json!({"type":"object", "properties": {
+                "op":{"type":"string","enum":["create","list","gc","budget","freeze_preview","freeze","freeze_status","ack","land","unfreeze","abort"]},
+                "project":{"type":"string"}, "root":{"type":"string"}, "task":{"type":"string"},
+                "shared_cargo":{"type":"boolean"}, "apply":{"type":"boolean"}, "force":{"type":"boolean"},
+                "confirmed":{"type":"boolean"}, "globs":{"type":"array","items":{"type":"string"}},
+                "work_id":{"type":"string","format":"uuid"}, "freeze_id":{"type":"string","format":"uuid"},
+                "reason":{"type":"string"}, "note":{"type":"string"}, "deadline_secs":{"type":"integer","minimum":1,"maximum":86400}
+            },"required":["op","project"],"additionalProperties":false}),
+        ));
+    }
     specs.extend(crate::self_service::tool_specs());
     if surface.shared_work {
         specs.extend(shared_work_tool_specs());
@@ -8817,5 +8835,211 @@ mod socket_path_tests {
         {
             std::fs::remove_dir_all(parent).ok();
         }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaneWorkspaceArgs {
+    op: String,
+    project: PathBuf,
+    root: Option<PathBuf>,
+    task: Option<String>,
+    #[serde(default)]
+    shared_cargo: bool,
+    #[serde(default)]
+    apply: bool,
+    #[serde(default)]
+    force: bool,
+    #[serde(default)]
+    confirmed: bool,
+    globs: Option<Vec<String>>,
+    work_id: Option<Uuid>,
+    freeze_id: Option<Uuid>,
+    reason: Option<String>,
+    note: Option<String>,
+    deadline_secs: Option<u64>,
+}
+
+impl AgentToolDispatcher {
+    async fn call_lane_workspace(&self, args: LaneWorkspaceArgs) -> Result<Value> {
+        use borg_lanes::workspace::hygiene;
+        ensure!(
+            self.shared_work.is_some(),
+            "workspace coordination requires shared_work capability"
+        );
+        let project = args.project.canonicalize().context("project must exist")?;
+        let team = self
+            .subagents
+            .as_ref()
+            .context("workspace coordination requires multiplayer session directory")?;
+        let journal = self
+            .journal
+            .as_ref()
+            .context("session journal unavailable")?;
+        // Only act on the caller's repository; another project's local paths
+        // must not be addressable through this session-scoped MCP tool.
+        let same_repo = |path: &Path| -> Result<PathBuf> {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+                .output()?;
+            ensure!(output.status.success(), "project is not a Git repository");
+            Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()).canonicalize()?)
+        };
+        ensure!(
+            same_repo(&project)? == same_repo(&self.runtime_root)?,
+            "project must be in the caller's Git repository"
+        );
+        let binding = journal
+            .workspace_binding(self.actor_session_id)
+            .await?
+            .context("workspace binding required")?;
+        let store = team.workspace_store().await?;
+        let mut active = Vec::new();
+        let mut exited = Vec::new();
+        for instance in store.list_instances(true).await? {
+            let id = instance.participant.id;
+            if journal.workspace_binding(id).await?.is_none() {
+                continue;
+            }
+            let owner_running =
+                crate::local_session_owner_is_active(&team.journal_root, id).unwrap_or(false);
+            let socket = crate::session_control_socket_path(&team.journal_root, id);
+            let live = owner_running || crate::session_control_socket_is_reachable(&socket).await;
+            if live {
+                if let Some(cwd) = instance.cwd {
+                    active.push((id, PathBuf::from(cwd)));
+                }
+            } else if instance.exited_at.is_some() {
+                exited.push(id)
+            }
+        }
+        let budget = hygiene::WorkspaceBudgets::default();
+        let value = match args.op.as_str() {
+            "create" => {
+                let task = args.task.context("task required")?;
+                let root = args
+                    .root
+                    .unwrap_or_else(|| project.parent().unwrap_or(&project).join("borg-wt"));
+                json!(hygiene::create_worktree(
+                    &project,
+                    &root,
+                    &task,
+                    self.actor_session_id,
+                    args.shared_cargo,
+                    &budget
+                )?)
+            }
+            "list" => json!(hygiene::inventory(&project, &active)?),
+            "gc" => {
+                ensure!(
+                    !args.apply || args.confirmed,
+                    "GC deletion requires explicit human confirmation of this exact action"
+                );
+                let mut candidates = Vec::new();
+                for mut tree in hygiene::inventory(&project, &active)? {
+                    let exit_confirmed = tree.owner.is_some_and(|id| exited.contains(&id));
+                    tree.owner_gone = exit_confirmed;
+                    let eligible = (tree.gc_reason.is_some()
+                        || (args.force
+                            && (tree.merged || tree.abandoned)
+                            && !tree.owner_live
+                            && tree.owner.is_some()))
+                        && exit_confirmed;
+                    let protection = if tree.owner.is_none() {
+                        "unmanaged or unknown owner"
+                    } else if tree.owner_live {
+                        "live owner"
+                    } else if !tree.merged && !tree.abandoned {
+                        "unmerged branch"
+                    } else if tree.dirty && !args.force {
+                        "dirty; explicit force required"
+                    } else if !exit_confirmed {
+                        "owner exit unconfirmed"
+                    } else {
+                        "none"
+                    };
+                    let removed = if args.apply && eligible {
+                        hygiene::gc(&project, &tree, &exited, true, args.force)?
+                    } else {
+                        false
+                    };
+                    candidates.push(json!({"tree":tree,"owner_exit_confirmed":exit_confirmed,
+                        "eligible":eligible,"protection":protection,"removed":removed}));
+                }
+                json!({"dry_run": !args.apply, "candidates":candidates})
+            }
+            "budget" => {
+                let disk = hygiene::disk_available(&project)?;
+                let ram = hygiene::ram_available()?;
+                let admission = hygiene::assess_admission(&budget, disk, ram, 0, 0, 0, 0);
+                if let Some(reason) = &admission.reason {
+                    team.broadcast_message_as(self.actor_session_id,
+                        &format!("Workspace pressure: {reason}; pause new builds and inspect `borg worktree gc`. Do not delete an active or dirty worktree.")).await?;
+                }
+                json!(admission)
+            }
+            "freeze_preview" => json!(hygiene::freeze_preview(
+                &project,
+                &args.globs.context("globs required")?,
+                &active
+            )?),
+            "freeze_status" => json!(hygiene::freeze_status(&project)?),
+            "freeze" => {
+                let freeze = hygiene::request_freeze(
+                    &project,
+                    args.work_id
+                        .context("claimed shared_work work_id required")?,
+                    self.actor_session_id,
+                    args.globs.context("globs required")?,
+                    args.reason.context("reason required")?,
+                    args.deadline_secs.unwrap_or(1800),
+                    &active,
+                )?;
+                team.broadcast_message_as(self.actor_session_id, &format!(
+                    "Freeze requested for {:?} (shared work {}). Ack freeze {} before deadline {}; preserve dirty edits and coordinate with owner {}.",
+                    freeze.globs, freeze.work_id, freeze.id, freeze.deadline_unix, binding.participant_id)).await?;
+                json!(freeze)
+            }
+            "ack" => json!(hygiene::acknowledge_freeze(
+                &project,
+                args.freeze_id.context("freeze_id required")?,
+                self.actor_session_id
+            )?),
+            "land" => json!(hygiene::land_freeze(
+                &project,
+                args.freeze_id.context("freeze_id required")?,
+                self.actor_session_id,
+                args.note.context("where did X move note required")?,
+                &active
+            )?),
+            "unfreeze" | "abort" => {
+                let freeze = hygiene::finish_freeze(
+                    &project,
+                    args.freeze_id.context("freeze_id required")?,
+                    self.actor_session_id,
+                    args.op == "abort",
+                )?;
+                team.broadcast_message_as(
+                    self.actor_session_id,
+                    &format!(
+                        "Freeze {} {:?} for {:?}. {}",
+                        freeze.id,
+                        freeze.status,
+                        freeze.globs,
+                        freeze
+                            .moved_note
+                            .as_deref()
+                            .unwrap_or("Aborted; no changes landed.")
+                    ),
+                )
+                .await?;
+                json!(freeze)
+            }
+            _ => bail!("unknown lane_workspace operation"),
+        };
+        Ok(value)
     }
 }
