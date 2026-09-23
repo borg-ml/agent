@@ -17,7 +17,7 @@ use smithay::desktop::{
     get_popup_toplevel_coords,
 };
 use smithay::input::keyboard::XkbConfig;
-use smithay::input::pointer::CursorImageStatus;
+use smithay::input::pointer::{CursorImageStatus, PointerHandle};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::generic::Generic;
@@ -37,6 +37,9 @@ use smithay::wayland::dmabuf::{
     DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier,
 };
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
+use smithay::wayland::pointer_constraints::{
+    PointerConstraint, PointerConstraintsHandler, PointerConstraintsState, with_pointer_constraint,
+};
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::data_device::{
@@ -52,8 +55,8 @@ use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_output,
-    delegate_relative_pointer, delegate_seat, delegate_shm, delegate_viewporter,
-    delegate_xdg_shell,
+    delegate_pointer_constraints, delegate_relative_pointer, delegate_seat, delegate_shm,
+    delegate_viewporter, delegate_xdg_shell,
 };
 
 use crate::control;
@@ -76,6 +79,8 @@ pub(crate) struct State {
     pub(crate) renderer: GlesRenderer,
     pub(crate) renderer_info: RendererInfo,
     pub(crate) pointer_location: Point<f64, Logical>,
+    /// The cursor the focused client asked for, drawn into screenshots on request.
+    pub(crate) cursor: CursorImageStatus,
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
     shm_state: ShmState,
@@ -253,6 +258,7 @@ pub(crate) fn run() -> Result<()> {
     let data_device_state = DataDeviceState::new::<State>(&display_handle);
     ViewporterState::new::<State>(&display_handle);
     RelativePointerManagerState::new::<State>(&display_handle);
+    PointerConstraintsState::new::<State>(&display_handle);
     let mut seat_state = SeatState::new();
     let mut seat = seat_state.new_wl_seat(&display_handle, "borg-private");
     seat.add_keyboard(XkbConfig::default(), 400, 30)
@@ -345,6 +351,7 @@ pub(crate) fn run() -> Result<()> {
         renderer,
         renderer_info: renderer_info.clone(),
         pointer_location: (0.0, 0.0).into(),
+        cursor: CursorImageStatus::default_named(),
         compositor_state,
         xdg_shell_state,
         shm_state,
@@ -433,6 +440,41 @@ impl State {
         self.window_for_surface(&focus)
     }
 
+    /// The active pointer constraint on the surface under the pointer, if any.
+    pub(crate) fn active_constraint(&self) -> Option<Constraint> {
+        let pointer = self.seat.get_pointer()?;
+        let (surface, _) = self.surface_under(self.pointer_location)?;
+        with_pointer_constraint(&surface, &pointer, |constraint| {
+            let constraint = constraint.filter(|constraint| constraint.is_active())?;
+            Some(match &*constraint {
+                PointerConstraint::Locked(_) => Constraint::Locked,
+                PointerConstraint::Confined(_) => Constraint::Confined,
+            })
+        })
+    }
+
+    /// Activate a pending lock or confinement once the pointer is over its
+    /// surface (and inside its region), as a desktop compositor would.
+    pub(crate) fn maybe_activate_constraint(&self) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let Some((surface, origin)) = self.surface_under(self.pointer_location) else {
+            return;
+        };
+        let local = self.pointer_location - origin;
+        with_pointer_constraint(&surface, &pointer, |constraint| {
+            if let Some(constraint) = constraint
+                && !constraint.is_active()
+                && constraint
+                    .region()
+                    .is_none_or(|region| region.contains(local.to_i32_round()))
+            {
+                constraint.activate();
+            }
+        });
+    }
+
     pub(crate) fn surface_under(
         &self,
         position: Point<f64, Logical>,
@@ -486,6 +528,38 @@ impl State {
 }
 
 struct Placed;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Constraint {
+    Locked,
+    Confined,
+}
+
+impl PointerConstraintsHandler for State {
+    fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
+        if pointer.current_focus().as_ref() == Some(surface) {
+            self.maybe_activate_constraint();
+        }
+    }
+
+    fn cursor_position_hint(
+        &mut self,
+        surface: &WlSurface,
+        pointer: &PointerHandle<Self>,
+        location: Point<f64, Logical>,
+    ) {
+        let active = with_pointer_constraint(surface, pointer, |constraint| {
+            constraint.is_some_and(|constraint| constraint.is_active())
+        });
+        if let Some((focus, origin)) = self.surface_under(self.pointer_location)
+            && active
+            && &focus == surface
+        {
+            self.pointer_location = origin + location;
+            pointer.set_location(self.pointer_location);
+        }
+    }
+}
 
 impl CompositorHandler for State {
     fn compositor_state(&mut self) -> &mut CompositorState {
@@ -572,7 +646,9 @@ impl SeatHandler for State {
         &mut self.seat_state
     }
 
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        self.cursor = image;
+    }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         let client = focused.and_then(|surface| self.display_handle.get_client(surface.id()).ok());
@@ -679,3 +755,4 @@ delegate_output!(State);
 delegate_xdg_shell!(State);
 delegate_viewporter!(State);
 delegate_relative_pointer!(State);
+delegate_pointer_constraints!(State);
