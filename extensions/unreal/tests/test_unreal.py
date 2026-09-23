@@ -466,6 +466,7 @@ time.sleep(0.3)  # Closing MCP is not enough: the process must exit too.
                                          stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE, text=True)
                 try:
+                    assert child.stdout is not None
                     self.assertEqual(child.stdout.readline().strip(), 'ready')
                     record = json.loads(pid_file.read_text())
                     self.assertEqual(record['pid'], child.pid)
