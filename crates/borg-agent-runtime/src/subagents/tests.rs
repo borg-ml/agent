@@ -2000,6 +2000,92 @@ async fn a_human_stopped_worker_is_not_reused_for_a_new_task() {
     scratch.discard().await;
 }
 
+/// A model switch must not rotate the worker, lose its conversation, or
+/// revert to the launch lane when that child is resumed after a stop.
+#[tokio::test]
+async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let mut root_launch = launch();
+    root_launch.cwd = directory.path().to_path_buf();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        root_launch,
+        2,
+        Arc::new(RecordingPeerExecutor::default()),
+        store.clone(),
+    )
+    .unwrap();
+    let child = coordinator
+        .spawn(SpawnSubagent {
+            task_name: "worker".into(),
+            message: "Remember this original prompt.".into(),
+            provider: Some(CodingProvider::Claude),
+            model: Some("claude-opus-5-5".into()),
+            effort: Some("high".into()),
+        })
+        .await
+        .unwrap();
+    let target = child.task_name.as_str();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while coordinator.get(child.session_id).await.unwrap().status != SubagentStatus::Ready {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let unauthorized = coordinator
+        .call_tool_as(
+            child.session_id,
+            "configure_agent",
+            json!({ "target": target, "provider": "codex" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(unauthorized.to_string().contains("only the director"));
+
+    let configured = coordinator
+        .call_tool_as(
+            root,
+            "configure_agent",
+            json!({ "target": target, "provider": "codex", "model": "gpt-6-sol", "effort": "max" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(configured["agent"]["session_id"], child.session_id.to_string());
+    assert_eq!(configured["agent"]["provider"], "codex");
+    assert_eq!(configured["agent"]["model"], "gpt-6-sol");
+    assert_eq!(configured["agent"]["effort"], "max");
+    let state = store.state(child.session_id).await.unwrap();
+    let config = state.configuration.unwrap();
+    assert_eq!(config.provider, CodingProvider::Codex);
+    assert_eq!(config.model.as_deref(), Some("gpt-6-sol"));
+    assert_eq!(config.effort.as_deref(), Some("max"));
+    assert_eq!(state.latest_prompt.as_deref(), Some("Remember this original prompt."));
+
+    coordinator.stop(target).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while coordinator.get(child.session_id).await.unwrap().status != SubagentStatus::Stopped {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    coordinator.ensure_child_actor(child.session_id).await.unwrap();
+    let revived = coordinator.get(child.session_id).await.unwrap();
+    assert_eq!(revived.session_id, child.session_id);
+    assert_eq!(revived.provider, CodingProvider::Codex);
+    assert_eq!(revived.model.as_deref(), Some("gpt-6-sol"));
+    assert_eq!(revived.effort.as_deref(), Some("max"));
+    coordinator.stop_all().await;
+    scratch.discard().await;
+}
+
 #[tokio::test]
 async fn ensuring_a_sidecar_reuses_one_idle_provider_session() {
     let directory = tempdir().unwrap();
