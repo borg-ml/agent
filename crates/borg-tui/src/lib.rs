@@ -8571,10 +8571,8 @@ impl BorgTerminal {
                 status_highlight,
                 status_duration.as_deref(),
             );
-            if session_is_active && self.running_sweeps {
-                let mut status_line = Line::from(status_spans);
-                apply_running_activity_pulse(&mut status_line, running_shimmer_phase());
-                status_spans = status_line.spans;
+            if session_is_active && self.running_sweeps && !status_highlight {
+                apply_running_status_shimmer(&mut status_spans, running_shimmer_phase());
             }
             let status_width = status_spans.iter().map(|span| span.width()).sum::<usize>();
             let agents_status = agents_status_label(active_subagents);
@@ -15981,6 +15979,56 @@ fn running_shimmer_phase() -> u128 {
 fn apply_running_activity_pulse(line: &mut Line<'static>, phase: u128) {
     let content_width = running_activity_content_width(line);
     apply_running_activity_pulse_with_width(line, phase, content_width);
+}
+
+fn apply_running_status_shimmer(spans: &mut Vec<Span<'static>>, phase: u128) {
+    let has_duration = spans.len() > 2;
+    let Some(label) = spans.get(1).cloned() else {
+        return;
+    };
+    let label_width = UnicodeWidthStr::width(label.content.as_ref());
+    if label_width == 0 {
+        return;
+    }
+
+    let period = label_width.saturating_add(RUNNING_SHIMMER_PADDING * 2);
+    let center = ((phase % RUNNING_SHIMMER_CYCLE_MILLIS) * period as u128
+        / RUNNING_SHIMMER_CYCLE_MILLIS) as usize;
+    let Color::Rgb(background_red, background_green, background_blue) = COMMAND_PANEL_BG else {
+        unreachable!("command panel background is RGB")
+    };
+    let mut offset = 0usize;
+    let mut animated = Vec::with_capacity(label.content.graphemes(true).count());
+    for grapheme in label.content.graphemes(true) {
+        let distance = offset
+            .saturating_add(RUNNING_SHIMMER_PADDING)
+            .abs_diff(center) as f32;
+        let intensity = if distance <= RUNNING_SHIMMER_HALF_WIDTH {
+            0.5 * (1.0 + (std::f32::consts::PI * distance / RUNNING_SHIMMER_HALF_WIDTH).cos())
+        } else {
+            0.0
+        };
+        let fade = intensity * 0.9;
+        let channel = |base: u8, background: u8| {
+            (f32::from(base) * (1.0 - fade) + f32::from(background) * fade) as u8
+        };
+        animated.push(Span::styled(
+            grapheme.to_string(),
+            label
+                .style
+                .fg(Color::Rgb(
+                    channel(202, background_red),
+                    channel(193, background_green),
+                    channel(196, background_blue),
+                ))
+                .add_modifier(Modifier::BOLD),
+        ));
+        offset = offset.saturating_add(UnicodeWidthStr::width(grapheme));
+    }
+    spans.splice(1..2, animated);
+    if has_duration && let Some(duration) = spans.last_mut() {
+        duration.style = duration.style.fg(Color::Gray);
+    }
 }
 
 fn running_activity_content_width(line: &Line<'static>) -> usize {
