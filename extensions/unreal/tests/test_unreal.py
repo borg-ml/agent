@@ -126,6 +126,9 @@ class AdapterTests(unittest.TestCase):
         build.write_text('#!/bin/sh\n'
                          'for arg; do case "$arg" in -Log=*) log="${arg#-Log=}";; esac; done\n'
                          'echo "[1/1] Compile" > "$log"\n'
+                         'test -d "$TMPDIR" && test -d "$UBA_FILE_MAPPING_DIR" || exit 92\n'
+                         'printf "%s\n%s\n" "$TMPDIR" "$UBA_FILE_MAPPING_DIR" > "' +
+                         str(self.root / 'uba-env.txt') + '"\n'
                          'mkdir -p "' + str(self.project.parent / 'Binaries/Linux') + '"\n'
                          'echo changed > "' + str(self.project.parent / 'Binaries/Linux/libGame.so') + '"\n'
                          'for fd in /proc/$$/fd/*; do\n'
@@ -134,13 +137,27 @@ class AdapterTests(unittest.TestCase):
                          'done\n')
         manifest = self.root / 'changed.json'
         log = self.root / 'build.log'
-        env = dict(self.env, UE_UBT_START_LOCK=str(self.root / 'ubt.lock'))
+        ambient_mapping = self.root / 'shared-uba'
+        env = dict(self.env, UE_UBT_START_LOCK=str(self.root / 'ubt.lock'),
+                   TMPDIR=str(self.root), UBA_FILE_MAPPING_DIR=str(ambient_mapping))
         proc = subprocess.run([sys.executable, str(ROOT / 'bin/ubt.py'),
                                '--symbols', str(manifest), '--', str(build),
                                'GameEditor', 'Linux', 'Development', str(self.project),
                                '-NoDumpSyms', '-Log=' + str(log)], env=env,
                               capture_output=True, text=True, timeout=15)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        private_tmp, mapping = map(Path, (self.root / 'uba-env.txt').read_text().splitlines())
+        self.assertNotEqual(mapping, ambient_mapping)
+        self.assertEqual(mapping, private_tmp / 'uba-mappings')
+        self.assertEqual(private_tmp.parent, self.root)
+        self.assertFalse(private_tmp.exists())  # Process-scoped cleanup after UBT exits.
+        repeated = subprocess.run(proc.args, env=env, capture_output=True,
+                                  text=True, timeout=15)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        next_tmp, next_mapping = map(Path, (self.root / 'uba-env.txt').read_text().splitlines())
+        self.assertNotEqual(next_tmp, private_tmp)
+        self.assertEqual(next_mapping, next_tmp / 'uba-mappings')
+        self.assertFalse(next_tmp.exists())
         library = self.project.parent / 'Binaries/Linux/libGame.so'
         self.assertEqual(json.loads(manifest.read_text()), [str(library)])
         debug = library.with_suffix('.debug')
