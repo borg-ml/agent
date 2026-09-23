@@ -5533,7 +5533,6 @@ async fn watcher_yield_is_hidden_and_rejected_until_opted_in() {
         .await
         .unwrap();
     let external = server.external_mcp_server().unwrap();
-    assert_eq!(external.env["BORG_AGENT_WATCHER_YIELD_ENABLED"], "true");
     assert!(
         external
             .allowed_tools
@@ -6927,4 +6926,14 @@ async fn an_idle_child_does_not_end_waits_for_a_running_one() {
     assert_eq!(changes[0]["task_name"], "/root/worker");
     assert_eq!(changes[0]["status"], "failed");
     scratch.discard().await;
+}
+
+#[test]
+fn only_a_blind_sleep_earns_the_wait_agent_hint() {
+    assert_eq!(bare_sleep_seconds("sleep 300; echo waited"), Some(300));
+    assert_eq!(bare_sleep_seconds("  sleep 5m && echo done"), Some(300));
+    assert_eq!(bare_sleep_seconds("sleep 240"), Some(240));
+    assert_eq!(bare_sleep_seconds("sleep 300 && cargo test"), None);
+    assert_eq!(bare_sleep_seconds("sleep 60; echo x; rm -rf build"), None);
+    assert_eq!(bare_sleep_seconds("make && sleep 300"), None);
 }

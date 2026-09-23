@@ -2280,6 +2280,15 @@ async fn run_agent_session_store_kernel_inner(
     let agent_tool_server =
         crate::AgentToolServer::start(session_root, session_id, dispatcher.clone()).await?;
     let agent_mcp_server = agent_tool_server.external_mcp_server()?;
+    let mut command_environment = agent_mcp_server.env.clone();
+    command_environment.insert(
+        "BORG_AGENT_CLI".to_string(),
+        agent_mcp_server.command.clone(),
+    );
+    // A command runs only after the session's permission policy admitted it,
+    // so what it asks of Borg through `borg call` is admitted with it.
+    command_environment.insert("BORG_AGENT_TOOL_APPROVED".to_string(), "1".to_string());
+    dispatcher.configure_command_environment(command_environment);
     let (autonomy_dispatch_tx, mut autonomy_dispatch_rx) = mpsc::channel(16);
     let autonomy_cancel = CancellationToken::new();
     let _autonomy_shutdown = SessionAutonomyShutdown(autonomy_cancel.clone());

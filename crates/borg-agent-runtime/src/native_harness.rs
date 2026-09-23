@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,9 +22,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
-    AgentTurn, AgentTurnControl, AgentTurnResult, ApprovalDecision, EventActor,
-    ExecutionCommandRequest, ExecutionProvider, ExecutionStdinRequest, HarnessMode, MessageStatus,
-    PermissionMode, SessionEventKind, SessionStatus,
+    AgentTurn, AgentTurnControl, AgentTurnResult, ApprovalDecision, EventActor, ExecutionProvider,
+    HarnessMode, MessageStatus, PermissionMode, SessionEventKind, SessionStatus,
 };
 
 mod cache_warming;
@@ -47,9 +46,7 @@ const MAX_TOOL_RESULT_ATTACHMENT_BASE64_BYTES: usize = 6 * 1024 * 1024;
 /// estimate keeps a screenshot from being counted as a megabyte of text.
 const ESTIMATED_TOKENS_PER_IMAGE: u64 = 1_600;
 const COMPACTION_IMAGE_RESERVATION_CHARS: usize = ESTIMATED_TOKENS_PER_IMAGE as usize * 2;
-const MAX_APPROVAL_DETAIL_BYTES: usize = 8 * 1024;
-const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
-const MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+pub(crate) const MAX_APPROVAL_DETAIL_BYTES: usize = 8 * 1024;
 /// Continuations granted when the model hits its completion-token limit
 /// before finishing a reply. Each one keeps the truncated prefix as its own
 /// message and asks the model to resume, instead of discarding the turn.
@@ -395,12 +392,6 @@ impl NativeHarness {
         turn.agent_tools
             .configure_execution_provider(self.execution_provider.clone());
         let session_store = turn.agent_tools.session_store();
-        let mut command_environment = turn.agent_mcp_server.env.clone();
-        command_environment.insert(
-            "BORG_AGENT_CLI".to_string(),
-            turn.agent_mcp_server.command.clone(),
-        );
-        command_environment.insert("BORG_AGENT_TOOL_APPROVED".to_string(), "1".to_string());
         let runtime = NativeToolRuntime::start(NativeToolRuntimeConfig {
             session_id: turn.session_id,
             root: turn.cwd.clone(),
@@ -411,7 +402,6 @@ impl NativeHarness {
             execution_provider: turn.agent_tools.execution_provider(),
             session_store,
             harness: self.harness,
-            command_environment,
             workflow_process_manager: self.workflow_process_manager.clone(),
         })
         .await?;
@@ -2205,7 +2195,6 @@ struct NativeToolRuntimeConfig {
     execution_provider: Arc<dyn ExecutionProvider>,
     session_store: Option<std::sync::Arc<dyn crate::SessionStore>>,
     harness: HarnessMode,
-    command_environment: BTreeMap<String, String>,
     workflow_process_manager: crate::native_process::ProcessManager,
 }
 
@@ -2220,7 +2209,6 @@ struct NativeToolRuntime {
     session_store: Option<std::sync::Arc<dyn crate::SessionStore>>,
     context: crate::native_context::NativeContext,
     harness: HarnessMode,
-    command_environment: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2261,7 +2249,6 @@ impl NativeToolRuntime {
             session_store: config.session_store,
             context,
             harness: config.harness,
-            command_environment: config.command_environment,
         })
     }
 
@@ -2314,44 +2301,10 @@ impl NativeToolRuntime {
                     .mutate_workspace_tool(self.execution_provider.as_ref(), name, arguments)
                     .await
             }
-            "exec_command" => {
-                let args: ExecCommandArgs = serde_json::from_value(arguments)?;
-                self.exec_command(args, cancellation).await
-            }
-            "write_stdin" => {
-                let args: WriteStdinArgs = serde_json::from_value(arguments)?;
-                self.write_stdin(args).await
-            }
-            "exec" => {
-                let args: ExecArgs = serde_json::from_value(arguments)?;
-                match (args.cmd.as_deref(), args.session_id) {
-                    (Some(cmd), None) => {
-                        ensure_process_fields_absent(&args)?;
-                        self.exec_command(
-                            ExecCommandArgs {
-                                cmd: cmd.to_string(),
-                                workdir: args.workdir,
-                                yield_time_ms: args.yield_time_ms,
-                                max_output_tokens: args.max_output_tokens,
-                                timeout_ms: args.timeout_ms,
-                            },
-                            cancellation,
-                        )
-                        .await
-                    }
-                    (None, Some(session_id)) => {
-                        ensure_command_fields_absent(&args)?;
-                        self.write_stdin(WriteStdinArgs {
-                            session_id,
-                            chars: args.chars,
-                            yield_time_ms: args.yield_time_ms,
-                            max_output_tokens: args.max_output_tokens,
-                            terminate: args.terminate,
-                        })
-                        .await
-                    }
-                    _ => bail!("exec requires exactly one of `cmd` or `session_id`"),
-                }
+            "exec" | "exec_command" | "write_stdin" => {
+                self.agent_tools
+                    .shell_tool(name, arguments, cancellation)
+                    .await
             }
             "run_blu_workflow" => {
                 let args: RunBluWorkflowArgs = serde_json::from_value(arguments)?;
@@ -2379,63 +2332,6 @@ impl NativeToolRuntime {
                     .await
             }
         }
-    }
-
-    /// `cancellation` outlives the initial output snapshot: firing it after the
-    /// command has gone to the background still terminates the process tree.
-    async fn exec_command(
-        &self,
-        args: ExecCommandArgs,
-        cancellation: Option<CancellationToken>,
-    ) -> Result<Value> {
-        let sleep_seconds = bare_sleep_seconds(&args.cmd);
-        let mut result = serde_json::to_value(
-            self.execution_provider
-                .command(ExecutionCommandRequest {
-                    owner_session_id: self.session_id,
-                    root: self.root.clone(),
-                    command: args.cmd,
-                    workdir: args.workdir,
-                    yield_time_ms: args.yield_time_ms,
-                    max_output_tokens: args.max_output_tokens,
-                    timeout_ms: args
-                        .timeout_ms
-                        .unwrap_or(DEFAULT_COMMAND_TIMEOUT_MS)
-                        .clamp(1, MAX_COMMAND_TIMEOUT_MS),
-                    journal: self.session_store.clone(),
-                    environment: self.command_environment.clone(),
-                    cancellation,
-                })
-                .await?,
-        )?;
-        // Measured orchestrators spent hours in `sleep 300; echo waited` while
-        // children worked. Not refused, since a timed pause can be legitimate,
-        // but pointed at the wait that returns on the child's own progress.
-        if sleep_seconds.is_some_and(|seconds| seconds >= 60)
-            && self.agent_tools.has_working_children().await
-            && let Some(result) = result.as_object_mut()
-        {
-            result.insert(
-                "hint".to_string(),
-                json!("Child agents are working. Wait for them with `wait_agent` instead of shell sleeps: one call blocks up to 30 minutes and returns as soon as a child finishes, fails, or messages you."),
-            );
-        }
-        Ok(result)
-    }
-
-    async fn write_stdin(&self, args: WriteStdinArgs) -> Result<Value> {
-        Ok(serde_json::to_value(
-            self.execution_provider
-                .write_stdin(ExecutionStdinRequest {
-                    owner_session_id: self.session_id,
-                    process_id: args.session_id,
-                    chars: args.chars,
-                    terminate: args.terminate.unwrap_or(false),
-                    yield_time_ms: args.yield_time_ms,
-                    max_output_tokens: args.max_output_tokens,
-                })
-                .await?,
-        )?)
     }
 
     async fn run_blu_workflow(
@@ -3591,22 +3487,6 @@ fn accept_tool_boundary_control(control: AgentTurnControl) -> Result<Option<Capt
     }
 }
 
-/// Seconds slept by a command that does nothing but sleep, optionally
-/// followed by an `echo`: the blind-wait shape, not a pause inside real work.
-fn bare_sleep_seconds(command: &str) -> Option<u64> {
-    static BARE_SLEEP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"^\s*sleep\s+(\d+)([smh]?)\s*(?:(?:;|&&)\s*echo\b[^;&|]*)?;?\s*$")
-            .expect("valid sleep pattern")
-    });
-    let captures = BARE_SLEEP.captures(command)?;
-    let amount = captures[1].parse::<u64>().ok()?;
-    Some(match &captures[2] {
-        "m" => amount.saturating_mul(60),
-        "h" => amount.saturating_mul(3600),
-        _ => amount,
-    })
-}
-
 fn skipped_tool_result() -> (String, bool) {
     (
         json!({"error": "Tool not executed: cancelled after user steering."}).to_string(),
@@ -4142,7 +4022,7 @@ fn bounded_tool_content(output: String) -> String {
     )
 }
 
-fn bounded_text(mut output: String, max_bytes: usize) -> String {
+pub(crate) fn bounded_text(mut output: String, max_bytes: usize) -> String {
     if output.len() <= max_bytes {
         return output;
     }
@@ -4225,37 +4105,8 @@ pub(crate) async fn native_user_message(
 }
 
 fn builtin_tool_specs() -> Vec<Value> {
-    vec![
-        tool(
-            "write_file",
-            "Create or deliberately overwrite a UTF-8 workspace file.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "minLength": 1 },
-                    "content": { "type": "string" },
-                    "overwrite": { "type": "boolean", "default": false },
-                    "create_parent_dirs": { "type": "boolean", "default": true }
-                },
-                "required": ["path", "content"],
-                "additionalProperties": false
-            }),
-        ),
-        tool(
-            "edit_file",
-            "Replace an exact text span in one workspace file; ambiguous matches fail unless replace_all is explicit.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "minLength": 1 },
-                    "old_text": { "type": "string", "minLength": 1 },
-                    "new_text": { "type": "string" },
-                    "replace_all": { "type": "boolean", "default": false }
-                },
-                "required": ["path", "old_text", "new_text"],
-                "additionalProperties": false
-            }),
-        ),
+    let mut specs = crate::subagents::file_mutation_tool_specs();
+    specs.extend([
         tool(
             "exec_command",
             "Run a shell command in the workspace. Returns promptly with a session_id when it is still running; use write_stdin to poll, interact, or terminate it.",
@@ -4281,7 +4132,7 @@ fn builtin_tool_specs() -> Vec<Value> {
                     "timeout_ms": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": MAX_COMMAND_TIMEOUT_MS
+                        "maximum": crate::subagents::RUNTIME_MAX_COMMAND_TIMEOUT_MS
                     }
                 },
                 "required": ["cmd"],
@@ -4326,45 +4177,13 @@ fn builtin_tool_specs() -> Vec<Value> {
                 "additionalProperties": false
             }),
         ),
-    ]
+    ]);
+    specs
 }
 
 fn exec_tool_definition() -> Result<ModelToolDefinition> {
-    ModelToolDefinition::new(
-        "exec",
-        "Run a shell command, or poll, interact with, or terminate a running process. Shell commands may invoke any installed language runtime. Use `borg tools` and `borg call NAME JSON` inside the shell for Borg and Blu capabilities.",
-        json!({
-            "type": "object",
-            "properties": {
-                "cmd": { "type": "string", "minLength": 1, "maxLength": 65536 },
-                "session_id": { "type": "string", "format": "uuid" },
-                "chars": { "type": "string" },
-                "terminate": { "type": "boolean", "default": false },
-                "workdir": { "type": "string" },
-                "yield_time_ms": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 30000
-                },
-                "max_output_tokens": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": 64000
-                },
-                "timeout_ms": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": MAX_COMMAND_TIMEOUT_MS
-                }
-            },
-            "oneOf": [
-                { "required": ["cmd"] },
-                { "required": ["session_id"] }
-            ],
-            "additionalProperties": false
-        }),
-    )
-    .map_err(anyhow::Error::msg)
+    ModelToolDefinition::from_mcp_spec(&crate::subagents::exec_tool_spec())
+        .map_err(anyhow::Error::msg)
 }
 
 fn validate_tool_definitions(definitions: &[ModelToolDefinition]) -> Result<()> {
@@ -4418,53 +4237,6 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ExecCommandArgs {
-    cmd: String,
-    workdir: Option<String>,
-    yield_time_ms: Option<u64>,
-    max_output_tokens: Option<usize>,
-    timeout_ms: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ExecArgs {
-    cmd: Option<String>,
-    session_id: Option<Uuid>,
-    chars: Option<String>,
-    terminate: Option<bool>,
-    workdir: Option<String>,
-    yield_time_ms: Option<u64>,
-    max_output_tokens: Option<usize>,
-    timeout_ms: Option<u64>,
-}
-
-fn ensure_process_fields_absent(args: &ExecArgs) -> Result<()> {
-    if args.chars.is_some() || args.terminate.is_some() {
-        bail!("exec command calls do not accept `chars` or `terminate`");
-    }
-    Ok(())
-}
-
-fn ensure_command_fields_absent(args: &ExecArgs) -> Result<()> {
-    if args.workdir.is_some() || args.timeout_ms.is_some() {
-        bail!("exec process calls do not accept `workdir` or `timeout_ms`");
-    }
-    Ok(())
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WriteStdinArgs {
-    session_id: Uuid,
-    chars: Option<String>,
-    yield_time_ms: Option<u64>,
-    max_output_tokens: Option<usize>,
-    terminate: Option<bool>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RunBluWorkflowArgs {
     workflow_id: Uuid,
     name: String,
@@ -4479,21 +4251,11 @@ struct ReadSkillArgs {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
 
     use super::*;
     use crate::SessionEvent;
-
-    #[test]
-    fn only_a_blind_sleep_earns_the_wait_agent_hint() {
-        assert_eq!(bare_sleep_seconds("sleep 300; echo waited"), Some(300));
-        assert_eq!(bare_sleep_seconds("  sleep 5m && echo done"), Some(300));
-        assert_eq!(bare_sleep_seconds("sleep 240"), Some(240));
-        assert_eq!(bare_sleep_seconds("sleep 300 && cargo test"), None);
-        assert_eq!(bare_sleep_seconds("sleep 60; echo x; rm -rf build"), None);
-        assert_eq!(bare_sleep_seconds("make && sleep 300"), None);
-    }
 
     #[test]
     fn mutating_builtins_are_gated_read_only_builtins_are_not() {
