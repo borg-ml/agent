@@ -412,17 +412,22 @@ impl Fixture {
             env,
             resources,
             memory_max_bytes: Some(128 << 20),
+            memory_swap_max_bytes: None,
             admission: no_budget(cwd),
             health: HealthCheck {
                 argv: vec!["/health".into()],
                 kind: HealthKind::Http,
                 interval_ms: 100,
                 timeout_ms: 1_000,
+                unhealthy_after_ms: None,
             },
             restart: RestartPolicy {
                 max_restarts: 3,
                 backoff_ms: 100,
                 debounce_ms: 100,
+                mode: Default::default(),
+                defer_while: vec![],
+                transient_exit_codes: vec![],
             },
             endpoint: Some(Endpoint {
                 listen: format!("127.0.0.1:{}", ports[0]),
@@ -717,6 +722,7 @@ fn mcp_initialize_health_reads_whole_replies_and_ends_sessions() {
         kind: HealthKind::McpInitialize,
         interval_ms: 100,
         timeout_ms: 1_000,
+        unhealthy_after_ms: None,
     };
     spec.readiness_timeout_ms = 6_000;
     spec.restart.max_restarts = 1;
@@ -1586,6 +1592,9 @@ fn shared_clients_restore_before_an_exclusive_and_failed_restores_fence_it() {
         max_restarts: 2,
         backoff_ms: 200,
         debounce_ms: 100,
+        mode: Default::default(),
+        defer_while: vec![],
+        transient_exit_codes: vec![],
     };
     spec.restore = Some(Hook {
         argv: vec![
