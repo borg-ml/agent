@@ -426,6 +426,7 @@ impl Fixture {
                 backoff_ms: 100,
                 debounce_ms: 100,
                 transient_exit_codes: vec![],
+                defer_while: vec![],
             },
             endpoint: Some(Endpoint {
                 listen: format!("127.0.0.1:{}", ports[0]),
@@ -1626,6 +1627,7 @@ fn shared_clients_restore_before_an_exclusive_and_failed_restores_fence_it() {
         backoff_ms: 200,
         debounce_ms: 100,
         transient_exit_codes: vec![],
+        defer_while: vec![],
     };
     spec.restore = Some(Hook {
         argv: vec![
