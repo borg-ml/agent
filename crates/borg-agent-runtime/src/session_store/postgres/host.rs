@@ -579,12 +579,33 @@ impl PostgresSessionStore {
                 .bind(session_id)
                 .fetch_one(&mut *transaction)
                 .await?;
-        if let Some(existing_owner) = existing_owner {
+        if let Some(existing_owner) = existing_owner
+            && existing_owner != owner_session_id
+        {
+            // A fork (a revert continues on one) takes over its ancestors'
+            // team; any other owner is still refused.
+            let inherited: bool = sqlx::query_scalar(
+                "with recursive lineage(id, parent) as ( \
+                     select id, parent_session_id from sessions where id = $1 \
+                     union all \
+                     select s.id, s.parent_session_id from sessions s \
+                     join lineage l on s.id = l.parent \
+                 ) select exists(select 1 from lineage where id = $2 and id <> $1)",
+            )
+            .bind(owner_session_id)
+            .bind(existing_owner)
+            .fetch_one(&mut *transaction)
+            .await?;
             ensure!(
-                existing_owner == owner_session_id,
+                inherited,
                 "child session {session_id} already belongs to {existing_owner}"
             );
-        } else {
+            sqlx::query("update sessions set owner_session_id = $1 where id = $2")
+                .bind(owner_session_id)
+                .bind(session_id)
+                .execute(&mut *transaction)
+                .await?;
+        } else if existing_owner.is_none() {
             sqlx::query("update sessions set owner_session_id = $1 where id = $2")
                 .bind(owner_session_id)
                 .bind(session_id)
@@ -1169,6 +1190,30 @@ mod tests {
                 .await
                 .is_err(),
             "a child must not be adopted away from its owner"
+        );
+
+        // A fork of the owner (a revert continues on one) takes the child
+        // over; the owner cannot then take it back from its fork.
+        for _ in 0..2 {
+            store
+                .append(crate::SessionEvent::new(
+                    owner,
+                    0,
+                    crate::SessionEventKind::SessionStarted,
+                ))
+                .await
+                .expect("append");
+        }
+        let fork = Uuid::new_v4();
+        store.fork_before(owner, fork, 2).await.expect("fork");
+        PostgresSessionStore::register_child_session(&store, fork, child)
+            .await
+            .expect("a fork adopts its ancestor's child");
+        assert!(
+            PostgresSessionStore::register_child_session(&store, owner, child)
+                .await
+                .is_err(),
+            "an ancestor must not take a child back from its fork"
         );
 
         // A child is not a root session, so it must not appear in listings.
