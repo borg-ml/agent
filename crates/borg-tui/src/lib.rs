@@ -1400,8 +1400,10 @@ fn draft_commit_message(
                 "--effort",
                 &model.effort,
                 "--no-session-persistence",
-                "--disallowedTools",
-                "Bash,Edit,Write,Agent,Task",
+                // The diff is in the prompt: no tools, and no MCP servers to start.
+                "--tools",
+                "",
+                "--strict-mcp-config",
             ])
             .current_dir(cwd)
             .stdin(std::process::Stdio::piped())
