@@ -6069,7 +6069,7 @@ async fn wait_agent_blocks_until_a_child_finishes_and_reports_it_once() {
         .unwrap()
         .unwrap();
     assert!(finished.elapsed() < Duration::from_secs(3));
-    assert_eq!(result["reason"], "child_update");
+    assert_eq!(result["reason"], "child_settled");
     assert_eq!(result["changes"][0]["status"], "ready");
     assert_eq!(result["changes"][0]["final_text"], "done: 3 files fixed");
     assert_eq!(result["agents"][0]["task_name"], "/root/worker");
@@ -6106,7 +6106,7 @@ async fn wait_agent_returns_on_a_child_report_and_on_waiting_input() {
         .expect("a child report ends the wait promptly")
         .unwrap()
         .unwrap();
-    assert_eq!(result["reason"], "child_update");
+    assert_eq!(result["reason"], "child_message");
     assert_eq!(result["messages"][0]["from"], "/root/worker");
     assert_eq!(result["messages"][0]["text"], "blocked on an API decision");
     assert_eq!(result["agents"][0]["status"], "running");

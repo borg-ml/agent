@@ -298,6 +298,15 @@ impl SubagentCoordinator {
                 senders.insert(*sender, name);
             }
         }
+        let reason = match (
+            reason,
+            unseen.changes.is_empty(),
+            unseen.messages.is_empty(),
+        ) {
+            ("child_update", false, true) => "child_settled",
+            ("child_update", true, false) => "child_message",
+            (reason, ..) => reason,
+        };
         let mut result = json!({
             "reason": reason,
             "waited_ms": u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
