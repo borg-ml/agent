@@ -117,8 +117,11 @@ def run(binary: Path, agents: int, jobs: int, scale: float, seed: int) -> dict:
                         pass  # Preserve the state directory for manual recovery.
                 raise
         statuses: list[dict] = []
+        status_latency_ms = []
         for job_id in sorted(ids):
+            queried_at = time.monotonic()
             status = cli(binary, lane, "job", "status", job_id)
+            status_latency_ms.append((time.monotonic() - queried_at) * 1000)
             if not isinstance(status, dict) or not state_done(status.get("job", {}).get("state")):
                 raise RuntimeError(f"incomplete public job status: {status!r}")
             statuses.append(status)
@@ -168,12 +171,15 @@ def run(binary: Path, agents: int, jobs: int, scale: float, seed: int) -> dict:
         throughput = [sum(t.duration for t in tasks[i]) / max(0.001, per_agent[i])
                       for i in range(agents)]
         fairness = (sum(throughput) ** 2 / (agents * sum(t*t for t in throughput))) if sum(throughput) else 1.
+        status_latency_ms.sort()
         return {"mode": "real-cli", "agents": agents, "requests": len(records),
                 "launches": len(ids), "coalesced": len(records)-len(ids),
                 "makespan_seconds": round(end-origin, 3),
                 "agent_wait_hours": round(sum(waits)/3600, 5),
                 "fairness_jain": round(fairness, 4), "oom": 0, "failures": 0,
                 "peak_reserved_gib": peak_slots,
+                "status_latency_ms_median": round(status_latency_ms[len(status_latency_ms)//2], 2),
+                "status_latency_ms_p95": round(status_latency_ms[int((len(status_latency_ms)-1)*.95)], 2),
                 "cpu_utilization_8_cores": round(sum(float(s.get("cpu_seconds") or 0)
                                                       for s in statuses) / ((end-origin)*8), 4),
                 "lane_state": "isolated temporary directory removed after successful run"}
