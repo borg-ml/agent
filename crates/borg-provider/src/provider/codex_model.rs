@@ -552,9 +552,17 @@ impl CodexModelProvider {
                 })
             })
             .collect();
+        // The catalog advertises `ultra`, but the Responses endpoint accepts
+        // `max` as its highest wire effort. Keep the Borg selection while
+        // sending the endpoint's accepted value.
+        let wire_effort = if self.effort == "ultra" {
+            "max"
+        } else {
+            &self.effort
+        };
         let mut body = json!({"model": self.model, "instructions": instructions.join("\n\n"),
             "input": input, "tools": tools, "tool_choice": "auto", "parallel_tool_calls": true,
-            "reasoning": {"effort": self.effort, "summary": "auto"},
+            "reasoning": {"effort": wire_effort, "summary": "auto"},
             "store": false, "stream": true, "include": ["reasoning.encrypted_content"]});
         if request.fast {
             body["service_tier"] = json!("priority");
@@ -725,6 +733,13 @@ fn subscription_failure_message(
     };
     if let Some(status) = status {
         message.push_str(&format!(" HTTP {}.", status.as_u16()));
+    }
+    // Fixed tokens identify a rejected field without copying backend message
+    // text, which may contain user content or account-specific details.
+    let code = known_or_other(error["code"].as_str(), &KNOWN_ERROR_CODES);
+    let param = known_or_other(error["param"].as_str(), &KNOWN_ERROR_PARAMS);
+    if code != "unknown" || param != "unknown" {
+        message.push_str(&format!(" Provider error: code={code}, param={param}."));
     }
     if limited {
         let retry_date = retry_after
@@ -1049,6 +1064,33 @@ const KNOWN_INCOMPLETE_REASONS: [&str; 2] = ["max_output_tokens", "content_filte
 /// counted as `other`, which still shows that an unsupported item arrived
 /// without repeating whatever the backend called it.
 const KNOWN_ITEM_TYPES: [&str; 3] = ["message", "function_call", "reasoning"];
+const KNOWN_ERROR_CODES: [&str; 8] = [
+    "invalid_value",
+    "invalid_type",
+    "invalid_request_error",
+    "missing_required_parameter",
+    "unknown_parameter",
+    "model_not_found",
+    "context_length_exceeded",
+    "unsupported_value",
+];
+const KNOWN_ERROR_PARAMS: [&str; 15] = [
+    "reasoning.effort",
+    "model",
+    "input",
+    "tools",
+    "instructions",
+    "text.format",
+    "max_output_tokens",
+    "service_tier",
+    "prompt_cache_key",
+    "include",
+    "tool_choice",
+    "parallel_tool_calls",
+    "store",
+    "stream",
+    "reasoning.summary",
+];
 
 /// Reduce a backend string to a known token. Unrecognised values collapse to
 /// `other` and missing ones to `unknown`, so no backend-controlled text ever
@@ -1406,6 +1448,15 @@ mod tests {
             Some("private-header"),
         );
         assert!(!malformed.contains("private-"));
+        let rejected_effort = subscription_failure_message(
+            Some(
+                &json!({"code":"invalid_value", "param":"reasoning.effort", "message":"private-account"}),
+            ),
+            Some(reqwest::StatusCode::BAD_REQUEST),
+            None,
+        );
+        assert!(rejected_effort.contains("code=invalid_value, param=reasoning.effort"));
+        assert!(!rejected_effort.contains("private-account"));
         let dated = subscription_failure_message(
             Some(&json!({"resets_in_seconds":99})),
             Some(reqwest::StatusCode::TOO_MANY_REQUESTS),
@@ -1504,6 +1555,27 @@ mod tests {
             .unwrap();
             assert_eq!(capabilities.supports_fast(), expected);
         }
+    }
+
+    #[test]
+    fn catalog_ultra_uses_the_highest_accepted_responses_effort() {
+        let request = ModelTurnRequest {
+            fast: false,
+            request_id: None,
+            session_id: None,
+            prompt_cache_key: None,
+            messages: vec![ModelMessage::user("test")],
+            tools: Vec::new(),
+            output_schema: None,
+        };
+        let provider = CodexModelProvider {
+            model: "gpt-6-sol".into(),
+            effort: "ultra".into(),
+        };
+        assert_eq!(
+            provider.request_body(&request).unwrap()["reasoning"]["effort"],
+            "max"
+        );
     }
 
     #[test]
