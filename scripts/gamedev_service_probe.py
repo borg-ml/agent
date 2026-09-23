@@ -246,7 +246,10 @@ def post_hook_barrier(started: Path, fifo: Path, done: Path, fail: bool = False)
 def run_atomic(binary: Path, descendant: bool = False, post_barrier: bool = False,
                project_alias: bool = False, canonical_project: bool = False,
                fail_post_hook: bool = False, fail_resume: bool = False,
-               fail_health: bool = False) -> dict:
+               fail_health: bool = False, foreign_lease: bool = False,
+               late_lease: bool = False, own_lease: bool = False,
+               foreign_grace: bool = False, foreign_indefinite: bool = False) -> dict:
+    foreign_lease = foreign_lease or late_lease or foreign_grace or foreign_indefinite
     binary = binary.resolve(strict=True)
     backend = Path(__file__).with_name("gamedev_fake_service.py").resolve()
     with isolated_root() as root:
@@ -304,19 +307,20 @@ def run_atomic(binary: Path, descendant: bool = False, post_barrier: bool = Fals
                 if status.get("backend_pid") is None:
                     raise RuntimeError(f"{service_id} never became healthy")
                 before[service_id] = status["backend_pid"]
-            # The happy-path client belongs to this exclusive's holder. A future
-            # foreign-client gate must deliberately use a different owner.
+            # Ordinary handoffs use the exclusive holder for the client lease;
+            # foreign-client cases deliberately use a different owner.
             holder_id = str(uuid.uuid4())
-            command(binary, root, "lease", "bench-editor-a", "--owner", holder_id,
-                    "--ttl-seconds", "10", "--purpose", "capture")
+            client_owner = str(uuid.uuid4()) if foreign_lease else holder_id
+            command(binary, root, "lease", "bench-editor-a", "--owner", client_owner,
+                    "--ttl-seconds", "20", "--purpose", "capture")
             marker = root / "exclusive.json"
             job_key = {"scope": {"Project": str(project / ".." / "project")}, "name": name} if project_alias else resource_key
             worker_ports = ports[:1] if project_alias or canonical_project else ports[:2]
             job_spec = {"fingerprint": "bench-D11-exclusive", "lease": {
                 "resources": [{"key": job_key, "access": "Exclusive"}],
-                "holder": {"participant_id": holder_id, "session_id": str(uuid.uuid4()),
+                "holder": {"participant_id": holder_id, "session_id": holder_id,
                            "host_pid": None, "purpose": "atomic editor handoff probe"},
-                "queue_timeout_ms": 10000},
+                "queue_timeout_ms": 40000 if late_lease else (20000 if foreign_lease else 10000)},
                 "argv": [sys.executable, str(Path(__file__).resolve()), "--borg", str(binary),
                          "--atomic-worker", str(root), ",".join(str(p) for p in worker_ports), str(marker),
                          str(child_markers) if descendant else "-"]
@@ -359,8 +363,91 @@ def run_atomic(binary: Path, descendant: bool = False, post_barrier: bool = Fals
                     submitted = lane(binary, root, "job", "submit", "--spec", "-",
                                      input_data=job_spec)
             else:
-                submitted = lane(binary, root, "job", "submit", "--spec", "-", input_data=job_spec)
+                submit_args = ["job", "submit", "--spec", "-"]
+                if foreign_lease:
+                    if foreign_indefinite:
+                        grace_seconds = 0
+                    elif foreign_grace:
+                        grace_seconds = 5
+                    elif late_lease:
+                        grace_seconds = 30
+                    else:
+                        grace_seconds = 15
+                    submit_args += ["--foreign-lease-grace-seconds", str(grace_seconds)]
+                submitted = lane(binary, root, *submit_args, input_data=job_spec)
             job_id = submitted["job_id"]
+            foreign_wait_reason = ""
+            service_notice = ""
+            if foreign_lease:
+                # A foreign client stays active: Preparing must hold the exclusive
+                # before any fake workload or destructive service yield is allowed.
+                deadline = time.monotonic() + 5
+                while True:
+                    row = lane(binary, root, "job", "status", job_id)
+                    if (row.get("state") == "Preparing"
+                            and (row.get("wait_reason") or "").startswith("foreign client lease:")):
+                        break
+                    if row.get("started_ms") is not None or marker.exists():
+                        raise RuntimeError(f"foreign client lease did not block grant: {row!r}")
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"foreign client never reached Preparing: {row!r}")
+                    subprocess.run(["inotifywait", "-q", "-t", "1", "-e", "modify,close_write,moved_to",
+                                    str(root)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+                before_release = command(binary, root, "status", "bench-editor-a")
+                foreign_wait_reason = str(row["wait_reason"])
+                service_notice = str(before_release.get("reason") or "")
+                if foreign_wait_reason not in service_notice:
+                    raise RuntimeError(f"service status omitted foreign client notice: {service_notice!r}")
+                if (before_release.get("backend_pid") != before["bench-editor-a"]
+                        or not before_release.get("clients") or not health_at(ports[0])):
+                    raise RuntimeError(f"foreign lease was yielded before release: {before_release!r}")
+                if len(started) > 1:
+                    other_id = "bench-editor-b"
+                    other_before = command(binary, root, "status", other_id)
+                    if (other_before.get("backend_pid") != before[other_id]
+                            or "Healthy" not in other_before.get("state", {})
+                            or not health_at(ports[1])):
+                        raise RuntimeError(f"other bound service yielded before foreign lease released: {other_before!r}")
+                if foreign_indefinite:
+                    # A zero grace must remain Preparing across a bounded
+                    # observation window, not merely for one status snapshot.
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline:
+                        subprocess.run(["inotifywait", "-q", "-t", "1", "-e", "modify,close_write,moved_to",
+                                        str(root)], stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, timeout=2)
+                        held = lane(binary, root, "job", "status", job_id)
+                        active = command(binary, root, "status", "bench-editor-a")
+                        if (held.get("state") != "Preparing" or held.get("started_ms") is not None
+                                or active.get("backend_pid") != before["bench-editor-a"]
+                                or not active.get("clients") or not health_at(ports[0])):
+                            raise RuntimeError(f"grace=0 released foreign client before lease end: {held!r}, {active!r}")
+                if late_lease:
+                    # New clients for another bound service must not sneak in
+                    # after the exclusive enters Preparing under the same R.
+                    late_owner = str(uuid.uuid4())
+                    late = lane(binary, root, "service", "lease", "bench-editor-b",
+                                "--owner", late_owner, "--ttl-seconds", "10",
+                                "--purpose", "late-client", timeout=5, allow_failure=True)
+                    if "exit_code" not in late:
+                        command(binary, root, "release", "bench-editor-b", "--owner", late_owner)
+                        raise RuntimeError(f"late client lease accepted during Preparing: {late!r}")
+                    if command(binary, root, "status", "bench-editor-b").get("clients"):
+                        raise RuntimeError("late client left a lease after refusal")
+                    # Reusing the active client's owner renews its expiration;
+                    # this too must be denied after Preparing, not silently extend.
+                    expires_before = before_release["clients"][0]["expires_at_unix_ms"]
+                    renewal = lane(binary, root, "service", "lease", "bench-editor-a",
+                                   "--owner", client_owner, "--ttl-seconds", "25",
+                                   "--purpose", "late-renew", timeout=5, allow_failure=True)
+                    if "exit_code" not in renewal:
+                        command(binary, root, "release", "bench-editor-a", "--owner", client_owner)
+                        raise RuntimeError(f"late client renewal accepted during Preparing: {renewal!r}")
+                    renewed = command(binary, root, "status", "bench-editor-a")["clients"]
+                    if len(renewed) != 1 or renewed[0]["expires_at_unix_ms"] != expires_before:
+                        raise RuntimeError(f"late renewal changed client expiry: {renewed!r}")
+                if not foreign_grace:
+                    command(binary, root, "release", "bench-editor-a", "--owner", client_owner)
             if post_barrier:
                 wait_env = {**os.environ, "BORG_LANES_ROOT": str(root), "BORG_LANE_DIR": str(root),
                             "BORG_LANE_SCOPE": "1", "BORG_LANE_DEGRADED": "0",
@@ -400,6 +487,10 @@ def run_atomic(binary: Path, descendant: bool = False, post_barrier: bool = Fals
             state = done.get("state", {})
             if not isinstance(state, dict) or state.get("Finished", {}).get("exit_code") != 0 or not marker.exists():
                 raise RuntimeError(f"D11 no-hook exclusive did not complete: {done!r}")
+            if foreign_grace:
+                waited = lane(binary, root, "job", "status", job_id)
+                if (waited.get("started_ms") or 0) - (waited.get("created_ms") or 0) < 3500:
+                    raise RuntimeError(f"foreign lease did not wait for grace: {waited!r}")
             if fail_post_hook:
                 row = lane(binary, root, "job", "status", job_id)
                 if not row.get("quarantined") or "post hook failed" not in (row.get("evidence") or ""):
@@ -537,7 +628,15 @@ def run_atomic(binary: Path, descendant: bool = False, post_barrier: bool = Fals
                     "auto_resumed": True, "job_hooks": post_barrier,
                     "post_hook_before_resume": post_barrier, "scoped_descendants": descendant,
                     "project_alias": project_alias, "canonical_project": canonical_project or alias_rejected,
-                    "alias_rejected": alias_rejected, "alias_refusal": alias_reason[:300]}
+                    "alias_rejected": alias_rejected, "alias_refusal": alias_reason[:300],
+                    "foreign_lease_waited": foreign_lease,
+                    "foreign_wait_reason": foreign_wait_reason if foreign_lease else None,
+                    "service_notice": service_notice if foreign_lease else None,
+                    "both_healthy_while_waiting": foreign_lease and len(started) > 1,
+                    "late_lease_refused": late_lease, "own_lease_unblocked": own_lease,
+                    "foreign_grace_expired": foreign_grace,
+                    "indefinite_wait_released": foreign_indefinite,
+                    "indefinite_observation_seconds": 2 if foreign_indefinite else None}
         finally:
             if post_barrier and hook_started.exists() and not hook_done.exists():
                 try:
@@ -674,6 +773,16 @@ def main() -> None:
                     help="two disjoint services cannot overreserve host RAM")
     ap.add_argument("--atomic-project-alias", action="store_true",
                     help="systemd-only canonical Project(path) alias exclusive handoff")
+    ap.add_argument("--atomic-foreign-indefinite", action="store_true",
+                    help="systemd-only grace=0 holds foreign client until public release")
+    ap.add_argument("--atomic-foreign-grace", action="store_true",
+                    help="systemd-only foreign client yielded after bounded grace")
+    ap.add_argument("--atomic-own-lease", action="store_true",
+                    help="systemd-only own holder client does not block an exclusive")
+    ap.add_argument("--atomic-late-lease", action="store_true",
+                    help="systemd-only refuse a late client while exclusive Preparing")
+    ap.add_argument("--atomic-foreign-lease", action="store_true",
+                    help="systemd-only wait on test-owned foreign service client then release")
     ap.add_argument("--atomic-unhealthy-resume", action="store_true",
                     help="systemd-only resumed backend fails health; retry without duplicate Resume")
     ap.add_argument("--fail-owned-health", action="store_true")
@@ -698,7 +807,7 @@ def main() -> None:
                       Path(child_dir) if child_dir != "-" else None, args.stop_owned_service,
                       args.fail_owned_health)
     else:
-        if args.atomic_descendant or args.atomic_post_hook or args.atomic_post_hook_fail or args.atomic_failed_resume or args.atomic_unhealthy_resume or args.atomic_project_alias or args.check_service_budget or args.check_service_disk_budget:
+        if args.atomic_descendant or args.atomic_post_hook or args.atomic_post_hook_fail or args.atomic_failed_resume or args.atomic_unhealthy_resume or args.atomic_foreign_lease or args.atomic_foreign_grace or args.atomic_foreign_indefinite or args.atomic_late_lease or args.atomic_own_lease or args.atomic_project_alias or args.check_service_budget or args.check_service_disk_budget:
             manager = subprocess.run(["systemctl", "--user", "show-environment"],
                                      capture_output=True, timeout=3)
             if manager.returncode:
@@ -706,13 +815,18 @@ def main() -> None:
             os.environ["BORG_BENCH_REQUIRE_SCOPE"] = "1"
         if args.check_service_budget or args.check_service_disk_budget:
             result = service_budget_gate(args.borg, disk=args.check_service_disk_budget)
-        elif args.atomic or args.atomic_descendant or args.atomic_post_hook or args.atomic_post_hook_fail or args.atomic_failed_resume or args.atomic_unhealthy_resume or args.atomic_project_alias:
+        elif args.atomic or args.atomic_descendant or args.atomic_post_hook or args.atomic_post_hook_fail or args.atomic_failed_resume or args.atomic_unhealthy_resume or args.atomic_foreign_lease or args.atomic_foreign_grace or args.atomic_foreign_indefinite or args.atomic_late_lease or args.atomic_own_lease or args.atomic_project_alias:
             result = run_atomic(args.borg, descendant=args.atomic_descendant,
                                 post_barrier=args.atomic_post_hook or args.atomic_post_hook_fail,
                                 project_alias=args.atomic_project_alias,
                                 fail_post_hook=args.atomic_post_hook_fail,
                                 fail_resume=args.atomic_failed_resume,
-                                fail_health=args.atomic_unhealthy_resume)
+                                fail_health=args.atomic_unhealthy_resume,
+                                foreign_lease=args.atomic_foreign_lease,
+                                late_lease=args.atomic_late_lease,
+                                own_lease=args.atomic_own_lease,
+                                foreign_grace=args.atomic_foreign_grace,
+                                foreign_indefinite=args.atomic_foreign_indefinite)
             if args.atomic_project_alias and not result["alias_rejected"]:
                 result["canonical_handoff"] = run_atomic(args.borg, canonical_project=True)
         else:
