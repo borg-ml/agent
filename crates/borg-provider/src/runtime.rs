@@ -76,7 +76,7 @@ pub fn claude_product_model() -> &'static str {
 }
 
 pub fn claude_default_effort() -> &'static str {
-    "high"
+    "medium"
 }
 
 pub fn codex_default_effort() -> &'static str {

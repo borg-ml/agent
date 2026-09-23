@@ -2738,8 +2738,8 @@ fn every_defaultable_provider_pins_a_model_for_a_fresh_session() {
     );
     assert_eq!(
         borg_provider::claude_default_effort(),
-        "high",
-        "and pair it with the high reasoning default"
+        "medium",
+        "and pair it with the medium reasoning default"
     );
     for provider in [
         CodingProvider::Codex,
