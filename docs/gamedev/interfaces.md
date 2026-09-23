@@ -112,6 +112,22 @@ release/expiry/crash, including PIE/cvars. A restart cannot silently discard
 unrestored settings. Healthy status is not proof that a raw MCP call respects
 client lease: adapter MCP proxy must enforce owner on every mutating call.
 
+Exclusive editor handoff must respect **foreign active client leases** before
+yield, not rely on an MCP-side service-status snapshot. Uniform CLI/MCP lane
+admission holds the job in `Preparing`/yield-pending while another session's
+client lease is active, reports the wait through service status (and a Borg
+team message where available), and yields when the lease ends or a per-resource
+grace expires (default five minutes; zero waits indefinitely). The requester's
+own client lease does not block. Client lease acquisition and the Preparing
+decision must share an atomic journal/lock boundary, including late arrivals;
+reading supervisor `status.clients` while holding only the lane lock is **not**
+atomic. Gate this behavior with public foreign-wait and own-lease real-CLI
+tests. If the cross-boundary policy cannot land safely in v0, disable
+model-facing exclusives with an explicit coordination/CLI message; retain
+nonexclusive jobs and service lease/read tools and defer lease-respecting
+preemption to v0.1. A CLI accessible through a shell is not a security
+boundary, so do not market this fallback as a sandbox.
+
 ## Workspace contract
 
 `workspace::{WorktreeSpec,WorktreeRecord,CachePolicy,FreezeRequest,Freeze,
