@@ -103,28 +103,48 @@ pub fn assess_admission(
                 ram_available, requested_ram, budgets.ram_reserve_bytes
             ),
         ),
-        (
-            agent_disk_used.saturating_add(requested_disk) > budgets.agent_disk_limit_bytes,
-            format!(
-                "agent disk cap: {} used + {} requested > {}",
-                agent_disk_used, requested_disk, budgets.agent_disk_limit_bytes
-            ),
-        ),
-        (
-            agent_ram_used.saturating_add(requested_ram) > budgets.agent_ram_limit_bytes,
-            format!(
-                "agent RAM cap: {} used + {} requested > {}",
-                agent_ram_used, requested_ram, budgets.agent_ram_limit_bytes
-            ),
-        ),
     ];
+    let reason = reasons
+        .into_iter()
+        .find_map(|(blocked, reason)| blocked.then_some(reason))
+        .or_else(|| {
+            agent_budget_reason(
+                budgets,
+                agent_disk_used,
+                agent_ram_used,
+                requested_disk,
+                requested_ram,
+            )
+        });
     WorkspaceAdmission {
-        admitted: !reasons.iter().any(|(blocked, _)| *blocked),
-        reason: reasons
-            .into_iter()
-            .find_map(|(blocked, reason)| blocked.then_some(reason)),
+        admitted: reason.is_none(),
+        reason,
         disk_available_bytes: disk_available,
         ram_available_bytes: ram_available,
+    }
+}
+
+/// Per-owner cap decision for lane dispatch. Call under the lane admission
+/// lock with reserved bytes from this holder's granted and preparing jobs.
+pub fn agent_budget_reason(
+    budgets: &WorkspaceBudgets,
+    used_disk: u64,
+    used_ram: u64,
+    requested_disk: u64,
+    requested_ram: u64,
+) -> Option<String> {
+    if used_disk.saturating_add(requested_disk) > budgets.agent_disk_limit_bytes {
+        Some(format!(
+            "agent disk cap: {used_disk} used + {requested_disk} requested > {}",
+            budgets.agent_disk_limit_bytes
+        ))
+    } else if used_ram.saturating_add(requested_ram) > budgets.agent_ram_limit_bytes {
+        Some(format!(
+            "agent RAM cap: {used_ram} used + {requested_ram} requested > {}",
+            budgets.agent_ram_limit_bytes
+        ))
+    } else {
+        None
     }
 }
 
@@ -239,7 +259,7 @@ fn disk_usage_bytes(path: &Path) -> Result<u64> {
 
 /// A configured worktree root can contain trees from several repositories.
 /// Count all Borg-managed worktrees owned by this session across that root.
-fn owned_root_usage(root: &Path, owner: Uuid) -> Result<u64> {
+pub fn owned_root_usage(root: &Path, owner: Uuid) -> Result<u64> {
     let mut total = 0u64;
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -602,6 +622,22 @@ pub fn freeze_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn agent_caps_include_running_reservations() {
+        let limits = WorkspaceBudgets::default();
+        assert_eq!(agent_budget_reason(&limits, 0, 15 * GIB, 0, GIB), None);
+        assert!(
+            agent_budget_reason(&limits, 0, 15 * GIB, 0, 2 * GIB)
+                .unwrap()
+                .contains("agent RAM cap")
+        );
+        assert!(
+            agent_budget_reason(&limits, 31 * GIB, 0, 2 * GIB, 0)
+                .unwrap()
+                .contains("agent disk cap")
+        );
+    }
+
     #[test]
     fn rejects_invalid_budget_configuration() {
         assert!(parse_budget_gib("reserve", "0").is_err());

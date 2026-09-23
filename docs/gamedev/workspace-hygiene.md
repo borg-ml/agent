@@ -37,7 +37,13 @@ record in the Git common directory is only a handshake.
   counts Borg-owned trees across repositories in the configured root toward
   the same owner's disk cap, and refuses admission if a disk-size probe fails. Lanes
   call `assess_budget(&AdmissionBudget, reserved_ram, reserved_disk)` at
-  dispatch and queue with its explicit reason; this is an API and **not** a
+  dispatch and queue with its explicit reason. For a per-owner job limit,
+  `hygiene::agent_budget_reason` compares active/Preparing reservations and
+  new requested RAM/disk against the configured agent caps under the same
+  dispatch lock. `hygiene::owned_root_usage` counts this agent's existing
+  Borg-managed worktrees in the configured root. **Per-agent job admission is
+  not yet enforced until the lane dispatcher calls this helper and its tests
+  exercise multiple jobs owned by one session.** This is an API and **not** a
   substitute for an actual lane supervisor maintaining cross-process
   reservations. For concurrent builds in distinct directories on the same
   volume, use `workspace::same_filesystem(path_a, path_b)` to sum disk
