@@ -22,7 +22,9 @@ record in the Git common directory is only a handshake.
 - `gc` is dry-run by default and lists all checked-out trees with protection
   reasons and size. `--apply` requires a journal-confirmed exited owner;
   `--force` only relaxes the dirty-tree check, never a live owner, unknown
-  owner, unmerged branch, or primary tree. MCP `apply` also requires explicit
+  owner, recent unmerged branch, or primary tree. Unmerged branches with no
+  worktree/index/commit activity for 30 days can be proposed as abandoned; Git
+  branches are preserved even when a checked-out worktree is removed. MCP `apply` also requires explicit
   human `confirmed` input. It does not delete assets or Git branches.
 - `borg worktree budget` checks `statvfs` on the output filesystem and Linux
   `MemAvailable`. Default safety reserves: **60 GiB free disk**, **8 GiB
