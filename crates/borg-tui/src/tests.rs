@@ -76,6 +76,42 @@ fn completion_alert_policies_respect_window_focus() {
 }
 
 #[test]
+fn completion_alert_waits_for_work_to_stop_rather_than_each_turn_boundary() {
+    let completed = SessionEventKind::TurnCompleted {
+        message_id: Uuid::new_v4(),
+        provider_session_id: None,
+        final_text: String::new(),
+        error: None,
+    };
+    let started = SessionEventKind::TurnStarted {
+        message_id: Uuid::new_v4(),
+        provider: CodingProvider::Claude,
+        model: None,
+        effort: None,
+        fast: false,
+    };
+    let ready = |detail: Option<&str>| SessionEventKind::StatusChanged {
+        status: SessionStatus::Ready,
+        detail: detail.map(str::to_string),
+    };
+    let mut pending = false;
+    // A goal continuation starts the next turn at once: no alert.
+    assert!(!completion_alert_due(&mut pending, &completed));
+    assert!(!completion_alert_due(&mut pending, &started));
+    assert!(!completion_alert_due(&mut pending, &ready(None)));
+    // Parking on watchers resumes by itself: no alert.
+    assert!(!completion_alert_due(&mut pending, &completed));
+    assert!(!completion_alert_due(
+        &mut pending,
+        &ready(Some("Waiting on 2 watcher(s)"))
+    ));
+    // Work that stops alerts exactly once.
+    assert!(!completion_alert_due(&mut pending, &completed));
+    assert!(completion_alert_due(&mut pending, &ready(None)));
+    assert!(!completion_alert_due(&mut pending, &ready(None)));
+}
+
+#[test]
 fn statusline_names_active_workers_as_subagents() {
     assert_eq!(agents_status_label(0), None);
     assert_eq!(agents_status_label(1).as_deref(), Some("1 subagent"));
