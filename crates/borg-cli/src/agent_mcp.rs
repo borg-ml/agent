@@ -498,6 +498,10 @@ async fn handle_line_with_cancel(
                     endpoint.shared_work_enabled(),
                     endpoint.team_policy(),
                     endpoint.consultation_enabled(),
+                    // Absent means a top-level session from an older server.
+                    std::env::var("BORG_AGENT_DESKTOP_ENABLED")
+                        .ok()
+                        .is_none_or(|value| value != "false"),
                     std::env::var("BORG_AGENT_WATCHER_YIELD_ENABLED")
                         .is_ok_and(|value| value == "true"),
                 )

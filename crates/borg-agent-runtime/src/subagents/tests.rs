@@ -3602,6 +3602,7 @@ fn persistent_peer_tool_is_root_only_and_not_recursive() {
         false,
         None,
         true,
+        true,
         false,
     )
     .into_iter()
@@ -3615,6 +3616,7 @@ fn persistent_peer_tool_is_root_only_and_not_recursive() {
         true,
         false,
         None,
+        false,
         false,
         false,
     )
@@ -4636,6 +4638,98 @@ async fn computer_use_live_desktop_clients() {
     dispatcher
         .persistent_runtimes
         .stop_session(session_id)
+        .await;
+}
+
+/// Failure mode: a sub-agent reading or driving the user's desktop through
+/// computer_use -- listing desktop windows, capturing the screen, or injecting
+/// input into the user's focused window -- instead of its private display.
+#[tokio::test]
+async fn a_sub_agent_computer_use_is_confined_to_a_private_display() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        3,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        Arc::new(store),
+    )
+    .unwrap();
+    let dispatcher_for = |actor| {
+        AgentToolDispatcher::new(
+            SessionGoalTools::disconnected(),
+            SessionTodoTools::disconnected(),
+            Some(coordinator.clone()),
+            crate::LspService::new(directory.path()),
+            CodingProvider::Codex,
+            actor,
+            true,
+            None,
+            None,
+            directory.path().to_path_buf(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::native_process::ProcessManager::default(),
+            PermissionMode::FullAccess,
+        )
+    };
+    let display_enum = |dispatcher: &AgentToolDispatcher| {
+        dispatcher
+            .specs()
+            .into_iter()
+            .find(|spec| spec["name"] == "computer_use")
+            .expect("computer_use is advertised")["inputSchema"]["properties"]["display"]["enum"]
+            .clone()
+    };
+    const REFUSAL: &str = "sub-agents may only use their private display";
+    let child = dispatcher_for(Uuid::new_v4());
+    assert_eq!(display_enum(&child), json!(["private"]));
+    for desktop in [
+        json!({"op": "list_windows"}),
+        json!({"op": "screenshot", "scope": "desktop"}),
+        json!({"op": "observe", "window_id": "a1b2:3"}),
+        json!({"op": "type_text", "window_id": "niri:17", "text": "x"}),
+        json!({"op": "pointer_click", "x": 10, "y": 10}),
+    ] {
+        let error = child
+            .call("computer_use", desktop.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(REFUSAL), "{desktop}: {error}");
+    }
+    // Private-display ops pass the confinement (the helper may still be
+    // unavailable on a host without a desktop session).
+    if let Err(error) = child
+        .call(
+            "computer_use",
+            json!({"op": "list_windows", "display": "private"}),
+        )
+        .await
+    {
+        assert!(!error.to_string().contains(REFUSAL), "{error}");
+    }
+    child
+        .persistent_runtimes
+        .stop_session(child.actor_session_id)
+        .await;
+
+    let director = dispatcher_for(root);
+    assert_eq!(display_enum(&director), json!(["desktop", "private"]));
+    if let Err(error) = director
+        .call("computer_use", json!({"op": "capabilities"}))
+        .await
+    {
+        assert!(!error.to_string().contains(REFUSAL), "{error}");
+    }
+    director
+        .persistent_runtimes
+        .stop_session(director.actor_session_id)
         .await;
 }
 
@@ -5775,12 +5869,11 @@ fn a_message_without_images_serializes_without_an_attachments_field() {
 /// providers while the runtime admitted eleven, fixed in 5a38ea2).
 #[test]
 fn a_child_surface_is_the_director_surface_minus_the_documented_exceptions() {
-    // The three documented exceptions, by tool name.
+    // The documented exceptions, by tool name.
     let exceptions = [
         "consult_model",
         "consult_peer",
         "rotate_peer",
-        "computer_use",
         "update_agent_settings",
         "watch",
         "list_watchers",
@@ -5827,7 +5920,20 @@ fn a_child_surface_is_the_director_surface_minus_the_documented_exceptions() {
             expected,
             "{provider:?} child surface is not the director surface minus the documented exceptions"
         );
+        // computer_use is kept but confined to a private display: only the
+        // description and the display enum differ.
+        let confined = child
+            .iter()
+            .find(|spec| spec["name"] == "computer_use")
+            .expect("a child keeps private-display computer use");
+        assert_eq!(
+            confined["inputSchema"]["properties"]["display"]["enum"],
+            json!(["private"])
+        );
         for name in names(&child) {
+            if name == "computer_use" {
+                continue;
+            }
             let in_director = director
                 .iter()
                 .find(|spec| spec["name"] == name.as_str())

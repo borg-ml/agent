@@ -80,6 +80,38 @@ const CONSEQUENTIAL_WORDS: &[&str] = &[
     "iban",
 ];
 
+/// Sub-agents drive only a private display: refuse anything that would read
+/// or act on the user's desktop (desktop windows, desktop screenshots, or
+/// input that reaches the user's seat). Private window ids start with `pd:`.
+pub(crate) fn ensure_private_display_only(arguments: &Value) -> Result<()> {
+    let op = arguments
+        .get("op")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let private_display = arguments.get("display").and_then(Value::as_str) == Some("private");
+    let private_window = arguments
+        .get("window_id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id.starts_with("pd:"));
+    ensure!(
+        arguments
+            .get("display")
+            .is_none_or(|display| display == "private"),
+        "sub-agents may only use their private display (display=\"private\"); the user's desktop is reserved for the top-level session"
+    );
+    let allowed = match op {
+        "capabilities" | "start_display" | "stop_display" | "attach_display" | "launch" => true,
+        "list_windows" => private_display,
+        "screenshot" => private_display || private_window,
+        _ => private_window,
+    };
+    ensure!(
+        allowed,
+        "sub-agents may only use their private display: {op} needs display=\"private\" or a pd: window_id from list_windows with display=private; launch the app there first"
+    );
+    Ok(())
+}
+
 /// Whether an effect on this element needs explicit human confirmation.
 pub(crate) fn action_is_consequential(op: &str, element: &ObservedElement) -> bool {
     if !matches!(op, "click" | "set_value" | "pointer_click" | "type_text") {
@@ -162,6 +194,7 @@ impl ComputerUse {
                     | "drag"
                     | "start_display"
                     | "stop_display"
+                    | "attach_display"
                     | "launch"
             ),
             "unsupported computer-use operation `{op}`"
@@ -205,7 +238,9 @@ impl ComputerUse {
         // Starting a private display, launching into it and tearing it down
         // wait on child processes; everything else is a bounded desktop call.
         let limit = match op {
-            "start_display" | "launch" | "stop_display" => Duration::from_secs(45),
+            "start_display" | "launch" | "stop_display" | "attach_display" => {
+                Duration::from_secs(45)
+            }
             _ => Duration::from_secs(15),
         };
         let response: Value = tokio::time::timeout(limit, async {
@@ -490,6 +525,39 @@ mod tests {
             "pointer_click",
             &element("AXButton", "Pay now")
         ));
+    }
+
+    #[test]
+    fn sub_agents_are_confined_to_the_private_display() {
+        for allowed in [
+            json!({"op": "capabilities"}),
+            json!({"op": "launch", "argv": ["vkcube"]}),
+            json!({"op": "attach_display", "display_id": "0123456789abcdef"}),
+            json!({"op": "list_windows", "display": "private"}),
+            json!({"op": "screenshot", "display": "private", "scope": "desktop"}),
+            json!({"op": "screenshot", "scope": "window", "window_id": "pd:2"}),
+            json!({"op": "observe", "window_id": "pd:2"}),
+            json!({"op": "pointer_click", "window_id": "pd:2", "x": 1, "y": 1}),
+            json!({"op": "key", "window_id": "pd:2", "keys": "ctrl+s"}),
+        ] {
+            ensure_private_display_only(&allowed)
+                .unwrap_or_else(|error| panic!("{allowed}: {error}"));
+        }
+        for refused in [
+            json!({"op": "list_windows"}),
+            json!({"op": "list_windows", "display": "desktop"}),
+            json!({"op": "screenshot", "scope": "desktop"}),
+            json!({"op": "screenshot", "scope": "window", "window_id": "niri:17"}),
+            json!({"op": "observe", "window_id": "a1b2:3"}),
+            json!({"op": "type_text", "window_id": "niri:17", "text": "x"}),
+            json!({"op": "pointer_click", "x": 10, "y": 10}),
+            json!({"op": "click", "window_id": "pd:2", "display": "desktop"}),
+        ] {
+            assert!(
+                ensure_private_display_only(&refused).is_err(),
+                "{refused} must be refused for a sub-agent"
+            );
+        }
     }
 
     #[tokio::test]
