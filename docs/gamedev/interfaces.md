@@ -284,6 +284,7 @@ producer-aware watch. See `docs/watcher-yield.md` and runtime `watch.rs`.
   require manual resolution; do not kill a guessed descendant or readmit the
   next job. No unsupported host silently gains production recovery claims.
 - D13: a native adapter's requested disk reservation (e.g. 24 GiB) is an
-  admission estimate; the current workspace per-agent cap/whole-worktree GC
-  do not implement a per-target byte quota or targeted cleanup. Document
-  this limitation rather than treating free-space checks as hard quotas.
+  admission estimate; the workspace per-agent cap helper (not wired into
+  lane job dispatch) and whole-worktree GC do not implement per-target byte
+  quotas or targeted cleanup. Document this limit; a free-space check is not
+  a hard quota.
