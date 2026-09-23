@@ -149,6 +149,7 @@ pub struct WorktreeRecord {
     pub owner_live: bool,
     pub owner_gone: bool,
     pub merged: bool,
+    pub abandoned: bool,
     pub dirty: bool,
     pub last_activity_unix: Option<u64>,
     pub size_bytes: u64,
@@ -182,6 +183,15 @@ pub fn inventory(repo: &Path, active: &[(Uuid, PathBuf)]) -> Result<Vec<Worktree
         repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?);
+    let primary_repo = primary
+        .parent()
+        .context("Git common directory has no parent")?;
+    let base_branch = git_text(
+        primary_repo,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .unwrap_or_else(|_| "main".into());
+    let base_ref = format!("refs/heads/{base_branch}");
     let mut trees = Vec::new();
     for block in output.split("\n\n") {
         let Some(path) = block
@@ -211,12 +221,11 @@ pub fn inventory(repo: &Path, active: &[(Uuid, PathBuf)]) -> Result<Vec<Worktree
             &["status", "--porcelain=v1", "--untracked-files=normal"],
         )?;
         let dirty = !status.status.success() || !status.stdout.is_empty();
-        let merged = branch.as_deref().is_some_and(|branch| branch != "main")
-            && git(
-                &path,
-                &["merge-base", "--is-ancestor", "HEAD", "refs/heads/main"],
-            )
-            .is_ok_and(|out| out.status.success());
+        let merged = branch
+            .as_deref()
+            .is_some_and(|branch| branch != base_branch)
+            && git(&path, &["merge-base", "--is-ancestor", "HEAD", &base_ref])
+                .is_ok_and(|out| out.status.success());
         let is_primary = git_dir(&path).is_ok_and(|dir| dir == primary);
         let owner_gone = false; // only the caller with journal exit evidence can set this
         let size_bytes = Command::new("du")
@@ -234,11 +243,40 @@ pub fn inventory(repo: &Path, active: &[(Uuid, PathBuf)]) -> Result<Vec<Worktree
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs());
-        let gc_reason = if !is_primary && merged && !dirty && !owner_live && owner.is_some() {
-            Some("merged, clean; verify owner exit before removal".into())
-        } else {
-            None
-        };
+        // Thirty days without a worktree/index update or branch commit is a
+        // *proposal*, never owner-exit proof. Git branches remain after removal.
+        let index_activity = git_dir(&path)
+            .ok()
+            .and_then(|dir| fs::metadata(dir.join("index")).ok())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        let commit_activity = git_text(&path, &["log", "-1", "--format=%ct"])
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok());
+        let last_activity_unix = [last_activity_unix, index_activity, commit_activity]
+            .into_iter()
+            .flatten()
+            .max();
+        let abandoned = !is_primary
+            && !merged
+            && last_activity_unix.is_some_and(|seen| {
+                now_unix().is_ok_and(|now| now.saturating_sub(seen) >= 30 * 86_400)
+            });
+        let gc_reason =
+            if !is_primary && (merged || abandoned) && !dirty && !owner_live && owner.is_some() {
+                Some(
+                    if merged {
+                        "merged, clean"
+                    } else {
+                        "abandoned 30d, clean; branch retained"
+                    }
+                    .to_string()
+                        + "; verify owner exit before removal",
+                )
+            } else {
+                None
+            };
         trees.push(WorktreeRecord {
             path,
             branch,
@@ -246,6 +284,7 @@ pub fn inventory(repo: &Path, active: &[(Uuid, PathBuf)]) -> Result<Vec<Worktree
             owner_live,
             owner_gone,
             merged,
+            abandoned,
             dirty,
             last_activity_unix,
             size_bytes,
@@ -345,7 +384,7 @@ pub fn gc(
     force: bool,
 ) -> Result<bool> {
     ensure!(
-        tree.gc_reason.is_some() || (force && tree.merged && !tree.owner_live),
+        tree.gc_reason.is_some() || (force && (tree.merged || tree.abandoned) && !tree.owner_live),
         "not eligible for GC"
     );
     ensure!(!tree.owner_live, "live session owns worktree");
@@ -364,7 +403,7 @@ pub fn gc(
         .context("worktree disappeared before GC")?;
     ensure!(!fresh.dirty || force, "worktree became dirty");
     ensure!(
-        fresh.merged && fresh.owner == tree.owner,
+        (fresh.merged || fresh.abandoned) && fresh.owner == tree.owner,
         "worktree changed since proposal"
     );
     let output = git(
@@ -711,6 +750,7 @@ mod safety_tests {
             owner_live: true,
             owner_gone: false,
             merged: true,
+            abandoned: false,
             dirty: false,
             last_activity_unix: None,
             size_bytes: 0,
