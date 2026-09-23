@@ -1304,6 +1304,7 @@ struct ConsultingExecutor {
 struct CrossProviderCompactionExecutor {
     seen: RecordedCompactionTurns,
     compacted: Arc<Notify>,
+    released: Arc<Mutex<Vec<CodingProvider>>>,
 }
 
 struct OversizedCompactionExecutor;
@@ -1589,6 +1590,15 @@ impl AgentTurnExecutor for ConsultingExecutor {
 impl AgentTurnExecutor for CrossProviderCompactionExecutor {
     fn supports_subscription_context_reuse(&self, provider: CodingProvider) -> bool {
         provider == CodingProvider::Codex
+    }
+
+    async fn release_provider_context(
+        &self,
+        _session_id: Uuid,
+        provider: CodingProvider,
+    ) -> Result<()> {
+        self.released.lock().unwrap().push(provider);
+        Ok(())
     }
 
     async fn execute(
@@ -6829,9 +6839,11 @@ async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() 
     let (event_tx, mut event_rx) = mpsc::channel(64);
     let seen = Arc::new(Mutex::new(Vec::new()));
     let compacted = Arc::new(Notify::new());
+    let released = Arc::new(Mutex::new(Vec::new()));
     let executor = Arc::new(CrossProviderCompactionExecutor {
         seen: Arc::clone(&seen),
         compacted: Arc::clone(&compacted),
+        released: Arc::clone(&released),
     });
     let actor_store = Arc::clone(&store);
     let actor = tokio::spawn({
@@ -6953,6 +6965,11 @@ async fn compaction_after_provider_switch_rehydrates_the_new_provider_session() 
         .unwrap();
     drop(command_tx);
     actor.await.unwrap().unwrap();
+
+    assert_eq!(
+        released.lock().unwrap().as_slice(),
+        [CodingProvider::Claude]
+    );
 
     assert_eq!(
             seen.lock().unwrap().as_slice(),
@@ -11430,6 +11447,76 @@ fn a_clean_compaction_boundary_bounds_context_without_changing_replay() {
     .into();
     bound_context_at_compaction(&mut failed, &boundary);
     assert_eq!(failed.len(), 3, "a failed boundary keeps its carry");
+}
+
+#[test]
+fn degraded_native_compaction_replays_the_original_history_once() {
+    use borg_provider::provider::ModelMessage;
+
+    let session_id = Uuid::new_v4();
+    let native = |sequence, message: ModelMessage| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "native_model_message".to_string(),
+                payload: serde_json::to_value(message).unwrap(),
+            },
+        )
+    };
+    let degraded = SessionEvent::new(
+        session_id,
+        4,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: json!({
+                "status": "completed",
+                "summary": "Automatic summarization failed",
+                "degraded": true,
+                "retained_messages": 2,
+            }),
+        },
+    );
+    assert!(!degraded.kind.is_completed_context_compaction());
+    assert!(degraded.kind.is_context_relevant());
+    assert!(!starts_context_generation(&degraded.kind));
+    let events = vec![
+        SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "context_compaction".to_string(),
+                payload: json!({"status": "completed", "summary": "earlier work"}),
+            },
+        ),
+        native(2, ModelMessage::user("original request")),
+        native(
+            3,
+            ModelMessage::assistant(Some("original answer".into()), None, None, Vec::new()),
+        ),
+        degraded.clone(),
+        native(5, ModelMessage::user("original request")),
+        native(
+            6,
+            ModelMessage::assistant(Some("original answer".into()), None, None, Vec::new()),
+        ),
+        native(
+            7,
+            ModelMessage::assistant(Some("next answer".into()), None, None, Vec::new()),
+        ),
+    ];
+    assert_eq!(
+        native_conversation(&events, CodingProvider::Codex).unwrap(),
+        vec![
+            ModelMessage::user("Previous conversation summary:\n\nearlier work"),
+            ModelMessage::user("original request"),
+            ModelMessage::assistant(Some("original answer".into()), None, None, Vec::new()),
+            ModelMessage::assistant(Some("next answer".into()), None, None, Vec::new()),
+        ]
+    );
 }
 
 #[test]

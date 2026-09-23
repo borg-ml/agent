@@ -1277,68 +1277,106 @@ impl NativeHarness {
         fast: bool,
         conversation: Vec<ModelMessage>,
     ) -> Result<(String, ProviderCallUsage)> {
+        let window = self
+            .model_client
+            .context_window(provider, model)
+            .await
+            .unwrap_or(NATIVE_ASSUMED_CONTEXT_WINDOW_TOKENS);
+        self.compact_with_window(provider, model, effort, fast, conversation, window)
+            .await
+    }
+
+    async fn compact_with_window(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+        effort: Option<&str>,
+        fast: bool,
+        conversation: Vec<ModelMessage>,
+        context_window_tokens: u64,
+    ) -> Result<(String, ProviderCallUsage)> {
         anyhow::ensure!(
             !conversation.is_empty(),
             "there is no native conversation to compact yet"
         );
-        // Tool output is the disposable bulk of a long transcript. Keep the
-        // durable message sequence and let the shared semantic projection
-        // clear old results before the compaction model sees them. This keeps
-        // native and subscription compaction on the same evidence policy.
-        let conversation = crate::session::prune_conversation_for_compaction(&conversation);
-        let mut messages = Vec::with_capacity(conversation.len().saturating_add(3));
-        messages.push(ModelMessage::System {
-            content: crate::session::COMPACTION_SUMMARY_PROMPT.to_string(),
-        });
-        messages.push(ModelMessage::user("<prior_provider_conversation>"));
-        messages.extend(conversation.into_iter().map(|message| match message {
-            ModelMessage::System { content } => ModelMessage::user(format!(
-                "System instructions from the conversation:
-{content}"
-            )),
-            message => message,
-        }));
-        messages.push(ModelMessage::user(
-            "</prior_provider_conversation>
-Return only the internal continuation checkpoint.",
-        ));
-        let result = self
-            .model_client
-            .model_turn(
-                provider,
-                model,
-                effort,
-                ModelTurnRequest {
-                    fast,
-                    request_id: Some(format!("compact:{}", Uuid::new_v4())),
-                    session_id: None,
-                    prompt_cache_key: None,
-                    messages,
-                    tools: Vec::new(),
-                    output_schema: None,
-                },
-                None,
-            )
-            .await
-            .map_err(anyhow::Error::new)?;
-        let ModelMessage::Assistant {
-            content,
-            tool_calls,
-            ..
-        } = result.message
-        else {
-            bail!("native compaction returned a non-assistant message")
-        };
+        // The source can be much larger than the target model's window after
+        // a provider switch. Render and fold bounded, provider-neutral chunks;
+        // replaying historical tool protocol in a summarization request can
+        // also make the target provider reject an otherwise valid transcript.
+        let input_chars = context_window_tokens
+            .max(1)
+            .min(1_024_000)
+            .saturating_div(2) as usize;
+        let summary_chars = (input_chars / 8).min(32 * 1024);
+        let wrapper_chars = crate::session::COMPACTION_SUMMARY_PROMPT.chars().count() + 160;
+        let chunk_chars = input_chars.saturating_sub(summary_chars + wrapper_chars);
         anyhow::ensure!(
-            tool_calls.is_empty(),
-            "native compaction unexpectedly requested a tool"
+            chunk_chars >= 1_024,
+            "native compaction context window is too small"
         );
-        let summary = content.unwrap_or_default();
-        anyhow::ensure!(
-            !summary.trim().is_empty(),
-            "native compaction returned an empty summary"
-        );
-        Ok((summary, result.usage))
+        let chunks = crate::session::compaction_context_chunks(&conversation, chunk_chars);
+        let mut summary = String::new();
+        let mut usage = ProviderCallUsage::default();
+        for chunk in chunks {
+            let prompt = if summary.is_empty() {
+                format!(
+                    "<prior_provider_conversation>\n{chunk}\n</prior_provider_conversation>\nReturn only the internal continuation checkpoint."
+                )
+            } else {
+                format!(
+                    "<prior_summary>\n{summary}\n</prior_summary>\n\n<prior_provider_conversation>\n{chunk}\n</prior_provider_conversation>\nReturn only the updated internal continuation checkpoint."
+                )
+            };
+            anyhow::ensure!(
+                prompt.chars().count() + crate::session::COMPACTION_SUMMARY_PROMPT.chars().count()
+                    <= input_chars,
+                "native compaction prompt exceeds its bounded input budget"
+            );
+            let result = self
+                .model_client
+                .model_turn(
+                    provider,
+                    model,
+                    effort,
+                    ModelTurnRequest {
+                        fast,
+                        request_id: Some(format!("compact:{}", Uuid::new_v4())),
+                        session_id: None,
+                        prompt_cache_key: None,
+                        messages: vec![
+                            ModelMessage::System {
+                                content: crate::session::COMPACTION_SUMMARY_PROMPT.to_string(),
+                            },
+                            ModelMessage::user(prompt),
+                        ],
+                        tools: Vec::new(),
+                        output_schema: None,
+                    },
+                    None,
+                )
+                .await
+                .map_err(anyhow::Error::new)?;
+            let ModelMessage::Assistant {
+                content,
+                tool_calls,
+                ..
+            } = result.message
+            else {
+                bail!("native compaction returned a non-assistant message")
+            };
+            anyhow::ensure!(
+                tool_calls.is_empty(),
+                "native compaction unexpectedly requested a tool"
+            );
+            let next = content.unwrap_or_default();
+            anyhow::ensure!(
+                !next.trim().is_empty(),
+                "native compaction returned an empty summary"
+            );
+            summary = crate::session::truncate_compaction_context(&next, summary_chars);
+            absorb_usage(&mut usage, &result.usage);
+        }
+        Ok((summary, usage))
     }
 
     /// Compact `messages` in place when `budget` says the next request would
@@ -1432,15 +1470,16 @@ Return only the internal continuation checkpoint.",
         )
         .await;
         let compacted = self
-            .compact(
+            .compact_with_window(
                 turn.provider,
                 model,
                 turn.effort.as_deref(),
                 turn.fast.unwrap_or(false),
                 messages.clone(),
+                context_window_tokens,
             )
             .await;
-        let (summary, retained, degraded) = match compacted {
+        let (summary, retained) = match compacted {
             Ok((summary, compaction_usage)) => {
                 absorb_usage(usage, &compaction_usage);
                 let retained =
@@ -1473,13 +1512,12 @@ Return only the internal continuation checkpoint.",
                     },
                 )
                 .await;
-                (summary, retained, false)
+                (summary, retained)
             }
             Err(error) => {
-                // Summarization is one more best-effort model call. When it
-                // fails, the oldest context is dropped mechanically so the
-                // turn continues on the recent window instead of dying with
-                // the work half done.
+                // The provider failure does not license dropping history.
+                // Leave the request view and durable journal unchanged so a
+                // later attempt can retry with the full source conversation.
                 send(
                     events,
                     SessionEventKind::ProviderEvent {
@@ -1491,36 +1529,12 @@ Return only the internal continuation checkpoint.",
                             "context_tokens_before": context_tokens,
                             "effective_context_window_tokens": context_window_tokens,
                             "error": format!("{error:#}"),
-                            "degraded_to": "recent_window",
+                            "history_preserved": true,
                         }),
                     },
                 )
                 .await;
-                let retained = retain_recent_native_messages(
-                    messages,
-                    context_window_tokens.saturating_mul(NATIVE_DEGRADED_RETAIN_PERCENT) / 100,
-                );
-                let summary = NATIVE_DEGRADED_COMPACTION_SUMMARY.to_string();
-                send(
-                    events,
-                    SessionEventKind::ProviderEvent {
-                        provider: turn.provider,
-                        kind: "context_compaction".to_string(),
-                        payload: json!({
-                            "status": "completed",
-                            "summary": summary,
-                            "native": true,
-                            "automatic": true,
-                            "degraded": true,
-                            "trigger": trigger,
-                            "context_tokens_before": context_tokens,
-                            "effective_context_window_tokens": context_window_tokens,
-                            "retained_messages": retained.len(),
-                        }),
-                    },
-                )
-                .await;
-                (summary, retained, true)
+                return Err(error.context("native context compaction failed; history preserved"));
             }
         };
         // The prefix that was being kept warm no longer exists, so any armed
@@ -1540,13 +1554,6 @@ Return only the internal continuation checkpoint.",
         }
         messages.extend(retained);
         canonicalize_native_messages(messages);
-        if degraded {
-            tracing::warn!(
-                context_tokens,
-                context_window_tokens,
-                "native compaction failed; continued on the recent window"
-            );
-        }
         send(
             events,
             SessionEventKind::ContextWindowUpdated {
@@ -3594,14 +3601,10 @@ fn absorb_usage(total: &mut ProviderCallUsage, usage: &ProviderCallUsage) {
     }
 }
 
-/// Share of the window kept when summarization itself fails and the oldest
-/// context is dropped mechanically so the turn can continue.
-const NATIVE_DEGRADED_RETAIN_PERCENT: u64 = 40;
 /// Window assumed when the provider reports none (local OpenAI-compatible
 /// servers commonly omit it). Compacting a larger model early costs one
 /// summary; never compacting costs the whole turn once the real window fills.
 const NATIVE_ASSUMED_CONTEXT_WINDOW_TOKENS: u64 = 128_000;
-const NATIVE_DEGRADED_COMPACTION_SUMMARY: &str = "Automatic summarization failed, so the oldest part of this conversation was dropped instead. The most recent messages are kept verbatim; use `query_history` or ask the user for anything earlier that is still needed.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct NativeContextBudget {
@@ -4416,11 +4419,10 @@ mod tests {
                 assert!(request.messages.iter().any(|message| matches!(message,
                     ModelMessage::User { content, .. }
                     if content.contains("Continue editing until the build passes"))));
-                assert!(
-                    request
-                        .messages
-                        .contains(&ModelMessage::user("Preserve the public API"))
-                );
+                assert!(request.messages.iter().any(|message| matches!(message,
+                    ModelMessage::User { content, .. }
+                    if content.contains("Preserve the public API"))));
+                assert_eq!(request.messages.len(), 2);
                 assert!(request.tools.is_empty());
                 Ok(ModelTurnResult {
                     message: ModelMessage::assistant(
@@ -4456,6 +4458,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(summary, "Resume the build fix");
+    }
+
+    #[tokio::test]
+    async fn native_compaction_folds_large_cross_provider_context_with_bounded_requests() {
+        struct BoundedClient {
+            prompts: Mutex<Vec<String>>,
+        }
+        #[async_trait]
+        impl NativeModelClient for BoundedClient {
+            async fn context_window(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+            ) -> Option<u64> {
+                Some(20_000)
+            }
+
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                request: ModelTurnRequest,
+                _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                assert_eq!(request.messages.len(), 2);
+                assert!(request.tools.is_empty());
+                assert!(request.messages.iter().all(|message| matches!(
+                    message,
+                    ModelMessage::System { .. } | ModelMessage::User { .. }
+                )));
+                let ModelMessage::User { content, .. } = &request.messages[1] else {
+                    unreachable!()
+                };
+                let input_chars = request
+                    .messages
+                    .iter()
+                    .map(|message| match message {
+                        ModelMessage::System { content } | ModelMessage::User { content, .. } => {
+                            content.chars().count()
+                        }
+                        _ => 0,
+                    })
+                    .sum::<usize>();
+                assert!(
+                    input_chars <= 10_000,
+                    "compaction input was {input_chars} chars"
+                );
+                self.prompts.lock().unwrap().push(content.clone());
+                Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(
+                        Some("Resume the build fix".into()),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    finish_reason: "stop".into(),
+                    usage: ProviderCallUsage::default(),
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+        let client = Arc::new(BoundedClient {
+            prompts: Mutex::new(Vec::new()),
+        });
+        let harness = NativeHarness {
+            model_client: client.clone(),
+            ..NativeHarness::default()
+        };
+        let conversation = (0..20)
+            .map(|index| {
+                ModelMessage::user(format!("Source message {index}: {}", "x".repeat(2_000)))
+            })
+            .collect();
+        let (summary, _) = harness
+            .compact(
+                crate::CodingProvider::Codex,
+                "test-model",
+                Some("high"),
+                false,
+                conversation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary, "Resume the build fix");
+        let prompts = client.prompts.lock().unwrap();
+        assert!(prompts.len() > 1);
+        assert!(prompts[1].contains("<prior_summary>\nResume the build fix"));
+        assert!(prompts.last().unwrap().contains("Source message 19"));
     }
 
     #[tokio::test]
@@ -6610,6 +6702,58 @@ mod tests {
             "the first model call read {} tokens for a {WINDOW}-token window",
             calls[0]
         );
+    }
+
+    #[tokio::test]
+    async fn failed_native_compaction_preserves_the_durable_history() {
+        struct RejectCompaction;
+        #[async_trait]
+        impl NativeModelClient for RejectCompaction {
+            async fn context_window(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+            ) -> Option<u64> {
+                Some(10_000)
+            }
+
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                _request: ModelTurnRequest,
+                _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                Err(ProviderCallError {
+                    message: "provider rejected compaction".into(),
+                    trace: Box::new(ProviderAttemptTrace::default()),
+                    session_id: None,
+                    kind: borg_provider::provider::ProviderErrorKind::Unknown,
+                })
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let (events, completed) = run_turn_events(
+            Arc::new(RejectCompaction),
+            root.path().to_path_buf(),
+            Uuid::new_v4(),
+            vec![ModelMessage::user("x".repeat(40_000))],
+            "go",
+            "",
+            "",
+        )
+        .await;
+        assert!(!completed);
+        assert!(events.iter().any(|event| matches!(event,
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction_failed"
+                    && payload["history_preserved"] == true)));
+        assert!(!events.iter().any(|event| matches!(event,
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction"
+                    && payload["status"] == "completed")));
     }
 
     /// The pre-call guard cannot see a window the route never advertises, and a

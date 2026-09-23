@@ -108,6 +108,9 @@ separate action-summary narration item.";
 /// never be resumed. Bump this whenever the provider-facing behavioral
 /// contract changes in a way that stale native context could preserve.
 pub(crate) const PROVIDER_CONTEXT_CONTRACT_VERSION: u32 = 1;
+const MAX_IDLE_CLAUDE_POOLS: usize = 4;
+const CLAUDE_POOL_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+const CLAUDE_POOL_REAP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A Claude turn built as a delta assumes the pooled process still holds the
 /// whole conversation. Claude sessions are not resumable from disk here, so
@@ -367,6 +370,12 @@ pub trait AgentTurnExecutor: Send + Sync {
         false
     }
 
+    /// A retained subscription process can be evicted while its Borg session
+    /// stays open. Check it before the actor chooses a delta over journal replay.
+    async fn has_provider_context(&self, _session_id: Uuid, _provider: CodingProvider) -> bool {
+        true
+    }
+
     /// Return a live view of the trusted executable Blu workflows available to
     /// the session. The view is intentionally a closure so extension reloads
     /// become visible to model tools without rebuilding the dispatcher.
@@ -417,6 +426,15 @@ pub trait AgentTurnExecutor: Send + Sync {
     }
 
     async fn stop_session(&self, _session_id: Uuid) -> Result<()> {
+        Ok(())
+    }
+
+    /// Release a provider's retained process after the session switches away.
+    async fn release_provider_context(
+        &self,
+        _session_id: Uuid,
+        _provider: CodingProvider,
+    ) -> Result<()> {
         Ok(())
     }
 }
@@ -485,7 +503,8 @@ struct RuntimeExtensions {
 
 #[derive(Default)]
 struct SubscriptionPoolRegistry {
-    slots: Mutex<HashMap<Uuid, SubscriptionPoolSlot>>,
+    slots: Arc<Mutex<HashMap<Uuid, SubscriptionPoolSlot>>>,
+    idle_reaper_running: Arc<AtomicBool>,
 }
 
 struct SubscriptionPoolSlot {
@@ -494,6 +513,7 @@ struct SubscriptionPoolSlot {
     context_generation: u64,
     epoch: u64,
     healthy: bool,
+    idle_since: Option<Instant>,
     pool: ClaudeSubscriptionPool,
 }
 
@@ -536,6 +556,7 @@ impl SubscriptionPoolRegistry {
                 context_generation,
                 epoch: 0,
                 healthy: false,
+                idle_since: None,
                 pool: ClaudeSubscriptionPool::default(),
             });
         let append = slot.provider == provider
@@ -544,6 +565,7 @@ impl SubscriptionPoolRegistry {
             && slot.lifecycle_key == lifecycle_key;
         // If execution is aborted, replay the journal on the next turn.
         slot.healthy = false;
+        slot.idle_since = None;
         if !append {
             slot.epoch = slot.epoch.saturating_add(1);
             slot.provider = provider;
@@ -563,13 +585,66 @@ impl SubscriptionPoolRegistry {
     }
 
     async fn mark(&self, session_id: Uuid, provider: CodingProvider, healthy: bool) {
-        if let Some(slot) = self.slots.lock().await.get_mut(&session_id)
-            && slot.provider == provider
-        {
-            slot.healthy = healthy;
-            if !healthy {
-                slot.epoch = slot.epoch.saturating_add(1);
-            }
+        let mut slots = self.slots.lock().await;
+        let Some(slot) = slots
+            .get_mut(&session_id)
+            .filter(|slot| slot.provider == provider)
+        else {
+            return;
+        };
+        slot.healthy = healthy;
+        slot.idle_since = healthy.then(Instant::now);
+        if !healthy {
+            slot.epoch = slot.epoch.saturating_add(1);
+            slot.pool = ClaudeSubscriptionPool::default();
+        }
+        let mut idle = slots
+            .iter()
+            .filter_map(|(session_id, slot)| slot.idle_since.map(|since| (*session_id, since)))
+            .collect::<Vec<_>>();
+        idle.sort_by_key(|(_, since)| *since);
+        let excess = idle.len().saturating_sub(MAX_IDLE_CLAUDE_POOLS);
+        let evicted = idle
+            .into_iter()
+            .take(excess)
+            .filter_map(|(session_id, _)| slots.remove(&session_id))
+            .collect::<Vec<_>>();
+        drop(slots);
+        drop(evicted);
+        if healthy && !self.idle_reaper_running.swap(true, Ordering::AcqRel) {
+            let slots = Arc::downgrade(&self.slots);
+            let running = Arc::downgrade(&self.idle_reaper_running);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(CLAUDE_POOL_REAP_INTERVAL).await;
+                    let (Some(slots), Some(running)) = (slots.upgrade(), running.upgrade()) else {
+                        break;
+                    };
+                    let mut slots = slots.lock().await;
+                    let now = Instant::now();
+                    let expired = slots
+                        .iter()
+                        .filter_map(|(session_id, slot)| {
+                            slot.idle_since
+                                .filter(|since| now.duration_since(*since) >= CLAUDE_POOL_IDLE_TTL)
+                                .map(|_| *session_id)
+                        })
+                        .collect::<Vec<_>>();
+                    let evicted = expired
+                        .into_iter()
+                        .filter_map(|session_id| slots.remove(&session_id))
+                        .collect::<Vec<_>>();
+                    let has_idle = slots.values().any(|slot| slot.idle_since.is_some());
+                    if !has_idle {
+                        running.store(false, Ordering::Release);
+                    }
+                    drop(slots);
+                    drop(evicted);
+                    if !has_idle {
+                        break;
+                    }
+                }
+            });
         }
     }
 }
@@ -972,6 +1047,18 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         provider == CodingProvider::Claude
     }
 
+    async fn has_provider_context(&self, session_id: Uuid, provider: CodingProvider) -> bool {
+        if provider != CodingProvider::Claude {
+            return true;
+        }
+        self.subscription_pools
+            .slots
+            .lock()
+            .await
+            .get(&session_id)
+            .is_some_and(|slot| slot.healthy)
+    }
+
     fn extension_workflow_snapshot(
         &self,
     ) -> Option<Arc<dyn Fn() -> Vec<BluWorkflowDefinition> + Send + Sync>> {
@@ -1254,6 +1341,21 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             .await
             .remove(&session_id);
         self.native_harness.stop_session(session_id).await
+    }
+
+    async fn release_provider_context(
+        &self,
+        session_id: Uuid,
+        provider: CodingProvider,
+    ) -> Result<()> {
+        if provider == CodingProvider::Claude {
+            self.subscription_pools
+                .slots
+                .lock()
+                .await
+                .remove(&session_id);
+        }
+        Ok(())
     }
 }
 
@@ -3060,6 +3162,51 @@ mod tests {
             .await;
         assert_eq!(replay.prompt, "canonical history + first + second + third");
         assert_ne!(appended.lifecycle_key, replay.lifecycle_key);
+    }
+
+    #[tokio::test]
+    async fn idle_claude_pools_are_bounded_and_evicted_sessions_replay() {
+        let registry = SubscriptionPoolRegistry::default();
+        let mut sessions = Vec::new();
+        for _ in 0..=MAX_IDLE_CLAUDE_POOLS {
+            let session_id = Uuid::new_v4();
+            registry
+                .prepare(
+                    session_id,
+                    SubscriptionTurnInput {
+                        context_generation: 0,
+                        provider: CodingProvider::Claude,
+                        prompt: "canonical history + first".to_string(),
+                        prompt_delta: "first".to_string(),
+                        lifecycle_key: "stable-config".to_string(),
+                    },
+                )
+                .await;
+            registry
+                .mark(session_id, CodingProvider::Claude, true)
+                .await;
+            sessions.push(session_id);
+        }
+
+        let slots = registry.slots.lock().await;
+        assert_eq!(slots.len(), MAX_IDLE_CLAUDE_POOLS);
+        assert!(!slots.contains_key(&sessions[0]));
+        drop(slots);
+
+        let replay = registry
+            .prepare(
+                sessions[0],
+                SubscriptionTurnInput {
+                    context_generation: 0,
+                    provider: CodingProvider::Claude,
+                    prompt: "canonical history + second".to_string(),
+                    prompt_delta: "second".to_string(),
+                    lifecycle_key: "stable-config".to_string(),
+                },
+            )
+            .await;
+        assert!(!replay.reused);
+        assert_eq!(replay.prompt, "canonical history + second");
     }
 
     #[tokio::test]

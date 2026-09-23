@@ -208,7 +208,10 @@ use a genuinely gated tool (e.g. `Write`).
 4. **Pooling.** Local pooled sessions keep one native process alive, restart it when
    lifecycle configuration changes, transfer steers that race a terminal result to
    the replacement session, and discard the process after abnormal or unconfirmed
-   termination.
+   termination. Borg releases the process on provider switch or failed turns and
+   retains at most four idle Claude processes per executor for 15 minutes. An
+   evicted session rebuilds provider context from Borg's durable journal before
+   its next turn.
 5. **Context telemetry.** Native Rust requests `get_context_usage` after each assistant
    message, emits the provider-neutral `claude.context_usage` event, and treats missing
    or unsupported responses as advisory rather than failing the turn.

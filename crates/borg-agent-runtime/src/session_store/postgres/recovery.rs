@@ -797,6 +797,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn degraded_native_compaction_recovers_from_the_previous_real_boundary() {
+        let Some(url) = test_url() else {
+            eprintln!("skipping: BORG_TEST_SESSIONS_URL is not set");
+            return;
+        };
+        let (scratch, store, session_id) = started_session(&url).await;
+        let early = user_message(&store, session_id, "before real summary").await;
+        assistant_message(&store, session_id, "earlier answer").await;
+        complete_turn(&store, session_id, early).await;
+        let real = store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: "context_compaction".to_string(),
+                    payload: serde_json::json!({"status": "completed", "summary": "earlier work"}),
+                },
+            ))
+            .await
+            .expect("real boundary");
+        let recent = user_message(&store, session_id, "before failed summary").await;
+        assistant_message(&store, session_id, "recent answer").await;
+        complete_turn(&store, session_id, recent).await;
+        let degraded = store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Codex,
+                    kind: "context_compaction".to_string(),
+                    payload: serde_json::json!({
+                        "status": "completed",
+                        "summary": "Automatic summarization failed",
+                        "degraded": true,
+                        "retained_messages": 0,
+                    }),
+                },
+            ))
+            .await
+            .expect("degraded boundary");
+
+        let latest = store
+            .latest_completed_context_compaction(session_id)
+            .await
+            .expect("latest boundary")
+            .expect("real boundary remains");
+        assert_eq!(latest.sequence, real.sequence);
+        let recovered = store.recovery(session_id).await.expect("recovery");
+        assert!(recovered.context_events.iter().any(|event| {
+            matches!(&event.kind, SessionEventKind::Message { text, .. }
+                if text == "recent answer")
+        }));
+        assert!(
+            recovered
+                .context_events
+                .iter()
+                .any(|event| event.sequence == degraded.sequence)
+        );
+        scratch.discard().await;
+    }
+
+    #[tokio::test]
     async fn recovery_reads_aged_history_that_sql_predicates_cannot_see() {
         let Some(url) = test_url() else {
             eprintln!("skipping: BORG_TEST_SESSIONS_URL is not set");

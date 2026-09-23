@@ -3064,6 +3064,7 @@ async fn run_agent_session_store_kernel_inner(
                             crate::SessionConfigAction::SetModel { .. }
                                 | crate::SessionConfigAction::SetProvider { .. }
                         );
+                        let previous_provider = launch.provider;
                         match apply_session_config(
                             &mut journal,
                             &events,
@@ -3074,7 +3075,13 @@ async fn run_agent_session_store_kernel_inner(
                         .await
                         {
                             Ok(provider_switched) => {
+                                if retry_selection {
+                                    provider_context_usage_valid = false;
+                                }
                                 if provider_switched {
+                                    executor
+                                        .release_provider_context(session_id, previous_provider)
+                                        .await?;
                                     subscription_context_reusable = false;
                                     // The provider session id belongs to the
                                     // provider we just left, so the next turn
@@ -3808,6 +3815,16 @@ async fn run_agent_session_store_kernel_inner(
             }
         }
 
+        if subscription_context_reusable
+            && !executor
+                .has_provider_context(session_id, launch.provider)
+                .await
+        {
+            subscription_context_reusable = false;
+            provider_context_usage_valid = false;
+            retained_context = None;
+        }
+
         if executor.uses_native_harness(launch.provider) {
             let state = journal.state(session_id).await?;
             if provider_context_usage_valid && native_auto_compaction_needed(&state) {
@@ -4415,6 +4432,8 @@ async fn run_agent_session_store_kernel_inner(
             )
             .await?;
         }
+        let active_provider = launch.provider;
+        let active_model = launch.model.clone();
         let turn = AgentTurn {
             session_id,
             prompt_cache_session_id: Some(journal.store.prompt_cache_session_id(session_id).await?),
@@ -5741,6 +5760,11 @@ async fn run_agent_session_store_kernel_inner(
                             deferred_commands.push_back(command);
                         }
                         HostCommand::Configure { action, .. } => {
+                            let context_selection_changed = matches!(
+                                action,
+                                crate::SessionConfigAction::SetModel { .. }
+                                    | crate::SessionConfigAction::SetProvider { .. }
+                            );
                             match apply_session_config(
                                 &mut journal,
                                 &events,
@@ -5755,6 +5779,9 @@ async fn run_agent_session_store_kernel_inner(
                                 // finishes, so the switch is applied at the
                                 // turn boundary instead of here.
                                 Ok(provider_switched) => {
+                                    if context_selection_changed {
+                                        provider_context_usage_valid = false;
+                                    }
                                     provider_switch_pending |= provider_switched;
                                 }
                                 Err(error) => {
@@ -6302,7 +6329,7 @@ async fn run_agent_session_store_kernel_inner(
                     let compaction_status = context_compaction_status(&kind);
                     if compaction_status == Some("started") {
                         context_compaction_in_progress = true;
-                    } else if compaction_status == Some("completed") {
+                    } else if matches!(compaction_status, Some("completed" | "failed")) {
                         context_compaction_in_progress = false;
                     }
                     let retry_steers = provider_event_is_steer_boundary(&kind)
@@ -6380,7 +6407,13 @@ async fn run_agent_session_store_kernel_inner(
             }
         }
         at_turn_boundary = true;
+        if active_provider != launch.provider || active_model != launch.model {
+            provider_context_usage_valid = false;
+        }
         if std::mem::take(&mut provider_switch_pending) {
+            executor
+                .release_provider_context(session_id, active_provider)
+                .await?;
             subscription_context_reusable = false;
             provider_session_id = None;
             provider_fork_turn_id = None;
@@ -6669,6 +6702,11 @@ fn native_conversation(
     }
     let mut active_provider = None;
     let mut native_structured_in_turn = false;
+    // Older native compaction failures wrote a fake summary and then copied a
+    // recent tail into the journal. The source history is still durable. When
+    // replay treats that event as a non-boundary, skip only its immediately
+    // following copies so the original messages are not duplicated.
+    let mut degraded_tail_copies: Option<(u64, usize)> = None;
     let non_interrupted_failed_turns = events
         .iter()
         .filter_map(|event| match &event.kind {
@@ -6682,6 +6720,17 @@ fn native_conversation(
         .collect::<HashSet<_>>();
     for event in events {
         match &event.kind {
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction"
+                    && payload.get("degraded").and_then(Value::as_bool) == Some(true)
+                    && payload.get("status").and_then(Value::as_str) == Some("completed") =>
+            {
+                degraded_tail_copies = payload
+                    .get("retained_messages")
+                    .and_then(Value::as_u64)
+                    .and_then(|count| usize::try_from(count).ok())
+                    .map(|count| (event.sequence.saturating_add(1), count));
+            }
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "context_compaction" && compaction_restarts_replay(payload) =>
             {
@@ -6755,6 +6804,14 @@ fn native_conversation(
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "native_model_message" =>
             {
+                if let Some((next_sequence, remaining)) = degraded_tail_copies.as_mut() {
+                    if event.sequence == *next_sequence && *remaining > 0 {
+                        *next_sequence = next_sequence.saturating_add(1);
+                        *remaining -= 1;
+                        continue;
+                    }
+                    degraded_tail_copies = None;
+                }
                 native_structured_in_turn = true;
                 pending_native.push(serde_json::from_value(payload.clone()).context(
                     "durable native model message does not match the model-turn contract",
@@ -7032,14 +7089,15 @@ fn close_dangling_tool_calls(messages: &mut Vec<borg_provider::provider::ModelMe
 }
 
 fn compaction_restarts_replay(payload: &Value) -> bool {
-    payload
-        .get("provider_context_preserved")
-        .and_then(Value::as_bool)
-        != Some(true)
-        || payload
-            .get("provider_recovery_checkpoint")
+    payload.get("degraded").and_then(Value::as_bool) != Some(true)
+        && (payload
+            .get("provider_context_preserved")
             .and_then(Value::as_bool)
-            == Some(true)
+            != Some(true)
+            || payload
+                .get("provider_recovery_checkpoint")
+                .and_then(Value::as_bool)
+                == Some(true))
 }
 
 /// Field on a completed `context_compaction` event carrying the declarations
@@ -7576,10 +7634,11 @@ async fn run_retained_compaction(
         .await
 }
 
-/// Split a conversation into frame-aligned chunks that each render within
-/// `max_chars`, shrinking oversized individual messages first. No whole message
-/// is omitted; the caller folds every chunk through the provider.
-fn compaction_context_chunks(
+/// Split a conversation into chunks that each render within `max_chars`.
+/// Shrink oversized messages before rendering and elide the middle of a frame
+/// only if its serialized form is still too large. The caller folds every
+/// chunk through the provider.
+pub(crate) fn compaction_context_chunks(
     conversation: &[borg_provider::provider::ModelMessage],
     max_chars: usize,
 ) -> Vec<String> {
@@ -7591,7 +7650,10 @@ fn compaction_context_chunks(
     let mut chunks: Vec<String> = Vec::new();
     let mut current = String::new();
     for message in &projected {
-        let frame = format_subscription_frame(&format_subscription_message(message));
+        let mut frame = format_subscription_frame(&format_subscription_message(message));
+        if frame.chars().count() > max_chars {
+            frame = truncate_compaction_context(&frame, max_chars);
+        }
         let separator = usize::from(!current.is_empty());
         if !current.is_empty()
             && current.chars().count() + separator + frame.chars().count() > max_chars
@@ -7666,7 +7728,7 @@ fn subscription_replay_context_budget(actor: EventActor, current_prompt: &str) -
     }
 }
 
-fn truncate_compaction_context(context: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_compaction_context(context: &str, max_chars: usize) -> String {
     if context.chars().count() <= max_chars {
         return context.to_string();
     }
@@ -9348,6 +9410,9 @@ fn context_compaction_status(kind: &SessionEventKind) -> Option<&str> {
     };
     if provider_kind == "context_compaction" {
         return payload.get("status").and_then(serde_json::Value::as_str);
+    }
+    if provider_kind == "context_compaction_failed" {
+        return Some("failed");
     }
     let (method, item_type) = provider_kind.split_once(':')?;
     let item_type = item_type.to_ascii_lowercase().replace(['-', '_'], "");

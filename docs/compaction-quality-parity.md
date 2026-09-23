@@ -2,6 +2,12 @@
 
 Read-only comparative audit. No Borg source was modified.
 
+**2026-09-23 update:** The native path now bounds summarization input by folding
+provider-neutral chunks. A failed native summary preserves the journal and
+stops the turn instead of writing a degraded compaction boundary. Replay treats
+older degraded boundaries as failed summaries and restores their source history.
+The failure and provenance rows below describe the 2026-09-19 audit baseline.
+
 ## 0. Corrections — read first
 
 An earlier draft of this report made two claims that verification disproved.

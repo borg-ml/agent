@@ -197,6 +197,8 @@ impl SessionEventKind {
             self,
             Self::ProviderEvent { kind, payload, .. }
                 if kind == "context_compaction"
+                    && payload.get("degraded").and_then(serde_json::Value::as_bool)
+                        != Some(true)
                     && payload
                         .get("provider_context_preserved")
                         .and_then(serde_json::Value::as_bool)
@@ -420,6 +422,15 @@ impl SessionEventKind {
             Self::TurnStarted { .. } | Self::TurnCompleted { .. } | Self::ContextCleared => true,
             kind if kind.is_completed_context_compaction()
                 || kind.is_completed_provider_recovery_checkpoint() =>
+            {
+                true
+            }
+            Self::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction"
+                    && payload.get("degraded").and_then(serde_json::Value::as_bool)
+                        == Some(true)
+                    && payload.get("status").and_then(serde_json::Value::as_str)
+                        == Some("completed") =>
             {
                 true
             }
