@@ -175,6 +175,7 @@ fn supervisor_crash_recovers_only_the_owned_scope() {
     spec.timeout_ms = 70_000;
     // Recovery must verify and kill the job's own custom-named scope.
     spec.unit_prefix = Some("ab-build".into());
+    spec.finish_hook = Some(reporting_hook(&lane, "orphan", "finish"));
     let job = lane.submit(&spec);
     let record = lane.until(|| {
         lane.record(&job).filter(|record| {
@@ -207,7 +208,35 @@ fn supervisor_crash_recovers_only_the_owned_scope() {
     assert!(out.status.success(), "{}", describe(&out));
     let result = lane.wait(&job, CANCELLED);
     assert_eq!(result["state"]["Finished"]["exit_code"], CANCELLED);
-    assert!(!lane.record(&job).unwrap().quarantined);
+    let recovered = lane.record(&job).unwrap();
+    assert!(!recovered.quarantined);
+    // Recovery names what it killed, in the evidence and recovery.jsonl.
+    let workload = record.workload_pid.unwrap();
+    let evidence = recovered.evidence.unwrap_or_default();
+    assert!(
+        evidence.contains(&format!("recover killed pids [{workload}")),
+        "{evidence}"
+    );
+    let logged = std::fs::read_to_string(lane.state().join("recovery.jsonl")).unwrap();
+    assert!(
+        logged
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|entry| entry["job"] == job.as_str()
+                && entry["killed_pids"]
+                    .as_array()
+                    .is_some_and(|pids| pids.contains(&Value::from(workload)))),
+        "{logged}"
+    );
+    // The lost supervisor's finish hook still runs, once.
+    let finish = lane.root.join("orphan.finish");
+    lane.until(|| (!lines(&finish).is_empty()).then_some(()));
+    let reported = lines(&finish);
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert!(
+        reported[0].starts_with("finish finished 125 ") && reported[0].contains("lost supervisor"),
+        "{reported:?}"
+    );
 }
 
 /// Failure mode: Ctrl-C on the submitting terminal (a signal to its process
@@ -440,6 +469,96 @@ fn wait_until_started_and_timeout_leave_the_job_alone() {
     let done = lane.wait(&queued, 0);
     assert_eq!(done["exit_code"], 0, "{done}");
     assert!(done.as_object().unwrap().contains_key("wait_reason"));
+}
+
+/// A hook that appends its phase and the job's ending to `<root>/<name>.<phase>`.
+fn reporting_hook(lane: &Lane, name: &str, phase: &str) -> Hook {
+    let out = lane.root.join(format!("{name}.{phase}"));
+    Hook {
+        argv: vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                r#"echo "$BORG_LANE_PHASE $BORG_LANE_STATE ${{BORG_LANE_EXIT_CODE:-none}} $BORG_LANE_REASON" >> '{}'"#,
+                out.display()
+            ),
+        ],
+        timeout_ms: 10_000,
+    }
+}
+
+/// Failure mode: the caller's cleanup (a finish hook) skipped on some
+/// ending, run twice, or told the wrong outcome; a post hook that cannot
+/// see the exit code.
+#[test]
+fn finish_hooks_run_once_after_every_ending() {
+    let lane = Lane::new();
+    let reported = |name: &str| lines(&lane.root.join(format!("{name}.finish")));
+    let job = |name: &str, script: &str| {
+        let mut spec = lane.spec(name, script);
+        spec.finish_hook = Some(reporting_hook(&lane, name, "finish"));
+        spec
+    };
+    let mut holder = job("holder", "exec sleep 30");
+    holder.timeout_ms = 60_000;
+    let holder = lane.submit(&holder);
+    let started = lane.cli(&["job", "wait", &holder, "--until", "started"], None);
+    assert!(started.status.success(), "{}", describe(&started));
+    // Three ways to end while queued behind `holder`.
+    let queued = lane.submit(&job("queued", "true"));
+    lane.json::<Value>(&["job", "cancel", &queued]);
+    let mut timeout = job("timeout", "true");
+    timeout.lease.queue_timeout_ms = Some(300);
+    let timeout = lane.submit(&timeout);
+    let mut abandoned = job("abandoned", "true");
+    abandoned.abandon_after_ms = Some(300);
+    let abandoned = lane.submit(&abandoned);
+    for id in [&timeout, &abandoned] {
+        lane.until(|| {
+            lane.record(id)
+                .and_then(|record| record.job)
+                .filter(|job| matches!(job.state, JobState::Cancelled { .. }))
+        });
+    }
+    // A running cancel, then a job that exits 3.
+    lane.json::<Value>(&["job", "cancel", &holder]);
+    lane.wait(&holder, CANCELLED);
+    let mut exited = job("exited", "exit 3");
+    if !lane.degraded {
+        // Unbound post hooks need their own scope.
+        exited.post_hook = Some(reporting_hook(&lane, "exited", "post"));
+    }
+    let exited = lane.submit(&exited);
+    lane.wait(&exited, 3);
+
+    let expected = [
+        ("holder", "finish cancelled none cancelled by requester"),
+        ("queued", "finish cancelled none cancelled by requester"),
+        ("timeout", "finish cancelled none queue timeout"),
+        ("abandoned", "finish cancelled none abandoned: no requester"),
+        ("exited", "finish finished 3 finished"),
+    ];
+    for (name, line) in expected {
+        lane.until(|| (!reported(name).is_empty()).then_some(()));
+        assert_eq!(reported(name), [line], "{name}");
+    }
+    for id in [&holder, &queued, &timeout, &abandoned, &exited] {
+        let record = lane.until(|| lane.record(id).filter(|r| r.finish_hook_outcome.is_some()));
+        assert_eq!(record.finish_hook_outcome.as_deref(), Some("exited 0"));
+    }
+    if !lane.degraded {
+        let post = lane.root.join("exited.post");
+        lane.until(|| (!lines(&post).is_empty()).then_some(()));
+        assert_eq!(lines(&post), ["post-exclusive finished 3 finished"]);
+    }
+    // Recovery and repeated waits start none of them again.
+    let out = lane.cli(&["job", "recover"], None);
+    assert!(out.status.success(), "{}", describe(&out));
+    lane.wait(&exited, 3);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    for (name, line) in expected {
+        assert_eq!(reported(name), [line], "{name} ran more than once");
+    }
 }
 
 /// Several agents submit a mixed workload concurrently. Judged only from the

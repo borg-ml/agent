@@ -120,6 +120,7 @@ impl Lane {
             foreign_client_grace_by_resource: Vec::new(),
             abandon_after_ms: None,
             unit_prefix: None,
+            finish_hook: None,
             fingerprint: JobFingerprint(name.into()),
             lease: LeaseRequest {
                 resources: vec![ResourceRequest {
