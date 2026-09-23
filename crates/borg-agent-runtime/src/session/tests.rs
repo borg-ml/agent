@@ -9132,6 +9132,7 @@ fn only_an_uncommitted_steer_is_withdrawable_from_the_active_turn() {
     let rejected_id = Uuid::new_v4();
     let awaiting_id = Uuid::new_v4();
     let accepted_id = Uuid::new_v4();
+    let team_id = Uuid::new_v4();
     let steer =
         |message_id: Uuid, state: PendingSteerState, admission: SteerAdmission| PendingSteer {
             prompt: QueuedPrompt {
@@ -9171,10 +9172,20 @@ fn only_an_uncommitted_steer_is_withdrawable_from_the_active_turn() {
             accepted,
         ),
     ]);
+    let mut team = steer(
+        team_id,
+        PendingSteerState::AwaitingAcknowledgement,
+        pending_steers[0].admission.clone(),
+    );
+    team.prompt.actor = EventActor::System;
+    team.prompt.interrupt_batch = false;
+    team.acknowledgement_id = pending_steers[0].acknowledgement_id;
+    pending_steers.insert(1, team);
 
     let recalled = recall_withdrawable_steers(&mut pending_steers, Some(accepted_id));
     assert!(recalled.is_empty());
-    assert_eq!(pending_steers.len(), 3);
+    assert!(recall_withdrawable_steers(&mut pending_steers, Some(team_id)).is_empty());
+    assert_eq!(pending_steers.len(), 4);
 
     let recalled = recall_withdrawable_steers(&mut pending_steers, None);
     assert_eq!(
@@ -9184,8 +9195,9 @@ fn only_an_uncommitted_steer_is_withdrawable_from_the_active_turn() {
             .collect::<Vec<_>>(),
         [awaiting_id, rejected_id]
     );
-    assert_eq!(pending_steers.len(), 1);
-    assert_eq!(pending_steers[0].prompt.message_id, accepted_id);
+    assert_eq!(pending_steers.len(), 2);
+    assert_eq!(pending_steers[0].prompt.message_id, team_id);
+    assert_eq!(pending_steers[1].prompt.message_id, accepted_id);
 }
 
 #[test]
@@ -17792,6 +17804,176 @@ async fn a_completed_queued_team_turn_acknowledges_its_delivery() {
         delivery_state(&workspace_store, &binding, message_id).await,
         crate::DeliveryState::Acknowledged
     );
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn projection_repair_settles_system_mail_from_a_direct_workspace() {
+    let (scratch, session_id, session_store, workspace_store, binding, projection) =
+        team_delivery_fixture().await;
+    let author = crate::local_human_participant_id("Human");
+    let direct_workspace = workspace_store
+        .ensure_direct_workspace(author, binding.participant_id)
+        .await
+        .unwrap();
+    let mut direct_binding = binding.clone();
+    direct_binding.workspace_id = direct_workspace;
+    let message_id = append_team_message(
+        &workspace_store,
+        &direct_binding,
+        "direct handoff",
+        crate::DeliveryMode::NextTurn,
+    )
+    .await;
+    for kind in [
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::System,
+            text: "direct handoff".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: Some(PromptDelivery::Queue),
+        },
+        SessionEventKind::TurnCompleted {
+            message_id,
+            provider_session_id: None,
+            final_text: "handled".to_string(),
+            error: None,
+        },
+    ] {
+        session_store
+            .append(SessionEvent::new(session_id, 0, kind))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        delivery_state(&workspace_store, &direct_binding, message_id).await,
+        crate::DeliveryState::Pending
+    );
+
+    let store: Arc<dyn SessionStore> = session_store.clone();
+    projection.repair(store, session_id).await.unwrap();
+
+    assert_eq!(
+        delivery_state(&workspace_store, &direct_binding, message_id).await,
+        crate::DeliveryState::Acknowledged
+    );
+    scratch.discard().await;
+}
+
+#[tokio::test]
+async fn recovery_corrects_only_verified_team_prompts_without_acknowledging_them() {
+    let (scratch, session_id, session_store, workspace_store, binding, projection) =
+        team_delivery_fixture().await;
+    let team_id = append_team_message(
+        &workspace_store,
+        &binding,
+        "report after a usage pause",
+        crate::DeliveryMode::NextTurn,
+    )
+    .await;
+    let active_team_id = append_team_message(
+        &workspace_store,
+        &binding,
+        "the interrupted turn",
+        crate::DeliveryMode::NextTurn,
+    )
+    .await;
+    let human_id = Uuid::new_v4();
+    let store: Arc<dyn SessionStore> = session_store.clone();
+    let mut runtime = RuntimeSessionStore::new(store.clone(), Vec::new(), true)
+        .with_workspace_projection(projection.clone());
+    for (message_id, text) in [
+        (
+            team_id,
+            "Team message from /root/worker:\n\nreport after a usage pause",
+        ),
+        (
+            human_id,
+            "Team message from /root/worker:\n\nhuman pasted this text",
+        ),
+    ] {
+        runtime
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::User,
+                    text: text.to_string(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Queued,
+                    delivery: Some(PromptDelivery::Queue),
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    runtime
+        .append(SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: active_team_id,
+                actor: EventActor::User,
+                text: "Team message from /root/worker:\n\nthe interrupted turn".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::InProgress,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        ))
+        .await
+        .unwrap();
+    let mut pending = recover_queued_prompts(&store.read(session_id).await.unwrap());
+    let (events, mut received) = mpsc::channel(8);
+    let durable_admissions = HashSet::from([active_team_id]);
+
+    repair_recovered_team_prompt_provenance(
+        &mut pending,
+        &durable_admissions,
+        &projection,
+        &mut runtime,
+        &events,
+        session_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(pending.len(), 3);
+    assert_eq!(pending[0].actor, EventActor::System);
+    assert!(!pending[0].interrupt_batch);
+    assert_eq!(pending[1].actor, EventActor::User);
+    assert_eq!(pending[2].actor, EventActor::User);
+    let correction = received.try_recv().unwrap();
+    assert!(matches!(
+        correction.kind,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::System,
+            status: MessageStatus::Queued,
+            ..
+        } if message_id == team_id
+    ));
+    assert!(received.try_recv().is_err());
+    assert_eq!(
+        delivery_state(&workspace_store, &binding, team_id).await,
+        crate::DeliveryState::Pending
+    );
+    let recovered = recover_queued_prompts(&store.read(session_id).await.unwrap());
+    assert_eq!(recovered[0].actor, EventActor::System);
+    assert_eq!(recovered[1].actor, EventActor::User);
+    assert_eq!(recovered[2].actor, EventActor::User);
+
+    repair_recovered_team_prompt_provenance(
+        &mut pending,
+        &durable_admissions,
+        &projection,
+        &mut runtime,
+        &events,
+        session_id,
+    )
+    .await
+    .unwrap();
+    assert!(received.try_recv().is_err(), "repair is idempotent");
     scratch.discard().await;
 }
 

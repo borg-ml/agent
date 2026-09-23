@@ -4841,7 +4841,7 @@ impl SubagentCoordinator {
         });
         for message in queued_inbox {
             command_tx
-                .send(HostCommand::Prompt {
+                .send(HostCommand::TeamPrompt {
                     session_id: actor_session_id,
                     message_id: message.message_id,
                     text: message.text,
