@@ -5600,7 +5600,7 @@ fn ctrl_c_exits_on_the_second_quick_press() {
 }
 
 #[test]
-fn turn_completion_preserves_followup_marker_while_input_is_queued() {
+fn turn_completion_keeps_the_escape_flush_marker_while_input_is_queued() {
     let event = SessionEventKind::TurnCompleted {
         message_id: Uuid::new_v4(),
         provider_session_id: None,
@@ -9411,6 +9411,69 @@ fn recovered_idle_session_stops_orphaned_tool_spinner() {
         transcript.order.first(),
         Some(TranscriptEntry::Tool { complete: true, .. })
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires a PTY; exercises Esc and Up with a queued prompt and a typed draft"]
+async fn escape_flushes_only_pending_queue_and_keeps_the_composer_draft() {
+    let session_id = Uuid::new_v4();
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        session_id,
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    terminal.status = SessionStatus::Running;
+    terminal.queued_prompts.push(PendingPromptProjection {
+        message_id: Uuid::new_v4(),
+        text: "send this now".to_string(),
+        delivery: PromptDelivery::Queue,
+    });
+    terminal.composer.insert("unsent draft");
+
+    assert!(matches!(
+        terminal
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap(),
+        UiAction::FlushPendingInput { target: None }
+    ));
+    assert_eq!(terminal.composer.text, "unsent draft");
+
+    terminal.status = SessionStatus::Ready;
+    assert!(matches!(
+        terminal
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap(),
+        UiAction::None
+    ));
+    assert_eq!(terminal.composer.text, "unsent draft");
+    assert_eq!(terminal.queued_prompts.len(), 1);
+
+    terminal.status = SessionStatus::Running;
+    terminal.queued_prompts.clear();
+    assert!(matches!(
+        terminal
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap(),
+        UiAction::Interrupt { target: None }
+    ));
+    assert_eq!(terminal.composer.text, "unsent draft");
+
+    terminal.queued_prompts.push(PendingPromptProjection {
+        message_id: Uuid::new_v4(),
+        text: "recall me".to_string(),
+        delivery: PromptDelivery::Queue,
+    });
+    terminal.composer.clear();
+    assert!(matches!(
+        terminal
+            .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .unwrap(),
+        UiAction::RecallQueuedPrompts { target: None }
+    ));
+    terminal.shutdown().await;
 }
 
 #[test]

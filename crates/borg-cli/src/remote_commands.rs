@@ -4966,6 +4966,19 @@ async fn run_local_agent_session(
                             HostCommand::BroadcastInstances { session_id, text },
                         );
                     }
+                    UiAction::FlushPendingInput { target } => {
+                        let command = target.map_or_else(
+                            || HostCommand::FlushPendingInput { session_id },
+                            |target| HostCommand::Subagent {
+                                session_id,
+                                action: SubagentAction::FlushPendingInput {
+                                    request_id: Uuid::new_v4(),
+                                    target: target.to_string(),
+                                },
+                            },
+                        );
+                        dispatch_ui_command(&ui_interaction_tx, command);
+                    }
                     UiAction::Rewind {
                         sequence,
                         text,
