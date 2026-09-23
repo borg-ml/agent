@@ -191,6 +191,24 @@ impl ModelToolDefinition {
     }
 }
 
+/// A routing token the provider issues on the first request of a turn and
+/// expects back on every later request of that turn, retries included (Codex
+/// `x-codex-turn-state`). Clones share it, so every request built for one turn
+/// carries the same slot; a new turn starts from an empty one.
+#[derive(Debug, Clone, Default)]
+pub struct TurnRouting(std::sync::Arc<std::sync::OnceLock<String>>);
+
+impl TurnRouting {
+    pub fn get(&self) -> Option<&str> {
+        self.0.get().map(String::as_str)
+    }
+
+    /// Keep the first token issued in the turn; later ones are ignored.
+    pub fn record(&self, token: &str) {
+        let _ = self.0.set(token.to_string());
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelTurnRequest {
     /// Explicit fast routing; adapters must reject it when unsupported.
@@ -201,6 +219,7 @@ pub struct ModelTurnRequest {
     pub session_id: Option<String>,
     /// Cache identity for the current canonical session prefix.
     pub prompt_cache_key: Option<String>,
+    pub turn_routing: TurnRouting,
     pub messages: Vec<ModelMessage>,
     pub tools: Vec<ModelToolDefinition>,
     pub output_schema: Option<Value>,

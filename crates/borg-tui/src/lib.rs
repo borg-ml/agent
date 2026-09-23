@@ -1435,6 +1435,7 @@ fn draft_commit_message(
                                 request_id: Some(uuid::Uuid::new_v4().to_string()),
                                 session_id: None,
                                 prompt_cache_key: None,
+                                turn_routing: Default::default(),
                                 messages: vec![ModelMessage::user(prompt)],
                                 tools: Vec::new(),
                                 output_schema: None,

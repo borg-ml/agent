@@ -824,6 +824,7 @@ mod tests {
             request_id: None,
             session_id: None,
             prompt_cache_key: None,
+            turn_routing: Default::default(),
             messages,
             tools,
             output_schema: None,

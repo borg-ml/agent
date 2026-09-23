@@ -41,7 +41,7 @@ async fn probe() -> Result<()> {
     let mut request = ModelTurnRequest {
         fast,
         request_id: Some(uuid::Uuid::new_v4().to_string()),
-        session_id: Some(session.clone()), prompt_cache_key: Some(session),
+        session_id: Some(session.clone()), prompt_cache_key: Some(session), turn_routing: Default::default(),
         messages: vec![
             ModelMessage::System { content: "You are testing a model-only Borg subscription adapter. Call borg_probe exactly once, then reply with the returned probe value. Do not request any other actions.".into() },
             ModelMessage::user("Read the probe value using borg_probe."),

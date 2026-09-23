@@ -27,7 +27,7 @@ pub use chat_stream::{
 };
 pub use model_turn::{
     ModelFunctionCall, ModelInputAttachment, ModelMessage, ModelToolCall, ModelToolDefinition,
-    ModelTurnRequest, ModelTurnResult,
+    ModelTurnRequest, ModelTurnResult, TurnRouting,
 };
 pub use openai_compatible::{ModelGateway, OpenAiCompatibleProfile, OpenAiCompatibleProvider};
 

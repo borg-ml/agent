@@ -1,6 +1,6 @@
 pub use borg_core::{
     ModelFunctionCall, ModelInputAttachment, ModelMessage, ModelToolCall, ModelToolDefinition,
-    ModelTurnRequest,
+    ModelTurnRequest, TurnRouting,
 };
 
 use crate::runtime::ProviderCallUsage;
