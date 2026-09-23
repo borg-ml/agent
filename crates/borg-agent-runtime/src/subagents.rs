@@ -111,6 +111,8 @@ pub struct SubagentUsage {
     pub context_tokens: Option<u64>,
     pub cost_microusd: Option<u64>,
     pub cost_basis: String,
+    /// None means the cost coverage of an older snapshot is unknown.
+    pub cost_complete: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -8676,11 +8678,33 @@ async fn update_from_session_event(
             input_tokens,
             output_tokens,
             total_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
             context_tokens,
             cost_microusd,
             cost_basis,
             ..
         } => {
+            let had_usage = entry.snapshot.usage.cost_complete.is_some()
+                || entry.snapshot.usage.total_tokens > 0
+                || entry.snapshot.usage.input_tokens > 0
+                || entry.snapshot.usage.output_tokens > 0
+                || entry.snapshot.usage.cost_microusd.is_some();
+            let usage_bearing = *total_tokens > 0
+                || *input_tokens > 0
+                || *output_tokens > 0
+                || *cached_input_tokens > 0
+                || *cache_creation_input_tokens > 0
+                || cost_microusd.is_some();
+            if usage_bearing {
+                entry.snapshot.usage.cost_complete = if cost_microusd.is_none() {
+                    Some(false)
+                } else if !had_usage {
+                    Some(true)
+                } else {
+                    entry.snapshot.usage.cost_complete
+                };
+            }
             entry.snapshot.usage.input_tokens = entry
                 .snapshot
                 .usage
@@ -8749,6 +8773,7 @@ fn project_child_state(snapshot: &mut SubagentSnapshot, state: &crate::SessionSt
         context_tokens: state.usage.context_tokens,
         cost_microusd: state.usage.cost_microusd,
         cost_basis: state.usage.cost_basis.clone(),
+        cost_complete: state.usage.cost_complete,
     };
 }
 

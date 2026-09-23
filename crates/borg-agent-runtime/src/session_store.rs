@@ -690,6 +690,9 @@ pub struct SessionUsage {
     pub total_tokens: u64,
     pub cost_microusd: Option<u64>,
     pub cost_basis: String,
+    /// None means an older snapshot cannot establish whether every call was priced.
+    #[serde(default)]
+    pub cost_complete: Option<bool>,
     pub cost_usd: Option<f64>,
     pub context_tokens: Option<u64>,
     pub context_window_tokens: Option<u64>,
@@ -1048,6 +1051,28 @@ impl SessionState {
                 context_window_tokens,
                 ..
             } => {
+                let had_usage = self.usage.cost_complete.is_some()
+                    || self.usage.total_tokens > 0
+                    || self.usage.input_tokens > 0
+                    || self.usage.output_tokens > 0
+                    || self.usage.cached_input_tokens > 0
+                    || self.usage.cache_creation_input_tokens > 0
+                    || self.usage.cost_microusd.is_some();
+                let usage_bearing = *total_tokens > 0
+                    || *input_tokens > 0
+                    || *output_tokens > 0
+                    || *cached_input_tokens > 0
+                    || *cache_creation_input_tokens > 0
+                    || cost_microusd.is_some();
+                if usage_bearing {
+                    self.usage.cost_complete = if cost_microusd.is_none() {
+                        Some(false)
+                    } else if !had_usage {
+                        Some(true)
+                    } else {
+                        self.usage.cost_complete
+                    };
+                }
                 self.usage.calls = self.usage.calls.saturating_add(1);
                 self.usage.provider_duration_ms = self
                     .usage
@@ -2215,6 +2240,38 @@ mod usage_tests {
                     "mixed"
                 }
             );
+            assert_eq!(state.usage.cost_complete, Some(sequence == 1));
         }
+
+        let mut legacy = serde_json::to_value(&state.usage).unwrap();
+        legacy.as_object_mut().unwrap().remove("cost_complete");
+        let restored: SessionUsage = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.cost_complete, None);
+
+        let mut cache_only = SessionState::default();
+        for (sequence, cached_input_tokens, cost_microusd) in [(1, 100, None), (2, 0, Some(50))] {
+            cache_only
+                .apply(&SessionEvent::new(
+                    session_id,
+                    sequence,
+                    SessionEventKind::UsageUpdated {
+                        provider_duration_ms: 0,
+                        turn_id: None,
+                        provider_context_reused: None,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cached_input_tokens,
+                        cache_creation_input_tokens: 0,
+                        total_tokens: 0,
+                        cost_microusd,
+                        cost_basis: "provider_reported".to_string(),
+                        cost_usd: None,
+                        context_tokens: None,
+                        context_window_tokens: None,
+                    },
+                ))
+                .unwrap();
+        }
+        assert_eq!(cache_only.usage.cost_complete, Some(false));
     }
 }

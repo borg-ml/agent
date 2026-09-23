@@ -644,6 +644,7 @@ impl Transcript {
             context_tokens: state.usage.context_tokens,
             cost_microusd: state.usage.cost_microusd,
             cost_basis: state.usage.cost_basis.clone(),
+            cost_complete: state.usage.cost_complete,
         };
         self.live_turn_closed = matches!(
             state.status,
@@ -1315,6 +1316,26 @@ impl Transcript {
                 context_window_tokens,
                 ..
             } => {
+                let had_usage = self.session_usage.cost_complete.is_some()
+                    || self.session_usage.total_tokens > 0
+                    || self.session_usage.input_tokens > 0
+                    || self.session_usage.output_tokens > 0
+                    || self.session_usage.cost_microusd.is_some();
+                let usage_bearing = *total_tokens > 0
+                    || *input_tokens > 0
+                    || *output_tokens > 0
+                    || *cached_input_tokens > 0
+                    || *cache_creation_input_tokens > 0
+                    || cost_microusd.is_some();
+                if usage_bearing {
+                    self.session_usage.cost_complete = if cost_microusd.is_none() {
+                        Some(false)
+                    } else if !had_usage {
+                        Some(true)
+                    } else {
+                        self.session_usage.cost_complete
+                    };
+                }
                 self.session_usage.input_tokens = self
                     .session_usage
                     .input_tokens

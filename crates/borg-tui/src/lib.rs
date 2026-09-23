@@ -98,6 +98,7 @@ const MESSAGE_HORIZONTAL_PADDING: usize = 2;
 const PARALLEL_MARKDOWN_RENDER_MIN_MESSAGES: usize = 512;
 const MAX_PARALLEL_MARKDOWN_RENDER_WORKERS: usize = 16;
 const COMMAND_PANEL_BG: Color = Color::Rgb(31, 24, 27);
+const COMPOSER_BG: Color = Color::Rgb(42, 32, 37);
 /// Divider between status-line segments. It is its own span so a hovered
 /// segment underlines its own text only.
 const STATUS_SEPARATOR: &str = " · ";
@@ -7638,22 +7639,25 @@ impl BorgTerminal {
             composer_cursor.0,
             usize::from(composer_max_height),
             is_launch_screen && resume_picker_open,
-        );
+        )
+        .saturating_add(u16::from(!is_launch_screen));
         let composer_height = if is_launch_screen {
             bounded_launch_composer_height(composer_height, terminal_size.height, controls_height)
         } else {
             composer_height
         };
+        let composer_border_rows = if is_launch_screen { 1 } else { 2 };
         let composer_scroll = if let Some(picker) = self.picker.as_ref().filter(|picker| {
             !matches!(
                 picker.kind,
                 PickerKind::Commands | PickerKind::MessageActions | PickerKind::Goal
             )
         }) {
-            let content_height = usize::from(composer_height.saturating_sub(1));
+            let content_height = usize::from(composer_height.saturating_sub(composer_border_rows));
             picker.scroll_offset(content_height, composer_line_count) as u16
         } else {
-            (composer_cursor.0 as u16).saturating_sub(composer_height.saturating_sub(2))
+            (composer_cursor.0 as u16)
+                .saturating_sub(composer_height.saturating_sub(composer_border_rows + 1))
         };
         let transcript_viewport_height = if is_launch_screen {
             0
@@ -7874,9 +7878,7 @@ impl BorgTerminal {
                     .saturating_add(composer_cursor_x_offset(is_launch_screen)),
                 y: composer_area.y.saturating_add(u16::from(!is_launch_screen)),
                 width: composer_text_width.min(u16::MAX as usize) as u16,
-                height: composer_area
-                    .height
-                    .saturating_sub(u16::from(!is_launch_screen)),
+                height: composer_area.height.saturating_sub(composer_border_rows),
             });
             next_composer_area = Some(composer_area);
             if !is_launch_screen
@@ -8423,15 +8425,15 @@ impl BorgTerminal {
                 );
             }
             let mut composer_block = Block::default()
-                .style(Style::default().bg(if !is_launch_screen {
-                    COMMAND_PANEL_BG
-                } else {
+                .style(Style::default().bg(if is_launch_screen {
                     Color::Reset
+                } else {
+                    COMMAND_PANEL_BG
                 }))
                 .borders(if is_launch_screen {
                     Borders::LEFT
                 } else {
-                    Borders::TOP
+                    Borders::TOP | Borders::BOTTOM
                 })
                 .border_style(Style::default().fg(if is_launch_screen {
                     BORG_ORANGE
@@ -8446,19 +8448,26 @@ impl BorgTerminal {
                         .add_modifier(Modifier::BOLD),
                 ));
             }
+            let composer_content_area = composer_block.inner(composer_area);
+            frame.render_widget(composer_block, composer_area);
+            let composer_content_style = Style::default().bg(if is_launch_screen {
+                Color::Reset
+            } else {
+                COMPOSER_BG
+            });
             if let Some(lines) = picker_lines.clone() {
                 frame.render_widget(
                     Paragraph::new(lines)
-                        .block(composer_block)
+                        .style(composer_content_style)
                         .scroll((composer_scroll, 0)),
-                    composer_area,
+                    composer_content_area,
                 );
             } else {
                 frame.render_widget(
                     Paragraph::new(composer_render_lines.clone())
-                        .block(composer_block)
+                        .style(composer_content_style)
                         .scroll((composer_scroll, 0)),
-                    composer_area,
+                    composer_content_area,
                 );
             }
             if self.picker.is_none() {
@@ -8513,7 +8522,7 @@ impl BorgTerminal {
                         width: picker_hit_width,
                         height: 1,
                     };
-                    if row.y < composer_area.bottom() {
+                    if row.y < composer_content_area.bottom() {
                         next_picker_hit_areas.push((row, index));
                     }
                 }
@@ -10882,7 +10891,7 @@ fn team_roster_table_lines(
         ui_text(language, "MODEL NOW"),
         ui_text(language, "EFFORT"),
         ui_text(language, "STATE"),
-        ui_text(language, "TOTAL TOKENS · PRICED $"),
+        ui_text(language, "LIFETIME TOKENS · COST"),
         columns,
     );
     std::iter::once(Line::from(Span::styled(
@@ -10925,9 +10934,9 @@ fn team_roster_table_columns(entries: &[AgentRosterEntry], width: usize) -> Agen
         effort: Some(column_width("EFFORT", |entry| &entry.effort, 8)),
         state: Some(column_width("STATE", |entry| &entry.state, 17)),
         usage: Some(column_width(
-            "TOTAL TOKENS · PRICED $",
+            "LIFETIME TOKENS · COST",
             |entry| &entry.usage,
-            24,
+            36,
         )),
     };
     while roster_columns_width(columns) > width && columns.name > 12 {
@@ -11696,13 +11705,22 @@ fn format_subagent_usage(usage: &borg_remote::SubagentUsage) -> String {
         } else {
             format!("{cost:.4}")
         };
-        let label = match usage.cost_basis.as_str() {
-            "subscription_equivalent" => format!("${amount} (sub)"),
-            "estimated_from_pricing" => format!("~${amount} (est)"),
-            "mixed" => format!("~${amount} (mix)"),
-            _ => format!("${amount}"),
+        let (prefix, basis) = match usage.cost_basis.as_str() {
+            "subscription_equivalent" => ("~", "sub eq."),
+            "estimated_from_pricing" => ("~", "est"),
+            "mixed" => ("~", "mix"),
+            "provider_reported" | "provider" => ("", "provider"),
+            _ => ("", "basis unknown"),
         };
+        let coverage = match usage.cost_complete {
+            Some(true) => "",
+            Some(false) => ", partial",
+            None => ", unverified",
+        };
+        let label = format!("{prefix}${amount} ({basis}{coverage})");
         parts.push(label);
+    } else if displayed_tokens.is_some() {
+        parts.push("cost unavailable".to_string());
     }
     format!("  {}", parts.join(" · "))
 }
@@ -12560,6 +12578,32 @@ fn update_queued_prompts(
     event: &SessionEventKind,
     requeue_cursor: &mut Option<usize>,
 ) {
+    if let SessionEventKind::Message {
+        message_id,
+        actor: EventActor::System,
+        status,
+        ..
+    } = event
+    {
+        // Team updates belong to the session's durable inbox, not the human
+        // Pending Input panel. A correction also removes any legacy row that
+        // was first journaled with the same ID as User.
+        if let Some(index) = queued_prompts
+            .iter()
+            .position(|queued| queued.message_id == *message_id)
+        {
+            queued_prompts.remove(index);
+            if let Some(cursor) = requeue_cursor
+                && index < *cursor
+            {
+                *cursor -= 1;
+            }
+        }
+        if *status != MessageStatus::Queued {
+            *requeue_cursor = None;
+        }
+        return;
+    }
     match event {
         SessionEventKind::TurnCompleted { error: Some(_), .. } => {
             // The session re-queues a failed turn's prompts at the head of its
@@ -12569,7 +12613,7 @@ fn update_queued_prompts(
         }
         SessionEventKind::Message {
             message_id,
-            actor: actor @ (EventActor::User | EventActor::System),
+            actor: EventActor::User,
             text,
             status: MessageStatus::Queued,
             delivery: Some(delivery),
@@ -12584,12 +12628,18 @@ fn update_queued_prompts(
                         message_id: *message_id,
                         text: text.clone(),
                         delivery: *delivery,
-                        actor: *actor,
+                        actor: EventActor::User,
                     },
                 );
                 *cursor = at + 1;
             } else {
-                push_queued_prompt(queued_prompts, *message_id, text.clone(), *delivery, *actor);
+                push_queued_prompt(
+                    queued_prompts,
+                    *message_id,
+                    text.clone(),
+                    *delivery,
+                    EventActor::User,
+                );
             }
             return;
         }
@@ -12600,7 +12650,7 @@ fn update_queued_prompts(
         SessionEventKind::TurnStarted { message_id, .. }
         | SessionEventKind::Message {
             message_id,
-            actor: EventActor::User | EventActor::System,
+            actor: EventActor::User,
             status: MessageStatus::InProgress,
             ..
         } => {
@@ -12610,7 +12660,7 @@ fn update_queued_prompts(
         }
         SessionEventKind::Message {
             message_id,
-            actor: actor @ (EventActor::User | EventActor::System),
+            actor: EventActor::User,
             status: MessageStatus::Complete,
             delivery,
             ..
@@ -12624,7 +12674,7 @@ fn update_queued_prompts(
                     queued_prompts.retain(|queued| {
                         let retain = index > admitted
                             || queued.delivery != PromptDelivery::Queue
-                            || queued.actor != *actor;
+                            || queued.actor != EventActor::User;
                         index += 1;
                         retain
                     });
@@ -12632,11 +12682,10 @@ fn update_queued_prompts(
                     queued_prompts.remove(admitted);
                 }
             } else if *delivery == Some(PromptDelivery::Queue) {
-                // A later prompt of the same actor was admitted while older
-                // projected queue entries remained. Human input can bypass
-                // team updates, so only its own queue entries are stale.
+                // A later human prompt was admitted while older projected
+                // queue entries remained.
                 queued_prompts.retain(|queued| {
-                    queued.delivery != PromptDelivery::Queue || queued.actor != *actor
+                    queued.delivery != PromptDelivery::Queue || queued.actor != EventActor::User
                 });
             }
         }
@@ -12670,9 +12719,10 @@ fn restore_optimistic_pending_prompts(
     optimistic_pending: Vec<PendingPromptProjection>,
 ) {
     for pending in optimistic_pending {
-        if !queued_prompts
-            .iter()
-            .any(|queued| queued.message_id == pending.message_id)
+        if pending.actor == EventActor::User
+            && !queued_prompts
+                .iter()
+                .any(|queued| queued.message_id == pending.message_id)
             && !events
                 .iter()
                 .any(|event| pending_prompt_projection_settled_by(event, pending.message_id))
@@ -12700,8 +12750,13 @@ fn pending_prompt_projection_settled_by(event: &SessionEvent, message_id: Uuid) 
         } => *event_message_id == message_id,
         SessionEventKind::Message {
             message_id: event_message_id,
-            actor: EventActor::User | EventActor::System,
+            actor: EventActor::User,
             status: MessageStatus::InProgress | MessageStatus::Complete | MessageStatus::Failed,
+            ..
+        }
+        | SessionEventKind::Message {
+            message_id: event_message_id,
+            actor: EventActor::System,
             ..
         } => *event_message_id == message_id,
         _ => false,
@@ -12857,26 +12912,8 @@ fn queued_prompt_lines(
             Style::default().fg(Color::DarkGray),
         )));
     }
-    let has_steers = queued_prompts
-        .iter()
-        .any(|prompt| prompt.actor == EventActor::User && prompt.delivery == PromptDelivery::Steer);
-    let has_queue = queued_prompts
-        .iter()
-        .any(|prompt| prompt.actor == EventActor::User && prompt.delivery == PromptDelivery::Queue);
-    let mut hints = Vec::new();
-    if has_queue || has_steers {
-        hints.push("esc send input · keep running");
-        hints.push("↑ edit / recall input");
-    } else if queued_prompts
-        .iter()
-        .any(|prompt| prompt.delivery == PromptDelivery::Steer)
-    {
-        hints.push("team update awaits provider");
-    } else {
-        hints.push("queued updates wait for the next turn");
-    }
     lines.push(Line::from(Span::styled(
-        format!("   {}", hints.join("  ·  ")),
+        "   esc send input · keep running  ·  ↑ edit / recall input",
         Style::default().fg(Color::DarkGray),
     )));
     lines
@@ -15274,14 +15311,15 @@ fn composer_frame_cursor(
         .x
         .saturating_add(composer_cursor_x_offset(is_launch_screen));
     let y = area.y.saturating_add(u16::from(!is_launch_screen));
-    // A collapsed composer has no text cell; its preceding row is the statusline.
-    if x >= area.right() || y >= area.bottom() {
+    let content_bottom = area.bottom().saturating_sub(u16::from(!is_launch_screen));
+    // A collapsed composer has no text cell between its borders.
+    if x >= area.right() || y >= content_bottom {
         return None;
     }
     Some(Position {
         x: x.saturating_add(column as u16).min(area.right() - 1),
         y: y.saturating_add((row as u16).saturating_sub(scroll))
-            .min(area.bottom() - 1),
+            .min(content_bottom - 1),
     })
 }
 
