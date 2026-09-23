@@ -352,7 +352,12 @@ impl LaneTools {
                 self.authorized(&store, caller, id, false)
                     .with_context(|| format!("only the session holding job {id} can cancel it"))?;
                 store.cancel_ticket(id, "cancelled by its submitting session")?;
-                Ok((json!({"job_id": id, "state": "cancelled"}), None))
+                // A running job ends once its supervisor has killed it.
+                let state = match store.job_status(id)?.state {
+                    JobState::Cancelled { .. } => "cancelled",
+                    _ => "cancel_requested",
+                };
+                Ok((json!({"job_id": id, "state": state}), None))
             }
         }
     }
