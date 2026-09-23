@@ -1613,6 +1613,8 @@ pub struct BorgTerminal {
     scrollbar_hovered: bool,
     jump_to_bottom_area: Option<Rect>,
     jump_to_bottom_hovered: bool,
+    pending_input_header_area: Option<Rect>,
+    pending_input_expanded: bool,
     keybindings_hint_area: Option<Rect>,
     keybindings_hovered: bool,
     dictation_button_area: Option<Rect>,
@@ -2846,6 +2848,8 @@ impl BorgTerminal {
             scrollbar_hovered: false,
             jump_to_bottom_area: None,
             jump_to_bottom_hovered: false,
+            pending_input_header_area: None,
+            pending_input_expanded: true,
             keybindings_hint_area: None,
             keybindings_hovered: false,
             dictation_button_area: None,
@@ -3021,6 +3025,8 @@ impl BorgTerminal {
         self.scrollbar_hovered = false;
         self.jump_to_bottom_area = None;
         self.jump_to_bottom_hovered = false;
+        self.pending_input_header_area = None;
+        self.pending_input_expanded = true;
         self.keybindings_hint_area = None;
         self.keybindings_hovered = false;
         self.dictation_button_area = None;
@@ -5690,6 +5696,14 @@ impl BorgTerminal {
                         return Ok(UiAction::None);
                     }
                     if !background_hover_suppressed {
+                        if !self.active_queued_prompts().is_empty()
+                            && self
+                                .pending_input_header_area
+                                .is_some_and(|area| area.contains(pointer))
+                        {
+                            self.pending_input_expanded = !self.pending_input_expanded;
+                            return Ok(UiAction::None);
+                        }
                         if self
                             .back_to_director_area
                             .is_some_and(|area| area.contains(pointer))
@@ -7639,7 +7653,11 @@ impl BorgTerminal {
             );
             let chunks = terminal_vertical_chunks(
                 area,
-                queued_prompt_panel_height(&queued_prompts, area.width),
+                queued_prompt_panel_height(
+                    &queued_prompts,
+                    area.width,
+                    self.pending_input_expanded,
+                ),
                 composer_height,
                 footer_height,
                 is_launch_screen,
@@ -7723,6 +7741,7 @@ impl BorgTerminal {
         let mut next_entry_hit_areas = Vec::new();
         let mut next_picker_hit_areas = Vec::new();
         let mut next_jump_to_bottom_area = None;
+        let mut next_pending_input_header_area = None;
         let mut next_status_area = None;
         let mut next_goal_status_area = None;
         let mut next_todo_status_area = None;
@@ -7759,7 +7778,11 @@ impl BorgTerminal {
             let area = centered_content_area_with_margin(frame.area(), self.horizontal_margin);
             let chunks = terminal_vertical_chunks(
                 area,
-                queued_prompt_panel_height(&queued_prompts, area.width),
+                queued_prompt_panel_height(
+                    &queued_prompts,
+                    area.width,
+                    self.pending_input_expanded,
+                ),
                 composer_height,
                 footer_height,
                 is_launch_screen,
@@ -8340,21 +8363,30 @@ impl BorgTerminal {
                 next_jump_to_bottom_area = Some(button);
             }
             if !queued_prompts.is_empty() {
+                next_pending_input_header_area = Some(Rect {
+                    height: chunks[1].height.min(1),
+                    ..chunks[1]
+                });
                 frame.render_widget(
-                    Paragraph::new(queued_prompt_lines(
-                        queued_prompts.as_slice(),
-                        chunks[1].width,
-                        self.focused_child.is_some().then_some(SUBAGENT_PINK),
-                    ))
+                    Paragraph::new(if self.pending_input_expanded {
+                        queued_prompt_lines(
+                            queued_prompts.as_slice(),
+                            chunks[1].width,
+                            self.focused_child.is_some().then_some(SUBAGENT_PINK),
+                        )
+                    } else {
+                        Vec::new()
+                    })
                     .block(
                         Block::default()
                             .borders(Borders::TOP | Borders::LEFT)
                             .border_style(Style::default().fg(Color::DarkGray))
                             .title(Span::styled(
-                                format!(
-                                    " {} · {} ",
-                                    ui_text(ui_language, "Pending Input"),
-                                    queued_prompts.len()
+                                pending_input_title(
+                                    ui_language,
+                                    queued_prompts.len(),
+                                    self.pending_input_expanded,
+                                    chunks[1].width,
                                 ),
                                 Style::default()
                                     .fg(if self.focused_child.is_some() {
@@ -9406,6 +9438,7 @@ impl BorgTerminal {
             next_link_hit_areas.clear();
             next_entry_hit_areas.clear();
             next_jump_to_bottom_area = None;
+            next_pending_input_header_area = None;
             next_status_area = None;
             next_goal_status_area = None;
             next_todo_status_area = None;
@@ -9441,6 +9474,7 @@ impl BorgTerminal {
         self.entry_hit_areas = next_entry_hit_areas;
         self.picker_hit_areas = next_picker_hit_areas;
         self.jump_to_bottom_area = next_jump_to_bottom_area;
+        self.pending_input_header_area = next_pending_input_header_area;
         self.status_area = next_status_area;
         self.goal_status_area = next_goal_status_area;
         self.todo_status_area = next_todo_status_area;
@@ -12693,9 +12727,16 @@ fn has_pending_steer_prompts(
             .any(|prompt| prompt.delivery == PromptDelivery::Steer)
 }
 
-fn queued_prompt_panel_height(queued_prompts: &[PendingPromptProjection], panel_width: u16) -> u16 {
+fn queued_prompt_panel_height(
+    queued_prompts: &[PendingPromptProjection],
+    panel_width: u16,
+    expanded: bool,
+) -> u16 {
     if queued_prompts.is_empty() {
         return 0;
+    }
+    if !expanded {
+        return 1;
     }
     let queue_width = panel_width.saturating_sub(26).max(1) as usize;
     let visible = queued_prompts.len().min(6);
@@ -12709,6 +12750,36 @@ fn queued_prompt_panel_height(queued_prompts: &[PendingPromptProjection], panel_
         // One top-border/title row plus one contextual shortcut row.
         .saturating_add(2)
         .min(u16::MAX as usize) as u16
+}
+
+fn pending_input_title(
+    language: UiLanguage,
+    count: usize,
+    expanded: bool,
+    panel_width: u16,
+) -> String {
+    let (arrow, action) = if expanded {
+        ("▾", "collapse")
+    } else {
+        ("▸", "expand")
+    };
+    let full = format!(
+        " {arrow} {} · {count} · click to {action} ",
+        ui_text(language, "Pending Input")
+    );
+    if full.width() < usize::from(panel_width) {
+        return full;
+    }
+    let compact = format!(" {arrow} {} · {count} ", ui_text(language, "Pending Input"));
+    if compact.width() < usize::from(panel_width) {
+        return compact;
+    }
+    let short = format!(" {arrow} {count} pending ");
+    if short.width() < usize::from(panel_width) {
+        short
+    } else {
+        format!(" {arrow} {count} ")
+    }
 }
 
 fn wrapped_pending_prompt_lines(text: &str, width: usize) -> Vec<String> {
