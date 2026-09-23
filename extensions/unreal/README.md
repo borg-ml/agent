@@ -67,8 +67,11 @@ or safely recover unmanaged UBT processes.
 `editor spec` emits a persistent service with loopback front/backend ports,
 MCP-initialize health, bounded restart, and a project-run resource declaration.
 `editor start|status|restart|yield|resume|stop|lease|release` forward to the
-integrating `borg lane service` CLI. **No editor has been started with this
-adapter**; do not use the live shared project's editor or its port. The stock
+integrating `borg lane service` CLI. A disposable **fake** editor with an MCP
+initialize endpoint reached Healthy through the services-owner debug CLI; its
+unfenced front proxy denied POST with 403 and stop closed all private ports.
+This does **not** validate a real Unreal editor or the D11 atomic handoff;
+do not use the live shared project's editor or its port. The stock
 Unreal MCP backend lacks owner enforcement. The service spec explicitly sets
 `adapter_enforces_leases=false`; `mcp ...` intentionally fails closed rather
 than exposing raw backend access. Only enable client access once an adapter
@@ -96,5 +99,11 @@ opt-in test. This host's systemd user manager works: the scoped fake build
 finished with exit 0 and a `borg-lane-…scope` cgroup. An earlier exit 125 was
 caused by setting XDG_RUNTIME_DIR to an isolated temp directory without a user
 bus, not by a missing manager. This is still not real Unreal editor/build
-validation. Consult `docs/gamedev/interfaces.md` for core contracts and
+validation. A second optional test sets `BORG_UNREAL_TEST_SERVICE_CLI` to a
+Borg binary with `lane service` and requires the same working user bus. It
+launches a fake MCP editor on disposable high loopback ports in isolated lane
+state, checks Healthy and the unfenced front proxy's HTTP 403 on POST, then
+stops it and checks port cleanup. Only the fake's graceful-stop hook is
+replaced; the real editor/QUIT_EDITOR path and D11 two-service handoff are
+not exercised. Consult `docs/gamedev/interfaces.md` for core contracts and
 rollout prerequisites.
