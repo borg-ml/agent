@@ -156,3 +156,24 @@ The lane owner rebuilt `gamedev/lanes` through `2d347be` after fixing Resume RPC
 | `--check-running-join` and `--check-budget` | **PASS**: already-running job `7244cfd3-416a-4e4f-9b81-8a980db65981` did not absorb identical later request `281ea895-838e-4cb8-a823-cb1b67ca8e2f`; impossible job disk admission returned 125 and `started: false`. |
 
 The bounded 6×8 public CLI replay on this same pinned binary produced 48 requests, **45 unique launches / 3 pending joins**, 14.124 s wall, 10/20 synthetic GiB peak, 0 job/OOM failures, per-agent observed waits p50/p95 **8.91/9.595 s**, Jain solo-work fairness **0.8459**. Shared-host startup/load variance makes this a regression replay, **not** a measured improvement over the simulator or older-hash runs. Model-facing exclusive dispatch with an active *foreign client lease* needs its own uniform CLI/MCP policy and regression: these lane CLI handoff tests must not be construed as clearance for a model-facing automatic exclusive. If that feature is deferred, disable model-facing exclusive explicitly and use manually coordinated `borg lane run --exclusive`.
+
+### Optional v0.1 foreign-client policy (owner branch, not the integrated v0 binary)
+
+`gamedev/lanes-v01 @7806669` adds lane-journal-locked service-client admission while an exclusive ticket is Preparing. The owner-built binary (`2026-09-23 04:51:24 +0100`) was **copied** to `target/debug/borg-bench-v01-pin`; SHA-256 `77c657df4b175d5a78a5469715c2e2b744e556879b54cfc6e0dce3406efa44e0` remained unchanged **before and after every** public-JSON-CLI probe. The final probe script SHA-256 was `5ad7a9e7a55f7490f97b9ed5d1314c69098057bd090653a28ff713d2db36e26d`. Use `BORG_BENCH_REQUIRE_SCOPE=1` to prohibit degraded jobs/services; all probes used isolated fake jobs, two owned supervised services, and real user-systemd scopes. A service lease's `--owner UUID` sets **both** Holder participant_id and session_id to that UUID; the synthetic job holder must match both for the own-holder case. The foreign-holder cases use a different UUID.
+
+```sh
+PIN=target/debug/borg-bench-v01-pin  # copy the matching owner binary first; verify SHA before/after
+for flag in atomic-own-lease atomic-foreign-lease atomic-foreign-grace atomic-foreign-indefinite atomic-late-lease; do
+  BORG_BENCH_REQUIRE_SCOPE=1 python3 scripts/gamedev_service_probe.py --borg "$PIN" --"$flag"
+done
+```
+
+| public CLI probe on `77c657df…` | observed result |
+| --- | --- |
+| `--atomic-own-lease` | **PASS** job `5f66f61e-a20d-4d4b-8f73-de1061bd9b12`: same participant **and** session Holder as active client; 20 s client TTL exceeds 10 s queue timeout, so waiting for lease expiry could not falsely pass; exclusive yielded and resumed both services. |
+| `--atomic-foreign-lease` | **PASS** job `95e01532-1156-49a8-9634-26a60d4a6a73`: job remained Preparing with `foreign client lease:` wait reason; **both** bound services retained original Healthy backend PIDs/front 200 before release, service A status `reason` included the exact job wait notice; releasing only its test-owned foreign lease allowed the two-service handoff/front 503, then automatic Healthy resume. CLI override grace 15 s. |
+| `--atomic-foreign-grace` | **PASS** job `5a5b8149-248b-41b8-8dc5-62c1f9c07df2`: both services stayed Healthy during the wait and the holder-visible notice matched; a 5 s override allowed the exclusive to yield and resume without a manual release; start minus creation was at least 3.5 s. |
+| `--atomic-foreign-indefinite` | **PASS within bounded observation** job `f16c459b-a3b4-4d75-84cf-c0a2f749c3e6`: override 0 reported `grace indefinite`, both services remained Healthy with the client active and no workload start during a **2 s event-driven** observation; public lease release then permitted yield/resume. This tests the zero-grace boundary, not an arbitrary-duration liveness proof. |
+| `--atomic-late-lease` | **PASS** job `da416942-7015-4b4d-b242-78e54863903b`: while the foreign client held Preparing and both original backends stayed Healthy, a new client lease for bound service B and a renewal of the existing client on A were each rejected; no ghost B client or changed A lease expiry. Releasing A allowed normal yield/resume. CLI override grace 30 s. |
+
+These are **optional owner-branch results only**: independent review and an integrated-binary rerun are required before enabling model-facing exclusive. The current v0 integrated bridge source instead rejects model-facing exclusive and instructs coordinated manual `borg lane run --exclusive`. Neither the synthetic fake-service results nor the coordinator-lease native experiment establish real Unreal editor parity or stock PostgreSQL multi-client lease support. Logs: `/tmp/gd-bench-v01-documented-atomic-*.log`; successful temp service roots and owned units were cleaned by the probe.
