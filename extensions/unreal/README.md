@@ -68,14 +68,18 @@ or safely recover unmanaged UBT processes.
 MCP-initialize health, bounded restart, and a project-run resource declaration.
 `editor start|status|restart|yield|resume|stop|lease|release` forward to the
 integrating `borg lane service` CLI. A disposable **fake** editor with an MCP
-initialize endpoint reached Healthy through the services-owner debug CLI; its
-unfenced front proxy denied POST with 403 and stop closed all private ports.
-This does **not** validate a real Unreal editor or the D11 atomic handoff;
-do not use the live shared project's editor or its port. The architect's
-`docs/gamedev/integration.md` records a scoped detached-child **fail-open** on
-an older combined core binary: a child survived yield yet an exclusive job
-started. A newer service fix must pass the same real-CLI regression before
-Unreal editor/exclusive interoperability can be enabled. The stock
+initialize endpoint reached Healthy through the exact combined lanes-owner
+binary (SHA256 `4022be198a99…`) using this adapter's `editor start/status/stop`
+entrypoints. Its unfenced front proxy denied POST with 403; the real graceful
+hook sent `QUIT_EDITOR` to the fake backend and stop closed all private ports.
+This does **not** validate a real Unreal editor. The architect's
+`docs/gamedev/integration.md` reports a passing real-systemd two-service,
+no-hook scoped descendant gate on that same binary, clearing the earlier
+stale-binary fail-open; ordered post-hook/resume errors, service capacity
+admission, owner fencing and real Unreal parity remain release blockers.
+Do not use the live shared project's editor or its port.
+
+The stock
 Unreal MCP backend lacks owner enforcement. The service spec explicitly sets
 `adapter_enforces_leases=false`; `mcp ...` intentionally fails closed rather
 than exposing raw backend access. Only enable client access once an adapter
@@ -83,10 +87,10 @@ proxy authenticates owner/generation on every mutating call and restores
 owner-scoped PIE/cvars/camera/HUD state.
 
 `run commandlet|import|verify|exclusive --spec -- COMMAND ARGS...` generates a
-core exclusive job template. **Non-spec runs always fail closed:** a plain
-job submission cannot atomically yield the service before admission. Core
-service-yield + job admission integration and editor owner coordination are
-required before executing these templates. Never run an exclusive commandlet
+core exclusive job template. **Non-spec runs always fail closed:** the adapter
+has not wired the core's now-proven no-hook auto-yield/grant path into verified
+post-hook resume, editor owner coordination and real Unreal parity. A plain
+job submission is not a safe substitute. Never run an exclusive commandlet
 against an active editor or infer safety from a JSON spec alone.
 
 Validate without UE using `python3 -m unittest discover -s extensions/unreal/tests -v`.
@@ -94,8 +98,8 @@ Default tests use a fake engine and do not establish real Unreal build or
 editor service readiness. An optional integration smoke uses only an isolated
 fake project/engine and lane state: set `BORG_UNREAL_TEST_CLI` to an already-built
 Borg binary with the lane job CLI, then run the same unittest command. By
-default, the opt-in test sets `BORG_LANE_DEGRADED=1` and `BORG_LANE_SCOPE=0` **only for the
-fake job**; do not use degraded/unscoped execution for production builds. To
+default, the opt-in test sets `BORG_LANE_DEGRADED=1` and `BORG_LANE_SCOPE=0`
+**only for the fake job**; do not use degraded/unscoped execution for production builds. To
 exercise real scoped ownership too, set `BORG_UNREAL_TEST_SCOPED=1` plus
 `XDG_RUNTIME_DIR=/run/user/$(id -u)` and
 `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus` before running the
@@ -106,8 +110,9 @@ bus, not by a missing manager. This is still not real Unreal editor/build
 validation. A second optional test sets `BORG_UNREAL_TEST_SERVICE_CLI` to a
 Borg binary with `lane service` and requires the same working user bus. It
 launches a fake MCP editor on disposable high loopback ports in isolated lane
-state, checks Healthy and the unfenced front proxy's HTTP 403 on POST, then
-stops it and checks port cleanup. Only the fake's graceful-stop hook is
-replaced; the real editor/QUIT_EDITOR path and D11 two-service handoff are
-not exercised. Consult `docs/gamedev/interfaces.md` for core contracts and
-rollout prerequisites.
+state through `unreal.py editor start/status/stop`, checks Healthy and the
+unfenced front proxy's HTTP 403 on POST, observes the default graceful hook's
+`QUIT_EDITOR` request, then checks port cleanup. Real Unreal/editor ownership
+and D11 two-service interoperability are not exercised by this test.
+Consult `docs/gamedev/interfaces.md` for core contracts and rollout
+prerequisites.

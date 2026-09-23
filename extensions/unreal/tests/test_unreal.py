@@ -197,16 +197,28 @@ class AdapterTests(unittest.TestCase):
         self.env.pop('BORG_LANE_DEGRADED', None)
         self.env.pop('BORG_LANE_SCOPE', None)
         editor = self.engine / 'Engine/Binaries/Linux/UnrealEditor'
+        quit_marker = self.root / 'quit.called'
         editor.write_text("""#!/usr/bin/env python3
 import json, sys
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 port = int(next(a.split('=', 1)[1] for a in sys.argv
                 if a.startswith('-ModelContextProtocolPort=')))
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
-        body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'result': {
-            'protocolVersion': '2025-11-25', 'capabilities': {},
-            'serverInfo': {'name': 'fake-unreal', 'version': '1'}}}).encode()
+        length = int(self.headers.get('Content-Length', '0'))
+        request = json.loads(self.rfile.read(length) or b'{}')
+        result = {'protocolVersion': '2025-11-25', 'capabilities': {},
+                  'serverInfo': {'name': 'fake-unreal', 'version': '1'}}
+        if request.get('method') == 'tools/call':
+            tool = request['params']['arguments'].get('tool_name')
+            if tool == 'exec_console':
+                command = request['params']['arguments']['arguments']['command']
+                Path('FAKE_QUIT_MARKER').write_text(command)
+            result = {'content': [{'type': 'text',
+                                   'text': json.dumps({'returnValue': False})}]}
+        body = json.dumps({'jsonrpc': '2.0', 'id': request.get('id'),
+                           'result': result}).encode()
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
@@ -215,7 +227,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 HTTPServer(('127.0.0.1', port), Handler).serve_forever()
-""")
+""".replace('FAKE_QUIT_MARKER', str(quit_marker)))
         editor.chmod(0o755)
         def free_port():
             with socket.socket() as sock:
@@ -234,21 +246,20 @@ HTTPServer(('127.0.0.1', port), Handler).serve_forever()
         self.assertEqual(generated.returncode, 0, generated.stderr)
         definition = json.loads(generated.stdout)
         self.assertFalse(definition['adapter_enforces_leases'])
-        definition['readiness_timeout_ms'] = 12_000
-        definition['restart']['max_restarts'] = 0
-        # The fake has no QUIT_EDITOR tool; Borg still owns stop/scope cleanup.
-        definition['graceful_stop'] = {'argv': ['/usr/bin/true'], 'timeout_ms': 1000}
-        spec_file = self.root / 'service.json'
-        spec_file.write_text(json.dumps(definition))
         service = definition['id']
+        self.env['BORG_AGENT_CLI'] = str(binary)
+        state = Path(runtime) / 'borg/unreal' / hashlib.sha256(
+            str(self.project).encode()).hexdigest()[:16]
+        self.addCleanup(shutil.rmtree, state, ignore_errors=True)
         attempted = False
         try:
-            attempted = True  # even a timed-out CLI may have started the service
-            start = subprocess.run([str(binary), 'lane', 'service', 'start', service,
-                                    '--definition', str(spec_file), '--wait-ready', '20', '--json'],
-                                   env=self.env, capture_output=True, text=True, timeout=35)
+            attempted = True  # a timed-out start may still have launched service
+            start = self.cli('editor', 'start')
             self.assertEqual(start.returncode, 0, start.stderr + start.stdout)
             self.assertIn('Healthy', str(json.loads(start.stdout)['state']))
+            status = self.cli('editor', 'status')
+            self.assertEqual(status.returncode, 0, status.stderr)
+            self.assertIn('Healthy', str(json.loads(status.stdout)['state']))
             request = urllib.request.Request(f'http://127.0.0.1:{ports[0]}/mcp',
                                              data=b'{}', method='POST')
             with self.assertRaises(urllib.error.HTTPError) as denied:
@@ -257,10 +268,10 @@ HTTPServer(('127.0.0.1', port), Handler).serve_forever()
             denied.exception.close()
         finally:
             if attempted:
-                stopped = subprocess.run([str(binary), 'lane', 'service', 'stop', service, '--json'],
-                                         env=self.env, capture_output=True, text=True, timeout=25)
+                stopped = self.cli('editor', 'stop')
                 self.assertEqual(stopped.returncode, 0, stopped.stderr)
                 self.assertEqual(json.loads(stopped.stdout)['state'], 'Stopped')
+                self.assertEqual(quit_marker.read_text(), 'QUIT_EDITOR')
                 for port in ports:
                     with socket.socket() as sock:
                         sock.settimeout(1)
