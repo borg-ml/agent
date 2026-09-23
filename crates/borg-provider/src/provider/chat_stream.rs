@@ -16,12 +16,15 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "claude")]
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tempfile::TempDir;
+#[cfg(feature = "claude")]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(feature = "claude")]
 use tokio::process::ChildStdin;
 use tokio::sync::{Mutex, mpsc};
 
