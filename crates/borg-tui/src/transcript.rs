@@ -2298,7 +2298,19 @@ impl Transcript {
                 self.finish_reasoning(event.created_at);
                 self.cache_diagnostics.reset();
                 let started = context_compaction_started(kind, payload);
-                if started {
+                let progress = payload
+                    .get("status")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|status| status.eq_ignore_ascii_case("progress"));
+                if started || progress {
+                    let progress_summary = if progress {
+                        payload
+                            .get("summary")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("Compacting context…")
+                    } else {
+                        "Compacting context…"
+                    };
                     if let Some(TranscriptEntry::Compaction {
                         summary,
                         time,
@@ -2308,13 +2320,13 @@ impl Transcript {
                     }) = self.order.last_mut()
                         && !*complete
                     {
-                        *summary = "Compacting context…".to_string();
+                        *summary = progress_summary.to_string();
                         *time = local_event_time(event);
                         *sequence = event.sequence;
                         *expanded = false;
                     } else {
                         self.order.push(TranscriptEntry::Compaction {
-                            summary: "Compacting context…".to_string(),
+                            summary: progress_summary.to_string(),
                             time: local_event_time(event),
                             sequence: event.sequence,
                             expanded: false,
