@@ -10,8 +10,11 @@ CLI works from the source package (`python3 extensions/native/native.py ...`)
 or the installed package (`python3 .borg/extensions/native/native.py ...`).
 
 Cargo `check`, `build`, `test` use a worktree-private `target`, debug profile,
-`-j` sized from MemAvailable (8 GiB reserve plus 2 GiB fixed job overhead, max six actions); CMake uses a
-private `build` and Release profile; ctest includes `-j`, regex and `-L`/`-LE`
+`-j` sized from MemAvailable (8 GiB reserve plus 2 GiB fixed job overhead,
+max six actions). Set `BORG_NATIVE_MAX_JOBS=2` to lower concurrency and its
+honest RAM reservation on a busy host; it cannot bypass the admission floor.
+CMake uses a private `build` and Release profile; ctest includes `-j`, regex
+and `-L`/`-LE`
 label selection. All output paths must remain inside the current worktree.
 Jobs request an exclusive worktree output resource, memory reserve and 60 GiB
 host disk floor. Cargo jobs reserve 24 GiB of additional disk headroom, while
