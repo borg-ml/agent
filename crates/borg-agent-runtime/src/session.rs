@@ -11021,11 +11021,19 @@ async fn apply_subagent_action(
                     agent: Box::new(subagents.resolve_snapshot(&target).await?),
                 })
             }
-            SubagentAction::Configure { target, provider, model, effort, .. } => {
-                Ok(SubagentControlOutcome::Accepted {
-                    agent: Box::new(subagents.configure_child(&target, provider, model, effort).await?),
-                })
-            }
+            SubagentAction::Configure {
+                target,
+                provider,
+                model,
+                effort,
+                ..
+            } => Ok(SubagentControlOutcome::Accepted {
+                agent: Box::new(
+                    subagents
+                        .configure_child(&target, provider, model, effort)
+                        .await?,
+                ),
+            }),
             SubagentAction::Interrupt { target, .. } => {
                 subagents.interrupt(&target).await?;
                 Ok(SubagentControlOutcome::Accepted {

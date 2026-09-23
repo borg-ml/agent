@@ -5822,12 +5822,21 @@ impl SubagentCoordinator {
             ensure_provider_can_spawn(&self.root_launch, selected)?;
         }
         let model = model.map(|model| model.trim().to_string());
-        ensure!(model.as_deref().is_none_or(|model| !model.is_empty()), "model cannot be empty");
+        ensure!(
+            model.as_deref().is_none_or(|model| !model.is_empty()),
+            "model cannot be empty"
+        );
         let effort = effort.map(|effort| effort.trim().to_ascii_lowercase());
-        ensure!(effort.as_deref().is_none_or(|effort| !effort.is_empty()), "effort cannot be empty");
+        ensure!(
+            effort.as_deref().is_none_or(|effort| !effort.is_empty()),
+            "effort cannot be empty"
+        );
         if let Some(effort) = effort.as_deref() {
             ensure!(
-                matches!(effort, "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"),
+                matches!(
+                    effort,
+                    "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+                ),
                 "effort must be one of none, low, medium, high, xhigh, max, or ultra"
             );
             validate_subagent_overrides(selected, None, Some(effort))?;
@@ -5849,24 +5858,38 @@ impl SubagentCoordinator {
         let mut events = self.subscribe();
         let id = current.session_id;
         let lane_change = if selected != current.provider {
-            Some(crate::SessionConfigAction::SetProvider { provider: selected, model })
+            Some(crate::SessionConfigAction::SetProvider {
+                provider: selected,
+                model,
+            })
         } else {
             model.map(|model| crate::SessionConfigAction::SetModel { model })
         };
         if let Some(action) = lane_change {
-            self.send_command(target, |session_id| HostCommand::Configure { session_id, action })
-                .await?;
+            self.send_command(target, |session_id| HostCommand::Configure {
+                session_id,
+                action,
+            })
+            .await?;
             self.wait_for_child_config(&mut events, id, selected, expected_model.as_deref(), None)
                 .await?;
         }
         if let Some(effort) = effort {
             self.send_command(target, |session_id| HostCommand::Configure {
                 session_id,
-                action: crate::SessionConfigAction::SetEffort { effort: effort.clone() },
+                action: crate::SessionConfigAction::SetEffort {
+                    effort: effort.clone(),
+                },
             })
             .await?;
-            self.wait_for_child_config(&mut events, id, selected, expected_model.as_deref(), Some(&effort))
-                .await?;
+            self.wait_for_child_config(
+                &mut events,
+                id,
+                selected,
+                expected_model.as_deref(),
+                Some(&effort),
+            )
+            .await?;
         }
         self.resolve_snapshot(target).await
     }
@@ -5893,7 +5916,8 @@ impl SubagentCoordinator {
                         } = event.kind
                             && actual_provider == provider
                             && actual_model.as_deref() == model
-                            && effort.is_none_or(|expected| actual_effort.as_deref() == Some(expected))
+                            && effort
+                                .is_none_or(|expected| actual_effort.as_deref() == Some(expected))
                         {
                             return Ok(());
                         }
@@ -5906,7 +5930,9 @@ impl SubagentCoordinator {
             }
         })
         .await
-        .with_context(|| format!("child {session_id} did not confirm its configuration within 30 seconds"))?
+        .with_context(|| {
+            format!("child {session_id} did not confirm its configuration within 30 seconds")
+        })?
     }
 
     /// Interrupt as the human (the UI path). `interrupt_agent` records its
@@ -7583,7 +7609,13 @@ pub fn agent_tool_specs_for_surface(
         specs.retain(|spec| {
             !matches!(
                 spec["name"].as_str(),
-                Some("watch" | "list_watchers" | "await_watchers" | "stop_watcher" | "configure_agent")
+                Some(
+                    "watch"
+                        | "list_watchers"
+                        | "await_watchers"
+                        | "stop_watcher"
+                        | "configure_agent"
+                )
             )
         });
     }
