@@ -16,6 +16,7 @@ mod image_delivery;
 mod importer;
 mod inspect;
 mod lane_commands;
+mod lane_service_commands;
 mod limits;
 mod protection;
 mod remote_commands;
