@@ -2425,10 +2425,14 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
             .write_all(b"POST /bad HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
             .await;
         let mut reply = Vec::new();
-        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut reply))
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut reply))
             .await
-            .unwrap()
             .unwrap();
+        // Closing a connection with the denied POST still unread may yield
+        // TCP RST after the first response; it must never forward the POST.
+        if let Err(error) = read {
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        }
         assert!(
             reply.starts_with(b"HTTP/1.0 200") || reply.starts_with(b"HTTP/1.1 403"),
             "reply: {:?}",

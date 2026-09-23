@@ -2254,7 +2254,21 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        store.resume_services(id).unwrap();
+        // Parallel tests may fork while the previous resume controller owns
+        // the flock; inherited descriptors can keep its gate busy briefly.
+        // WouldBlock leaves the journal pending, so retry until a deadline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            store.resume_services(id).unwrap();
+            if store.record(id).unwrap().resume_pending.is_empty() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "resume gate stayed busy"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
         let row = store.record(id).unwrap();
         assert!(row.resume_pending.is_empty());
         assert!(row.resume_error.is_none());
