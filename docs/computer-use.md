@@ -116,6 +116,40 @@ pointer-locked relative motion arriving as 10-count deltas, and focus restored
 to the human's window. The X11 EWMH path was verified in Xvfb (listing and
 `import -window` capture only; uinput reaches the real seat, not Xvfb).
 
+### Linux private display (preferred for testing apps and games)
+
+`launch {argv, env?, cwd?, x11?, wait?, width?, height?}` runs an app on a
+session-owned headless display served by `borg-display`, a small Borg
+compositor shipped beside `borg`. The display starts on demand, is reused for
+the session, and is torn down with it (also when the helper is killed); apps
+launched into it are killed at teardown unless `detached`.
+
+- Rendering is on the GPU: GLES on the boot VGA render node, with dmabuf so
+  Vulkan/GL clients render directly. X11-only apps (`x11: true`) run through
+  xwayland-satellite with GPU glamor. `capabilities.private_display` reports
+  the renderer, whether it is hardware-accelerated, and its limitations.
+- `list_windows {display: "private"}` returns `pd:` window ids; every op then
+  works on them. `screenshot {display: "private", scope: "desktop"}` captures
+  the display, `scope: "window"` one window, and `cursor: true` draws the
+  pointer. Pointer x,y are private display pixels.
+- All input goes through the compositor's private seat, never uinput or the
+  user's focused window. `type_text` types any Unicode (characters outside
+  the layout go through a temporary keymap). Apps can lock or confine the
+  pointer (`zwp_pointer_constraints_v1`); `pointer_move` dx/dy then arrive as
+  exact relative motion while the pointer stays put.
+- Sub-agents may use only a private display: desktop windows, desktop
+  screenshots and seat input are refused for them. Each child gets its own
+  display; `attach_display {display_id}` shares a parent's instead, and
+  detaching kills only the child's apps.
+- Without `borg-display` (for example an older install), the private display is
+  reported unavailable with how to get it: update or reinstall Borg, or set
+  `BORG_DISPLAY_BIN`.
+
+Verified live on niri 26.04 with an AMD RX 7900 GRE: vkcube (RADV) and
+glxgears over X11 rendering on the GPU, GTK typing and clicks, an SDL3 app in
+relative mouse mode receiving exact deltas, ✓ and é typed into SDL3 and GTK,
+and the human's focused window, pointer and input devices unchanged.
+
 ### Linux input backend (implemented, test-only verification)
 
 `computer_use/linux.py` injects through a Borg-owned evdev uinput device
