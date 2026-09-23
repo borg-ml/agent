@@ -15,24 +15,22 @@ removed once the Rust scheduler and the CLI gates below covered that policy.
 
 The CLI contract is in `docs/gamedev/interfaces.md`: `borg lane job submit|wait|status --json` and service start/status/lease/yield/resume. The lane CLI initially landed at `37c5ee8`; the lane-owner lane+service CLI and automatic handoff are verified below on the hash-pinned candidate built from source through `5429399` (**not** the final `gamedev/integrated` CLI). The drivers execute only public JSON CLI commands with fake jobs in isolated lane state directories, never direct Rust calls or hand-made supervisor state. The isolated service proxy restart/switchover and scoped two-service handoff are verified below. Project-path alias rejection, RAM admission, failed bound post-hook and failed service-resume retry have separate post-fix public-CLI results below; orphan/crash ownership recovery remains untested. Report any divergence with CLI invocation, JSON output and minimal reproduction to `gd_lanes_core`/`gd_services_core`. Dated results below were recorded with the Python drivers (`scripts/gamedev_*.py`, retrievable with `git show 62de8686:scripts/<name>`); their gates now live in cargo integration tests.
 
-### Public-CLI drivers (hash-pinned binary verified below)
+### Public-CLI gates
 
-After building an integrated lane+service CLI binary in this worktree:
+The gates are cargo integration tests that drive the `borg` binary cargo builds:
 
 ```sh
-cargo test -p borg --test lane_process -- --include-ignored
-python3 scripts/gamedev_service_probe.py --borg target/debug/borg
-# Scope-required gates need a user systemd manager and an owner-built current binary:
-python3 scripts/gamedev_service_probe.py --borg target/debug/borg --atomic-project-alias
-python3 scripts/gamedev_service_probe.py --borg target/debug/borg --check-service-disk-budget
-# RAM uses moving MemAvailable; informational, not a deterministic hard gate:
-python3 scripts/gamedev_service_probe.py --borg target/debug/borg --check-service-budget
-python3 scripts/gamedev_service_probe.py --borg target/debug/borg --atomic-post-hook-fail
-python3 scripts/gamedev_service_probe.py --borg target/debug/borg --atomic-failed-resume
-python3 scripts/gamedev_service_probe.py --borg target/debug/borg --atomic-unhealthy-resume
+# Default Linux cases (run by every `cargo test -p borg`):
+cargo test -p borg --test lane_process --test lane_services
+# Cases that need real cgroup scopes (a user systemd manager):
+cargo test -p borg --test lane_process --test lane_services -- --include-ignored --test-threads=1
 ```
 
-`lane_process` builds its specs from the `borg-lanes` types, submits them through `lane --json job submit --spec -`, blocks via `job wait`, and judges only `job status --json`. Its contention case runs three agents × four mixed jobs against a 10-slot synthetic host resource and asserts that jobs sharing an exclusive key never overlap, the shared capacity is never over-admitted and disjoint keys do run concurrently; separate cases cover an impossible disk budget timing out without a launch and an identical submit not joining a running job. Scheduling cases use `BORG_LANE_SCOPE=0`/`BORG_LANE_DEGRADED=1` only when no user systemd manager exists; scoped crash recovery is the ignored case. The earlier Python driver's throughput, fairness and wait metrics were informational and are not reproduced. The service probe drives only the JSON CLI and a local synthetic HTTP backend, tests lease/release, stable front port across restart and exclusive yield/resume, and stops only its own service. These commands passed against the hash-pinned lane-owner candidate below, not the final integrated v0 CLI; CI must build its own current binary and fail on any invariant rather than trusting this historical result.
+`lane_process` builds its specs from the `borg-lanes` types, submits them through `lane --json job submit --spec -`, blocks via `job wait`, and judges only `job status --json`. Its contention case runs three agents × four mixed jobs against a 10-slot synthetic host resource and asserts that jobs sharing an exclusive key never overlap, the shared capacity is never over-admitted and disjoint keys do run concurrently; separate cases cover an impossible disk budget timing out without a launch and an identical submit not joining a running job. Scoped crash recovery is its ignored case.
+
+`lane_services` re-executes its own test binary as the synthetic HTTP/MCP backend, its detached child and the exclusive-job workload, so it needs no interpreter. By default it covers the stable front port across lease, restart and yield/resume; MCP-initialize health on an editor-shaped keep-alive reply; and the D11 handoff. The ignored scoped cases map to the former probe flags: `--atomic-descendant`, `--atomic-post-hook`, `--atomic-post-hook-fail`, `--atomic-failed-resume`, `--atomic-unhealthy-resume`, `--atomic-foreign-lease`, `--atomic-foreign-grace`, `--atomic-foreign-indefinite`, `--atomic-late-lease`, `--atomic-active-hook-rollback`, `--atomic-per-resource-grace`, `--atomic-slow-resume`, `--atomic-project-alias`, `--check-service-disk-budget`, `--check-service-budget` (RAM; MemAvailable moves, so informational) and the shared-client probe with `--restore-failure-recovery`. `--atomic-own-lease` was the plain D11 run under a scope, which the default case now is wherever a user systemd manager exists. Tests use `BORG_LANE_SCOPE=0`/`BORG_LANE_DEGRADED=1` only when none exists.
+
+The earlier Python drivers' throughput, fairness and wait metrics were informational and are not reproduced. CI builds its own current binary and fails on any invariant rather than trusting the historical results below.
 
 ### Observed lane CLI (fake processes, not Unreal)
 

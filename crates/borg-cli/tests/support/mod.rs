@@ -25,10 +25,10 @@ pub fn systemd_user_manager() -> bool {
 }
 
 pub struct Lane {
-    _dir: tempfile::TempDir,
+    _dir: Option<tempfile::TempDir>,
     pub root: PathBuf,
-    /// Scheduling tests use explicit degraded mode where no user systemd
-    /// manager exists (CI); the crash test requires a real scope.
+    /// Tests use explicit degraded mode only where no user systemd manager
+    /// exists (CI); scope-dependent tests are ignored by default.
     pub degraded: bool,
 }
 
@@ -40,23 +40,34 @@ impl Lane {
             .unwrap();
         let root = dir.path().canonicalize().unwrap();
         Self {
-            _dir: dir,
+            _dir: Some(dir),
             root,
             degraded: !systemd_user_manager(),
         }
     }
 
-    pub fn cli(&self, args: &[&str], stdin: Option<&JobSpec>) -> Output {
+    /// A second handle on an existing test root, e.g. from inside a job.
+    pub fn attach(root: PathBuf, degraded: bool) -> Self {
+        Self {
+            _dir: None,
+            root,
+            degraded,
+        }
+    }
+
+    pub fn state(&self) -> PathBuf {
+        self.root.join("state")
+    }
+
+    pub fn command(&self, args: &[&str]) -> Command {
         let mut command = Command::new(BORG);
         command
             .args(["lane", "--json"])
             .args(args)
-            .env("BORG_LANE_DIR", self.root.join("state"))
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
+            .env("BORG_LANE_DIR", self.state())
+            .env("BORG_LANES_ROOT", self.state())
+            .env("BORG_LANE_EXECUTABLE", BORG)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if self.degraded {
@@ -64,11 +75,39 @@ impl Lane {
                 .env("BORG_LANE_SCOPE", "0")
                 .env("BORG_LANE_DEGRADED", "1");
         }
+        command
+    }
+
+    /// Run one CLI command; a hung command fails the test instead of hanging it.
+    pub fn cli(&self, args: &[&str], stdin: Option<&JobSpec>) -> Output {
+        let mut command = self.command(args);
+        if stdin.is_some() {
+            command.stdin(Stdio::piped());
+        }
         let mut child = command.spawn().unwrap();
         if let Some(spec) = stdin {
             serde_json::to_writer(child.stdin.take().unwrap(), spec).unwrap();
         }
-        child.wait_with_output().unwrap()
+        let pid = child.id();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sender.send(child.wait_with_output().unwrap()));
+        receiver
+            .recv_timeout(Duration::from_secs(90))
+            .unwrap_or_else(|_| {
+                // Only the CLI process this helper started.
+                let _ = Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status();
+                panic!("borg lane {args:?} did not exit within 90 s")
+            })
+    }
+
+    /// Run a command that must succeed and parse its JSON output.
+    pub fn json<T: serde::de::DeserializeOwned>(&self, args: &[&str]) -> T {
+        let out = self.cli(args, None);
+        assert!(out.status.success(), "{args:?}\n{}", describe(&out));
+        serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|error| panic!("{args:?}: {error}\n{}", describe(&out)))
     }
 
     pub fn spec(&self, name: &str, script: &str) -> JobSpec {
@@ -133,9 +172,7 @@ impl Lane {
     }
 
     pub fn records(&self) -> Vec<LaneRecord> {
-        let out = self.cli(&["job", "status"], None);
-        assert!(out.status.success(), "{}", describe(&out));
-        serde_json::from_slice(&out.stdout).unwrap()
+        self.json(&["job", "status"])
     }
 
     pub fn record(&self, id: &str) -> Option<LaneRecord> {
@@ -145,18 +182,19 @@ impl Lane {
     }
 
     /// Test-only polling of fake process state; production waits use flock.
-    pub fn until<T>(&self, mut probe: impl FnMut() -> Option<T>) -> T {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(value) = probe() {
-                return value;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for fake process state"
-            );
-            std::thread::sleep(Duration::from_millis(30));
+    pub fn until<T>(&self, probe: impl FnMut() -> Option<T>) -> T {
+        until(Duration::from_secs(5), probe)
+    }
+}
+
+pub fn until<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(value) = probe() {
+            return value;
         }
+        assert!(Instant::now() < deadline, "timed out after {timeout:?}");
+        std::thread::sleep(Duration::from_millis(30));
     }
 }
 
