@@ -6217,11 +6217,10 @@ impl BorgTerminal {
             let sequence = desktop_notification_sequence("Borg Agent", "Finished working");
             let _ = write!(self.terminal.backend_mut(), "{sequence}");
         }
-        // Terminal bells are often muted even when desktop notifications are
-        // enabled. Play the system chime without holding up the TUI, and keep
-        // BEL as a fallback when no native player is available.
-        if sound && !play_system_completion_sound() {
-            let _ = write!(self.terminal.backend_mut(), "\x07");
+        // Play the chime without holding up the TUI. A terminal bell has no
+        // per-play volume control, so a missing sound player stays silent.
+        if sound {
+            let _ = play_system_completion_sound();
         }
         let _ = io::Write::flush(self.terminal.backend_mut());
     }
@@ -10242,7 +10241,7 @@ fn play_system_completion_sound() -> bool {
     #[cfg(target_os = "macos")]
     {
         let mut command = Command::new("/usr/bin/afplay");
-        command.arg("/System/Library/Sounds/Glass.aiff");
+        command.args(["-v", "0.25", "/System/Library/Sounds/Glass.aiff"]);
         return start_completion_sound(command);
     }
     #[cfg(windows)]
@@ -10261,14 +10260,14 @@ fn play_system_completion_sound() -> bool {
     #[cfg(target_os = "linux")]
     {
         let mut command = Command::new("canberra-gtk-play");
-        command.args(["--id", "complete"]);
+        command.args(["--id", "complete", "--volume=-12.0"]);
         if start_completion_sound(command) {
             return true;
         }
         let sound = Path::new("/usr/share/sounds/freedesktop/stereo/complete.oga");
         if sound.exists() {
             let mut command = Command::new("paplay");
-            command.arg(sound);
+            command.arg("--volume=16384").arg(sound);
             return start_completion_sound(command);
         }
         false
