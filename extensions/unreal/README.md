@@ -82,6 +82,12 @@ or safely recover unmanaged UBT processes.
 
 `editor spec` emits a persistent service with loopback front/backend ports,
 MCP-initialize health, bounded restart, and a project-run resource declaration.
+The backend launcher records its own PID/start identity in a private, per-port
+file and then `exec`s Unreal in that same process; the 90 s graceful-stop hook
+ends PIE, sends `QUIT_EDITOR`, and waits (up to 85 s) for both the backend PID
+to exit and its MCP port to close. The core still tears down the tracked
+cgroup after the hook returns, so an unresponsive editor cannot run forever.
+The PID file is not a lease and cannot authorize external stop actions.
 `editor start|status|restart|yield|resume|stop|lease|release` forward to the
 integrating `borg lane service` CLI. A disposable **fake** editor with an MCP
 initialize endpoint reached Healthy through the exact combined lanes-owner

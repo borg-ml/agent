@@ -459,14 +459,19 @@ time.sleep(0.3)  # Closing MCP is not enough: the process must exit too.
                 with socket.socket() as sock:
                     sock.bind(('127.0.0.1', 0))
                     port = sock.getsockname()[1]
-                child = subprocess.Popen([sys.executable, str(fake), str(port),
-                                          str(marker), mode], stdout=subprocess.PIPE,
+                pid_file = self.root / f'{mode}-{port}.pid'
+                child = subprocess.Popen([sys.executable, str(ROOT / 'editor/launch.py'),
+                                          '--pid-file', str(pid_file), '--',
+                                          sys.executable, str(fake), str(port), str(marker), mode],
+                                         stdout=subprocess.PIPE,
                                          stderr=subprocess.PIPE, text=True)
                 try:
                     self.assertEqual(child.stdout.readline().strip(), 'ready')
+                    record = json.loads(pid_file.read_text())
+                    self.assertEqual(record['pid'], child.pid)
                     before = time.monotonic()
                     hook = subprocess.run([sys.executable, str(ROOT / 'editor/quit.py'),
-                                           '--port', str(port), '--pid', str(child.pid),
+                                           '--port', str(port), '--pid-file', str(pid_file),
                                            '--timeout-seconds', '1.5' if mode == 'exit' else '0.6'],
                                           capture_output=True, text=True, timeout=5)
                     if mode == 'exit':
@@ -493,6 +498,10 @@ time.sleep(0.3)  # Closing MCP is not enough: the process must exit too.
                          ['unreal-project-run', 'unreal-run-ram'])
         self.assertEqual(self.cli('run', 'verify', '--', sys.executable, '-c', 'print(1)').returncode, 2)
         service = json.loads(self.cli('editor', 'spec').stdout)
+        self.assertIn('editor/launch.py', service['argv'][1])
+        self.assertEqual(service['argv'][2:4], ['--pid-file',
+                                                service['graceful_stop']['argv'][-1]])
+        self.assertIn('backend-{port}.pid', service['argv'][3])
         self.assertIn('-RenderOffscreen', service['argv'])
         self.assertIn('-unattended', service['argv'])
         self.assertIn('-ModelContextProtocolPort={port}', service['argv'])
