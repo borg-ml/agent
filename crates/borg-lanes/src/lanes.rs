@@ -163,6 +163,10 @@ pub struct JobSpec {
     /// abandoned, or recovered from a lost supervisor.
     #[serde(default)]
     pub finish_hook: Option<Hook>,
+    /// Swap limit of the workload scope (systemd MemorySwapMax); None
+    /// leaves the default.
+    #[serde(default)]
+    pub memory_swap_max_bytes: Option<u64>,
     pub fingerprint: JobFingerprint,
     pub lease: LeaseRequest,
     pub argv: Vec<String>,
@@ -735,6 +739,7 @@ impl LaneStore {
                         && serde_json::to_value(&spec.finish_hook).ok()
                             == serde_json::to_value(&other.finish_hook).ok()
                         && spec.memory_max_bytes == other.memory_max_bytes
+                        && spec.memory_swap_max_bytes == other.memory_swap_max_bytes
                         && spec.foreign_client_grace_ms == other.foreign_client_grace_ms
                         && spec.foreign_client_grace_by_resource
                             == other.foreign_client_grace_by_resource
@@ -2418,6 +2423,9 @@ impl LaneStore {
             if let Some(max) = spec.memory_max_bytes {
                 command.args(["-p", &format!("MemoryMax={max}")]);
             }
+            if let Some(max) = spec.memory_swap_max_bytes {
+                command.args(["-p", &format!("MemorySwapMax={max}")]);
+            }
             command.arg("--").arg(&spec.argv[0]).args(&spec.argv[1..]);
             command
         } else {
@@ -3355,6 +3363,7 @@ mod tests {
             abandon_after_ms: None,
             unit_prefix: None,
             finish_hook: None,
+            memory_swap_max_bytes: None,
             fingerprint: JobFingerprint("post-fail".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -4100,6 +4109,7 @@ mod tests {
             abandon_after_ms: None,
             unit_prefix: None,
             finish_hook: None,
+            memory_swap_max_bytes: None,
             fingerprint: JobFingerprint("foreign-client".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -4252,6 +4262,7 @@ mod tests {
                 abandon_after_ms: None,
                 unit_prefix: None,
                 finish_hook: None,
+                memory_swap_max_bytes: None,
                 fingerprint: JobFingerprint("shared-foreign".into()),
                 lease: LeaseRequest {
                     resources: vec![resource("fake-exclusive", Access::Exclusive)],
@@ -4387,6 +4398,7 @@ mod tests {
             abandon_after_ms: None,
             unit_prefix: None,
             finish_hook: None,
+            memory_swap_max_bytes: None,
             foreign_client_grace_by_resource: vec![ForeignClientGrace {
                 resource: resource("editor", Access::Exclusive).key,
                 grace_ms: 0,
@@ -4494,6 +4506,7 @@ mod tests {
             abandon_after_ms: None,
             unit_prefix: None,
             finish_hook: None,
+            memory_swap_max_bytes: None,
             fingerprint: JobFingerprint("yield-r1".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -4602,6 +4615,7 @@ mod tests {
             abandon_after_ms: None,
             unit_prefix: None,
             finish_hook: None,
+            memory_swap_max_bytes: None,
             fingerprint: JobFingerprint("auto-bound".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -4662,6 +4676,7 @@ mod tests {
             abandon_after_ms: None,
             unit_prefix: None,
             finish_hook: None,
+            memory_swap_max_bytes: None,
             fingerprint: JobFingerprint("no-yield".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -4719,6 +4734,7 @@ mod tests {
             abandon_after_ms: None,
             unit_prefix: None,
             finish_hook: None,
+            memory_swap_max_bytes: None,
             fingerprint: JobFingerprint("source-r1".into()),
             lease: LeaseRequest {
                 resources: vec![resource("build", Access::Exclusive)],

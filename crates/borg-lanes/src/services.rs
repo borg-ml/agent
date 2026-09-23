@@ -77,6 +77,10 @@ pub struct ServiceSpec {
     pub env: Vec<(String, String)>,
     pub resources: Vec<ResourceRequest>,
     pub memory_max_bytes: Option<u64>,
+    /// Swap limit of the service unit (systemd MemorySwapMax); None leaves
+    /// the default.
+    #[serde(default)]
+    pub memory_swap_max_bytes: Option<u64>,
     pub admission: AdmissionBudget,
     pub health: HealthCheck,
     pub restart: RestartPolicy,
@@ -515,6 +519,9 @@ impl ServiceManager {
             command.arg(format!("--setenv=BORG_SERVICE_UNIT={unit}.service"));
             if let Some(bytes) = spec.memory_max_bytes {
                 command.args(["-p", &format!("MemoryMax={bytes}")]);
+            }
+            if let Some(bytes) = spec.memory_swap_max_bytes {
+                command.args(["-p", &format!("MemorySwapMax={bytes}")]);
             }
             let lane_root = self.root.parent().context("invalid root")?.display();
             command.arg(format!("--setenv=BORG_LANE_DIR={lane_root}"));
@@ -2195,6 +2202,7 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
                 access: Access::Exclusive,
             }],
             memory_max_bytes: None,
+            memory_swap_max_bytes: None,
             admission: AdmissionBudget {
                 min_available_ram_bytes: 0,
                 reserve_ram_bytes: 0,
