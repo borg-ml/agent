@@ -173,6 +173,7 @@ fn root_history_page_cannot_replace_a_focused_child_transcript() {
         &mut director,
         true,
         &[root_event],
+        false,
     ));
     assert!(matches!(
         &displayed.order[0],
@@ -232,6 +233,7 @@ fn older_root_history_hides_agent_cards_and_preserves_authoritative_roster_state
         &mut director,
         false,
         &[stale_parent_event],
+        false,
     ));
 
     assert!(displayed.order.is_empty());
@@ -243,6 +245,100 @@ fn older_root_history_hides_agent_cards_and_preserves_authoritative_roster_state
         displayed.subagent_snapshots[&child].detail.as_deref(),
         Some("crash cleanup completed")
     );
+}
+
+#[test]
+fn resumed_history_waits_for_roster_then_hides_child_reports_and_keeps_peers_in_order() {
+    let root = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    let peer = Uuid::new_v4();
+    let now = Utc::now();
+    let child_snapshot = SubagentSnapshot {
+        session_id: child,
+        parent_session_id: root,
+        task_name: "/root/worker".to_string(),
+        status: SubagentStatus::Ready,
+        provider: CodingProvider::Codex,
+        model: None,
+        effort: None,
+        cwd: PathBuf::from("/workspace"),
+        created_at: now,
+        updated_at: now,
+        detail: None,
+        final_text: None,
+        usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
+    };
+    let assistant = |sequence, text: &str| {
+        SessionEvent::new(
+            root,
+            sequence,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::Assistant,
+                text: text.to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        )
+    };
+    let receipt = |sequence, sender_id, text: &str| {
+        SessionEvent::new(
+            root,
+            sequence,
+            SessionEventKind::AgentMessageReceived {
+                message_id: Uuid::new_v4(),
+                sender_id,
+                sender_name: "worker".to_string(),
+                text: text.to_string(),
+            },
+        )
+    };
+    let history = [
+        assistant(1, "before"),
+        receipt(2, child, "child report"),
+        receipt(3, peer, "peer report"),
+        assistant(4, "after"),
+    ];
+    let mut transcript = Transcript::default();
+    let mut director = None;
+
+    // A bounded first-paint tail may contain receipts but no creation event.
+    assert!(replace_root_transcript_history(
+        &mut transcript,
+        &mut director,
+        false,
+        &history,
+        true,
+    ));
+    assert_eq!(transcript.order.len(), 2);
+
+    transcript.upsert_subagent_snapshot(&child_snapshot);
+    assert!(replace_root_transcript_history(
+        &mut transcript,
+        &mut director,
+        false,
+        &history,
+        false,
+    ));
+    let visible = transcript
+        .order
+        .iter()
+        .map(|entry| match entry {
+            TranscriptEntry::Message { text, .. } => text.as_str(),
+            TranscriptEntry::Action {
+                body: Some(body), ..
+            } => body.as_str(),
+            _ => "other",
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(visible, ["before", "peer report", "after"]);
+    assert!(matches!(
+        &transcript.order[1],
+        TranscriptEntry::Action { label, .. } if label == "Peer"
+    ));
+    assert!(transcript.subagent_snapshots.contains_key(&child));
 }
 
 #[test]
@@ -760,6 +856,49 @@ fn child_history_merge_prefers_completion_over_a_late_partial_snapshot() {
             ..
         } if text == "I am complete"
     ));
+}
+
+#[test]
+fn child_history_merge_uses_journal_order_when_timestamps_invert() {
+    let session_id = Uuid::new_v4();
+    let process_id = Uuid::new_v4();
+    let now = Utc::now();
+    let mut tool = SessionEvent::new(
+        session_id,
+        2684,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "shell-1".to_string(),
+            name: "exec_command".to_string(),
+            input: serde_json::json!({"cmd": "cargo test"}),
+            input_ref: None,
+        },
+    );
+    tool.created_at = now;
+    let mut process = SessionEvent::new(
+        session_id,
+        2685,
+        SessionEventKind::RuntimeProcessStarted {
+            process_id,
+            pid: 4242,
+            command: "cargo test".to_string(),
+            cwd: PathBuf::from("/workspace"),
+        },
+    );
+    process.created_at = now - chrono::Duration::milliseconds(1);
+
+    let events = merge_child_history(&[tool, process], Vec::new());
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        [2684, 2685]
+    );
+    let mut transcript = Transcript::default();
+    for event in &events {
+        transcript.apply(event);
+    }
+    assert_eq!(transcript.active_shell_rows()[0].1, Some(0));
 }
 
 #[test]
@@ -8341,6 +8480,7 @@ fn detached_history_rebuild_preserves_scroll_follow_state() {
         &mut None,
         false,
         &[event],
+        false,
     ));
     assert!(!transcript.follow_tail);
 }

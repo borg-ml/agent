@@ -2655,8 +2655,11 @@ async fn run_local_agent_session(
     if let Some(terminal) = terminal.as_mut() {
         terminal.set_configured_model_entries(agent_config.configured_model_entries());
         terminal.set_extension_commands(extension_catalog.api_snapshot().commands);
-        terminal.seed_history(&history);
+        if resuming {
+            terminal.begin_team_history_hydration();
+        }
         terminal.seed_team_roster(&team_snapshots);
+        terminal.seed_history(&history);
         terminal.seed_session_state(&display_session_state);
         if let Some(notice) = startup_update_notice.as_deref() {
             terminal.set_notice(notice);
@@ -3508,6 +3511,7 @@ async fn run_local_agent_session(
                                 &team_snapshots,
                                 &child_histories,
                             );
+                            terminal.replace_history(&history);
                             terminal_dirty = true;
                         }
                     }
@@ -3515,12 +3519,16 @@ async fn run_local_agent_session(
                         tracing::warn!(%error, "could not hydrate subagent history after first paint");
                         if let Some(terminal) = terminal.as_mut() {
                             terminal.finish_child_history_hydration();
+                            terminal.replace_history(&history);
+                            terminal_dirty = true;
                         }
                     }
                     Err(error) => {
                         tracing::warn!(%error, "subagent history hydration task failed");
                         if let Some(terminal) = terminal.as_mut() {
                             terminal.finish_child_history_hydration();
+                            terminal.replace_history(&history);
+                            terminal_dirty = true;
                         }
                     }
                 }
@@ -5175,13 +5183,14 @@ async fn run_local_agent_session(
                                     .recent_user_messages(session_id, RICH_TUI_PROMPT_HISTORY_LIMIT)
                                     .await?;
                                 restored.seed_composer_history(&composer_history);
-                                restored.seed_history(&latest.events);
                                 let (_, agents, histories) = load_subagent_thread_state(
                                     store.as_ref(),
                                     &sessions_dir,
                                     session_id,
                                 )
                                 .await?;
+                                restored.seed_team_roster(&agents);
+                                restored.seed_history(&latest.events);
                                 seed_terminal_subagent_threads(&mut restored, &agents, &histories);
                                 restored.seed_session_state(&latest_state);
                                 terminal = Some(restored);
@@ -6942,7 +6951,6 @@ async fn run_local_agent_session(
                                             )
                                             .await?;
                                         restored.seed_composer_history(&composer_history);
-                                        restored.seed_history(&latest.events);
                                         let (_, agents, histories) =
                                             load_subagent_thread_state(
                                                 store.as_ref(),
@@ -6950,6 +6958,8 @@ async fn run_local_agent_session(
                                                 session_id,
                                             )
                                                 .await?;
+                                        restored.seed_team_roster(&agents);
+                                        restored.seed_history(&latest.events);
                                         seed_terminal_subagent_threads(
                                             &mut restored,
                                             &agents,
