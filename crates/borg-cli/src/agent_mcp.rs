@@ -45,6 +45,17 @@ pub(crate) async fn list_tools(name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+pub(crate) async fn workspace_instances() -> Result<Value> {
+    let endpoint = AgentToolEndpoint::from_env()?;
+    forward(
+        &endpoint,
+        "list_instances",
+        json!({ "include_exited": true, "limit": 10000 }),
+        None,
+    )
+    .await
+}
+
 pub(crate) async fn call_tool(name: &str, arguments: Option<&str>) -> Result<()> {
     let arguments = match arguments {
         Some("-") => {
