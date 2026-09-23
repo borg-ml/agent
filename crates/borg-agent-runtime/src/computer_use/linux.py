@@ -7,10 +7,15 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
+from typing import TYPE_CHECKING
 
 import gi
+
+if TYPE_CHECKING:  # at runtime linux_windows.py is concatenated before this file
+    from linux_windows import *  # noqa: F403
 
 gi.require_version("Atspi", "2.0")
 from gi.repository import Atspi  # pyright: ignore[reportAttributeAccessIssue]
@@ -21,6 +26,15 @@ objects = {}
 object_ids = {}
 next_id = 0
 observations = {}
+COMPOSITOR = {}  # compositor window id -> entry, refreshed by windows()
+ACCESSIBLE_COMPOSITOR = {}  # AT-SPI window id -> correlated compositor entry
+COMPOSITOR_STATE: dict = {"error": None}
+WINDOW_CAPTURES = {}  # window id -> {"scale": image px per window px} of the latest window screenshot
+FOCUS: dict = {"human": None, "borg": None, "changed_at": 0.0}  # the human's window before Borg moved focus, and Borg's last target
+POINTER: dict = {"window": None}  # window the helper last placed the pointer in
+LOCATED = {}  # window id -> {"image": decoded window capture, "origin": desktop origin} from the last localisation
+PNG_SIGNATURE = bytes.fromhex("89504e470d0a1a0a")
+MAX_IMAGE_BYTES = 4 * 1024 * 1024
 
 
 def identify(obj):
@@ -46,19 +60,42 @@ def alive(obj):
 
 
 def windows():
-    result = []
+    """AT-SPI windows merged with compositor-listed ones (which may have no accessibility tree)."""
+    result, accessible = [], []
     private_pids = {w["pid"] for w in private_windows(accessibility=False)}
     desktop = Atspi.get_desktop(0)
     for ai in range(min(desktop.get_child_count(), 256)):
         app = desktop.get_child_at_index(ai)
-        if private_pids and app_pid(app) in private_pids:
+        pid = app_pid(app)
+        if private_pids and pid in private_pids:
             continue  # listed under display=private
         for wi in range(min(app.get_child_count(), 256)):
             win = app.get_child_at_index(wi)
             if alive(win):
-                result.append({"id": identify(win), "title": win.get_name(),
-                               "application": app.get_name(),
-                               "active": states(win).contains(Atspi.StateType.ACTIVE)})
+                entry = {"id": identify(win), "title": win.get_name(), "application": app.get_name(),
+                         "active": states(win).contains(Atspi.StateType.ACTIVE), "accessible": True}
+                result.append(entry)
+                accessible.append((entry["id"], pid, entry["title"], entry["active"]))
+    COMPOSITOR.clear()
+    ACCESSIBLE_COMPOSITOR.clear()
+    try:
+        listed = compositor_list()
+        COMPOSITOR_STATE["error"] = None
+    except Exception as error:  # a broken compositor IPC must not hide accessible windows
+        listed = []
+        COMPOSITOR_STATE["error"] = str(error)[:512]
+    matches = correlate(accessible, listed)
+    for entry in result:
+        match = matches.get(entry["id"])
+        if match:
+            entry["compositor"] = public_window(match)
+            ACCESSIBLE_COMPOSITOR[entry["id"]] = match
+    matched = {m["id"] for m in matches.values()}
+    for item in listed:
+        COMPOSITOR[item["id"]] = item
+        if item["id"] not in matched:
+            result.append({"id": item["id"], "title": item["title"], "application": item["app_id"],
+                           "active": item["focused"], "accessible": False, "compositor": public_window(item)})
     return result
 
 
@@ -78,7 +115,26 @@ def window(key):
         return accessible
     if key not in {w["id"] for w in windows()}:
         raise ValueError("stale or unknown window_id; list_windows again")
-    return objects[key]
+    return COMPOSITOR[key] if key in COMPOSITOR else objects[key]
+
+
+def is_compositor(win):
+    """Compositor-only windows are plain dicts; accessible windows are AT-SPI proxies."""
+    return isinstance(win, dict)
+
+
+PUBLIC_FIELDS = ("backend", "native_id", "title", "app_id", "pid", "workspace", "output", "focused", "floating",
+                 "visible", "geometry", "size")
+
+
+def public_window(entry):
+    return {k: entry.get(k) for k in PUBLIC_FIELDS}
+
+
+def compositor_for(wid):
+    """Fresh compositor entry for a window id (compositor-only or correlated AT-SPI), or None."""
+    windows()
+    return COMPOSITOR.get(wid) or ACCESSIBLE_COMPOSITOR.get(wid)
 
 
 def extents_type():
@@ -138,23 +194,203 @@ def tree(win, limit):
     return nodes, truncated or bool(queue)
 
 
-def screenshot(scope):
+def png_size(data):
+    if not data.startswith(PNG_SIGNATURE) or len(data) < 24:
+        raise ValueError("capture did not return a PNG")
+    return struct.unpack_from(">II", data, 16)
+
+
+def attachment(data):
+    return [{"media_type": "image/png", "data_base64": base64.b64encode(data).decode()}]
+
+
+def screenshot(scope, wid=None):
+    if scope == "window":
+        if not isinstance(wid, str):
+            raise ValueError("scope=window requires window_id")
+        return window_screenshot(wid)
     if scope != "desktop":
-        raise ValueError("only explicit desktop capture is available; isolated window capture is unsupported")
+        raise ValueError('scope must be "desktop" or "window" (window needs window_id)')
     capture = subprocess.run(["grim", "-"], capture_output=True, timeout=5)
     if capture.returncode:
         raise ValueError("desktop capture failed: " + capture.stderr.decode(errors="replace")[:1024])
     data = capture.stdout
-    if not data.startswith(bytes.fromhex("89504e470d0a1a0a")) or len(data) < 24:
-        raise ValueError("capture did not return a PNG")
-    if len(data) > 4 * 1024 * 1024:
+    width, height = png_size(data)
+    if len(data) > MAX_IMAGE_BYTES:
         raise ValueError("screenshot exceeds 4 MiB")
-    width, height = struct.unpack_from(">II", data, 16)
     global SCREEN
     SCREEN = (width, height)
     return {"scope": "desktop", "width": width, "height": height,
             "coordinate_space": "screenshot pixels, not AT-SPI screen coordinates",
-            "borg_attachments": [{"media_type": "image/png", "data_base64": base64.b64encode(data).decode()}]}
+            "borg_attachments": attachment(data)}
+
+
+# ---- Window capture ---------------------------------------------------------
+
+def run_bytes(command, timeout=5):
+    run = subprocess.run(command, capture_output=True, timeout=timeout)
+    if run.returncode:
+        raise ValueError(f"{command[0]} failed: " + run.stderr.decode(errors="replace").strip()[:1024])
+    return run.stdout
+
+
+def clipboard_snapshot():
+    """The current clipboard (one MIME type) so a compositor screenshot can be undone."""
+    if not (shutil.which("wl-paste") and shutil.which("wl-copy")):
+        return {"available": False}
+    listing = subprocess.run(["wl-paste", "--list-types"], capture_output=True, text=True, timeout=3)
+    types = listing.stdout.split() if listing.returncode == 0 else []
+    kind = clipboard_restore_type(types)
+    if kind is None:
+        return {"available": True, "type": None}
+    content = subprocess.run(["wl-paste", "--no-newline", "--type", kind], capture_output=True, timeout=3)
+    if content.returncode or len(content.stdout) > 32 * 1024 * 1024:
+        return {"available": True, "type": kind, "unreadable": True}
+    return {"available": True, "type": kind, "data": content.stdout, "types": len(types)}
+
+
+def clipboard_restore(saved, capture):
+    """Put the saved clipboard back once the compositor's own image selection landed."""
+    if not saved.get("available"):
+        return "clipboard now holds the capture (install wl-clipboard so Borg can restore it)"
+    if saved.get("unreadable"):
+        return f"clipboard now holds the capture; the previous {saved['type']} content was too large or unreadable to restore"
+    # niri sets its selection asynchronously; restoring earlier would be overwritten,
+    # and if something else replaced it meanwhile (the human copied), leave it alone.
+    deadline, landed = time.monotonic() + 1.0, False
+    while capture and time.monotonic() < deadline:
+        probe = subprocess.run(["wl-paste", "--no-newline", "--type", "image/png"], capture_output=True, timeout=3)
+        if probe.returncode == 0 and probe.stdout == capture:
+            landed = True
+            break
+        time.sleep(0.03)
+    if capture and not landed:
+        return "clipboard not restored: it no longer held the capture (it changed during the capture)"
+    detached = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "start_new_session": True, "timeout": 3}
+    if saved.get("type") is None:
+        subprocess.run(["wl-copy", "--clear"], stdin=subprocess.DEVNULL, **detached)
+        return "clipboard was empty and was cleared again"
+    subprocess.run(["wl-copy", "--type", saved["type"]], input=saved["data"], **detached)
+    extra = "" if saved.get("types", 1) <= 1 else " (other offered formats were not restored)"
+    return f"clipboard restored as {saved['type']}{extra}"
+
+
+def niri_capture(entry):
+    """niri renders exactly this window's surfaces (on-screen or not) without changing focus.
+
+    niri also copies every screenshot to the clipboard and may show a
+    'Screenshot captured' notification; the clipboard is restored afterwards.
+    """
+    directory = tempfile.mkdtemp(prefix="borg-cua-")
+    path = os.path.join(directory, "window.png")
+    saved = clipboard_snapshot()
+    data = None
+    try:
+        niri_request({"Action": {"ScreenshotWindow": {"id": entry["native_id"], "write_to_disk": True,
+                                                      "show_pointer": False, "path": path}}})
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                with open(path, "rb") as handle:
+                    candidate = handle.read()
+                # niri writes the file non-atomically; wait for the IEND chunk.
+                if candidate.startswith(PNG_SIGNATURE) and candidate.endswith(b"IEND\xaeB`\x82"):
+                    data = candidate
+                    break
+            except FileNotFoundError:
+                pass
+            time.sleep(0.02)
+    finally:
+        note = clipboard_restore(saved, data)
+        shutil.rmtree(directory, ignore_errors=True)
+    if data is None:
+        raise ValueError("niri did not write the window screenshot; the window may have closed")
+    return data, "niri screenshot-window (isolated window surfaces)", [note, "niri may show a 'Screenshot captured' notification"]
+
+
+def grim_region(geometry, scale):
+    g = geometry
+    spec = f"{g['x'] / scale:g},{g['y'] / scale:g} {g['width'] / scale:g}x{g['height'] / scale:g}"
+    return run_bytes(["grim", "-g", spec, "-"])
+
+
+def refreshed(entry):
+    fresh = next((c for c in compositor_list(entry["backend"]) if c["id"] == entry["id"]), None)
+    if fresh is None:
+        raise ValueError("window closed; list_windows again")
+    return fresh
+
+
+def capture_compositor_window(entry):
+    backend = entry["backend"]
+    if backend == "niri":
+        return niri_capture(entry)
+    notes = []
+    if entry.get("toplevel_identifier") and shutil.which("grim"):
+        # ext-image-copy-capture: isolated even when hidden, where the compositor supports it.
+        run = subprocess.run(["grim", "-T", entry["toplevel_identifier"], "-"], capture_output=True, timeout=5)
+        if run.returncode == 0:
+            return run.stdout, "grim -T (ext-image-copy-capture, isolated)", notes
+        notes.append("grim -T unsupported here: " + run.stderr.decode(errors="replace").strip()[:200])
+    if backend == "x11" and shutil.which("import"):
+        data = run_bytes(["import", "-silent", "-window", f"{entry['native_id']:#x}", "png:-"])
+        return data, "ImageMagick import -window (X11; overlapping windows can show through)", notes
+    if backend in ("sway", "hyprland"):
+        prior = None
+        if not entry.get("visible"):
+            # Bring it into view, capture, then put the human's focus back.
+            prior = next((c for c in compositor_list(backend) if c["focused"]), None)
+            compositor_focus(entry)
+            time.sleep(0.25)
+            entry = refreshed(entry)
+            notes.append("window was brought into view for capture and prior focus restored")
+        try:
+            if not entry.get("geometry"):
+                raise ValueError("the compositor reports no geometry for this window")
+            return grim_region(entry["geometry"], entry.get("scale") or 1.0), "grim -g compositor geometry (region of the composited desktop)", notes
+        finally:
+            if prior is not None and prior["id"] != entry["id"]:
+                compositor_focus(prior)
+    raise ValueError(f"isolated window capture is unavailable with the {backend} window backend")
+
+
+def fit_image(data):
+    """Downscale a capture that exceeds the 4 MiB attachment bound; returns (png, scale)."""
+    if len(data) <= MAX_IMAGE_BYTES:
+        return data, 1.0
+    try:
+        from PIL import Image
+    except ImportError:
+        raise ValueError("window screenshot exceeds 4 MiB and python-pillow is not installed to downscale it")
+    import io
+    image = Image.open(io.BytesIO(data))
+    scale = 1.0
+    for _ in range(6):
+        scale *= 0.85 * math.sqrt(MAX_IMAGE_BYTES / len(data))
+        buffer = io.BytesIO()
+        image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale)))).save(buffer, "PNG", optimize=True)
+        if buffer.tell() <= MAX_IMAGE_BYTES:
+            return buffer.getvalue(), scale
+        data = buffer.getvalue()
+    raise ValueError("window screenshot exceeds 4 MiB even after downscaling")
+
+
+def window_screenshot(wid):
+    entry = compositor_for(wid)
+    if entry is None:
+        backend = compositor_backend()
+        raise ValueError("window capture needs a compositor window backend (niri, sway, Hyprland or X11 EWMH); " +
+                         (f"{backend} does not list this window" if backend else "none was detected in this session"))
+    data, method, notes = capture_compositor_window(entry)
+    raw_size = png_size(data)
+    data, scale = fit_image(data)
+    width, height = png_size(data)
+    WINDOW_CAPTURES[wid] = {"scale": scale, "size": raw_size}
+    return {"scope": "window", "window_id": wid, "width": width, "height": height, "scale": round(scale, 6),
+            "capture_backend": method, "notes": [n for n in notes if n],
+            "compositor": public_window(entry),
+            "coordinate_space": "window screenshot pixels; pass coordinate_space=window to pointer ops to target them",
+            "borg_attachments": attachment(data)}
 
 
 def snapshot(args):
@@ -163,7 +399,7 @@ def snapshot(args):
     limit = args.get("max_nodes", 300)
     if not isinstance(limit, int) or not 1 <= limit <= 1000:
         raise ValueError("max_nodes must be between 1 and 1000")
-    nodes, truncated = tree(win, limit)
+    nodes, truncated = ({}, False) if is_compositor(win) else tree(win, limit)
     token = uuid.uuid4().hex
     previous = observations.get(wid)
     requested = args.get("since")
@@ -181,18 +417,23 @@ def snapshot(args):
                        "removed": [k for k in old if k not in nodes]})
     else:
         result["nodes"] = list(nodes.values())
+    if is_compositor(win):
+        result.update({"accessible": False, "compositor": public_window(win),
+                       "note": "This window exposes no accessibility tree; use screenshot scope=window and coordinate input."})
     observations[wid] = {"observation_id": token, "nodes": nodes}
     if args.get("screenshot"):
         if is_private(wid):
             result.update(private_screenshot({"scope": args.get("screenshot_scope") or "window", "window_id": wid}))
         else:
-            result.update(screenshot(args.get("screenshot_scope")))
+            result.update(screenshot(args.get("screenshot_scope"), wid))
     return result
 
 
 def target(args):
     wid = args["window_id"]
     win = window(wid)
+    if is_compositor(win):
+        raise ValueError("this window exposes no accessibility tree, so it has no elements; use coordinate input (x, y with coordinate_space=window) from a window screenshot")
     observed = observations.get(wid)
     if not observed or observed["observation_id"] != args.get("observation_id"):
         raise ValueError("stale observation_id; observe the window again before acting")
@@ -240,10 +481,17 @@ def mutate(args):
             raise ValueError("AT-SPI rejected text replacement")
     else:
         raise ValueError(f"unsupported operation: {op}")
-    return settle_and_snapshot(win, args["window_id"], op)
+    return settle_and_snapshot(win, args["window_id"], op, {"restored_focus": restore_focus(args, args["window_id"])})
 
 
 def settle_and_snapshot(win, wid, op, extra=None):
+    if is_compositor(win):
+        time.sleep(0.05)
+        result = snapshot({"window_id": wid})
+        result.update({"action": op, "dispatched": True, "tree_settled": None,
+                       "verification": "No accessibility tree: take screenshot scope=window to verify the effect."})
+        result.update(extra or {})
+        return result
     # Bounded settling: two matching trees; not a claim that application work finished.
     deadline = time.monotonic() + 1.5
     previous = None
@@ -268,6 +516,7 @@ def settle_and_snapshot(win, wid, op, extra=None):
 ABS_MAX = 65535
 SCREEN = None  # (width, height) in desktop screenshot pixels; set by screenshot()/screen_size()
 INPUT_DEVICE = None
+RELATIVE_DEVICE = None
 BUTTONS = {"left": "BTN_LEFT", "right": "BTN_RIGHT", "middle": "BTN_MIDDLE"}
 MODIFIERS = {"ctrl": "KEY_LEFTCTRL", "control": "KEY_LEFTCTRL", "alt": "KEY_LEFTALT", "option": "KEY_LEFTALT",
              "opt": "KEY_LEFTALT", "shift": "KEY_LEFTSHIFT", "cmd": "KEY_LEFTMETA", "command": "KEY_LEFTMETA",
@@ -332,6 +581,27 @@ def input_device():
     return INPUT_DEVICE
 
 
+def relative_device():
+    """A separate Borg-owned relative mouse (REL_X/REL_Y): libinput classifies it as an
+    ordinary mouse, so games with pointer lock receive the motion as relative deltas.
+    Kept apart from the absolute pointer so neither device is misclassified."""
+    global RELATIVE_DEVICE
+    if RELATIVE_DEVICE is not None:
+        return RELATIVE_DEVICE
+    missing = [m for m in input_requirements() if "type_text" not in m]
+    if missing:
+        raise ValueError("input injection unavailable: " + "; ".join(missing))
+    from evdev import UInput, ecodes
+    capabilities: dict = {ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE],
+                    ecodes.EV_REL: [ecodes.REL_X, ecodes.REL_Y, ecodes.REL_WHEEL, ecodes.REL_HWHEEL]}
+    try:
+        RELATIVE_DEVICE = UInput(capabilities, name="Borg virtual mouse", vendor=0x1209, product=0xb0b7, version=1)
+    except OSError as error:
+        raise ValueError(f"cannot create the uinput mouse device: {error}")
+    time.sleep(0.5)  # let the compositor's libinput pick the new device up
+    return RELATIVE_DEVICE
+
+
 def emit(kind, code, value):
     from evdev import ecodes
     device = input_device()
@@ -367,8 +637,46 @@ def number(value):
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
 
 
-def ensure_active(win):
-    """Injected events go to the focused window, so refuse unless the target is active."""
+def compositor_focus(entry):
+    backend, native = entry["backend"], entry["native_id"]
+    if backend == "niri":
+        niri_request({"Action": {"FocusWindow": {"id": native}}})
+    elif backend == "sway":
+        run_text(["swaymsg", f"[con_id={native}]", "focus"])
+    elif backend == "hyprland":
+        run_text(["hyprctl", "dispatch", "focuswindow", f"address:{native}"])
+    elif backend == "x11":
+        run_text(["xdotool", "windowactivate", "--sync", str(native)])
+    else:
+        raise ValueError(f"the {backend} window backend cannot focus windows")
+
+
+def focused_entry(backend):
+    return next((c for c in compositor_list(backend) if c["focused"]), None)
+
+
+def ensure_active(win, wid=None):
+    """Injected events go to the focused window: focus the target (through the
+    compositor when it lists the window) and refuse unless it became active.
+    Remembers the human's window from before Borg's first focus change, for restore_focus."""
+    entry = win if is_compositor(win) else (compositor_for(wid) if wid else None)
+    if entry is not None:
+        current = focused_entry(entry["backend"])
+        if current and current["id"] != FOCUS["borg"]:
+            FOCUS["human"] = current  # focus moved since Borg last focused: remember the human's window
+        if not (current and current["id"] == entry["id"]):
+            compositor_focus(entry)
+            FOCUS.update(borg=entry["id"], changed_at=time.monotonic())
+            for _ in range(40):
+                current = focused_entry(entry["backend"])
+                if current and current["id"] == entry["id"]:
+                    break
+                time.sleep(0.025)
+            else:
+                raise ValueError("the compositor did not focus the target window; injected input would reach another window")
+            time.sleep(0.05)  # let the client see keyboard focus before input arrives
+    if is_compositor(win):
+        return
     win.clear_cache()
     if states(win).contains(Atspi.StateType.ACTIVE):
         return
@@ -382,6 +690,19 @@ def ensure_active(win):
         if states(win).contains(Atspi.StateType.ACTIVE):
             return
     raise ValueError("target window is not active and could not be raised; injected input would reach the focused window, so activate it first")
+
+
+def restore_focus(args, wid):
+    """Give focus back to the window the human had before Borg started moving focus."""
+    human = FOCUS["human"]
+    if not args.get("restore_focus") or human is None or human["id"] == wid:
+        return None
+    try:
+        compositor_focus(human)
+        FOCUS.update(human=None, borg=None)
+        return human["id"]
+    except Exception as error:
+        return f"failed: {error}"
 
 
 def move_pointer(x, y):
@@ -401,7 +722,8 @@ def button_code(name):
 
 
 def parse_keys(spec):
-    """'ctrl+shift+t' -> ([modifier codes], key code); one non-modifier key per call."""
+    """'ctrl+shift+t' -> ([modifier codes], key code); one non-modifier key per call.
+    A bare modifier ('shift') is itself the key, so it can be tapped or held."""
     if not isinstance(spec, str) or not spec.strip():
         raise ValueError("keys is required")
     modifiers, key = [], None
@@ -414,7 +736,9 @@ def parse_keys(spec):
         else:
             raise ValueError(f'unsupported key "{part}"; use one non-modifier key per call')
     if key is None:
-        raise ValueError("keys must name one non-modifier key")
+        if not modifiers:
+            raise ValueError("keys must name a key")
+        key = modifiers.pop()
     return modifiers, key
 
 
@@ -431,24 +755,184 @@ def type_text(text):
         raise ValueError(f"{tool} failed: " + run.stderr.decode(errors="replace")[:1024])
 
 
+def coordinate_space(args):
+    space = args.get("coordinate_space", "desktop")
+    if space not in ("desktop", "window"):
+        raise ValueError('coordinate_space must be "desktop" or "window"')
+    return space
+
+
 def pointer_target(args):
-    """The centre of an observed element (validated like click) or an explicit desktop pixel."""
+    """What to point at: an observed element (validated like click) or an x,y in desktop or window space.
+    Resolved to desktop pixels by resolve_point only after the window is focused."""
     wid = args["window_id"]
     if args.get("element_id") is not None:
-        if session_type() == "wayland":
-            raise ValueError("element-targeted pointer ops are unavailable on Wayland: AT-SPI extents are window-relative and the window origin is unknown; use click/set_value or x,y read from a desktop screenshot")
         win, obj = target(args)
         observations.pop(wid, None)
-        extents = obj.get_component_iface().get_extents(Atspi.CoordType.SCREEN)
-        if extents.width <= 0 or extents.height <= 0 or not states(obj).contains(Atspi.StateType.SHOWING):
-            raise ValueError("element has no on-screen bounds")
-        return win, (extents.x + extents.width / 2, extents.y + extents.height / 2), False
+        return win, ("element", obj)
     win = window(wid)
     x, y = number(args.get("x")), number(args.get("y"))
     if x is None or y is None:
         raise ValueError("pointer ops need element_id + observation_id or x + y")
     observations.pop(wid, None)
-    return win, (x, y), True
+    return win, (coordinate_space(args), x, y)
+
+
+def decode_rgb(data):
+    import io
+    import numpy
+    from PIL import Image
+    image = Image.open(io.BytesIO(data))
+    alpha = numpy.asarray(image.getchannel("A")) if image.mode in ("RGBA", "LA") else None
+    return numpy.asarray(image.convert("RGB")), alpha
+
+
+def locate_on_desktop(entry, window_image=None):
+    """Locate the window's pixels on a fresh desktop frame. Returns (match or None,
+    (rgb, alpha) of a new window capture when one was taken)."""
+    import io
+    import numpy
+    from PIL import Image
+    global SCREEN
+    desktop = subprocess.Popen(["grim", "-t", "ppm", "-"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    fresh = None
+    try:
+        if window_image is None:
+            image, _, _ = niri_capture(entry)
+            fresh = (decode_rgb(image), image)
+            window_image = fresh[0]
+    finally:
+        shot, _ = desktop.communicate(timeout=5)
+    desk = Image.open(io.BytesIO(shot))
+    SCREEN = desk.size
+    return locate_window(window_image[0], numpy.asarray(desk.convert("RGB")), window_image[1]), fresh
+
+
+def confirm_origin(wid, entry, mapping):
+    """Right before pressing a button, check the window has not moved since it was located."""
+    located = LOCATED.get(wid)
+    if not mapping or "window_origin" not in mapping or not located or entry is None or entry["backend"] != "niri":
+        return
+    if located.get("geometry"):
+        geometry = refreshed(entry).get("geometry")
+        if not geometry or (geometry["x"], geometry["y"]) != located["origin"]:
+            raise ValueError("the window moved while it was being targeted; nothing was clicked, retry once it settles")
+        return
+    here, _ = locate_on_desktop(entry, located["image"])
+    if not here or (here["x"], here["y"]) != located["origin"]:
+        raise ValueError("the window moved while it was being targeted; nothing was clicked, retry once it settles")
+
+
+def geometry_matches_capture(wid, entry):
+    """Whether window screenshot pixels start at the compositor geometry (no
+    shadows or popups widening the capture), so geometry maps them exactly."""
+    if not entry.get("geometry"):
+        return False
+    captured = WINDOW_CAPTURES.get(wid, {}).get("size")
+    size = entry.get("size") or {}
+    return captured is None or tuple(captured) == (size.get("width"), size.get("height"))
+
+
+def settle_geometry(entry):
+    """After Borg focused a window the workspace may still be sliding into view:
+    wait until two region grabs match (grim only, no side effects), up to 1.5 s."""
+    previous = None
+    while time.monotonic() - FOCUS["changed_at"] < 1.5:
+        entry = refreshed(entry)
+        if not entry.get("geometry"):
+            break
+        frame = grim_region(entry["geometry"], entry.get("scale") or 1.0)
+        if frame == previous and time.monotonic() - FOCUS["changed_at"] >= 0.3:
+            break
+        previous = frame
+        time.sleep(0.08)
+    entry = refreshed(entry)
+    if not entry.get("geometry"):
+        raise ValueError("the window is no longer floating on a visible workspace")
+    return entry
+
+
+def desktop_origin(wid, entry, purpose="window"):
+    """Desktop pixel of the top-left corner of this window's screenshot image.
+
+    Compositors with absolute geometry (sway, Hyprland, X11, niri floating)
+    answer directly. niri does not expose the scroll position of tiled
+    windows, so the helper captures the window and the desktop together and
+    finds the window's pixels on the desktop; ambiguous or unmatched content
+    is refused rather than guessed.
+    """
+    entry = refreshed(entry)
+    if entry["backend"] != "niri":
+        if entry.get("geometry") and entry.get("visible") is not False:
+            return (entry["geometry"]["x"], entry["geometry"]["y"]), {"method": "compositor geometry"}
+        raise ValueError("the compositor reports no on-screen geometry for this window")
+    if (entry.get("geometry") and purpose == "element") or geometry_matches_capture(wid, entry):
+        # Floating window: niri IPC gives exact placement. Wait out a workspace
+        # switch without extra captures, then use it.
+        entry = settle_geometry(entry)
+        origin = (entry["geometry"]["x"], entry["geometry"]["y"])
+        LOCATED[wid] = {"origin": origin, "geometry": True}
+        return origin, {"method": "niri floating-window geometry (IPC)"}
+    try:
+        import numpy  # noqa: F401
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        if entry.get("geometry"):
+            return (entry["geometry"]["x"], entry["geometry"]["y"]), {"method": "niri floating geometry"}
+        raise ValueError("locating a tiled niri window needs python-numpy and python-pillow")
+    if entry.get("visible") is False:
+        raise ValueError("window is not on a visible workspace")
+    window_image, image, seen, since, frames = None, None, None, 0.0, 0
+    for attempt in range(14):
+        refresh = window_image is None or attempt % 5 == 4  # refresh the window pixels now and then
+        here, image_now = locate_on_desktop(entry, None if refresh else window_image)
+        if image_now is not None:
+            window_image, image = image_now
+        # A focus change starts workspace/column animations: only trust a
+        # position that holds over several frames spanning 300 ms.
+        position = (here["x"], here["y"]) if here else None
+        if here is None or position != seen:
+            seen, since, frames = position, time.monotonic(), 1
+        else:
+            frames += 1
+            if frames >= 3 and time.monotonic() - since >= 0.3:
+                origin = (here["x"], here["y"])
+                LOCATED[wid] = {"image": window_image, "origin": origin}
+                here.update({"method": "matched the window capture on the desktop (stable for 300 ms)", "attempts": attempt + 1})
+                return origin, here
+        time.sleep(0.1)
+    if entry.get("geometry") and image is not None and (entry.get("size") or {}).get("width") == png_size(image)[0]:
+        return (entry["geometry"]["x"], entry["geometry"]["y"]), {"method": "niri floating geometry"}
+    raise ValueError("could not locate the window on the desktop (it may be covered, off-screen or showing no distinctive content); use desktop coordinates from a desktop screenshot instead")
+
+
+def resolve_point(win, wid, spec):
+    """Desktop pixel for a pointer target, plus how it was mapped."""
+    if spec[0] == "desktop":
+        return (spec[1], spec[2]), {"coordinate_space": "desktop"}
+    if spec[0] == "window":
+        entry = win if is_compositor(win) else compositor_for(wid)
+        if entry is None:
+            raise ValueError("coordinate_space=window needs a compositor window backend that lists this window")
+        origin, how = desktop_origin(wid, entry)
+        scale = WINDOW_CAPTURES.get(wid, {}).get("scale", 1.0)
+        return window_point(spec[1], spec[2], origin, scale), {"coordinate_space": "window", "window_origin": list(origin),
+                                                             "image_scale": scale, "mapping": how}
+    obj = spec[1]
+    obj.clear_cache()
+    extents = obj.get_component_iface().get_extents(extents_type())
+    if extents.width <= 0 or extents.height <= 0 or not states(obj).contains(Atspi.StateType.SHOWING):
+        raise ValueError("element has no on-screen bounds")
+    element = {"x": extents.x, "y": extents.y, "width": extents.width, "height": extents.height}
+    if session_type() != "wayland":
+        return (element["x"] + element["width"] / 2, element["y"] + element["height"] / 2), {"coordinate_space": "element"}
+    entry = compositor_for(wid)
+    if entry is None:
+        raise ValueError("element-targeted pointer ops on Wayland need the compositor to list this window (AT-SPI extents are window-relative); use click/set_value or coordinate input")
+    frame = win.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+    origin, how = desktop_origin(wid, entry, "element")
+    point = element_point(element, {"x": frame.x, "y": frame.y}, origin, entry.get("scale") or 1.0)
+    return point, {"coordinate_space": "element", "window_origin": list(origin), "mapping": how}
 
 
 def click_button(code, count):
@@ -462,6 +946,25 @@ def click_button(code, count):
 def notches(pixels):
     """Wheel notches for a pixel distance: at least one for any non-zero request (~120 px per notch)."""
     return 0 if pixels == 0 else int(math.copysign(max(1, round(abs(pixels) / 120)), pixels))
+
+
+def bounded_int(args, name, default, low, high):
+    value = args.get(name, default)
+    if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+        raise ValueError(f"{name} must be an integer between {low} and {high}")
+    return value
+
+
+def press(modifiers, key):
+    for code in modifiers:
+        emit("EV_KEY", code, 1)
+    emit("EV_KEY", key, 1)
+
+
+def release(modifiers, key):
+    emit("EV_KEY", key, 0)
+    for code in reversed(modifiers):
+        emit("EV_KEY", code, 0)
 
 
 def inject(args):
@@ -478,42 +981,107 @@ def inject(args):
         win = window(wid)
         input_device()  # surface missing prerequisites before touching focus
         observations.pop(wid, None)
-        ensure_active(win)
+        ensure_active(win, wid)
         type_text(text)
-        return settle_and_snapshot(win, wid, op)
+        return settle_and_snapshot(win, wid, op, {"restored_focus": restore_focus(args, wid)})
     if op == "key":
         modifiers, key = parse_keys(args.get("keys"))
+        hold = bounded_int(args, "hold_ms", 0, 0, 10000)
         win = window(wid)
         input_device()
         observations.pop(wid, None)
-        ensure_active(win)
-        for code in modifiers:
-            emit("EV_KEY", code, 1)
-        emit("EV_KEY", key, 1)
-        time.sleep(0.02)
-        emit("EV_KEY", key, 0)
-        for code in reversed(modifiers):
-            emit("EV_KEY", code, 0)
-        return settle_and_snapshot(win, wid, op, {"keys": args["keys"]})
+        ensure_active(win, wid)
+        press(modifiers, key)
+        try:
+            time.sleep(max(0.02, hold / 1000))
+        finally:
+            release(modifiers, key)
+        return settle_and_snapshot(win, wid, op, {"keys": args["keys"], "held_ms": max(20, hold),
+                                                  "restored_focus": restore_focus(args, wid)})
+    if op == "pointer_move":
+        dx, dy = number(args.get("dx", 0)), number(args.get("dy", 0))
+        if dx is None or dy is None or abs(dx) > 20000 or abs(dy) > 20000:
+            raise ValueError("pointer_move needs dx, dy of at most 20000 counts")
+        steps = bounded_int(args, "steps", max(1, min(200, math.ceil(max(abs(dx), abs(dy)) / 10))), 1, 1000)
+        duration = bounded_int(args, "duration_ms", min(2000, steps * 8), 0, 10000)
+        held = parse_keys(args["hold_keys"]) if args.get("hold_keys") is not None else None
+        win = window(wid)
+        device = relative_device()
+        input_device()
+        place = None
+        if args.get("x") is not None or args.get("y") is not None:
+            x, y = number(args.get("x")), number(args.get("y"))
+            if x is None or y is None:
+                raise ValueError("pointer_move start point needs both x and y")
+            place = (coordinate_space(args), x, y)
+        observations.pop(wid, None)
+        ensure_active(win, wid)
+        placement = None
+        if place is None and POINTER["window"] != wid:
+            # Wayland sends motion (and grants pointer lock) only to the surface
+            # under the pointer, so enter the window once before moving relatively.
+            try:
+                size = (compositor_for(wid) or {}).get("size") or {}
+                capture_scale = WINDOW_CAPTURES.get(wid, {}).get("scale", 1.0)
+                place = ("window", size["width"] * capture_scale / 2, size["height"] * capture_scale / 2)
+            except (KeyError, TypeError):
+                placement = "pointer position unknown: pass x, y to place it inside the window first"
+        if place is not None:
+            try:
+                (px, py), mapping = resolve_point(win, wid, place)
+                move_pointer(px, py)
+                POINTER["window"] = wid
+                placement = {"point": {"x": px, "y": py}, "mapping": mapping}
+            except ValueError as error:
+                if args.get("x") is not None:
+                    raise
+                placement = f"pointer not placed ({error}); motion reaches whichever surface is under the pointer"
+        if held:
+            press(*held)
+        try:
+            from evdev import ecodes
+            pause = duration / 1000 / steps
+            for ex, ey in split_motion(dx, dy, steps):
+                if ex:
+                    device.write(ecodes.EV_REL, ecodes.REL_X, ex)
+                if ey:
+                    device.write(ecodes.EV_REL, ecodes.REL_Y, ey)
+                device.syn()
+                time.sleep(pause)
+        finally:
+            if held:
+                release(*held)
+        return settle_and_snapshot(win, wid, op, {
+            "sent": {"dx": round(dx), "dy": round(dy)}, "steps": steps, "duration_ms": duration,
+            "hold_keys": args.get("hold_keys"), "placement": placement,
+            "units": "raw relative mouse counts; apps using relative-pointer (games) get them unaccelerated, the visible cursor follows compositor pointer acceleration",
+            "restored_focus": restore_focus(args, wid)})
     if op == "pointer_click":
         code = button_code(args.get("button"))
         count = args.get("count", 1)
         if count not in (1, 2) or isinstance(count, bool):
             raise ValueError("count must be 1 or 2")
-        win, (x, y), coordinate = pointer_target(args)
+        win, spec = pointer_target(args)
         input_device()
-        ensure_active(win)
+        ensure_active(win, wid)
+        (x, y), mapping = resolve_point(win, wid, spec)
         move_pointer(x, y)
+        POINTER["window"] = wid
+        confirm_origin(wid, compositor_for(wid), mapping)
         click_button(code, count)
-        return settle_and_snapshot(win, wid, op, {"coordinate_click": coordinate, "point": {"x": x, "y": y}})
+        return settle_and_snapshot(win, wid, op, {"coordinate_click": spec[0] != "element", "point": {"x": x, "y": y},
+                                                  "mapping": mapping, "restored_focus": restore_focus(args, wid)})
     if op == "scroll":
         dx, dy = number(args.get("dx", 0)), number(args.get("dy", 0))
         if dx is None or dy is None or abs(dx) > 10000 or abs(dy) > 10000:
             raise ValueError("scroll distance is limited to 10000 pixels")
-        win, (x, y), coordinate = pointer_target(args)
+        win, spec = pointer_target(args)
         input_device()
-        ensure_active(win)
+        ensure_active(win, wid)
+        (x, y), mapping = resolve_point(win, wid, spec)
         move_pointer(x, y)
+        POINTER["window"] = wid
+        confirm_origin(wid, compositor_for(wid), mapping)
         # Positive dy scrolls content down; REL_WHEEL is positive for scrolling up.
         # Positive dx scrolls content right; REL_HWHEEL is positive for scrolling right.
         vertical, horizontal = -notches(dy), notches(dx)
@@ -523,24 +1091,34 @@ def inject(args):
         for _ in range(abs(horizontal)):
             emit("EV_REL", "REL_HWHEEL", int(math.copysign(1, horizontal)))
             time.sleep(0.01)
-        return settle_and_snapshot(win, wid, op, {"coordinate_click": coordinate, "point": {"x": x, "y": y},
-                                                  "units": "wheel notches of about 120 pixels",
-                                                  "notches": {"dx": horizontal, "dy": -vertical}})
+        return settle_and_snapshot(win, wid, op, {"coordinate_click": spec[0] != "element", "point": {"x": x, "y": y},
+                                                  "mapping": mapping, "units": "wheel notches of about 120 pixels",
+                                                  "notches": {"dx": horizontal, "dy": -vertical},
+                                                  "restored_focus": restore_focus(args, wid)})
     if op == "drag":
         points = [number(args.get(k)) for k in ("from_x", "from_y", "to_x", "to_y")]
         if any(p is None for p in points):
             raise ValueError("drag needs from_x, from_y, to_x, to_y")
-        fx, fy, tx, ty = points
+        space = coordinate_space(args)
         code = button_code(args.get("button"))
         win = window(wid)
+        input_device()
+        observations.pop(wid, None)
+        ensure_active(win, wid)
+        sx, sy, ex, ey = (p or 0.0 for p in points)  # validated as numbers above
+        (fx, fy), mapping = resolve_point(win, wid, (space, sx, sy))
+        if space == "desktop":
+            tx, ty = ex, ey
+        else:  # same window origin and screenshot scale as the start point
+            scale = float(mapping["image_scale"])
+            tx, ty = fx + (ex - sx) / scale, fy + (ey - sy) / scale
         width, height = screen_size()
         for x, y in ((fx, fy), (tx, ty)):
             if not (0 <= x < width and 0 <= y < height):
                 raise ValueError(f"point ({x:g}, {y:g}) is outside the {width}x{height} desktop")
-        input_device()
-        observations.pop(wid, None)
-        ensure_active(win)
         move_pointer(fx, fy)
+        POINTER["window"] = wid
+        confirm_origin(wid, compositor_for(wid), mapping)
         emit("EV_KEY", code, 1)
         steps = 12
         for step in range(1, steps + 1):
@@ -548,7 +1126,8 @@ def inject(args):
             move_pointer(fx + (tx - fx) * t, fy + (ty - fy) * t)
             time.sleep(0.02)
         emit("EV_KEY", code, 0)
-        return settle_and_snapshot(win, wid, op, {"from": {"x": fx, "y": fy}, "to": {"x": tx, "y": ty}})
+        return settle_and_snapshot(win, wid, op, {"from": {"x": fx, "y": fy}, "to": {"x": tx, "y": ty}, "mapping": mapping,
+                                                  "restored_focus": restore_focus(args, wid)})
     raise ValueError(f"unsupported operation: {op}")
 
 
@@ -1184,6 +1763,36 @@ def private_capabilities():
     return status
 
 
+def module_available(name):
+    import importlib.util
+    return importlib.util.find_spec(name) is not None
+
+
+def window_capabilities():
+    """Window backend, whether window capture works, and honest limitations."""
+    backend = compositor_backend()
+    limitations = []
+    capture = False
+    if backend == "niri":
+        capture = True
+        limitations.append("niri: scope=window uses niri's own window screenshot, which renders only that window's surfaces even when it is on another workspace or scrolled off-screen, without changing focus. niri also copies each capture to the clipboard and shows a transient 'Screenshot captured' notification; Borg restores the previous clipboard contents in one format" + ("" if shutil.which("wl-copy") else " once wl-clipboard is installed (it is missing)") + ".")
+        locate = module_available("numpy") and module_available("PIL")
+        limitations.append("niri: coordinate_space=window and element-targeted pointer ops use niri's IPC geometry for floating windows (no capture). niri exposes no position for tiled windows, so for those the helper falls back to locating the window by matching a fresh window capture on the desktop (another capture + notification per op), requires the position to hold for 300 ms, re-checks it right before pressing, and refuses covered, off-screen, featureless or duplicate-looking windows." if locate else
+                           "niri: tiled-window localisation needs python-numpy and python-pillow (missing), so coordinate_space=window works only for floating windows.")
+    elif backend in ("sway", "hyprland"):
+        capture = bool(shutil.which("grim"))
+        limitations.append(f"{backend}: scope=window crops the composited desktop to the compositor's window geometry (grim -g; grim -T when the compositor exposes an ext-foreign-toplevel identifier); overlapping windows appear in the crop and hidden windows are briefly brought into view, then prior focus is restored.")
+    elif backend == "x11":
+        capture = bool(shutil.which("import"))
+        limitations.append("X11: windows come from EWMH _NET_CLIENT_LIST; scope=window uses ImageMagick import -window" + ("" if capture else " (not installed: install imagemagick)") + ", where overlapping windows can show through without a compositor.")
+    elif backend == "foreign-toplevel":
+        capture = bool(shutil.which("grim"))
+        limitations.append("wlr/ext foreign-toplevel via lswt: windows are listed without geometry or pid; scope=window needs grim -T support in the compositor.")
+    else:
+        limitations.append("No compositor window backend detected (niri, sway, Hyprland, lswt or X11 EWMH): list_windows shows only AT-SPI windows and scope=window is unavailable.")
+    return backend, capture, limitations
+
+
 def dispatch(args):
     op = args["op"]
     display = args.get("display", "desktop")
@@ -1205,15 +1814,18 @@ def dispatch(args):
         return private_inject(args)
     if op == "capabilities":
         missing = input_requirements()
+        backend, window_capture, limitations = window_capabilities()
         operations = ["capabilities", "list_windows", "observe", "screenshot", "click", "set_value"]
-        limitations = ["Desktop screenshots require explicit scope=desktop and grim on a supported Wayland compositor; no isolated window capture."]
+        if not (shutil.which("grim") and os.environ.get("WAYLAND_DISPLAY")):
+            limitations.append("Desktop screenshots need grim on a Wayland compositor with wlr-screencopy.")
         if missing:
             limitations.append("Input injection unavailable: " + "; ".join(missing) + ".")
         else:
-            operations += ["type_text", "key", "pointer_click", "scroll", "drag"]
-            limitations.append("Input injection requires the target window to be active (it is raised when the compositor allows); events reach the focused window.")
+            operations += ["type_text", "key", "pointer_click", "scroll", "drag", "pointer_move"]
+            limitations.append("Input injection focuses the target window through the compositor when it lists the window (pass restore_focus=true to hand focus back afterwards) and refuses if it did not become focused; events reach the focused window.")
+            limitations.append("pointer_move emits raw relative motion (REL_X/REL_Y) from a separate Borg virtual mouse; games with pointer lock receive unaccelerated deltas, the visible cursor follows compositor acceleration. key hold_ms (up to 10 s) and pointer_move hold_keys hold keys for games.")
             if session_type() == "wayland":
-                limitations.append("On Wayland, element-targeted pointer_click/scroll are refused because AT-SPI extents are window-relative; use x,y from a desktop screenshot.")
+                limitations.append("On Wayland, element-targeted pointer_click/scroll map window-relative AT-SPI extents through the compositor's window position; they are refused when the compositor does not list the window.")
         private = private_capabilities()
         if private["available"]:
             operations += ["start_display", "stop_display", "attach_display", "launch"]
@@ -1222,19 +1834,24 @@ def dispatch(args):
                                "its input and capture never touch the user's desktop. Desktop input goes to the user's focused window.")
         return {"platform": "linux", "backend": "AT-SPI2", "desktop_available": Atspi.get_desktop_count() > 0,
                 "session_type": session_type(), "operations": operations,
-                "capture_scopes": ["desktop"] if shutil.which("grim") and os.environ.get("WAYLAND_DISPLAY") else [],
+                "window_backend": backend,
+                "capture_scopes": (["desktop"] if shutil.which("grim") and os.environ.get("WAYLAND_DISPLAY") else []) + (["window"] if window_capture else []),
                 "input_backend": None if missing else f"evdev uinput + {typing_tool()}",
-                "input_coordinate_space": "desktop screenshot pixels (top-left origin)",
+                "input_coordinate_space": "desktop screenshot pixels (top-left origin); coordinate_space=window uses window screenshot pixels",
                 "limitations": limitations, "private_display": private}
     if op == "list_windows":
-        return {"windows": windows()}
+        listed = windows()
+        result = {"windows": listed, "window_backend": compositor_backend()}
+        if COMPOSITOR_STATE["error"]:
+            result["window_backend_error"] = COMPOSITOR_STATE["error"]
+        return result
     if op == "screenshot":
-        return screenshot(args.get("scope"))
+        return screenshot(args.get("scope"), args.get("window_id"))
     if op == "observe":
         return snapshot(args)
     if op in ("click", "set_value"):
         return mutate(args)
-    if op in ("type_text", "key", "pointer_click", "scroll", "drag"):
+    if op in ("type_text", "key", "pointer_click", "scroll", "drag", "pointer_move"):
         return inject(args)
     raise ValueError(f"unsupported operation: {op}")
 
