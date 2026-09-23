@@ -383,6 +383,14 @@ impl ServiceManager {
             status.reason = "supervisor not running".into();
             status.backend_pid = None;
         }
+        let lane = LaneStore::new(
+            self.root
+                .parent()
+                .context("service root has no lane parent")?,
+        )?;
+        if let Some(waiting) = lane.service_preemption_notice(id)? {
+            status.reason = format!("{}; {waiting}", status.reason);
+        }
         Ok(status)
     }
     pub async fn send(
@@ -1067,8 +1075,11 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                 stopping = true;
                 break;
             }
-            status.clients.retain(|l| l.id != lease.id);
-            publish(&dir, &status)?;
+            gate.store
+                .service_client_change(&spec.id, &gate.request.resources, false, || {
+                    status.clients.retain(|l| l.id != lease.id);
+                    publish(&dir, &status)
+                })?;
         }
         status
             .yields
@@ -1490,7 +1501,15 @@ async fn handle_request(
                 for lease in status.clients.clone() {
                     restore_client(spec, &lease, active.as_ref().and_then(|b| b.port)).await?;
                 }
-                status.clients.clear();
+                gate.store.service_client_change(
+                    &spec.id,
+                    &gate.request.resources,
+                    false,
+                    || {
+                        status.clients.clear();
+                        publish(dir, status)
+                    },
+                )?;
             }
             *pending = Some((now, reason.clone()));
             transition(
@@ -1517,8 +1536,15 @@ async fn handle_request(
             // Failure keeps the service lease/backend intact and blocks the job.
             for lease in status.clients.clone() {
                 restore_client(spec, &lease, active.as_ref().and_then(|b| b.port)).await?;
-                status.clients.retain(|l| l.id != lease.id);
-                publish(dir, status)?;
+                gate.store.service_client_change(
+                    &spec.id,
+                    &gate.request.resources,
+                    false,
+                    || {
+                        status.clients.retain(|l| l.id != lease.id);
+                        publish(dir, status)
+                    },
+                )?;
             }
             // The caller supplies a lane job ID; no other owner can resume this yield.
             let expires = now.saturating_add(ttl_ms);
@@ -1587,48 +1613,54 @@ async fn handle_request(
                 ttl_ms > 0 && ttl_ms <= 86_400_000,
                 "lease ttl must be within 1..86400000 ms"
             );
-            ensure!(
-                matches!(
-                    status.state,
-                    ServiceState::Healthy { .. } | ServiceState::RestartPending
-                ),
-                "service not ready for client leases"
-            );
-            ensure!(
-                status.yields.is_empty(),
-                "service yielded for exclusive work"
-            );
-            ensure!(
-                status
-                    .clients
-                    .iter()
-                    .all(|lease| lease.owner.participant_id == owner.participant_id
-                        && lease.owner.session_id == owner.session_id),
-                "service lease held by another owner"
-            );
-            if let Some(existing) = status.clients.iter_mut().find(|lease| {
-                lease.owner.participant_id == owner.participant_id
-                    && lease.owner.session_id == owner.session_id
-            }) {
-                existing.expires_at_unix_ms = now.saturating_add(ttl_ms);
-                existing.purpose = purpose;
-            } else {
-                status.clients.push(ClientLease {
-                    id: Uuid::new_v4(),
-                    service_id: spec.id.clone(),
-                    owner,
-                    expires_at_unix_ms: now.saturating_add(ttl_ms),
-                    purpose,
-                });
-            }
-            *last_activity = now;
             if *idle {
                 if let Some(h) = &spec.active {
                     hook(h, spec, active.as_ref().and_then(|b| b.port), None).await?;
                 }
                 *idle = false;
             }
-            publish(dir, status)?;
+            // The lane job's Preparing decision and all client intake share
+            // state.lock. Publishing the client file inside this transaction
+            // makes the job's under-lock read an atomic authority check.
+            gate.store
+                .service_client_change(&spec.id, &gate.request.resources, true, || {
+                    ensure!(
+                        matches!(
+                            status.state,
+                            ServiceState::Healthy { .. } | ServiceState::RestartPending
+                        ),
+                        "service not ready for client leases"
+                    );
+                    ensure!(
+                        status.yields.is_empty(),
+                        "service yielded for exclusive work"
+                    );
+                    ensure!(
+                        status
+                            .clients
+                            .iter()
+                            .all(|lease| lease.owner.participant_id == owner.participant_id
+                                && lease.owner.session_id == owner.session_id),
+                        "service lease held by another owner"
+                    );
+                    if let Some(existing) = status.clients.iter_mut().find(|lease| {
+                        lease.owner.participant_id == owner.participant_id
+                            && lease.owner.session_id == owner.session_id
+                    }) {
+                        existing.expires_at_unix_ms = now.saturating_add(ttl_ms);
+                        existing.purpose = purpose;
+                    } else {
+                        status.clients.push(ClientLease {
+                            id: Uuid::new_v4(),
+                            service_id: spec.id.clone(),
+                            owner,
+                            expires_at_unix_ms: now.saturating_add(ttl_ms),
+                            purpose,
+                        });
+                    }
+                    publish(dir, status)
+                })?;
+            *last_activity = now;
         }
         ServiceRequest::Release { lease_id, owner } => {
             let lease = status
@@ -1642,8 +1674,11 @@ async fn handle_request(
                 .context("client lease not owned by caller")?
                 .clone();
             restore_client(spec, &lease, active.as_ref().and_then(|b| b.port)).await?;
-            status.clients.retain(|l| l.id != lease_id);
-            publish(dir, status)?;
+            gate.store
+                .service_client_change(&spec.id, &gate.request.resources, false, || {
+                    status.clients.retain(|l| l.id != lease_id);
+                    publish(dir, status)
+                })?;
         }
         ServiceRequest::Touch => {
             *last_activity = now;
