@@ -1017,8 +1017,11 @@ impl LaneStore {
         }
         let record = self.record(id)?;
         ensure!(
-            matches!(record.state, TicketState::Finished),
-            "cannot resume service before job finishes"
+            matches!(
+                record.state,
+                TicketState::Finished | TicketState::Cancelled { .. }
+            ),
+            "cannot resume service before job ends"
         );
         ensure!(
             !record.quarantined,
@@ -1192,8 +1195,14 @@ pub struct ResumeOutcome {
     pub error: Option<String>,
 }
 
+/// A job that ended either way (Finished or Cancelled) returns the services
+/// that yielded to it.
 fn resume_is_pending(row: &LaneRecord) -> bool {
-    matches!(row.state, TicketState::Finished) && !row.resume_pending.is_empty() && !row.quarantined
+    matches!(
+        row.state,
+        TicketState::Finished | TicketState::Cancelled { .. }
+    ) && !row.resume_pending.is_empty()
+        && !row.quarantined
 }
 
 fn capacity(capacities: &[Capacity], key: &ResourceKey) -> u32 {
@@ -2821,6 +2830,40 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// Failure mode: services that yielded to a job stay stopped when the
+    /// job ends Cancelled (a running cancel, or a queue timeout waiting for
+    /// a foreign client) because only Finished jobs resumed them.
+    #[test]
+    fn services_yielded_to_a_cancelled_job_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let spec = coalescing_spec(dir.path(), None);
+        let id = store
+            .locked(|state| {
+                let (ticket, _) =
+                    store.enqueue_record(state, spec.lease.clone(), Some(spec.clone()))?;
+                let row = state
+                    .records
+                    .iter_mut()
+                    .find(|r| r.ticket.id == ticket.id)
+                    .unwrap();
+                row.yield_services.push("test".into());
+                grant_entry(row);
+                Ok(ticket.id)
+            })
+            .unwrap();
+        store.cancel_ticket(id, "stop").unwrap();
+        store
+            .conclude(id, JobEnd::Cancelled("stop".into()), "cancelled: stop")
+            .unwrap();
+        assert_eq!(store.record(id).unwrap().resume_pending, ["test"]);
+        fs::write(dir.path().join("fake-resume-ok"), b"ok").unwrap();
+        let (_, outcomes) = store.recover_wait(Duration::from_secs(10)).unwrap();
+        assert_eq!(outcomes.len(), 1, "cancelled job's resume was not started");
+        assert_eq!(outcomes[0].outcome, "resumed");
+        assert!(store.record(id).unwrap().resume_pending.is_empty());
     }
 
     #[test]
