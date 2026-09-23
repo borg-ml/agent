@@ -1067,8 +1067,8 @@ class ComputerUse:
     def type_text(self, window_id, text):
         return self("type_text", window_id=window_id, text=text)
 
-    def key(self, window_id, keys):
-        return self("key", window_id=window_id, keys=keys)
+    def key(self, window_id, keys, **options):
+        return self("key", window_id=window_id, keys=keys, **options)
 
     def pointer_click(self, window_id, **options):
         return self("pointer_click", window_id=window_id, **options)
@@ -1361,7 +1361,7 @@ cua.observe = (window_id, options = {}) => cua("observe", {...options, window_id
 cua.click = (window_id, element_id, observation_id, options = {}) => cua("click", {...options, window_id, element_id, observation_id});
 cua.set_value = (window_id, element_id, observation_id, text, options = {}) => cua("set_value", {...options, window_id, element_id, observation_id, text});
 cua.type_text = (window_id, text) => cua("type_text", {window_id, text});
-cua.key = (window_id, keys) => cua("key", {window_id, keys});
+cua.key = (window_id, keys, options = {}) => cua("key", {...options, window_id, keys});
 cua.pointer_click = (window_id, options = {}) => cua("pointer_click", {...options, window_id});
 cua.scroll = (window_id, dx = 0, dy = 0, options = {}) => cua("scroll", {...options, window_id, dx, dy});
 cua.drag = (window_id, from_x, from_y, to_x, to_y, options = {}) => cua("drag", {...options, window_id, from_x, from_y, to_x, to_y});

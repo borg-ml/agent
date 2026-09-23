@@ -54,6 +54,8 @@ Linux (AT-SPI2) and macOS (AXUIElement) are verified previews; the Windows (UI A
 experimental. capabilities reports the backend, permissions and capture scopes. All provide accessibility observations with \
 diffs, semantic click/set_value, explicitly scoped screenshots, and type_text/key/pointer_click/scroll/drag \
 input injection (Linux evdev+wtype, macOS CGEvent, Windows SendInput); capabilities lists what the host permits. \
+On Linux, list_windows also shows compositor windows without an accessibility tree (games, Unreal), \
+screenshot scope=window captures one window, and pointer_move/key hold_ms drive games. \
 On Linux, test apps and games on the private display: `launch` runs them on a session-owned headless GPU \
 display whose pd: windows take every op without touching the user's seat, pointer or focus. \
 Acting on a consequential control (send, \

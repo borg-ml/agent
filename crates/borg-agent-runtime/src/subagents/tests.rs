@@ -4635,6 +4635,19 @@ async fn computer_use_live_desktop_clients() {
         );
         assert!(result["value"].get("borg_attachments").is_none());
     }
+    // The concatenated helper (compositor prologue + AT-SPI worker) boots and
+    // lists windows through the dispatcher and both code-mode clients.
+    for (runtime, code) in [
+        ("python", "cua.list_windows()"),
+        ("javascript", "await cua.list_windows()"),
+    ] {
+        let result = dispatcher
+            .call("runtime_exec", json!({"runtime": runtime, "code": code}))
+            .await
+            .unwrap();
+        assert!(result["value"]["windows"].is_array());
+        assert!(result["value"].get("window_backend").is_some());
+    }
     dispatcher
         .persistent_runtimes
         .stop_session(session_id)
