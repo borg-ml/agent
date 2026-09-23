@@ -471,6 +471,54 @@ fn wait_until_started_and_timeout_leave_the_job_alone() {
     assert!(done.as_object().unwrap().contains_key("wait_reason"));
 }
 
+/// Failure mode: a build queued behind its own busy tree holding another
+/// tree's build off a free host build slot until the first build ends.
+#[test]
+fn a_build_waiting_for_its_tree_does_not_hold_back_another_tree() {
+    let lane = Lane::new();
+    let out = lane.cli(
+        &[
+            "resource",
+            "set-capacity",
+            "--name",
+            "slots",
+            "--slots",
+            "2",
+        ],
+        None,
+    );
+    assert!(out.status.success(), "{}", describe(&out));
+    let build = |name: &str, tree: &str, script: &str| {
+        let dir = lane.root.join(tree);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tree = ResourceScope::Worktree(dir.canonicalize().unwrap());
+        let mut spec = lane.spec_in(name, script, tree);
+        spec.timeout_ms = 60_000;
+        spec.lease.resources.push(ResourceRequest {
+            key: ResourceKey {
+                scope: ResourceScope::Host,
+                name: "slots".into(),
+            },
+            access: Access::Shared { slots: 1 },
+        });
+        spec
+    };
+    let first = lane.submit(&build("t1", "t", "exec sleep 30"));
+    let started = lane.cli(&["job", "wait", &first, "--until", "started"], None);
+    assert!(started.status.success(), "{}", describe(&started));
+    let behind = lane.submit(&build("t2", "t", "true"));
+    let other = lane.submit(&build("u1", "u", "true"));
+    let out = lane.cli(&["job", "wait", &other, "--timeout", "10"], None);
+    assert!(out.status.success(), "{}", describe(&out));
+    let queued = lane.record(&behind).unwrap();
+    assert!(
+        matches!(queued.job.unwrap().state, JobState::Queued),
+        "t2 must still wait for its tree"
+    );
+    lane.json::<Value>(&["job", "cancel", &first]);
+    lane.wait(&behind, 0);
+}
+
 /// A hook that appends its phase and the job's ending to `<root>/<name>.<phase>`.
 fn reporting_hook(lane: &Lane, name: &str, phase: &str) -> Hook {
     let out = lane.root.join(format!("{name}.{phase}"));
