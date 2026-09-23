@@ -410,6 +410,59 @@ pub fn is_diff_language(language: &str) -> bool {
     language == "diff" || language.starts_with("diff:")
 }
 
+/// The edit a command or process follow-up actually made, as recorded in its
+/// result envelope. The command itself keeps its own output and action row.
+pub fn command_edit_presentation(name: &str, output: &str) -> Option<ToolPresentation> {
+    if !is_command_tool(name) && !matches!(tool_leaf_name(name).as_str(), "write_stdin" | "wait") {
+        return None;
+    }
+    let changes = introduced_changes(output)?;
+    let body = edit_result_presentation("edit", output)
+        .map(|edit| edit.body)
+        .or_else(|| {
+            serde_json::from_str::<Value>(output)
+                .ok()?
+                .get("changes_deferred")?
+                .as_bool()
+                .filter(|deferred| *deferred)?;
+            Some(ToolPresentationBody {
+                language: "text".to_string(),
+                text: "Diff available; open this action to load it".to_string(),
+            })
+        })?;
+    let detail = serde_json::from_str::<Value>(output)
+        .ok()
+        .filter(|value| value.get("changes_deferred").and_then(Value::as_bool) == Some(true))
+        .and_then(|value| {
+            let count = value.get("changes_count")?.as_u64()? as usize;
+            let first = display_edit_path(&changes.first()?.path);
+            let files = if count > 1 {
+                format!("{first} + {} more", count - 1)
+            } else {
+                first
+            };
+            let added = value.get("changes_added")?.as_u64()?;
+            let removed = value.get("changes_removed")?.as_u64()?;
+            Some(match (added, removed) {
+                (added, 0) => format!("{files} +{added}"),
+                (0, removed) => format!("{files} -{removed}"),
+                (added, removed) => format!("{files} +{added} -{removed}"),
+            })
+        })
+        .unwrap_or_else(|| introduced_change_summary(&changes));
+    Some(ToolPresentation {
+        label: "Edit".to_string(),
+        detail,
+        category: ToolPresentationCategory::Edit,
+        input: Some(body),
+        output: None,
+        result: None,
+        body_rows: Vec::new(),
+        backgrounded: false,
+        hidden: false,
+    })
+}
+
 pub fn canonical_action_descriptor(name: &str, input: &Value) -> String {
     if let Some(action) = input.get("action").and_then(Value::as_str) {
         let action = action.trim();

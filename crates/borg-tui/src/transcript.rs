@@ -124,6 +124,7 @@ struct Transcript {
     child_transcript: bool,
     director_prompt: DirectorPrompt,
     tools: HashMap<String, usize>,
+    command_edit_rows: HashMap<String, usize>,
     foreground_tool: Option<String>,
     preparing_tools: HashMap<String, String>,
     unkeyed_preparing_tools: Vec<String>,
@@ -249,6 +250,7 @@ impl Default for Transcript {
             child_transcript: false,
             director_prompt: DirectorPrompt::Unknown,
             tools: HashMap::new(),
+            command_edit_rows: HashMap::new(),
             foreground_tool: None,
             preparing_tools: HashMap::new(),
             unkeyed_preparing_tools: Vec::new(),
@@ -458,6 +460,18 @@ enum TranscriptActionKind {
     Approval,
     ProviderInteraction,
     Error,
+}
+
+fn command_output_without_changes(output: &str) -> String {
+    let Ok(serde_json::Value::Object(mut result)) = serde_json::from_str(output) else {
+        return output.to_string();
+    };
+    result.remove("changes");
+    result.remove("changes_deferred");
+    result.remove("changes_count");
+    result.remove("changes_added");
+    result.remove("changes_removed");
+    serde_json::Value::Object(result).to_string()
 }
 
 /// Whether the director's opening assignment can still be identified among
@@ -699,6 +713,7 @@ impl Transcript {
         self.order.clear();
         self.messages.clear();
         self.tools.clear();
+        self.command_edit_rows.clear();
         self.subagent_entries.clear();
         self.agent_messages.clear();
         self.agent_message_senders.clear();
@@ -987,6 +1002,15 @@ impl Transcript {
     }
 
     fn hydrate_payload(&mut self, payload: &SessionPayloadRef, bytes: Vec<u8>) -> Result<()> {
+        let Some(index) = self.order.iter().position(|entry| {
+            matches!(
+                entry,
+                TranscriptEntry::Tool { payload_refs, .. }
+                    if payload_refs.iter().any(|candidate| candidate.id == payload.id)
+            )
+        }) else {
+            return Ok(());
+        };
         let Some(TranscriptEntry::Tool {
             source_name,
             name,
@@ -997,16 +1021,11 @@ impl Transcript {
             backgrounded,
             payload_refs,
             ..
-        }) = self.order.iter_mut().find(|entry| {
-            matches!(
-                entry,
-                TranscriptEntry::Tool { payload_refs, .. }
-                    if payload_refs.iter().any(|candidate| candidate.id == payload.id)
-            )
-        })
+        }) = self.order.get_mut(index)
         else {
             return Ok(());
         };
+        let mut command_edit = None;
         match payload.kind {
             SessionPayloadKind::ToolInput => {
                 let input: serde_json::Value = serde_json::from_slice(&bytes)
@@ -1019,10 +1038,15 @@ impl Transcript {
             SessionPayloadKind::ToolOutput => {
                 let output =
                     String::from_utf8(bytes).context("stored tool output is not valid UTF-8")?;
+                command_edit = command_edit_presentation(source_name, &output);
+                let run_output = command_edit
+                    .as_ref()
+                    .map(|_| command_output_without_changes(&output))
+                    .unwrap_or(output);
                 let hydrated_presentation = project_tool_presentation(
                     source_name,
                     &serde_json::Value::Null,
-                    Some(&output),
+                    Some(&run_output),
                     *error,
                 );
                 *backgrounded = hydrated_presentation.backgrounded;
@@ -1045,15 +1069,15 @@ impl Transcript {
                     *output_view = if is_mcp_resource_probe(source_name) {
                         None
                     } else if *error
-                        && !output.trim().is_empty()
+                        && !run_output.trim().is_empty()
                         && hydrated_presentation
                             .output
                             .as_ref()
                             .is_none_or(|body| body.language != "text")
                     {
-                        Some(("text".to_string(), output.trim_end().to_string()))
+                        Some(("text".to_string(), run_output.trim_end().to_string()))
                     } else {
-                        tool_output_code_view(source_name, &output)
+                        tool_output_code_view(source_name, &run_output)
                     };
                 }
             }
@@ -1078,6 +1102,18 @@ impl Transcript {
             SessionPayloadKind::ProviderPrompt | SessionPayloadKind::ProviderModelMessage => {}
         }
         payload_refs.retain(|candidate| candidate.id != payload.id);
+        if let Some(edit) = command_edit
+            && let Some(tool_call_id) = self.tools.iter().find_map(|(tool_call_id, tool_index)| {
+                (*tool_index == index).then(|| tool_call_id.clone())
+            })
+            && let Some(TranscriptEntry::Tool {
+                time,
+                completed_at: Some(completed_at),
+                ..
+            }) = self.order.get(index)
+        {
+            self.upsert_command_edit(&tool_call_id, edit, time.clone(), *completed_at, None);
+        }
         Ok(())
     }
 
@@ -1176,7 +1212,9 @@ impl Transcript {
             // event and a reconnect replay, so the label stays truthful there.
             SessionEventKind::StatusChanged { status, detail } => {
                 self.waiting_on_watchers = *status == SessionStatus::Ready
-                    && detail.as_deref().is_some_and(ready_detail_is_waiting_on_watchers);
+                    && detail
+                        .as_deref()
+                        .is_some_and(ready_detail_is_waiting_on_watchers);
             }
             _ => {}
         }
@@ -1788,10 +1826,24 @@ impl Transcript {
                         _ => None,
                     })
                     .unwrap_or_default();
+                let command_edit = command_edit_presentation(&source_name_for_process, output);
+                let deferred_command_edit = command_edit
+                    .as_ref()
+                    .and_then(|edit| edit.input.as_ref())
+                    .is_some_and(|body| !is_diff_language(&body.language));
+                let run_output = command_edit
+                    .as_ref()
+                    .map(|_| command_output_without_changes(output))
+                    .unwrap_or_else(|| output.clone());
                 let stored_followup_handle = self.provider_followups.remove(tool_call_id);
                 let followup_handle =
                     tool_process_followup_handle(&source_name_for_process, input.as_ref())
                         .or(stored_followup_handle);
+                let edit_origin = followup_handle
+                    .as_deref()
+                    .and_then(|handle| Uuid::parse_str(handle).ok())
+                    .and_then(|process_id| self.originating_tool_call_id(process_id))
+                    .unwrap_or_else(|| tool_call_id.clone());
                 let reported_background_handle = (!*is_error)
                     .then(|| tool_output_background_handle(output))
                     .flatten();
@@ -1828,11 +1880,14 @@ impl Transcript {
                     let completion_presentation = project_tool_presentation(
                         source_name,
                         input.as_ref().unwrap_or(&serde_json::Value::Null),
-                        Some(output),
+                        Some(&run_output),
                         *is_error,
                     );
                     if *is_error && !output.trim().is_empty() {
-                        let message = completion_presentation.result.as_deref().unwrap_or(output);
+                        let message = completion_presentation
+                            .result
+                            .as_deref()
+                            .unwrap_or(&run_output);
                         let message = compact_text(message, 120);
                         if detail.trim().is_empty() {
                             *detail = message;
@@ -1905,27 +1960,37 @@ impl Transcript {
                         } else {
                             *output_view = if is_mcp_resource_probe(source_name) {
                                 None
-                            } else if *is_error && !output.trim().is_empty() {
-                                Some(("text".to_string(), output.trim_end().to_string()))
+                            } else if *is_error && !run_output.trim().is_empty() {
+                                Some(("text".to_string(), run_output.trim_end().to_string()))
                             } else {
-                                tool_output_code_view(source_name, output)
+                                tool_output_code_view(source_name, &run_output)
                             };
                         }
                     } else {
-                        *output_view = if is_mcp_resource_probe(source_name) {
-                            None
-                        } else if *is_error
-                            && !output.trim().is_empty()
-                            && completion_presentation
-                                .output
-                                .as_ref()
-                                .is_none_or(|body| body.language != "text")
+                        if !(deferred_command_edit && output_ref.is_some() && output_view.is_some())
                         {
-                            Some(("text".to_string(), output.trim_end().to_string()))
-                        } else {
-                            borg_control_tool_output_view(source_name, input.as_ref(), output)
+                            *output_view = if is_mcp_resource_probe(source_name) {
+                                None
+                            } else if *is_error
+                                && !run_output.trim().is_empty()
+                                && completion_presentation
+                                    .output
+                                    .as_ref()
+                                    .is_none_or(|body| body.language != "text")
+                            {
+                                Some(("text".to_string(), run_output.trim_end().to_string()))
+                            } else {
+                                borg_control_tool_output_view(
+                                    source_name,
+                                    input.as_ref(),
+                                    &run_output,
+                                )
                                 .or_else(|| {
-                                    borg_lsp_diagnostics_view(source_name, input.as_ref(), output)
+                                    borg_lsp_diagnostics_view(
+                                        source_name,
+                                        input.as_ref(),
+                                        &run_output,
+                                    )
                                 })
                                 .map(|text| {
                                     (
@@ -1938,8 +2003,9 @@ impl Transcript {
                                         text,
                                     )
                                 })
-                                .or_else(|| tool_output_code_view(source_name, output))
-                        };
+                                .or_else(|| tool_output_code_view(source_name, &run_output))
+                            };
+                        }
                     }
                     let _ = name;
                 }
@@ -1974,6 +2040,15 @@ impl Transcript {
                         *output_view = Some(("text".to_string(), output));
                     }
                     *backgrounded = false;
+                }
+                if let Some(edit) = command_edit {
+                    self.upsert_command_edit(
+                        &edit_origin,
+                        edit,
+                        local_event_time(event),
+                        event.created_at,
+                        output_ref.as_ref(),
+                    );
                 }
             }
             SessionEventKind::StatusChanged {
@@ -2072,8 +2147,10 @@ impl Transcript {
                 process_id,
                 stdout,
                 stderr,
+                changes,
                 ..
             } => {
+                let edit_origin = self.originating_tool_call_id(*process_id);
                 let tool_index = self
                     .runtime_processes
                     .get(process_id)
@@ -2105,6 +2182,21 @@ impl Transcript {
                         *output_view = Some(("text".to_string(), output));
                     }
                     *backgrounded = false;
+                }
+                if !changes.is_empty()
+                    && let Some(tool_call_id) = edit_origin
+                    && let Some(edit) = command_edit_presentation(
+                        "exec",
+                        &serde_json::json!({"changes": changes}).to_string(),
+                    )
+                {
+                    self.upsert_command_edit(
+                        &tool_call_id,
+                        edit,
+                        local_event_time(event),
+                        event.created_at,
+                        None,
+                    );
                 }
             }
             SessionEventKind::ProviderEvent { kind, payload, .. }
@@ -2459,6 +2551,14 @@ impl Transcript {
                 *stored_index -= 1;
             }
         }
+        self.command_edit_rows.retain(|_, stored_index| {
+            if *stored_index == index {
+                false
+            } else {
+                *stored_index -= usize::from(*stored_index > index);
+                true
+            }
+        });
         for process in self.runtime_processes.values_mut() {
             process.tool_index = process.tool_index.and_then(|tool_index| {
                 (tool_index != index).then_some(tool_index - usize::from(tool_index > index))
@@ -2599,6 +2699,7 @@ impl Transcript {
             .messages
             .values_mut()
             .chain(self.tools.values_mut())
+            .chain(self.command_edit_rows.values_mut())
             .chain(self.subagent_entries.values_mut())
         {
             if *stored_index >= index {
@@ -2867,6 +2968,93 @@ impl Transcript {
         if is_edit_diff {
             self.last_edit = Some(tool_index);
         }
+    }
+
+    fn upsert_command_edit(
+        &mut self,
+        tool_call_id: &str,
+        edit: borg_remote::ToolPresentation,
+        time: String,
+        completed_at: DateTime<Utc>,
+        output_ref: Option<&SessionPayloadRef>,
+    ) {
+        let Some(body) = edit.input else {
+            return;
+        };
+        let expanded = is_diff_language(&body.language)
+            && self.diff_expansion != DiffExpansionPolicy::Collapsed;
+        let payload_refs = if expanded || is_diff_language(&body.language) {
+            Vec::new()
+        } else {
+            output_ref.cloned().into_iter().collect()
+        };
+        if let Some(index) = self.command_edit_rows.get(tool_call_id).copied()
+            && let Some(TranscriptEntry::Tool {
+                detail,
+                code_view,
+                payload_refs: stored_refs,
+                expanded: stored_expanded,
+                ..
+            }) = self.order.get_mut(index)
+        {
+            if code_view
+                .as_ref()
+                .is_some_and(|(language, _)| is_diff_language(language))
+                && !is_diff_language(&body.language)
+            {
+                return;
+            }
+            if *detail == edit.detail
+                && code_view.as_ref().is_some_and(|(language, text)| {
+                    language == &body.language && text == &body.text
+                })
+                && *stored_refs == payload_refs
+            {
+                return;
+            }
+            *detail = edit.detail;
+            *code_view = Some((body.language, body.text));
+            *stored_refs = payload_refs;
+            *stored_expanded = expanded;
+            self.tool_body_cache
+                .get_mut()
+                .lines
+                .retain(|(tool_index, _, _, _), _| *tool_index != index);
+            return;
+        }
+        if !self.tools.contains_key(tool_call_id) {
+            return;
+        }
+        if self.diff_expansion == DiffExpansionPolicy::UntilNextAction {
+            self.collapse_previous_edit();
+        }
+        let index = self.order.len();
+        self.order.push(TranscriptEntry::Tool {
+            source_name: "command_edit".to_string(),
+            name: edit.label,
+            detail: edit.detail,
+            code_view: Some((body.language, body.text)),
+            output_view: None,
+            payload_refs,
+            time,
+            started_at: completed_at,
+            completed_at: Some(completed_at),
+            complete: true,
+            error: false,
+            user_interrupted: false,
+            backgrounded: false,
+            expanded,
+        });
+        self.command_edit_rows
+            .insert(tool_call_id.to_string(), index);
+        self.last_edit = Some(index);
+    }
+
+    fn originating_tool_call_id(&self, process_id: Uuid) -> Option<String> {
+        let origin = self.runtime_processes.get(&process_id)?.tool_index?;
+        self.tools
+            .iter()
+            .find_map(|(tool_call_id, index)| (*index == origin).then(|| tool_call_id.clone()))
     }
 
     fn upsert_action_preparation(
@@ -4175,8 +4363,7 @@ impl Transcript {
                                                     // tile at least shows shape.
                                                     attachments::preview(
                                                         path,
-                                                        available
-                                                            .min(GLYPH_PREVIEW_TILE_WIDTH),
+                                                        available.min(GLYPH_PREVIEW_TILE_WIDTH),
                                                         GLYPH_PREVIEW_TILE_ROWS,
                                                     )
                                                     .unwrap_or_default()

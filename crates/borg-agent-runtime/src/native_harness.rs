@@ -3503,11 +3503,11 @@ async fn record_native_tool_result(
     is_error: bool,
 ) -> Result<u64> {
     let (output, attachments) = split_tool_result_attachments(output);
-    let output = bounded_tool_content(output);
+    let model_output = bounded_tool_content(command_result_for_model(&output));
     let attachment_count = attachments.len();
     let message = ModelMessage::Tool {
         tool_call_id: tool_call_id.to_string(),
-        content: output.clone(),
+        content: model_output,
         attachments,
     };
     let tokens = estimated_message_tokens(&message);
@@ -3531,6 +3531,21 @@ async fn record_native_tool_result(
     )
     .await;
     Ok(tokens)
+}
+
+fn command_result_for_model(output: &str) -> String {
+    let Ok(Value::Object(mut fields)) = serde_json::from_str::<Value>(output) else {
+        return output.to_string();
+    };
+    if fields.get("session_id").and_then(Value::as_str).is_some()
+        && fields.get("command").and_then(Value::as_str).is_some()
+        && fields.get("running").and_then(Value::as_bool).is_some()
+        && fields.remove("changes").is_some()
+    {
+        Value::Object(fields).to_string()
+    } else {
+        output.to_string()
+    }
 }
 
 async fn record_native_message(
@@ -6257,6 +6272,56 @@ mod tests {
         .to_string();
         let (_, attachments) = split_tool_result_attachments(many);
         assert_eq!(attachments.len(), MAX_TOOL_RESULT_ATTACHMENTS);
+    }
+
+    #[tokio::test]
+    async fn command_diff_is_journaled_for_the_ui_without_entering_model_context() {
+        let output = json!({
+            "session_id": Uuid::new_v4(),
+            "command": "python3 rewrite.py",
+            "running": false,
+            "exit_code": 0,
+            "stdout": "saved",
+            "changes": [{
+                "path": "src/lib.rs",
+                "added": 1,
+                "removed": 1,
+                "diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n-old\n+new"
+            }]
+        })
+        .to_string();
+        let (events, mut received) = mpsc::channel(4);
+        let mut messages = Vec::new();
+        record_native_tool_result(
+            &events,
+            crate::CodingProvider::Codex,
+            &mut messages,
+            "call-1",
+            output,
+            false,
+        )
+        .await
+        .expect("record result");
+
+        let ModelMessage::Tool { content, .. } = &messages[0] else {
+            panic!("model receives a tool result");
+        };
+        let model_result: Value = serde_json::from_str(content).expect("model JSON");
+        assert_eq!(model_result["stdout"], "saved");
+        assert!(model_result.get("changes").is_none());
+        let _model_journal = received.recv().await.expect("model journal");
+        let SessionEventKind::ToolCompleted { output, .. } =
+            received.recv().await.expect("UI journal")
+        else {
+            panic!("UI receives the completed tool result");
+        };
+        let ui_result: Value = serde_json::from_str(&output).expect("UI JSON");
+        assert_eq!(ui_result["changes"][0]["path"], "src/lib.rs");
+        assert_eq!(
+            command_result_for_model(&json!({"changes": [{"status": "ready"}]}).to_string()),
+            json!({"changes": [{"status": "ready"}]}).to_string(),
+            "other tools use `changes` for results that the model needs"
+        );
     }
 
     #[test]

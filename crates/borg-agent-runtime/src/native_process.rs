@@ -15,6 +15,7 @@ use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::command_changes::{CommandChange, CommandChangeBaseline};
 use crate::{RuntimeProcessStatus, RuntimeProcessStream, SessionEvent, SessionEventKind};
 
 const MAX_ACTIVE_PROCESSES: usize = 8;
@@ -107,6 +108,7 @@ struct ProcessEntry {
     attachment_spool: Option<PathBuf>,
     /// Why this process has no image channel, when it has none.
     attachment_channel_error: Option<String>,
+    changes: Mutex<Vec<CommandChange>>,
 }
 
 impl Drop for ProcessEntry {
@@ -172,6 +174,9 @@ pub struct ProcessSnapshot {
     /// missing screenshot is explained rather than silently absent.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub attachment_errors: Vec<String>,
+    /// Text changes observed between this process starting and completing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<CommandChange>,
 }
 
 impl Default for ProcessManager {
@@ -315,6 +320,13 @@ impl ProcessManager {
             );
         }
 
+        let baseline_cwd = cwd.clone();
+        let change_baseline =
+            tokio::task::spawn_blocking(move || CommandChangeBaseline::capture(&baseline_cwd))
+                .await
+                .ok()
+                .flatten();
+
         let process_id = Uuid::new_v4();
         let (attachment_spool, attachment_channel_error) = match create_attachment_spool(process_id)
         {
@@ -383,6 +395,7 @@ impl ProcessManager {
             updates: self.inner.updates.clone(),
             attachment_spool,
             attachment_channel_error,
+            changes: Mutex::new(Vec::new()),
         });
         self.inner
             .processes
@@ -434,6 +447,7 @@ impl ProcessManager {
             stdout_task,
             stderr_task,
             journal,
+            change_baseline,
         ));
         startup.pid = None;
 
@@ -662,6 +676,7 @@ impl ProcessManager {
                     "native process owner was lost; the process was recovered and terminated"
                         .to_string(),
                 ),
+                Vec::new(),
             )
             .await?;
         }
@@ -919,6 +934,16 @@ fn snapshot(process_id: Uuid, entry: &ProcessEntry, max_output_tokens: usize) ->
         .lock()
         .expect("native process status lock poisoned")
         .clone();
+    let changes = if status.running {
+        Vec::new()
+    } else {
+        std::mem::take(
+            &mut *entry
+                .changes
+                .lock()
+                .expect("native process changes lock poisoned"),
+        )
+    };
     let (stdout, stdout_omitted_bytes) = output.stdout.render(max_output_tokens);
     let (stderr, stderr_omitted_bytes) = output.stderr.render(max_output_tokens);
     ProcessSnapshot {
@@ -935,6 +960,7 @@ fn snapshot(process_id: Uuid, entry: &ProcessEntry, max_output_tokens: usize) ->
         error: status.error,
         attachments,
         attachment_errors,
+        changes,
     }
 }
 
@@ -1011,6 +1037,7 @@ async fn append_runtime_completed(
     stdout_omitted_bytes: usize,
     stderr_omitted_bytes: usize,
     error: Option<String>,
+    changes: Vec<CommandChange>,
 ) -> Result<SessionEvent> {
     append_runtime_event(
         store,
@@ -1026,6 +1053,7 @@ async fn append_runtime_completed(
             stdout_omitted_bytes,
             stderr_omitted_bytes,
             error,
+            changes,
         },
     )
     .await
@@ -1215,6 +1243,7 @@ async fn supervise_process(
     stdout_task: tokio::task::JoinHandle<()>,
     stderr_task: tokio::task::JoinHandle<()>,
     journal: Option<std::sync::Arc<dyn crate::SessionStore>>,
+    change_baseline: Option<CommandChangeBaseline>,
 ) {
     let complete = async {
         let result = child.wait().await;
@@ -1243,6 +1272,14 @@ async fn supervise_process(
             }
         },
     };
+    if let Some(baseline) = change_baseline
+        && let Ok(changes) = tokio::task::spawn_blocking(move || baseline.finish()).await
+    {
+        *entry
+            .changes
+            .lock()
+            .expect("native process changes lock poisoned") = changes;
+    }
     let (runtime_status, exit_code, timed_out, error) = {
         let mut status = entry
             .status
@@ -1262,6 +1299,11 @@ async fn supervise_process(
     let journal_error = if let Some(store) = journal.as_ref() {
         let (stdout, stdout_omitted_bytes) = snapshot_output(&entry, JOURNAL_OUTPUT_TOKENS, true);
         let (stderr, stderr_omitted_bytes) = snapshot_output(&entry, JOURNAL_OUTPUT_TOKENS, false);
+        let changes = entry
+            .changes
+            .lock()
+            .expect("native process changes lock poisoned")
+            .clone();
         append_runtime_completed(
             store.as_ref(),
             entry.session_id,
@@ -1275,6 +1317,7 @@ async fn supervise_process(
             stdout_omitted_bytes,
             stderr_omitted_bytes,
             error,
+            changes,
         )
         .await
         .err()
@@ -1727,6 +1770,134 @@ mod tests {
             completed.stdout.contains("got:hello"),
             "unexpected process result: {completed:?}"
         );
+    }
+
+    /// The reported patch must be the command's delta, even when another
+    /// agent left the same file dirty before this process started. A running
+    /// snapshot must not publish the patch before the command is finished.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn background_command_reports_edits_to_clean_and_already_dirty_files() {
+        let root = tempfile::tempdir().expect("workspace");
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(root.path())
+                    .status()
+                    .expect("git")
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.path().join("dirty.rs"), "one\n").expect("dirty seed");
+        std::fs::write(root.path().join("clean.rs"), "start\n").expect("clean seed");
+        git(&["add", "--all"]);
+        git(&[
+            "-c",
+            "user.name=Borg Test",
+            "-c",
+            "user.email=borg@example.invalid",
+            "commit",
+            "-qm",
+            "initial",
+        ]);
+        std::fs::write(root.path().join("dirty.rs"), "one\npending\n").expect("earlier edit");
+
+        let manager = ProcessManager::default();
+        let owner = Uuid::new_v4();
+        let first = manager
+            .exec(
+                owner,
+                root.path(),
+                "printf 'new\\n' >> dirty.rs; printf 'change\\n' >> clean.rs; read done"
+                    .to_string(),
+                None,
+                Some(5),
+                Some(100),
+                10_000,
+                None,
+            )
+            .await
+            .expect("spawn");
+        assert!(first.running);
+        assert!(first.changes.is_empty());
+        let completed = manager
+            .write_stdin(
+                owner,
+                first.session_id,
+                Some("\n"),
+                false,
+                Some(2_000),
+                Some(100),
+            )
+            .await
+            .expect("complete");
+        assert!(!completed.running, "{completed:?}");
+        assert_eq!(completed.changes.len(), 2, "{completed:?}");
+        let dirty = completed
+            .changes
+            .iter()
+            .find(|change| change.path == "dirty.rs")
+            .expect("dirty file change");
+        assert!(dirty.diff.contains("+new"), "{}", dirty.diff);
+        assert!(!dirty.diff.contains("+pending"), "{}", dirty.diff);
+        let clean = completed
+            .changes
+            .iter()
+            .find(|change| change.path == "clean.rs")
+            .expect("clean file change");
+        assert!(clean.diff.contains("+change"), "{}", clean.diff);
+    }
+
+    /// A command can leave a clean worktree by committing its own edit. The
+    /// action still needs the patch between HEAD at launch and HEAD at exit.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn command_that_commits_its_edit_reports_the_change() {
+        let root = tempfile::tempdir().expect("workspace");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .expect("git");
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+            output.stdout
+        };
+        git(&["init", "-q"]);
+        std::fs::write(root.path().join("code.rs"), "old\n").expect("seed");
+        git(&["add", "code.rs"]);
+        git(&[
+            "-c",
+            "user.name=Borg Test",
+            "-c",
+            "user.email=borg@example.invalid",
+            "commit",
+            "-qm",
+            "initial",
+        ]);
+
+        let completed = ProcessManager::default()
+            .exec(
+                Uuid::new_v4(),
+                root.path(),
+                "printf 'new\\n' >> code.rs && git add code.rs && git -c user.name='Borg Test' -c user.email=borg@example.invalid commit -qm updated"
+                    .to_string(),
+                None,
+                Some(2_000),
+                Some(100),
+                10_000,
+                None,
+            )
+            .await
+            .expect("command");
+        assert!(!completed.running, "{completed:?}");
+        assert!(git(&["status", "--porcelain"]).is_empty());
+        assert_eq!(completed.changes.len(), 1, "{completed:?}");
+        assert_eq!(completed.changes[0].path, "code.rs");
+        assert!(completed.changes[0].diff.contains("+new"));
     }
 
     #[tokio::test]
@@ -2743,6 +2914,7 @@ mod tests {
             error: None,
             attachments: Vec::new(),
             attachment_errors: errors,
+            changes: Vec::new(),
         };
         let result = serde_json::to_value(&snapshot).expect("serialize");
         assert!(

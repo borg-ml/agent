@@ -626,6 +626,63 @@ async fn an_oversized_tool_output_is_deferred_and_reloadable() {
 }
 
 #[tokio::test]
+async fn deferred_command_changes_survive_journal_replay() {
+    for harness in harnesses().await {
+        let store = Arc::clone(&harness.store);
+        let session_id = started_session(store.as_ref()).await;
+        let output = serde_json::json!({
+            "stdout": "x".repeat(super::INLINE_SESSION_PAYLOAD_BYTES),
+            "changes": [{
+                "path": "src/example.rs",
+                "added": 2,
+                "removed": 1,
+                "diff": "@@ -1 +1,2 @@\n-old\n+new\n+more\n",
+            }],
+        })
+        .to_string();
+        store
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ToolCompleted {
+                    tool_call_id: "edited-code".to_string(),
+                    output: output.clone(),
+                    output_ref: None,
+                    is_error: false,
+                    input: None,
+                    input_ref: None,
+                },
+            ))
+            .await
+            .expect("store changed command");
+
+        let events = store.read(session_id).await.expect("replay journal");
+        let (summary, reference) = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::ToolCompleted {
+                    output,
+                    output_ref: Some(reference),
+                    ..
+                } => Some((output, reference)),
+                _ => None,
+            })
+            .expect("deferred command completion");
+        let preview: serde_json::Value = serde_json::from_str(summary).expect("valid JSON summary");
+        assert_eq!(preview["changes_deferred"], true);
+        assert_eq!(preview["changes_count"], 1);
+        assert_eq!(preview["changes"][0]["path"], "src/example.rs");
+        assert_eq!(preview["changes"][0]["added"], 2);
+        assert!(preview["changes"][0].get("diff").is_none());
+        assert_eq!(
+            String::from_utf8(store.load_payload(reference).await.expect("full output")).unwrap(),
+            output,
+        );
+        harness.discard().await;
+    }
+}
+
+#[tokio::test]
 async fn sessions_are_listed_newest_first_without_children() {
     for harness in harnesses().await {
         let store = Arc::clone(&harness.store);

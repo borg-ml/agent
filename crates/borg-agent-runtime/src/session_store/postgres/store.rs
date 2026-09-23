@@ -32,8 +32,8 @@ use crate::session_store::{
     SessionLineage, SessionLiveEvent, SessionPayloadKind, SessionPayloadRef, SessionRecovery,
     SessionState, SessionStatus, SessionStore, SessionStoreCompaction, SessionStoreFork,
     SessionStoreHealth, SessionSummary, SessionWorkspaceBinding, deferred_json_payload,
-    deferred_provider_payload, deferred_text_payload, event_kind, historical_projection_json,
-    oversized_provider_payload_bytes,
+    deferred_provider_payload, deferred_text_payload, deferred_tool_output_payload, event_kind,
+    historical_projection_json, oversized_provider_payload_bytes,
 };
 
 impl PostgresSessionStore {
@@ -82,7 +82,7 @@ impl PostgresSessionStore {
                             output.as_bytes(),
                         )
                         .await?;
-                        *output = deferred_text_payload(output, &payload);
+                        *output = deferred_tool_output_payload(output, &payload);
                         *output_ref = Some(payload);
                     }
                     if input_ref.is_none()
