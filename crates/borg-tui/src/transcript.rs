@@ -4056,8 +4056,17 @@ impl Transcript {
                     // own resolution and the text inside it stays readable. A
                     // glyph tile packs two pixels into one cell, so it stays
                     // small - and its caption says the text cannot be read there.
+                    //
+                    // A graphics tile also carries a gutter bar down its left
+                    // edge: a screenshot of this interface drawn at its own
+                    // resolution is otherwise indistinguishable from the live
+                    // transcript around it.
+                    let gutter = self.image_cell.is_some();
                     let (tile_width, tile_rows) = match self.image_cell {
-                        Some(_) => (available, GLYPH_PREVIEW_TILE_ROWS.min(available)),
+                        Some(_) => {
+                            let tile_width = available.saturating_sub(2).max(1);
+                            (tile_width, GLYPH_PREVIEW_TILE_ROWS.min(tile_width))
+                        }
                         None => {
                             let tile_width = available.min(GLYPH_PREVIEW_TILE_WIDTH);
                             (tile_width, tile_width.min(GLYPH_PREVIEW_TILE_ROWS))
@@ -4115,6 +4124,12 @@ impl Transcript {
                         for row in 0..=height {
                             let mut line = Line::from("  ");
                             for (column, (number, path)) in group.iter().enumerate() {
+                                if gutter {
+                                    line.spans.push(Span::styled(
+                                        "▌ ",
+                                        Style::default().fg(Color::LightCyan),
+                                    ));
+                                }
                                 let start = line.width();
                                 let tile = if row == height {
                                     Line::from(Span::styled(
@@ -4183,7 +4198,9 @@ impl Transcript {
                     } else {
                         lines.len()
                     };
-                    if is_chat_message && *complete {
+                    // A sent message waiting behind a running tool is not
+                    // complete yet, but its text is final and copyable.
+                    if is_chat_message && (*complete || *actor == EventActor::User) {
                         message_rows.push((index, message_background_start, message_end));
                     }
                     selection_rows.push(SelectionRowRange::transcript_entry(

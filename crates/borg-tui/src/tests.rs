@@ -14812,3 +14812,29 @@ fn glyph_terminal_says_a_preview_cannot_show_text() {
         "the glyph fallback must say the text cannot be read"
     );
 }
+
+#[test]
+fn a_sent_message_waiting_behind_a_tool_is_clickable() {
+    // Failure mode: a prompt sent during a running tool is not complete until
+    // the provider admits it, and had no click target, so it could not be
+    // copied while it waited.
+    let mut transcript = Transcript::default();
+    transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::User,
+        text: "sent while a tool runs".to_string(),
+        attachments: Vec::new(),
+        model: None,
+        effort: None,
+        time: "2026-09-23 17:00".to_string(),
+        status: MessageStatus::InProgress,
+        complete: false,
+        user_interrupted: false,
+        redirected: false,
+    });
+    let rendered = transcript.render(100, None, None, None);
+    assert!(
+        rendered.3.iter().any(|(index, _, _)| *index == 0),
+        "{:?}",
+        rendered.3
+    );
+}
