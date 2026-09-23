@@ -39,6 +39,16 @@ Port 5433 rather than 5432 is deliberate: a developer machine frequently
 already runs a system PostgreSQL on 5432, and adopting someone else's cluster is
 not Borg's decision to make.
 
+Borg sets `synchronous_commit = off` on a fresh managed cluster and on an
+existing managed cluster still using PostgreSQL's default, without restarting
+it. An explicit operator setting is left alone. This prevents every agent's
+journal events from waiting on a disk flush. PostgreSQL still keeps `fsync = on`
+and WAL recovery: commits remain atomic, and clean shutdowns flush them. On a
+machine crash or power loss, the most recent unflushed commits (typically under
+one second) may be lost. A server selected with `BORG_SESSIONS_URL` is never
+reconfigured; its operator owns the commit policy. `borg doctor` reports the
+active policy separately from store readiness.
+
 Borg does **not** install PostgreSQL. It locates the `initdb` and `pg_ctl` that
 an installation already provides -- including the version-suffixed directories
 distributions keep off `PATH`, such as `/usr/lib/postgresql/17/bin`. When they
@@ -47,15 +57,10 @@ escape hatches. Borg has no second place to put history, and inventing one
 would split a machine's journal in a way that stays invisible until someone
 goes looking for a session that was quietly written elsewhere.
 
-Several Borg processes routinely start at the same moment and all of them run
-this. No lock is taken; instead each step treats losing the race as having had
-nothing to do. `initdb` refuses a populated directory and `pg_ctl start` refuses
-a running cluster, and both outcomes are re-checked against live state before
-being treated as failures.
-
-A crash leaves `postmaster.pid` behind and the next start refuses, assuming the
-old server is alive. Borg checks whether that process actually exists and clears
-the file if it does not, because the machine this runs on does crash.
+Several Borg processes can start together. They serialize cluster
+provisioning and configuration under a short Borg-home advisory lock; journal
+writes do not hold that lock. `initdb` runs in a staging directory renamed into
+place, and PostgreSQL handles stale `postmaster.pid` files during recovery.
 
 ## Where the setting is read
 

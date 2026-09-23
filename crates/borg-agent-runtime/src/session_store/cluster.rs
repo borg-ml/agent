@@ -499,6 +499,30 @@ impl ManagedCluster {
                 }
             }
         }
+        // A managed cluster is used by many agents. Waiting for an fsync on
+        // every journal event stalls them all when the disk is busy. PostgreSQL
+        // still writes WAL and recovers atomically; a host crash can only lose
+        // the most recent unflushed commits. Upgrade existing managed clusters
+        // as well as fresh ones, but respect an operator's explicit setting.
+        let source: String =
+            sqlx::query_scalar("select source from pg_settings where name = 'synchronous_commit'")
+                .fetch_one(&mut connection)
+                .await
+                .context("could not inspect the session cluster's commit policy")?;
+        if source == "default" {
+            connection
+                .execute("alter system set synchronous_commit = off")
+                .await
+                .context("could not configure asynchronous commits for the session cluster")?;
+            let reloaded: bool = sqlx::query_scalar("select pg_reload_conf()")
+                .fetch_one(&mut connection)
+                .await
+                .context("could not reload the session cluster's commit policy")?;
+            anyhow::ensure!(
+                reloaded,
+                "the session cluster refused to reload its commit policy"
+            );
+        }
         connection.close().await.ok();
         Ok(())
     }

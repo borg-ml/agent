@@ -1869,16 +1869,15 @@ pub struct SessionStoreHealth {
     pub integrity_checked: bool,
     /// Whether a commit is durable before the caller is told it succeeded.
     ///
-    /// This is the one readiness property worth reporting, because it is the
-    /// one whose absence loses work that the journal already acknowledged. A
-    /// server configured to acknowledge before the write reaches disk will
-    /// answer every query correctly right up until it restarts.
+    /// Reported separately from readiness: `synchronous_commit = off` is
+    /// Borg's managed-cluster default. It preserves atomic recovery, but a
+    /// machine crash can lose recently acknowledged, unflushed commits.
     #[serde(default)]
     pub durable_commits: bool,
     /// The server setting `durable_commits` was derived from, verbatim.
     ///
-    /// Reported rather than reduced to the boolean because an operator asked
-    /// to fix a degraded store needs to see the value that made it degraded.
+    /// Reported rather than reduced to a boolean so an operator can inspect
+    /// the configured trade-off without calling a healthy async store degraded.
     #[serde(default)]
     pub commit_durability: String,
     pub sessions: i64,
@@ -1889,10 +1888,10 @@ pub struct SessionStoreHealth {
 }
 
 impl SessionStoreHealth {
-    /// Ready means the journal answered, nothing it actually checked came back
-    /// wrong, and an acknowledged write will survive a restart.
+    /// Ready means the journal answered and nothing it checked came back wrong.
+    /// The commit policy is reported separately; async commit is intentional.
     pub fn is_ready(&self) -> bool {
-        (!self.integrity_checked || self.integrity == "ok") && self.durable_commits
+        !self.integrity_checked || self.integrity == "ok"
     }
 }
 
@@ -2205,6 +2204,26 @@ mod conformance;
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+
+    #[test]
+    fn async_commit_is_ready_but_a_failed_integrity_check_is_not() {
+        // Borg's managed-cluster default must not make `borg doctor` fail.
+        let mut health = SessionStoreHealth {
+            integrity: "not_checked".into(),
+            integrity_checked: false,
+            durable_commits: false,
+            commit_durability: "off".into(),
+            sessions: 0,
+            events: 0,
+            actions: 0,
+            payloads: 0,
+            projection_version: SESSION_PROJECTION_VERSION,
+        };
+        assert!(health.is_ready());
+        health.integrity_checked = true;
+        health.integrity = "failed".into();
+        assert!(!health.is_ready());
+    }
 
     #[test]
     fn session_cost_basis_tracks_the_contributions_to_its_total() {
