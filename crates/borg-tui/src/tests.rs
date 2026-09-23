@@ -5600,7 +5600,7 @@ fn ctrl_c_exits_on_the_second_quick_press() {
 }
 
 #[test]
-fn turn_completion_keeps_the_escape_flush_marker_while_input_is_queued() {
+fn turn_completion_preserves_followup_marker_while_input_is_queued() {
     let event = SessionEventKind::TurnCompleted {
         message_id: Uuid::new_v4(),
         provider_session_id: None,

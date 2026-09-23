@@ -111,7 +111,6 @@ const RESUME_PICKER_SESSION_LIMIT: usize = 1_000;
 enum PromptSubmissionKind {
     Send,
     Queue,
-    Flush,
 }
 
 impl PromptSubmissionKind {
@@ -119,19 +118,6 @@ impl PromptSubmissionKind {
         match self {
             Self::Send => "send the prompt",
             Self::Queue => "queue the prompt",
-            Self::Flush => "send the pending input",
-        }
-    }
-
-    fn disconnected_notice(self) -> &'static str {
-        match self {
-            Self::Send => "Prompt saved durably · waiting for the session coordinator to reconnect",
-            Self::Queue => {
-                "Prompt saved durably · waiting for the session coordinator to reconnect"
-            }
-            Self::Flush => {
-                "Pending input saved durably · waiting for the session coordinator to reconnect"
-            }
         }
     }
 }
@@ -3321,11 +3307,11 @@ async fn run_local_agent_session(
                         }
                     }
                     UiInteractionCompletion::Prompt {
-                        submission,
                         outcome: UiPromptOutcome::CoordinatorClosed,
+                        ..
                     } => {
                         if let Some(terminal) = terminal.as_mut() {
-                            terminal.set_notice(submission.kind.disconnected_notice().to_string());
+                            terminal.set_notice("Prompt saved durably · waiting for the session coordinator to reconnect".to_string());
                             interaction_dirty = true;
                             terminal_dirty = true;
                         }
@@ -4979,73 +4965,6 @@ async fn run_local_agent_session(
                             &ui_interaction_tx,
                             HostCommand::BroadcastInstances { session_id, text },
                         );
-                    }
-                    UiAction::FlushPendingInput { target, prompt } => {
-                        if let Some((message_id, text, attachments)) = prompt {
-                            let command = target.map_or_else(
-                                || HostCommand::Prompt {
-                                    session_id,
-                                    message_id,
-                                    text: text.clone(),
-                                    attachments: attachments.clone(),
-                                    output_schema: None,
-                                    delivery: PromptDelivery::Steer,
-                                },
-                                |target| HostCommand::Subagent {
-                                    session_id,
-                                    action: SubagentAction::Prompt {
-                                        request_id: Uuid::new_v4(),
-                                        target: target.to_string(),
-                                        message_id,
-                                        text: text.clone(),
-                                        attachments: attachments.clone(),
-                                        delivery: PromptDelivery::Steer,
-                                    },
-                                },
-                            );
-                            let submission = UiPromptSubmission {
-                                journal_session_id: target.unwrap_or(session_id),
-                                target,
-                                message_id,
-                                rejected_text: text.clone(),
-                                text,
-                                attachments,
-                                delivery: PromptDelivery::Steer,
-                                command: Some(command),
-                                kind: PromptSubmissionKind::Flush,
-                                started_idle_turn: false,
-                            };
-                            if let Err(submission) = dispatch_ui_prompt(
-                                &ui_interaction_tx,
-                                &mut pending_prompt_ids,
-                                submission,
-                            ) {
-                                let terminal = terminal.as_mut().expect("terminal");
-                                terminal.reject_optimistic_prompt(
-                                    submission.target,
-                                    submission.message_id,
-                                    submission.rejected_text,
-                                    submission.attachments,
-                                );
-                                terminal.set_notice(
-                                    "Could not queue the pending input for durable storage"
-                                        .to_string(),
-                                );
-                                interaction_dirty = true;
-                                terminal_dirty = true;
-                            }
-                        }
-                        let command = target.map_or_else(
-                            || HostCommand::FlushPendingInput { session_id },
-                            |target| HostCommand::Subagent {
-                                session_id,
-                                action: SubagentAction::FlushPendingInput {
-                                    request_id: Uuid::new_v4(),
-                                    target: target.to_string(),
-                                },
-                            },
-                        );
-                        dispatch_ui_command(&ui_interaction_tx, command);
                     }
                     UiAction::Rewind {
                         sequence,
