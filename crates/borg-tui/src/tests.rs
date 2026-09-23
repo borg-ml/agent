@@ -5860,7 +5860,7 @@ fn slash_command_picker_selects_the_highlighted_match() {
     assert_eq!(slash_matches("/status")[0].0, "/status");
     assert_eq!(slash_selected_command("/mo", 0), Some("/model"));
     assert_eq!(slash_selected_command("/eff", 0), Some("/effort"));
-    assert_eq!(slash_selected_command("/lang", 0), Some("/language"));
+    assert_eq!(slash_selected_command("/lang", 0), None);
     assert_eq!(slash_selected_command("/st", 2), Some("/stop"));
     assert_eq!(slash_selected_command("/goal add", 0), None);
     assert!(slash_matches("/todo add").is_empty());
