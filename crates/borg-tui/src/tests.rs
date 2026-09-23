@@ -8216,6 +8216,7 @@ fn accepted_steer_moves_from_pending_input_into_the_timeline() {
             message_id,
             text: "follow up".to_string(),
             delivery: PromptDelivery::Steer,
+            actor: EventActor::User,
         }]
     );
 
@@ -9123,7 +9124,7 @@ fn agent_message_is_visible_while_stopped_once_on_replay_and_never_human_pending
 }
 
 #[test]
-fn internal_team_delivery_never_renders_or_enters_user_prompt_history() {
+fn internal_team_delivery_is_pending_until_settled_but_not_in_user_history() {
     let session_id = Uuid::new_v4();
     let message_id = Uuid::new_v4();
     let text = "Team message from /root/worker:\n\nchild result".to_string();
@@ -9176,6 +9177,11 @@ fn internal_team_delivery_never_renders_or_enters_user_prompt_history() {
         },
         &mut None,
     );
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].actor, EventActor::System);
+    assert_eq!(pending[0].message_id, message_id);
+    assert!(!has_recallable_queued_prompts("", &pending));
+    update_queued_prompts(&mut pending, &current.kind, &mut None);
     assert!(pending.is_empty());
 }
 
@@ -9302,6 +9308,7 @@ fn committed_steer_does_not_hide_a_separate_next_turn_queue() {
             message_id: queued_id,
             text: "run next".to_string(),
             delivery: PromptDelivery::Queue,
+            actor: EventActor::User,
         }]
     );
 }
@@ -9337,6 +9344,7 @@ fn queue_projection_preserves_fifo_and_discards_bypassed_stale_entries() {
             message_id: second,
             text: "second".to_string(),
             delivery: PromptDelivery::Queue,
+            actor: EventActor::User,
         }]
     );
 
@@ -9381,6 +9389,7 @@ fn resume_pending_prompt_projection_replays_queue_events() {
             message_id: second,
             text: "second".to_string(),
             delivery: PromptDelivery::Queue,
+            actor: EventActor::User,
         }]
     );
 }
@@ -9405,6 +9414,7 @@ fn child_history_hydration_keeps_unsettled_optimistic_prompt() {
         message_id: pending_id,
         text: "pending".to_string(),
         delivery: PromptDelivery::Queue,
+        actor: EventActor::User,
     }];
     let mut pending = Vec::new();
 
@@ -9415,11 +9425,86 @@ fn child_history_hydration_keeps_unsettled_optimistic_prompt() {
 }
 
 #[test]
+fn team_message_actor_correction_survives_child_hydration() {
+    let session_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let message = |sequence, actor, status| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id,
+                actor,
+                text: "Team message from /root/worker:\n\nreport".to_string(),
+                attachments: Vec::new(),
+                status,
+                delivery: Some(PromptDelivery::Queue),
+            },
+        )
+    };
+    let legacy = message(1, EventActor::User, MessageStatus::Queued);
+    let corrected = message(2, EventActor::System, MessageStatus::Queued);
+    let mut pending = pending_prompt_projection_from_events(&[legacy, corrected]);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].actor, EventActor::System);
+
+    let optimistic = vec![PendingPromptProjection {
+        actor: EventActor::User,
+        ..pending[0].clone()
+    }];
+    restore_optimistic_pending_prompts(&mut pending, &[], optimistic);
+    assert_eq!(pending[0].actor, EventActor::System);
+    assert!(!has_recallable_queued_prompts("", &pending));
+    let rendered = queued_prompt_lines(&pending, 80, None)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("queued updates wait for the next turn"));
+    assert!(!rendered.contains("esc send"));
+
+    update_queued_prompts(
+        &mut pending,
+        &message(3, EventActor::System, MessageStatus::InProgress).kind,
+        &mut None,
+    );
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn human_admission_does_not_hide_older_team_message() {
+    let system_id = Uuid::new_v4();
+    let user_id = Uuid::new_v4();
+    let mut pending = Vec::new();
+    let mut apply = |message_id, actor, status| {
+        update_queued_prompts(
+            &mut pending,
+            &SessionEventKind::Message {
+                message_id,
+                actor,
+                text: String::new(),
+                attachments: Vec::new(),
+                status,
+                delivery: Some(PromptDelivery::Queue),
+            },
+            &mut None,
+        );
+    };
+    apply(system_id, EventActor::System, MessageStatus::Queued);
+    apply(user_id, EventActor::User, MessageStatus::Queued);
+    apply(user_id, EventActor::User, MessageStatus::Complete);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].message_id, system_id);
+    assert_eq!(pending[0].actor, EventActor::System);
+}
+
+#[test]
 fn pending_prompt_recall_treats_whitespace_only_composer_as_empty() {
     let queued = PendingPromptProjection {
         message_id: Uuid::new_v4(),
         text: "pending".to_string(),
         delivery: PromptDelivery::Queue,
+        actor: EventActor::User,
     };
     assert!(has_recallable_queued_prompts(" \n", &[queued]));
 }
@@ -9430,6 +9515,7 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
         message_id: Uuid::new_v4(),
         text: "visible follow-up".to_string(),
         delivery: PromptDelivery::Queue,
+        actor: EventActor::User,
     }];
     let six = (0..6).map(|_| prompts[0].clone()).collect::<Vec<_>>();
     let seven = (0..7).map(|_| prompts[0].clone()).collect::<Vec<_>>();
@@ -9455,7 +9541,7 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
         .collect::<String>();
     assert!(content.contains("Next"));
     assert!(content.contains("visible follow-up"));
-    assert!(hint.contains("↑ edit / recall pending"));
+    assert!(hint.contains("↑ edit / recall input"));
 }
 
 #[test]
@@ -9465,6 +9551,7 @@ fn collapsed_pending_input_keeps_the_queue_count_and_reclaims_transcript_rows() 
             message_id: Uuid::new_v4(),
             text: "long pending input ".repeat(15),
             delivery: PromptDelivery::Queue,
+            actor: EventActor::User,
         })
         .collect::<Vec<_>>();
     assert!(queued_prompt_panel_height(&prompts, 80, true) > 20);
@@ -9519,6 +9606,7 @@ async fn pending_input_title_click_toggles_and_empty_queue_clears_hit_area() {
         message_id: Uuid::new_v4(),
         text: "visible follow-up".to_string(),
         delivery: PromptDelivery::Queue,
+        actor: EventActor::User,
     });
     let click = |area: Rect| TerminalInputEvent {
         event: Event::Mouse(MouseEvent {
@@ -9559,6 +9647,7 @@ fn pending_input_wraps_the_entire_prompt_instead_of_compacting_it() {
         message_id: Uuid::new_v4(),
         text: text.to_string(),
         delivery: PromptDelivery::Queue,
+        actor: EventActor::User,
     }];
     let lines = queued_prompt_lines(&prompts, 44, None);
     let rendered = lines
@@ -9578,6 +9667,7 @@ fn pending_steer_ui_uses_the_shared_next_label_and_live_flush_action() {
         message_id: Uuid::new_v4(),
         text: "focus on the failing test".to_string(),
         delivery: PromptDelivery::Steer,
+        actor: EventActor::User,
     }];
     let rendered = queued_prompt_lines(&prompts, 80, None)
         .into_iter()
@@ -9589,10 +9679,10 @@ fn pending_steer_ui_uses_the_shared_next_label_and_live_flush_action() {
     assert!(!rendered.contains("NEXT TOOL"));
     assert!(!rendered.contains("NEXT TURN"));
     assert!(rendered.contains("focus on the failing test"));
-    assert!(rendered.contains("esc send now · keep running"));
+    assert!(rendered.contains("esc send input · keep running"));
     // ↑ asks the session to recall the steer; it decides whether the provider
     // has acknowledged it yet.
-    assert!(rendered.contains("recall pending"));
+    assert!(rendered.contains("recall input"));
 }
 
 #[test]
@@ -9641,6 +9731,7 @@ async fn escape_flushes_only_pending_queue_and_keeps_the_composer_draft() {
         message_id: Uuid::new_v4(),
         text: "send this now".to_string(),
         delivery: PromptDelivery::Queue,
+        actor: EventActor::User,
     });
     terminal.composer.insert("unsent draft");
 
@@ -9676,6 +9767,7 @@ async fn escape_flushes_only_pending_queue_and_keeps_the_composer_draft() {
         message_id: Uuid::new_v4(),
         text: "recall me".to_string(),
         delivery: PromptDelivery::Queue,
+        actor: EventActor::User,
     });
     terminal.composer.clear();
     assert!(matches!(
@@ -9693,11 +9785,13 @@ fn up_recall_targets_all_queued_prompts_only_for_an_empty_composer() {
         message_id: Uuid::new_v4(),
         text: "edit me".to_string(),
         delivery: PromptDelivery::Queue,
+        actor: EventActor::User,
     };
     let steer = PendingPromptProjection {
         message_id: Uuid::new_v4(),
         text: "already submitted".to_string(),
         delivery: PromptDelivery::Steer,
+        actor: EventActor::User,
     };
 
     assert!(has_recallable_queued_prompts(
@@ -9715,6 +9809,7 @@ fn up_recall_targets_all_queued_prompts_only_for_an_empty_composer() {
             message_id: Uuid::new_v4(),
             text: "queued".to_string(),
             delivery: PromptDelivery::Queue,
+            actor: EventActor::User,
         }]
     ));
 
@@ -9722,6 +9817,7 @@ fn up_recall_targets_all_queued_prompts_only_for_an_empty_composer() {
         message_id: Uuid::new_v4(),
         text: "newer".to_string(),
         delivery: PromptDelivery::Queue,
+        actor: EventActor::User,
     };
     assert!(has_recallable_queued_prompts("", &[queued, newer]));
 }
@@ -9732,6 +9828,7 @@ fn up_asks_the_session_to_reconcile_a_pending_steer() {
         message_id: Uuid::new_v4(),
         text: "already submitted".to_string(),
         delivery: PromptDelivery::Steer,
+        actor: EventActor::User,
     };
 
     assert!(!has_recallable_queued_prompts(

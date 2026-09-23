@@ -413,6 +413,7 @@ struct PendingPromptProjection {
     message_id: Uuid,
     text: String,
     delivery: PromptDelivery,
+    actor: EventActor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -3173,6 +3174,7 @@ impl BorgTerminal {
                 pending.message_id,
                 pending.text,
                 pending.delivery,
+                pending.actor,
             );
         }
     }
@@ -3349,10 +3351,17 @@ impl BorgTerminal {
                 message_id,
                 text,
                 delivery,
+                EventActor::User,
             );
         } else {
             self.active_turn_followup = true;
-            push_queued_prompt(&mut self.queued_prompts, message_id, text, delivery);
+            push_queued_prompt(
+                &mut self.queued_prompts,
+                message_id,
+                text,
+                delivery,
+                EventActor::User,
+            );
         }
     }
 
@@ -3400,6 +3409,7 @@ impl BorgTerminal {
                 withheld.message_id,
                 withheld.text,
                 withheld.delivery,
+                withheld.actor,
             );
         }
     }
@@ -4434,7 +4444,9 @@ impl BorgTerminal {
     }
 
     fn has_pending_input_for_escape(&self) -> bool {
-        !self.active_queued_prompts().is_empty()
+        self.active_queued_prompts()
+            .iter()
+            .any(|prompt| prompt.actor == EventActor::User)
     }
 
     fn flush_pending_input(&mut self) -> UiAction {
@@ -9954,6 +9966,7 @@ impl BorgTerminal {
                         message_id,
                         text.clone(),
                         PromptDelivery::Queue,
+                        EventActor::User,
                     );
                     UiAction::Queue {
                         target: self.focused_child,
@@ -12525,6 +12538,7 @@ fn optimistic_idle_prompt_decision(
                 message_id: *message_id,
                 text: text.clone(),
                 delivery: *delivery,
+                actor: EventActor::User,
             })
         }
         SessionEventKind::TurnStarted { message_id, .. } if *message_id == optimistic => {
@@ -12556,7 +12570,7 @@ fn update_queued_prompts(
         }
         SessionEventKind::Message {
             message_id,
-            actor: EventActor::User,
+            actor: actor @ (EventActor::User | EventActor::System),
             text,
             status: MessageStatus::Queued,
             delivery: Some(delivery),
@@ -12571,11 +12585,12 @@ fn update_queued_prompts(
                         message_id: *message_id,
                         text: text.clone(),
                         delivery: *delivery,
+                        actor: *actor,
                     },
                 );
                 *cursor = at + 1;
             } else {
-                push_queued_prompt(queued_prompts, *message_id, text.clone(), *delivery);
+                push_queued_prompt(queued_prompts, *message_id, text.clone(), *delivery, *actor);
             }
             return;
         }
@@ -12586,7 +12601,7 @@ fn update_queued_prompts(
         SessionEventKind::TurnStarted { message_id, .. }
         | SessionEventKind::Message {
             message_id,
-            actor: EventActor::User,
+            actor: EventActor::User | EventActor::System,
             status: MessageStatus::InProgress,
             ..
         } => {
@@ -12596,7 +12611,7 @@ fn update_queued_prompts(
         }
         SessionEventKind::Message {
             message_id,
-            actor: EventActor::User,
+            actor: actor @ (EventActor::User | EventActor::System),
             status: MessageStatus::Complete,
             delivery,
             ..
@@ -12608,7 +12623,9 @@ fn update_queued_prompts(
                 if *delivery == Some(PromptDelivery::Queue) {
                     let mut index = 0;
                     queued_prompts.retain(|queued| {
-                        let retain = index > admitted || queued.delivery != PromptDelivery::Queue;
+                        let retain = index > admitted
+                            || queued.delivery != PromptDelivery::Queue
+                            || queued.actor != *actor;
                         index += 1;
                         retain
                     });
@@ -12616,10 +12633,12 @@ fn update_queued_prompts(
                     queued_prompts.remove(admitted);
                 }
             } else if *delivery == Some(PromptDelivery::Queue) {
-                // A later user prompt was admitted while older projected queue
-                // entries remained. FIFO admission makes older queued entries
-                // stale, while active-turn steers are independent.
-                queued_prompts.retain(|queued| queued.delivery != PromptDelivery::Queue);
+                // A later prompt of the same actor was admitted while older
+                // projected queue entries remained. Human input can bypass
+                // team updates, so only its own queue entries are stale.
+                queued_prompts.retain(|queued| {
+                    queued.delivery != PromptDelivery::Queue || queued.actor != *actor
+                });
             }
         }
         SessionEventKind::Message { message_id, .. }
@@ -12652,15 +12671,19 @@ fn restore_optimistic_pending_prompts(
     optimistic_pending: Vec<PendingPromptProjection>,
 ) {
     for pending in optimistic_pending {
-        if !events
+        if !queued_prompts
             .iter()
-            .any(|event| pending_prompt_projection_settled_by(event, pending.message_id))
+            .any(|queued| queued.message_id == pending.message_id)
+            && !events
+                .iter()
+                .any(|event| pending_prompt_projection_settled_by(event, pending.message_id))
         {
             push_queued_prompt(
                 queued_prompts,
                 pending.message_id,
                 pending.text,
                 pending.delivery,
+                pending.actor,
             );
         }
     }
@@ -12678,8 +12701,8 @@ fn pending_prompt_projection_settled_by(event: &SessionEvent, message_id: Uuid) 
         } => *event_message_id == message_id,
         SessionEventKind::Message {
             message_id: event_message_id,
-            actor: EventActor::User,
-            status: MessageStatus::Complete | MessageStatus::Failed,
+            actor: EventActor::User | EventActor::System,
+            status: MessageStatus::InProgress | MessageStatus::Complete | MessageStatus::Failed,
             ..
         } => *event_message_id == message_id,
         _ => false,
@@ -12691,6 +12714,7 @@ fn push_queued_prompt(
     message_id: Uuid,
     text: String,
     delivery: PromptDelivery,
+    actor: EventActor,
 ) {
     if let Some(queued) = queued_prompts
         .iter_mut()
@@ -12698,11 +12722,13 @@ fn push_queued_prompt(
     {
         queued.text = text;
         queued.delivery = delivery;
+        queued.actor = actor;
     } else {
         queued_prompts.push(PendingPromptProjection {
             message_id,
             text,
             delivery,
+            actor,
         });
     }
 }
@@ -12712,9 +12738,9 @@ fn has_recallable_queued_prompts(
     queued_prompts: &[PendingPromptProjection],
 ) -> bool {
     composer_text.trim().is_empty()
-        && queued_prompts
-            .iter()
-            .any(|prompt| prompt.delivery == PromptDelivery::Queue)
+        && queued_prompts.iter().any(|prompt| {
+            prompt.actor == EventActor::User && prompt.delivery == PromptDelivery::Queue
+        })
 }
 
 fn has_pending_steer_prompts(
@@ -12722,9 +12748,9 @@ fn has_pending_steer_prompts(
     queued_prompts: &[PendingPromptProjection],
 ) -> bool {
     composer_text.trim().is_empty()
-        && queued_prompts
-            .iter()
-            .any(|prompt| prompt.delivery == PromptDelivery::Steer)
+        && queued_prompts.iter().any(|prompt| {
+            prompt.actor == EventActor::User && prompt.delivery == PromptDelivery::Steer
+        })
 }
 
 fn queued_prompt_panel_height(
@@ -12834,14 +12860,21 @@ fn queued_prompt_lines(
     }
     let has_steers = queued_prompts
         .iter()
-        .any(|prompt| prompt.delivery == PromptDelivery::Steer);
+        .any(|prompt| prompt.actor == EventActor::User && prompt.delivery == PromptDelivery::Steer);
     let has_queue = queued_prompts
         .iter()
-        .any(|prompt| prompt.delivery == PromptDelivery::Queue);
+        .any(|prompt| prompt.actor == EventActor::User && prompt.delivery == PromptDelivery::Queue);
     let mut hints = Vec::new();
     if has_queue || has_steers {
-        hints.push("esc send now · keep running");
-        hints.push("↑ edit / recall pending");
+        hints.push("esc send input · keep running");
+        hints.push("↑ edit / recall input");
+    } else if queued_prompts
+        .iter()
+        .any(|prompt| prompt.delivery == PromptDelivery::Steer)
+    {
+        hints.push("team update awaits provider");
+    } else {
+        hints.push("queued updates wait for the next turn");
     }
     lines.push(Line::from(Span::styled(
         format!("   {}", hints.join("  ·  ")),
