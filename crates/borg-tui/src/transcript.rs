@@ -348,8 +348,13 @@ fn billing_status_for(
 }
 
 impl SessionDisplayConfig {
-    fn cache_signature(&self) -> CacheSignature {
-        CacheSignature::new(self.provider, self.model.as_deref(), self.effort.as_deref())
+    fn cache_signature(&self, claude_direct_auth: bool) -> CacheSignature {
+        CacheSignature::for_session(
+            self.provider,
+            self.model.as_deref(),
+            self.effort.as_deref(),
+            claude_direct_auth,
+        )
     }
 }
 
@@ -361,8 +366,13 @@ struct ActiveTurnDisplayConfig {
 }
 
 impl ActiveTurnDisplayConfig {
-    fn cache_signature(&self) -> CacheSignature {
-        CacheSignature::new(self.provider, self.model.as_deref(), self.effort.as_deref())
+    fn cache_signature(&self, claude_direct_auth: bool) -> CacheSignature {
+        CacheSignature::for_session(
+            self.provider,
+            self.model.as_deref(),
+            self.effort.as_deref(),
+            claude_direct_auth,
+        )
     }
 }
 
@@ -1382,15 +1392,16 @@ impl Transcript {
                         .as_ref()
                         .is_some_and(|active| active.message_id == turn_id)
                 });
+                let claude_direct_auth = self.claude_direct_auth();
                 if usage_belongs_to_active_turn
                     && let Some(signature) = self
                         .active_turn
                         .as_ref()
-                        .map(ActiveTurnDisplayConfig::cache_signature)
+                        .map(|active| active.cache_signature(claude_direct_auth))
                         .or_else(|| {
                             self.config
                                 .as_ref()
-                                .map(SessionDisplayConfig::cache_signature)
+                                .map(|config| config.cache_signature(claude_direct_auth))
                         })
                     && let Some(notice) = self.cache_diagnostics.observe(
                         event.created_at,
@@ -3374,8 +3385,21 @@ impl Transcript {
         if self.active_turn.is_some() {
             return None;
         }
-        let signature = self.config.as_ref()?.cache_signature();
+        let signature = self
+            .config
+            .as_ref()?
+            .cache_signature(self.claude_direct_auth());
         self.cache_diagnostics.status(now, &signature)
+    }
+
+    fn claude_direct_auth(&self) -> bool {
+        self.provider_capabilities.iter().any(|capability| {
+            capability.provider == CodingProvider::Claude
+                && matches!(
+                    capability.billing,
+                    Some(borg_remote::BillingLane::Subscription | borg_remote::BillingLane::ApiKey)
+                )
+        })
     }
 
     fn active_subagent_count(&self) -> usize {

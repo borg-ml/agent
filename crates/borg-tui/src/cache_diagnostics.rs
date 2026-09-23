@@ -25,6 +25,7 @@ pub(super) struct CacheSignature {
     provider: CodingProvider,
     model: Option<String>,
     effort: Option<String>,
+    effort_can_reuse_cache: bool,
 }
 
 impl CacheSignature {
@@ -33,7 +34,30 @@ impl CacheSignature {
             provider,
             model: model.map(str::to_string),
             effort: effort.map(str::to_string),
+            effort_can_reuse_cache: false,
         }
+    }
+
+    pub(super) fn for_session(
+        provider: CodingProvider,
+        model: Option<&str>,
+        effort: Option<&str>,
+        claude_direct_auth: bool,
+    ) -> Self {
+        let effort_can_reuse_cache = claude_direct_auth
+            && provider == CodingProvider::Claude
+            && matches!(model, Some("claude-opus-5-5" | "claude-fable-5-1"));
+        Self {
+            effort_can_reuse_cache,
+            ..Self::new(provider, model, effort)
+        }
+    }
+
+    fn same_cache_identity(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && self.model == other.model
+            && (self.effort == other.effort
+                || (self.effort_can_reuse_cache && other.effort_can_reuse_cache))
     }
 }
 
@@ -162,7 +186,7 @@ impl CacheDiagnostics {
             // follow-up into another loud miss card, so announce only at a real
             // boundary (signature change, cache expiry, or a measured Borg
             // replay) or when the cached prefix itself shrank.
-            let same_signature = previous.signature == signature;
+            let same_signature = previous.signature.same_cache_identity(&signature);
             let within_cache_window = cache_window(signature.provider)
                 .is_none_or(|window| elapsed(previous.at, at) < window);
             let boundary = !same_signature
@@ -256,6 +280,15 @@ impl CacheDiagnostics {
         }
         let model_changed = previous.signature.model != signature.model;
         let effort_changed = previous.signature.effort != signature.effort;
+        if effort_changed
+            && !model_changed
+            && previous.signature.effort_can_reuse_cache
+            && signature.effort_can_reuse_cache
+        {
+            // The next turn may reuse its prefix; its first usage report will
+            // tell us whether it did. The previous hit rate is stale here.
+            return None;
+        }
         if model_changed || effort_changed {
             let changed = match (model_changed, effort_changed) {
                 (true, true) => "model + effort changed",
@@ -413,10 +446,9 @@ fn cache_miss_cause(
     if previous.signature.provider != current.provider {
         return CacheMissCause::ProviderChanged;
     }
-    match (
-        previous.signature.model != current.model,
-        previous.signature.effort != current.effort,
-    ) {
+    let effort_changed = previous.signature.effort != current.effort
+        && !(previous.signature.effort_can_reuse_cache && current.effort_can_reuse_cache);
+    match (previous.signature.model != current.model, effort_changed) {
         (true, true) => return CacheMissCause::ModelAndEffortChanged,
         (true, false) => return CacheMissCause::ModelChanged,
         (false, true) => return CacheMissCause::EffortChanged,
@@ -761,6 +793,84 @@ mod tests {
             )
             .expect("observed miss");
         assert_eq!(notice.cause, CacheMissCause::ModelAndEffortChanged);
+    }
+
+    #[test]
+    fn direct_claude_effort_switch_waits_for_measured_cache_usage() {
+        let at = Utc::now();
+        for model in ["claude-opus-5-5", "claude-fable-5-1"] {
+            let at_medium = CacheSignature::for_session(
+                CodingProvider::Claude,
+                Some(model),
+                Some("medium"),
+                true,
+            );
+            let at_xhigh = CacheSignature::for_session(
+                CodingProvider::Claude,
+                Some(model),
+                Some("xhigh"),
+                true,
+            );
+            let mut diagnostics = CacheDiagnostics::default();
+            let mut warm = usage(1_000, 99_000);
+            warm.context_tokens = Some(100_000);
+            diagnostics.observe(at, at_medium.clone(), warm);
+            let mut warm = usage(1_000, 99_000);
+            warm.context_tokens = Some(100_000);
+            diagnostics.observe(at + TimeDelta::seconds(1), at_medium.clone(), warm);
+
+            assert!(
+                diagnostics
+                    .status(at + TimeDelta::seconds(2), &at_xhigh)
+                    .is_none(),
+                "{model}: prior cache measurement is stale after an effort switch"
+            );
+            let mut warm = usage(1_000, 99_000);
+            warm.context_tokens = Some(100_000);
+            assert!(
+                diagnostics
+                    .observe(at + TimeDelta::seconds(3), at_xhigh.clone(), warm)
+                    .is_none(),
+                "{model}: an effort change alone is not a measured miss"
+            );
+            assert_eq!(
+                diagnostics
+                    .status(at + TimeDelta::seconds(3), &at_xhigh)
+                    .as_ref()
+                    .map(|status| status.label.as_str()),
+                Some("cache 99% hit")
+            );
+
+            let mut cold = usage(100_000, 0);
+            cold.context_tokens = Some(100_000);
+            assert!(
+                diagnostics
+                    .status(at + TimeDelta::seconds(4), &at_medium)
+                    .is_none()
+            );
+            let notice = diagnostics
+                .observe(at + TimeDelta::seconds(4), at_medium, cold)
+                .expect("measured cache loss must still warn");
+            assert_eq!(
+                notice.cause,
+                CacheMissCause::Unknown,
+                "{model}: do not misattribute the measured loss to effort"
+            );
+
+            let unknown_route_medium = CacheSignature::for_session(
+                CodingProvider::Claude,
+                Some(model),
+                Some("medium"),
+                false,
+            );
+            let unknown_route_xhigh = CacheSignature::for_session(
+                CodingProvider::Claude,
+                Some(model),
+                Some("xhigh"),
+                false,
+            );
+            assert_ne!(unknown_route_medium, unknown_route_xhigh);
+        }
     }
 
     #[test]
