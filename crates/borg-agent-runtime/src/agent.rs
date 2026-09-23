@@ -425,6 +425,7 @@ pub trait AgentTurnExecutor: Send + Sync {
         anyhow::bail!("manual context compaction is not supported by this provider")
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn compact_native(
         &self,
         _access: ModelAccessContext,
@@ -1362,6 +1363,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn compact_native(
         &self,
         access: ModelAccessContext,

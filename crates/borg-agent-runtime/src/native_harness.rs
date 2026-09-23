@@ -871,6 +871,45 @@ impl NativeHarness {
                     assistant_message_id = Uuid::new_v4();
                     continue;
                 }
+                let budget =
+                    native_context_budget(&result.usage, &messages, result.usage.output_tokens);
+                if budget.context_source == "provider"
+                    && budget.window_source == "provider"
+                    && budget
+                        .context_tokens
+                        .saturating_add(IN_PLACE_COMPACTION_HEADROOM_TOKENS)
+                        <= budget.context_window_tokens
+                    && budget.needs_auto_compaction(&self.compaction_budget(
+                        turn.provider,
+                        &model,
+                        budget.context_window_tokens,
+                    ))
+                {
+                    let compacted = self
+                        .compact_context_if_needed(
+                            &turn,
+                            &model,
+                            "final_answer_context_threshold",
+                            budget,
+                            NativeCompactionContext {
+                                messages: &mut messages,
+                                usage: &mut usage,
+                                warmer: warmer.as_ref(),
+                                events: &events,
+                                earlier_tool_calls: &earlier_tool_calls,
+                                prefix: &request_template,
+                                force: false,
+                            },
+                        )
+                        .await;
+                    if let Err(error) = compacted {
+                        tracing::warn!(%error, "post-answer context compaction failed; answer preserved");
+                        usage.context_tokens = Some(budget.context_tokens);
+                    } else {
+                        usage.context_tokens = Some(estimated_messages_tokens(&messages));
+                    }
+                    usage.context_window_tokens = Some(budget.context_window_tokens);
+                }
                 send_usage(&events, &usage, Some(turn.message_id)).await;
                 send(
                     &events,
@@ -1278,6 +1317,7 @@ impl NativeHarness {
         workflows
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn compact(
         &self,
         provider: crate::CodingProvider,
@@ -1746,10 +1786,10 @@ impl NativeHarness {
 /// reasoning and checkpoint.
 const IN_PLACE_COMPACTION_HEADROOM_TOKENS: u64 = 16_384;
 
-fn internal_compaction_effort<'a>(
+fn internal_compaction_effort(
     provider: crate::CodingProvider,
-    effort: Option<&'a str>,
-) -> Option<&'a str> {
+    effort: Option<&str>,
+) -> Option<&str> {
     if provider == crate::CodingProvider::Codex && matches!(effort, Some("max" | "xhigh" | "ultra"))
     {
         Some("high")
@@ -7156,6 +7196,174 @@ mod tests {
                 if kind == "context_compaction"
                     && payload["status"] == "completed"
                     && payload["in_place"] == true)));
+    }
+
+    #[tokio::test]
+    async fn final_answer_compaction_replays_once_and_failure_keeps_the_answer() {
+        const WINDOW: u64 = 200_000;
+        struct FinalClient {
+            reject_compaction: bool,
+            requests: Mutex<Vec<ModelTurnRequest>>,
+        }
+        #[async_trait]
+        impl NativeModelClient for FinalClient {
+            async fn context_window(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+            ) -> Option<u64> {
+                Some(WINDOW)
+            }
+
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                request: ModelTurnRequest,
+                _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                let compacting = request
+                    .request_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("compact:"));
+                self.requests.lock().unwrap().push(request);
+                if compacting && self.reject_compaction {
+                    return Err(ProviderCallError {
+                        message: "compaction unavailable".into(),
+                        trace: Box::new(ProviderAttemptTrace::default()),
+                        session_id: None,
+                        kind: borg_provider::provider::ProviderErrorKind::ConnectionLost,
+                    });
+                }
+                Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(
+                        Some(
+                            if compacting {
+                                "checkpoint"
+                            } else {
+                                "final answer"
+                            }
+                            .into(),
+                        ),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    finish_reason: "stop".into(),
+                    usage: ProviderCallUsage {
+                        output_tokens: 1_000,
+                        context_tokens: Some(if compacting { 500 } else { 180_000 }),
+                        context_window_tokens: Some(WINDOW),
+                        ..Default::default()
+                    },
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+
+        for reject_compaction in [false, true] {
+            let client = Arc::new(FinalClient {
+                reject_compaction,
+                requests: Mutex::new(Vec::new()),
+            });
+            let session_id = Uuid::new_v4();
+            let root = tempfile::tempdir().unwrap();
+            let (events, completed) = run_turn_events(
+                client.clone(),
+                root.path().to_path_buf(),
+                session_id,
+                Vec::new(),
+                HashMap::new(),
+                "important question",
+                "",
+                "",
+            )
+            .await;
+            assert!(
+                completed,
+                "the answered turn must complete even if compaction fails"
+            );
+            let requests = client.requests.lock().unwrap();
+            assert!(
+                requests.len() >= 2,
+                "final answer should trigger compaction"
+            );
+            assert_eq!(requests[1].session_id, requests[0].session_id);
+            assert_eq!(requests[1].prompt_cache_key, requests[0].prompt_cache_key);
+            assert!(events.iter().any(|event| matches!(event,
+                SessionEventKind::Message { actor: EventActor::Assistant, text, .. }
+                    if text == "final answer")));
+            let completed_compaction = events.iter().any(|event| {
+                matches!(event,
+                SessionEventKind::ProviderEvent { kind, payload, .. }
+                    if kind == "context_compaction"
+                        && payload["status"] == "completed"
+                        && payload["trigger"] == "final_answer_context_threshold"
+                        && payload["in_place"] == true)
+            });
+            assert_eq!(completed_compaction, !reject_compaction);
+            let last_usage_context = events.iter().rev().find_map(|event| match event {
+                SessionEventKind::UsageUpdated { context_tokens, .. } => *context_tokens,
+                _ => None,
+            });
+            if reject_compaction {
+                assert!(events.iter().any(|event| matches!(event,
+                    SessionEventKind::ProviderEvent { kind, .. }
+                        if kind == "context_compaction_failed")));
+                assert_eq!(last_usage_context, Some(181_000));
+            } else {
+                let reduced_context = events.iter().find_map(|event| match event {
+                    SessionEventKind::ContextWindowUpdated { context_tokens, .. } => {
+                        Some(*context_tokens)
+                    }
+                    _ => None,
+                });
+                assert_eq!(last_usage_context, reduced_context);
+                assert!(last_usage_context.unwrap() < 100_000);
+            }
+
+            let mut journal = vec![SessionEvent::new(
+                session_id,
+                1,
+                SessionEventKind::TurnStarted {
+                    message_id: Uuid::new_v4(),
+                    provider: crate::CodingProvider::OpenRouter,
+                    model: Some("test-model".into()),
+                    effort: None,
+                    fast: true,
+                },
+            )];
+            for event in &events {
+                if event.persistence() == crate::session_store::EventPersistence::Durable
+                    && event.is_context_relevant()
+                {
+                    journal.push(SessionEvent::new(
+                        session_id,
+                        journal.len() as u64 + 1,
+                        event.clone(),
+                    ));
+                }
+            }
+            let replay =
+                crate::session::native_conversation(&journal, crate::CodingProvider::OpenRouter)
+                    .unwrap();
+            assert_eq!(
+                replay
+                    .iter()
+                    .filter(|message| matches!(message,
+                    ModelMessage::Assistant { content: Some(text), .. }
+                        if text == "final answer"))
+                    .count(),
+                1
+            );
+            if !reject_compaction {
+                assert!(replay.iter().any(|message| matches!(message,
+                    ModelMessage::User { content, .. }
+                        if content.contains("Previous conversation summary:\n\ncheckpoint"))));
+            }
+        }
     }
 
     #[tokio::test]
