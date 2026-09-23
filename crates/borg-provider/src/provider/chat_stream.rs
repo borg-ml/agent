@@ -1901,10 +1901,10 @@ fn claude_command_args(
         "stream-json".to_string(),
         "--verbose".to_string(),
         "--include-partial-messages".to_string(),
-        // Delegation and monitoring go through Borg's own tools so every
-        // provider shares one implementation, journal, and UI.
-        "--disallowedTools".to_string(),
-        "Agent,Task,Monitor,Watch".to_string(),
+        // Claude Code is the subscription transport; Borg is the agent. Every
+        // tool the model can call is Borg's, served from --mcp-config.
+        "--tools".to_string(),
+        String::new(),
     ];
     if permission == LocalAgentPermission::FullAccess {
         args.push("--dangerously-skip-permissions".to_string());
@@ -1916,6 +1916,11 @@ fn claude_command_args(
                 LocalAgentPermission::Manual => "manual".to_string(),
                 LocalAgentPermission::FullAccess => unreachable!(),
             },
+            // Borg asks before it runs a command or changes a file; Claude Code
+            // asking first as well would ask twice.
+            "--allowedTools".to_string(),
+            "mcp__borg_agent__exec,mcp__borg_agent__write_file,mcp__borg_agent__edit_file"
+                .to_string(),
         ]);
     }
     if request.persist_session == Some(false) {
@@ -2151,10 +2156,12 @@ mod tests {
                 "stream-json",
                 "--verbose",
                 "--include-partial-messages",
-                "--disallowedTools",
-                "Agent,Task,Monitor,Watch",
+                "--tools",
+                "",
                 "--permission-mode",
                 "manual",
+                "--allowedTools",
+                "mcp__borg_agent__exec,mcp__borg_agent__write_file,mcp__borg_agent__edit_file",
                 "--no-session-persistence",
                 "--resume",
                 "session-1",

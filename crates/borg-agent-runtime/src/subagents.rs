@@ -42,7 +42,7 @@ const ROOT_MESSAGE_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const RUNTIME_DEFAULT_FILE_BYTES: u64 = 256 * 1024;
 const RUNTIME_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const RUNTIME_DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
-const RUNTIME_MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+pub(crate) const RUNTIME_MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 const MAX_RUNTIME_HOST_CALLS: usize = 128;
 const DEFAULT_PERSISTENT_PEER_CONSULTATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MIN_PERSISTENT_PEER_CONSULTATION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -230,6 +230,9 @@ pub struct AgentToolDispatcher {
     tool_approvals: Arc<RwLock<Option<crate::session::SessionToolApprovals>>>,
     resource_limits: Option<HostResourceLimits>,
     execution_provider: Arc<RwLock<Arc<dyn crate::ExecutionProvider>>>,
+    /// Environment for commands the model runs through Borg's shell tools, so
+    /// a shell reaches this session with `borg call` and `borg image`.
+    command_environment: Arc<RwLock<BTreeMap<String, String>>>,
     persistent_runtimes: PersistentRuntimeRegistry,
     #[cfg(unix)]
     lanes: crate::lane_tools::LaneTools,
@@ -500,27 +503,6 @@ impl AgentToolServer {
                 .and_then(|value| value.as_str().map(str::to_string))
                 .context("provider does not serialize to a string")?,
         );
-        if let Some(policy) = &self.team_policy
-            && let Ok(policy) = serde_json::to_string(policy)
-        {
-            env.insert("BORG_AGENT_TEAM_POLICY".to_string(), policy);
-        }
-        env.insert(
-            "BORG_AGENT_SHARED_WORK_ENABLED".to_string(),
-            self.shared_work_enabled.to_string(),
-        );
-        env.insert(
-            "BORG_AGENT_CONSULTATION_ENABLED".to_string(),
-            self.consultation_enabled.to_string(),
-        );
-        env.insert(
-            "BORG_AGENT_DESKTOP_ENABLED".to_string(),
-            self.desktop_enabled.to_string(),
-        );
-        env.insert(
-            "BORG_AGENT_WATCHER_YIELD_ENABLED".to_string(),
-            self.watcher_yield_enabled.to_string(),
-        );
         #[cfg(unix)]
         env.insert(
             "BORG_AGENT_TOOL_SOCKET".to_string(),
@@ -656,7 +638,12 @@ async fn serve_agent_tool_connection<S>(
                 json!({ "error": "agent tool authentication failed" })
             }
             Ok(request) if request.name == "__borg_tools" => {
-                json!({ "result": dispatcher.specs() })
+                let workspace_tools = request
+                    .arguments
+                    .get("workspace_tools")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                json!({ "result": dispatcher.mcp_specs(workspace_tools) })
             }
             Ok(request) => {
                 let cancel = shutdown.child_token();
@@ -837,6 +824,7 @@ impl AgentToolDispatcher {
             tool_approvals: Arc::new(RwLock::new(None)),
             resource_limits: None,
             execution_provider: Arc::new(RwLock::new(execution_provider)),
+            command_environment: Arc::new(RwLock::new(BTreeMap::new())),
             persistent_runtimes: PersistentRuntimeRegistry::default(),
             #[cfg(unix)]
             lanes: crate::lane_tools::LaneTools::default(),
@@ -920,6 +908,138 @@ impl AgentToolDispatcher {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    pub(crate) fn configure_command_environment(&self, environment: BTreeMap<String, String>) {
+        *self
+            .command_environment
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = environment;
+    }
+
+    /// Borg's shell: `exec` starts a command or drives a running one, and the
+    /// native catalog's `exec_command`/`write_stdin` pair splits the same
+    /// operations. Every provider's commands run here, so they share one
+    /// process registry, journal and cancellation path. The caller has already
+    /// applied the session's permission policy.
+    pub(crate) async fn shell_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+        cancellation: Option<CancellationToken>,
+    ) -> Result<Value> {
+        let execution_provider = self.execution_provider();
+        if let Some(journal) = self.journal.clone() {
+            execution_provider
+                .recover_session(self.actor_session_id, journal)
+                .await?;
+        }
+        let (command, stdin) = match name {
+            "exec" => {
+                let args: RuntimeExecArgs = serde_json::from_value(arguments)?;
+                match (args.cmd, args.session_id) {
+                    (Some(cmd), None) => {
+                        ensure!(
+                            args.chars.is_none() && args.terminate.is_none(),
+                            "exec command calls do not accept `chars` or `terminate`"
+                        );
+                        let command = RuntimeExecCommandArgs {
+                            cmd,
+                            workdir: args.workdir,
+                            yield_time_ms: args.yield_time_ms,
+                            max_output_tokens: args.max_output_tokens,
+                            timeout_ms: args.timeout_ms,
+                        };
+                        (Some(command), None)
+                    }
+                    (None, Some(session_id)) => {
+                        ensure!(
+                            args.workdir.is_none() && args.timeout_ms.is_none(),
+                            "exec process calls do not accept `workdir` or `timeout_ms`"
+                        );
+                        let stdin = RuntimeWriteStdinArgs {
+                            session_id,
+                            chars: args.chars,
+                            yield_time_ms: args.yield_time_ms,
+                            max_output_tokens: args.max_output_tokens,
+                            terminate: args.terminate,
+                        };
+                        (None, Some(stdin))
+                    }
+                    _ => bail!("exec requires exactly one of `cmd` or `session_id`"),
+                }
+            }
+            "exec_command" => (Some(serde_json::from_value(arguments)?), None),
+            "write_stdin" => (None, Some(serde_json::from_value(arguments)?)),
+            other => bail!("{other} is not a shell tool"),
+        };
+        if let Some(args) = stdin {
+            return Ok(serde_json::to_value(
+                execution_provider
+                    .write_stdin(crate::ExecutionStdinRequest {
+                        owner_session_id: self.actor_session_id,
+                        process_id: args.session_id,
+                        chars: args.chars,
+                        terminate: args.terminate.unwrap_or(false),
+                        yield_time_ms: args.yield_time_ms,
+                        max_output_tokens: args.max_output_tokens,
+                    })
+                    .await?,
+            )?);
+        }
+        let args = command.expect("a shell call is a command or a process write");
+        let sleep_seconds = bare_sleep_seconds(&args.cmd);
+        let environment = self
+            .command_environment
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut result = serde_json::to_value(
+            execution_provider
+                .command(crate::ExecutionCommandRequest {
+                    owner_session_id: self.actor_session_id,
+                    root: self.runtime_root.clone(),
+                    command: args.cmd,
+                    workdir: args.workdir,
+                    yield_time_ms: args.yield_time_ms,
+                    max_output_tokens: args.max_output_tokens,
+                    timeout_ms: args
+                        .timeout_ms
+                        .unwrap_or(RUNTIME_DEFAULT_COMMAND_TIMEOUT_MS)
+                        .clamp(1, RUNTIME_MAX_COMMAND_TIMEOUT_MS),
+                    journal: self.journal.clone(),
+                    environment,
+                    cancellation,
+                })
+                .await?,
+        )?;
+        // Measured orchestrators spent hours in `sleep 300; echo waited` while
+        // children worked. Not refused, since a timed pause can be legitimate,
+        // but pointed at the wait that returns on the child's own progress.
+        if sleep_seconds.is_some_and(|seconds| seconds >= 60)
+            && self.has_working_children().await
+            && let Some(result) = result.as_object_mut()
+        {
+            result.insert(
+                "hint".to_string(),
+                json!("Child agents are working. Wait for them with `wait_agent` instead of shell sleeps: one call blocks up to 30 minutes and returns as soon as a child finishes, fails, or messages you."),
+            );
+        }
+        Ok(result)
+    }
+
+    /// The catalog served to a provider CLI over MCP. `workspace_tools` adds
+    /// Borg's shell and file-mutation tools for a CLI whose own built-in tools
+    /// are disabled, so that Borg executes every command and edit.
+    pub fn mcp_specs(&self, workspace_tools: bool) -> Vec<Value> {
+        let mut specs = self.specs();
+        if workspace_tools {
+            let mut workspace = vec![exec_tool_spec()];
+            workspace.extend(file_mutation_tool_specs());
+            add_action_metadata(&mut workspace);
+            specs.extend(workspace);
+        }
+        specs
     }
 
     /// Configure the external MCP grant for the session without starting any
@@ -1337,10 +1457,12 @@ impl AgentToolDispatcher {
     ) -> Result<Value> {
         let mut workflow_approved = workflow_approved;
         let trusted_settings = crate::self_service::trusted_settings_sections(name, &arguments);
+        let workspace_effect = workspace_effect(name, &arguments);
         if (matches!(
             name,
             "runtime_exec" | "computer_use" | "lane_job" | "lane_service"
-        ) || !trusted_settings.is_empty())
+        ) || workspace_effect.is_some()
+            || !trusted_settings.is_empty())
             && !workflow_approved
             && self.runtime_permission != crate::PermissionMode::FullAccess
         {
@@ -1357,16 +1479,21 @@ impl AgentToolDispatcher {
                 trusted_settings.join(", ")
             );
             if let Some(approvals) = approvals {
-                let detail = serde_json::to_string(&arguments)?;
+                let (title, detail) = match workspace_effect {
+                    Some((title, detail)) => (title.to_string(), detail),
+                    None if trusted_settings.is_empty() => (
+                        format!("Use Borg {name}"),
+                        serde_json::to_string(&arguments)?,
+                    ),
+                    None => (
+                        format!("Change trusted settings [{}]", trusted_settings.join(", ")),
+                        serde_json::to_string(&arguments)?,
+                    ),
+                };
                 ensure!(
                     detail.len() <= crate::MAX_HOOK_ARGUMENT_BYTES,
                     "tool request is too large to display for approval; split it into smaller calls"
                 );
-                let title = if trusted_settings.is_empty() {
-                    format!("Use Borg {name}")
-                } else {
-                    format!("Change trusted settings [{}]", trusted_settings.join(", "))
-                };
                 let request = approvals.request(title, detail);
                 let decision = if let Some(cancel) = &workflow_cancel {
                     tokio::select! {
@@ -1598,6 +1725,20 @@ impl AgentToolDispatcher {
             "read_file" | "search_files" | "list_files" => {
                 self.read_workspace_tool(self.execution_provider().as_ref(), name, arguments)
                     .await
+            }
+            "exec" | "exec_command" | "write_stdin" | "write_file" | "edit_file" => {
+                ensure!(
+                    workflow_approved
+                        || self.runtime_permission == crate::PermissionMode::FullAccess
+                        || workspace_effect(name, &arguments).is_none(),
+                    "{name} requires Full Access or an explicit approval"
+                );
+                if matches!(name, "write_file" | "edit_file") {
+                    self.mutate_workspace_tool(self.execution_provider().as_ref(), name, arguments)
+                        .await
+                } else {
+                    self.shell_tool(name, arguments, workflow_cancel).await
+                }
             }
             "watch" => {
                 ensure!(
@@ -7567,6 +7708,19 @@ struct RuntimeExecCommandArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RuntimeExecArgs {
+    cmd: Option<String>,
+    session_id: Option<Uuid>,
+    chars: Option<String>,
+    terminate: Option<bool>,
+    workdir: Option<String>,
+    yield_time_ms: Option<u64>,
+    max_output_tokens: Option<usize>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuntimeWriteStdinArgs {
     session_id: Uuid,
     chars: Option<String>,
@@ -8232,6 +8386,129 @@ fn add_action_metadata(specs: &mut [Value]) {
 
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({ "name": name, "description": description, "inputSchema": input_schema })
+}
+
+/// What a shell or file tool call would change, as an approval title and
+/// detail. Polling or writing to a process that was already approved is not a
+/// new effect.
+fn workspace_effect(name: &str, arguments: &Value) -> Option<(&'static str, String)> {
+    use crate::native_harness::{MAX_APPROVAL_DETAIL_BYTES, bounded_text};
+    let field = |key: &str| {
+        arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    match name {
+        "exec" | "exec_command" => arguments.get("cmd").and_then(Value::as_str).map(|cmd| {
+            (
+                "Run command",
+                bounded_text(cmd.to_string(), MAX_APPROVAL_DETAIL_BYTES),
+            )
+        }),
+        "write_file" => Some(("Write file", field("path"))),
+        "edit_file" => Some((
+            "Edit file",
+            format!(
+                "{}\n- {}\n+ {}",
+                field("path"),
+                bounded_text(field("old_text"), MAX_APPROVAL_DETAIL_BYTES / 2),
+                bounded_text(field("new_text"), MAX_APPROVAL_DETAIL_BYTES / 2),
+            ),
+        )),
+        _ => None,
+    }
+}
+
+/// Borg's single shell tool: start a command, or poll, interact with, or
+/// terminate one that is still running.
+pub(crate) fn exec_tool_spec() -> Value {
+    tool(
+        "exec",
+        "Run a shell command, or poll, interact with, or terminate a running process. Shell commands may invoke any installed language runtime. Use `borg tools` and `borg call NAME JSON` inside the shell for Borg and Blu capabilities.",
+        json!({
+            "type": "object",
+            "properties": {
+                "cmd": { "type": "string", "minLength": 1, "maxLength": 65536 },
+                "session_id": { "type": "string", "format": "uuid" },
+                "chars": { "type": "string" },
+                "terminate": { "type": "boolean", "default": false },
+                "workdir": { "type": "string" },
+                "yield_time_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 30000
+                },
+                "max_output_tokens": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 64000
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": RUNTIME_MAX_COMMAND_TIMEOUT_MS
+                }
+            },
+            "oneOf": [
+                { "required": ["cmd"] },
+                { "required": ["session_id"] }
+            ],
+            "additionalProperties": false
+        }),
+    )
+}
+
+pub(crate) fn file_mutation_tool_specs() -> Vec<Value> {
+    vec![
+        tool(
+            "write_file",
+            "Create or deliberately overwrite a UTF-8 workspace file.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "minLength": 1 },
+                    "content": { "type": "string" },
+                    "overwrite": { "type": "boolean", "default": false },
+                    "create_parent_dirs": { "type": "boolean", "default": true }
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "edit_file",
+            "Replace an exact text span in one workspace file; ambiguous matches fail unless replace_all is explicit.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "minLength": 1 },
+                    "old_text": { "type": "string", "minLength": 1 },
+                    "new_text": { "type": "string" },
+                    "replace_all": { "type": "boolean", "default": false }
+                },
+                "required": ["path", "old_text", "new_text"],
+                "additionalProperties": false
+            }),
+        ),
+    ]
+}
+
+/// Seconds slept by a command that does nothing but sleep, optionally
+/// followed by an `echo`: the blind-wait shape, not a pause inside real work.
+fn bare_sleep_seconds(command: &str) -> Option<u64> {
+    static BARE_SLEEP: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"^\s*sleep\s+(\d+)([smh]?)\s*(?:(?:;|&&)\s*echo\b[^;&|]*)?;?\s*$")
+            .expect("valid sleep pattern")
+    });
+    let captures = BARE_SLEEP.captures(command)?;
+    let amount = captures[1].parse::<u64>().ok()?;
+    Some(match &captures[2] {
+        "m" => amount.saturating_mul(60),
+        "h" => amount.saturating_mul(3600),
+        _ => amount,
+    })
 }
 
 fn lsp_path_schema() -> Value {

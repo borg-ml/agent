@@ -291,52 +291,23 @@ enum AgentToolEndpoint {
     Unix {
         socket: PathBuf,
         provider: borg_remote::CodingProvider,
-        shared_work_enabled: bool,
-        consultation_enabled: bool,
-        team_policy: Option<borg_remote::TeamPolicy>,
     },
     #[cfg(not(unix))]
     Loopback {
         address: std::net::SocketAddr,
         token: String,
         provider: borg_remote::CodingProvider,
-        shared_work_enabled: bool,
-        consultation_enabled: bool,
-        team_policy: Option<borg_remote::TeamPolicy>,
     },
 }
 
 impl AgentToolEndpoint {
     fn from_env() -> Result<Self> {
         let provider = agent_tool_provider()?;
-        let team_policy = std::env::var("BORG_AGENT_TEAM_POLICY")
-            .ok()
-            .map(|policy| serde_json::from_str(&policy))
-            .transpose()
-            .context("BORG_AGENT_TEAM_POLICY must contain a valid team policy")?;
-        let shared_work_enabled = std::env::var("BORG_AGENT_SHARED_WORK_ENABLED")
-            .ok()
-            .map(|value| value.parse::<bool>())
-            .transpose()
-            .context("BORG_AGENT_SHARED_WORK_ENABLED must be true or false")?
-            .unwrap_or(false);
-        let consultation_enabled = std::env::var("BORG_AGENT_CONSULTATION_ENABLED")
-            .ok()
-            .map(|value| value.parse::<bool>())
-            .transpose()
-            .context("BORG_AGENT_CONSULTATION_ENABLED must be true or false")?
-            .unwrap_or(true);
         #[cfg(unix)]
         {
             std::env::var_os("BORG_AGENT_TOOL_SOCKET")
                 .map(PathBuf::from)
-                .map(|socket| Self::Unix {
-                    socket,
-                    provider,
-                    shared_work_enabled,
-                    consultation_enabled,
-                    team_policy,
-                })
+                .map(|socket| Self::Unix { socket, provider })
                 .context("BORG_AGENT_TOOL_SOCKET is required")
         }
         #[cfg(not(unix))]
@@ -355,9 +326,6 @@ impl AgentToolEndpoint {
                 address,
                 token,
                 provider,
-                shared_work_enabled,
-                consultation_enabled,
-                team_policy,
             })
         }
     }
@@ -368,45 +336,6 @@ impl AgentToolEndpoint {
             Self::Unix { provider, .. } => *provider,
             #[cfg(not(unix))]
             Self::Loopback { provider, .. } => *provider,
-        }
-    }
-
-    fn team_policy(&self) -> Option<&borg_remote::TeamPolicy> {
-        match self {
-            #[cfg(unix)]
-            Self::Unix { team_policy, .. } => team_policy.as_ref(),
-            #[cfg(not(unix))]
-            Self::Loopback { team_policy, .. } => team_policy.as_ref(),
-        }
-    }
-
-    fn shared_work_enabled(&self) -> bool {
-        match self {
-            #[cfg(unix)]
-            Self::Unix {
-                shared_work_enabled,
-                ..
-            } => *shared_work_enabled,
-            #[cfg(not(unix))]
-            Self::Loopback {
-                shared_work_enabled,
-                ..
-            } => *shared_work_enabled,
-        }
-    }
-
-    fn consultation_enabled(&self) -> bool {
-        match self {
-            #[cfg(unix)]
-            Self::Unix {
-                consultation_enabled,
-                ..
-            } => *consultation_enabled,
-            #[cfg(not(unix))]
-            Self::Loopback {
-                consultation_enabled,
-                ..
-            } => *consultation_enabled,
         }
     }
 }
@@ -502,25 +431,24 @@ async fn handle_line_with_cancel(
         })),
         "ping" => Ok(json!({})),
         "tools/list" => {
-            let result = json!({
-                "tools": borg_remote::agent_tool_specs_with_capabilities_and_consultation(
-                    endpoint.provider(),
-                    true,
-                    endpoint.shared_work_enabled(),
-                    endpoint.team_policy(),
-                    endpoint.consultation_enabled(),
-                    // Absent means a top-level session from an older server.
-                    std::env::var("BORG_AGENT_DESKTOP_ENABLED")
-                        .ok()
-                        .is_none_or(|value| value != "false"),
-                    std::env::var("BORG_AGENT_WATCHER_YIELD_ENABLED")
-                        .is_ok_and(|value| value == "true"),
-                )
-            });
-            Ok(if modern {
-                modern_result(result)
-            } else {
-                result
+            // The session's live catalog, so the model sees exactly what the
+            // dispatcher serves. Claude Code runs with its built-in tools
+            // disabled, so a Claude session also gets Borg's shell and file tools.
+            let workspace_tools = endpoint.provider() == borg_remote::CodingProvider::Claude;
+            forward(
+                endpoint,
+                "__borg_tools",
+                json!({ "workspace_tools": workspace_tools }),
+                cancel,
+            )
+            .await
+            .map(|tools| {
+                let result = json!({ "tools": tools });
+                if modern {
+                    modern_result(result)
+                } else {
+                    result
+                }
             })
         }
         "resources/list" => {
@@ -1225,67 +1153,6 @@ mod tests {
         assert_eq!(std::fs::read_dir(spool.path()).unwrap().count(), 0);
     }
 
-    #[tokio::test]
-    async fn local_proxy_exposes_the_shared_agent_tool_catalog() {
-        #[cfg(unix)]
-        let endpoint = AgentToolEndpoint::Unix {
-            socket: Path::new("/unused").to_path_buf(),
-            provider: borg_remote::CodingProvider::Codex,
-            shared_work_enabled: true,
-            consultation_enabled: true,
-            team_policy: None,
-        };
-        #[cfg(not(unix))]
-        let endpoint = AgentToolEndpoint::Loopback {
-            address: "127.0.0.1:1".parse().unwrap(),
-            token: "unused".to_string(),
-            provider: borg_remote::CodingProvider::Codex,
-            shared_work_enabled: true,
-            consultation_enabled: true,
-            team_policy: None,
-        };
-        let response = handle_line(
-            &endpoint,
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#,
-        )
-        .await
-        .unwrap();
-        let tools = response["result"]["tools"].as_array().unwrap();
-        let names = tools
-            .iter()
-            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert!(names.contains(&"get_goal"));
-        assert!(names.contains(&"update_plan"));
-        assert!(names.contains(&"spawn_agent"));
-        assert!(names.contains(&"wait_agent"));
-        assert!(names.contains(&"create_shared_work"));
-        assert!(names.contains(&"consult_peer"));
-        assert!(names.contains(&"rotate_peer"));
-        assert!(names.contains(&"lsp_workspace_diagnostics"));
-        assert!(names.contains(&"list_blu_workflows"));
-        assert!(!names.contains(&"await_watchers"));
-        assert!(names.contains(&"run_blu_extension"));
-        for tool in tools {
-            let properties = tool["inputSchema"]["properties"]
-                .as_object()
-                .expect("agent tool properties");
-            assert_eq!(
-                properties.keys().next().map(String::as_str),
-                Some("action"),
-                "{} must present action first",
-                tool["name"]
-            );
-            assert!(
-                tool["inputSchema"]["required"]
-                    .as_array()
-                    .is_some_and(|required| required.iter().all(|field| field != "action")),
-                "{} must not reject missing presentation metadata",
-                tool["name"]
-            );
-        }
-    }
-
     #[test]
     fn action_metadata_is_removed_before_tool_dispatch() {
         let mut arguments = json!({
@@ -1319,18 +1186,12 @@ mod tests {
         let endpoint = AgentToolEndpoint::Unix {
             socket: Path::new("/unused").to_path_buf(),
             provider: borg_remote::CodingProvider::Codex,
-            shared_work_enabled: false,
-            consultation_enabled: true,
-            team_policy: None,
         };
         #[cfg(not(unix))]
         let endpoint = AgentToolEndpoint::Loopback {
             address: "127.0.0.1:1".parse().unwrap(),
             token: "unused".to_string(),
             provider: borg_remote::CodingProvider::Codex,
-            shared_work_enabled: false,
-            consultation_enabled: true,
-            team_policy: None,
         };
         let meta = json!({
             PROTOCOL_VERSION_META: CURRENT_PROTOCOL_VERSION,
@@ -1364,7 +1225,7 @@ mod tests {
             &json!({
                 "jsonrpc": "2.0",
                 "id": 2,
-                "method": "tools/list",
+                "method": "ping",
                 "params": { "_meta": {
                     PROTOCOL_VERSION_META: CURRENT_PROTOCOL_VERSION,
                     CLIENT_CAPABILITIES_META: {},
@@ -1375,7 +1236,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(listing["result"]["resultType"], "complete");
-        assert!(listing["result"]["tools"].is_array());
 
         let resources = handle_line(
             &endpoint,
@@ -1418,18 +1278,12 @@ mod tests {
         let endpoint = AgentToolEndpoint::Unix {
             socket: Path::new("/unused").to_path_buf(),
             provider: borg_remote::CodingProvider::Codex,
-            shared_work_enabled: false,
-            consultation_enabled: true,
-            team_policy: None,
         };
         #[cfg(not(unix))]
         let endpoint = AgentToolEndpoint::Loopback {
             address: "127.0.0.1:1".parse().unwrap(),
             token: "unused".to_string(),
             provider: borg_remote::CodingProvider::Codex,
-            shared_work_enabled: false,
-            consultation_enabled: true,
-            team_policy: None,
         };
         let response = handle_line(
             &endpoint,
@@ -1446,18 +1300,12 @@ mod tests {
         let endpoint = AgentToolEndpoint::Unix {
             socket: Path::new("/unused").to_path_buf(),
             provider: borg_remote::CodingProvider::Codex,
-            shared_work_enabled: false,
-            consultation_enabled: true,
-            team_policy: None,
         };
         #[cfg(not(unix))]
         let endpoint = AgentToolEndpoint::Loopback {
             address: "127.0.0.1:1".parse().unwrap(),
             token: "unused".to_string(),
             provider: borg_remote::CodingProvider::Codex,
-            shared_work_enabled: false,
-            consultation_enabled: true,
-            team_policy: None,
         };
         let response = handle_line(
             &endpoint,
@@ -1490,18 +1338,12 @@ mod tests {
         let endpoint = AgentToolEndpoint::Unix {
             socket: Path::new("/unused").to_path_buf(),
             provider: borg_remote::CodingProvider::Codex,
-            shared_work_enabled: false,
-            consultation_enabled: true,
-            team_policy: None,
         };
         #[cfg(not(unix))]
         let endpoint = AgentToolEndpoint::Loopback {
             address: "127.0.0.1:1".parse().unwrap(),
             token: "unused".to_string(),
             provider: borg_remote::CodingProvider::Codex,
-            shared_work_enabled: false,
-            consultation_enabled: true,
-            team_policy: None,
         };
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         let (read, write) = tokio::io::split(server);
@@ -1511,7 +1353,7 @@ mod tests {
                 concat!(
                     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
                     "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
-                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n",
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/list\",\"params\":{}}\n",
                 )
                 .as_bytes(),
             )
@@ -1530,6 +1372,6 @@ mod tests {
         assert_eq!(responses.len(), 2);
         assert_eq!(responses[0]["id"], 1);
         assert_eq!(responses[1]["id"], 2);
-        assert!(responses[1]["result"]["tools"].is_array());
+        assert!(responses[1]["result"]["resources"].is_array());
     }
 }
