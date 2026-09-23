@@ -206,6 +206,10 @@ pub struct LaneRecord {
     /// Active service IDs captured atomically when this exclusive enters Preparing.
     #[serde(default)]
     pub yield_services: Vec<String>,
+    #[serde(default)]
+    pub resume_pending: Vec<String>,
+    #[serde(default)]
+    pub resume_error: Option<String>,
     pub evidence: Option<String>,
 }
 
@@ -458,9 +462,10 @@ impl LaneStore {
                     let Some(other) = r.spec.as_ref() else {
                         return false;
                     };
-                    r.job
-                        .as_ref()
-                        .is_some_and(|j| matches!(j.state, JobState::Queued))
+                    matches!(r.state, TicketState::Queued)
+                        && r.job
+                            .as_ref()
+                            .is_some_and(|j| matches!(j.state, JobState::Queued))
                         && spec.fingerprint == other.fingerprint
                         && spec.argv == other.argv
                         && spec.cwd == other.cwd
@@ -519,6 +524,8 @@ impl LaneStore {
             quarantined: false,
             service_lease: false,
             yield_services: vec![],
+            resume_pending: vec![],
+            resume_error: None,
             evidence: None,
         });
         Ok((ticket, job))
@@ -619,12 +626,17 @@ impl LaneStore {
                 .find(|r| r.ticket.id == id)
                 .context("unknown job")?;
             record.finished_ms = Some(milliseconds());
-            record.evidence = Some(evidence.to_owned());
+            let earlier = record.evidence.take();
+            record.evidence =
+                Some(earlier.map_or_else(|| evidence.to_owned(), |e| format!("{e}; {evidence}")));
             record.state = TicketState::Finished;
+            if !record.quarantined {
+                record.resume_pending = record.yield_services.clone();
+            }
             if let Some(job) = record.job.as_mut() {
                 job.state = JobState::Finished { exit_code };
             }
-            Ok(record.yield_services.clone())
+            Ok(record.resume_pending.clone())
         })?;
         if !services.is_empty() && !cfg!(test) {
             // Recovery also invokes finish; resume is a detached control task
@@ -646,19 +658,72 @@ impl LaneStore {
         Ok(())
     }
 
+    /// The detached control process is idempotent and holds a per-job lock.
+    /// Remaining failures are journalled so recover can retry and users can
+    /// inspect them; successful resume cannot hide workload exit status.
     pub fn resume_services(&self, id: Uuid) -> Result<()> {
+        let gate = stable_file(&self.root.join("locks").join(format!("resume-{id}.flock")))?;
+        match gate.try_lock() {
+            Ok(()) => (),
+            Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
         let record = self.record(id)?;
         ensure!(
-            matches!(
-                record.state,
-                TicketState::Finished | TicketState::Cancelled { .. }
-            ),
+            matches!(record.state, TicketState::Finished),
             "cannot resume service before job finishes"
         );
-        for service in &record.yield_services {
-            self.service_control(service, id, "resume", 0)?;
+        ensure!(
+            !record.quarantined,
+            "resource quarantined: automatic service resume refused"
+        );
+        for service in &record.resume_pending {
+            let result = self.service_status(service).and_then(|status| {
+                if status.yields.contains_key(&id.to_string()) {
+                    self.service_control(service, id, "resume", 0)
+                } else {
+                    Ok(())
+                }
+            });
+            self.locked(|state| {
+                let row = state
+                    .records
+                    .iter_mut()
+                    .find(|r| r.ticket.id == id)
+                    .context("job disappeared")?;
+                match &result {
+                    Ok(()) => {
+                        row.resume_pending.retain(|s| s != service);
+                        row.resume_error = None;
+                    }
+                    Err(error) => {
+                        row.resume_error =
+                            Some(format!("service {service} resume pending: {error:#}"));
+                    }
+                }
+                Ok(())
+            })?;
+            result?;
         }
         Ok(())
+    }
+
+    fn service_status(&self, service_id: &str) -> Result<crate::services::ServiceStatus> {
+        let executable = std::env::var_os("BORG_LANE_EXECUTABLE")
+            .map(PathBuf::from)
+            .unwrap_or(std::env::current_exe()?);
+        let output = Command::new(executable)
+            .args(["lane", "--json", "--state-dir"])
+            .arg(&self.root)
+            .args(["service", "status", service_id])
+            .output()
+            .with_context(|| format!("reading service {service_id} status"))?;
+        ensure!(
+            output.status.success(),
+            "service {service_id} status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(serde_json::from_slice(&output.stdout)?)
     }
 
     pub fn cancel_ticket(&self, id: Uuid, reason: &str) -> Result<()> {
@@ -820,69 +885,40 @@ fn mem_available() -> Option<u64> {
         .map(|kb| kb * 1024)
 }
 
-fn disk_available(path: &Path) -> Option<u64> {
+fn same_filesystem(left: &Path, right: &Path) -> bool {
     #[cfg(unix)]
     {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        let path = CString::new(path.as_os_str().as_bytes()).ok()?;
-        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
-            return None;
+        use std::os::unix::fs::MetadataExt;
+        match (fs::metadata(left), fs::metadata(right)) {
+            (Ok(a), Ok(b)) => a.dev() == b.dev(),
+            _ => left == right,
         }
-        let stat = unsafe { stat.assume_init() };
-        Some(stat.f_bavail.saturating_mul(stat.f_frsize))
     }
     #[cfg(not(unix))]
     {
-        let _ = path;
-        None
+        left == right
     }
 }
 
-fn budget_reason(state: &Journal, spec: &JobSpec) -> Option<String> {
+fn budget_reason(state: &Journal, spec: &JobSpec) -> Result<Option<String>> {
     let reserved_ram: u64 = state
         .records
         .iter()
         .filter(|r| matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
         .filter_map(|r| r.spec.as_ref())
         .map(|s| s.admission.reserve_ram_bytes)
-        .sum();
+        .fold(0_u64, u64::saturating_add);
     let reserved_disk: u64 = state
         .records
         .iter()
         .filter(|r| matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
         .filter_map(|r| r.spec.as_ref())
-        .filter(|s| s.admission.disk_path == spec.admission.disk_path)
+        .filter(|s| same_filesystem(&s.admission.disk_path, &spec.admission.disk_path))
         .map(|s| s.admission.reserve_disk_bytes)
-        .sum();
-    let ram_needed = spec
-        .admission
-        .min_available_ram_bytes
-        .saturating_add(spec.admission.reserve_ram_bytes)
-        .saturating_add(reserved_ram);
-    if let Some(available) = mem_available()
-        && available < ram_needed
-    {
-        return Some(format!(
-            "waiting for RAM: MemAvailable {available} bytes, need {ram_needed} bytes including {reserved_ram} reserved"
-        ));
-    }
-    let disk_needed = spec
-        .admission
-        .min_free_disk_bytes
-        .saturating_add(spec.admission.reserve_disk_bytes)
-        .saturating_add(reserved_disk);
-    match disk_available(&spec.admission.disk_path) {
-        Some(free) if free < disk_needed => Some(format!(
-            "waiting for disk on {}: {free} bytes free, need {disk_needed} bytes including {reserved_disk} reserved",
-            spec.admission.disk_path.display()
-        )),
-        None => Some(format!(
-            "cannot inspect disk free on {}",
-            spec.admission.disk_path.display()
-        )),
-        _ => None,
+        .fold(0_u64, u64::saturating_add);
+    match crate::workspace::assess_budget(&spec.admission, reserved_ram, reserved_disk) {
+        Ok(admission) => Ok((!admission.admitted).then_some(admission.reason)),
+        Err(error) => Ok(Some(format!("budget inspection unavailable: {error:#}"))),
     }
 }
 
@@ -937,15 +973,20 @@ impl LaneStore {
     /// even two independent supervisors on different worktrees cannot race.
     fn try_grant(&self, id: Uuid) -> Result<Option<Lease>> {
         self.locked(|state| {
-            let reason = dispatch_reason(state, id)?.or_else(|| {
-                state
+            let reason = dispatch_reason(state, id)?;
+            let reason = if reason.is_some() {
+                reason
+            } else {
+                match state
                     .records
                     .iter()
-                    .find(|r| r.ticket.id == id)?
-                    .spec
-                    .as_ref()
-                    .and_then(|spec| budget_reason(state, spec))
-            });
+                    .find(|r| r.ticket.id == id)
+                    .and_then(|r| r.spec.as_ref())
+                {
+                    Some(spec) => budget_reason(state, spec)?,
+                    None => None,
+                }
+            };
             let request = state
                 .records
                 .iter()
@@ -1060,10 +1101,10 @@ impl LaneStore {
                         .context("ticket disappeared")?;
                     Ok(grant_entry(entry))
                 });
-                if granted.is_err() {
-                    if let Some(post) = &spec.post_hook {
-                        let _ = self.run_hook(post, &spec, id, "post-exclusive", false);
-                    }
+                if granted.is_err()
+                    && let Some(post) = &spec.post_hook
+                {
+                    let _ = self.run_hook(post, &spec, id, "post-exclusive", false);
                 }
                 return granted;
             }
@@ -1144,7 +1185,14 @@ impl LaneStore {
             )
             .env("BORG_LANE_LOG", self.job_dir(id).join("output.log"))
             .env("BORG_LANES_ROOT", &self.root);
-        if !sync {
+        let scoped_post = phase.starts_with("post") && systemd_available();
+        if phase.starts_with("post") && !scoped_post {
+            ensure!(
+                std::env::var("BORG_LANE_DEGRADED").as_deref() == Ok("1"),
+                "post hook requires a systemd user scope outside explicit degraded mode"
+            );
+        }
+        if !sync || scoped_post {
             let unit = format!("borg-lane-hook-{id}-{phase}.scope");
             self.locked(|state| {
                 let entry = state
@@ -1403,15 +1451,30 @@ impl LaneStore {
             }
             std::thread::sleep(Duration::from_millis(100));
         };
-        // Post hooks start asynchronously and cannot falsify job status.
+        // Bound services must remain stopped until the post hook completes.
+        // Unbound jobs keep their independently scoped asynchronous hook.
         if let Some(post) = &spec.post_hook {
-            let _ = self.run_hook(
+            let bound = !self.record(id)?.yield_services.is_empty();
+            if let Err(error) = self.run_hook(
                 post,
                 &spec,
                 id,
                 if exclusive { "post-exclusive" } else { "post" },
-                false,
-            );
+                bound,
+            ) {
+                self.locked(|state| {
+                    let row = state
+                        .records
+                        .iter_mut()
+                        .find(|r| r.ticket.id == id)
+                        .context("job vanished")?;
+                    row.evidence = Some(format!("post hook failed: {error:#}"));
+                    if bound {
+                        row.quarantined = true;
+                    }
+                    Ok(())
+                })?;
+            }
         }
         let _ = lease;
         Ok(code)
@@ -1430,6 +1493,26 @@ impl LaneStore {
 
     pub fn recover(&self, dry_run: bool) -> Result<Vec<String>> {
         let mut actions = Vec::new();
+        if !dry_run {
+            for row in self.snapshot()?.into_iter().filter(|r| {
+                matches!(r.state, TicketState::Finished)
+                    && !r.resume_pending.is_empty()
+                    && !r.quarantined
+            }) {
+                let executable = std::env::var_os("BORG_LANE_EXECUTABLE")
+                    .map(PathBuf::from)
+                    .unwrap_or(std::env::current_exe()?);
+                let _ = Command::new(executable)
+                    .args(["lane", "--state-dir"])
+                    .arg(&self.root)
+                    .args(["__resume_services"])
+                    .arg(row.ticket.id.to_string())
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn();
+            }
+        }
         // Avoid nested metadata locks: test each kernel lock before journalling.
         for record in self.snapshot()? {
             if !matches!(
@@ -1711,6 +1794,8 @@ mod tests {
             quarantined: false,
             service_lease: false,
             yield_services: vec![],
+            resume_pending: vec![],
+            resume_error: None,
             evidence: None,
         }
     }
@@ -1849,7 +1934,16 @@ mod tests {
             stall_timeout_ms: None,
             coalesce: false,
         };
-        let job = store.enqueue_job(spec).unwrap();
+        let job = store
+            .locked(|state| {
+                Ok(store
+                    .enqueue_record(state, spec.lease.clone(), Some(spec))?
+                    .1
+                    .unwrap())
+            })
+            .unwrap();
+        let owner_lock = stable_file(&store.ticket_path(job.id)).unwrap();
+        owner_lock.lock().unwrap();
         let waiting = store.clone();
         let task = std::thread::spawn(move || waiting.wait_grant(job.id));
         let started = std::time::Instant::now();
@@ -1988,7 +2082,16 @@ mod tests {
             stall_timeout_ms: None,
             coalesce: false,
         };
-        let job = store.enqueue_job(spec).unwrap();
+        let job = store
+            .locked(|state| {
+                Ok(store
+                    .enqueue_record(state, spec.lease.clone(), Some(spec))?
+                    .1
+                    .unwrap())
+            })
+            .unwrap();
+        let owner_lock = stable_file(&store.ticket_path(job.id)).unwrap();
+        owner_lock.lock().unwrap();
         assert!(
             store
                 .wait_grant(job.id)
