@@ -6220,6 +6220,16 @@ async fn only_the_interrupting_agent_resumes_an_interrupted_child() {
         received.recv().await,
         Some(HostCommand::Interrupt { .. })
     ));
+    // A real child records Running ("cancelling") while it winds down.
+    child_event(
+        &coordinator,
+        worker,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Running,
+            detail: Some("cancelling".to_string()),
+        },
+    )
+    .await;
     // The interrupt leaves the child idle with its last narration. The parent
     // is about to act on that, so the follow-up's wait must not end on it.
     child_event(
@@ -6260,7 +6270,7 @@ async fn only_the_interrupting_agent_resumes_an_interrupted_child() {
     ));
     assert!(matches!(
         received.recv().await,
-        Some(HostCommand::TeamPrompt { .. })
+        Some(HostCommand::TeamPrompt { text, .. }) if text.contains("the stop is lifted")
     ));
     followup("one more thing").await;
     assert!(matches!(

@@ -5419,6 +5419,16 @@ impl SubagentCoordinator {
                 .await
                 .map_err(|_| anyhow::anyhow!("subagent command channel closed"))?;
             entry.interrupted_by = None;
+            // Measured live: a resumed child read the interrupt as the human
+            // rejecting its work and refused its parent's follow-up as a peer
+            // wake that a human stop overrides. Say what actually happened.
+            if let Some(message) = messages.last_mut() {
+                message.text = format!(
+                    "{actor} (your parent) interrupted your previous turn itself; the human did \
+                     not stop you. This follow-up resumes you: the stop is lifted, so act on it.\n\n{}",
+                    message.text
+                );
+            }
         }
         for message in messages {
             send_prompt(entry, id, message).await?;
@@ -8518,13 +8528,14 @@ async fn update_from_session_event(
             entry.snapshot.provider = *provider;
             entry.snapshot.model = model.clone();
             entry.snapshot.effort = effort.clone();
+            if matches!(event.kind, SessionEventKind::TurnStarted { .. }) {
+                // A new turn by any route ends that interrupt. Not a Running
+                // status: the interrupt itself records Running ("cancelling").
+                entry.interrupted_by = None;
+            }
         }
         SessionEventKind::StatusChanged { status, detail } => {
             entry.assignment_claimed = false;
-            if *status == SessionStatus::Running {
-                // Running again by any route: that interrupt is over.
-                entry.interrupted_by = None;
-            }
             entry.snapshot.status = match status {
                 SessionStatus::Starting => SubagentStatus::Starting,
                 SessionStatus::Running => SubagentStatus::Running,
