@@ -36,8 +36,8 @@ Parent integration order:
 5. `gamedev/unreal` and `gamedev/native`: distinct Blu packages. Ensure they
    use the real CLI schema, not speculative `[api.lanes]`, and keep Abundance
    shared tree read-only. Adapters may merge independently after lanes CLI.
-6. `gamedev/bench`: Python simulation and, if available, real CLI contention
-   replay. Its simulated timings are model output, not observed performance.
+6. `gamedev/bench`: real CLI contention replay (an early Python policy model
+   was later removed; its timings were model output, not observed performance).
 7. `gamedev/research`: sourced landscape doc, linked from design. Independent
    documentation; cherry-pick after author commits. Its broad competitor
    claims must retain source/verification caveats.
