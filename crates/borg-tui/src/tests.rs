@@ -2267,7 +2267,7 @@ fn deferred_command_change_hydrates_its_edit_action() {
             payload_refs,
             expanded: false,
             ..
-        } if name == "Edit" && language == "text" && payload_refs == &[payload.clone()]
+        } if name == "Edit" && language == "text" && payload_refs == std::slice::from_ref(&payload)
     ));
 
     transcript

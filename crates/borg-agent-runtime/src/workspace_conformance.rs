@@ -1127,8 +1127,8 @@ async fn a_directory_sync_identifies_instances_and_retires_stopped_ones() {
                     participant: participant(participant_id, "remote peer"),
                     host_id: Some(remote_host),
                     workspace_id: None,
-                    cwd: Some(cwd).map(str::to_string),
-                    status: Some(status).map(str::to_string),
+                    cwd: Some(str::to_string(cwd)),
+                    status: Some(str::to_string(status)),
                 }])
                 .await
         };
@@ -1192,8 +1192,8 @@ async fn a_directory_sync_identifies_instances_and_retires_stopped_ones() {
                     participant: participant(Uuid::new_v4(), &format!("stopped peer {index}")),
                     host_id: Some(remote_host),
                     workspace_id: None,
-                    cwd: Some("/home/remote/checkout").map(str::to_string),
-                    status: Some("stopped").map(str::to_string),
+                    cwd: Some(str::to_string("/home/remote/checkout")),
+                    status: Some(str::to_string("stopped")),
                 }])
                 .await
                 .unwrap_or_else(|error| panic!("[{name}] stopped peer: {error:#}"));
@@ -1275,7 +1275,7 @@ async fn a_directory_entry_never_erases_a_locally_known_identity() {
                 host_id: Some(Uuid::new_v4()),
                 workspace_id: None,
                 cwd: None,
-                status: Some("running").map(str::to_string),
+                status: Some(str::to_string("running")),
             }])
             .await
             .unwrap_or_else(|error| panic!("[{name}] directory sync: {error:#}"));
