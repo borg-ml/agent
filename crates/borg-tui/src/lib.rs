@@ -1235,7 +1235,7 @@ struct CommitMessageModel {
     effort: String,
 }
 
-const DEFAULT_COMMIT_MESSAGE_MODEL: &str = "gpt-5.6-luna@low";
+const DEFAULT_COMMIT_MESSAGE_MODEL: &str = "gpt-6-luna@low";
 const COMMIT_DIFF_CHAR_BUDGET: usize = 60_000;
 
 impl CommitMessageModel {

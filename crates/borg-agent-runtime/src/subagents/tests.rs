@@ -2092,7 +2092,7 @@ async fn rotating_a_sidecar_archives_the_old_identity_and_rebinds_the_lane() {
         .rotate_sidecar(
             "gpt",
             CodingProvider::Codex,
-            Some("gpt-5.6-luna".to_string()),
+            Some("gpt-6-luna".to_string()),
             Some("max".to_string()),
         )
         .await
@@ -2106,7 +2106,7 @@ async fn rotating_a_sidecar_archives_the_old_identity_and_rebinds_the_lane() {
         .expect("archived sidecar remains visible");
     assert_ne!(rotation.session_id, first.session_id);
     assert_eq!(rotation.task_name, "/root/gpt");
-    assert_eq!(rotation.model.as_deref(), Some("gpt-5.6-luna"));
+    assert_eq!(rotation.model.as_deref(), Some("gpt-6-luna"));
     assert_eq!(rotation.effort.as_deref(), Some("max"));
     assert_eq!(archived.session_id, first.session_id);
     assert!(archived.task_name.starts_with("/root/peer_archive_"));
@@ -3788,7 +3788,7 @@ fn subagent_tool_and_validation_use_the_provider_model_catalog() {
         validate_subagent_overrides(CodingProvider::Codex, Some(model), None)
             .expect("catalog model should be accepted");
     }
-    assert!(description.contains("gpt-5.6-luna"));
+    assert!(description.contains("gpt-6-luna"));
     assert!(
         validate_subagent_overrides(CodingProvider::Codex, Some("not-a-codex-model"), None)
             .is_err()
@@ -3820,13 +3820,13 @@ fn every_parent_model_can_see_codex_luna_as_a_subagent_option() {
         assert!(
             spawn["description"]
                 .as_str()
-                .is_some_and(|description| description.contains("gpt-5.6-luna (Luna)")),
+                .is_some_and(|description| description.contains("gpt-6-luna (Luna)")),
             "parent {parent:?} omitted Luna from its orchestration instructions"
         );
         assert!(
             spawn["inputSchema"]["properties"]["model"]["description"]
                 .as_str()
-                .is_some_and(|description| description.contains("gpt-5.6-luna")),
+                .is_some_and(|description| description.contains("gpt-6-luna")),
             "parent {parent:?} omitted Luna from the model argument metadata"
         );
     }
