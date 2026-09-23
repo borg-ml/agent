@@ -1,7 +1,7 @@
 //! CLI for host-local shared services; the internal supervisor command runs outside an agent session.
 use anyhow::{Context, Result, ensure};
 use borg_lanes::{
-    lanes::Holder,
+    lanes::{Holder, LaneStore},
     services::{self, ServiceManager, ServiceRequest, ServiceSpec, ServiceState, ServiceStatus},
 };
 use clap::{Args, Subcommand};
@@ -14,6 +14,9 @@ pub(crate) struct ServiceArgs {
     pub(crate) command: ServiceCommand,
     #[arg(long, global = true)]
     pub(crate) json: bool,
+    /// Filled by the enclosing `borg lane --state-dir` parser, not a second CLI option.
+    #[arg(skip)]
+    pub(crate) root: Option<PathBuf>,
 }
 #[derive(Debug, Subcommand)]
 pub(crate) enum ServiceCommand {
@@ -115,7 +118,11 @@ fn display(status: &ServiceStatus, json: bool) -> Result<()> {
     Ok(())
 }
 pub(crate) async fn run(args: ServiceArgs) -> Result<()> {
-    let manager = ServiceManager::current()?;
+    let root = args
+        .root
+        .unwrap_or_else(LaneStore::default_root)
+        .join("services");
+    let manager = ServiceManager::new(root, std::env::current_exe()?);
     let timeout = Duration::from_secs(120);
     match args.command {
         ServiceCommand::Start {

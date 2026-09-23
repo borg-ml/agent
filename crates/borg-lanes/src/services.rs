@@ -188,7 +188,8 @@ fn unix_ms() -> u64 {
 
 /// The runtime root can be private to a test, user, or installation. IDs never become paths unchecked.
 pub fn service_root() -> PathBuf {
-    std::env::var_os("BORG_LANE_DIR")
+    std::env::var_os("BORG_LANES_ROOT")
+        .or_else(|| std::env::var_os("BORG_LANE_DIR"))
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("XDG_RUNTIME_DIR").map(|p| PathBuf::from(p).join("borg/lanes"))
@@ -417,7 +418,7 @@ impl ServiceManager {
                 command.args(["-p", &format!("MemoryMax={bytes}")]);
             }
             command.arg(format!(
-                "--setenv=BORG_LANE_DIR={}",
+                "--setenv=BORG_LANES_ROOT={}",
                 self.root.parent().context("invalid root")?.display()
             ));
             command.arg(&self.executable).args(args);
@@ -1548,8 +1549,19 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
         u16,
         tokio::task::JoinHandle<Result<()>>,
     ) {
+        setup_with(|_| {}).await
+    }
+    async fn setup_with(
+        configure: impl FnOnce(&mut ServiceSpec),
+    ) -> (
+        tempfile::TempDir,
+        ServiceManager,
+        u16,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
         let root = tempfile::tempdir().unwrap();
-        let spec = spec(root.path());
+        let mut spec = spec(root.path());
+        configure(&mut spec);
         let front = spec
             .endpoint
             .as_ref()
@@ -1826,6 +1838,49 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
             fs::read_to_string(root.path().join("restored"))
                 .unwrap()
                 .contains(&second.participant_id.to_string())
+        );
+        cleanup(&manager, task).await;
+    }
+
+    #[tokio::test]
+    async fn idle_hook_runs_once_and_touch_wakes_backend() {
+        let (root, manager, _front, task) = setup_with(|spec| {
+            let file = spec.cwd.join("idle-events").display().to_string();
+            let hook = |name: &str| Hook {
+                argv: vec![
+                    "python3".into(),
+                    "-c".into(),
+                    "import sys; open(sys.argv[1], 'a').write(sys.argv[2]+'\\n')".into(),
+                    file.clone(),
+                    name.into(),
+                ],
+                timeout_ms: 1000,
+            };
+            spec.idle = Some(hook("idle"));
+            spec.active = Some(hook("active"));
+            spec.idle_after_ms = 200;
+        })
+        .await;
+        let path = root.path().join("idle-events");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !path.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "idle hook never fired"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        manager
+            .send("fake", ServiceRequest::Touch, Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .take(2)
+                .collect::<Vec<_>>(),
+            vec!["idle", "active"]
         );
         cleanup(&manager, task).await;
     }
