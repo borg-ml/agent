@@ -24,8 +24,8 @@ record in the Git common directory is only a handshake.
   `--force` only relaxes the dirty-tree check, never a live owner, unknown
   owner, recent unmerged branch, or primary tree. Unmerged branches with no
   worktree/index/commit activity for 30 days can be proposed as abandoned; Git
-  branches are preserved even when a checked-out worktree is removed. MCP `apply` also requires explicit
-  human `confirmed` input. It does not delete assets or Git branches.
+  branches are preserved even when a checked-out worktree is removed. MCP GC is always dry-run; direct CLI `--apply` requires a real terminal
+  and typing the exact path for every deletion, including `--force`. It does not delete assets or Git branches.
 - `borg worktree budget` checks `statvfs` on the output filesystem and Linux
   `MemAvailable`. Default safety reserves: **60 GiB free disk**, **8 GiB
   MemAvailable**, **32 GiB per agent on disk**, **16 GiB per agent RAM**.
@@ -51,7 +51,10 @@ adapter; do not copy it per tree. Sharing a writable Cargo target across
 branches risks lock contention and stale outputs, and is not enabled. A
 reflink copy can seed *immutable* artifacts on CoW filesystems but is not a
 live shared writable cache. `sccache` would be worth measuring after it is
-installed; it was not installed here. Per-output target cleaning on a live
+installed; it was not installed here. `borg worktree target-status --cap-gib 24` reports per-worktree target
+usage and cap breaches (MCP op `target_status` is also read-only). Lanes should
+queue further builds with the budget reason until an owner clears outputs.
+Per-output target cleaning on a live
 worktree is deliberately not automated: wait for all owner jobs to finish,
 request the owner's confirmation, then `cargo clean` there. Whole-tree GC
 only handles clean merged Borg-created trees with confirmed-dead owners.
@@ -64,7 +67,8 @@ only handles clean merged Borg-created trees with confirmed-dead owners.
 3. Request a freeze with shared-work UUID, glob(s), rationale and timeout:
    CLI `freeze --work-id ID --owner SESSION --reason TEXT GLOB` or MCP
    `lane_workspace {op:"freeze",project:P,work_id:ID,globs:[...],reason:...}`.
-   MCP broadcasts a request to the team; the record lists the participating
+   MCP verifies its caller owns the shared-work claim at request time and
+   broadcasts a request to the team; the record lists the participating
    live sessions and an initial dirty-owner snapshot. The file is updated
    under a stable `flock`, atomic rename and fsync; no running locks are
    unlinked. This handshake does *not* magically lock Git or editors.

@@ -1356,6 +1356,11 @@ pub(crate) enum WorktreeCommand {
     },
     /// Show disk and RAM headroom against lane admission reserves.
     Budget,
+    /// Read-only per-worktree Cargo target usage and cap breaches.
+    TargetStatus {
+        #[arg(long, default_value_t = 24)]
+        cap_gib: u64,
+    },
     /// Emit pressure to a Borg command watch; timer checks without agent polling.
     Monitor {
         #[arg(long, default_value_t = 60)]
