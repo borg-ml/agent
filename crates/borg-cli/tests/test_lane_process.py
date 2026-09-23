@@ -135,7 +135,8 @@ class LaneProcess(unittest.TestCase):
         reason = self.until(lambda: next((r.get("wait_reason") for r in self.records()
                                           if r["ticket"]["id"] == job and r.get("wait_reason")), None))
         self.assertIn("disk", reason)
-        self.cli("job", "cancel", job)
+        self.assertEqual(self.cli("job", "cancel", job).returncode, 0)
+        self.wait(job, 125)  # Supervisor exits before TemporaryDirectory cleanup.
 
     def test_pre_exclusive_prepares_before_grant_and_failing_hook_blocks_workload(self):
         state_file = self.root / "prestate"
