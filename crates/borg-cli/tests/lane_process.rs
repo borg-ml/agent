@@ -173,6 +173,8 @@ fn supervisor_crash_recovers_only_the_owned_scope() {
     assert!(!lane.degraded, "no systemd user manager");
     let mut spec = lane.spec("orphan", "sleep 60");
     spec.timeout_ms = 70_000;
+    // Recovery must verify and kill the job's own custom-named scope.
+    spec.unit_prefix = Some("ab-build".into());
     let job = lane.submit(&spec);
     let record = lane.until(|| {
         lane.record(&job).filter(|record| {
@@ -182,7 +184,12 @@ fn supervisor_crash_recovers_only_the_owned_scope() {
                 })
         })
     });
-    assert!(record.scope_cgroup.unwrap().contains("borg-lane-"));
+    assert!(
+        record
+            .scope_cgroup
+            .unwrap()
+            .ends_with(&format!("/ab-build-{job}.scope"))
+    );
     // This test started exactly this supervisor.
     let pid = record.supervisor_pid.unwrap().to_string();
     assert!(
