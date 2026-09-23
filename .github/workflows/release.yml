@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to rebuild and publish
+        description: Existing draft release tag to rebuild
         required: true
         type: string
 
@@ -129,6 +129,7 @@ jobs:
           sdk_package="packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk"
           mkdir -p "$package_dir/providers/claude"
           cp "$native_package/claude" "$package_dir/providers/claude/claude"
+          cp "$native_package/LICENSE.md" "$package_dir/providers/claude/LICENSE.md"
           cp "$sdk_package/manifest.json" "$package_dir/providers/claude/manifest.json"
           cp "$sdk_package/package.json" "$package_dir/providers/claude/package.json"
           chmod 700 "$package_dir/providers/claude/claude"
@@ -137,8 +138,8 @@ jobs:
           cp docs/customization.md "$package_dir/docs/"
           cp configs/extension.example.toml "$package_dir/configs/"
           cp include/borg_extension.h "$package_dir/include/"
-          cp LICENSE NOTICE.md README.md "$package_dir/"
-          tar -C "$package_dir" -czf "$PWD/$asset" "${binaries[@]}" providers docs configs include LICENSE NOTICE.md README.md
+          cp LICENSE NOTICE.md README.md CHANGELOG.md "$package_dir/"
+          tar -C "$package_dir" -czf "$PWD/$asset" "${binaries[@]}" providers docs configs include LICENSE NOTICE.md README.md CHANGELOG.md
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "$asset" >"$asset.sha256"
           else
@@ -159,6 +160,7 @@ jobs:
           $sdkPackage = "packages/claude-native-runtime/node_modules/@anthropic-ai/claude-agent-sdk"
           New-Item -ItemType Directory -Path "$packageDir/providers/claude"
           Copy-Item (Join-Path $platformPackage.FullName "claude.exe") "$packageDir/providers/claude/claude.exe"
+          Copy-Item (Join-Path $platformPackage.FullName "LICENSE.md") "$packageDir/providers/claude/LICENSE.md"
           Copy-Item (Join-Path $sdkPackage "manifest.json") "$packageDir/providers/claude/manifest.json"
           Copy-Item (Join-Path $sdkPackage "package.json") "$packageDir/providers/claude/package.json"
           New-Item -ItemType Directory -Path "$packageDir/docs", "$packageDir/configs", "$packageDir/include"
@@ -166,7 +168,7 @@ jobs:
           Copy-Item "docs/customization.md" "$packageDir/docs/"
           Copy-Item "configs/extension.example.toml" "$packageDir/configs/"
           Copy-Item "include/borg_extension.h" "$packageDir/include/"
-          Copy-Item LICENSE, NOTICE.md, README.md $packageDir
+          Copy-Item LICENSE, NOTICE.md, README.md, CHANGELOG.md $packageDir
           Compress-Archive -Path "$packageDir/*" -DestinationPath $asset
           $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
           "$hash  $asset" | Set-Content -NoNewline "$asset.sha256"
@@ -183,6 +185,8 @@ jobs:
           native="$(find "$smoke_dir" -path '*/providers/claude/claude' -type f -print -quit)"
           test -n "$native"
           "$native" --version
+          test -f "$(dirname "$binary")/providers/claude/LICENSE.md"
+          test -f "$(dirname "$binary")/CHANGELOG.md"
           test -f "$(dirname "$binary")/docs/blu-extensions.md"
           test -f "$(dirname "$binary")/docs/customization.md"
           test -f "$(dirname "$binary")/configs/extension.example.toml"
@@ -200,6 +204,8 @@ jobs:
           $native = Get-ChildItem -Path $smokeDir -Recurse -Filter "claude.exe" | Select-Object -First 1
           if (-not $native) { throw "packaged native claude.exe was not found" }
           & $native.FullName --version
+          if (-not (Test-Path (Join-Path $binary.DirectoryName "providers/claude/LICENSE.md"))) { throw "Claude license was not packaged" }
+          if (-not (Test-Path (Join-Path $binary.DirectoryName "CHANGELOG.md"))) { throw "Changelog was not packaged" }
           if (-not (Get-ChildItem -Path $smokeDir -Recurse -Filter "blu-extensions.md")) { throw "Blu documentation was not packaged" }
           if (-not (Get-ChildItem -Path $smokeDir -Recurse -Filter "customization.md")) { throw "Customization documentation was not packaged" }
           if (-not (Get-ChildItem -Path $smokeDir -Recurse -Filter "extension.example.toml")) { throw "Blu manifest example was not packaged" }
@@ -210,12 +216,33 @@ jobs:
           path: |
             borg-${{ matrix.target }}.*
 
-  publish:
+  stage_draft:
     needs: [validate, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          fetch-depth: 0
+      - name: Prepare release notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if release_draft="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq .draft 2>release-lookup.err)"; then
+            if [[ "$release_draft" != true ]]; then
+              echo "Refusing to modify an already published release: $RELEASE_TAG" >&2
+              exit 1
+            fi
+          elif ! grep -Fq 'HTTP 404' release-lookup.err; then
+            cat release-lookup.err >&2
+            exit 1
+          fi
+          python3 scripts/release-notes.py extract "${RELEASE_TAG#v}" CHANGELOG.md >release-notes.md
+          previous_tag="$(git describe --tags --abbrev=0 "${RELEASE_TAG}^")"
+          printf '\n[Full changelog](https://github.com/%s/compare/%s...%s)\n' "$GITHUB_REPOSITORY" "$previous_tag" "$RELEASE_TAG" >>release-notes.md
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
@@ -224,4 +251,5 @@ jobs:
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           files: artifacts/*
-          generate_release_notes: true
+          body_path: release-notes.md
+          draft: true

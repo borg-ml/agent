@@ -4,6 +4,7 @@ set -euo pipefail
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/borg-release-tests.XXXXXX")"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 release_script="$script_dir/release.sh"
+release_notes_script="$script_dir/release-notes.py"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
 
 cleanup() {
@@ -37,6 +38,13 @@ if [[ -f "$repo_root/.github/workflows/release.yml" ]]; then
     fail "release workflow cannot recover an existing tag"
   grep -Fq 'tag_name: ${{ env.RELEASE_TAG }}' "$release_workflow" ||
     fail "release publication is not pinned to the requested tag"
+  grep -Fq 'body_path: release-notes.md' "$release_workflow" ||
+    fail "release body does not use the curated changelog"
+  grep -Fq 'draft: true' "$release_workflow" ||
+    fail "tag workflow can publish without manual approval"
+  if grep -Fq 'generate_release_notes: true' "$release_workflow"; then
+    fail "release body still depends on pull request generated notes"
+  fi
   if awk '
     /^  build:$/ { inside_build = 1; next }
     inside_build && /^  [[:alnum:]_-]+:$/ { exit }
@@ -49,8 +57,16 @@ if [[ -f "$repo_root/.github/workflows/release.yml" ]]; then
     fail "release publication does not wait for both validation and artifacts"
   grep -Fq '$sdk_package/manifest.json' "$release_workflow" ||
     fail "Unix release packaging does not use the SDK manifest"
+  grep -Fq '$native_package/LICENSE.md' "$release_workflow" ||
+    fail "Unix release packaging omits the native Claude license"
   grep -Fq 'Join-Path $sdkPackage "manifest.json"' "$release_workflow" ||
     fail "Windows release packaging does not use the SDK manifest"
+  grep -Fq 'Join-Path $platformPackage.FullName "LICENSE.md"' "$release_workflow" ||
+    fail "Windows release packaging omits the native Claude license"
+  grep -Fq 'cp LICENSE NOTICE.md README.md CHANGELOG.md' "$release_workflow" ||
+    fail "Unix release packaging omits the changelog"
+  grep -Fq 'Copy-Item LICENSE, NOTICE.md, README.md, CHANGELOG.md' "$release_workflow" ||
+    fail "Windows release packaging omits the changelog"
   if grep -Fq '$native_package/manifest.json' "$release_workflow" ||
     grep -Fq 'Join-Path $platformPackage.FullName "manifest.json"' "$release_workflow"; then
     fail "release packaging reads a manifest that is absent from platform packages"
@@ -191,14 +207,27 @@ make_fixture() {
     done
   } >"$fixture/Cargo.lock"
 
-  git -C "$fixture" add Cargo.toml Cargo.lock
+  {
+    echo '# Changelog'
+    echo
+    echo "## Unreleased (since $version)"
+    echo
+    echo '- Improve release flow.'
+    echo
+    echo "## $version (2026-09-20)"
+    echo
+    echo '- Initial release.'
+  } >"$fixture/CHANGELOG.md"
+
+  git -C "$fixture" add Cargo.toml Cargo.lock CHANGELOG.md
   git -C "$fixture" commit --quiet -m "Release Borg Agent $version"
   git -C "$fixture" tag -a "v$version" -m "Borg Agent $version"
 
   cp "$release_script" "$fixture/scripts/release.sh"
+  cp "$release_notes_script" "$fixture/scripts/release-notes.py"
   cp "$repo_root/Justfile" "$fixture/Justfile"
   chmod +x "$fixture/scripts/release.sh"
-  git -C "$fixture" add scripts/release.sh Justfile
+  git -C "$fixture" add scripts/release.sh scripts/release-notes.py Justfile
   git -C "$fixture" commit --quiet -m "Add release tooling"
 
   git init --quiet --bare "$origin"
@@ -348,6 +377,25 @@ if run_release "$success_fixture" --verify-tag v1.2.4 >/dev/null 2>&1; then
   fail "mismatched release tag was accepted"
 fi
 
+for notes_problem in missing empty; do
+  notes_fixture="$(make_fixture "notes-$notes_problem")"
+  if [[ "$notes_problem" == missing ]]; then
+    replace_in_files '/^## Unreleased (since 1\.2\.3)$/d' "$notes_fixture/CHANGELOG.md"
+  else
+    replace_in_files '/^- Improve release flow\.$/d' "$notes_fixture/CHANGELOG.md"
+  fi
+  git -C "$notes_fixture" add CHANGELOG.md
+  git -C "$notes_fixture" commit --quiet -m "Introduce $notes_problem release notes"
+  git -C "$notes_fixture" push --quiet origin main
+  if run_release "$notes_fixture" --check >"$test_root/notes-$notes_problem.log" 2>&1; then
+    fail "release check accepted $notes_problem Unreleased notes"
+  fi
+  grep -Fq 'release notes:' "$test_root/notes-$notes_problem.log" ||
+    fail "release check did not report the $notes_problem notes failure"
+  [[ ! -s "$test_root/notes-$notes_problem-fake-cargo.log" ]] ||
+    fail "release check reached Cargo with $notes_problem notes"
+done
+
 before_check="$(git -C "$success_fixture" rev-parse HEAD)"
 run_release "$success_fixture" --check
 assert_equal "$before_check" "$(git -C "$success_fixture" rev-parse HEAD)" \
@@ -358,6 +406,11 @@ assert_equal "$before_check" "$(git -C "$success_fixture" rev-parse HEAD)" \
 run_release "$success_fixture"
 assert_equal "1.2.4" "$(fixture_version "$success_fixture")" \
   "default release version"
+grep -Fxq '## Unreleased (since 1.2.4)' "$success_fixture/CHANGELOG.md" ||
+  fail "release did not open the next Unreleased section"
+notes="$(python3 "$release_notes_script" extract 1.2.4 "$success_fixture/CHANGELOG.md")"
+[[ "$notes" == *'- Improve release flow.'* && "$notes" != *'- Initial release.'* ]] ||
+  fail "release notes did not select only the current curated section"
 assert_equal "Release Borg Agent 1.2.4" \
   "$(git -C "$success_fixture" log -1 --format=%s)" \
   "default release commit"
@@ -378,7 +431,19 @@ grep -Fxq 'fmt --all -- --check' "$test_root/success-fake-cargo.log" ||
   fail "release did not run the formatting check"
 grep -Fxq 'test --workspace --exclude borg-gui --locked -- --test-threads=1' "$test_root/success-fake-cargo.log" ||
   fail "release did not run workspace tests"
+run_release "$success_fixture" --verify-tag v1.2.4
 
+python3 - "$success_fixture/CHANGELOG.md" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+path.write_text(text.replace("## Unreleased (since 1.2.4)\n", "## Unreleased (since 1.2.4)\n\n- Second release note.\n", 1))
+PY
+git -C "$success_fixture" add CHANGELOG.md
+git -C "$success_fixture" commit --quiet -m "Describe next release"
+git -C "$success_fixture" push --quiet origin main
 run_release "$success_fixture" v2.0.0
 assert_equal "2.0.0" "$(fixture_version "$success_fixture")" \
   "explicit release version"
@@ -395,7 +460,7 @@ assert_equal "1.2.4" "$(fixture_version "$tolerant_fixture")" \
   "release with generated drift"
 assert_equal "generated drift" "$(<"$tolerant_fixture/generated.txt")" \
   "preserved generated drift"
-assert_equal $'Cargo.lock\nCargo.toml' \
+assert_equal $'CHANGELOG.md\nCargo.lock\nCargo.toml' \
   "$(git -C "$tolerant_fixture" diff-tree --no-commit-id --name-only -r HEAD | sort)" \
   "release commit scope"
 [[ -n "$(git -C "$tolerant_fixture" status --porcelain -- generated.txt)" ]] ||
@@ -404,7 +469,8 @@ assert_equal $'Cargo.lock\nCargo.toml' \
 interrupted_fixture="$(make_fixture interrupted)"
 replace_in_files 's/1\.2\.3/1.2.4/g' \
   "$interrupted_fixture/Cargo.toml" "$interrupted_fixture/Cargo.lock"
-git -C "$interrupted_fixture" add Cargo.toml Cargo.lock
+python3 "$release_notes_script" stamp 1.2.3 1.2.4 "$interrupted_fixture/CHANGELOG.md"
+git -C "$interrupted_fixture" add Cargo.toml Cargo.lock CHANGELOG.md
 git -C "$interrupted_fixture" commit --quiet -m "Bump workspace version to 1.2.4"
 git -C "$interrupted_fixture" push --quiet origin main
 interrupted_head="$(git -C "$interrupted_fixture" rev-parse HEAD)"
@@ -420,8 +486,9 @@ assert_equal "$interrupted_head" \
 prebumped_fixture="$(make_fixture prebumped 0.1.43)"
 replace_in_files 's/0\.1\.43/0.1.44/g' \
   "$prebumped_fixture/Cargo.toml" "$prebumped_fixture/Cargo.lock"
+python3 "$release_notes_script" stamp 0.1.43 0.1.44 "$prebumped_fixture/CHANGELOG.md"
 echo "coalesced release change" >"$prebumped_fixture/status.txt"
-git -C "$prebumped_fixture" add Cargo.toml Cargo.lock status.txt
+git -C "$prebumped_fixture" add Cargo.toml Cargo.lock CHANGELOG.md status.txt
 git -C "$prebumped_fixture" commit --quiet \
   -m "Preserve status tracking and bump version to 0.1.44"
 git -C "$prebumped_fixture" push --quiet origin main
@@ -446,6 +513,7 @@ git -C "$minor_fixture" rev-parse --verify 'refs/tags/v0.2.0^{commit}' \
 rollback_fixture="$(make_fixture rollback)"
 rollback_manifest="$(sha256sum "$rollback_fixture/Cargo.toml")"
 rollback_lock="$(sha256sum "$rollback_fixture/Cargo.lock")"
+rollback_changelog="$(sha256sum "$rollback_fixture/CHANGELOG.md")"
 rollback_head="$(git -C "$rollback_fixture" rev-parse HEAD)"
 rollback_log="$test_root/rollback-fake-cargo.log"
 : >"$rollback_log"
@@ -462,6 +530,8 @@ assert_equal "$rollback_manifest" "$(sha256sum "$rollback_fixture/Cargo.toml")" 
   "Cargo.toml rollback"
 assert_equal "$rollback_lock" "$(sha256sum "$rollback_fixture/Cargo.lock")" \
   "Cargo.lock rollback"
+assert_equal "$rollback_changelog" "$(sha256sum "$rollback_fixture/CHANGELOG.md")" \
+  "CHANGELOG.md rollback"
 assert_equal "$rollback_head" "$(git -C "$rollback_fixture" rev-parse HEAD)" \
   "failed release HEAD"
 [[ -z "$(git -C "$rollback_fixture" status --porcelain)" ]] ||
@@ -492,7 +562,7 @@ for disk_phase in preflight build; do
     fail "release ignored $disk_phase disk exhaustion"
   fi
   ((SECONDS - before < 10)) || fail "low-space cancellation waited for the build"
-  git -C "$disk_fixture" diff --exit-code -- Cargo.toml Cargo.lock || fail "low-space rollback changed manifests"
+  git -C "$disk_fixture" diff --exit-code -- Cargo.toml Cargo.lock CHANGELOG.md || fail "low-space rollback changed manifests or notes"
   [[ -z "$(git -C "$disk_fixture" status --porcelain)" ]] || fail "low-space release left temporary files"
   if [[ "$disk_phase" == preflight ]]; then
     [[ ! -s "$disk_log" ]] || fail "low-space preflight reached Cargo"

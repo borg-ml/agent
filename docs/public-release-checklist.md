@@ -5,15 +5,27 @@ focused on release boundaries rather than broad refactors.
 
 ## Local verification
 
-- `cargo fmt --all -- --check`
-- `cargo test --workspace --locked --no-fail-fast`
-- `cargo clippy --workspace --all-targets --locked -- -D warnings`
-- `cargo deny check advisories bans licenses sources`
-- `cargo audit --ignore RUSTSEC-2024-0320 --ignore RUSTSEC-2025-0141`
-- `git diff --check`
+- Point `BORG_TEST_SESSIONS_URL` and `BORG_SESSIONS_URL` at the same disposable
+  PostgreSQL test server, then run `just verify`. The platform CI provisions
+  that server automatically and runs the same gate on `main`.
+- Run `just release-test`, then `just release-check` from a clean checkout.
+- Confirm the six native platform jobs and workspace quality job pass for the
+  exact commit to be tagged. Re-run a failed job and investigate any repeated
+  failure before publishing.
 
-Run the workspace test command at least twice with its default parallelism;
-serial tests are not a substitute for finding scheduling races.
+For changes to scheduling or delivery, additionally run the affected tests
+with default parallelism to catch races hidden by the serial workspace gate.
+
+## Public-facing material
+
+- Review the user-facing `CHANGELOG.md` Unreleased section and the release
+  notes rendered from it. Include supported platforms, notable fixes and
+  known limitations.
+- Provide a private security-reporting path and a `SECURITY.md` that names it.
+- Confirm the contributor licence signing path described in
+  `CONTRIBUTING.md` is available before inviting external contributions.
+- Review redistribution rights and notices for the bundled native Claude
+  payload before publishing its archives.
 
 ## Recovery and boundaries
 
@@ -37,8 +49,14 @@ serial tests are not a substitute for finding scheduling races.
 - Build and smoke-test every supported platform archive.
 - Test fresh install, upgrade, interrupted update, and next-launch recovery.
 - Verify the Borg binary and bundled native provider together.
-- Run `just release-test`, then `just release-check` from a clean checkout.
-- Perform a small beta/canary release before marking the tag stable.
+- Install the draft archive on a canary host and exercise one real provider
+  session before publishing the draft.
+
+## Publication
+
+- Create the version tag only after the release candidate and notes are
+  approved. The tag workflow builds a draft release; inspect its assets and
+  checksums, then publish that draft only with explicit approval.
 
 ## Rollback
 

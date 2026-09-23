@@ -32,6 +32,7 @@ claude-native:
     test -n "$platform_dir"
     sdk_dir="$install_dir/node_modules/@anthropic-ai/claude-agent-sdk"
     cp "$platform_dir/claude" "$native_dir/claude"
+    cp "$platform_dir/LICENSE.md" "$native_dir/LICENSE.md"
     cp "$sdk_dir/manifest.json" "$native_dir/manifest.json"
     cp "$sdk_dir/package.json" "$native_dir/package.json"
     chmod 700 "$native_dir/claude"
@@ -68,11 +69,11 @@ verify:
 gui-check:
     cargo check -p borg-gui --locked
 
-# Bump, verify, commit, tag, and publish a release. Defaults to the next patch.
+# Bump, verify, commit, tag, and stage a draft release. Defaults to the next patch.
 release version="":
     ./scripts/release.sh {{ quote(version) }}
 
-# Bump the minor component and reset the patch component, e.g. 0.1.44 -> 0.2.0.
+# Bump the minor component, reset the patch component, and stage a draft release.
 release-minor version="":
     ./scripts/release.sh --minor {{ quote(version) }}
 

@@ -15,6 +15,8 @@ pull request does not by itself execute a CLA. A maintainer must provide and
 confirm Borg's approved signing process before a contribution can be merged.
 The final CLA text and signing workflow require Borg's software-licensing
 counsel.
+Until that process exists, please discuss proposed contributions in an issue
+before opening a pull request.
 
 Contributors must have the right to submit their work. Do not submit customer
 data, credentials, generated model transcripts, or third-party code whose

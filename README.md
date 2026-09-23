@@ -28,8 +28,8 @@ irm https://borg.ml/install.ps1 | iex
 
 The installer chooses the platform and CPU, verifies the release checksum, and
 installs `borg` in a user-local binary directory. Run `borg update` to update
-an existing installation. The same release also installs the native GUI
-launcher.
+an existing installation. The native GUI is experimental and is built from
+source separately.
 
 ## Use Borg
 
@@ -274,6 +274,7 @@ See [`CONTRIBUTING.md`](CONTRIBUTING.md) before submitting a change.
 
 Release tags matching `v*` build checksum-paired archives for Linux, macOS,
 and Windows on x86-64 and ARM64. See the
+[changelog](CHANGELOG.md) for user-visible changes and the
 [public release checklist](docs/public-release-checklist.md) before publishing
 a release.
 

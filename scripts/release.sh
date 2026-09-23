@@ -301,7 +301,7 @@ run_release_checks() (
   trap 'rm -rf -- "$test_tmp"' EXIT
   cargo fmt --all -- --check
   TMPDIR="$test_tmp" run_build cargo test --workspace --exclude borg-gui --locked -- --test-threads=1
-  git diff --check -- Cargo.toml Cargo.lock
+  git diff --check -- Cargo.toml Cargo.lock CHANGELOG.md
 )
 
 release_args=("$@")
@@ -336,7 +336,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$script_dir/.." && pwd)"
 cd "$repo_root"
 
-for command in cargo git awk; do
+for command in cargo git awk python3; do
   command -v "$command" >/dev/null 2>&1 || die "required command '$command' was not found"
 done
 
@@ -348,7 +348,8 @@ validate_version "$current_version" ||
 if [[ "$mode" == "verify-tag" ]]; then
   [[ "$1" == "v$current_version" ]] ||
     die "tag '$1' does not match workspace version v$current_version"
-  echo "Release tag $1 matches workspace version $current_version."
+  python3 "$script_dir/release-notes.py" verify "$current_version" CHANGELOG.md
+  echo "Release tag $1 matches workspace version and notes for $current_version."
   exit 0
 fi
 
@@ -366,11 +367,11 @@ remote="${BORG_RELEASE_REMOTE:-origin}"
 branch="${BORG_RELEASE_BRANCH:-main}"
 
 worktree_status="$(git status --porcelain --untracked-files=all)"
-release_file_status="$(git status --porcelain --untracked-files=all -- Cargo.toml Cargo.lock)"
+release_file_status="$(git status --porcelain --untracked-files=all -- Cargo.toml Cargo.lock CHANGELOG.md)"
 [[ -z "$release_file_status" ]] ||
-  die "Cargo.toml and Cargo.lock must be clean before release"
+  die "Cargo.toml, Cargo.lock and CHANGELOG.md must be clean before release"
 if [[ -n "$worktree_status" ]]; then
-  echo "release: continuing with unrelated worktree changes; only Cargo.toml and Cargo.lock will be committed" >&2
+  echo "release: continuing with unrelated worktree changes; only Cargo.toml, Cargo.lock and CHANGELOG.md will be committed" >&2
 fi
 [[ "$(git branch --show-current)" == "$branch" ]] ||
   die "release must run from branch '$branch'"
@@ -441,6 +442,12 @@ if [[ "$recovered" -eq 0 ]] && git rev-parse --quiet --verify "refs/tags/$tag^{c
 fi
 
 if [[ "$recovered" -eq 1 ]]; then
+  python3 "$script_dir/release-notes.py" verify "$target_version" CHANGELOG.md
+else
+  python3 "$script_dir/release-notes.py" check "$current_version" CHANGELOG.md
+fi
+
+if [[ "$recovered" -eq 1 ]]; then
   echo "Recovered $recovery_kind release: $target_version (version bump already committed)"
 else
   echo "Release plan: $current_version -> $target_version"
@@ -450,9 +457,9 @@ echo "Targets: Linux, macOS, and Windows on x86-64 and ARM64"
 if [[ "$mode" == "check" ]]; then
   run_release_checks
   if [[ "$recovered" -eq 1 ]]; then
-    echo "Release checks passed. Run 'just release' to publish v$target_version."
+    echo "Release checks passed. Run 'just release' to stage v$target_version as a draft."
   else
-    echo "Release checks passed. Run 'just release${requested_version:+ $requested_version}'."
+    echo "Release checks passed. Run 'just release${requested_version:+ $requested_version}' to stage a draft."
   fi
   exit 0
 fi
@@ -462,7 +469,7 @@ if [[ "$recovered" -eq 1 ]]; then
   if ! git rev-parse --quiet --verify "refs/tags/$tag^{commit}" >/dev/null; then
     git tag -a "$tag" -m "Borg Agent $target_version"
   fi
-  echo "Publishing $tag atomically to $remote..."
+  echo "Pushing $tag atomically to $remote to stage a draft..."
   git push --atomic "$remote" "HEAD:refs/heads/$branch" "refs/tags/$tag"
   echo "Release workflow started: $REPOSITORY_URL/actions/workflows/release.yml"
   exit 0
@@ -470,8 +477,10 @@ fi
 
 manifest_backup="$(mktemp "$repo_root/.borg-release-cargo-toml.XXXXXX")"
 lock_backup="$(mktemp "$repo_root/.borg-release-cargo-lock.XXXXXX")"
+changelog_backup="$(mktemp "$repo_root/.borg-release-changelog.XXXXXX")"
 cp Cargo.toml "$manifest_backup"
 cp Cargo.lock "$lock_backup"
+cp CHANGELOG.md "$changelog_backup"
 committed=0
 
 cleanup() {
@@ -480,16 +489,18 @@ cleanup() {
   if [[ "$status" -ne 0 && "$committed" -eq 0 ]]; then
     mv -f -- "$manifest_backup" Cargo.toml
     mv -f -- "$lock_backup" Cargo.lock
-    echo "release: restored Cargo.toml and Cargo.lock after failure" >&2
+    mv -f -- "$changelog_backup" CHANGELOG.md
+    echo "release: restored Cargo.toml, Cargo.lock and CHANGELOG.md after failure" >&2
   elif [[ "$status" -ne 0 ]]; then
     echo "release: the release commit was retained; inspect it before retrying the atomic push" >&2
   fi
-  rm -f "$manifest_backup" "$lock_backup"
+  rm -f "$manifest_backup" "$lock_backup" "$changelog_backup"
   exit "$status"
 }
 trap cleanup EXIT
 
 replace_workspace_version "$current_version" "$target_version"
+python3 "$script_dir/release-notes.py" stamp "$current_version" "$target_version" CHANGELOG.md
 
 # Refresh workspace package versions in Cargo.lock before enforcing --locked.
 run_build cargo check --workspace --exclude borg-gui --all-targets
@@ -511,11 +522,11 @@ run_release_checks
 # Commit only the release files. Other staged or concurrently generated work
 # must remain in the user's working tree and must never hitchhike into a
 # release commit.
-git commit --only Cargo.toml Cargo.lock -m "Release Borg Agent $target_version"
+git commit --only Cargo.toml Cargo.lock CHANGELOG.md -m "Release Borg Agent $target_version"
 committed=1
 git tag -a "$tag" -m "Borg Agent $target_version"
 
-echo "Publishing $tag atomically to $remote..."
+echo "Pushing $tag atomically to $remote to stage a draft..."
 git push --atomic "$remote" "HEAD:refs/heads/$branch" "refs/tags/$tag"
 
 echo "Release workflow started: $REPOSITORY_URL/actions/workflows/release.yml"
