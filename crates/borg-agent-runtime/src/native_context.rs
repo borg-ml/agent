@@ -121,6 +121,25 @@ impl NativeContext {
         appendix
     }
 
+    /// The same guidance for a transport without Borg's `read_skill` tool: each
+    /// skill carries its SKILL.md path so the model reads only the one it needs.
+    pub(crate) fn path_catalog_appendix(&self) -> String {
+        let mut appendix = self.project_instructions.clone();
+        if !self.skills.is_empty() {
+            appendix.push_str(
+                "\n\nAvailable skills are listed below. When a user names one or the task clearly matches its description, read the complete SKILL.md at the listed path before acting and follow it for that turn.",
+            );
+            for (name, skill) in &self.skills {
+                appendix.push_str(&format!(
+                    "\n- {name}: {} (SKILL.md: {})",
+                    skill.description,
+                    skill.path.display()
+                ));
+            }
+        }
+        appendix
+    }
+
     pub(crate) fn has_skills(&self) -> bool {
         !self.skills.is_empty()
     }

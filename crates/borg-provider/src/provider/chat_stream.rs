@@ -1902,8 +1902,14 @@ fn claude_command_args(
         "--verbose".to_string(),
         "--include-partial-messages".to_string(),
         // Claude Code is the subscription transport; Borg is the agent. Every
-        // tool the model can call is Borg's, served from --mcp-config.
+        // tool the model can call is Borg's, served from --mcp-config, and no
+        // skill, plugin, hook or settings file of Claude Code's own shapes the
+        // context.
         "--tools".to_string(),
+        String::new(),
+        "--strict-mcp-config".to_string(),
+        "--disable-slash-commands".to_string(),
+        "--setting-sources".to_string(),
         String::new(),
     ];
     if permission == LocalAgentPermission::FullAccess {
@@ -1966,10 +1972,27 @@ async fn build_claude_command_spec(
     // automatic backgrounding of slow Bash commands withholds the turn's
     // `result` until the task finishes, which left sessions "running" for
     // minutes after the model had already delivered its final answer.
-    let mut environment = vec![(
-        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".to_string(),
-        "1".to_string(),
-    )];
+    let mut environment = vec![
+        (
+            "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".to_string(),
+            "1".to_string(),
+        ),
+        // Borg supplies AGENTS.md and skills itself and keeps its own memory.
+        (
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS".to_string(),
+            "1".to_string(),
+        ),
+        (
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY".to_string(),
+            "1".to_string(),
+        ),
+        // Claude Code's nudge after text-free rounds duplicates Borg's own
+        // progress rule and pushed updates into thinking instead of text.
+        (
+            "CLAUDE_CODE_SILENT_TURN_REMINDER".to_string(),
+            "0".to_string(),
+        ),
+    ];
     if let Some(auth_home) = auth_home {
         environment.push(("HOME".to_string(), auth_home.path().display().to_string()));
     }
@@ -2157,6 +2180,10 @@ mod tests {
                 "--verbose",
                 "--include-partial-messages",
                 "--tools",
+                "",
+                "--strict-mcp-config",
+                "--disable-slash-commands",
+                "--setting-sources",
                 "",
                 "--permission-mode",
                 "manual",

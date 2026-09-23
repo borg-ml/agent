@@ -1068,7 +1068,18 @@ impl LocalAgentTurnExecutor {
             .extend(runtime_extensions.skill_roots);
         turn.extension_workflows
             .extend(runtime_extensions.workflows);
-        if !turn.extension_skill_roots.is_empty() {
+        if turn.provider == CodingProvider::Claude {
+            // Claude Code's own AGENTS.md, skill and plugin discovery is off, so
+            // Borg supplies the project guidance and skill catalog its native
+            // harness gives every other model.
+            let context = crate::native_context::NativeContext::load(
+                turn.cwd.clone(),
+                turn.extension_skill_roots.clone(),
+            )
+            .await?;
+            turn.system_prompt_appendix
+                .push_str(&context.path_catalog_appendix());
+        } else if !turn.extension_skill_roots.is_empty() {
             turn.system_prompt_appendix.push_str(
                 &crate::native_context::extension_skill_prompt_appendix(
                     turn.extension_skill_roots.clone(),
