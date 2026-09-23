@@ -54,7 +54,7 @@ args = ["-nullrhi"]
 submits to `borg lane job submit --spec - --json` when core is available;
 `--wait` uses its terminal wait. The core owns queue, worktree resource lease,
 admission, memory/time limits, and coalescing of **pending** identical inputs.
-The adapter calculates a source/toolchain fingerprint, a per-attempt UBT log,
+The adapter calculates a source/toolchain fingerprint, a per-revision/policy UBT log (reset at job start),
 RAM-derived `-MaxParallelActions`, and `-NoMutex`; a narrow UBT-start lock in
 the Unreal-specific helper protects Trace.uba startup, not build scheduling.
 When installed Linux symbol tools are present, UBT uses `-NoDumpSyms` and the

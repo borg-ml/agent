@@ -97,7 +97,8 @@ def fingerprint(project: Path, engine: Path, args: list[str]) -> str:
     h = hashlib.sha256()
     h.update(json.dumps([str(project), str(engine), args], sort_keys=True).encode())
     for top in (project, engine / 'Engine/Build/BatchFiles' / PLATFORM / 'Build.sh',
-                engine / 'Engine/Build/Build.version', project.parent / 'Source', project.parent / 'Plugins'):
+                engine / 'Engine/Build/Build.version', ROOT / 'bin/ubt.py',
+                ROOT / 'bin/symbols.py', project.parent / 'Source', project.parent / 'Plugins'):
         if not top.exists():
             continue
         paths = [top] if top.is_file() else sorted(p for p in top.rglob('*') if p.is_file()
@@ -136,11 +137,7 @@ def build_spec(args: argparse.Namespace, project: Path, engine: Path, cfg: dict)
     if str(project) not in positional and not any(a.startswith('-Project=') for a in positional):
         positional.insert(3, str(project))
     script = engine / 'Engine/Build/BatchFiles' / PLATFORM / 'Build.sh'
-    rev = fingerprint(project, engine, [str(script), *positional])
     state = Path(os.environ.get('XDG_RUNTIME_DIR') or '/tmp') / 'borg' / 'unreal' / project_id(project)
-    attempt = uuid.uuid4().hex
-    log = state / f'{rev}.{attempt}.ubt.log'
-    symbols = state / f'{rev}.{attempt}.symbols.json'
     action_gb = float(cfg.get('build', {}).get('gb_per_action', 1.5))
     reserve = sizes(cfg, 'build', 'reserve_ram_gb', 4)
     if action_gb <= 0:
@@ -148,13 +145,21 @@ def build_spec(args: argparse.Namespace, project: Path, engine: Path, cfg: dict)
     available = mem_available_bytes() // GIB
     actions = max(1, min((os.cpu_count() or 2) // 2, int(max(1, available - reserve) / action_gb)))
     ubt_args = [a for a in positional if not a.lower().startswith(('-waitmutex', '-nomutex', '-log=', '-maxparallelactions='))]
-    ubt_args += ['-NoMutex', f'-MaxParallelActions={actions}', f'-Log={log}']
+    ubt_args += ['-NoMutex', f'-MaxParallelActions={actions}']
     have_syms = (PLATFORM == 'Linux' and
                  all((engine / 'Engine/Binaries/Linux' / n).is_file()
                      for n in ('dump_syms', 'BreakpadSymbolEncoder')) and
                  not any(a.lower().startswith(('-clean', '-mode=', '-nodumpsyms')) for a in positional))
     if have_syms:
         ubt_args.append('-NoDumpSyms')
+    # Identical pending jobs must have identical argv/env/hooks. Keep log and
+    # manifest stable per revision/policy, and clear old artifacts at job start.
+    rev = fingerprint(project, engine, [str(script), *ubt_args, sys.executable, str(state),
+                                        json.dumps(cfg.get('build', {}), sort_keys=True),
+                                        str(int(action_gb * GIB))])
+    log = state / f'{rev}.ubt.log'
+    symbols = state / f'{rev}.symbols.json'
+    ubt_args.append(f'-Log={log}')
     cmd = [sys.executable, str(ROOT / 'bin/ubt.py'), '--symbols', str(symbols), '--', str(script), *ubt_args]
     env = [['UnrealBuildTool_ParallelExecutor__MemoryPerActionBytes', str(int(action_gb * GIB))],
            ['UE_UBT_START_LOCK', str(state.parent / 'ubt-start.lock')]]

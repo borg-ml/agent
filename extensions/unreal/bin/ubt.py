@@ -41,6 +41,8 @@ def main(argv: list[str]) -> int:
         parser.error('per-build -Log= is required')
     log_path = Path(log_arg.split('=', 1)[1])
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.unlink(missing_ok=True)
+    args.symbols.unlink(missing_ok=True)
     start_lock = Path(os.environ.get('UE_UBT_START_LOCK', '/tmp/borg-unreal-ubt-start.lock'))
     start_lock.parent.mkdir(parents=True, exist_ok=True)
     def start_once():
