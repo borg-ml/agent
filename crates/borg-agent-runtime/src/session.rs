@@ -4405,7 +4405,19 @@ async fn run_agent_session_store_kernel_inner(
             cwd: launch.cwd.clone(),
             prompt_delta,
             prompt: provider_prompt,
-            attachments: prompt.attachments.clone(),
+            attachments: if native_provider || reuse_subscription_context {
+                prompt.attachments.clone()
+            } else {
+                // A fresh replay is text-only, so re-attach the images of prompts
+                // the model never finished answering (e.g. a steer into a turn a
+                // provider switch then interrupted).
+                let mut attachments = prompt.attachments.clone();
+                attachments.extend(unanswered_prompt_attachments(
+                    journal.context_events(),
+                    &attachments,
+                ));
+                attachments
+            },
             output_schema: prompt.output_schema.clone(),
             model: launch.model.clone(),
             effort: launch.effort.clone(),
@@ -7558,6 +7570,40 @@ fn compaction_context_chunks(
         chunks.push(current);
     }
     chunks
+}
+
+const MAX_REPLAYED_ATTACHMENTS: usize = 8;
+
+/// Attachments of user prompts admitted after the last successfully completed
+/// turn, newest kept, excluding `current` and files that no longer exist.
+fn unanswered_prompt_attachments(events: &[SessionEvent], current: &[PathBuf]) -> Vec<PathBuf> {
+    let start = events
+        .iter()
+        .rposition(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::TurnCompleted { error: None, .. }
+            )
+        })
+        .map_or(0, |index| index + 1);
+    let mut attachments: Vec<PathBuf> = Vec::new();
+    for event in &events[start..] {
+        if let SessionEventKind::Message {
+            actor: EventActor::User,
+            attachments: paths,
+            ..
+        } = &event.kind
+        {
+            for path in paths {
+                if !current.contains(path) && !attachments.contains(path) && path.is_file() {
+                    attachments.push(path.clone());
+                }
+            }
+        }
+    }
+    let excess = attachments.len().saturating_sub(MAX_REPLAYED_ATTACHMENTS);
+    attachments.drain(..excess);
+    attachments
 }
 
 fn retained_conversation_context(events: &[SessionEvent]) -> Option<String> {

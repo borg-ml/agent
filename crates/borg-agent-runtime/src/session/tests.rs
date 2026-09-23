@@ -11,6 +11,55 @@ use borg_provider::ProviderCallUsage;
 use super::*;
 
 #[test]
+fn fresh_replay_reattaches_images_the_model_never_finished_answering() {
+    let dir = tempdir().unwrap();
+    let image = |name: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"png").unwrap();
+        path
+    };
+    let (answered, steered, current) = (image("a.png"), image("b.png"), image("c.png"));
+    let session_id = Uuid::new_v4();
+    let prompt = |attachments: Vec<PathBuf>| {
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "look [Image 1]".to_string(),
+                attachments,
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        )
+    };
+    let completed = |error: Option<&str>| {
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::TurnCompleted {
+                message_id: Uuid::new_v4(),
+                provider_session_id: None,
+                final_text: String::new(),
+                error: error.map(str::to_string),
+            },
+        )
+    };
+    let events = [
+        prompt(vec![answered]),
+        completed(None),
+        prompt(vec![steered.clone(), dir.path().join("deleted.png")]),
+        completed(Some("turn interrupted")),
+        prompt(vec![current.clone()]),
+    ];
+    assert_eq!(
+        unanswered_prompt_attachments(&events, std::slice::from_ref(&current)),
+        [steered]
+    );
+}
+
+#[test]
 fn prompt_title_has_a_durable_fallback_for_attachment_only_messages() {
     assert_eq!(prompt_session_title("  \n"), "New conversation");
     assert_eq!(
