@@ -669,6 +669,28 @@ fn stall_detection_counts_every_process_of_the_job() {
     assert!(cpu > 0.1, "the child's CPU was not counted: {cpu}");
 }
 
+/// Failure mode: a build swapping the host to a halt because its scope has
+/// no swap limit (legacy builds ran with MemorySwapMax=2G).
+#[test]
+fn a_job_scope_caps_swap() {
+    let lane = Lane::new();
+    if lane.degraded {
+        return; // Unscoped jobs have no cgroup of their own.
+    }
+    let limit = lane.root.join("swap.max");
+    let mut spec = lane.spec(
+        "swap",
+        &format!(
+            "cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/memory.swap.max > '{}'",
+            limit.display()
+        ),
+    );
+    spec.memory_swap_max_bytes = Some(64 << 20);
+    let job = lane.submit(&spec);
+    lane.wait(&job, 0);
+    assert_eq!(std::fs::read_to_string(&limit).unwrap().trim(), "67108864");
+}
+
 /// A hook that appends its phase and the job's ending to `<root>/<name>.<phase>`.
 fn reporting_hook(lane: &Lane, name: &str, phase: &str) -> Hook {
     let out = lane.root.join(format!("{name}.{phase}"));
