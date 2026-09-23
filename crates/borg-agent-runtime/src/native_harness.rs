@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::{
     AgentTurn, AgentTurnControl, AgentTurnResult, ApprovalDecision, EventActor, ExecutionProvider,
     HarnessMode, MessageStatus, PermissionMode, SessionEventKind, SessionStatus,
+    agent::NativeCompactionProgress,
 };
 
 mod cache_warming;
@@ -1284,12 +1285,17 @@ impl NativeHarness {
         effort: Option<&str>,
         fast: bool,
         conversation: Vec<ModelMessage>,
+        observed_context_window_tokens: Option<u64>,
+        progress: Option<mpsc::UnboundedSender<NativeCompactionProgress>>,
     ) -> Result<(String, ProviderCallUsage)> {
-        let window = self
-            .model_client
-            .context_window(provider, model)
-            .await
-            .unwrap_or(NATIVE_ASSUMED_CONTEXT_WINDOW_TOKENS);
+        let window = match observed_context_window_tokens.filter(|window| *window > 0) {
+            Some(window) => window,
+            None => self
+                .model_client
+                .context_window(provider, model)
+                .await
+                .unwrap_or(NATIVE_ASSUMED_CONTEXT_WINDOW_TOKENS),
+        };
         let mut usage = ProviderCallUsage::default();
         match self
             .compact_with_window(
@@ -1300,6 +1306,7 @@ impl NativeHarness {
                 conversation,
                 window,
                 &mut usage,
+                progress.as_ref(),
             )
             .await
         {
@@ -1318,6 +1325,7 @@ impl NativeHarness {
         conversation: Vec<ModelMessage>,
         context_window_tokens: u64,
         usage: &mut ProviderCallUsage,
+        progress: Option<&mpsc::UnboundedSender<NativeCompactionProgress>>,
     ) -> Result<String> {
         anyhow::ensure!(
             !conversation.is_empty(),
@@ -1340,8 +1348,16 @@ impl NativeHarness {
             chunk_chars,
             COMPACTION_IMAGE_RESERVATION_CHARS,
         )?;
+        let total_passes = chunks.len();
+        if let Some(progress) = progress {
+            let _ = progress.send(NativeCompactionProgress {
+                completed_passes: 0,
+                total_passes,
+                pass_duration_ms: 0,
+            });
+        }
         let mut summary = String::new();
-        for chunk in chunks {
+        for (pass_index, chunk) in chunks.into_iter().enumerate() {
             let prompt = if summary.is_empty() {
                 format!(
                     "<prior_provider_conversation>\n{}\n</prior_provider_conversation>\nReturn only the internal continuation checkpoint.",
@@ -1365,12 +1381,13 @@ impl NativeHarness {
             } else {
                 ModelMessage::user(prompt)
             };
+            let pass_started = Instant::now();
             let result = self
                 .model_client
                 .model_turn(
                     provider,
                     model,
-                    effort,
+                    internal_compaction_effort(provider, effort),
                     ModelTurnRequest {
                         fast,
                         request_id: Some(format!("compact:{}", Uuid::new_v4())),
@@ -1391,6 +1408,10 @@ impl NativeHarness {
                 .await
                 .map_err(anyhow::Error::new)?;
             absorb_usage(usage, &result.usage);
+            anyhow::ensure!(
+                result.finish_reason == "stop",
+                "native compaction checkpoint was truncated or incomplete"
+            );
             let ModelMessage::Assistant {
                 content,
                 tool_calls,
@@ -1409,6 +1430,14 @@ impl NativeHarness {
                 "native compaction returned an empty summary"
             );
             summary = crate::session::truncate_compaction_context(&next, summary_chars);
+            if let Some(progress) = progress {
+                let _ = progress.send(NativeCompactionProgress {
+                    completed_passes: pass_index + 1,
+                    total_passes,
+                    pass_duration_ms: pass_started.elapsed().as_millis().min(u64::MAX as u128)
+                        as u64,
+                });
+            }
         }
         Ok(summary)
     }
@@ -1461,7 +1490,7 @@ impl NativeHarness {
         else {
             return None;
         };
-        let complete = result.finish_reason != "length";
+        let complete = result.finish_reason == "stop";
         (complete && tool_calls.is_empty() && !content.trim().is_empty()).then(|| {
             crate::session::truncate_compaction_context(
                 &content,
@@ -1597,6 +1626,7 @@ impl NativeHarness {
                     messages.clone(),
                     context_window_tokens,
                     &mut compaction_usage,
+                    None,
                 )
                 .await
             }
@@ -1715,6 +1745,18 @@ impl NativeHarness {
 /// Room an in-place compaction needs beyond the history for its instruction,
 /// reasoning and checkpoint.
 const IN_PLACE_COMPACTION_HEADROOM_TOKENS: u64 = 16_384;
+
+fn internal_compaction_effort<'a>(
+    provider: crate::CodingProvider,
+    effort: Option<&'a str>,
+) -> Option<&'a str> {
+    if provider == crate::CodingProvider::Codex && matches!(effort, Some("max" | "xhigh" | "ultra"))
+    {
+        Some("high")
+    } else {
+        effort
+    }
+}
 
 /// Characters of history one text-fold compaction request may carry.
 fn compaction_input_chars(context_window_tokens: u64) -> usize {
@@ -1998,6 +2040,17 @@ impl NativeModelClient for ProviderModelClient {
     async fn context_window(&self, provider: crate::CodingProvider, model: &str) -> Option<u64> {
         let gateway = match self.route(provider, model) {
             Ok(NativeRoute::ChatCompletions { gateway, .. }) => gateway,
+            #[cfg(feature = "subscription-adapters")]
+            Ok(NativeRoute::CodexAccount(account)) => {
+                return borg_provider::provider::CodexModelProvider {
+                    model: model.to_string(),
+                    effort: borg_provider::codex_default_effort().to_string(),
+                }
+                .context_window_for_account_with_auth(account, self.codex_auth_file.clone())
+                .await
+                .ok()
+                .flatten();
+            }
             // A published Claude window keeps the context meter and the pre-call
             // budget check working on this route too.
             Ok(NativeRoute::AnthropicMessages) => {
@@ -4382,10 +4435,71 @@ mod tests {
                     },
                     ModelMessage::user("Preserve the public API"),
                 ],
+                None,
+                None,
             )
             .await
             .unwrap();
         assert_eq!(summary, "Resume the build fix");
+    }
+
+    #[tokio::test]
+    async fn truncated_compaction_checkpoint_is_rejected_with_usage_preserved() {
+        struct TruncatedClient;
+        #[async_trait]
+        impl NativeModelClient for TruncatedClient {
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                _request: ModelTurnRequest,
+                _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(
+                        Some("partial checkpoint".into()),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    finish_reason: "length".into(),
+                    usage: ProviderCallUsage {
+                        input_tokens: 10,
+                        output_tokens: 2,
+                        total_tokens: 12,
+                        ..Default::default()
+                    },
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+        let harness = NativeHarness {
+            model_client: Arc::new(TruncatedClient),
+            ..NativeHarness::default()
+        };
+        let error = harness
+            .compact(
+                crate::CodingProvider::Codex,
+                "test-model",
+                Some("high"),
+                false,
+                vec![ModelMessage::user("important history")],
+                Some(20_000),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("truncated or incomplete"));
+        assert_eq!(
+            error
+                .downcast_ref::<crate::agent::PartialCompactionUsage>()
+                .unwrap()
+                .usage
+                .total_tokens,
+            12
+        );
     }
 
     #[tokio::test]
@@ -4400,17 +4514,18 @@ mod tests {
                 _provider: crate::CodingProvider,
                 _model: &str,
             ) -> Option<u64> {
-                Some(20_000)
+                panic!("observed context window should be used for compaction")
             }
 
             async fn model_turn(
                 &self,
                 _provider: crate::CodingProvider,
                 _model: &str,
-                _effort: Option<&str>,
+                effort: Option<&str>,
                 request: ModelTurnRequest,
                 _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
             ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                assert_eq!(effort, Some("high"));
                 assert_eq!(request.messages.len(), 2);
                 assert!(request.tools.is_empty());
                 assert!(request.messages.iter().all(|message| matches!(
@@ -4521,19 +4636,39 @@ mod tests {
                 }],
             },
         );
+        let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
         let (summary, _) = harness
             .compact(
                 crate::CodingProvider::Codex,
                 "test-model",
-                Some("high"),
+                Some("max"),
                 false,
                 conversation,
+                Some(20_000),
+                Some(progress_tx),
             )
             .await
             .unwrap();
         assert_eq!(summary, "Resume the build fix");
         let prompts = client.prompts.lock().unwrap();
         assert!(prompts.len() > 3, "history must require multiple folds");
+        let mut passes = Vec::new();
+        while let Ok(progress) = progress_rx.try_recv() {
+            passes.push(progress);
+        }
+        assert_eq!(passes.len(), prompts.len() + 1);
+        assert_eq!(passes[0].completed_passes, 0);
+        assert!(
+            passes
+                .iter()
+                .all(|progress| progress.total_passes == prompts.len())
+        );
+        assert!(
+            passes
+                .iter()
+                .enumerate()
+                .all(|(index, progress)| progress.completed_passes == index)
+        );
         assert!(
             prompts[1]
                 .0
@@ -4641,6 +4776,8 @@ mod tests {
                 None,
                 false,
                 conversation.clone(),
+                None,
+                None,
             )
             .await
             .unwrap_err();

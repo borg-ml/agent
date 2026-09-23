@@ -10646,6 +10646,26 @@ fn automatic_compaction_event_reports_work_in_progress() {
         Some(TranscriptEntry::Compaction { summary, .. })
             if summary == "Compacting context…"
     ));
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "context_compaction".to_string(),
+            payload: serde_json::json!({
+                "status": "progress",
+                "summary": "Compacting context: 2/5 passes complete",
+                "completed_passes": 2,
+                "total_passes": 5
+            }),
+        },
+    ));
+    assert_eq!(transcript.order.len(), 1);
+    assert!(matches!(
+        transcript.order.last(),
+        Some(TranscriptEntry::Compaction { summary, complete: false, .. })
+            if summary == "Compacting context: 2/5 passes complete"
+    ));
 }
 
 #[test]

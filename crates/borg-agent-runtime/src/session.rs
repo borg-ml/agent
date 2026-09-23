@@ -3350,6 +3350,8 @@ async fn run_agent_session_store_kernel_inner(
                                         launch.effort.as_deref(),
                                         launch.fast.unwrap_or(false),
                                         conversation,
+                                        None,
+                                        None,
                                     )
                                     .await
                                     .map(|compaction| Some((compaction, Vec::new())))
@@ -3908,27 +3910,61 @@ async fn run_agent_session_store_kernel_inner(
                 .await?;
                 journal.ensure_complete_context(session_id).await?;
                 let result = async {
-                    executor
-                        .compact_native(
-                            crate::ModelAccessContext {
-                                session_id,
-                                store: dispatcher.session_store(),
-                            },
-                            launch.provider,
-                            launch
-                                .model
-                                .as_deref()
-                                .context("native context compaction requires a model")?,
-                            launch.effort.as_deref(),
-                            launch.fast.unwrap_or(false),
-                            native_conversation_with_historical_images(
-                                journal.context_events(),
-                                launch.provider,
-                                &launch.cwd,
-                            )
-                            .await?,
-                        )
-                        .await
+                    let conversation = native_conversation_with_historical_images(
+                        journal.context_events(),
+                        launch.provider,
+                        &launch.cwd,
+                    )
+                    .await?;
+                    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+                    let compaction = executor.compact_native(
+                        crate::ModelAccessContext {
+                            session_id,
+                            store: dispatcher.session_store(),
+                        },
+                        launch.provider,
+                        launch
+                            .model
+                            .as_deref()
+                            .context("native context compaction requires a model")?,
+                        launch.effort.as_deref(),
+                        launch.fast.unwrap_or(false),
+                        conversation,
+                        Some(context_window_tokens),
+                        Some(progress_tx),
+                    );
+                    tokio::pin!(compaction);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            Some(progress) = progress_rx.recv() => {
+                                record(
+                                    &mut journal,
+                                    &events,
+                                    session_id,
+                                    SessionEventKind::ProviderEvent {
+                                        provider: launch.provider,
+                                        kind: "context_compaction".to_string(),
+                                        payload: serde_json::json!({
+                                            "status": "progress",
+                                            "summary": format!(
+                                                "Compacting context: {}/{} passes complete",
+                                                progress.completed_passes,
+                                                progress.total_passes,
+                                            ),
+                                            "automatic": true,
+                                            "trigger": "context_threshold",
+                                            "completed_passes": progress.completed_passes,
+                                            "total_passes": progress.total_passes,
+                                            "pass_duration_ms": progress.pass_duration_ms,
+                                        }),
+                                    },
+                                )
+                                .await?;
+                            }
+                            result = &mut compaction => break result,
+                        }
+                    }
                 }
                 .await;
                 match result {

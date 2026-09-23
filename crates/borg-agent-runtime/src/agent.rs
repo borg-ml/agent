@@ -293,6 +293,13 @@ pub struct AgentCompaction {
     pub provider_session_id: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct NativeCompactionProgress {
+    pub completed_passes: usize,
+    pub total_passes: usize,
+    pub pass_duration_ms: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct PartialCompactionUsage {
     pub(crate) usage: ProviderCallUsage,
@@ -426,6 +433,8 @@ pub trait AgentTurnExecutor: Send + Sync {
         _effort: Option<&str>,
         _fast: bool,
         _conversation: Vec<borg_provider::provider::ModelMessage>,
+        _observed_context_window_tokens: Option<u64>,
+        _progress: Option<mpsc::UnboundedSender<NativeCompactionProgress>>,
     ) -> Result<AgentCompaction> {
         anyhow::bail!("native context compaction is not supported by this provider")
     }
@@ -1361,6 +1370,8 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         effort: Option<&str>,
         fast: bool,
         conversation: Vec<borg_provider::provider::ModelMessage>,
+        observed_context_window_tokens: Option<u64>,
+        progress: Option<mpsc::UnboundedSender<NativeCompactionProgress>>,
     ) -> Result<AgentCompaction> {
         anyhow::ensure!(
             self.uses_native_harness(provider),
@@ -1370,7 +1381,15 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             .native_harness
             .with_model_access_for(provider, Some(model), &access)
             .await?
-            .compact(provider, model, effort, fast, conversation)
+            .compact(
+                provider,
+                model,
+                effort,
+                fast,
+                conversation,
+                observed_context_window_tokens,
+                progress,
+            )
             .await?;
         Ok(AgentCompaction {
             summary,
@@ -3008,6 +3027,8 @@ mod tests {
                 vec![borg_provider::provider::ModelMessage::user(
                     "private conversation",
                 )],
+                None,
+                None,
             )
             .await
             .unwrap_err();

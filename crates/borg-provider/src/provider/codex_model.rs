@@ -277,6 +277,25 @@ impl CodexModelProvider {
             .identity())
     }
 
+    pub async fn context_window_for_account_with_auth(
+        &self,
+        expected_account: &str,
+        auth_file: Option<std::path::PathBuf>,
+    ) -> Result<Option<u64>> {
+        let mut access = SubscriptionAccess::read_with(auth_file, None).await?;
+        ensure!(
+            access.identity() == expected_account,
+            "OpenAI credentials changed during this turn; retry to use the currently selected account"
+        );
+        if access.is_api_key() {
+            return Ok(None);
+        }
+        let capabilities = access
+            .model_capabilities(&reqwest::Client::new(), &self.model)
+            .await?;
+        Ok(Some(capabilities.usable_context_window()?))
+    }
+
     /// Keep the credentials selected at turn admission stable while this turn runs.
     pub async fn model_turn_for_account(
         &self,

@@ -71,7 +71,8 @@ pub use command_changes::CommandChange;
 pub use agent::{
     AgentCompaction, AgentTurn, AgentTurnControl, AgentTurnExecutor, AgentTurnResult,
     BluWorkflowDefinition, ConsultationRequest, ConsultationResult, LocalAgentSettings,
-    LocalAgentTurnExecutor, ModelAccessContext, run_agent_turn, run_agent_turn_controlled,
+    LocalAgentTurnExecutor, ModelAccessContext, NativeCompactionProgress, run_agent_turn,
+    run_agent_turn_controlled,
 };
 pub use autonomy::{
     AutonomyCheckpoint, AutonomyJob, AutonomyJobHandler, AutonomyJobState, AutonomyJobTransition,
