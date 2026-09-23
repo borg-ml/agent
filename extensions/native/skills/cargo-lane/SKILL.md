@@ -9,6 +9,8 @@ Run from the worktree root, not the canonical dirty checkout. The adapter is
 `extensions/native/native.py` (source) or `.borg/extensions/native/native.py` (installed) and uses `cargo check|build|test`
 with `-j` (at most 6, from MemAvailable with an 8 GiB reserve plus 2 GiB fixed job overhead). It sets
 `CARGO_TARGET_DIR` to this worktree's `target/` and does not use `--release`.
+On a busy host, `BORG_NATIVE_MAX_JOBS=2` lowers both `-j` and its lane RAM
+reservation; it cannot lower the 8 GiB admission floor.
 Pass additional Cargo args **after** `--` to avoid mixing adapter flags with
 Cargo flags:
 
@@ -30,6 +32,7 @@ PostgreSQL database with CREATEDB privileges; each test creates a UUID scratch
 database. Run `python3 .borg/extensions/native/postgres.py -- python3 .borg/extensions/native/native.py cargo test -p borg-agent-runtime`. The wrapper leases the `test-postgres` shared service, creates a per-client database and provides `BORG_TEST_SESSIONS_URL`; it drops only its own database and releases its lease in a finally block. A service administrator supplies `BORG_TEST_POSTGRES_ADMIN_URL` (do not commit credentials). Never stop another agent's service. Never claim PostgreSQL coverage with
 this URL missing (the suite intentionally fails).
 
-Until the core CLI lands, normal execution fails closed. `--dry-run` prints
-argv/env for verification; `--probe-direct` runs **uncoordinated**, only for
-explicit bootstrap/benchmark probes, not routine multi-agent work.
+Normal execution requires a built CLI exposing `borg lane job submit`.
+`--dry-run` prints argv/env for verification; `--probe-direct` runs
+**uncoordinated**, only for explicit bootstrap/benchmark probes, not routine
+multi-agent work.

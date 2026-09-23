@@ -18,13 +18,15 @@ python3 .borg/extensions/native/native.py ctest test # full gate
 ```
 
 The adapter selects a worktree-private `build/`, Release (for native C++), and
-`-j` from RAM (8 GiB reserve plus 2 GiB fixed overhead, 6-process cap). Override `--build-dir` only with
+`-j` from RAM (8 GiB reserve plus 2 GiB fixed overhead, 6-process cap).
+`BORG_NATIVE_MAX_JOBS=2` can lower parallelism and its lane reservation on a
+busy host, never the 8 GiB admission floor. Override `--build-dir` only with
 a path **inside** that worktree. Pass raw CMake/ctest flags after `--`.
 `cmake_configure`, `cmake_build`, `ctest_fast`, `ctest_all` workflows are also
 registered as `/ext:native:<command>` in a project with the Blu
 package installed. `-LE slow` is safe even if the checkout predates label
-registration; inspect `ctest --print-labels` before assuming seven tests were
-excluded. CTest `--output-on-failure` preserves evidence. Core resource keys
+registration; inspect `ctest --print-labels` before assuming any tests were
+excluded (our 306-test Abundance checkout currently has no labels). CTest `--output-on-failure` preserves evidence. Core resource keys
 are worktree-private build output and host CPU/RAM; use test fixture leases
 when tests mutate external state. Never run Unreal via this adapter.
 
