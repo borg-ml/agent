@@ -26,7 +26,7 @@ use uuid::Uuid;
 
 use crate::lanes::{
     Access, AdmissionBudget, Holder, Hook, LaneStore, Lease, LeaseRequest, ResourceKey,
-    ResourceRequest, TicketState,
+    ResourceRequest,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -335,6 +335,19 @@ fn valid_spec(spec: &ServiceSpec) -> Result<()> {
     for key in &spec.restart.defer_while {
         key.validate_canonical()?;
         ensure!(!key.name.trim().is_empty(), "empty restart deferral key");
+        ensure!(
+            !spec.resources.iter().any(|resource| resource.key == *key),
+            "restart deferral key overlaps service resource"
+        );
+        ensure!(
+            spec.restart
+                .defer_while
+                .iter()
+                .filter(|other| *other == key)
+                .count()
+                == 1,
+            "duplicate restart deferral key"
+        );
     }
     ensure!(
         spec.restart
@@ -1256,6 +1269,7 @@ struct ServiceGate {
     request: LeaseRequest,
     budget: AdmissionBudget,
     lease: Option<Lease>,
+    restart_barrier: Option<Lease>,
 }
 impl ServiceGate {
     fn new(root: &Path, spec: &ServiceSpec) -> Result<Self> {
@@ -1281,6 +1295,7 @@ impl ServiceGate {
             },
             budget: spec.admission.clone(),
             lease: None,
+            restart_barrier: None,
         })
     }
     fn acquire(&mut self) -> Result<bool> {
@@ -1304,21 +1319,40 @@ impl ServiceGate {
             .and_then(|r| r.wait_reason.clone())
             .unwrap_or_else(|| "waiting for lane resource admission".into()))
     }
-    fn restart_deferred(&self, spec: &ServiceSpec) -> Result<bool> {
-        if spec.restart.defer_while.is_empty() {
-            return Ok(false);
+    /// Reserve defer keys in the *same* journal transaction as build grants.
+    /// The barrier lives only from restart admission through backend readiness
+    /// (and, for warm mode, old-backend shutdown), never for the editor lifetime.
+    fn acquire_restart_barrier(&mut self, spec: &ServiceSpec) -> Result<bool> {
+        if spec.restart.defer_while.is_empty() || self.restart_barrier.is_some() {
+            return Ok(true);
         }
-        Ok(self.store.snapshot()?.iter().any(|record| {
-            matches!(&record.state, TicketState::Granted(_))
-                && record.ticket.id != self.lease.as_ref().map(|l| l.ticket.id).unwrap_or_default()
-                && record
-                    .request
-                    .resources
-                    .iter()
-                    .any(|request| spec.restart.defer_while.contains(&request.key))
-        }))
+        let mut holder = self.request.holder.clone();
+        holder.purpose = format!("restart:{}", spec.id);
+        self.restart_barrier = self.store.try_acquire_restart_barrier(LeaseRequest {
+            resources: spec
+                .restart
+                .defer_while
+                .iter()
+                .cloned()
+                .map(|key| ResourceRequest {
+                    key,
+                    access: Access::Exclusive,
+                })
+                .collect(),
+            holder,
+            queue_timeout_ms: None,
+        })?;
+        Ok(self.restart_barrier.is_some())
+    }
+    fn release_restart_barrier(&mut self) -> Result<()> {
+        if let Some(lease) = &self.restart_barrier {
+            self.store.release_lease(lease)?;
+            self.restart_barrier = None;
+        }
+        Ok(())
     }
     fn release(&mut self) -> Result<()> {
+        self.release_restart_barrier()?;
         if let Some(lease) = &self.lease {
             self.store.release_lease(lease)?;
             self.lease = None;
@@ -1526,9 +1560,10 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             && active.is_none()
             && candidate.is_none()
             && now >= next_launch
-            && !gate.restart_deferred(&spec)?
+            && gate.acquire_restart_barrier(&spec)?
         {
             if !gate.acquire()? {
+                gate.release_restart_barrier()?;
                 let reason = gate.denial_reason()?;
                 if status.reason != reason {
                     transition(
@@ -1570,6 +1605,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                     .await?;
                 }
                 Err(error) => {
+                    gate.release_restart_barrier()?;
                     failures += 1;
                     next_launch = now + backoff(&spec, failures);
                     transition(
@@ -1593,6 +1629,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             if gone || overdue {
                 stop_child(&mut b.child, &spec, b.port, b.scope.as_deref()).await?;
                 candidate = None;
+                gate.release_restart_barrier()?;
                 let transient = exit
                     .and_then(|status| status.code())
                     .is_some_and(|code| spec.restart.transient_exit_codes.contains(&code));
@@ -1660,6 +1697,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                         stop_child(&mut old.child, &spec, old.port, old.scope.as_deref()).await?;
                         status.restarts += 1;
                     }
+                    gate.release_restart_barrier()?;
                 }
             }
         }
@@ -1753,7 +1791,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             && status.clients.is_empty()
             && now.saturating_sub(*requested) >= spec.restart.debounce_ms
             && now >= next_launch
-            && !gate.restart_deferred(&spec)?
+            && gate.acquire_restart_barrier(&spec)?
         {
             if spec.restart.mode == RestartMode::Cold {
                 transition(
@@ -1797,6 +1835,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                     .await?;
                 }
                 Err(error) => {
+                    gate.release_restart_barrier()?;
                     next_launch = now + backoff(&spec, failures + 1);
                     transition(
                         &dir,
@@ -2662,6 +2701,86 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
     }
 
     #[tokio::test]
+    async fn cold_restart_barrier_holds_build_key_through_new_backend_readiness() {
+        let key = ResourceKey {
+            scope: ResourceScope::Host,
+            name: "editor-build".into(),
+        };
+        let (root, manager, _front, task) = setup_with(|spec| {
+            spec.restart.mode = RestartMode::Cold;
+            spec.restart.defer_while = vec![key.clone()];
+            spec.restart.debounce_ms = 50;
+            spec.readiness_timeout_ms = 5_000;
+            spec.argv[3] = FAKE_HTTP.replace(
+                "class Handler",
+                "if len(open(record).readlines()) > 1: time.sleep(.8)\nclass Handler",
+            );
+        })
+        .await;
+        let store = LaneStore::new(root.path()).unwrap();
+        let old = manager.read_status("fake").unwrap().backend_pid;
+        manager
+            .send(
+                "fake",
+                ServiceRequest::Restart {
+                    reason: "build".into(),
+                    force: false,
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let launched = fs::read_to_string(root.path().join("launches"))
+                .unwrap()
+                .lines()
+                .count()
+                == 2;
+            let barrier = store.snapshot().unwrap().iter().any(|r| {
+                r.restart_barrier && matches!(r.state, crate::lanes::TicketState::Granted(_))
+            });
+            if launched && barrier {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "new backend never started behind barrier"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let ticket = store
+            .enqueue_lease(LeaseRequest {
+                resources: vec![ResourceRequest {
+                    key,
+                    access: Access::Exclusive,
+                }],
+                holder: owner(),
+                queue_timeout_ms: None,
+            })
+            .unwrap();
+        let waiting = store.clone();
+        let mut build = tokio::spawn(async move { waiting.wait(&ticket).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut build)
+                .await
+                .is_err(),
+            "build granted while cold editor restart is still unready"
+        );
+        state(&manager, |s| {
+            matches!(s.state, ServiceState::Healthy { .. }) && s.backend_pid != old
+        })
+        .await;
+        let lease = tokio::time::timeout(Duration::from_secs(3), build)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        store.release_lease(&lease).unwrap();
+        cleanup(&manager, task).await;
+    }
+
+    #[tokio::test]
     async fn transient_candidate_exits_do_not_exhaust_restart_limit() {
         let (root, manager, _front, task) = setup_with(|spec| {
             spec.restart.max_restarts = 0;
@@ -2736,6 +2855,12 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
         invalid.health.unhealthy_after_ms = None;
         invalid.restart.transient_exit_codes = vec![-1];
         assert!(valid_spec(&invalid).is_err());
+        invalid.restart.transient_exit_codes.clear();
+        invalid.restart.defer_while = vec![invalid.resources[0].key.clone()];
+        assert!(
+            valid_spec(&invalid).is_err(),
+            "barrier must not include its own service gate"
+        );
     }
 
     async fn budget_contenders(disk_budget: bool) {
