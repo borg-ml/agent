@@ -37,6 +37,19 @@ Git comparison.
 
 ### Agents and teams
 
+- **Claude sessions run on Borg's tools and context.** Claude Code now only
+  provides the subscription model and its loop. Borg runs every command and
+  file edit: Claude uses Borg's `exec`, `write_file` and `edit_file`, the same
+  shell Codex uses, with one process registry and journal, so `borg call` and
+  `borg image` work from Claude's shell. Borg also asks for approval outside
+  Full Access. Claude sees Borg's full tool catalog, including `web_search`
+  and extension tools, and Borg supplies the AGENTS.md chain and skill
+  catalog. Claude Code's own tools, claude.ai connectors, plugins, skills,
+  settings files, memory and "the user hasn't heard from you" reminder are
+  off. That reminder often pushed Claude to write its progress updates
+  inside thinking.
+- **Reasoned rows show their summary.** A collapsed Reasoned row now shows
+  the first line of the thinking summary.
 - **Provider switches and compaction keep Borg's context.** Switching between
   Claude and Codex, reconnecting after a failed turn, and resuming an evicted
   Claude process now rebuild from the durable session journal. A failed
