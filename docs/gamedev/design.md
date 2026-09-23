@@ -56,6 +56,15 @@ unrelated jobs concurrently without putting a global mutex around every
 engine. An atomic multi-resource grant avoids deadlock. Capacity is explicit
 and coupled to measured RAM/disk headroom, not a thread count alone.
 
+For v0, the shared lane lock enforces global RAM/disk admission and resource
+FIFO, including resident services. It does **not** enforce a per-agent job
+reservation cap at dispatch: one agent can enqueue many jobs and occupy many
+FIFO positions, increasing other agents' wait time even while host limits
+protect capacity. The workspace per-agent budget helper is not wired to this
+job admission path. Report waits by agent in the contention benchmark; add
+per-agent reservation limits and fairness policy in v0.1 rather than claiming
+current FIFO gives equal agent shares.
+
 Waits belong to the execution layer, not to an LLM sleep loop. Submission
 returns immediately. A blocking `borg lane job wait ID` observes the
 supervisor's event channel and emits terminal outcome; Borg's existing
@@ -162,6 +171,8 @@ project-by-project opt-in with before/after metrics. Gate parity on measured
 queue wait, duplicate work, successful captures, disk peak, process isolation,
 and correct recovery. Do not advertise a zero-downtime editor until the A/B
 proxy is verified with live in-flight requests and meaningful health checks.
+Real Unreal editor parity is a project migration acceptance test, not the
+Borg core v0 branch gate; fake adapter tests establish only contract wiring.
 
 ### Market positioning
 
