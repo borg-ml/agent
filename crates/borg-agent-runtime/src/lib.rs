@@ -60,6 +60,7 @@ mod workspace;
 #[cfg(test)]
 mod workspace_conformance;
 mod workspace_snapshot;
+pub mod workspace_hygiene;
 
 pub use agent::{
     AgentCompaction, AgentTurn, AgentTurnControl, AgentTurnExecutor, AgentTurnResult,
