@@ -269,6 +269,27 @@ impl SubagentCoordinator {
                 .messages
                 .extend(unseen.messages.iter().map(|(id, ..)| *id));
         }
+        if self.is_root_session(actor) && !unseen.messages.is_empty() {
+            // Reports shown here are read: acknowledge them so
+            // list_unread_team_messages does not return them again. Wake
+            // messages are left to the steer that delivers them.
+            let inbox = self
+                .root_inbox
+                .lock()
+                .await
+                .iter()
+                .map(|message| message.message_id)
+                .collect::<HashSet<_>>();
+            let read = unseen
+                .messages
+                .iter()
+                .map(|(id, ..)| *id)
+                .filter(|id| inbox.contains(id))
+                .collect::<Vec<_>>();
+            if let Err(error) = self.acknowledge_messages_for_session(actor, &read).await {
+                tracing::debug!(%error, "wait_agent could not acknowledge the reports it returned");
+            }
+        }
         let mut children = self.children(actor).await;
         children.sort_by_key(|agent| !working(agent));
         let now = Utc::now();
