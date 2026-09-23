@@ -4556,6 +4556,8 @@ async fn computer_use_requires_approval_even_for_observation() {
         "screenshot",
         "click",
         "set_value",
+        "launch",
+        "start_display",
     ] {
         let error = dispatcher
             .call("computer_use", json!({"op": op}))
@@ -4635,6 +4637,87 @@ async fn computer_use_live_desktop_clients() {
         .persistent_runtimes
         .stop_session(session_id)
         .await;
+}
+
+/// Failure mode: private-display input or lifetime leaking onto the user's
+/// machine -- an app driven through the uinput seat, or an app and its
+/// compositor outliving the session that launched them.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+#[ignore = "requires a GPU render node, borg-display (BORG_DISPLAY_BIN or PATH), AT-SPI2 and vkcube"]
+async fn computer_use_live_private_display() {
+    let directory = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let dispatcher = AgentToolDispatcher::new(
+        SessionGoalTools::disconnected(),
+        SessionTodoTools::disconnected(),
+        None,
+        crate::LspService::new(directory.path()),
+        CodingProvider::Codex,
+        session_id,
+        false,
+        None,
+        None,
+        directory.path().to_path_buf(),
+        None,
+        None,
+        None,
+        Vec::new(),
+        None,
+        crate::native_process::ProcessManager::default(),
+        PermissionMode::FullAccess,
+    );
+    let call = |arguments: Value| dispatcher.call("computer_use", arguments);
+    let launched = call(
+        json!({"op": "launch", "argv": ["vkcube", "--wsi", "wayland"],
+        "width": 800, "height": 600}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(launched["display"]["gpu_accelerated"], true, "{launched}");
+    let pid = launched["pid"].as_i64().unwrap() as i32;
+    let window_id = launched["windows"][0]["id"].as_str().unwrap().to_string();
+    assert!(window_id.starts_with("pd:"), "{launched}");
+    let clicked = call(json!({"op": "pointer_click", "window_id": window_id, "x": 400, "y": 300}))
+        .await
+        .unwrap();
+    assert_eq!(clicked["dispatched"], true);
+    let shot = call(json!({"op": "screenshot", "scope": "window", "window_id": window_id}))
+        .await
+        .unwrap();
+    assert_eq!(
+        (shot["width"].as_u64(), shot["height"].as_u64()),
+        (Some(800), Some(600))
+    );
+    assert_eq!(shot["borg_attachments"][0]["media_type"], "image/png");
+    for (runtime, code) in [
+        ("python", "cua.list_windows('private')"),
+        ("javascript", "await cua.list_windows('private')"),
+    ] {
+        let listed = dispatcher
+            .call("runtime_exec", json!({"runtime": runtime, "code": code}))
+            .await
+            .unwrap();
+        assert_eq!(
+            listed["value"]["windows"][0]["id"],
+            window_id.as_str(),
+            "{listed}"
+        );
+    }
+    let devices = std::fs::read_to_string("/proc/bus/input/devices").unwrap();
+    assert!(
+        !devices.contains("Borg virtual input"),
+        "private input used uinput"
+    );
+    dispatcher
+        .persistent_runtimes
+        .stop_session(session_id)
+        .await;
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        -1,
+        "launched app survived the session"
+    );
 }
 
 /// Settling a delivery at the session projection must not turn a worker's own

@@ -580,23 +580,26 @@ def display_env():
     return {k: v for k, v in os.environ.items() if k not in SCRUBBED_DISPLAY_ENV}
 
 
-def terminate_group(process, grace=3.0):
-    """SIGTERM the process group started for this child, then SIGKILL stragglers."""
+def terminate_groups(processes, grace=3.0):
+    """SIGTERM each child's process group, wait once for all, then SIGKILL stragglers and leftover members."""
     import signal
-    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 2.0)):
-        try:
-            os.killpg(process.pid, sig)
-        except (ProcessLookupError, PermissionError):
-            pass
-        try:
-            process.wait(timeout=wait)
+
+    def signal_groups(sig):
+        for process in processes:
             try:
-                os.killpg(process.pid, signal.SIGKILL)  # leftover group members
+                os.killpg(process.pid, sig)
             except (ProcessLookupError, PermissionError):
                 pass
-            return
+    signal_groups(signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while any(p.poll() is None for p in processes) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    signal_groups(signal.SIGKILL)
+    for process in processes:
+        try:
+            process.wait(timeout=2)
         except subprocess.TimeoutExpired:
-            continue
+            pass
 
 
 class BorgDisplay:
@@ -767,10 +770,8 @@ def start_display(args):
 
 def stop_display(_args=None):
     global PRIVATE
-    terminated = []
-    for pid, app in list(PRIVATE_APPS.items()):
-        terminate_group(app)
-        terminated.append(pid)
+    terminated = sorted(PRIVATE_APPS)
+    terminate_groups(list(PRIVATE_APPS.values()))
     PRIVATE_APPS.clear()
     if PRIVATE is None:
         return {"display": "private", "running": False, "stopped": False, "terminated_pids": terminated}
@@ -783,7 +784,7 @@ def stop_display(_args=None):
 
 def stop_x11(x11):
     """Stop xwayland-satellite and remove the X socket and lock it leaves behind."""
-    terminate_group(x11[0], grace=1.0)
+    terminate_groups([x11[0]], grace=1.0)
     number = x11[1].lstrip(":")
     for path in (f"/tmp/.X11-unix/X{number}", f"/tmp/.X{number}-lock"):
         try:

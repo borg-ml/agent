@@ -109,14 +109,28 @@ fn element_from_node(node: &Value) -> Option<(String, ObservedElement)> {
 }
 
 struct DesktopProcess {
-    _child: Child,
+    child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
 }
 
 impl ComputerUse {
+    /// Close the helper's stdin so it tears down any private display and the
+    /// apps launched into it, then kill it if it does not exit promptly.
     pub(crate) async fn stop(&self) {
-        self.process.lock().await.take();
+        let Some(DesktopProcess {
+            mut child, stdin, ..
+        }) = self.process.lock().await.take()
+        else {
+            return;
+        };
+        drop(stdin);
+        if tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .is_err()
+        {
+            let _ = child.kill().await;
+        }
     }
 
     pub(crate) async fn call(&self, arguments: Value) -> Result<Value> {
@@ -143,8 +157,12 @@ impl ComputerUse {
                     | "type_text"
                     | "key"
                     | "pointer_click"
+                    | "pointer_move"
                     | "scroll"
                     | "drag"
+                    | "start_display"
+                    | "stop_display"
+                    | "launch"
             ),
             "unsupported computer-use operation `{op}`"
         );
@@ -180,11 +198,17 @@ impl ComputerUse {
                             .take()
                             .context("desktop helper stdout unavailable")?,
                     ),
-                    _child: child,
+                    child,
                 }
             }
         };
-        let response: Value = tokio::time::timeout(Duration::from_secs(15), async {
+        // Starting a private display, launching into it and tearing it down
+        // wait on child processes; everything else is a bounded desktop call.
+        let limit = match op {
+            "start_display" | "launch" | "stop_display" => Duration::from_secs(45),
+            _ => Duration::from_secs(15),
+        };
+        let response: Value = tokio::time::timeout(limit, async {
             process.stdin.write_all(&request).await?;
             process.stdin.flush().await?;
             let mut line = Vec::new();
@@ -290,7 +314,7 @@ const HELPER_REQUIREMENTS: &str = if cfg!(target_os = "macos") {
 } else if cfg!(target_os = "windows") {
     "Windows computer use requires Windows PowerShell 5.1+ (or pwsh) in the interactive user session"
 } else {
-    "Linux computer use requires python3, PyGObject and AT-SPI2 on the desktop session bus; input injection also needs python-evdev, a writable /dev/uinput and wtype (Wayland) or xdotool (X11)"
+    "Linux computer use requires python3, PyGObject and AT-SPI2 on the desktop session bus; desktop input injection also needs python-evdev, a writable /dev/uinput and wtype (Wayland) or xdotool (X11); the private display needs the borg-display binary"
 };
 
 /// Platform helper process. Linux runs the AT-SPI worker under the system
@@ -322,6 +346,14 @@ async fn helper_command() -> Result<Command> {
     }
     let mut command = Command::new("python3");
     command.args(["-I", "-u", "-c", include_str!("computer_use/linux.py")]);
+    // Release archives ship the private-display compositor next to borg.
+    if let Some(display) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("borg-display")))
+        .filter(|path| path.is_file())
+    {
+        command.env("BORG_DISPLAY_BIN", display);
+    }
     Ok(command)
 }
 
