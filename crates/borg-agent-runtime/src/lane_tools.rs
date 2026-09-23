@@ -924,6 +924,7 @@ pub(crate) mod tests {
             post_hook: None,
             timeout_ms: 60_000,
             stall_timeout_ms: None,
+            scope_unit_prefix: None,
             coalesce: false,
         }
     }

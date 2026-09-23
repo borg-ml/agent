@@ -165,6 +165,9 @@ pub struct JobSpec {
     pub post_hook: Option<Hook>,
     pub timeout_ms: u64,
     pub stall_timeout_ms: Option<u64>,
+    /// Optional systemd scope unit prefix, e.g. `ab-build-` gives `ab-build-<id>.scope`.
+    #[serde(default)]
+    pub scope_unit_prefix: Option<String>,
     pub coalesce: bool,
 }
 
@@ -283,6 +286,43 @@ struct Journal {
     client_revision: u64,
 }
 
+// Keep a bounded history in the admission snapshot. Quarantined rows and
+// pending service resumes are recovery authorities and must never be pruned.
+const TERMINAL_HISTORY_LIMIT: usize = 2048;
+impl Journal {
+    fn prune_terminal(&mut self) {
+        let mut eligible = self
+            .records
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.state,
+                    TicketState::Finished | TicketState::Cancelled { .. }
+                ) && !row.quarantined
+                    && row.resume_pending.is_empty()
+            })
+            .count();
+        if eligible <= TERMINAL_HISTORY_LIMIT {
+            return;
+        }
+        self.records.retain(|row| {
+            if eligible > TERMINAL_HISTORY_LIMIT
+                && matches!(
+                    row.state,
+                    TicketState::Finished | TicketState::Cancelled { .. }
+                )
+                && !row.quarantined
+                && row.resume_pending.is_empty()
+            {
+                eligible -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
 /// One host-local lane store. Clones share held in-process lease FDs; cross-
 /// process jobs are owned by a detached supervisor, not the submitter.
 #[derive(Clone)]
@@ -353,6 +393,9 @@ impl LaneStore {
         };
         let before = serde_json::to_vec(&journal)?;
         let result = f(&mut journal);
+        if result.is_ok() {
+            journal.prune_terminal();
+        }
         if result.is_ok() && serde_json::to_vec(&journal)? != before {
             let tmp = self.root.join(format!("state.{}.tmp", Uuid::new_v4()));
             let mut out = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
@@ -642,6 +685,7 @@ impl LaneStore {
                     override_.resource.name
                 );
             }
+            scope_unit_prefix(spec)?;
             ensure!(!spec.argv.is_empty(), "a job needs a command");
             ensure!(spec.cwd.is_absolute(), "job cwd must be absolute");
             ensure!(
@@ -677,6 +721,7 @@ impl LaneStore {
                         && spec.abandon_after_ms == other.abandon_after_ms
                         && spec.timeout_ms == other.timeout_ms
                         && spec.stall_timeout_ms == other.stall_timeout_ms
+                        && spec.scope_unit_prefix == other.scope_unit_prefix
                         // Only the existing ticket's supervisor enforces a
                         // queue timeout, so a joiner is bound by that ticket's
                         // limit, not its own. Join only an equal limit: the
@@ -1178,6 +1223,45 @@ fn conflicts(left: &ResourceRequest, right: &ResourceRequest) -> bool {
     left.key == right.key
 }
 
+/// A queued multi-key ticket blocked by an active non-yieldable holder
+/// cannot reserve a different, free key against independent work.
+fn blocked_by_active_holder(state: &Journal, queued: &LaneRecord, later: &LaneRecord) -> bool {
+    queued.request.resources.iter().any(|claim| {
+        if later.request.resources.iter().any(|r| r.key == claim.key) {
+            return false;
+        }
+        let holders: Vec<_> = state
+            .records
+            .iter()
+            .filter(|row| matches!(row.state, TicketState::Granted(_) | TicketState::Preparing))
+            .filter(|row| row.request.resources.iter().any(|r| r.key == claim.key))
+            .collect();
+        if holders.is_empty() {
+            return false;
+        }
+        // An exclusive job can prepare a bound service to yield, so it retains FIFO priority.
+        if queued.spec.is_some()
+            && matches!(claim.access, Access::Exclusive)
+            && holders.iter().all(|row| row.service_lease)
+        {
+            return false;
+        }
+        let used: u32 = holders
+            .iter()
+            .flat_map(|row| &row.request.resources)
+            .filter(|r| r.key == claim.key)
+            .map(|r| match r.access {
+                Access::Exclusive => capacity(&state.capacities, &r.key),
+                Access::Shared { slots } => slots,
+            })
+            .sum();
+        used.saturating_add(match claim.access {
+            Access::Exclusive => capacity(&state.capacities, &claim.key),
+            Access::Shared { slots } => slots,
+        }) > capacity(&state.capacities, &claim.key)
+    })
+}
+
 /// Pure FIFO decision: an earlier conflicting ticket is never overtaken,
 /// while disjoint keys can run concurrently. All keys grant atomically.
 fn dispatch_reason(state: &Journal, id: Uuid) -> Result<Option<String>> {
@@ -1208,6 +1292,8 @@ fn dispatch_reason(state: &Journal, id: Uuid) -> Result<Option<String>> {
         .filter(|r| r.ticket.sequence < me.ticket.sequence)
     {
         if matches!(earlier.state, TicketState::Queued | TicketState::Preparing)
+            && !(matches!(earlier.state, TicketState::Queued)
+                && blocked_by_active_holder(state, earlier, me))
             && earlier
                 .request
                 .resources
@@ -1434,6 +1520,25 @@ fn scope_control_group(unit: &str) -> Option<String> {
     }
     let path = String::from_utf8(output.stdout).ok()?.trim().to_owned();
     if path.is_empty() { None } else { Some(path) }
+}
+
+fn scope_unit_prefix(spec: &JobSpec) -> Result<&str> {
+    let prefix = spec.scope_unit_prefix.as_deref().unwrap_or("borg-lane-");
+    ensure!(
+        prefix.len() <= 64
+            && prefix.len() >= 3
+            && prefix.starts_with(|c: char| c.is_ascii_lowercase())
+            && prefix.ends_with('-')
+            && prefix
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'),
+        "scope unit prefix must be lowercase ASCII letters, digits and hyphens, start with a letter, end with a hyphen, and be at most 64 bytes"
+    );
+    Ok(prefix)
+}
+
+fn workload_unit(spec: &JobSpec, id: Uuid) -> Result<String> {
+    Ok(format!("{}{}.scope", scope_unit_prefix(spec)?, id))
 }
 
 fn proc_cpu(pid: u32) -> Option<f64> {
@@ -1941,7 +2046,7 @@ impl LaneStore {
             .append(true)
             .open(self.job_dir(id).join("output.log"))?;
         let stderr = log.try_clone()?;
-        let unit = format!("borg-lane-{id}.scope");
+        let unit = workload_unit(&spec, id)?;
         let mut command = if scoped {
             let mut command = Command::new("systemd-run");
             command
@@ -2017,6 +2122,7 @@ impl LaneStore {
         let mut last_progress = started;
         let mut last_size = 0;
         let mut last_cpu = 0.0;
+        let mut last_journal_progress = Instant::now() - Duration::from_secs(2);
         let leader = child.id();
         let end = loop {
             if let Some(status) = child.try_wait()? {
@@ -2032,16 +2138,29 @@ impl LaneStore {
             if self.abandoned(&spec, id, &mut last_requester_ms) {
                 self.cancel_ticket(id, ABANDONED)?;
             }
-            let cancel = self.locked(|state| {
-                let record = state
-                    .records
-                    .iter_mut()
-                    .find(|r| r.ticket.id == id)
-                    .context("job vanished")?;
-                record.progress = Some(format!("{} bytes", size));
-                record.cpu_seconds = Some(cpu);
-                Ok(record.cancel_requested.clone())
-            })?;
+            let cancel = if last_journal_progress.elapsed() >= Duration::from_secs(2) {
+                last_journal_progress = Instant::now();
+                self.locked(|state| {
+                    let record = state
+                        .records
+                        .iter_mut()
+                        .find(|r| r.ticket.id == id)
+                        .context("job vanished")?;
+                    record.progress = Some(format!("{} bytes", size));
+                    record.cpu_seconds = Some(cpu);
+                    Ok(record.cancel_requested.clone())
+                })?
+            } else {
+                self.reading(|state| {
+                    Ok(state
+                        .records
+                        .iter()
+                        .find(|r| r.ticket.id == id)
+                        .context("job vanished")?
+                        .cancel_requested
+                        .clone())
+                })?
+            };
             let timed_out = started.elapsed() > Duration::from_millis(spec.timeout_ms);
             let stalled = spec
                 .stall_timeout_ms
@@ -2315,12 +2434,17 @@ impl LaneStore {
             }) = &record.job
             {
                 if !scope.is_empty() {
-                    let expected = format!("borg-lane-{}.scope", record.ticket.id);
+                    let expected = record
+                        .spec
+                        .as_ref()
+                        .and_then(|spec| workload_unit(spec, record.ticket.id).ok());
                     let current = scope_control_group(scope);
-                    if scope != &expected
-                        || !current
-                            .as_ref()
-                            .is_some_and(|c| c.ends_with(&format!("/{expected}")))
+                    if expected.as_deref() != Some(scope.as_str())
+                        || !current.as_ref().is_some_and(|c| {
+                            expected
+                                .as_ref()
+                                .is_some_and(|unit| c.ends_with(&format!("/{unit}")))
+                        })
                         || record
                             .scope_cgroup
                             .as_ref()
@@ -2689,6 +2813,121 @@ mod tests {
         assert_eq!(dispatch_reason(&state, Uuid::from_u128(3)).unwrap(), None);
     }
     #[test]
+    fn busy_tree_does_not_reserve_shared_host_slot_against_other_tree() {
+        let host = resource("host", Access::Shared { slots: 1 });
+        let state = Journal {
+            sequence: 4,
+            capacities: vec![Capacity {
+                key: key("host"),
+                slots: 2,
+            }],
+            records: vec![
+                granted(1, vec![resource("tree-a", Access::Exclusive)]),
+                record(
+                    2,
+                    TicketState::Queued,
+                    vec![resource("tree-a", Access::Exclusive), host.clone()],
+                ),
+                record(
+                    3,
+                    TicketState::Queued,
+                    vec![resource("tree-b", Access::Exclusive), host.clone()],
+                ),
+                record(
+                    4,
+                    TicketState::Queued,
+                    vec![resource("tree-b", Access::Exclusive), host],
+                ),
+            ],
+            ..Journal::default()
+        };
+        assert_eq!(dispatch_reason(&state, Uuid::from_u128(3)).unwrap(), None);
+        assert!(
+            dispatch_reason(&state, Uuid::from_u128(4))
+                .unwrap()
+                .unwrap()
+                .contains("FIFO")
+        );
+        let mut active = state.clone();
+        active.records[0].state = TicketState::Finished;
+        assert!(
+            dispatch_reason(&active, Uuid::from_u128(3))
+                .unwrap()
+                .unwrap()
+                .contains("FIFO")
+        );
+    }
+
+    #[test]
+    fn scope_prefix_is_validated_and_affects_coalescing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let mut spec = coalescing_spec(dir.path(), None);
+        for invalid in ["/tmp/", "AB-", "ab.scope", "ab--/"] {
+            spec.scope_unit_prefix = Some(invalid.into());
+            assert!(
+                store
+                    .locked(|state| store.enqueue_record(
+                        state,
+                        spec.lease.clone(),
+                        Some(spec.clone())
+                    ))
+                    .is_err()
+            );
+        }
+        spec.scope_unit_prefix = Some("ab-build-".into());
+        let first = store
+            .locked(|state| store.enqueue_record(state, spec.lease.clone(), Some(spec.clone())))
+            .unwrap()
+            .0;
+        assert_eq!(
+            workload_unit(&spec, first.id).unwrap(),
+            format!("ab-build-{}.scope", first.id)
+        );
+        spec.scope_unit_prefix = None;
+        let second = store
+            .locked(|state| store.enqueue_record(state, spec.lease.clone(), Some(spec.clone())))
+            .unwrap()
+            .0;
+        assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn journal_prunes_only_safe_terminal_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        store
+            .locked(|journal| {
+                for i in 1..=(TERMINAL_HISTORY_LIMIT as u128 + 9) {
+                    journal.records.push(record(
+                        i as u64,
+                        TicketState::Finished,
+                        vec![resource("build", Access::Exclusive)],
+                    ));
+                    journal.records.last_mut().unwrap().ticket.id = Uuid::from_u128(i);
+                }
+                journal.records[0].quarantined = true;
+                journal.records[1].resume_pending.push("editor".into());
+                journal.records.push(record(
+                    5000,
+                    TicketState::Queued,
+                    vec![resource("build", Access::Exclusive)],
+                ));
+                Ok(())
+            })
+            .unwrap();
+        let records = store.snapshot().unwrap();
+        assert_eq!(records.len(), TERMINAL_HISTORY_LIMIT + 3);
+        assert!(records.iter().any(|r| r.quarantined));
+        assert!(records.iter().any(|r| !r.resume_pending.is_empty()));
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(r.state, TicketState::Queued))
+        );
+        assert!(!records.iter().any(|r| r.ticket.id == Uuid::from_u128(3)));
+    }
+    #[test]
     fn capacity_respects_weights_and_atomic_multi_key_requests() {
         let state = Journal {
             client_revision: 0,
@@ -2742,6 +2981,7 @@ mod tests {
             }),
             timeout_ms: 2000,
             stall_timeout_ms: None,
+            scope_unit_prefix: None,
             coalesce: false,
         };
         let id = store
@@ -3233,6 +3473,7 @@ mod tests {
             post_hook: None,
             timeout_ms: 2000,
             stall_timeout_ms: None,
+            scope_unit_prefix: None,
             coalesce: false,
         };
         let job = store
@@ -3378,6 +3619,7 @@ mod tests {
                 post_hook: None,
                 timeout_ms: 2000,
                 stall_timeout_ms: None,
+                scope_unit_prefix: None,
                 coalesce: false,
             };
             let job = store
@@ -3518,6 +3760,7 @@ mod tests {
             post_hook: None,
             timeout_ms: 2000,
             stall_timeout_ms: None,
+            scope_unit_prefix: None,
             coalesce: false,
         };
         let mut invalid = spec.clone();
@@ -3625,6 +3868,7 @@ mod tests {
             post_hook: None,
             timeout_ms: 2000,
             stall_timeout_ms: None,
+            scope_unit_prefix: None,
             coalesce: false,
         };
         let job = store
@@ -3728,6 +3972,7 @@ mod tests {
             post_hook: None,
             timeout_ms: 2000,
             stall_timeout_ms: None,
+            scope_unit_prefix: None,
             coalesce: false,
         };
         let id = store
@@ -3789,6 +4034,7 @@ mod tests {
             post_hook: None,
             timeout_ms: 2000,
             stall_timeout_ms: None,
+            scope_unit_prefix: None,
             coalesce: false,
         };
         let job = store
@@ -3841,6 +4087,7 @@ mod tests {
             post_hook: None,
             timeout_ms: 5000,
             stall_timeout_ms: None,
+            scope_unit_prefix: None,
             coalesce: true,
         }
     }
