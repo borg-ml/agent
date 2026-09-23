@@ -12,7 +12,8 @@ with `-j` (at most 6, from MemAvailable with an 8 GiB reserve plus 2 GiB fixed j
 On a busy host, `BORG_NATIVE_MAX_JOBS=2` lowers both `-j` and its lane RAM
 reservation; it cannot lower the 8 GiB admission floor.
 Pass additional Cargo args **after** `--` to avoid mixing adapter flags with
-Cargo flags:
+Cargo flags. To pass test-harness flags such as `--skip`, supply a second
+`--` so Cargo forwards them: `cargo test -p borg-agent-runtime -- -- --skip NAME`.
 
 ```sh
 python3 .borg/extensions/native/native.py cargo test -p borg-agent-runtime

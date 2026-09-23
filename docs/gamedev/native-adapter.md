@@ -36,7 +36,7 @@ database passwords in job specs.
 
 ## Reproducible probes (2026-09-23)
 
-- `python3 -m unittest discover -s extensions/native/tests -v`: ten pass.
+- `python3 -m unittest discover -s extensions/native/tests -v`: twelve pass.
 - `borg extensions install ./extensions/native --project --json`: active,
   five Blu workflows registered; `borg extensions doctor --json`: active.
 - In the isolated `/home/shulgin/abundance-wt/gd-native` checkout, explicit
@@ -62,8 +62,22 @@ database passwords in job specs.
   `cargo test -p borg-agent-runtime -- --skip <two pre-existing failing tests>`
   submitted job `a63f6985-...`: worktree target lease granted, 26.628 s
   runtime from lane state, 877 passed / 0 failed / 9 ignored / 2 filtered,
-  PostgreSQL-backed tests included. These jobs used a private throwaway
-  PostgreSQL server, not the not-yet-wired supervised service.
+  PostgreSQL-backed tests included. These earlier jobs used a private throwaway
+  PostgreSQL server, before the supervised service CLI was wired.
+- Real supervised `test-postgres` CLI on `gamedev/lanes` @`dee1b25`:
+  the peer-only cluster started Healthy with the required shared
+  `Host/test-postgres` lane resource. With `BORG_LANE_DIR` pointing at our
+  isolated `/tmp/gd-native-lane-smoke`, `BORG_NATIVE_BORG` pointing at that
+  rebuilt CLI, `BORG_NATIVE_MAX_JOBS=2`, and
+  `BORG_TEST_POSTGRES_ADMIN_URL` set to the fixture's printed Unix-socket URL,
+  `python3 extensions/native/postgres.py -- python3 extensions/native/native.py cargo test -p borg-agent-runtime -- -- --skip remembered_failure_skips_relaunch_until_config_change_or_cooldown_expiry --skip reported_stderr_is_scrubbed_of_secrets`
+  submitted job `e2fce75b-...`: 877 passed / 0 failed / 9 ignored / 2 filtered
+  in 24.28 s. The first `--` goes to `postgres.py`, the second separates
+  adapter flags, and the third passes test-harness flags through Cargo.
+  The wrapper confirmed terminal status, dropped its per-client database,
+  released its lease, and left the service Healthy with zero clients and zero
+  `borg_native_%` databases. A prior malformed Cargo invocation returned exit
+  1 but also cleaned up its lease and database.
 - Borg SQLx Postgres coverage through peer-compatible socket URL
   `postgresql://shulgin@localhost/postgres?host=/tmp/gd-native-pg-benchmark&port=55471`:
   `workspace_conformance::the_shared_read_surface_answers_identically`
