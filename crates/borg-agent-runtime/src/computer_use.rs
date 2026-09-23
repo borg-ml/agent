@@ -99,6 +99,12 @@ pub(crate) fn ensure_private_display_only(arguments: &Value) -> Result<()> {
             .is_none_or(|display| display == "private"),
         "sub-agents may only use their private display (display=\"private\"); the user's desktop is reserved for the top-level session"
     );
+    ensure!(
+        arguments
+            .get("restore_focus")
+            .is_none_or(|restore| matches!(restore, Value::Bool(false))),
+        "sub-agents may not use restore_focus: it moves focus on the user's desktop"
+    );
     let allowed = match op {
         "capabilities" | "start_display" | "stop_display" | "attach_display" | "launch" => true,
         "list_windows" => private_display,
@@ -546,6 +552,10 @@ mod tests {
             json!({"op": "observe", "window_id": "pd:2"}),
             json!({"op": "pointer_click", "window_id": "pd:2", "x": 1, "y": 1}),
             json!({"op": "key", "window_id": "pd:2", "keys": "ctrl+s"}),
+            json!({"op": "key", "window_id": "pd:2", "keys": "w", "hold_ms": 2000}),
+            json!({"op": "pointer_move", "window_id": "pd:2", "dx": 40, "dy": -10, "hold_keys": "shift+w"}),
+            json!({"op": "pointer_click", "window_id": "pd:2", "coordinate_space": "window", "x": 5, "y": 5}),
+            json!({"op": "observe", "window_id": "pd:2", "screenshot": true, "screenshot_scope": "window"}),
         ] {
             ensure_private_display_only(&allowed)
                 .unwrap_or_else(|error| panic!("{allowed}: {error}"));
@@ -559,6 +569,16 @@ mod tests {
             json!({"op": "type_text", "window_id": "niri:17", "text": "x"}),
             json!({"op": "pointer_click", "x": 10, "y": 10}),
             json!({"op": "click", "window_id": "pd:2", "display": "desktop"}),
+            // Desktop window capture, relative motion, holds and focus moves.
+            json!({"op": "screenshot", "scope": "window", "window_id": "x11:0x2c00007"}),
+            json!({"op": "observe", "window_id": "niri:17", "screenshot": true, "screenshot_scope": "window"}),
+            json!({"op": "pointer_move", "window_id": "niri:17", "dx": 40, "dy": -10}),
+            json!({"op": "pointer_move", "dx": 40, "dy": -10}),
+            json!({"op": "key", "window_id": "niri:17", "keys": "w", "hold_ms": 2000}),
+            json!({"op": "pointer_click", "window_id": "niri:17", "coordinate_space": "window", "x": 5, "y": 5}),
+            json!({"op": "drag", "window_id": "sway:41", "coordinate_space": "window", "from_x": 1, "from_y": 1, "to_x": 9, "to_y": 9}),
+            json!({"op": "key", "window_id": "pd:2", "keys": "w", "restore_focus": true}),
+            json!({"op": "click", "window_id": "pd:2", "element_id": "e", "observation_id": "o", "restore_focus": true}),
         ] {
             assert!(
                 ensure_private_display_only(&refused).is_err(),

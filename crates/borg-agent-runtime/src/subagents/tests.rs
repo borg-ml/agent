@@ -4703,12 +4703,24 @@ async fn a_sub_agent_computer_use_is_confined_to_a_private_display() {
     const REFUSAL: &str = "sub-agents may only use their private display";
     let child = dispatcher_for(Uuid::new_v4());
     assert_eq!(display_enum(&child), json!(["private"]));
+    let child_properties = child
+        .specs()
+        .into_iter()
+        .find(|spec| spec["name"] == "computer_use")
+        .expect("computer_use is advertised")["inputSchema"]["properties"]
+        .clone();
+    assert!(
+        child_properties.get("restore_focus").is_none(),
+        "a child cannot move the user's desktop focus"
+    );
     for desktop in [
         json!({"op": "list_windows"}),
         json!({"op": "screenshot", "scope": "desktop"}),
         json!({"op": "observe", "window_id": "a1b2:3"}),
         json!({"op": "type_text", "window_id": "niri:17", "text": "x"}),
         json!({"op": "pointer_click", "x": 10, "y": 10}),
+        json!({"op": "screenshot", "scope": "window", "window_id": "niri:17"}),
+        json!({"op": "pointer_move", "window_id": "niri:17", "dx": 40, "dy": 0}),
     ] {
         let error = child
             .call("computer_use", desktop.clone())
