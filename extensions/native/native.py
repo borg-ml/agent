@@ -29,7 +29,10 @@ def jobs(bytes_per_job: int) -> int:
     ram = max(0, available_ram() - 10 * GIB)
     if ram < bytes_per_job:
         raise RuntimeError('insufficient available RAM for one native job')
-    return min(6, os.cpu_count() or 1, ram // bytes_per_job)
+    cap = int(os.environ.get('BORG_NATIVE_MAX_JOBS', '6'))
+    if not 1 <= cap <= 6:
+        raise ValueError('BORG_NATIVE_MAX_JOBS must be between 1 and 6')
+    return min(cap, os.cpu_count() or 1, ram // bytes_per_job)
 
 
 def project_root(path: str) -> Path:

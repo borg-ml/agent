@@ -26,6 +26,20 @@ class NativePlannerTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'insufficient available RAM'):
                 native.jobs(native.GIB)
 
+    def test_explicit_job_cap_only_lowers_parallelism(self):
+        with patch.object(native, 'available_ram', return_value=24 * native.GIB):
+            with patch.dict(native.os.environ, {'BORG_NATIVE_MAX_JOBS': '2'}):
+                self.assertEqual(native.jobs(native.GIB), 2)
+            for invalid in ('0', '7', 'none'):
+                with self.subTest(invalid=invalid):
+                    with patch.dict(native.os.environ, {'BORG_NATIVE_MAX_JOBS': invalid}):
+                        with self.assertRaises(ValueError):
+                            native.jobs(native.GIB)
+        with patch.object(native, 'available_ram', return_value=11 * native.GIB):
+            with patch.dict(native.os.environ, {'BORG_NATIVE_MAX_JOBS': '2'}):
+                with self.assertRaisesRegex(RuntimeError, 'insufficient available RAM'):
+                    native.jobs(2 * native.GIB)
+
     def test_output_cannot_escape_worktree(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
