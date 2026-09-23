@@ -599,9 +599,11 @@ fn free_ports(count: usize) -> Vec<u16> {
 fn get(port: u16, path: &str) -> std::io::Result<(u16, String)> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    write!(
-        stream,
-        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    // One write: `write!` on an unbuffered stream sends each piece as its
+    // own segment, and a front that answers 503 after its first read closes
+    // the connection, so a later piece fails with a broken pipe.
+    stream.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes(),
     )?;
     let mut reader = BufReader::new(stream);
     let mut status = String::new();
