@@ -280,6 +280,11 @@ pub struct LaneRecord {
     pub quarantined: bool,
     #[serde(default)]
     pub service_lease: bool,
+    /// A service restart's transient exclusive claim on its `defer_while`
+    /// keys (`LaneStore::try_acquire_restart_barrier`); never a yielding
+    /// service lease.
+    #[serde(default)]
+    pub restart_barrier: bool,
     /// Only a Granted row reserves service RAM and filesystem space.
     #[serde(default)]
     pub service_admission: Option<AdmissionBudget>,
@@ -576,6 +581,80 @@ impl LaneStore {
         Ok(lease)
     }
 
+    /// Nonblocking, all-or-nothing exclusive claim on a service restart's
+    /// `defer_while` keys, decided under the same metadata lock that admits
+    /// builds: no build is admitted between this check and the restart, nor
+    /// until the barrier is released. A ticket that holds (Granted or
+    /// Preparing), waits for (Queued: builds already in line keep their FIFO
+    /// turn) or quarantines one of the keys defers the restart; a refused
+    /// attempt journals nothing and creates no lock inode. The barrier is not
+    /// a service lease, so a job can never prepare past it by having a
+    /// service yield.
+    pub(crate) fn try_acquire_restart_barrier(
+        &self,
+        request: LeaseRequest,
+    ) -> Result<RestartBarrier> {
+        ensure!(
+            request
+                .resources
+                .iter()
+                .all(|r| matches!(r.access, Access::Exclusive)),
+            "restart barrier keys must be exclusive"
+        );
+        ensure!(
+            request.holder.purpose.starts_with("restart:"),
+            "restart barrier holder must name its service"
+        );
+        let mut held: Option<File> = None;
+        let outcome = self.locked(|state| {
+            Self::validate(&request, &state.capacities)?;
+            let blocker = state.records.iter().find_map(|record| {
+                let how = if record.quarantined {
+                    "quarantined by"
+                } else {
+                    match record.state {
+                        TicketState::Granted(_) | TicketState::Preparing => "held by",
+                        TicketState::Queued => "queued for",
+                        _ => return None,
+                    }
+                };
+                let claim = record.request.resources.iter().find(|claim| {
+                    request
+                        .resources
+                        .iter()
+                        .any(|wanted| conflicts(claim, wanted))
+                })?;
+                Some(format!(
+                    "{} {how} ticket {}",
+                    key_label(&claim.key),
+                    record.ticket.id
+                ))
+            });
+            if let Some(reason) = blocker {
+                return Ok(RestartBarrier::Deferred(reason));
+            }
+            let (ticket, _) = self.enqueue_record(state, request, None)?;
+            let lock = stable_file(&self.ticket_path(ticket.id))?;
+            lock.lock()?;
+            held = Some(lock);
+            let entry = state
+                .records
+                .iter_mut()
+                .find(|r| r.ticket.id == ticket.id)
+                .context("restart barrier ticket missing")?;
+            entry.restart_barrier = true;
+            entry.supervisor_pid = entry.request.holder.host_pid;
+            Ok(RestartBarrier::Held(grant_entry(entry)))
+        })?;
+        if let RestartBarrier::Held(lease) = &outcome {
+            self.held.lock().unwrap().insert(
+                lease.ticket.id,
+                held.context("restart barrier lock FD missing")?,
+            );
+        }
+        Ok(outcome)
+    }
+
     /// Latest nonblocking refusal for a named service; a rejected attempt has
     /// no FIFO position but the supervisor can report its actual wait reason.
     pub fn service_admission_reason(&self, service_id: &str) -> Result<Option<String>> {
@@ -796,6 +875,7 @@ impl LaneStore {
             post_scope: None,
             quarantined: false,
             service_lease: false,
+            restart_barrier: false,
             service_admission: None,
             preparing_since_ms: None,
             yield_services: vec![],
@@ -1542,6 +1622,24 @@ fn capacity(capacities: &[Capacity], key: &ResourceKey) -> u32 {
 
 fn conflicts(left: &ResourceRequest, right: &ResourceRequest) -> bool {
     left.key == right.key
+}
+
+/// A resource key for status reasons: its name and scope.
+pub(crate) fn key_label(key: &ResourceKey) -> String {
+    match &key.scope {
+        ResourceScope::Host => format!("{} (host)", key.name),
+        ResourceScope::Project(path) => format!("{} (project {})", key.name, path.display()),
+        ResourceScope::Worktree(path) => format!("{} (worktree {})", key.name, path.display()),
+    }
+}
+
+/// The outcome of `LaneStore::try_acquire_restart_barrier`.
+#[derive(Debug)]
+pub(crate) enum RestartBarrier {
+    /// Every key is reserved until this lease is released.
+    Held(Lease),
+    /// Why not: `<key> (<scope>) held by|queued for|quarantined by ticket <id>`.
+    Deferred(String),
 }
 
 /// FIFO decision. A later ticket never overtakes an earlier conflicting
@@ -2807,7 +2905,7 @@ impl LaneStore {
             if !matches!(
                 record.state,
                 TicketState::Granted(_) | TicketState::Queued | TicketState::Preparing
-            ) || (record.job.is_none() && !record.service_lease)
+            ) || (record.job.is_none() && !record.service_lease && !record.restart_barrier)
             {
                 continue;
             }
@@ -2834,14 +2932,24 @@ impl LaneStore {
                 continue;
             }
             let note = format!(
-                "job {} lost supervisor pid {:?} while {:?}",
-                record.ticket.id, record.supervisor_pid, record.state
+                "{} {} lost supervisor pid {:?} while {:?}",
+                if record.restart_barrier {
+                    "restart barrier"
+                } else {
+                    "job"
+                },
+                record.ticket.id,
+                record.supervisor_pid,
+                record.state
             );
             actions.push(note.clone());
             if dry_run {
                 continue;
             }
-            let mut verified = !record.service_lease;
+            // A service lost mid-restart may have left its old or new
+            // backend running with nobody to stop it: without proof, fail
+            // closed rather than admit a build of its tree beside it.
+            let mut verified = !record.service_lease && !record.restart_barrier;
             if let Some(JobHandle {
                 state: JobState::Running { scope },
                 ..
@@ -3092,6 +3200,7 @@ mod tests {
             post_scope: None,
             quarantined: false,
             service_lease: false,
+            restart_barrier: false,
             service_admission: None,
             preparing_since_ms: None,
             yield_services: vec![],
@@ -4946,5 +5055,300 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+
+    fn barrier_request(names: &[&str]) -> LeaseRequest {
+        LeaseRequest {
+            resources: names
+                .iter()
+                .map(|name| resource(name, Access::Exclusive))
+                .collect(),
+            holder: Holder {
+                purpose: "restart:editor".into(),
+                ..holder()
+            },
+            queue_timeout_ms: None,
+        }
+    }
+    fn exclusive_lease(names: &[&str]) -> LeaseRequest {
+        LeaseRequest {
+            holder: holder(),
+            ..barrier_request(names)
+        }
+    }
+    fn held_barrier(outcome: RestartBarrier) -> Lease {
+        match outcome {
+            RestartBarrier::Held(lease) => lease,
+            RestartBarrier::Deferred(reason) => panic!("restart barrier deferred: {reason}"),
+        }
+    }
+    fn deferred_barrier(outcome: RestartBarrier) -> String {
+        match outcome {
+            RestartBarrier::Deferred(reason) => reason,
+            RestartBarrier::Held(lease) => panic!("restart barrier granted: {lease:?}"),
+        }
+    }
+    /// A queued job (it may prepare past a service lease) on `names`.
+    fn queue_job(store: &LaneStore, dir: &Path, names: &[&str]) -> Uuid {
+        let spec = JobSpec {
+            foreign_client_grace_ms: default_foreign_client_grace_ms(),
+            foreign_client_grace_by_resource: vec![],
+            abandon_after_ms: None,
+            unit_prefix: None,
+            finish_hook: None,
+            memory_swap_max_bytes: None,
+            fingerprint: JobFingerprint(names.join("+")),
+            lease: exclusive_lease(names),
+            argv: vec!["true".into()],
+            cwd: dir.into(),
+            env: vec![],
+            memory_max_bytes: None,
+            admission: test_budget(dir),
+            pre_hook: None,
+            post_hook: None,
+            timeout_ms: 2000,
+            stall_timeout_ms: None,
+            coalesce: false,
+        };
+        store
+            .locked(|state| {
+                Ok(store
+                    .enqueue_record(state, spec.lease.clone(), Some(spec))?
+                    .0
+                    .id)
+            })
+            .unwrap()
+    }
+
+    /// Failure mode (C10): a service restart and a build of its tree both
+    /// admitted, because the restart checked the build keys in one step and
+    /// reserved nothing, or a queued build lost its turn to it.
+    #[tokio::test]
+    async fn restart_barrier_and_build_admission_never_interleave() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let keys = ["main-build", "start-lock"];
+        let journal = || {
+            (
+                store.snapshot().unwrap().len(),
+                fs::read_dir(dir.path().join("locks")).unwrap().count(),
+            )
+        };
+
+        // Before: a build queued ahead keeps its FIFO turn, then holds the
+        // key. A refused attempt journals no record and makes no lock inode.
+        let build = store.enqueue_lease(exclusive_lease(&keys[..1])).unwrap();
+        let before = journal();
+        let reason = deferred_barrier(
+            store
+                .try_acquire_restart_barrier(barrier_request(&keys))
+                .unwrap(),
+        );
+        assert_eq!(
+            reason,
+            format!("main-build (host) queued for ticket {}", build.id)
+        );
+        assert_eq!(journal(), before, "a refused barrier left journal churn");
+        let lease = LaneCoordinator::wait(&store, &build).await.unwrap();
+        let reason = deferred_barrier(
+            store
+                .try_acquire_restart_barrier(barrier_request(&keys))
+                .unwrap(),
+        );
+        assert_eq!(
+            reason,
+            format!("main-build (host) held by ticket {}", build.id)
+        );
+        store.release_lease(&lease).unwrap();
+        // All keys or none: a build on the second key alone refuses it, and
+        // the first key is not reserved meanwhile.
+        let other = store.enqueue_lease(exclusive_lease(&keys[1..])).unwrap();
+        let other = LaneCoordinator::wait(&store, &other).await.unwrap();
+        deferred_barrier(
+            store
+                .try_acquire_restart_barrier(barrier_request(&keys))
+                .unwrap(),
+        );
+        assert!(!store.snapshot().unwrap().iter().any(|r| r.restart_barrier));
+        store.release_lease(&other).unwrap();
+
+        // During: no ticket needing a barrier key is admitted. Not a plain
+        // lease, not a job that could prepare past a service lease by having
+        // the service yield, and not another service's shared lease.
+        let barrier = held_barrier(
+            store
+                .try_acquire_restart_barrier(barrier_request(&keys))
+                .unwrap(),
+        );
+        let service = store
+            .try_acquire_service(
+                LeaseRequest {
+                    resources: vec![resource("editor", Access::Shared { slots: 1 })],
+                    holder: service_holder(),
+                    queue_timeout_ms: None,
+                },
+                &test_budget(dir.path()),
+            )
+            .unwrap()
+            .expect("the editor's own key is not in the barrier");
+        let other_service = LeaseRequest {
+            resources: vec![resource("main-build", Access::Shared { slots: 1 })],
+            holder: Holder {
+                purpose: "service:other".into(),
+                ..holder()
+            },
+            queue_timeout_ms: None,
+        };
+        assert!(
+            store
+                .try_acquire_service(other_service, &test_budget(dir.path()))
+                .unwrap()
+                .is_none()
+        );
+        let plain = store.enqueue_lease(exclusive_lease(&keys[1..])).unwrap();
+        let job = queue_job(&store, dir.path(), &["editor", "main-build"]);
+        assert!(store.try_grant(plain.id).unwrap().is_none());
+        assert!(store.try_grant(job).unwrap().is_none());
+        let row = store.record(job).unwrap();
+        assert!(
+            matches!(row.state, TicketState::Queued) && row.yield_services.is_empty(),
+            "a job prepared past the restart barrier: {row:?}"
+        );
+        assert_eq!(
+            row.wait_reason.as_deref(),
+            Some("exclusive resource main-build busy")
+        );
+
+        // After: the queued tickets are admitted in turn (the job by having
+        // the editor yield), and a second restart waits for them.
+        store.release_lease(&barrier).unwrap();
+        assert!(store.try_grant(plain.id).unwrap().is_some());
+        store.finish(plain.id, 0, "test").unwrap();
+        assert!(store.try_grant(job).unwrap().is_none());
+        let row = store.record(job).unwrap();
+        assert!(matches!(row.state, TicketState::Preparing));
+        assert_eq!(row.yield_services, vec!["test"]);
+        let reason = deferred_barrier(
+            store
+                .try_acquire_restart_barrier(barrier_request(&keys))
+                .unwrap(),
+        );
+        assert_eq!(
+            reason,
+            format!("main-build (host) held by ticket {job}"),
+            "{reason}"
+        );
+        store.finish(job, 0, "test").unwrap();
+        store.release_lease(&service).unwrap();
+        let again = held_barrier(
+            store
+                .try_acquire_restart_barrier(barrier_request(&keys))
+                .unwrap(),
+        );
+        store.release_lease(&again).unwrap();
+    }
+
+    /// Two threads race a restart barrier against build admission on the
+    /// same key; neither may ever see the other granted beside it.
+    #[test]
+    fn restart_barrier_races_build_admission_without_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let overlap = |store: &LaneStore| {
+            let rows = store.snapshot().unwrap();
+            let granted = |barrier: bool| {
+                rows.iter().any(|r| {
+                    r.restart_barrier == barrier && matches!(r.state, TicketState::Granted(_))
+                })
+            };
+            granted(true) && granted(false)
+        };
+        let restarts = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                let mut held = 0;
+                for _ in 0..2000 {
+                    if held == 10 {
+                        break;
+                    }
+                    if let RestartBarrier::Held(lease) = store
+                        .try_acquire_restart_barrier(barrier_request(&["main-build"]))
+                        .unwrap()
+                    {
+                        held += 1;
+                        assert!(!overlap(&store), "a build was granted beside the barrier");
+                        store.release_lease(&lease).unwrap();
+                    }
+                }
+                held
+            })
+        };
+        let mut builds = 0;
+        for _ in 0..2000 {
+            if builds == 10 {
+                break;
+            }
+            let ticket = store
+                .enqueue_lease(exclusive_lease(&["main-build"]))
+                .unwrap();
+            if store.try_grant(ticket.id).unwrap().is_some() {
+                builds += 1;
+                assert!(!overlap(&store), "the barrier was granted beside a build");
+            }
+            store.finish(ticket.id, 0, "test").unwrap();
+        }
+        let held = restarts.join().unwrap();
+        assert_eq!((held, builds), (10, 10), "barriers and builds granted");
+    }
+
+    /// Failure mode: a service supervisor lost mid-restart (its old or new
+    /// backend maybe still running) letting a build of the tree start.
+    #[test]
+    fn orphaned_restart_barrier_quarantines_its_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let barrier = held_barrier(
+            store
+                .try_acquire_restart_barrier(barrier_request(&["main-build"]))
+                .unwrap(),
+        );
+        // While its owner lives, recovery leaves it alone.
+        assert!(store.recover(false).unwrap().is_empty());
+        let build = store
+            .enqueue_lease(exclusive_lease(&["main-build"]))
+            .unwrap();
+        // The supervisor dies: its lock FD closes with no journal release.
+        drop(store);
+        let recovered = LaneStore::new(dir.path()).unwrap();
+        let actions = recovered.recover(false).unwrap();
+        assert!(
+            actions.iter().any(|action| action
+                .starts_with(&format!("restart barrier {} lost supervisor", barrier.ticket.id))),
+            "{actions:?}"
+        );
+        let row = recovered.record(barrier.ticket.id).unwrap();
+        assert!(
+            row.quarantined && matches!(row.state, TicketState::Finished),
+            "orphaned barrier not quarantined: {row:?}"
+        );
+        assert!(recovered.try_grant(build.id).unwrap().is_none());
+        assert!(
+            recovered
+                .record(build.id)
+                .unwrap()
+                .wait_reason
+                .unwrap()
+                .contains("quarantined")
+        );
+        let reason = deferred_barrier(
+            recovered
+                .try_acquire_restart_barrier(barrier_request(&["main-build"]))
+                .unwrap(),
+        );
+        assert_eq!(
+            reason,
+            format!("main-build (host) quarantined by ticket {}", barrier.ticket.id)
+        );
     }
 }
