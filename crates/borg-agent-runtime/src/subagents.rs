@@ -551,7 +551,7 @@ impl AgentToolServer {
     }
 }
 
-fn agent_mcp_executable() -> Result<PathBuf> {
+pub(crate) fn agent_mcp_executable() -> Result<PathBuf> {
     let current = std::env::current_exe().context("failed to locate the Borg executable")?;
     resolve_agent_mcp_executable(&current)
 }

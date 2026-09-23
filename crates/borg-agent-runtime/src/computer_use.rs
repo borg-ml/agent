@@ -9,6 +9,11 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::run_helper as run_linux_helper;
+
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Default)]
@@ -355,11 +360,11 @@ const HELPER_REQUIREMENTS: &str = if cfg!(target_os = "macos") {
 } else if cfg!(target_os = "windows") {
     "Windows computer use requires Windows PowerShell 5.1+ (or pwsh) in the interactive user session"
 } else {
-    "Linux computer use requires python3, PyGObject and AT-SPI2 on the desktop session bus; desktop input injection also needs python-evdev, a writable /dev/uinput and wtype (Wayland) or xdotool (X11); the private display needs the borg-display binary"
+    "Linux computer use requires AT-SPI2 on the desktop session bus; desktop input injection also needs a writable /dev/uinput and wtype (Wayland) or xdotool (X11); the private display needs the borg-display binary"
 };
 
-/// Platform helper process. Linux runs the AT-SPI worker under the system
-/// Python; macOS compiles the Swift accessibility worker once per source
+/// Platform helper process. Linux re-executes Borg as its desktop worker;
+/// macOS compiles the Swift accessibility worker once per source
 /// revision and caches the binary under `~/.borg/state/computer-use`.
 async fn helper_command() -> Result<Command> {
     if cfg!(target_os = "macos") {
@@ -385,8 +390,11 @@ async fn helper_command() -> Result<Command> {
             .arg(script);
         return Ok(command);
     }
-    let mut command = Command::new("python3");
-    command.args(["-I", "-u", "-c", LINUX_HELPER_SOURCE]);
+    // Linux runs the Rust worker in a child `borg` process, so a hung desktop
+    // call is killed without touching the host.
+    let executable = crate::subagents::agent_mcp_executable()?;
+    let mut command = Command::new(executable);
+    command.arg("__computer-use-helper");
     // Release archives ship the private-display compositor next to borg.
     if let Some(display) = std::env::current_exe()
         .ok()
@@ -399,13 +407,6 @@ async fn helper_command() -> Result<Command> {
 }
 
 const MACOS_HELPER_SOURCE: &str = include_str!("computer_use/macos.swift");
-/// Compositor window parsing/mapping is a separate AT-SPI-free module so it can
-/// be unit tested; it runs as the prologue of the Linux worker.
-const LINUX_HELPER_SOURCE: &str = concat!(
-    include_str!("computer_use/linux_windows.py"),
-    "\n",
-    include_str!("computer_use/linux.py")
-);
 const WINDOWS_HELPER_SOURCE: &str = include_str!("computer_use/windows.ps1");
 
 fn which_in_path(program: &str) -> bool {
@@ -585,30 +586,6 @@ mod tests {
                 "{refused} must be refused for a sub-agent"
             );
         }
-    }
-
-    /// Compositor window parsing and window-to-desktop mapping decide where
-    /// injected clicks land, so a regression would click the wrong pixels.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_window_backends_parse_and_map_coordinates() {
-        let source = concat!(
-            include_str!("computer_use/linux_windows.py"),
-            "\n",
-            include_str!("computer_use/linux_windows_test.py")
-        );
-        let Ok(output) = std::process::Command::new("python3")
-            .args(["-I", "-c", source])
-            .output()
-        else {
-            eprintln!("python3 unavailable; skipping the Linux helper unit tests");
-            return;
-        };
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
     }
 
     #[tokio::test]

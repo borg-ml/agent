@@ -1,5 +1,5 @@
 // Borg-owned macOS accessibility worker. JSONL on stdin/stdout; diagnostics on stderr.
-// Same contract as linux.py: element handles live only for this process; every
+// Same contract as the Linux worker (computer_use/linux.rs): element handles live only for this process; every
 // effect consumes the observation it was issued against.
 import AppKit
 import ApplicationServices
