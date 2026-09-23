@@ -63,6 +63,41 @@ parent requires D11 atomic editor/exclusive handoff and real-CLI proof.
 | `gamedev/mcp-bridge` | `ca2815e` imported into integrated | Actor-derived holder, registered template, blanket-denied model exclusives, no model restart, bounded GET and configured-CLI submit; owner reports targeted unit/live tests. | Integrated actor-pair coalesced access regression passed at `5143197`; final integrated-binary MCP live check and public probes pending. Owner later committed equivalent actor-pair fix at `89b60d3`, not imported. |
 | `gamedev/research` | `17e9296` sourced `docs/gamedev/landscape.md` | Survey read: Epic native UE 5.8 MCP/Horde/Zen, Unity CLI switch, VCS asset locks; thesis and caveats incorporated into design. | Preserve citation/verification qualifiers on merge. |
 
+## Rebase onto post-0.10 `main` (plan, simulated 2026-09-23)
+
+Simulated against `main` `2164265` merged in memory with
+`borg/release-prep-0.10` `92fa61b` (clean). Repeat on the real base when it
+lands; release-prep is still being rebased.
+
+- **Rebase only the gamedev range.** `7e0b13f..4e01e0e` (25 commits:
+  `cua/integrated` computer use, `borg-display` and `borg/agent-productivity`)
+  is already upstream under other hashes, all 25 by subject. Replaying the
+  whole branch or merging `main` into it re-conflicts on duplicate history
+  (`release.yml`, `Cargo.*`, `computer_use/linux.py`, `borg-display/src/main.rs`
+  add/add, `docs/computer-use.md`, `subagents/tests.rs`). Use
+  `git rebase -i --rebase-merges --onto <main> 4e01e0e` and **drop `df60d9d`**
+  (and any equivalent of `937c810`'s `native_mcp.rs` hunk). It does not
+  conflict textually with upstream `72e8e78`, so leaving it would silently
+  add a second stderr wait.
+- **Expected stops (2), both mechanical.** Redoing merge `33693be` (workspace)
+  stops on `subagents.rs`, `worktree_commands.rs`, `workspace.rs`,
+  `workspace/hygiene.rs` and `workspace-hygiene.md`. Take `33693be`'s version
+  of the four files upstream never touched. `subagents.rs` resolves cleanly
+  3-way (rebased side, base `33693be^1`, theirs `33693be`). Redoing `dea7e45`
+  (MCP bridge) stops on `docs/gamedev/services.md`; take `dea7e45`'s version.
+  Result: 149 commits, 6 merges. The tree equals applying the gamedev delta
+  `4e01e0e..tip` (minus `df60d9d`) onto `main`, and `crates/borg-lanes` and
+  `docs/gamedev` are byte-identical to the source branch.
+- **Hot spots.** `native_harness.rs` is unchanged upstream since `4e01e0e`.
+  `subagents.rs`: upstream `2078508` (follow-ups revive stopped subagents) and
+  the MCP-diagnostic changes are all inside `SubagentCoordinator` and the tool
+  spec text. Gamedev adds the dispatcher's `lane_job`/`lane_service` arm,
+  `lane_caller()` and a per-dispatcher `LaneTools`, so the hunks don't
+  overlap. Semantic check for the gate: a revived child must still act only
+  as its own session (`lane_caller` uses the dispatcher's `actor_session_id`).
+  If revival builds a fresh dispatcher, its in-memory co-submit set is empty
+  (item 10: fails closed).
+
 ## Expected conflicts and resolution
 
 - Every branch based on design may contain the same `ede51c5`; rebase on the
