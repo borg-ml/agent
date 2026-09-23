@@ -899,6 +899,7 @@ async fn restore_client(spec: &ServiceSpec, lease: &ClientLease, port: Option<u1
 struct ServiceGate {
     store: LaneStore,
     request: LeaseRequest,
+    budget: AdmissionBudget,
     lease: Option<Lease>,
 }
 impl ServiceGate {
@@ -923,12 +924,15 @@ impl ServiceGate {
                 },
                 queue_timeout_ms: None,
             },
+            budget: spec.admission.clone(),
             lease: None,
         })
     }
     fn acquire(&mut self) -> Result<bool> {
         if self.lease.is_none() {
-            self.lease = self.store.try_acquire_service(self.request.clone())?;
+            self.lease = self
+                .store
+                .try_acquire_service(self.request.clone(), &self.budget)?;
         }
         Ok(self.lease.is_some())
     }
