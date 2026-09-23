@@ -4762,6 +4762,7 @@ async fn a_sub_agent_computer_use_is_confined_to_a_private_display() {
 /// identity -- its parent's service lease or jobs -- because identity came
 /// from anything but its own session.
 #[tokio::test]
+#[cfg(unix)]
 async fn a_sub_agent_cannot_use_its_parents_lane_or_service_identity() {
     use crate::lane_tools::tests::{fixture_tools, write_test_service};
     let directory = tempdir().unwrap();

@@ -20,6 +20,7 @@ mod generation_activity;
 mod harness;
 mod host_paths;
 mod imported_memory;
+#[cfg(unix)]
 mod lane_tools;
 mod local_control;
 mod lsp;

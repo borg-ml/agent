@@ -125,6 +125,7 @@ pub(crate) enum Command {
         command: RemoteCommand,
     },
     /// Queue and supervise engine-neutral jobs and resource leases.
+    #[cfg(unix)]
     Lane(crate::lane_commands::LaneArgs),
     /// Check for or install the latest Borg Agent release.
     #[command(visible_alias = "install")]
@@ -160,6 +161,7 @@ pub(crate) enum Command {
     /// List local multiplayer workspaces available to this OS user.
     Workspaces(WorkspacesArgs),
     /// Create, inspect and safely reclaim Git worktrees.
+    #[cfg(unix)]
     Worktree(WorktreeArgs),
     /// Inspect, branch, export, and restore local durable sessions.
     Session {
@@ -1295,6 +1297,7 @@ impl From<RemotePermissionArg> for borg_remote::PermissionMode {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Args)]
 pub(crate) struct WorktreeArgs {
     #[arg(long, default_value = ".")]
@@ -1305,6 +1308,7 @@ pub(crate) struct WorktreeArgs {
     pub(crate) command: WorktreeCommand,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Subcommand)]
 pub(crate) enum WorktreeCommand {
     /// Create a task worktree in --root (default: sibling borg-wt).
