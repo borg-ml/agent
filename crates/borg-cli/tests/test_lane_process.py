@@ -99,6 +99,24 @@ class LaneProcess(unittest.TestCase):
         self.assertGreater(lines.index("start x"), lines.index("end a"))
         self.assertGreater(lines.index("start x"), lines.index("end b"))
 
+    def test_rejects_project_and_worktree_path_aliases(self):
+        project = self.root / "project"
+        project.mkdir()
+        link = self.root / "project-link"
+        link.symlink_to(project, target_is_directory=True)
+        canonical = self.submit(self.spec("canonical", scope={"Project": str(project)}))
+        self.wait(canonical)
+        for scope_kind in ("Project", "Worktree"):
+            for path in (project / ".." / "project", link):
+                spec = self.spec("alias", scope={scope_kind: str(path)})
+                out = self.cli("job", "submit", "--spec", "-", spec=spec)
+                self.assertNotEqual(out.returncode, 0, (out.stdout, out.stderr))
+                self.assertIn("not canonical", out.stderr)
+                cap = self.cli("resource", "set-capacity", "--name", "build",
+                               "--scope", str(path), "--slots", "2")
+                self.assertNotEqual(cap.returncode, 0)
+        self.assertEqual(len(self.records()), 1, "invalid aliases must never enter the journal")
+
     def test_ram_and_disk_queue_reasons(self):
         spec = self.spec("ram", admission={"min_available_ram_bytes": 2**60, "reserve_ram_bytes": 1,
                             "min_free_disk_bytes": 0, "reserve_disk_bytes": 1, "disk_path": str(self.root)})
