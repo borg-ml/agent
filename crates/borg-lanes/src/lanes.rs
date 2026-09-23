@@ -67,6 +67,9 @@ pub struct Ticket {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lease {
     pub id: Uuid,
+    /// Monotone fencing token (global ticket sequence, hence per-key monotone).
+    #[serde(default)]
+    pub generation: u64,
     pub ticket: Ticket,
     pub resources: Vec<ResourceRequest>,
     pub holder: Holder,
@@ -156,4 +159,1249 @@ pub trait JobCoordinator: Send + Sync {
     async fn wait(&self, id: Uuid) -> Result<JobHandle>;
     async fn status(&self, id: Uuid) -> Result<JobHandle>;
     async fn cancel(&self, id: Uuid) -> Result<()>;
+}
+
+// The journal is a single atomically replaced snapshot protected by a stable
+// kernel lock. Scope and lease tokens describe ownership; open lock FDs prove it.
+use anyhow::{Context, bail, ensure};
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LaneRecord {
+    pub ticket: Ticket,
+    pub request: LeaseRequest,
+    pub state: TicketState,
+    pub job: Option<JobHandle>,
+    pub spec: Option<JobSpec>,
+    pub created_ms: u64,
+    pub started_ms: Option<u64>,
+    pub finished_ms: Option<u64>,
+    pub supervisor_pid: Option<u32>,
+    pub wait_reason: Option<String>,
+    pub progress: Option<String>,
+    pub parallelism_hint: Option<u32>,
+    pub cpu_seconds: Option<f64>,
+    pub evidence: Option<String>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Journal {
+    sequence: u64,
+    records: Vec<LaneRecord>,
+    capacities: Vec<Capacity>,
+}
+
+/// One host-local lane store. Clones share held in-process lease FDs; cross-
+/// process jobs are owned by a detached supervisor, not the submitter.
+#[derive(Clone)]
+pub struct LaneStore {
+    root: PathBuf,
+    held: Arc<Mutex<HashMap<Uuid, File>>>,
+}
+
+fn milliseconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn stable_file(path: &Path) -> Result<File> {
+    Ok(OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+        .with_context(|| format!("opening stable lane lock {}", path.display()))?)
+}
+
+impl LaneStore {
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        fs::create_dir_all(root.join("locks"))?;
+        fs::create_dir_all(root.join("jobs"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&root, &root.join("locks"), &root.join("jobs")] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        Ok(Self {
+            root,
+            held: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    pub fn default_root() -> PathBuf {
+        let base = std::env::var_os("BORG_LANE_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("XDG_RUNTIME_DIR").map(|p| PathBuf::from(p).join("borg/lanes"))
+            })
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("borg-lanes-{}", unsafe { libc::geteuid() }))
+            });
+        base
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn locked<T>(&self, f: impl FnOnce(&mut Journal) -> Result<T>) -> Result<T> {
+        let guard = stable_file(&self.root.join("state.lock"))?;
+        guard.lock()?;
+        let state = self.root.join("state.json");
+        let mut journal: Journal = if state.exists() {
+            serde_json::from_slice(&fs::read(&state)?)?
+        } else {
+            Journal::default()
+        };
+        let before = serde_json::to_vec(&journal)?;
+        let result = f(&mut journal);
+        if result.is_ok() && serde_json::to_vec(&journal)? != before {
+            let tmp = self.root.join(format!("state.{}.tmp", Uuid::new_v4()));
+            let mut out = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+            }
+            out.write_all(&serde_json::to_vec(&journal)?)?;
+            out.sync_all()?;
+            fs::rename(&tmp, &state)?;
+            File::open(&self.root)?.sync_all()?;
+        }
+        result
+    }
+
+    /// Global capacities are host-scoped keys; missing keys default to one.
+    pub fn set_capacity(&self, capacity: Capacity) -> Result<()> {
+        ensure!(capacity.slots > 0, "capacity must be positive");
+        self.locked(|state| {
+            if let Some(existing) = state.capacities.iter_mut().find(|c| c.key == capacity.key) {
+                *existing = capacity;
+            } else {
+                state.capacities.push(capacity);
+            }
+            Ok(())
+        })
+    }
+
+    fn reading<T>(&self, f: impl FnOnce(&Journal) -> Result<T>) -> Result<T> {
+        let lock = stable_file(&self.root.join("state.lock"))?;
+        lock.lock_shared()?;
+        let path = self.root.join("state.json");
+        if !path.exists() {
+            return f(&Journal::default());
+        }
+        f(&serde_json::from_slice(&fs::read(path)?)?)
+    }
+
+    pub fn snapshot(&self) -> Result<Vec<LaneRecord>> {
+        self.reading(|state| Ok(state.records.clone()))
+    }
+
+    fn ticket_path(&self, id: Uuid) -> PathBuf {
+        self.root.join("locks").join(format!("{id}.flock"))
+    }
+    fn job_dir(&self, id: Uuid) -> PathBuf {
+        self.root.join("jobs").join(id.to_string())
+    }
+
+    fn validate(request: &LeaseRequest, capacities: &[Capacity]) -> Result<()> {
+        ensure!(
+            !request.resources.is_empty(),
+            "at least one resource required"
+        );
+        let mut seen = HashSet::new();
+        for r in &request.resources {
+            ensure!(!r.key.name.trim().is_empty(), "empty resource name");
+            ensure!(
+                seen.insert(&r.key),
+                "duplicate resource key: {}",
+                r.key.name
+            );
+            let cap = capacity(capacities, &r.key);
+            if let Access::Shared { slots } = r.access {
+                ensure!(
+                    slots > 0 && slots <= cap,
+                    "shared slots must fit capacity of {} ({cap})",
+                    r.key.name
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn enqueue_record(
+        &self,
+        state: &mut Journal,
+        request: LeaseRequest,
+        spec: Option<JobSpec>,
+    ) -> Result<(Ticket, Option<JobHandle>)> {
+        Self::validate(&request, &state.capacities)?;
+        if let Some(ref spec) = spec {
+            ensure!(!spec.argv.is_empty(), "a job needs a command");
+            ensure!(spec.cwd.is_absolute(), "job cwd must be absolute");
+            ensure!(
+                spec.cwd.is_dir(),
+                "job cwd does not exist: {}",
+                spec.cwd.display()
+            );
+            if spec.coalesce {
+                if let Some(existing) = state.records.iter().find(|r| {
+                    let Some(other) = r.spec.as_ref() else {
+                        return false;
+                    };
+                    r.job
+                        .as_ref()
+                        .is_some_and(|j| matches!(j.state, JobState::Queued))
+                        && spec.fingerprint == other.fingerprint
+                        && spec.argv == other.argv
+                        && spec.cwd == other.cwd
+                        && spec.env == other.env
+                        && serde_json::to_value(&spec.lease.resources).ok()
+                            == serde_json::to_value(&other.lease.resources).ok()
+                        && serde_json::to_value(&spec.admission).ok()
+                            == serde_json::to_value(&other.admission).ok()
+                        && serde_json::to_value(&spec.pre_hook).ok()
+                            == serde_json::to_value(&other.pre_hook).ok()
+                        && serde_json::to_value(&spec.post_hook).ok()
+                            == serde_json::to_value(&other.post_hook).ok()
+                        && spec.memory_max_bytes == other.memory_max_bytes
+                        && spec.timeout_ms == other.timeout_ms
+                        && spec.stall_timeout_ms == other.stall_timeout_ms
+                }) {
+                    return Ok((existing.ticket.clone(), existing.job.clone()));
+                }
+            }
+        }
+        state.sequence += 1;
+        let ticket = Ticket {
+            id: Uuid::new_v4(),
+            sequence: state.sequence,
+        };
+        let job = spec.as_ref().map(|s| JobHandle {
+            id: ticket.id,
+            ticket: ticket.clone(),
+            fingerprint: s.fingerprint.clone(),
+            log_path: self.job_dir(ticket.id).join("output.log"),
+            state: JobState::Queued,
+        });
+        if job.is_some() {
+            fs::create_dir_all(self.job_dir(ticket.id))?;
+        }
+        // Never unlink a lock inode: waiters and a crashed process may still hold it.
+        stable_file(&self.ticket_path(ticket.id))?;
+        state.records.push(LaneRecord {
+            ticket: ticket.clone(),
+            request,
+            state: TicketState::Queued,
+            job: job.clone(),
+            spec,
+            created_ms: milliseconds(),
+            started_ms: None,
+            finished_ms: None,
+            supervisor_pid: None,
+            wait_reason: None,
+            progress: None,
+            parallelism_hint: None,
+            cpu_seconds: None,
+            evidence: None,
+        });
+        Ok((ticket, job))
+    }
+
+    pub fn enqueue_lease(&self, request: LeaseRequest) -> Result<Ticket> {
+        self.locked(|state| {
+            self.enqueue_record(state, request, None)
+                .map(|(ticket, _)| ticket)
+        })
+    }
+
+    pub fn enqueue_job(&self, spec: JobSpec) -> Result<JobHandle> {
+        // A submitter holds the completion lock while publishing and spawning,
+        // so a waiter never sees a queued job without a live owner.
+        let mut owner: Option<File> = None;
+        let (job, newly_created) = self.locked(|state| {
+            let old = state.sequence;
+            let (_, job) = self.enqueue_record(state, spec.lease.clone(), Some(spec))?;
+            let job = job.context("job submission yielded no handle")?;
+            if state.sequence != old {
+                let lock = stable_file(&self.ticket_path(job.id))?;
+                lock.lock()?;
+                owner = Some(lock);
+            }
+            Ok((job, state.sequence != old))
+        })?;
+        if newly_created {
+            let lock = owner.context("new job has no lock")?;
+            let executable = std::env::var_os("BORG_LANE_EXECUTABLE")
+                .map(PathBuf::from)
+                .unwrap_or(std::env::current_exe()?);
+            // The lock FD crosses exec to the supervisor, not to the workload.
+            use std::os::fd::AsRawFd;
+            let fd = lock.as_raw_fd();
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, 0);
+            }
+            let spawned = Command::new(executable)
+                .args(["lane", "__supervise", "--state-dir"])
+                .arg(&self.root)
+                .arg(job.id.to_string())
+                .env("BORG_LANE_LOCK_FD", fd.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            if let Err(error) = spawned {
+                self.finish(job.id, 125, &format!("cannot spawn supervisor: {error}"))?;
+            }
+            drop(lock);
+        }
+        self.job_status(job.id)
+    }
+
+    fn record(&self, id: Uuid) -> Result<LaneRecord> {
+        self.reading(|state| {
+            state
+                .records
+                .iter()
+                .find(|r| r.ticket.id == id)
+                .cloned()
+                .with_context(|| format!("unknown lane ticket/job {id}"))
+        })
+    }
+    pub fn job_status(&self, id: Uuid) -> Result<JobHandle> {
+        self.record(id)?.job.context("ticket has no job")
+    }
+    pub fn ticket_state(&self, ticket: &Ticket) -> Result<TicketState> {
+        Ok(self.record(ticket.id)?.state)
+    }
+
+    /// Block on the kernel-owned completion lock; an exited supervisor wakes
+    /// every waiter immediately even if it never wrote a terminal event.
+    pub fn wait_job(&self, id: Uuid) -> Result<JobHandle> {
+        let initial = self.job_status(id)?;
+        if matches!(
+            initial.state,
+            JobState::Finished { .. } | JobState::Cancelled { .. }
+        ) {
+            return Ok(initial);
+        }
+        let lock = stable_file(&self.ticket_path(id))?;
+        lock.lock_shared()?;
+        drop(lock);
+        self.recover(false)?;
+        self.job_status(id)
+    }
+
+    pub fn finish(&self, id: Uuid, exit_code: i32, evidence: &str) -> Result<()> {
+        self.locked(|state| {
+            let record = state
+                .records
+                .iter_mut()
+                .find(|r| r.ticket.id == id)
+                .context("unknown job")?;
+            record.finished_ms = Some(milliseconds());
+            record.evidence = Some(evidence.to_owned());
+            record.state = TicketState::Finished;
+            if let Some(job) = record.job.as_mut() {
+                job.state = JobState::Finished { exit_code };
+            }
+            Ok(())
+        })
+    }
+
+    pub fn cancel_ticket(&self, id: Uuid, reason: &str) -> Result<()> {
+        self.locked(|state| {
+            let record = state
+                .records
+                .iter_mut()
+                .find(|r| r.ticket.id == id)
+                .context("unknown ticket")?;
+            ensure!(
+                matches!(record.state, TicketState::Queued),
+                "cannot cancel a running or completed ticket"
+            );
+            record.state = TicketState::Cancelled {
+                reason: reason.to_owned(),
+            };
+            if let Some(job) = record.job.as_mut() {
+                job.state = JobState::Cancelled {
+                    reason: reason.to_owned(),
+                };
+            }
+            record.finished_ms = Some(milliseconds());
+            Ok(())
+        })
+    }
+}
+
+fn capacity(capacities: &[Capacity], key: &ResourceKey) -> u32 {
+    capacities
+        .iter()
+        .find(|c| &c.key == key)
+        .map_or(1, |c| c.slots)
+}
+
+fn conflicts(left: &ResourceRequest, right: &ResourceRequest) -> bool {
+    left.key == right.key
+}
+
+/// Pure FIFO decision: an earlier conflicting ticket is never overtaken,
+/// while disjoint keys can run concurrently. All keys grant atomically.
+fn dispatch_reason(state: &Journal, id: Uuid) -> Result<Option<String>> {
+    let me = state
+        .records
+        .iter()
+        .find(|r| r.ticket.id == id)
+        .context("unknown ticket")?;
+    if !matches!(me.state, TicketState::Queued) {
+        bail!("ticket is not queued");
+    }
+    for earlier in state
+        .records
+        .iter()
+        .filter(|r| r.ticket.sequence < me.ticket.sequence)
+    {
+        if matches!(earlier.state, TicketState::Queued)
+            && earlier
+                .request
+                .resources
+                .iter()
+                .any(|a| me.request.resources.iter().any(|b| conflicts(a, b)))
+        {
+            return Ok(Some(format!("FIFO ticket {} ahead", earlier.ticket.id)));
+        }
+    }
+    for requested in &me.request.resources {
+        let used = state
+            .records
+            .iter()
+            .filter(|r| matches!(r.state, TicketState::Granted(_)))
+            .flat_map(|r| &r.request.resources)
+            .filter(|r| r.key == requested.key)
+            .fold(0_u32, |n, r| {
+                n.saturating_add(match r.access {
+                    Access::Exclusive => capacity(&state.capacities, &r.key),
+                    Access::Shared { slots } => slots,
+                })
+            });
+        if used > 0 && matches!(requested.access, Access::Exclusive) {
+            return Ok(Some(format!(
+                "exclusive resource {} busy",
+                requested.key.name
+            )));
+        }
+        if used.saturating_add(match requested.access {
+            Access::Shared { slots } => slots,
+            Access::Exclusive => capacity(&state.capacities, &requested.key),
+        }) > capacity(&state.capacities, &requested.key)
+        {
+            return Ok(Some(format!(
+                "resource {} capacity {}/{}",
+                requested.key.name,
+                used,
+                capacity(&state.capacities, &requested.key)
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn mem_available() -> Option<u64> {
+    fs::read_to_string("/proc/meminfo")
+        .ok()?
+        .lines()
+        .find(|s| s.starts_with("MemAvailable:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u64>()
+        .ok()
+        .map(|kb| kb * 1024)
+}
+
+fn disk_available(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let stat = unsafe { stat.assume_init() };
+        return Some(stat.f_bavail.saturating_mul(stat.f_frsize));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn budget_reason(state: &Journal, spec: &JobSpec) -> Option<String> {
+    let reserved_ram: u64 = state
+        .records
+        .iter()
+        .filter(|r| matches!(r.state, TicketState::Granted(_)))
+        .filter_map(|r| r.spec.as_ref())
+        .map(|s| s.admission.reserve_ram_bytes)
+        .sum();
+    let reserved_disk: u64 = state
+        .records
+        .iter()
+        .filter(|r| matches!(r.state, TicketState::Granted(_)))
+        .filter_map(|r| r.spec.as_ref())
+        .filter(|s| s.admission.disk_path == spec.admission.disk_path)
+        .map(|s| s.admission.reserve_disk_bytes)
+        .sum();
+    let ram_needed = spec
+        .admission
+        .min_available_ram_bytes
+        .saturating_add(spec.admission.reserve_ram_bytes)
+        .saturating_add(reserved_ram);
+    if let Some(available) = mem_available() {
+        if available < ram_needed {
+            return Some(format!(
+                "waiting for RAM: MemAvailable {available} bytes, need {ram_needed} bytes including {reserved_ram} reserved"
+            ));
+        }
+    }
+    let disk_needed = spec
+        .admission
+        .min_free_disk_bytes
+        .saturating_add(spec.admission.reserve_disk_bytes)
+        .saturating_add(reserved_disk);
+    match disk_available(&spec.admission.disk_path) {
+        Some(free) if free < disk_needed => Some(format!(
+            "waiting for disk on {}: {free} bytes free, need {disk_needed} bytes including {reserved_disk} reserved",
+            spec.admission.disk_path.display()
+        )),
+        None => Some(format!(
+            "cannot inspect disk free on {}",
+            spec.admission.disk_path.display()
+        )),
+        _ => None,
+    }
+}
+
+fn proc_cpu(pid: u32) -> Option<f64> {
+    let text = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let tail = text
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let ticks: u64 = tail
+        .get(11)?
+        .parse::<u64>()
+        .ok()?
+        .saturating_add(tail.get(12)?.parse().ok()?);
+    Some(ticks as f64 / unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64)
+}
+
+impl LaneStore {
+    /// Dequeued admission is journalled while the metadata lock is held, so
+    /// even two independent supervisors on different worktrees cannot race.
+    fn try_grant(&self, id: Uuid) -> Result<Option<Lease>> {
+        self.locked(|state| {
+            let reason = dispatch_reason(state, id)?.or_else(|| {
+                state
+                    .records
+                    .iter()
+                    .find(|r| r.ticket.id == id)?
+                    .spec
+                    .as_ref()
+                    .and_then(|spec| budget_reason(state, spec))
+            });
+            let entry = state
+                .records
+                .iter_mut()
+                .find(|r| r.ticket.id == id)
+                .context("ticket disappeared")?;
+            if let Some(reason) = reason {
+                entry.wait_reason = Some(reason);
+                return Ok(None);
+            }
+            let lease = Lease {
+                id: Uuid::new_v4(),
+                generation: entry.ticket.sequence,
+                ticket: entry.ticket.clone(),
+                resources: entry.request.resources.clone(),
+                holder: entry.request.holder.clone(),
+            };
+            entry.state = TicketState::Granted(lease.clone());
+            entry.started_ms = Some(milliseconds());
+            entry.wait_reason = None;
+            if let Some(spec) = entry.spec.as_ref() {
+                let available = mem_available().unwrap_or(0);
+                let free = available.saturating_sub(spec.admission.reserve_ram_bytes);
+                let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+                entry.parallelism_hint =
+                    Some(((free / (1024 * 1024 * 1024)) as usize).clamp(1, cores) as u32);
+            }
+            if let Some(job) = entry.job.as_mut() {
+                job.state = JobState::Running {
+                    scope: String::new(),
+                };
+            }
+            Ok(Some(lease))
+        })
+    }
+
+    fn wait_grant(&self, id: Uuid) -> Result<Lease> {
+        let entered = std::time::Instant::now();
+        let event = StateEvents::new(&self.root)?;
+        loop {
+            self.recover(false)?;
+            if let Some(lease) = self.try_grant(id)? {
+                return Ok(lease);
+            }
+            let record = self.record(id)?;
+            if let Some(limit) = record.request.queue_timeout_ms {
+                if entered.elapsed().as_millis() >= u128::from(limit) {
+                    self.cancel_ticket(id, "queue timeout")?;
+                    bail!("queue timeout for ticket {id}");
+                }
+            }
+            // Snapshot followed by a subscribed notification (armed before
+            // the snapshot) cannot miss an already-committed transition.
+            event.wait(Duration::from_secs(2))?;
+        }
+    }
+
+    fn run_hook(
+        &self,
+        hook: &Hook,
+        spec: &JobSpec,
+        id: Uuid,
+        phase: &str,
+        sync: bool,
+    ) -> Result<()> {
+        ensure!(!hook.argv.is_empty(), "empty {phase} hook");
+        let mut command = Command::new(&hook.argv[0]);
+        command
+            .args(&hook.argv[1..])
+            .current_dir(&spec.cwd)
+            .env("BORG_LANE_JOB", id.to_string())
+            .env("BORG_LANE_PHASE", phase)
+            .env(
+                "BORG_LANE_RESOURCE",
+                spec.lease.resources.first().map_or("", |r| &r.key.name),
+            )
+            .env("BORG_LANE_LOG", self.job_dir(id).join("output.log"));
+        let mut child = command.stdin(Stdio::null()).spawn()?;
+        if !sync {
+            return Ok(());
+        }
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                ensure!(status.success(), "{phase} hook exited with {status}");
+                return Ok(());
+            }
+            if start.elapsed() > Duration::from_millis(hook.timeout_ms) {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("{phase} hook timed out after {}ms", hook.timeout_ms);
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+
+    /// Called only from `borg lane __supervise` with the inherited done-lock FD.
+    /// Workload FDs use CLOEXEC: neither a compiler nor a hook can hold the
+    /// completion lock after its supervisor has died.
+    pub fn supervise(&self, id: Uuid) -> Result<i32> {
+        use std::os::fd::FromRawFd;
+        let lock = if let Ok(fd) = std::env::var("BORG_LANE_LOCK_FD") {
+            let fd: i32 = fd.parse()?;
+            let inherited = unsafe { File::from_raw_fd(fd) };
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+            inherited
+        } else {
+            let lock = stable_file(&self.ticket_path(id))?;
+            lock.lock()?;
+            lock
+        };
+        self.locked(|state| {
+            let record = state
+                .records
+                .iter_mut()
+                .find(|r| r.ticket.id == id)
+                .context("unknown supervisor job")?;
+            record.supervisor_pid = Some(std::process::id());
+            Ok(())
+        })?;
+        let result = self.supervise_job(id);
+        let code = match &result {
+            Ok(code) => *code,
+            Err(_) => 125,
+        };
+        let evidence = match result {
+            Ok(_) => "finished".to_owned(),
+            Err(error) => format!("supervisor: {error:#}"),
+        };
+        self.finish(id, code, &evidence)?;
+        drop(lock);
+        Ok(code)
+    }
+
+    fn supervise_job(&self, id: Uuid) -> Result<i32> {
+        let lease = self.wait_grant(id)?;
+        let spec = self.record(id)?.spec.context("job spec missing")?;
+        let exclusive = spec
+            .lease
+            .resources
+            .iter()
+            .any(|r| matches!(r.access, Access::Exclusive));
+        if let Some(pre) = &spec.pre_hook {
+            // A failed yield must prevent an exclusive command from starting.
+            self.run_hook(
+                pre,
+                &spec,
+                id,
+                if exclusive { "pre-exclusive" } else { "pre" },
+                true,
+            )?;
+        }
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.job_dir(id).join("output.log"))?;
+        let stderr = log.try_clone()?;
+        let unit = format!("borg-lane-{id}.scope");
+        let mut command = if std::env::var_os("BORG_LANE_SCOPE").as_deref()
+            != Some(std::ffi::OsStr::new("0"))
+            && Command::new("systemd-run")
+                .args(["--user", "--scope", "--quiet", "--collect", "true"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        {
+            let mut command = Command::new("systemd-run");
+            command
+                .args([
+                    "--user",
+                    "--scope",
+                    "--quiet",
+                    "--collect",
+                    "--expand-environment=no",
+                ])
+                .arg(format!("--unit={unit}"));
+            if let Some(max) = spec.memory_max_bytes {
+                command.args(["-p", &format!("MemoryMax={max}")]);
+            }
+            if fs::read_to_string("/proc/self/cgroup").is_ok_and(|s| s.contains("/app-borg.slice/"))
+                && Command::new("systemctl")
+                    .args(["--user", "cat", "app-borg-workloads.slice"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
+            {
+                command.arg("--slice=app-borg-workloads.slice");
+            }
+            command.arg("--").arg(&spec.argv[0]).args(&spec.argv[1..]);
+            command
+        } else {
+            let mut command = Command::new(&spec.argv[0]);
+            command.args(&spec.argv[1..]);
+            command
+        };
+        command
+            .current_dir(&spec.cwd)
+            .envs(spec.env.clone())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(stderr));
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("starting job {id}"))?;
+        self.locked(|state| {
+            let record = state
+                .records
+                .iter_mut()
+                .find(|r| r.ticket.id == id)
+                .context("job vanished")?;
+            if let Some(job) = record.job.as_mut() {
+                job.state = JobState::Running {
+                    scope: unit.clone(),
+                };
+            }
+            Ok(())
+        })?;
+        let started = std::time::Instant::now();
+        let mut last_progress = started;
+        let mut last_size = 0;
+        let mut last_cpu = 0.0;
+        let code = loop {
+            if let Some(status) = child.try_wait()? {
+                break status.code().unwrap_or(128 + status.signal().unwrap_or(9));
+            }
+            let size = fs::metadata(self.job_dir(id).join("output.log")).map_or(0, |m| m.len());
+            let cpu = proc_cpu(child.id()).unwrap_or(0.0);
+            if size != last_size || cpu > last_cpu + 0.05 {
+                last_progress = std::time::Instant::now();
+            }
+            last_size = size;
+            last_cpu = cpu;
+            self.locked(|state| {
+                let record = state
+                    .records
+                    .iter_mut()
+                    .find(|r| r.ticket.id == id)
+                    .context("job vanished")?;
+                record.progress = Some(format!("{} bytes", size));
+                record.cpu_seconds = Some(cpu);
+                Ok(())
+            })?;
+            if started.elapsed() > Duration::from_millis(spec.timeout_ms)
+                || spec
+                    .stall_timeout_ms
+                    .is_some_and(|ms| last_progress.elapsed() > Duration::from_millis(ms))
+            {
+                let reason = if started.elapsed() > Duration::from_millis(spec.timeout_ms) {
+                    "timeout"
+                } else {
+                    "stall: no CPU or log growth"
+                };
+                self.log_recovery(id, reason)?;
+                if matches!(self.job_status(id)?.state, JobState::Running { ref scope } if scope == &unit)
+                {
+                    let _ = Command::new("systemctl")
+                        .args(["--user", "kill", "--signal=SIGKILL", &unit])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+                // Without a scope, the supervisor can kill only the child it
+                // started and can still wait on; never sweep names or PIDs.
+                let _ = child.kill();
+                let _ = child.wait();
+                break if reason == "timeout" { 124 } else { 125 };
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        // Post hooks start asynchronously and cannot falsify job status.
+        if let Some(post) = &spec.post_hook {
+            let _ = self.run_hook(
+                post,
+                &spec,
+                id,
+                if exclusive { "post-exclusive" } else { "post" },
+                false,
+            );
+        }
+        let _ = lease;
+        Ok(code)
+    }
+
+    fn log_recovery(&self, id: Uuid, reason: &str) -> Result<()> {
+        let record = serde_json::json!({"time_ms": milliseconds(), "job": id, "reason": reason,
+            "evidence": self.record(id)?});
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(self.root.join("recovery.jsonl"))?;
+        writeln!(file, "{record}")?;
+        Ok(())
+    }
+
+    pub fn recover(&self, dry_run: bool) -> Result<Vec<String>> {
+        let mut actions = Vec::new();
+        // Avoid nested metadata locks: test each kernel lock before journalling.
+        for record in self.snapshot()? {
+            if !matches!(record.state, TicketState::Granted(_) | TicketState::Queued)
+                || record.job.is_none()
+            {
+                continue;
+            }
+            let lock = stable_file(&self.ticket_path(record.ticket.id))?;
+            if lock.try_lock_shared().is_err() {
+                continue;
+            }
+            drop(lock);
+            let note = format!(
+                "job {} lost supervisor pid {:?} while {:?}",
+                record.ticket.id, record.supervisor_pid, record.state
+            );
+            actions.push(note.clone());
+            if dry_run {
+                continue;
+            }
+            if let Some(JobHandle {
+                state: JobState::Running { scope },
+                ..
+            }) = &record.job
+            {
+                if scope == &format!("borg-lane-{}.scope", record.ticket.id) {
+                    let _ = Command::new("systemctl")
+                        .args(["--user", "kill", "--signal=SIGKILL", scope])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            }
+            self.log_recovery(record.ticket.id, &note)?;
+            self.finish(record.ticket.id, 125, &note)?;
+        }
+        Ok(actions)
+    }
+}
+
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+
+#[async_trait]
+impl LaneCoordinator for LaneStore {
+    async fn enqueue(&self, request: LeaseRequest) -> Result<Ticket> {
+        self.enqueue_lease(request)
+    }
+    async fn wait(&self, ticket: &Ticket) -> Result<Lease> {
+        let store = self.clone();
+        let id = ticket.id;
+        tokio::task::spawn_blocking(move || {
+            let lock = stable_file(&store.ticket_path(id))?;
+            lock.lock()?;
+            let granted = store.wait_grant(id);
+            if granted.is_ok() {
+                store.held.lock().unwrap().insert(id, lock);
+            }
+            granted
+        })
+        .await?
+    }
+    async fn release(&self, lease: &Lease) -> Result<()> {
+        ensure!(
+            self.held.lock().unwrap().remove(&lease.ticket.id).is_some(),
+            "lease is not held by this process"
+        );
+        self.locked(|state| {
+            let record = state
+                .records
+                .iter_mut()
+                .find(|r| r.ticket.id == lease.ticket.id)
+                .context("lease vanished")?;
+            ensure!(
+                matches!(&record.state, TicketState::Granted(current) if current.id == lease.id && current.generation == lease.generation),
+                "lease token mismatch"
+            );
+            record.state = TicketState::Finished;
+            record.finished_ms = Some(milliseconds());
+            Ok(())
+        })
+    }
+    async fn ticket_status(&self, ticket: &Ticket) -> Result<TicketState> {
+        self.ticket_state(ticket)
+    }
+    async fn recover(&self, dry_run: bool) -> Result<Vec<String>> {
+        LaneStore::recover(self, dry_run)
+    }
+}
+
+#[async_trait]
+impl JobCoordinator for LaneStore {
+    async fn submit(&self, spec: JobSpec) -> Result<JobHandle> {
+        self.enqueue_job(spec)
+    }
+    async fn wait(&self, id: Uuid) -> Result<JobHandle> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.wait_job(id)).await?
+    }
+    async fn status(&self, id: Uuid) -> Result<JobHandle> {
+        self.job_status(id)
+    }
+    async fn cancel(&self, id: Uuid) -> Result<()> {
+        self.cancel_ticket(id, "cancelled by requester")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(name: &str) -> ResourceKey {
+        ResourceKey {
+            scope: ResourceScope::Host,
+            name: name.into(),
+        }
+    }
+    fn resource(name: &str, access: Access) -> ResourceRequest {
+        ResourceRequest {
+            key: key(name),
+            access,
+        }
+    }
+    fn holder() -> Holder {
+        Holder {
+            participant_id: Uuid::nil(),
+            session_id: Uuid::nil(),
+            host_pid: None,
+            purpose: "test".into(),
+        }
+    }
+    fn record(seq: u64, state: TicketState, resources: Vec<ResourceRequest>) -> LaneRecord {
+        LaneRecord {
+            ticket: Ticket {
+                id: Uuid::from_u128(u128::from(seq)),
+                sequence: seq,
+            },
+            request: LeaseRequest {
+                resources,
+                holder: holder(),
+                queue_timeout_ms: None,
+            },
+            state,
+            job: None,
+            spec: None,
+            created_ms: 0,
+            started_ms: None,
+            finished_ms: None,
+            supervisor_pid: None,
+            wait_reason: None,
+            progress: None,
+            parallelism_hint: None,
+            cpu_seconds: None,
+            evidence: None,
+        }
+    }
+    fn granted(seq: u64, resources: Vec<ResourceRequest>) -> LaneRecord {
+        let mut row = record(seq, TicketState::Queued, resources);
+        row.state = TicketState::Granted(Lease {
+            id: Uuid::new_v4(),
+            generation: seq,
+            ticket: row.ticket.clone(),
+            resources: row.request.resources.clone(),
+            holder: holder(),
+        });
+        row
+    }
+    #[test]
+    fn fifo_exclusive_not_overtaken_by_shared() {
+        // A running shared reader must not allow a later reader to starve a queued writer.
+        let state = Journal {
+            sequence: 3,
+            capacities: vec![Capacity {
+                key: key("gpu"),
+                slots: 2,
+            }],
+            records: vec![
+                granted(1, vec![resource("gpu", Access::Shared { slots: 1 })]),
+                record(
+                    2,
+                    TicketState::Queued,
+                    vec![resource("gpu", Access::Exclusive)],
+                ),
+                record(
+                    3,
+                    TicketState::Queued,
+                    vec![resource("gpu", Access::Shared { slots: 1 })],
+                ),
+            ],
+        };
+        assert!(
+            dispatch_reason(&state, Uuid::from_u128(3))
+                .unwrap()
+                .unwrap()
+                .contains("FIFO")
+        );
+        assert!(
+            dispatch_reason(&state, Uuid::from_u128(2))
+                .unwrap()
+                .unwrap()
+                .contains("exclusive")
+        );
+    }
+    #[test]
+    fn disjoint_jobs_admit_without_waiting_for_blocked_tree() {
+        let state = Journal {
+            sequence: 3,
+            capacities: vec![],
+            records: vec![
+                granted(1, vec![resource("a", Access::Exclusive)]),
+                record(
+                    2,
+                    TicketState::Queued,
+                    vec![resource("a", Access::Exclusive)],
+                ),
+                record(
+                    3,
+                    TicketState::Queued,
+                    vec![resource("b", Access::Exclusive)],
+                ),
+            ],
+        };
+        assert_eq!(dispatch_reason(&state, Uuid::from_u128(3)).unwrap(), None);
+    }
+    #[test]
+    fn capacity_respects_weights_and_atomic_multi_key_requests() {
+        let state = Journal {
+            sequence: 2,
+            capacities: vec![Capacity {
+                key: key("ram"),
+                slots: 4,
+            }],
+            records: vec![
+                granted(1, vec![resource("ram", Access::Shared { slots: 3 })]),
+                record(
+                    2,
+                    TicketState::Queued,
+                    vec![
+                        resource("cpu", Access::Shared { slots: 1 }),
+                        resource("ram", Access::Shared { slots: 2 }),
+                    ],
+                ),
+            ],
+        };
+        assert!(
+            dispatch_reason(&state, Uuid::from_u128(2))
+                .unwrap()
+                .unwrap()
+                .contains("ram")
+        );
+    }
+    #[test]
+    fn pending_coalesces_only_matching_workload_and_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let spec = JobSpec {
+            fingerprint: JobFingerprint("source-r1".into()),
+            lease: LeaseRequest {
+                resources: vec![resource("build", Access::Exclusive)],
+                holder: holder(),
+                queue_timeout_ms: None,
+            },
+            argv: vec!["true".into()],
+            cwd: dir.path().to_path_buf(),
+            env: vec![],
+            memory_max_bytes: Some(2_000_000_000),
+            admission: AdmissionBudget {
+                min_available_ram_bytes: 0,
+                reserve_ram_bytes: 1,
+                min_free_disk_bytes: 0,
+                reserve_disk_bytes: 1,
+                disk_path: dir.path().into(),
+            },
+            pre_hook: None,
+            post_hook: None,
+            timeout_ms: 5000,
+            stall_timeout_ms: None,
+            coalesce: true,
+        };
+        store
+            .locked(|state| {
+                let first = store
+                    .enqueue_record(state, spec.lease.clone(), Some(spec.clone()))?
+                    .0;
+                let joined = store
+                    .enqueue_record(state, spec.lease.clone(), Some(spec.clone()))?
+                    .0;
+                assert_eq!(first.id, joined.id);
+                let changed = JobSpec {
+                    argv: vec!["false".into()],
+                    ..spec.clone()
+                };
+                assert_ne!(
+                    first.id,
+                    store
+                        .enqueue_record(state, changed.lease.clone(), Some(changed))?
+                        .0
+                        .id
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+/// Cross-process journal change notification. Install the watch before taking
+/// the first snapshot, then drain after each wake. The timeout only rechecks
+/// external RAM/disk changes that have no journal event.
+struct StateEvents {
+    #[cfg(target_os = "linux")]
+    fd: std::os::fd::OwnedFd,
+}
+impl StateEvents {
+    fn new(path: &Path) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::ffi::CString;
+            use std::os::fd::FromRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+            let name = CString::new(path.as_os_str().as_bytes())?;
+            let watch = unsafe {
+                libc::inotify_add_watch(
+                    std::os::fd::AsRawFd::as_raw_fd(&fd),
+                    name.as_ptr(),
+                    libc::IN_MOVED_TO,
+                )
+            };
+            if watch < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(Self { fd })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = path;
+            Ok(Self {})
+        }
+    }
+    fn wait(&self, timeout: Duration) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut poll = libc::pollfd {
+                fd: self.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe {
+                libc::poll(
+                    &mut poll,
+                    1,
+                    timeout.as_millis().min(i32::MAX as u128) as i32,
+                )
+            };
+            if rc < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if rc > 0 {
+                let mut bytes = [0u8; 4096];
+                while unsafe {
+                    libc::read(self.fd.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len())
+                } > 0
+                {}
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::thread::sleep(timeout);
+            Ok(())
+        }
+    }
 }
