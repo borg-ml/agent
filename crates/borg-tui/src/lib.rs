@@ -840,10 +840,6 @@ pub enum UiAction {
     RecallQueuedPrompts {
         target: Option<Uuid>,
     },
-    FlushPendingInput {
-        target: Option<Uuid>,
-        prompt: Option<(Uuid, String, Vec<PathBuf>)>,
-    },
     Rewind {
         sequence: u64,
         text: String,
@@ -4421,34 +4417,6 @@ impl BorgTerminal {
             self.event_redraw_needed = true;
         }
         true
-    }
-
-    fn has_pending_input_for_escape(&self) -> bool {
-        !self.composer.text.trim().is_empty()
-            || !self.composer.attachments.is_empty()
-            || !self.active_queued_prompts().is_empty()
-            || self
-                .focused_child
-                .map_or(self.active_turn_followup, |child| {
-                    self.child_active_turn_followups.contains(&child)
-                })
-    }
-
-    fn flush_pending_input(&mut self) -> UiAction {
-        let target = self.focused_child;
-        let (text, attachments) = self.composer.take();
-        let prompt = (!text.trim().is_empty() || !attachments.is_empty()).then(|| {
-            let message_id = Uuid::new_v4();
-            self.project_pending_prompt(target, message_id, text.clone(), PromptDelivery::Steer);
-            (message_id, text, attachments)
-        });
-        if let Some(child) = target {
-            self.child_active_turn_followups.remove(&child);
-        } else {
-            self.active_turn_followup = false;
-        }
-        self.notice = Some("Sending pending input".to_string());
-        UiAction::FlushPendingInput { target, prompt }
     }
 
     pub fn hydrate_payload(
@@ -9729,9 +9697,6 @@ impl BorgTerminal {
         }
         if let Some(target) = focused_child_interrupt_target(&self.keymap, &key, self.focused_child)
         {
-            if self.has_pending_input_for_escape() {
-                return Ok(self.flush_pending_input());
-            }
             return Ok(if self.begin_user_interrupt() {
                 UiAction::Interrupt {
                     target: Some(target),
@@ -9976,13 +9941,6 @@ impl BorgTerminal {
             return Ok(UiAction::None);
         }
         if self.keymap.matches(KeyAction::Interrupt, &key) {
-            if status_control_is_actionable(self.active_status())
-                && self.connection_retry_at.is_none()
-                && self.usage_retry_at.is_none()
-                && self.has_pending_input_for_escape()
-            {
-                return Ok(self.flush_pending_input());
-            }
             return Ok(if self.begin_user_interrupt() {
                 UiAction::Interrupt {
                     target: self.focused_child,
