@@ -129,11 +129,9 @@ child in the backend subgroup and exited its leader. Recovery verified the
 child gone, restarted on the alternate port (`restarts=1`), then the owned
 fixture was stopped; its unit was inactive and subgroup removed.
 
-Independent no-hook two-service scoped gate (bench script, SHA256
+Independent no-hook two-service scoped gate (external probe, tested CLI SHA256
 `4022be198a99c3e8f8cac3069387f222bd2cb4e1bfdfb7a4135e8048c19a34b2`):
-`python3 scripts/gamedev_service_probe.py --borg PATH --atomic-descendant`
-exited 0 on a real
-systemd-user job; both backend PIDs, detached descendants and delegated
+the test exited 0 on a real systemd-user job; both backend PIDs, detached descendants and delegated
 subgroups were gone before exclusive grant, both proxies returned 503, a
 client was restored, restart attempts remained fenced, and both services
 auto-resumed on release. See `/tmp/gd-two-service-scoped.log`. No real Unreal
@@ -143,3 +141,11 @@ An owned-unit supervisor-crash smoke SIGKILLed only the test supervisor main
 process; `KillMode=control-group` killed its detached backend child and the
 unit became inactive. The lack of a safe non-systemd process-tree scope still
 prevents a standalone `setsid` production fallback.
+
+Production two-service capacity smoke on integrated CLI SHA256
+`73aed7d927988e189b245d631aa7f67830094c6b41e1f2975da29bb190c88e59`:
+service A became Healthy with 10.8 GB reserved disk; separate service B on
+the same filesystem stayed Degraded with no backend and the exact "disk
+admission queued" reason. Yielding A admitted B to Healthy; both owned
+systemd-user units stopped inactive/dead with empty control groups. See
+`/tmp/gd-real-capacity-probe.log` (synthetic HTTP, not Unreal).
