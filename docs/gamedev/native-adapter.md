@@ -10,7 +10,7 @@ CLI works from the source package (`python3 extensions/native/native.py ...`)
 or the installed package (`python3 .borg/extensions/native/native.py ...`).
 
 Cargo `check`, `build`, `test` use a worktree-private `target`, debug profile,
-`-j` sized from MemAvailable (8 GiB reserve, max six actions); CMake uses a
+`-j` sized from MemAvailable (8 GiB reserve plus 2 GiB fixed job overhead, max six actions); CMake uses a
 private `build` and Release profile; ctest includes `-j`, regex and `-L`/`-LE`
 label selection. All output paths must remain inside the current worktree.
 Jobs request an exclusive worktree output resource, memory reserve and 60 GiB
@@ -33,7 +33,7 @@ database passwords in job specs.
 
 ## Reproducible probes (2026-09-23)
 
-- `python3 -m unittest discover -s extensions/native/tests -v`: eight pass.
+- `python3 -m unittest discover -s extensions/native/tests -v`: ten pass.
 - `borg extensions install ./extensions/native --project --json`: active,
   five Blu workflows registered; `borg extensions doctor --json`: active.
 - In the isolated `/home/shulgin/abundance-wt/gd-native` checkout, explicit
@@ -52,6 +52,15 @@ database passwords in job specs.
   test was modified by this branch. The latter asserts both that the same
   redaction marker is absent and present in its error. Do not report the
   package suite as passing. PostgreSQL-backed test coverage did run.
+- With the committed `gamedev/services` core rebased and a debug Borg CLI,
+  `python3 .borg/extensions/native/native.py ctest test --regex '^cave-network-tests$'`
+  submitted job `0c8183e9-...` immediately, and `borg lane job wait ID --json`
+  returned `Finished(exit_code=0)`; actual CTest case 1/1 passed in 1.26 s.
+  `cargo test -p borg-agent-runtime -- --skip <two pre-existing failing tests>`
+  submitted job `a63f6985-...`: worktree target lease granted, 26.628 s
+  runtime from lane state, 877 passed / 0 failed / 9 ignored / 2 filtered,
+  PostgreSQL-backed tests included. These jobs used a private throwaway
+  PostgreSQL server, not the not-yet-wired supervised service.
 - Throwaway PostgreSQL 18.6, `pg_ctl -w start`, three independent clusters vs
   one shared cluster plus three `CREATE DATABASE` operations (PSS summed over
   each server's process tree): independent starts 0.323 s total / 58.52 MiB
@@ -64,8 +73,9 @@ database passwords in job specs.
 - Actual coordinated two-agent `cargo test -p borg-agent-runtime` contention
   numbers require the lane CLI and two warm private targets. The initial
   direct-probe compile is explicitly **not** a coordinated result.
-- Workspace core currently provides a 32 GiB **per-agent** disk cap and safe
-  **whole-worktree** GC (`borg worktree --project ROOT gc`, dry-run). A hard
+- Workspace core currently provides a 32 GiB **per-agent** disk cap,
+  read-only `borg worktree --project ROOT target-status` (after workspace-core
+  integration), and safe **whole-worktree** GC (`borg worktree --project ROOT gc`, dry-run). A hard
   per-target byte cap or target-only GC is **not implemented**; use `cargo
   clean` only on your own finished worktree and request a workspace-core
   enhancement before claiming that feature.

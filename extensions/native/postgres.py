@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -17,6 +18,8 @@ from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
 
 def client_url(admin: str, name: str) -> str:
     parsed = urlsplit(admin)
+    if parsed.password:
+        raise ValueError('do not embed passwords in test database URLs')
     if parsed.scheme not in ('postgres', 'postgresql') or not parsed.path.strip('/'):
         raise ValueError('admin URL must select a PostgreSQL maintenance database')
     return urlunsplit((parsed.scheme, parsed.netloc, '/' + quote(name), parsed.query, parsed.fragment))
@@ -40,6 +43,12 @@ def main() -> int:
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command:
         parser.error('command required after --')
+    if not args.probe_admin_url and not (
+        len(command) >= 4 and Path(command[0]).name.startswith('python')
+        and Path(command[1]).name == 'native.py'
+        and command[2:4] == ['cargo', 'test']
+    ):
+        parser.error('leased mode requires: python3 native.py cargo test ...')
     lease_id: str | None = None
     owner: str | None = None
     admin: str | None = None
@@ -63,12 +72,12 @@ def main() -> int:
                             if client['owner']['participant_id'] == str(uuid5(NAMESPACE_OID, owner)))
             admin = os.environ['BORG_TEST_POSTGRES_ADMIN_URL']
         assert admin is not None
+        url = client_url(admin, name)
         sql(admin, f'CREATE DATABASE {name}')
         created = True
-        url = client_url(admin, name)
         result = subprocess.run(command, env={**os.environ, 'BORG_TEST_SESSIONS_URL': url},
                                 capture_output=True, text=True)
-        print(result.stdout, end='')
+        print(result.stdout, end='', flush=True)
         print(result.stderr, end='', file=sys.stderr)
         if result.returncode == 0 and not args.probe_admin_url:
             try:
