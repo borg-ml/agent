@@ -1,52 +1,37 @@
 manifest_version = 1
 id = "native"
 name = "Native toolchain lanes"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cargo and CMake/ctest jobs backed by Borg's engine-neutral lanes."
 enabled = true
-runtime_access = "trusted"
+runtime_access = "sandboxed"
 borg_version = ">=0.9.5"
 skill_roots = ["skills"]
 
-[workflows.cargo_test]
-description = "Run Borg runtime tests in the native Cargo lane."
-entrypoint = "workflows/cargo_test.blu"
-
-[workflows.cmake_configure]
-description = "Configure this CMake worktree in its private build directory."
-entrypoint = "workflows/cmake_configure.blu"
-
-[workflows.cmake_build]
-description = "Build this CMake worktree with RAM-aware parallelism."
-entrypoint = "workflows/cmake_build.blu"
-
-[workflows.ctest_fast]
-description = "Run non-slow ctest cases through the native test lane."
-entrypoint = "workflows/ctest_fast.blu"
-
-[workflows.ctest_all]
-description = "Run all ctest cases through the native test lane."
-entrypoint = "workflows/ctest_all.blu"
+[workflows.native]
+description = "Plan and submit a Cargo, CMake or ctest job through the Borg lane; returns the job ID."
+entrypoint = "workflows/native.blu"
 
 [api]
 version = 1
 
-[api.commands.cargo-test]
-workflow = "cargo_test"
-description = "Run Borg runtime tests through the Cargo lane"
+[api.tools.run]
+workflow = "native"
+description = "Submit a Cargo/CMake/ctest lane job, e.g. `cargo test -p borg-agent-runtime`, `cmake build --target T`, `ctest test --regex R`, `postgres cargo test -p borg-agent-runtime`, `service start`. Add --dry-run to print the job spec. Returns the lane job ID immediately."
+effect = "at_most_once"
 
-[api.commands.cmake-configure]
-workflow = "cmake_configure"
-description = "Configure the private CMake build directory"
+[api.tools.run.input_schema]
+type = "object"
+required = ["arguments", "request_id"]
 
-[api.commands.cmake-build]
-workflow = "cmake_build"
-description = "Build the private CMake build directory"
+[api.tools.run.input_schema.properties.arguments]
+type = "string"
+description = "Adapter arguments as on a command line; raw Cargo/CMake/ctest flags go after `--`."
 
-[api.commands.ctest-fast]
-workflow = "ctest_fast"
-description = "Run non-slow ctest cases"
+[api.tools.run.input_schema.properties.request_id]
+type = "string"
+description = "Fresh value per submission: identical arguments replay the earlier result instead of submitting again."
 
-[api.commands.ctest-all]
-workflow = "ctest_all"
-description = "Run the full ctest suite"
+[api.commands.run]
+workflow = "native"
+description = "Submit a native lane job, e.g. /ext:native:run cargo test -p borg-agent-runtime"

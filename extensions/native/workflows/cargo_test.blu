@@ -1,3 +1,0 @@
-local result = borg_exec(1, "python3 .borg/extensions/native/native.py cargo test -p borg-agent-runtime", ".", 1000, 1800000, 64000)
-borg_assert_exec_success(2, result)
-return result

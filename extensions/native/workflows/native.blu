@@ -1,0 +1,606 @@
+-- Cargo/CMake/ctest adapter over Borg's engine-neutral lanes.
+--
+-- Every effect goes through borg_exec. Toolchains never run here: they run
+-- only inside a `borg lane` job, which owns admission, leases and execution.
+-- Arguments mirror the former native.py argv, e.g.
+--   cargo test -p borg-agent-runtime -- --locked
+--   cmake build --target worldgen-tests
+--   ctest test --exclude-label slow
+--   postgres cargo test -p borg-agent-runtime
+--   service start
+
+local GIB = 1024 * 1024 * 1024
+local MIB = 1024 * 1024
+local null = {}
+
+local USAGE = "native: usage: [--project DIR] [--target-dir DIR] [--build-dir DIR] [--dry-run] "
+    .. "(cargo check|build|test [-p PKG] | cmake configure|build [--target T] | "
+    .. "ctest test [--exclude-label L] [--label L] [--regex R] | postgres cargo test [-p PKG] | "
+    .. "service show|start [--data-dir DIR] [--port N]) [-- EXTRA...]"
+
+local function fail(message)
+    error("native: " .. message, 0)
+end
+
+local function encode(value)
+    if value == nil or value == null then
+        return "null"
+    end
+    local kind = type(value)
+    if kind == "boolean" then
+        return tostring(value)
+    elseif kind == "number" then
+        return string.format("%d", value)
+    elseif kind == "string" then
+        local escaped = value:gsub('[%c"\\]', function(c)
+            local named = { ['"'] = '\\"', ["\\"] = "\\\\", ["\n"] = "\\n", ["\r"] = "\\r", ["\t"] = "\\t" }
+            return named[c] or string.format("\\u%04x", c:byte())
+        end)
+        return '"' .. escaped .. '"'
+    end
+    local parts = {}
+    if value[1] ~= nil or next(value) == nil then
+        for _, item in ipairs(value) do
+            parts[#parts + 1] = encode(item)
+        end
+        return "[" .. table.concat(parts, ",") .. "]"
+    end
+    local keys = {}
+    for key in pairs(value) do
+        keys[#keys + 1] = key
+    end
+    table.sort(keys)
+    for _, key in ipairs(keys) do
+        parts[#parts + 1] = encode(key) .. ":" .. encode(value[key])
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
+end
+
+local function decode(text)
+    local pos = 1
+    local escapes = { b = "\b", f = "\f", n = "\n", r = "\r", t = "\t", ['"'] = '"', ["\\"] = "\\", ["/"] = "/" }
+    local function bad(what)
+        fail("invalid JSON (" .. what .. ") at byte " .. pos)
+    end
+    local function space()
+        pos = text:find("[^ \t\r\n]", pos) or #text + 1
+    end
+    local function str()
+        pos = pos + 1
+        local parts = {}
+        while true do
+            local at = text:find('["\\]', pos)
+            if not at then
+                bad("string")
+            end
+            parts[#parts + 1] = text:sub(pos, at - 1)
+            if text:sub(at, at) == '"' then
+                pos = at + 1
+                return table.concat(parts)
+            end
+            local escape = text:sub(at + 1, at + 1)
+            if escape == "u" then
+                local code = tonumber(text:sub(at + 2, at + 5), 16)
+                if not code then
+                    bad("unicode escape")
+                end
+                pos = at + 6
+                if code >= 0xD800 and code <= 0xDBFF and text:sub(pos, pos + 1) == "\\u" then
+                    local low = tonumber(text:sub(pos + 2, pos + 5), 16)
+                    if low and low >= 0xDC00 and low <= 0xDFFF then
+                        code = 0x10000 + (code - 0xD800) * 0x400 + (low - 0xDC00)
+                        pos = pos + 6
+                    end
+                end
+                parts[#parts + 1] = utf8.char(code)
+            elseif escapes[escape] then
+                parts[#parts + 1] = escapes[escape]
+                pos = at + 2
+            else
+                bad("escape")
+            end
+        end
+    end
+    local value
+    value = function()
+        space()
+        local c = text:sub(pos, pos)
+        if c == "{" or c == "[" then
+            local object, close, result = c == "{", c == "{" and "}" or "]", {}
+            pos = pos + 1
+            space()
+            if text:sub(pos, pos) == close then
+                pos = pos + 1
+                return result
+            end
+            while true do
+                space()
+                if object then
+                    if text:sub(pos, pos) ~= '"' then
+                        bad("key")
+                    end
+                    local key = str()
+                    space()
+                    if text:sub(pos, pos) ~= ":" then
+                        bad("colon")
+                    end
+                    pos = pos + 1
+                    local item = value()
+                    if item ~= null then
+                        result[key] = item
+                    end
+                else
+                    result[#result + 1] = value()
+                end
+                space()
+                local separator = text:sub(pos, pos)
+                pos = pos + 1
+                if separator == close then
+                    return result
+                elseif separator ~= "," then
+                    bad("separator")
+                end
+            end
+        elseif c == '"' then
+            return str()
+        end
+        for literal, result in pairs({ ["true"] = true, ["false"] = false, ["null"] = null }) do
+            if text:sub(pos, pos + #literal - 1) == literal then
+                pos = pos + #literal
+                return result
+            end
+        end
+        local first, last = text:find("^%-?%d+%.?%d*[eE]?[%-+]?%d*", pos)
+        if not first then
+            bad("value")
+        end
+        pos = last + 1
+        return tonumber(text:sub(first, last))
+    end
+    local result = value()
+    space()
+    if pos <= #text then
+        bad("trailing data")
+    end
+    return result
+end
+
+local function q(value)
+    return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+end
+
+-- Call id 1 reads the workflow arguments; host commands follow in order so a
+-- resumed workflow replays the same journaled calls.
+local next_call = 1
+
+local function sh(command)
+    next_call = next_call + 1
+    local snapshot = decode(borg_exec(next_call, command, ".", 25000, 60000, 16000))
+    if snapshot.running then
+        fail("host command did not finish within 25 s: " .. command)
+    end
+    return snapshot
+end
+
+local function sh_ok(command)
+    local snapshot = sh(command)
+    if snapshot.exit_code ~= 0 or snapshot.timed_out then
+        local detail = (snapshot.stderr or "") .. (snapshot.stdout or "")
+        fail("command failed (exit " .. tostring(snapshot.exit_code) .. "): " .. detail:gsub("%s+$", ""))
+    end
+    return snapshot.stdout or ""
+end
+
+local function facts(lines)
+    local result = {}
+    local script = "kv() { printf '%s=%s\\n' \"$1\" \"$2\"; }\n" .. table.concat(lines, "\n")
+    for line in sh_ok(script):gmatch("[^\n]+") do
+        local key, value = line:match("^([%w_]+)=(.*)$")
+        if key then
+            result[key] = value
+        end
+    end
+    return result
+end
+
+local function words(text)
+    local result, current, active, quote, i = {}, {}, false, nil, 1
+    while i <= #text do
+        local c = text:sub(i, i)
+        if quote == "'" then
+            if c == "'" then
+                quote = nil
+            else
+                current[#current + 1] = c
+            end
+        elseif quote == '"' then
+            if c == '"' then
+                quote = nil
+            elseif c == "\\" and i < #text then
+                i = i + 1
+                current[#current + 1] = text:sub(i, i)
+            else
+                current[#current + 1] = c
+            end
+        elseif c:match("%s") then
+            if active then
+                result[#result + 1] = table.concat(current)
+                current, active = {}, false
+            end
+        elseif c == "'" or c == '"' then
+            quote, active = c, true
+        elseif c == "\\" and i < #text then
+            i = i + 1
+            current[#current + 1] = text:sub(i, i)
+            active = true
+        else
+            current[#current + 1] = c
+            active = true
+        end
+        i = i + 1
+    end
+    if quote then
+        fail("unterminated quote in arguments")
+    end
+    if active then
+        result[#result + 1] = table.concat(current)
+    end
+    return result
+end
+
+local VALUED = {
+    ["--project"] = "project", ["--target-dir"] = "target_dir", ["--build-dir"] = "build_dir",
+    ["-p"] = "package", ["--package"] = "package", ["--target"] = "target",
+    ["--exclude-label"] = "exclude_label", ["--label"] = "label", ["--regex"] = "regex",
+    ["--data-dir"] = "data_dir", ["--port"] = "port",
+}
+local ALLOWED = {
+    cargo = { package = true }, cmake = { target = true },
+    ctest = { exclude_label = true, label = true, regex = true },
+    service = { data_dir = true, port = true },
+}
+local OPERATIONS = {
+    cargo = { check = true, build = true, test = true }, cmake = { configure = true, build = true },
+    ctest = { test = true }, service = { show = true, start = true },
+}
+
+local function parse(argv)
+    local split = #argv + 1
+    for index, word in ipairs(argv) do
+        if word == "--" then
+            split = index
+            break
+        end
+    end
+    local options = { project = ".", target_dir = "target", build_dir = "build", extra = {} }
+    for index = split + 1, #argv do
+        options.extra[#options.extra + 1] = argv[index]
+    end
+    local positional, given, index = {}, {}, 1
+    while index < split do
+        local word = argv[index]
+        local flag, inline = word:match("^(%-%-[%w%-]+)=(.*)$")
+        if flag and VALUED[flag] then
+            options[VALUED[flag]], given[VALUED[flag]] = inline, true
+        elseif VALUED[word] then
+            if index + 1 >= split then
+                fail(word .. " requires a value")
+            end
+            options[VALUED[word]], given[VALUED[word]] = argv[index + 1], true
+            index = index + 1
+        elseif word == "--dry-run" then
+            options.dry_run = true
+        elseif word:sub(1, 1) == "-" then
+            fail("unknown option " .. word .. "\n" .. USAGE)
+        else
+            positional[#positional + 1] = word
+        end
+        index = index + 1
+    end
+    if positional[1] == "postgres" then
+        options.postgres = true
+        table.remove(positional, 1)
+        if positional[1] ~= "cargo" or positional[2] ~= "test" then
+            fail("postgres mode only wraps: postgres cargo test ...")
+        end
+    end
+    options.tool, options.operation = positional[1], positional[2]
+    if #positional ~= 2 or not OPERATIONS[options.tool] or not OPERATIONS[options.tool][options.operation] then
+        fail(USAGE:sub(9))
+    end
+    for key in pairs(given) do
+        if not ALLOWED[options.tool][key] and key ~= "project" and key ~= "target_dir" and key ~= "build_dir" then
+            fail("option for " .. key .. " does not apply to " .. options.tool)
+        end
+    end
+    return options
+end
+
+local function jobs(f, bytes_per_job)
+    if not f.mem_kb then
+        fail("MemAvailable unavailable; cannot size native jobs")
+    end
+    -- The JobSpec also reserves a fixed 2 GiB for linker/test overhead; leave
+    -- that outside the parallel-action budget so admission can grant the job.
+    local ram = math.max(0, tonumber(f.mem_kb) * 1024 - 10 * GIB)
+    if ram < bytes_per_job then
+        fail("insufficient available RAM for one native job")
+    end
+    local cap = f.max_jobs:match("^%s*(%d+)%s*$")
+    cap = cap and tonumber(cap)
+    if not cap or cap < 1 or cap > 6 then
+        fail("BORG_NATIVE_MAX_JOBS must be between 1 and 6")
+    end
+    return math.min(cap, tonumber(f.cpus), ram // bytes_per_job)
+end
+
+local function client_url(admin, name)
+    local scheme, netloc, path, rest = admin:match("^(%a[%w+.%-]*)://([^/?#]*)([^?#]*)(.*)$")
+    if netloc and netloc:match("^[^@]*:[^@]*@") then
+        fail("do not embed passwords in test database URLs")
+    end
+    if (scheme ~= "postgres" and scheme ~= "postgresql") or not path or path:gsub("/", "") == "" then
+        fail("admin URL must select a PostgreSQL maintenance database")
+    end
+    return scheme .. "://" .. netloc .. "/" .. name .. rest
+end
+
+local function sorted_pairs(map)
+    local keys, result = {}, {}
+    for key in pairs(map) do
+        keys[#keys + 1] = key
+    end
+    table.sort(keys)
+    for _, key in ipairs(keys) do
+        result[#result + 1] = { key, map[key] }
+    end
+    return result
+end
+
+local function lane(options)
+    local kind = options.tool
+    local output = kind == "cargo" and options.target_dir or options.build_dir
+    local manifest = kind == "cargo" and "Cargo.toml" or "CMakeLists.txt"
+    local f = facts({
+        "root=$(cd -- " .. q(options.project) .. " 2>/dev/null && pwd -P) || { echo 'project must be an existing directory' >&2; exit 2; }",
+        "kv root \"$root\"",
+        "kv output \"$(cd \"$root\" && realpath -m -- " .. q(output) .. ")\"",
+        "test -f \"$root\"/" .. q(manifest) .. " && kv manifest 1",
+        "awk '/^MemAvailable:/ {print \"mem_kb=\" $2}' /proc/meminfo",
+        "kv cpus \"$(nproc)\"",
+        "kv max_jobs \"${BORG_NATIVE_MAX_JOBS-6}\"",
+        "kv tool_path \"$(command -v -- " .. q(kind) .. ")\"",
+        "kv nice \"$(command -v nice || echo /usr/bin/nice)\"",
+        "kv borg \"$(command -v -- \"${BORG_NATIVE_BORG:-borg}\")\"",
+        "kv psql \"$(command -v psql)\"",
+        "kv free \"$(df -P -B1 -- \"$root\" | awk 'NR == 2 {print $4}')\"",
+        "[ \"${BORG_TEST_SESSIONS_URL+set}\" = set ] && kv sessions_url \"$BORG_TEST_SESSIONS_URL\"",
+        "kv admin_url \"${BORG_TEST_POSTGRES_ADMIN_URL-}\"",
+        "kv participant \"${BORG_PARTICIPANT_ID:-$(cat /proc/sys/kernel/random/uuid)}\"",
+        "kv session \"${BORG_SESSION_ID:-$(cat /proc/sys/kernel/random/uuid)}\"",
+        "kv nonce \"$(cat /proc/sys/kernel/random/uuid)\"",
+        "if [ -e \"$root/.git\" ]; then kv git 1; [ -n \"$(git -C \"$root\" ls-files --others --exclude-standard | head -c 1)\" ] && kv untracked 1; fi",
+        "exit 0",
+    })
+    local root = f.root
+    if f.output ~= root and f.output:sub(1, #root + 1) ~= root .. "/" then
+        fail("output must stay in worktree: " .. f.output)
+    end
+    if not f.manifest then
+        fail(manifest .. " missing from project root")
+    end
+    local env, command, per_job, job_count = {}, nil, nil, 1
+    if kind == "cargo" then
+        per_job = 1536 * MIB
+        job_count = jobs(f, per_job)
+        env.CARGO_TARGET_DIR = f.output
+        env.CARGO_BUILD_JOBS = tostring(job_count)
+        command = { "cargo", options.operation, "-j", env.CARGO_BUILD_JOBS }
+        if options.package then
+            command[#command + 1] = "-p"
+            command[#command + 1] = options.package
+        end
+    elseif kind == "cmake" and options.operation == "configure" then
+        per_job = 2 * GIB
+        command = { "cmake", "-S", root, "-B", f.output, "-DCMAKE_BUILD_TYPE=Release" }
+    elseif kind == "cmake" then
+        per_job = 2 * GIB
+        job_count = jobs(f, per_job)
+        command = { "cmake", "--build", f.output, "-j", tostring(job_count) }
+        if options.target then
+            command[#command + 1] = "--target"
+            command[#command + 1] = options.target
+        end
+    else
+        per_job = 512 * MIB
+        job_count = jobs(f, per_job)
+        command = { "ctest", "--test-dir", f.output, "-j", tostring(job_count), "--output-on-failure" }
+        for _, pair in ipairs({ { "-LE", options.exclude_label }, { "-L", options.label }, { "-R", options.regex } }) do
+            if pair[2] then
+                command[#command + 1] = pair[1]
+                command[#command + 1] = pair[2]
+            end
+        end
+    end
+    for _, word in ipairs(options.extra) do
+        command[#command + 1] = word
+    end
+    local lane_name = kind .. "-" .. options.operation
+    if f.tool_path == "" then
+        fail("command is not installed: " .. kind)
+    end
+    local borg = f.borg ~= "" and f.borg or nil
+
+    local pre_hook, post_hook = null, null
+    if options.postgres then
+        if f.admin_url == "" then
+            fail("BORG_TEST_POSTGRES_ADMIN_URL is required for postgres mode")
+        end
+        if f.psql == "" or not borg then
+            fail("postgres mode requires psql and the borg CLI")
+        end
+        -- The lane runs the pre hook only when this job reaches the head of
+        -- its queue, and runs the post hook after the job ends or the pre
+        -- hook fails. A queued or cancelled job therefore holds nothing.
+        local name = "borg_native_" .. f.nonce:gsub("%-", "")
+        env.BORG_TEST_SESSIONS_URL = client_url(f.admin_url, name)
+        local psql = q(f.psql) .. " -X -q -v ON_ERROR_STOP=1 --dbname " .. q(f.admin_url) .. " -c "
+        pre_hook = { argv = { "/bin/sh", "-c", table.concat({
+            "set -e",
+            q(borg) .. " lane service lease test-postgres --owner " .. name
+                .. " --ttl-seconds 3600 --purpose database --json >/dev/null",
+            psql .. q("CREATE DATABASE " .. name) .. " >/dev/null",
+        }, "\n") }, timeout_ms = 120000 }
+        post_hook = { argv = { "/bin/sh", "-c", table.concat({
+            "rc=0",
+            psql .. q("DROP DATABASE IF EXISTS " .. name .. " WITH (FORCE)") .. " >/dev/null || rc=$?",
+            q(borg) .. " lane service release test-postgres --owner " .. name .. " || rc=$?",
+            "exit $rc",
+        }, "\n") }, timeout_ms = 120000 }
+    elseif f.sessions_url then
+        env.BORG_TEST_SESSIONS_URL = f.sessions_url
+    end
+    if env.BORG_TEST_SESSIONS_URL then
+        local _, netloc = env.BORG_TEST_SESSIONS_URL:match("^(%a[%w+.%-]*)://([^/?#]*)")
+        if netloc and netloc:match("^[^@]*:[^@]*@") then
+            fail("do not persist a PostgreSQL password in a lane job spec")
+        end
+    end
+
+    local env_pairs = sorted_pairs(env)
+    -- Long `..` chains overflow the Blu compiler's stack; build commands as lists.
+    local git = "git -C " .. q(root)
+    local fingerprint = sh_ok(table.concat({
+        "{ printf '%s' " .. q(encode({ root, command, env_pairs })) .. ";",
+        "if [ -e " .. q(root .. "/.git") .. " ]; then",
+        git .. " rev-parse HEAD;",
+        git .. " status --porcelain --untracked-files=normal;",
+        git .. " diff HEAD --binary;",
+        "fi; } | sha256sum",
+    }, " ")):match("^(%x+)")
+    local argv = { f.nice, "-n", "10", f.tool_path }
+    for index = 2, #command do
+        argv[#argv + 1] = command[index]
+    end
+    local memory = job_count * per_job + 2 * GIB
+    local spec = {
+        fingerprint = fingerprint,
+        lease = {
+            resources = { {
+                key = { scope = { Worktree = root }, name = kind == "cargo" and "target" or "build" },
+                access = "Exclusive",
+            } },
+            holder = { participant_id = f.participant, session_id = f.session, host_pid = null, purpose = lane_name },
+            queue_timeout_ms = null,
+        },
+        argv = argv,
+        cwd = root,
+        env = env_pairs,
+        memory_max_bytes = memory,
+        admission = {
+            min_available_ram_bytes = 8 * GIB,
+            reserve_ram_bytes = memory,
+            min_free_disk_bytes = 60 * GIB,
+            reserve_disk_bytes = kind == "cargo" and 24 * GIB or 6 * GIB,
+            disk_path = root,
+        },
+        pre_hook = pre_hook,
+        post_hook = post_hook,
+        timeout_ms = 30 * 60 * 1000,
+        stall_timeout_ms = null,
+        coalesce = kind ~= "ctest" and not env.BORG_TEST_SESSIONS_URL and not f.untracked,
+    }
+    if options.dry_run then
+        return encode({ project = root, lane = lane_name, argv = command, env = env_pairs, spec = spec })
+    end
+    local free = tonumber(f.free)
+    if not free or free < 60 * GIB then
+        fail(string.format("free disk on output filesystem below 60 GiB: %.1f GiB", (free or 0) / GIB))
+    end
+    if lane_name == "cargo-test" and options.package == "borg-agent-runtime" and not env.BORG_TEST_SESSIONS_URL then
+        fail("BORG_TEST_SESSIONS_URL required; use `postgres cargo test -p borg-agent-runtime`")
+    end
+    if not borg then
+        fail("borg CLI not found; set BORG_NATIVE_BORG")
+    end
+    -- Submission returns the job ID immediately; waiting belongs to
+    -- `borg lane job wait ID` in a shell or a Borg watch, not a workflow.
+    local submitted = sh("cd -- " .. q(root) .. " && printf '%s' " .. q(encode(spec))
+        .. " | " .. q(borg) .. " lane job submit --spec - --json")
+    if submitted.exit_code ~= 0 then
+        fail("lane submission failed (exit " .. tostring(submitted.exit_code) .. "): " .. (submitted.stderr or ""))
+    end
+    return (submitted.stdout:gsub("%s+$", ""))
+end
+
+local function service(options)
+    local f = facts({
+        "data=" .. q(options.data_dir or "") .. "; [ -n \"$data\" ] || data=/tmp/borg-native-test-postgres-$(id -u)/data",
+        "data=$(realpath -m -- \"$data\")",
+        "kv data \"$data\"",
+        "kv parent \"$(dirname -- \"$data\")\"",
+        "kv user \"$(id -un)\"",
+        "kv borg \"$(command -v -- \"${BORG_NATIVE_BORG:-borg}\")\"",
+        "test -f \"$data/PG_VERSION\" && kv initialized 1",
+        "exit 0",
+    })
+    local data, parent = f.data, f.parent
+    if data:sub(1, 5) ~= "/tmp/" then
+        fail("test cluster must be under /tmp")
+    end
+    local port = tostring(options.port or "55481"):match("^%d+$")
+    port = port and tonumber(port)
+    if not port or port < 1024 or port > 65535 then
+        fail("invalid port")
+    end
+    local definition = {
+        id = "test-postgres",
+        argv = { "/usr/bin/postgres", "-D", data, "-k", parent, "-h", "", "-p", tostring(port) },
+        cwd = parent,
+        env = {},
+        resources = { { key = { scope = "Host", name = "test-postgres" }, access = { Shared = { slots = 1 } } } },
+        memory_max_bytes = GIB,
+        admission = {
+            min_available_ram_bytes = 8 * GIB, reserve_ram_bytes = GIB,
+            min_free_disk_bytes = 2 * GIB, reserve_disk_bytes = GIB, disk_path = data,
+        },
+        health = {
+            argv = { "pg_isready", "-h", parent, "-p", tostring(port) },
+            kind = "command", interval_ms = 1000, timeout_ms = 3000,
+        },
+        restart = { max_restarts = 3, backoff_ms = 500, debounce_ms = 500 },
+        endpoint = null,
+        restore = null,
+    }
+    local admin = "BORG_TEST_POSTGRES_ADMIN_URL=postgresql://" .. f.user .. "@localhost:" .. port
+        .. "/postgres?host=" .. parent
+    if options.operation == "show" then
+        return encode(definition) .. "\n" .. admin
+    end
+    if f.borg == "" then
+        fail("borg CLI not found; set BORG_NATIVE_BORG")
+    end
+    if not f.initialized then
+        sh_ok("mkdir -p -m 700 -- " .. q(parent) .. " && initdb -D " .. q(data)
+            .. " --auth-local=peer --auth-host=reject --no-instructions")
+    end
+    local existing = sh(q(f.borg) .. " lane service status test-postgres --json")
+    if existing.exit_code == 0 and decode(existing.stdout).state ~= "Stopped" then
+        fail("test-postgres already running: inspect its endpoint/owner instead of replacing it")
+    end
+    local file = parent .. "/test-postgres.json"
+    sh_ok("umask 077 && printf '%s\\n' " .. q(encode(definition)) .. " > " .. q(file) .. " && chmod 600 " .. q(file))
+    sh_ok(q(f.borg) .. " lane service start test-postgres --definition " .. q(file) .. " --json")
+    return admin
+end
+
+local arguments = decode(borg_workflow_arguments(1))
+local text = type(arguments) == "table" and arguments.arguments
+if type(text) ~= "string" or text:match("^%s*$") then
+    fail(USAGE:sub(9))
+end
+local options = parse(words(text))
+if options.tool == "service" then
+    return service(options)
+end
+return lane(options)
