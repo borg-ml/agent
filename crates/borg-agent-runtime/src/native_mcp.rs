@@ -199,6 +199,7 @@ struct NativeMcpClient {
     // its exit status. Keep both so the failure is reported with its cause
     // instead of a bare "closed its stdout".
     stderr_tail: StderrTail,
+    stderr_reader: Option<tokio::task::JoinHandle<()>>,
     child: Child,
 }
 
@@ -288,7 +289,7 @@ impl NativeMcpClient {
             .take()
             .with_context(|| format!("MCP server `{}` has no stdout", server.name))?;
         let stderr_tail = StderrTail::default();
-        if let Some(stderr) = child.stderr.take() {
+        let stderr_reader = child.stderr.take().map(|stderr| {
             let name = server.name.clone();
             let tail = stderr_tail.clone();
             tokio::spawn(async move {
@@ -303,8 +304,8 @@ impl NativeMcpClient {
                     );
                     tail.push(line);
                 }
-            });
-        }
+            })
+        });
         let client = Self {
             server_name: server.name.clone(),
             next_id: 1,
@@ -312,6 +313,7 @@ impl NativeMcpClient {
             stdin,
             stdout: BufReader::new(stdout),
             stderr_tail,
+            stderr_reader,
             child,
         };
         Ok(client)
@@ -560,11 +562,36 @@ impl NativeMcpClient {
             bail!("outgoing MCP message exceeded {MAX_MCP_MESSAGE_BYTES} bytes");
         }
         bytes.push(b'\n');
-        self.stdin
-            .write_all(&bytes)
-            .await
-            .with_context(|| format!("failed writing to MCP server `{}`", self.server_name))?;
-        self.stdin.flush().await?;
+        if let Err(error) = self.stdin.write_all(&bytes).await {
+            let (exited, diagnostics) = self.exit_diagnostics().await;
+            if exited {
+                bail!(
+                    "MCP server `{}` closed its stdout{diagnostics}",
+                    self.server_name
+                );
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "failed writing to MCP server `{}`{diagnostics}",
+                    self.server_name
+                )
+            });
+        }
+        if let Err(error) = self.stdin.flush().await {
+            let (exited, diagnostics) = self.exit_diagnostics().await;
+            if exited {
+                bail!(
+                    "MCP server `{}` closed its stdout{diagnostics}",
+                    self.server_name
+                );
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "failed flushing MCP server `{}`{diagnostics}",
+                    self.server_name
+                )
+            });
+        }
         Ok(())
     }
 
@@ -572,7 +599,7 @@ impl NativeMcpClient {
     /// finished, plus the tail of its own stderr. Optional plugins that are
     /// simply not running explain themselves here instead of surfacing as an
     /// unexplained transport failure.
-    async fn exit_diagnostics(&mut self) -> String {
+    async fn exit_diagnostics(&mut self) -> (bool, String) {
         let status = match self.child.try_wait() {
             Ok(Some(status)) => Some(status),
             // A server can close stdout a moment before the process is reaped.
@@ -582,6 +609,14 @@ impl NativeMcpClient {
                 .and_then(Result::ok),
             Err(_) => None,
         };
+        // The child may exit before its stderr reader has been scheduled. Wait
+        // for the pipe to drain before reporting the failure that killed it.
+        if status.is_some()
+            && let Some(reader) = self.stderr_reader.take()
+        {
+            let _ = tokio::time::timeout(EXIT_DIAGNOSTIC_TIMEOUT, reader).await;
+        }
+        let exited = status.is_some();
         let mut diagnostics = String::new();
         match status {
             Some(status) => {
@@ -593,7 +628,7 @@ impl NativeMcpClient {
         if !stderr.is_empty() {
             diagnostics.push_str(&format!("; its stderr said: {stderr}"));
         }
-        diagnostics
+        (exited, diagnostics)
     }
 
     async fn read_message(&mut self) -> Result<Value> {
@@ -603,7 +638,7 @@ impl NativeMcpClient {
                 format!("failed reading from MCP server `{}`", self.server_name)
             })?;
         if bytes == 0 {
-            let diagnostics = self.exit_diagnostics().await;
+            let (_, diagnostics) = self.exit_diagnostics().await;
             bail!(
                 "MCP server `{}` closed its stdout{diagnostics}",
                 self.server_name
@@ -894,6 +929,26 @@ printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text
             error.contains("127"),
             "failure should report the exit status: {error}"
         );
+    }
+
+    /// An immediately exiting server may close stdin before initialize can
+    /// be written. That transport error must retain the process's real cause.
+    #[tokio::test]
+    async fn early_stdin_close_reports_server_stderr_and_exit_code() {
+        let server = ExternalMcpServer {
+            name: "early-exit".to_string(),
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "echo 'server binary unavailable' >&2; exit 127".to_string(),
+            ],
+            ..Default::default()
+        };
+        let mut client = NativeMcpClient::spawn(&server).await.unwrap();
+        assert_eq!(client.child.wait().await.unwrap().code(), Some(127));
+        let error = client.write(&json!({})).await.unwrap_err().to_string();
+        assert!(error.contains("server binary unavailable"), "{error}");
+        assert!(error.contains("127"), "{error}");
     }
 
     /// Counts how many times the launcher actually ran, so the memo is tested
