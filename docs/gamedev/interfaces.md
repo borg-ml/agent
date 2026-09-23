@@ -190,8 +190,11 @@ inputs:object,[idempotency_key:string]} → {job_id,ticket,state,log_path}`;
 `lane_status {id:string} → {state,holder?,queue_position?,log_path?}`;
 `lane_release {lease_id:string}`; `lane_cancel {id:string}`;
 `lane_service {op:start|status|lease|release|restart|yield|resume|stop,
-id:string,[owner],[ttl_ms]}`; `lane_workspace {op:create|list|gc|freeze|
-ack|unfreeze,project:string,[path],[work_id],[dry_run]}`. Input validation,
+id:string,[ttl_ms]}`; `lane_workspace {op:create|list|gc|freeze|
+ack|unfreeze,project:string,[path],[work_id],[dry_run]}`. The holder is
+derived from the authenticated session, never supplied as a model field.
+Model-facing `gc` is dry-run only until an exact human approval is bound in
+Borg durable state. Input validation,
 authorization and capability checks happen before supervisor side effects;
 list/status/logs are scoped to allowed workspace. Never expose an unrestricted
 `argv` field to model-facing tools.
@@ -249,3 +252,11 @@ producer-aware watch. See `docs/watcher-yield.md` and runtime `watch.rs`.
   `--template` shorthand until validated template admission is implemented.
   Model-facing tools must validate/admit named templates rather than accept
   untrusted arbitrary process argv.
+- D10: model-facing service mutation tools are held for final integration,
+  not implemented independently in the services branch. A safe dispatcher
+  derives holder from authenticated session, permits only pre-registered
+  service specs, and authenticates owner/fence on every mutation; until that
+  boundary is reviewed, CLI plus status-only inspection is the supported
+  bridge. A model-supplied `owner` or `confirmed` boolean cannot confer
+  participant authority or human approval. Workspace destructive MCP GC is
+  dry-run only until approval is bound to the exact deletion.
