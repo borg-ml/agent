@@ -173,6 +173,7 @@ fn supervisor_crash_recovers_only_the_owned_scope() {
     assert!(!lane.degraded, "no systemd user manager");
     let mut spec = lane.spec("orphan", "sleep 60");
     spec.timeout_ms = 70_000;
+    spec.scope_unit_prefix = Some("ab-build-".into());
     let job = lane.submit(&spec);
     let record = lane.until(|| {
         lane.record(&job).filter(|record| {
@@ -182,7 +183,12 @@ fn supervisor_crash_recovers_only_the_owned_scope() {
                 })
         })
     });
-    assert!(record.scope_cgroup.unwrap().contains("borg-lane-"));
+    assert!(
+        record
+            .scope_cgroup
+            .unwrap()
+            .ends_with(&format!("/ab-build-{job}.scope"))
+    );
     // This test started exactly this supervisor.
     let pid = record.supervisor_pid.unwrap().to_string();
     assert!(
@@ -201,6 +207,17 @@ fn supervisor_crash_recovers_only_the_owned_scope() {
     let result = lane.wait(&job, CANCELLED);
     assert_eq!(result["state"]["Finished"]["exit_code"], CANCELLED);
     assert!(!lane.record(&job).unwrap().quarantined);
+    let recovery = std::fs::read_to_string(lane.state().join("recovery.jsonl")).unwrap();
+    assert!(
+        recovery
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|entry| entry["job"] == job
+                && entry["reason"] == "recovery killed pids"
+                && entry["killed_pids"]
+                    .as_array()
+                    .is_some_and(|pids| !pids.is_empty()))
+    );
 }
 
 /// Failure mode: Ctrl-C on the submitting terminal (a signal to its process
@@ -292,17 +309,13 @@ fn cancelling_a_running_job_kills_it_and_reports_the_reason() {
         evidence.contains("cancelled: cancelled by requester"),
         "{evidence}"
     );
-    if lane.degraded {
-        // Unbound post hooks run in their own scope, so degraded mode only
-        // records the attempt.
-        assert!(evidence.contains("post hook"), "{evidence}");
-    } else {
-        lane.until(|| {
-            std::fs::read_to_string(&post)
-                .ok()
-                .filter(|phase| phase.trim() == "post-exclusive")
-        });
-    }
+    // In explicit degraded mode the post hook runs synchronously; scoped
+    // installations keep the independently scoped asynchronous behaviour.
+    lane.until(|| {
+        std::fs::read_to_string(&post)
+            .ok()
+            .filter(|phase| phase.trim() == "post-exclusive")
+    });
 }
 
 /// Failure mode: a workload leader exits but a process it started (a
@@ -594,4 +607,123 @@ fn identical_submit_does_not_join_a_running_job() {
     let first = lane.record(&first).unwrap();
     let second = lane.record(&second).unwrap();
     assert!(second.started_ms.unwrap() >= first.finished_ms.unwrap());
+}
+
+#[test]
+fn terminal_hooks_receive_exit_state_reason_for_finish_queue_timeout_and_cancel() {
+    let lane = Lane::new();
+    let marker = lane.root.join("post-env");
+    let hook = Hook {
+        argv: vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "printf '%s|%s|%s|%s\\n' \"$BORG_LANE_JOB\" \"$BORG_LANE_EXIT_CODE\" \"$BORG_LANE_STATE\" \"$BORG_LANE_REASON\" >> '{}'",
+                marker.display()
+            ),
+        ],
+        timeout_ms: 5000,
+    };
+    let mut success = lane.spec("success-hook", "exit 7");
+    success.post_hook = Some(hook.clone());
+    let first = lane.submit(&success);
+    lane.wait(&first, 7);
+    lane.until(|| {
+        lines(&marker)
+            .iter()
+            .any(|line| line.starts_with(&format!("{first}|7|finished|")))
+            .then_some(())
+    });
+
+    let mut holder = lane.spec("holder", "exec sleep 30");
+    holder.timeout_ms = 60_000;
+    let held = lane.submit(&holder);
+    lane.until(|| {
+        matches!(
+            lane.record(&held).unwrap().job.unwrap().state,
+            JobState::Running { .. }
+        )
+        .then_some(())
+    });
+    let mut timeout = lane.spec("timeout-hook", "true");
+    timeout.post_hook = Some(hook.clone());
+    timeout.lease.queue_timeout_ms = Some(250);
+    let timed = lane.submit(&timeout);
+    lane.wait(&timed, CANCELLED);
+    lane.until(|| {
+        lines(&marker)
+            .iter()
+            .any(|line| line.contains(&format!("{timed}|125|cancelled|queue timeout")))
+            .then_some(())
+    });
+
+    let mut cancelled = lane.spec("cancel-hook", "true");
+    cancelled.post_hook = Some(hook);
+    let cancelled = lane.submit(&cancelled);
+    let _: Value = lane.json(&["job", "cancel", &cancelled]);
+    lane.wait(&cancelled, CANCELLED);
+    lane.until(|| {
+        lines(&marker)
+            .iter()
+            .any(|line| line.contains(&format!("{cancelled}|125|cancelled|cancelled by requester")))
+            .then_some(())
+    });
+    let _: Value = lane.json(&["job", "cancel", &held]);
+    lane.wait(&held, CANCELLED);
+}
+
+#[test]
+fn invalid_scope_prefix_is_rejected_before_job_submit() {
+    let lane = Lane::new();
+    for bad in ["/tmp/", "AB-", "ab.scope", "bad/", "a"] {
+        let mut spec = lane.spec("invalid-prefix", "true");
+        spec.scope_unit_prefix = Some(bad.into());
+        let out = lane.cli(&["job", "submit", "--spec", "-"], Some(&spec));
+        assert!(!out.status.success(), "unsafe scope prefix {bad} admitted");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("scope unit prefix"));
+    }
+}
+
+#[test]
+fn lost_queued_supervisor_runs_terminal_hook_on_recovery() {
+    let lane = Lane::new();
+    let mut holder = lane.spec("recovery-holder", "exec sleep 30");
+    holder.timeout_ms = 60_000;
+    let held = lane.submit(&holder);
+    lane.until(|| matches!(lane.record(&held)?.job?.state, JobState::Running { .. }).then_some(()));
+    let marker = lane.root.join("recovered-post");
+    let mut orphan = lane.spec("orphaned-queued", "true");
+    orphan.post_hook = Some(Hook {
+        argv: vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "printf '%s|%s|%s\\n' \"$BORG_LANE_EXIT_CODE\" \"$BORG_LANE_STATE\" \"$BORG_LANE_REASON\" > '{}'",
+                marker.display()
+            ),
+        ],
+        timeout_ms: 5000,
+    });
+    let id = lane.submit(&orphan);
+    let pid = lane.until(|| lane.record(&id)?.supervisor_pid);
+    // This test owns exactly this detached supervisor; recover must take its ticket lock.
+    assert!(
+        Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = lane.cli(&["job", "recover"], None);
+    assert!(out.status.success(), "{}", describe(&out));
+    lane.wait(&id, CANCELLED);
+    lane.until(|| {
+        std::fs::read_to_string(&marker)
+            .ok()
+            .filter(|text| text.contains("125|finished|job") && text.contains("lost supervisor"))
+    });
+    let row = lane.record(&id).unwrap();
+    assert!(row.post_hook_completed);
+    let _: Value = lane.json(&["job", "cancel", &held]);
+    lane.wait(&held, CANCELLED);
 }
