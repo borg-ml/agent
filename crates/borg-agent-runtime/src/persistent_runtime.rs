@@ -1033,11 +1033,24 @@ class ComputerUse:
     def capabilities(self):
         return self("capabilities")
 
-    def list_windows(self):
-        return self("list_windows")
+    def list_windows(self, display=None):
+        return self("list_windows", **({"display": display} if display else {}))
 
-    def screenshot(self, scope, window_id=None):
-        return self("screenshot", scope=scope, **({"window_id": window_id} if window_id else {}))
+    def screenshot(self, scope, window_id=None, display=None):
+        return self("screenshot", scope=scope, **({"window_id": window_id} if window_id else {}),
+                    **({"display": display} if display else {}))
+
+    def launch(self, argv, **options):
+        return self("launch", argv=list(argv), **options)
+
+    def start_display(self, **options):
+        return self("start_display", **options)
+
+    def stop_display(self):
+        return self("stop_display")
+
+    def pointer_move(self, window_id, dx=0, dy=0, **options):
+        return self("pointer_move", window_id=window_id, dx=dx, dy=dy, **options)
 
     def observe(self, window_id, **options):
         return self("observe", window_id=window_id, **options)
@@ -1334,8 +1347,12 @@ borg.rlm = rlm;
 context.borg = borg;
 const cua = (op, arguments_ = {}) => borg.tool("computer_use", {...arguments_, op});
 cua.capabilities = () => cua("capabilities");
-cua.list_windows = () => cua("list_windows");
-cua.screenshot = (scope, window_id) => cua("screenshot", window_id ? {scope, window_id} : {scope});
+cua.list_windows = (display) => cua("list_windows", display ? {display} : {});
+cua.screenshot = (scope, window_id, display) => cua("screenshot", {scope, ...(window_id ? {window_id} : {}), ...(display ? {display} : {})});
+cua.launch = (argv, options = {}) => cua("launch", {...options, argv});
+cua.start_display = (options = {}) => cua("start_display", options);
+cua.stop_display = () => cua("stop_display");
+cua.pointer_move = (window_id, dx = 0, dy = 0, options = {}) => cua("pointer_move", {...options, window_id, dx, dy});
 cua.observe = (window_id, options = {}) => cua("observe", {...options, window_id});
 cua.click = (window_id, element_id, observation_id, options = {}) => cua("click", {...options, window_id, element_id, observation_id});
 cua.set_value = (window_id, element_id, observation_id, text, options = {}) => cua("set_value", {...options, window_id, element_id, observation_id, text});
