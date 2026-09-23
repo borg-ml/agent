@@ -938,6 +938,7 @@ fn run_atomic(o: Atomic) {
     let mut job = JobSpec {
         foreign_client_grace_ms: 300_000,
         foreign_client_grace_by_resource: Vec::new(),
+        abandon_after_ms: None,
         fingerprint: JobFingerprint("bench-D11-exclusive".into()),
         lease: LeaseRequest {
             resources,
@@ -1653,6 +1654,7 @@ fn shared_clients_restore_before_an_exclusive_and_failed_restores_fence_it() {
     let job = JobSpec {
         foreign_client_grace_ms: 300_000,
         foreign_client_grace_by_resource: Vec::new(),
+        abandon_after_ms: None,
         fingerprint: JobFingerprint(unique("shared-client-exclusive")),
         lease: LeaseRequest {
             resources: vec![exclusive(resource.clone())],
