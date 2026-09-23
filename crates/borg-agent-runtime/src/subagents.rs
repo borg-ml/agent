@@ -6204,7 +6204,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "wait_agent",
-            "Block until your child agents give you something to act on, then report it. This is how to wait for children: one call covers a whole assignment, so never poll with shell sleeps or repeated list_agents. Returns early when a child finishes, fails, stops or needs approval, when a child or teammate messages you, or when human or team input is waiting for you (answer that first); otherwise at timeout_ms. Each change is reported once, so a child that finished earlier does not end later waits. With no child working it returns after a few seconds instead of blocking. The result gives the reason, the changes with each finished child's final text, messages, and a compact status line for every child.",
+            "Block until your child agents give you something to act on, then report it. This is how to wait for children: one call covers a whole assignment, so never poll with shell sleeps or repeated list_agents. Returns early when a child finishes, fails, stops or needs approval, when a child or teammate messages you, or when human or team input is waiting for you (answer that first); otherwise at timeout_ms. Each change is reported once, so a child that finished earlier does not end later waits. With no child working it returns after a few seconds instead of blocking. The result gives the reason (child_settled, child_message, child_update for both, input_pending, no_active_children, timeout), the changes with each finished child's final text, messages, and a compact status line for every child.",
             json!({
                 "type": "object",
                 "properties": {
