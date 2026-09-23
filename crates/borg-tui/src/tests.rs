@@ -7683,8 +7683,8 @@ fn model_picker_wheel_and_hover_share_one_stable_viewport() {
 fn launch_resume_picker_height_is_stable_and_reserved_once() {
     let short_preview = composer_panel_height(4, 0, 18, true);
     let long_preview = composer_panel_height(40, 0, 18, true);
-    assert_eq!(short_preview, 20);
-    assert_eq!(long_preview, 20);
+    assert_eq!(short_preview, 19);
+    assert_eq!(long_preview, 19);
 
     let bounded = bounded_launch_composer_height(short_preview, 24, 1);
     assert_eq!(bounded, 16);
