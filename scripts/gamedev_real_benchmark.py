@@ -152,6 +152,7 @@ def run(binary: Path, agents: int, jobs: int, scale: float, seed: int) -> dict:
             peak_slots = max(peak_slots, used)
         if peak_slots > 20:
             raise RuntimeError(f"lane admitted {peak_slots} RAM slots, cap is 20")
+        queue_ms = sorted(max(0, s["started_ms"] - s["created_ms"]) for s in statuses)
         waits = []
         for record in records:
             match = next(s for s in statuses if s["ticket"]["id"] == record["id"])
@@ -178,6 +179,8 @@ def run(binary: Path, agents: int, jobs: int, scale: float, seed: int) -> dict:
                 "agent_wait_hours": round(sum(waits)/3600, 5),
                 "fairness_jain": round(fairness, 4), "oom": 0, "failures": 0,
                 "peak_reserved_gib": peak_slots,
+                "enqueue_to_start_ms_median": queue_ms[len(queue_ms)//2],
+                "enqueue_to_start_ms_p95": queue_ms[int((len(queue_ms)-1)*.95)],
                 "status_latency_ms_median": round(status_latency_ms[len(status_latency_ms)//2], 2),
                 "status_latency_ms_p95": round(status_latency_ms[int((len(status_latency_ms)-1)*.95)], 2),
                 "cpu_utilization_8_cores": round(sum(float(s.get("cpu_seconds") or 0)
@@ -222,6 +225,72 @@ def probe_disk_budget(binary: Path) -> dict:
                 "started": False, "reason": reason}
 
 
+
+def probe_running_join(binary: Path) -> dict:
+    """An already-running build cannot be joined using a stale fingerprint."""
+    binary = binary.resolve(strict=True)
+    with isolated_root() as root:
+        project = root / "project"
+        project.mkdir()
+        lane_root = root / "lanes"
+        marker = project / "started"
+        payload = ("from pathlib import Path\nimport time\n"
+                   f"Path({str(marker)!r}).write_text('started')\n"
+                   "memory = bytearray(1024 * 1024)\n"
+                   "end = time.monotonic() + 2\n"
+                   "while time.monotonic() < end: sum(range(50))\n")
+        spec = {"fingerprint": "bench-revision-A", "lease": {
+            "resources": [{"key": {"scope": {"Worktree": str(project)}, "name": "build"},
+                           "access": "Exclusive"}],
+            "holder": {"participant_id": str(uuid.uuid4()), "session_id": str(uuid.uuid4()),
+                       "host_pid": None, "purpose": "running coalescing regression"},
+            "queue_timeout_ms": 10000},
+            "argv": [sys.executable, "-c", payload], "cwd": str(project), "env": [],
+            "memory_max_bytes": 64 * 1024 * 1024,
+            "admission": {"min_available_ram_bytes": 0, "reserve_ram_bytes": 0,
+                          "min_free_disk_bytes": 0, "reserve_disk_bytes": 0,
+                          "disk_path": str(project)},
+            "pre_hook": None, "post_hook": None, "timeout_ms": 10000,
+            "stall_timeout_ms": None, "coalesce": True}
+        first = cli(binary, lane_root, "job", "submit", "--spec", "-", input_data=spec)
+        assert isinstance(first, dict)
+        first_id = first["job_id"]
+        try:
+            if not marker.exists():
+                subprocess.run(["inotifywait", "-q", "-t", "5", "-e", "create,moved_to", str(project)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+            if not marker.exists():
+                raise RuntimeError("first fake worker never started")
+            running = cli(binary, lane_root, "job", "status", first_id)
+            assert isinstance(running, dict)
+            if running.get("started_ms") is None or running.get("finished_ms") is not None:
+                raise RuntimeError(f"first job not running at second submit: {running!r}")
+            second = cli(binary, lane_root, "job", "submit", "--spec", "-", input_data=spec)
+            assert isinstance(second, dict)
+            second_id = second["job_id"]
+            if second_id == first_id:
+                raise RuntimeError("unsafe running coalescing: stale fingerprint joined in-flight job")
+            for job_id in (first_id, second_id):
+                cli(binary, lane_root, "job", "wait", job_id, timeout=15)
+            first_done = cli(binary, lane_root, "job", "status", first_id)
+            second_done = cli(binary, lane_root, "job", "status", second_id)
+            assert isinstance(first_done, dict) and isinstance(second_done, dict)
+            if second_done["started_ms"] < first_done["finished_ms"]:
+                raise RuntimeError("same-output build jobs overlapped")
+            return {"mode": "running-join-cli", "first": first_id, "second": second_id,
+                    "joined_running": False, "fifo": True}
+        except BaseException:
+            for job_id in (first_id, locals().get("second_id")):
+                if not job_id:
+                    continue
+                try:
+                    cli(binary, lane_root, "job", "cancel", job_id)
+                    cli(binary, lane_root, "job", "wait", job_id, timeout=5)
+                except Exception:
+                    pass  # Retain state on failure for diagnosis.
+            raise
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--borg", required=True, type=Path, help="built Borg CLI binary with lane job subcommands")
@@ -230,10 +299,17 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=23)
     ap.add_argument("--scale", type=float, default=200)
     ap.add_argument("--check-budget", action="store_true", help="test impossible disk budget via CLI")
+    ap.add_argument("--check-running-join", action="store_true",
+                    help="prove already-running identical job is not unsafely coalesced")
     args = ap.parse_args()
     if not (1 <= args.agents <= 8 and 1 <= args.jobs <= 20 and args.scale >= 1):
         ap.error("real mode requires agents=1..8, jobs=1..20, scale>=1")
-    result = probe_disk_budget(args.borg) if args.check_budget else run(args.borg, args.agents, args.jobs, args.scale, args.seed)
+    if args.check_running_join:
+        result = probe_running_join(args.borg)
+    elif args.check_budget:
+        result = probe_disk_budget(args.borg)
+    else:
+        result = run(args.borg, args.agents, args.jobs, args.scale, args.seed)
     print(json.dumps(result, indent=2))
 
 
