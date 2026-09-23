@@ -761,15 +761,45 @@ impl LaneStore {
             unsafe {
                 libc::fcntl(fd, libc::F_SETFD, 0);
             }
-            let spawned = Command::new(executable)
+            // Detach the supervisor from its submitter: a session of its own
+            // (no terminal Ctrl-C or process-group kill) and, with a user
+            // manager, a scope of its own (it outlives the caller's cgroup).
+            // `systemd-run --scope` execs in place, keeping the lock FD.
+            let mut command = if workload_scoped() {
+                let mut command = Command::new("systemd-run");
+                command
+                    .args([
+                        "--user",
+                        "--scope",
+                        "--quiet",
+                        "--collect",
+                        "--expand-environment=no",
+                    ])
+                    .arg(format!("--unit=borg-lane-sup-{}", job.id))
+                    .arg("--")
+                    .arg(&executable);
+                command
+            } else {
+                Command::new(&executable)
+            };
+            command
                 .args(["lane", "__supervise", "--state-dir"])
                 .arg(&self.root)
                 .arg(job.id.to_string())
                 .env("BORG_LANE_LOCK_FD", fd.to_string())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
+                .stderr(Stdio::null());
+            unsafe {
+                use std::os::unix::process::CommandExt;
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let spawned = command.spawn();
             unsafe {
                 libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
             }
@@ -1233,6 +1263,13 @@ fn systemd_available() -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+/// Workloads and supervisors run in systemd user scopes unless the caller
+/// opts out with `BORG_LANE_SCOPE=0` or no user manager exists.
+fn workload_scoped() -> bool {
+    std::env::var_os("BORG_LANE_SCOPE").as_deref() != Some(std::ffi::OsStr::new("0"))
+        && systemd_available()
 }
 
 fn scope_control_group(unit: &str) -> Option<String> {
@@ -1699,9 +1736,7 @@ impl LaneStore {
     }
 
     fn supervise_job(&self, id: Uuid) -> Result<i32> {
-        let scoped = std::env::var_os("BORG_LANE_SCOPE").as_deref()
-            != Some(std::ffi::OsStr::new("0"))
-            && systemd_available();
+        let scoped = workload_scoped();
         ensure!(
             scoped || std::env::var("BORG_LANE_DEGRADED").as_deref() == Ok("1"),
             "lane requires a systemd user manager (set BORG_LANE_DEGRADED=1 only for explicit unscoped testing)"
@@ -1754,6 +1789,8 @@ impl LaneStore {
         command
             .current_dir(&spec.cwd)
             .envs(spec.env.clone())
+            .env("BORG_LANE_JOB", id.to_string())
+            .env("BORG_LANES_ROOT", &self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr));
