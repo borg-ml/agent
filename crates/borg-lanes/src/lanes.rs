@@ -1312,12 +1312,13 @@ impl LaneStore {
             }
             let lock = stable_file(&self.ticket_path(record.ticket.id))?;
             match lock.try_lock_shared() {
-                Ok(()) => drop(lock),
+                Ok(()) => (),
                 Err(std::fs::TryLockError::WouldBlock) => continue,
                 Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
             }
-            // A concurrent owner may have released and finished after our
-            // snapshot, before we probed its lock. Never quarantine or finish
+            // Hold the shared probe lock through recovery. Owner journals
+            // Finished BEFORE unlocking its exclusive FD; a fresh metadata
+            // check cannot race its release. Never quarantine or finish
             // that already-released row based on stale evidence.
             let active = self.reading(|state| {
                 Ok(state.records.iter().any(|current| {
