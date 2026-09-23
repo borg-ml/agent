@@ -23,6 +23,29 @@ pub struct ResourceKey {
     pub name: String,
 }
 
+impl ResourceKey {
+    /// Reject aliases before any ticket, capacity or service binding can enter
+    /// the journal. Only already-canonical, existing absolute roots are valid.
+    pub fn validate_canonical(&self) -> Result<()> {
+        if let ResourceScope::Project(path) | ResourceScope::Worktree(path) = &self.scope {
+            ensure!(
+                path.is_absolute(),
+                "lane resource path must be absolute: {}",
+                path.display()
+            );
+            let resolved = fs::canonicalize(path)
+                .with_context(|| format!("lane resource path must exist: {}", path.display()))?;
+            ensure!(
+                &resolved == path,
+                "lane resource path is not canonical: {} (expected {})",
+                path.display(),
+                resolved.display()
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Capacity {
     pub key: ResourceKey,
@@ -312,6 +335,7 @@ impl LaneStore {
     /// Global capacities are host-scoped keys; missing keys default to one.
     pub fn set_capacity(&self, capacity: Capacity) -> Result<()> {
         ensure!(capacity.slots > 0, "capacity must be positive");
+        capacity.key.validate_canonical()?;
         self.locked(|state| {
             if let Some(existing) = state.capacities.iter_mut().find(|c| c.key == capacity.key) {
                 *existing = capacity;
@@ -481,6 +505,7 @@ impl LaneStore {
         );
         let mut seen = HashSet::new();
         for r in &request.resources {
+            r.key.validate_canonical()?;
             ensure!(!r.key.name.trim().is_empty(), "empty resource name");
             ensure!(
                 seen.insert(&r.key),
@@ -1915,6 +1940,56 @@ mod tests {
             holder: holder(),
         });
         row
+    }
+    #[test]
+    fn aliases_and_symlinks_never_create_distinct_project_or_worktree_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let alias = dir.path().join("project").join("..").join("project");
+        let symlink = dir.path().join("project-link");
+        std::os::unix::fs::symlink(&project, &symlink).unwrap();
+        let store = LaneStore::new(dir.path().join("state")).unwrap();
+        for scope in [ResourceScope::Project, ResourceScope::Worktree] {
+            let canonical = ResourceKey {
+                scope: scope(project.clone()),
+                name: "editor".into(),
+            };
+            canonical.validate_canonical().unwrap();
+            store
+                .set_capacity(Capacity {
+                    key: canonical.clone(),
+                    slots: 2,
+                })
+                .unwrap();
+            for path in [&alias, &symlink] {
+                let key = ResourceKey {
+                    scope: scope(path.clone()),
+                    name: "editor".into(),
+                };
+                assert!(key.validate_canonical().is_err());
+                assert!(
+                    store
+                        .set_capacity(Capacity {
+                            key: key.clone(),
+                            slots: 2
+                        })
+                        .is_err()
+                );
+                assert!(
+                    store
+                        .enqueue_lease(LeaseRequest {
+                            resources: vec![ResourceRequest {
+                                key,
+                                access: Access::Exclusive
+                            }],
+                            holder: holder(),
+                            queue_timeout_ms: None
+                        })
+                        .is_err()
+                );
+            }
+        }
     }
     #[test]
     fn fifo_exclusive_not_overtaken_by_shared() {
