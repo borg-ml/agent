@@ -108,7 +108,17 @@ persist credentials, should redact declared secrets, and use per-user
 permissions. The stable editor endpoint binds loopback only, and every
 mutating MCP request must check an owner lease (the current raw editor MCP
 server's stock tools are not all lease-gated). A/B backend switching cannot
-itself imply zero loss of in-flight editor sessions.
+itself imply zero loss of in-flight editor sessions. For the required v0
+editor-to-exclusive handoff, lanes must discover **every** service bound to
+the canonical project key and reserve `Preparing` before any yield. A service
+restores active clients, stops its entire *verified owned backend scope*
+(including descendants), then acknowledges with a fencing token and holds
+the front proxy at 503; the lane grants only after all acknowledgments.
+Service startup/restart is forbidden for the full exclusive lease under the
+same journal lock. A leader PID exiting alone does not prove descendants
+are gone; unknown ownership quarantines the key rather than admitting a
+headless job behind a live editor. The two-service real-CLI regression in
+`integration.md` is a v0 release gate, not a benchmark-only demonstration.
 
 Worktree GC is a destructive operation: default dry-run; check dirty status,
 active locks, git references and owner confirmation before removal. Cache
