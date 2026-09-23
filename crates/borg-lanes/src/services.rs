@@ -261,6 +261,9 @@ fn valid_spec(spec: &ServiceSpec) -> Result<()> {
         !spec.resources.is_empty(),
         "service must bind at least one lane resource"
     );
+    for resource in &spec.resources {
+        resource.key.validate_canonical()?;
+    }
     ensure!(
         spec.health.timeout_ms > 0 && spec.health.interval_ms > 0 && spec.readiness_timeout_ms > 0,
         "service health timeouts must be positive"
