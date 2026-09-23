@@ -46,6 +46,7 @@ crossterm = { version = "0.29", features = ["bracketed-paste", "event-stream"] }
 futures-util = "0.3"
 getrandom = "0.4.3"
 hex.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 libloading = "0.9.0"
 pulldown-cmark = "0.13"
 qrcode = { version = "0.14.1", default-features = false }

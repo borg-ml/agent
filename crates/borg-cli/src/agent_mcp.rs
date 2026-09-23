@@ -639,6 +639,89 @@ const MAX_RESULT_IMAGES: usize = 8;
 /// Count of images lifted out of the metadata, matching the native harness.
 const ATTACHED_IMAGES_KEY: &str = "attached_images";
 const DROPPED_ATTACHMENTS_KEY: &str = "dropped_attachments";
+/// Original and sent size of each lifted image, with the exact scale.
+const SENT_IMAGES_KEY: &str = "sent_images";
+const IMAGE_COORDINATES_KEY: &str = "image_coordinates";
+/// Providers downscale larger images themselves (Anthropic above a 1568 px
+/// edge or about 1.15 megapixels), silently changing the coordinate space the
+/// model sees. Fitting them here instead makes the scale known and reported.
+const MAX_IMAGE_EDGE: u32 = 1568;
+const MAX_IMAGE_PIXELS: f64 = 1_150_000.0;
+/// A fitted PNG larger than this is sent as JPEG instead.
+const MAX_FITTED_PNG_BYTES: usize = 1024 * 1024;
+
+struct SentImage {
+    media_type: String,
+    data_base64: String,
+    size: Value,
+    scaled: bool,
+}
+
+/// Fit one image within the model's size limits. Returns `None` when it
+/// cannot be decoded, in which case it is sent exactly as produced.
+fn fit_image_for_model(media_type: &str, data_base64: &str) -> Option<SentImage> {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let bytes = engine.decode(data_base64).ok()?;
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let scale = 1f64
+        .min(f64::from(MAX_IMAGE_EDGE) / f64::from(width.max(height)))
+        .min((MAX_IMAGE_PIXELS / (f64::from(width) * f64::from(height))).sqrt());
+    let size = |sent_width: u32, sent_height: u32, media_type: &str| {
+        json!({
+            "width": width, "height": height,
+            "sent_width": sent_width, "sent_height": sent_height,
+            "scale": (f64::from(sent_width) / f64::from(width) * 1e6).round() / 1e6,
+            "media_type": media_type,
+        })
+    };
+    if scale >= 1.0 {
+        return Some(SentImage {
+            media_type: media_type.to_string(),
+            data_base64: data_base64.to_string(),
+            size: size(width, height, media_type),
+            scaled: false,
+        });
+    }
+    let sent_width = ((f64::from(width) * scale).round() as u32).max(1);
+    let sent_height = ((f64::from(height) * scale).round() as u32).max(1);
+    let resized = image::load_from_memory(&bytes).ok()?.resize_exact(
+        sent_width,
+        sent_height,
+        image::imageops::FilterType::Triangle,
+    );
+    let mut encoded = Vec::new();
+    resized
+        .write_to(
+            &mut std::io::Cursor::new(&mut encoded),
+            image::ImageFormat::Png,
+        )
+        .ok()?;
+    let mut sent_type = "image/png";
+    if encoded.len() > MAX_FITTED_PNG_BYTES {
+        encoded.clear();
+        image::DynamicImage::ImageRgb8(resized.to_rgb8())
+            .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut std::io::Cursor::new(&mut encoded),
+                85,
+            ))
+            .ok()?;
+        sent_type = "image/jpeg";
+    }
+    Some(SentImage {
+        media_type: sent_type.to_string(),
+        data_base64: engine.encode(&encoded),
+        size: size(sent_width, sent_height, sent_type),
+        scaled: true,
+    })
+}
 
 /// Move a result's `borg_attachments` images into MCP `image` content items.
 ///
@@ -659,6 +742,8 @@ fn lift_result_images(value: &mut Value, images: &mut Vec<Value>, depth: usize) 
     if let Some(Value::Array(attachments)) = object.remove(ATTACHMENTS_KEY) {
         let mut lifted = 0;
         let mut dropped = Vec::new();
+        let mut sizes = Vec::new();
+        let mut scaled = false;
         for (index, attachment) in attachments.into_iter().enumerate() {
             let media_type = attachment.get("media_type").and_then(Value::as_str);
             let data = attachment.get("data_base64").and_then(Value::as_str);
@@ -672,7 +757,16 @@ fn lift_result_images(value: &mut Value, images: &mut Vec<Value>, depth: usize) 
                         ));
                         continue;
                     }
+                    let sent = fit_image_for_model(media_type, data);
+                    let (media_type, data) = match &sent {
+                        Some(sent) => (sent.media_type.as_str(), sent.data_base64.as_str()),
+                        None => (media_type, data),
+                    };
                     images.push(json!({"type": "image", "data": data, "mimeType": media_type}));
+                    if let Some(sent) = sent {
+                        scaled |= sent.scaled;
+                        sizes.push(sent.size);
+                    }
                     lifted += 1;
                 }
                 (Some(media_type), Some(_)) if !media_type.starts_with("image/") => {
@@ -682,6 +776,15 @@ fn lift_result_images(value: &mut Value, images: &mut Vec<Value>, depth: usize) 
             }
         }
         object.insert(ATTACHED_IMAGES_KEY.to_string(), json!(lifted));
+        if !sizes.is_empty() {
+            object.insert(SENT_IMAGES_KEY.to_string(), Value::Array(sizes));
+        }
+        if scaled {
+            object.insert(
+                IMAGE_COORDINATES_KEY.to_string(),
+                json!("the image was downscaled to fit the model; a point (x, y) on it is (x * width / sent_width, y * height / sent_height) in the tool's coordinates"),
+            );
+        }
         if !dropped.is_empty() {
             object.insert(DROPPED_ATTACHMENTS_KEY.to_string(), json!(dropped));
         }
@@ -885,6 +988,72 @@ mod tests {
             );
             assert_eq!(result["isError"], false);
         }
+    }
+
+    fn png(width: u32, height: u32) -> String {
+        use base64::Engine as _;
+        let mut bytes = Vec::new();
+        image::DynamicImage::new_rgb8(width, height)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn decoded_size(data: &str) -> (u32, u32) {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap()
+    }
+
+    /// Failure mode: the provider silently downscaling a 1920x1080 capture,
+    /// so points the model reads off the image no longer match the display
+    /// pixels pointer ops take.
+    #[test]
+    fn oversized_images_are_fitted_with_their_scale_reported() {
+        let result = legacy_tool_result(json!({
+            "scope": "desktop", "display": "private",
+            "borg_attachments": [{"media_type": "image/png", "data_base64": png(1920, 1080)}],
+        }));
+        let image = &result["content"][1];
+        assert_eq!(image["mimeType"], "image/png");
+        let (width, height) = decoded_size(image["data"].as_str().unwrap());
+        assert!(width <= MAX_IMAGE_EDGE && height <= MAX_IMAGE_EDGE);
+        assert!(f64::from(width) * f64::from(height) <= MAX_IMAGE_PIXELS);
+        let metadata = &result["structuredContent"];
+        assert_eq!(
+            metadata[SENT_IMAGES_KEY][0],
+            json!({"width": 1920, "height": 1080, "sent_width": width, "sent_height": height,
+                   "scale": (f64::from(width) / 1920.0 * 1e6).round() / 1e6,
+                   "media_type": "image/png"})
+        );
+        assert!(metadata[IMAGE_COORDINATES_KEY].is_string());
+
+        let small = png(640, 360);
+        let result = legacy_tool_result(json!({
+            "borg_attachments": [{"media_type": "image/png", "data_base64": small}],
+        }));
+        assert_eq!(
+            result["content"][1]["data"], small,
+            "small images pass through"
+        );
+        assert_eq!(
+            result["structuredContent"][SENT_IMAGES_KEY][0]["scale"],
+            1.0
+        );
+        assert!(
+            result["structuredContent"]
+                .get(IMAGE_COORDINATES_KEY)
+                .is_none()
+        );
     }
 
     /// Failure mode: a runtime script's nested images staying inline, or a

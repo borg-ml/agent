@@ -22,6 +22,11 @@ User-visible changes. Release pages on GitHub also list every merged change.
   window. `pointer_move` sends relative mouse motion, `key` takes `hold_ms`,
   `coordinate_space: "window"` targets window pixels, and `restore_focus`
   hands focus back afterwards.
+- **Screenshots reach Claude and Codex agents as images.** Tool results now
+  carry images as MCP image content instead of base64 inside JSON text, which
+  Claude Code spooled to a file unseen. Images larger than the model accepts
+  are downscaled first, and `sent_images` reports the exact scale so points on
+  the image map back to display pixels.
 - **GTK4 on Wayland works with the accessibility ops.** Its elements are no
   longer refused as disabled, and element bounds are window-relative.
 - **Sub-agents are confined to private displays.** Sub-agents previously had
