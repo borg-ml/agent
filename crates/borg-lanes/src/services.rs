@@ -1272,7 +1272,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
         }
         if let Some(b) = active.as_mut() {
             if b.child.try_wait()?.is_some() {
-                let dead = active.take().expect("active present");
+                let mut dead = active.take().expect("active present");
                 transition(
                     &dir,
                     &mut status,
@@ -1284,6 +1284,10 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                     None,
                 )
                 .await?;
+                // The leader may exit leaving detached descendants. They stay
+                // inside its delegated cgroup; stop/verify it before releasing
+                // the lane resource or starting a replacement.
+                stop_child(&mut dead.child, &spec, dead.port, dead.scope.as_deref()).await?;
                 status.backend_pid = None;
                 status.restarts += 1;
                 failures += 1;
