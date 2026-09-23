@@ -4227,6 +4227,13 @@ impl BorgTerminal {
             .as_deref_mut()
             .unwrap_or(&mut self.transcript);
         for agent in agents {
+            if transcript
+                .subagent_snapshots
+                .get(&agent.session_id)
+                .is_some_and(|current| current.updated_at > agent.updated_at)
+            {
+                continue;
+            }
             transcript.upsert_subagent_snapshot(agent);
             let status = subagent_session_status(agent.status);
             self.child_statuses.insert(agent.session_id, status);
@@ -10783,16 +10790,29 @@ fn merge_child_history(
             } if completed_messages.contains(message_id)
         )
     });
-    // A child's journal sequence is its execution order. Events created by
-    // concurrent tasks can have slightly inverted timestamps; replaying by
-    // time can put a process start before the tool that owns it. Sequence-zero
-    // live snapshots have no journal position and follow durable events.
+    // Keep sequence-zero live snapshots near their observed time, then put
+    // durable events in journal order within the slots they occupied. Sorting
+    // all snapshots last can resurrect an unfinished Thinking row after its
+    // durable completion; sorting all events by time can put a process start
+    // before the tool that owns it.
     events.sort_by(|left, right| {
-        (left.sequence == 0, left.sequence)
-            .cmp(&(right.sequence == 0, right.sequence))
-            .then_with(|| left.created_at.cmp(&right.created_at))
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.sequence.cmp(&right.sequence))
             .then_with(|| left.id.cmp(&right.id))
     });
+    let mut durable = events
+        .iter()
+        .filter(|event| event.sequence > 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    durable.sort_by_key(|event| (event.sequence, event.id));
+    let mut durable = durable.into_iter();
+    for event in &mut events {
+        if event.sequence > 0 {
+            *event = durable.next().expect("one durable event per durable slot");
+        }
+    }
     events
 }
 
