@@ -204,6 +204,10 @@ impl SubagentCoordinator {
         }
     }
 
+    pub(crate) async fn has_working_children(&self, actor: Uuid) -> bool {
+        self.children(actor).await.iter().any(working)
+    }
+
     async fn children(&self, actor: Uuid) -> Vec<SubagentSnapshot> {
         self.table
             .lock()

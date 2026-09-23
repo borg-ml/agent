@@ -844,6 +844,16 @@ impl AgentToolDispatcher {
         self
     }
 
+    /// Whether this session has a child that is still starting or running.
+    pub(crate) async fn has_working_children(&self) -> bool {
+        match &self.subagents {
+            Some(subagents) if self.subagents_enabled => {
+                subagents.has_working_children(self.actor_session_id).await
+            }
+            _ => false,
+        }
+    }
+
     /// Published by the session loop while input waits for the running turn.
     pub(crate) fn set_input_pending(&self, pending: bool) {
         self.input_pending.send_if_modified(|current| {
