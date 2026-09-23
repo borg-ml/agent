@@ -4758,6 +4758,361 @@ async fn a_sub_agent_computer_use_is_confined_to_a_private_display() {
         .await;
 }
 
+/// Failure mode: a sub-agent acting on lanes/services with its parent's
+/// identity -- its parent's service lease or jobs -- because identity came
+/// from anything but its own session.
+#[tokio::test]
+async fn a_sub_agent_cannot_use_its_parents_lane_or_service_identity() {
+    use crate::lane_tools::tests::{fixture_tools, write_test_service};
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        launch(),
+        3,
+        Arc::new(crate::LocalAgentTurnExecutor::default()),
+        Arc::new(store),
+    )
+    .unwrap();
+    let (_lanes_dir, lanes, project) = fixture_tools();
+    // The parent's session holds the editor lease.
+    let parent_identity = crate::lane_tools::Caller {
+        participant_id: root,
+        session_id: root,
+    };
+    write_test_service(&lanes.root, &project, Some(&parent_identity));
+    let dispatcher_for = |actor| {
+        AgentToolDispatcher::new(
+            SessionGoalTools::disconnected(),
+            SessionTodoTools::disconnected(),
+            Some(coordinator.clone()),
+            crate::LspService::new(directory.path()),
+            CodingProvider::Codex,
+            actor,
+            true,
+            None,
+            None,
+            directory.path().to_path_buf(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::native_process::ProcessManager::default(),
+            PermissionMode::FullAccess,
+        )
+        .with_lane_tools(lanes.clone())
+    };
+    let child = dispatcher_for(Uuid::new_v4());
+    for name in ["lane_job", "lane_service"] {
+        assert!(child.specs().iter().any(|spec| spec["name"] == name));
+    }
+    let error = child
+        .call(
+            "lane_service",
+            json!({"op": "read", "id": "editor", "path": "/capture"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("read needs a lease"), "{error}");
+    let error = child
+        .call(
+            "lane_service",
+            json!({"op": "lease", "id": "editor", "owner": root.to_string()}),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("cannot be supplied"), "{error}");
+    let status = child
+        .call("lane_service", json!({"op": "status", "id": "editor"}))
+        .await
+        .unwrap();
+    assert_eq!(status["clients"][0]["yours"], false);
+
+    // The parent's own session passes the lease check (the read then fails
+    // only because no service is listening in this fixture).
+    let parent = dispatcher_for(root);
+    let status = parent
+        .call("lane_service", json!({"op": "status", "id": "editor"}))
+        .await
+        .unwrap();
+    assert_eq!(status["clients"][0]["yours"], true);
+    let error = parent
+        .call(
+            "lane_service",
+            json!({"op": "read", "id": "editor", "path": "/capture"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(!error.to_string().contains("needs a lease"), "{error}");
+}
+
+/// Failure mode: the model-facing lane path not running a registered job
+/// end to end, or leaking one session's job to another.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+#[ignore = "requires BORG_LANE_EXECUTABLE (a built borg) and a systemd user session"]
+async fn lane_jobs_run_from_registered_templates_as_the_calling_session() {
+    use crate::lane_tools::tests::{fixture_tools, register_template, spec};
+    let executable = std::env::var_os("BORG_LANE_EXECUTABLE").map(std::path::PathBuf::from);
+    let (_lanes_dir, lanes, project) = fixture_tools();
+    let lanes = crate::lane_tools::LaneTools::new(lanes.root, lanes.templates, executable);
+    let mut job = spec(&project, borg_lanes::lanes::Access::Shared { slots: 1 });
+    job.argv
+        .extend(["-c".into(), "echo built by a lane".into()]);
+    register_template(&lanes.templates, "build", job);
+    let dispatcher_for = |actor| {
+        AgentToolDispatcher::new(
+            SessionGoalTools::disconnected(),
+            SessionTodoTools::disconnected(),
+            None,
+            crate::LspService::new(&project),
+            CodingProvider::Codex,
+            actor,
+            false,
+            None,
+            None,
+            project.clone(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::native_process::ProcessManager::default(),
+            PermissionMode::FullAccess,
+        )
+        .with_lane_tools(lanes.clone())
+    };
+    let session = dispatcher_for(Uuid::new_v4());
+    let submitted = session
+        .call(
+            "lane_job",
+            json!({"op": "submit", "adapter": "native", "template": "build"}),
+        )
+        .await
+        .unwrap();
+    let job_id = submitted["job_id"].as_str().unwrap().to_string();
+    let waited = session
+        .call(
+            "lane_job",
+            json!({"op": "wait", "job_id": job_id, "timeout_seconds": 60}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        waited["state"],
+        json!({"Finished": {"exit_code": 0}}),
+        "{waited}"
+    );
+    let log = std::fs::read_to_string(waited["log_path"].as_str().unwrap()).unwrap();
+    assert!(log.contains("built by a lane"), "{log}");
+    let listed = session
+        .call("lane_job", json!({"op": "list"}))
+        .await
+        .unwrap();
+    assert_eq!(listed["jobs"][0]["job_id"], json!(job_id));
+    let other = dispatcher_for(Uuid::new_v4());
+    let error = other
+        .call("lane_job", json!({"op": "status", "job_id": job_id}))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("not one of your session's jobs"),
+        "{error}"
+    );
+
+    // watch=true hands completion to the session's watchers: no polling.
+    let watcher_session = Uuid::new_v4();
+    let (events, mut received) = tokio::sync::mpsc::channel(8);
+    let watched = dispatcher_for(watcher_session).with_watches(crate::watch::Watches::new(
+        crate::native_process::ProcessManager::default(),
+        events,
+        watcher_session,
+    ));
+    let submitted = watched
+        .call(
+            "lane_job",
+            json!({"op": "submit", "adapter": "native", "template": "build", "watch": true}),
+        )
+        .await
+        .unwrap();
+    assert!(submitted["watch"]["watch_id"].is_string(), "{submitted}");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(60), received.recv())
+        .await
+        .expect("the lane watcher reports the job's exit")
+        .unwrap();
+    assert!(event.contains("lane job"), "{event}");
+    assert!(event.contains("Finished"), "{event}");
+}
+
+/// Failure mode: a real supervised service accepting one session's lease,
+/// restart or capture read on behalf of another.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+#[ignore = "requires BORG_LANE_EXECUTABLE (a built borg) and BORG_TEST_FAKE_SERVICE (gamedev_fake_service.py)"]
+async fn lane_service_leases_belong_to_the_calling_session_live() {
+    use crate::lane_tools::tests::fixture_tools;
+    let executable = std::path::PathBuf::from(std::env::var_os("BORG_LANE_EXECUTABLE").unwrap());
+    let backend = std::env::var("BORG_TEST_FAKE_SERVICE").unwrap();
+    let (_lanes_dir, lanes, project) = fixture_tools();
+    let lanes =
+        crate::lane_tools::LaneTools::new(lanes.root, lanes.templates, Some(executable.clone()));
+    let ports: Vec<u16> = (0..3)
+        .map(|_| {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        })
+        .collect();
+    let cli = |args: &[&str]| {
+        let output = std::process::Command::new(&executable)
+            .args(["lane", "--state-dir"])
+            .arg(&lanes.root)
+            .arg("--json")
+            .args(args)
+            .env("BORG_LANE_SCOPE", "0")
+            .env("BORG_LANE_DEGRADED", "1")
+            .env("BORG_LANE_EXECUTABLE", &executable)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let resource = format!("bridge-editor-{}", Uuid::new_v4().simple());
+    cli(&[
+        "resource",
+        "set-capacity",
+        "--name",
+        &resource,
+        "--slots",
+        "1",
+    ]);
+    let spec = json!({
+        "id": "editor", "argv": ["/usr/bin/python3", backend, "{port}"],
+        "cwd": project, "env": [],
+        "resources": [{"key": {"scope": "Host", "name": resource}, "access": {"Shared": {"slots": 1}}}],
+        "adapter_enforces_leases": false, "read_only_paths": ["/", "/health"],
+        "memory_max_bytes": 134217728,
+        "admission": {"min_available_ram_bytes": 0, "reserve_ram_bytes": 0,
+                      "min_free_disk_bytes": 0, "reserve_disk_bytes": 0, "disk_path": project},
+        "health": {"argv": ["/health"], "kind": "http", "interval_ms": 100, "timeout_ms": 1000},
+        "restart": {"max_restarts": 3, "backoff_ms": 100, "debounce_ms": 100},
+        "endpoint": {"listen": format!("127.0.0.1:{}", ports[0]), "backend_ports": [ports[1], ports[2]]},
+        "restore": null
+    });
+    let definition = project.join("service.json");
+    std::fs::write(&definition, spec.to_string()).unwrap();
+    cli(&[
+        "service",
+        "start",
+        "editor",
+        "--definition",
+        definition.to_str().unwrap(),
+    ]);
+
+    let dispatcher_for = |actor| {
+        AgentToolDispatcher::new(
+            SessionGoalTools::disconnected(),
+            SessionTodoTools::disconnected(),
+            None,
+            crate::LspService::new(&project),
+            CodingProvider::Codex,
+            actor,
+            false,
+            None,
+            None,
+            project.clone(),
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            crate::native_process::ProcessManager::default(),
+            PermissionMode::FullAccess,
+        )
+        .with_lane_tools(lanes.clone())
+    };
+    let (a, b) = (
+        dispatcher_for(Uuid::new_v4()),
+        dispatcher_for(Uuid::new_v4()),
+    );
+    let service = |args: Value| {
+        json!({"id": "editor"})
+            .as_object()
+            .unwrap()
+            .clone()
+            .into_iter()
+            .chain(args.as_object().unwrap().clone())
+            .collect::<serde_json::Map<String, Value>>()
+    };
+    let leased = a
+        .call(
+            "lane_service",
+            Value::Object(service(json!({"op": "lease", "purpose": "capture"}))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(leased["clients"][0]["yours"], true, "{leased}");
+    let refused = b
+        .call(
+            "lane_service",
+            Value::Object(service(json!({"op": "lease"}))),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{refused:#}").contains("another owner"),
+        "{refused:#}"
+    );
+    let refused = b
+        .call(
+            "lane_service",
+            Value::Object(service(json!({"op": "read", "path": "/"}))),
+        )
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("needs a lease"), "{refused}");
+    let read = a
+        .call(
+            "lane_service",
+            Value::Object(service(json!({"op": "read", "path": "/"}))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read["status"], 200, "{read}");
+    assert!(read["body"].as_str().unwrap().starts_with("pid="), "{read}");
+    let released = a
+        .call(
+            "lane_service",
+            Value::Object(service(json!({"op": "release"}))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(released["clients"], json!([]), "{released}");
+    let leased = b
+        .call(
+            "lane_service",
+            Value::Object(service(json!({"op": "lease"}))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(leased["clients"][0]["yours"], true, "{leased}");
+    b.call(
+        "lane_service",
+        Value::Object(service(json!({"op": "release"}))),
+    )
+    .await
+    .unwrap();
+    cli(&["service", "stop", "editor"]);
+}
+
 /// Failure mode: private-display input or lifetime leaking onto the user's
 /// machine -- an app driven through the uinput seat, or an app and its
 /// compositor outliving the session that launched them.

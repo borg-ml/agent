@@ -222,6 +222,7 @@ pub struct AgentToolDispatcher {
     resource_limits: Option<HostResourceLimits>,
     execution_provider: Arc<RwLock<Arc<dyn crate::ExecutionProvider>>>,
     persistent_runtimes: PersistentRuntimeRegistry,
+    lanes: crate::lane_tools::LaneTools,
     runtime_mcp: Arc<Mutex<RuntimeMcpState>>,
     harness_lock: Arc<Mutex<()>>,
     web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
@@ -827,11 +828,31 @@ impl AgentToolDispatcher {
             resource_limits: None,
             execution_provider: Arc::new(RwLock::new(execution_provider)),
             persistent_runtimes: PersistentRuntimeRegistry::default(),
+            lanes: crate::lane_tools::LaneTools::default(),
             runtime_mcp: Arc::new(Mutex::new(RuntimeMcpState::default())),
             harness_lock: Arc::new(Mutex::new(())),
             web_search,
             input_pending: Arc::new(tokio::sync::watch::Sender::new(false)),
         }
+    }
+
+    /// The lanes/services caller: always this dispatcher's own session, so a
+    /// sub-agent never acts with its parent's (or anyone's) leases.
+    fn lane_caller(&self) -> crate::lane_tools::Caller {
+        crate::lane_tools::Caller {
+            participant_id: self
+                .shared_work
+                .as_ref()
+                .map(|context| context.participant_id)
+                .unwrap_or(self.actor_session_id),
+            session_id: self.actor_session_id,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_lane_tools(mut self, lanes: crate::lane_tools::LaneTools) -> Self {
+        self.lanes = lanes;
+        self
     }
 
     pub(crate) fn with_watches(mut self, watches: crate::watch::Watches) -> Self {
@@ -1304,7 +1325,10 @@ impl AgentToolDispatcher {
     ) -> Result<Value> {
         let mut workflow_approved = workflow_approved;
         let trusted_settings = crate::self_service::trusted_settings_sections(name, &arguments);
-        if (matches!(name, "runtime_exec" | "computer_use") || !trusted_settings.is_empty())
+        if (matches!(
+            name,
+            "runtime_exec" | "computer_use" | "lane_job" | "lane_service"
+        ) || !trusted_settings.is_empty())
             && !workflow_approved
             && self.runtime_permission != crate::PermissionMode::FullAccess
         {
@@ -1767,6 +1791,47 @@ impl AgentToolDispatcher {
                     _ = cancel.cancelled() => bail!("computer use was cancelled; observe before retrying an action"),
                     result = self.persistent_runtimes.computer_use(self.actor_session_id, arguments) => result,
                 }
+            }
+            "lane_job" | "lane_service" => {
+                ensure!(
+                    self.runtime_permission == crate::PermissionMode::FullAccess
+                        || workflow_approved,
+                    "{name} requires Full Access or explicit approval"
+                );
+                let caller = self.lane_caller();
+                if name == "lane_service" {
+                    return self.lanes.service(&caller, arguments).await;
+                }
+                let (mut result, watch) = self.lanes.job(&caller, arguments).await?;
+                if let Some(watch) = watch {
+                    result["watch"] = match self.watches.as_ref() {
+                        None => {
+                            json!({"error": "watchers are unavailable for this session; use wait"})
+                        }
+                        Some(watches) => {
+                            let args = crate::watch::WatchArgs {
+                                command: watch.command,
+                                label: watch.label,
+                                notify_on: Some(crate::watch::NotifyOn::Exit),
+                                ..Default::default()
+                            };
+                            match watches
+                                .start(
+                                    self.actor_session_id,
+                                    &self.runtime_root,
+                                    args,
+                                    self.session_store(),
+                                    24 * 60 * 60 * 1000,
+                                )
+                                .await
+                            {
+                                Ok(info) => serde_json::to_value(info)?,
+                                Err(error) => json!({"error": error.to_string()}),
+                            }
+                        }
+                    };
+                }
+                Ok(result)
             }
             "runtime_exec" => {
                 let args: PersistentRuntimeArgs = serde_json::from_value(arguments)?;
@@ -6741,6 +6806,14 @@ pub fn agent_tool_specs_for_surface(
                 "required": ["op"], "additionalProperties": false
             }),
         ),
+        {
+            let (name, description, schema) = crate::lane_tools::lane_job_spec();
+            tool(name, description, schema)
+        },
+        {
+            let (name, description, schema) = crate::lane_tools::lane_service_spec();
+            tool(name, description, schema)
+        },
         tool(
             "list_files",
             "List one workspace directory without following symlinks.",

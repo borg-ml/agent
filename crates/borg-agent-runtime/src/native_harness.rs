@@ -2919,7 +2919,7 @@ async fn execute_tool(
     if (shell_command.is_some()
         || matches!(
             tool_call.function.name.as_str(),
-            "runtime_exec" | "computer_use"
+            "runtime_exec" | "computer_use" | "lane_job" | "lane_service"
         )
         || matches!(
             tool_call.function.name.as_str(),
@@ -3074,6 +3074,8 @@ async fn execute_tool(
             | "run_blu_extension"
             | "runtime_exec"
             | "computer_use"
+            | "lane_job"
+            | "lane_service"
             | "watch"
     ) && runtime.permission != PermissionMode::FullAccess;
     // A shell command is cancelled by an interrupt but not by a steer: the
@@ -3090,6 +3092,8 @@ async fn execute_tool(
                 | "run_blu_extension"
                 | "runtime_exec"
                 | "computer_use"
+                | "lane_job"
+                | "lane_service"
                 | "watch"
         ))
     .then(CancellationToken::new);
