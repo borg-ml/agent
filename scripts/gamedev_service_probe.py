@@ -3,14 +3,28 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
 from urllib.request import urlopen
+
+
+@contextmanager
+def isolated_root():
+    root = Path(tempfile.mkdtemp(prefix="borg-service-bench-"))
+    try:
+        yield root
+    except BaseException:
+        print(f"Failed service probe retained for diagnosis: {root}", file=sys.stderr)
+        raise
+    else:
+        shutil.rmtree(root)
 
 
 def available_port() -> int:
@@ -39,8 +53,7 @@ def health_at(port: int) -> str:
 def run(binary: Path) -> dict:
     binary = binary.resolve(strict=True)
     backend = Path(__file__).with_name("gamedev_fake_service.py").resolve()
-    with tempfile.TemporaryDirectory(prefix="borg-service-bench-") as tmp:
-        root = Path(tmp)
+    with isolated_root() as root:
         ports = []
         while len(ports) < 3:
             port = available_port()
@@ -80,7 +93,11 @@ def run(binary: Path) -> dict:
         finally:
             if started:
                 # Only the service created in this isolated root can be stopped.
-                command(binary, root, "stop", "bench-editor")
+                stopped = command(binary, root, "stop", "bench-editor")
+                if stopped.get("state") not in ("Stopped", {"Stopped": None}):
+                    status = command(binary, root, "status", "bench-editor")
+                    if status.get("state") not in ("Stopped", {"Stopped": None}):
+                        raise RuntimeError(f"own test service did not stop; preserve state: {status!r}")
 
 
 def main() -> None:
