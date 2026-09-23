@@ -4907,8 +4907,17 @@ async fn user_stop_gate_holds_background_turns_until_a_human_prompt() {
         assert!(seen[1].0.contains("queued-before-escape"));
         assert!(seen[2].0.contains("second"));
         assert!(
-            !seen.iter().any(|turn| turn.0.contains("background report")),
+            seen[..2]
+                .iter()
+                .all(|turn| !turn.0.contains("background report")),
             "the held team report never became a provider turn"
+        );
+        let resumed_prompt = &seen[2].0;
+        assert!(
+            resumed_prompt
+                .find("background report")
+                .is_some_and(|index| index < resumed_prompt.find("second").unwrap()),
+            "the held report becomes context only when the human resumes"
         );
 
         let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
