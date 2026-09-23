@@ -12,7 +12,7 @@ use uuid::Uuid;
 pub(crate) struct ServiceArgs {
     #[command(subcommand)]
     pub(crate) command: ServiceCommand,
-    #[arg(long, global = true)]
+    #[arg(skip)]
     pub(crate) json: bool,
     /// Filled by the enclosing `borg lane --state-dir` parser, not a second CLI option.
     #[arg(skip)]

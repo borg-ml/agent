@@ -28,6 +28,8 @@ pub(crate) enum LaneCommand {
         #[command(subcommand)]
         command: ResourceCommand,
     },
+    /// Supervised shared services bound to lane resources.
+    Service(crate::lane_service_commands::ServiceArgs),
     #[command(name = "__supervise", hide = true)]
     Supervise { id: Uuid },
 }
@@ -90,6 +92,11 @@ pub(crate) async fn run(args: LaneArgs) -> Result<()> {
     let store = LaneStore::new(args.state_dir.unwrap_or_else(LaneStore::default_root))?;
     let json = args.json;
     match args.command {
+        LaneCommand::Service(mut service) => {
+            service.root = Some(store.root().to_path_buf());
+            service.json |= json;
+            crate::lane_service_commands::run(service).await?;
+        }
         LaneCommand::Supervise { id } => {
             let code = store.supervise(id)?;
             if code != 0 {
