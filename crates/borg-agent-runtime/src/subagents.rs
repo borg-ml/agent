@@ -5410,6 +5410,7 @@ impl SubagentCoordinator {
         }
         let mut messages = std::mem::take(&mut entry.inbox);
         messages.push(inbox_message);
+        self.mark_seen(actor_session_id, &entry.snapshot).await;
         if entry.interrupted_by == Some(actor_session_id)
             && let Some(commands) = &entry.commands
         {

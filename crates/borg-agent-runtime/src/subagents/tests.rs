@@ -6220,7 +6220,40 @@ async fn only_the_interrupting_agent_resumes_an_interrupted_child() {
         received.recv().await,
         Some(HostCommand::Interrupt { .. })
     ));
+    // The interrupt leaves the child idle with its last narration. The parent
+    // is about to act on that, so the follow-up's wait must not end on it.
+    child_event(
+        &coordinator,
+        worker,
+        SessionEventKind::Message {
+            message_id: Uuid::new_v4(),
+            actor: crate::EventActor::Assistant,
+            text: "Running the full suite now".to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::Complete,
+            delivery: None,
+        },
+    )
+    .await;
+    child_event(
+        &coordinator,
+        worker,
+        SessionEventKind::StatusChanged {
+            status: SessionStatus::Ready,
+            detail: Some("Interrupted".to_string()),
+        },
+    )
+    .await;
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::ReleaseRetainedContext { .. })
+    ));
     followup("resume with the smaller fix").await;
+    let waited = coordinator
+        .wait_for(root, Duration::from_millis(300), WaitSignals::default())
+        .await
+        .unwrap();
+    assert_eq!(waited["changes"], json!([]), "{waited}");
     assert!(matches!(
         received.recv().await,
         Some(HostCommand::ResumeFromInterrupt { session_id }) if session_id == worker

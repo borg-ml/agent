@@ -204,6 +204,21 @@ impl SubagentCoordinator {
         }
     }
 
+    /// The parent is giving this child new work, so the state the child is
+    /// resting in (say, idle after an interrupt) is not news to report back:
+    /// the next wait should end on what the new work does.
+    pub(super) async fn mark_seen(&self, actor: Uuid, agent: &SubagentSnapshot) {
+        if settled(agent) {
+            self.wait_cursors
+                .lock()
+                .await
+                .entry(actor)
+                .or_default()
+                .settled
+                .insert(agent.session_id, fingerprint(agent));
+        }
+    }
+
     pub(crate) async fn has_working_children(&self, actor: Uuid) -> bool {
         self.children(actor).await.iter().any(working)
     }
