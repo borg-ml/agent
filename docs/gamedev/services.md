@@ -50,7 +50,7 @@ borg lane service stop my-service --json
 `--state-dir DIR` belongs to the enclosing `borg lane` command. The service
 state lives at `DIR/services/ID` (default `$XDG_RUNTIME_DIR/borg/lanes/services/ID`),
 with a private Unix control socket, state/spec JSON, a stable lock inode, and
-output log. `BORG_LANES_ROOT` overrides the lane root, `BORG_LANE_DIR` is a
+output log. `BORG_LANE_DIR` overrides the lane root; `BORG_LANES_ROOT` is a
 compatibility alias. State and control socket are owner-only. A client lease
 holds owner/purpose/expiry; release requires its UUID and matching owner; the
 restore callback must succeed before the lease disappears. Expiry/crash also
