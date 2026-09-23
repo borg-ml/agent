@@ -111,6 +111,18 @@ database passwords in job specs.
 
 ## Remaining integration/decisions
 
+- The present services core accepts one **distinct lease owner** per service:
+  while client A holds `test-postgres`, the stock `postgres.py` wrapper for
+  client B (a different UUID owner) is rejected with `service lease held by
+  another owner`, not queued. Therefore sequential leased test coverage above
+  does **not** demonstrate two concurrent independent Postgres clients. Do not
+  share an owner between separate wrappers: the first release can invalidate
+  the other active client. A bounded two-client scheduling benchmark may use a
+  single coordinator lease held across both distinct client databases and both
+  terminal jobs, but this is a benchmark-only bypass of independent leases,
+  not product support for simultaneous leased wrappers. A future opt-in
+  multi-client service contract belongs to services core/architect.
+
 - Actual coordinated two-agent `cargo test -p borg-agent-runtime` contention
   numbers require two warm private targets; the second target warm-up was queued
   by the real lane with an actionable RAM budget reason and cancelled before

@@ -31,7 +31,11 @@ host/service lease. Run `borg worktree --project "$PWD" budget` and preview `bor
 Borg runtime tests require `BORG_TEST_SESSIONS_URL` pointing at an admin
 PostgreSQL database with CREATEDB privileges; each test creates a UUID scratch
 database. Run `python3 .borg/extensions/native/postgres.py -- python3 .borg/extensions/native/native.py cargo test -p borg-agent-runtime`. The wrapper leases the `test-postgres` shared service, creates a per-client database and provides `BORG_TEST_SESSIONS_URL`; it drops only its own database and releases its lease in a finally block. A service administrator supplies `BORG_TEST_POSTGRES_ADMIN_URL` (do not commit credentials). Never stop another agent's service. Never claim PostgreSQL coverage with
-this URL missing (the suite intentionally fails).
+this URL missing (the suite intentionally fails). Current service core admits
+only one distinct lease owner at a time: two simultaneous `postgres.py`
+wrappers targeting one `test-postgres` service do not both get leases. Do not
+reuse an owner token across wrappers: the first release could invalidate the
+second job. See `docs/gamedev/native-adapter.md` for the explicit limitation.
 
 Normal execution requires a built CLI exposing `borg lane job submit`.
 `--dry-run` prints argv/env for verification; `--probe-direct` runs
