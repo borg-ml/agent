@@ -29,7 +29,11 @@ record in the Git common directory is only a handshake.
 - `borg worktree budget` checks `statvfs` on the output filesystem and Linux
   `MemAvailable`. Default safety reserves: **60 GiB free disk**, **8 GiB
   MemAvailable**, **32 GiB per agent on disk**, **16 GiB per agent RAM**.
-  Admission subtracts projected outputs and current reservations; `create`
+  Override with positive integer GiB values in
+  `BORG_WORKTREE_DISK_RESERVE_GIB`, `BORG_WORKTREE_RAM_RESERVE_GIB`,
+  `BORG_WORKTREE_AGENT_DISK_GIB`, and `BORG_WORKTREE_AGENT_RAM_GIB`;
+  invalid/zero/overflowing overrides fail closed instead of silently falling
+  back to defaults. Admission subtracts projected outputs and current reservations; `create`
   counts other Borg-owned worktrees toward the same owner's disk cap. Lanes
   call `assess_budget(&AdmissionBudget, reserved_ram, reserved_disk)` at
   dispatch and queue with its explicit reason; this is an API and **not** a

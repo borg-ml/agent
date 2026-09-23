@@ -28,6 +28,47 @@ impl Default for WorkspaceBudgets {
     }
 }
 
+impl WorkspaceBudgets {
+    /// Machine/agent limits are explicit and fail closed on malformed overrides.
+    /// A zero or overflowing cap is not treated as "unlimited".
+    pub fn from_env() -> Result<Self> {
+        let defaults = Self::default();
+        Ok(Self {
+            disk_reserve_bytes: budget_gib(
+                "BORG_WORKTREE_DISK_RESERVE_GIB",
+                defaults.disk_reserve_bytes,
+            )?,
+            ram_reserve_bytes: budget_gib(
+                "BORG_WORKTREE_RAM_RESERVE_GIB",
+                defaults.ram_reserve_bytes,
+            )?,
+            agent_disk_limit_bytes: budget_gib(
+                "BORG_WORKTREE_AGENT_DISK_GIB",
+                defaults.agent_disk_limit_bytes,
+            )?,
+            agent_ram_limit_bytes: budget_gib(
+                "BORG_WORKTREE_AGENT_RAM_GIB",
+                defaults.agent_ram_limit_bytes,
+            )?,
+        })
+    }
+}
+
+fn budget_gib(name: &str, default: u64) -> Result<u64> {
+    match std::env::var_os(name) {
+        None => Ok(default),
+        Some(value) => parse_budget_gib(name, &value.to_string_lossy()),
+    }
+}
+
+fn parse_budget_gib(name: &str, value: &str) -> Result<u64> {
+    let gib: u64 = value
+        .parse()
+        .with_context(|| format!("{name} must be a positive integer GiB value"))?;
+    ensure!((1..=4096).contains(&gib), "{name} must be 1..4096 GiB");
+    Ok(gib * GIB)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceAdmission {
     pub admitted: bool,
@@ -538,6 +579,14 @@ pub fn freeze_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rejects_invalid_budget_configuration() {
+        assert!(parse_budget_gib("reserve", "0").is_err());
+        assert!(parse_budget_gib("reserve", "-1").is_err());
+        assert!(parse_budget_gib("reserve", "4097").is_err());
+        assert_eq!(parse_budget_gib("reserve", "24").unwrap(), 24 * GIB);
+    }
+
     #[test]
     fn budget_refusal_is_actionable_and_saturates() {
         let b = WorkspaceBudgets::default();
