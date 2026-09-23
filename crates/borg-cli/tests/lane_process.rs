@@ -420,11 +420,22 @@ fn wait_until_started_and_timeout_leave_the_job_alone() {
     let lane = Lane::new();
     let mut long = lane.spec("long", "exec sleep 30");
     long.timeout_ms = 60_000;
+    // A shared job is granted before its pre hook runs; started means the
+    // workload itself has spawned.
+    long.lease.resources[0].access = Access::Shared { slots: 1 };
+    long.pre_hook = Some(Hook {
+        argv: vec!["sleep".into(), "0.5".into()],
+        timeout_ms: 5_000,
+    });
     let long = lane.submit(&long);
     let started = lane.cli(&["job", "wait", &long, "--until", "started"], None);
     assert!(started.status.success(), "{}", describe(&started));
     let value: Value = serde_json::from_slice(&started.stdout).unwrap();
     assert!(value["state"]["Running"].is_object(), "{value}");
+    assert!(
+        lane.record(&long).unwrap().workload_pid.is_some(),
+        "--until started returned before the workload spawned"
+    );
 
     let queued = lane.submit(&lane.spec("queued", "true"));
     let timed = lane.cli(

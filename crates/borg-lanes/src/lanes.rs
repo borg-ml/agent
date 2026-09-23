@@ -918,14 +918,22 @@ impl LaneStore {
         now.saturating_sub(*last_seen_ms) >= after
     }
 
-    /// Block, as a requester, until the workload has started (Running) or the
-    /// job ended. A free ticket lock means its supervisor died: recover first.
+    /// Block, as a requester, until the workload has spawned or the job
+    /// ended. A granted job is Running before its (non-exclusive) pre hook
+    /// and spawn, so this waits for the recorded workload PID. A free ticket
+    /// lock means its supervisor died: recover first.
     pub fn wait_started(&self, id: Uuid) -> Result<JobHandle> {
         let _requester = self.hold_as_requester(id)?;
         let events = StateEvents::new(&self.root)?;
         loop {
-            let job = self.job_status(id)?;
-            if !matches!(job.state, JobState::Queued) {
+            let record = self.record(id)?;
+            let job = record.job.context("ticket has no job")?;
+            if record.workload_pid.is_some()
+                || matches!(
+                    job.state,
+                    JobState::Finished { .. } | JobState::Cancelled { .. }
+                )
+            {
                 return Ok(job);
             }
             let lock = stable_file(&self.ticket_path(id))?;
