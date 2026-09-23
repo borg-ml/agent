@@ -2198,7 +2198,11 @@ async fn run_agent_session_store_kernel_inner(
     let _watch_shutdown = SessionAutonomyShutdown(watches.cancel.clone());
     if owns_team {
         let team = subagents.as_ref().expect("enabled team");
-        for activity in team.restore_from_events(&recovery.subagent_events).await? {
+        // A fork (a revert continues on one) keeps the parent's team; its own
+        // later activity comes after and wins.
+        let mut team_events = store.fork_team_events(session_id).await?;
+        team_events.extend(recovery.subagent_events.iter().cloned());
+        for activity in team.restore_from_events(&team_events).await? {
             record_subagent_activity(&mut journal, &events, session_id, team, &watches, activity)
                 .await?;
         }
