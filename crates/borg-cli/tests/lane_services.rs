@@ -24,8 +24,8 @@ use borg_lanes::lanes::{
     LeaseRequest, ResourceKey, ResourceRequest, ResourceScope, TicketState,
 };
 use borg_lanes::services::{
-    ClientMode, Endpoint, HealthCheck, HealthKind, RestartPolicy, ServiceSpec, ServiceState,
-    ServiceStatus,
+    ClientMode, Endpoint, HealthCheck, HealthKind, RestartMode, RestartPolicy, ServiceSpec,
+    ServiceState, ServiceStatus,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -425,6 +425,7 @@ impl Fixture {
                 max_restarts: 3,
                 backoff_ms: 100,
                 debounce_ms: 100,
+                mode: Default::default(),
                 transient_exit_codes: vec![],
                 defer_while: vec![],
             },
@@ -696,6 +697,61 @@ fn front_port_survives_lease_restart_and_yield() {
     assert!(yielded.backend_pid.is_none(), "{yielded:?}");
     f.run(&["resume", "bench-editor", "--by", "bench-import"]);
     f.resumed("bench-editor");
+    serves(ports[0]);
+}
+
+/// Failure mode: a cold restart (an editor too big to run twice) starting
+/// the replacement while the old backend, or a process it detached, still
+/// runs in its cgroup.
+#[test]
+fn cold_restart_ends_the_old_backend_and_its_children_first() {
+    let f = Fixture::scoped();
+    let ports = free_ports(3);
+    let name = unique("cold-service");
+    f.capacity(&name, 1);
+    let markers = f.root().join("cold-children");
+    let mut spec = f.service(
+        "cold-editor",
+        f.root(),
+        [ports[0], ports[1], ports[2]],
+        vec![shared(host(&name))],
+        vec![(CHILD_MARKER_DIR, markers.clone())],
+    );
+    spec.restart.mode = RestartMode::Cold;
+    f.start(&spec, &[]);
+    let old = f.resumed("cold-editor").backend_pid.unwrap();
+    let old_backend = serde_json::json!({"pid": old, "start_ticks": start_ticks(old).unwrap()});
+    let old_child: Value =
+        serde_json::from_slice(&std::fs::read(markers.join(format!("{old}.json"))).unwrap())
+            .unwrap();
+    f.run(&["restart", "cold-editor"]);
+    // The replacement records its own child as it starts; by then both old
+    // processes must be gone.
+    let replacement = until(Duration::from_secs(20), || {
+        std::fs::read_dir(&markers)
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()?
+                    .strip_suffix(".json")?
+                    .parse::<u32>()
+                    .ok()
+            })
+            .find(|pid| *pid != old)
+    });
+    assert!(
+        !live_child(&old_backend),
+        "backend {old} ran beside its replacement"
+    );
+    assert!(
+        !live_child(&old_child),
+        "the old backend's detached child survived"
+    );
+    let restarted = f.resumed("cold-editor");
+    assert_eq!(restarted.backend_pid, Some(replacement));
+    assert_eq!(restarted.restarts, 1);
     serves(ports[0]);
 }
 
@@ -1626,6 +1682,7 @@ fn shared_clients_restore_before_an_exclusive_and_failed_restores_fence_it() {
         max_restarts: 2,
         backoff_ms: 200,
         debounce_ms: 100,
+        mode: Default::default(),
         transient_exit_codes: vec![],
         defer_while: vec![],
     };
