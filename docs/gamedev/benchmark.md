@@ -39,3 +39,14 @@ For an actual CPU/RSS smoke test: `python3 scripts/gamedev_benchmark.py --agents
 ## Real CLI status
 
 The CLI contract is in `docs/gamedev/interfaces.md`: `borg lane job submit|wait|status --json` and service start/status/lease/yield/resume. This is a proposed interface until the owning branches land. The real-mode driver will execute only public CLI commands with fake jobs in an isolated lane state directory; do not substitute direct Rust API calls or hand-made state files. Tests of ownership, recovery and proxy switchover are still pending a real CLI. Report any divergence with CLI invocation, JSON output, and minimal reproduction to `gd_lanes_core`/`gd_services_core`.
+
+### Public-CLI drivers (pending binary verification)
+
+After the lane implementation is committed and built in this worktree:
+
+```sh
+python3 scripts/gamedev_real_benchmark.py --borg target/debug/borg --agents 3 --jobs 3 --scale 200
+python3 scripts/gamedev_service_probe.py --borg target/debug/borg
+```
+
+The job driver submits the **same seeded workload generator** as the simulator through `lane --json job submit --spec -`, blocks via `job wait`, and reads timing from `job status --json`. It creates only an isolated temporary project/lane directory, with a 20-slot synthetic host memory resource. Each fake job touches 16 MiB/model GiB (≤320 MiB across admitted jobs) and consumes about 0.25 CPU; disable systemd scope integration for the smoke with `BORG_LANE_SCOPE=0` so the shared host is not affected. First builds have a 0.5 s minimum to permit coalescing despite CLI startup; subsequent tasks have a 0.04 s minimum. Real mode measures CLI coordination plus tiny fake jobs, **not** nominal UBT/Unreal time or systemd crash recovery. The service probe drives only the JSON CLI and a local synthetic HTTP backend, tests lease/release, stable front port across restart and exclusive yield/resume, and stops only its own service. Do not treat pending scripts as passing CI until compiled public CLI binaries have exercised them; a failing smoke must be reported to the owning core agent with the CLI repro.
