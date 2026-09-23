@@ -39,6 +39,10 @@ service**, not per client. Shared mode does not grant raw backend MCP mutation
 rights: the proxy is still deny-by-default without a validated owner/fencing
 adapter. A trusted Postgres adapter may use its own per-owner database/socket
 access control; CLI `--owner` alone is not authentication.
+Under the v0.1 foreign-client handshake ([lanes.md](lanes.md)), every shared
+owner other than an exclusive job's holder is a foreign client: the job holds in
+`Preparing`, with every client and the backend live, until those leases are
+released, expire or the grace ends, and new shared owners are refused meanwhile.
 
 If a client restore callback fails, `service yield` and `service stop` refuse to
 release the backend/lane lease; status retains each unrestored client and its
