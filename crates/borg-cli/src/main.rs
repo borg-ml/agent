@@ -15,6 +15,8 @@ mod extensions;
 mod image_delivery;
 mod importer;
 mod inspect;
+mod lane_commands;
+mod lane_service_commands;
 mod limits;
 mod protection;
 mod remote_commands;
@@ -25,6 +27,7 @@ mod terminal_ui {
 }
 mod updater;
 mod usage_count;
+mod worktree_commands;
 
 use anyhow::{Context, Result};
 use std::fs::{self, OpenOptions};
@@ -110,6 +113,7 @@ async fn run() -> Result<()> {
         .init();
     match command {
         Command::Import(args) => importer::run(args).await,
+        Command::Lane(args) => lane_commands::run(args).await,
         Command::Agent(args) => run_local_agent(args).await,
         Command::Resume { session } => run_local_agent(LocalAgentCliArgs::resume(session)).await,
         Command::Login {
@@ -131,6 +135,7 @@ async fn run() -> Result<()> {
         Command::Customize(args) => customization::run(args),
         Command::Inspect(args) => inspect::run(args).await,
         Command::Workspaces(args) => print_local_workspaces(args.json).await,
+        Command::Worktree(args) => worktree_commands::run(args).await,
         Command::Session { command } => session_commands::run(command).await,
         Command::Acp(args) => acp::run(args).await,
         Command::Collab { command } => collab::run(command).await,

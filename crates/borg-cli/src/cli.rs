@@ -64,12 +64,14 @@ impl Cli {
                 | "import"
                 | "inspect"
                 | "workspaces"
+                | "worktree"
                 | "session"
                 | "acp"
                 | "collab"
                 | "doctor"
                 | "bug"
                 | "limits"
+                | "lane"
                 | "help"
                 | "__agent-mcp"
                 | "-h"
@@ -126,6 +128,8 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    /// Queue and supervise engine-neutral jobs and resource leases.
+    Lane(crate::lane_commands::LaneArgs),
     /// Check for or install the latest Borg Agent release.
     #[command(visible_alias = "install")]
     Update(UpdateArgs),
@@ -159,6 +163,8 @@ pub(crate) enum Command {
     Inspect(InspectArgs),
     /// List local multiplayer workspaces available to this OS user.
     Workspaces(WorkspacesArgs),
+    /// Create, inspect and safely reclaim Git worktrees.
+    Worktree(WorktreeArgs),
     /// Inspect, branch, export, and restore local durable sessions.
     Session {
         #[command(subcommand)]
@@ -1317,4 +1323,83 @@ impl From<RemotePermissionArg> for borg_remote::PermissionMode {
             RemotePermissionArg::Manual => Self::Manual,
         }
     }
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct WorktreeArgs {
+    #[arg(long, default_value = ".")]
+    pub(crate) project: PathBuf,
+    #[arg(long)]
+    pub(crate) root: Option<PathBuf>,
+    #[command(subcommand)]
+    pub(crate) command: WorktreeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum WorktreeCommand {
+    /// Create a task worktree in --root (default: sibling borg-wt).
+    New {
+        task: String,
+        #[arg(long)]
+        owner: Option<Uuid>,
+        #[arg(long)]
+        shared_cargo: bool,
+    },
+    /// List ownership, branch, merge status, activity and size.
+    List,
+    /// Preview eligible worktrees; --apply requires a journal-confirmed exited owner.
+    Gc {
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show disk and RAM headroom against lane admission reserves.
+    Budget,
+    /// Read-only per-worktree Cargo target usage and cap breaches.
+    TargetStatus {
+        #[arg(long, default_value_t = 24)]
+        cap_gib: u64,
+    },
+    /// Emit pressure to a Borg command watch; timer checks without agent polling.
+    Monitor {
+        #[arg(long, default_value_t = 60)]
+        interval_secs: u64,
+    },
+    /// Read-only snapshot of uncommitted files matching the given globs in all worktrees.
+    FreezePreview {
+        #[arg(required = true)]
+        globs: Vec<String>,
+    },
+    /// Request a local freeze linked to an already claimed shared-work item.
+    Freeze {
+        #[arg(long)]
+        work_id: Uuid,
+        #[arg(long)]
+        owner: Uuid,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value_t = 1800)]
+        deadline_secs: u64,
+        #[arg(required = true)]
+        globs: Vec<String>,
+    },
+    FreezeStatus,
+    FreezeAck {
+        id: Uuid,
+        participant: Uuid,
+    },
+    /// Land only after every ack and all protected edits are committed.
+    FreezeLand {
+        id: Uuid,
+        owner: Uuid,
+        #[arg(long)]
+        note: String,
+    },
+    FreezeRelease {
+        id: Uuid,
+        owner: Uuid,
+        #[arg(long)]
+        abort: bool,
+    },
 }

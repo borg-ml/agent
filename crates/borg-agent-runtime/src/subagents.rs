@@ -222,6 +222,7 @@ pub struct AgentToolDispatcher {
     resource_limits: Option<HostResourceLimits>,
     execution_provider: Arc<RwLock<Arc<dyn crate::ExecutionProvider>>>,
     persistent_runtimes: PersistentRuntimeRegistry,
+    lanes: crate::lane_tools::LaneTools,
     runtime_mcp: Arc<Mutex<RuntimeMcpState>>,
     harness_lock: Arc<Mutex<()>>,
     web_search: Option<Arc<dyn borg_search::WebSearchProvider>>,
@@ -827,11 +828,31 @@ impl AgentToolDispatcher {
             resource_limits: None,
             execution_provider: Arc::new(RwLock::new(execution_provider)),
             persistent_runtimes: PersistentRuntimeRegistry::default(),
+            lanes: crate::lane_tools::LaneTools::default(),
             runtime_mcp: Arc::new(Mutex::new(RuntimeMcpState::default())),
             harness_lock: Arc::new(Mutex::new(())),
             web_search,
             input_pending: Arc::new(tokio::sync::watch::Sender::new(false)),
         }
+    }
+
+    /// The lanes/services caller: always this dispatcher's own session, so a
+    /// sub-agent never acts with its parent's (or anyone's) leases.
+    fn lane_caller(&self) -> crate::lane_tools::Caller {
+        crate::lane_tools::Caller {
+            participant_id: self
+                .shared_work
+                .as_ref()
+                .map(|context| context.participant_id)
+                .unwrap_or(self.actor_session_id),
+            session_id: self.actor_session_id,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_lane_tools(mut self, lanes: crate::lane_tools::LaneTools) -> Self {
+        self.lanes = lanes;
+        self
     }
 
     pub(crate) fn with_watches(mut self, watches: crate::watch::Watches) -> Self {
@@ -1304,7 +1325,10 @@ impl AgentToolDispatcher {
     ) -> Result<Value> {
         let mut workflow_approved = workflow_approved;
         let trusted_settings = crate::self_service::trusted_settings_sections(name, &arguments);
-        if (matches!(name, "runtime_exec" | "computer_use") || !trusted_settings.is_empty())
+        if (matches!(
+            name,
+            "runtime_exec" | "computer_use" | "lane_job" | "lane_service"
+        ) || !trusted_settings.is_empty())
             && !workflow_approved
             && self.runtime_permission != crate::PermissionMode::FullAccess
         {
@@ -1768,6 +1792,47 @@ impl AgentToolDispatcher {
                     result = self.persistent_runtimes.computer_use(self.actor_session_id, arguments) => result,
                 }
             }
+            "lane_job" | "lane_service" => {
+                ensure!(
+                    self.runtime_permission == crate::PermissionMode::FullAccess
+                        || workflow_approved,
+                    "{name} requires Full Access or explicit approval"
+                );
+                let caller = self.lane_caller();
+                if name == "lane_service" {
+                    return self.lanes.service(&caller, arguments).await;
+                }
+                let (mut result, watch) = self.lanes.job(&caller, arguments).await?;
+                if let Some(watch) = watch {
+                    result["watch"] = match self.watches.as_ref() {
+                        None => {
+                            json!({"error": "watchers are unavailable for this session; use wait"})
+                        }
+                        Some(watches) => {
+                            let args = crate::watch::WatchArgs {
+                                command: watch.command,
+                                label: watch.label,
+                                notify_on: Some(crate::watch::NotifyOn::Exit),
+                                ..Default::default()
+                            };
+                            match watches
+                                .start(
+                                    self.actor_session_id,
+                                    &self.runtime_root,
+                                    args,
+                                    self.session_store(),
+                                    24 * 60 * 60 * 1000,
+                                )
+                                .await
+                            {
+                                Ok(info) => serde_json::to_value(info)?,
+                                Err(error) => json!({"error": error.to_string()}),
+                            }
+                        }
+                    };
+                }
+                Ok(result)
+            }
             "runtime_exec" => {
                 let args: PersistentRuntimeArgs = serde_json::from_value(arguments)?;
                 self.run_persistent_runtime(args, workflow_approved, workflow_cancel)
@@ -1881,6 +1946,10 @@ impl AgentToolDispatcher {
                         .call(SessionTodoToolRequest::Update { items: args.plan })
                         .await,
                 )
+            }
+            "lane_workspace" => {
+                let args: LaneWorkspaceArgs = serde_json::from_value(arguments)?;
+                self.call_lane_workspace(args).await
             }
             "lsp_status" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
@@ -6737,6 +6806,14 @@ pub fn agent_tool_specs_for_surface(
                 "required": ["op"], "additionalProperties": false
             }),
         ),
+        {
+            let (name, description, schema) = crate::lane_tools::lane_job_spec();
+            tool(name, description, schema)
+        },
+        {
+            let (name, description, schema) = crate::lane_tools::lane_service_spec();
+            tool(name, description, schema)
+        },
         tool(
             "list_files",
             "List one workspace directory without following symlinks.",
@@ -7152,6 +7229,20 @@ pub fn agent_tool_specs_for_surface(
                 Some("consult_model" | "consult_peer" | "rotate_peer")
             )
         });
+    }
+    if surface.shared_work {
+        specs.push(tool(
+            "lane_workspace",
+            "Manage local Git worktrees and a shared-work-linked freeze handshake. GC is read-only from MCP; deletion requires a human at the local CLI terminal with journal-confirmed exited owner. Freeze is advisory until the exclusive project lane is acquired; first create/claim shared_work and communicate with affected agents.",
+            json!({"type":"object", "properties": {
+                "op":{"type":"string","enum":["create","list","gc","budget","target_status","freeze_preview","freeze","freeze_status","ack","land","unfreeze","abort"]},
+                "project":{"type":"string"}, "root":{"type":"string"}, "task":{"type":"string"},
+                "shared_cargo":{"type":"boolean"}, "force":{"type":"boolean"}, "cap_gib":{"type":"integer","minimum":1},
+                "globs":{"type":"array","items":{"type":"string"}},
+                "work_id":{"type":"string","format":"uuid"}, "freeze_id":{"type":"string","format":"uuid"},
+                "reason":{"type":"string"}, "note":{"type":"string"}, "deadline_secs":{"type":"integer","minimum":1,"maximum":86400}
+            },"required":["op","project"],"additionalProperties":false}),
+        ));
     }
     specs.extend(crate::self_service::tool_specs());
     if surface.shared_work {
@@ -8817,5 +8908,247 @@ mod socket_path_tests {
         {
             std::fs::remove_dir_all(parent).ok();
         }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaneWorkspaceArgs {
+    op: String,
+    project: PathBuf,
+    root: Option<PathBuf>,
+    task: Option<String>,
+    #[serde(default)]
+    shared_cargo: bool,
+    #[serde(default)]
+    force: bool,
+    globs: Option<Vec<String>>,
+    work_id: Option<Uuid>,
+    freeze_id: Option<Uuid>,
+    reason: Option<String>,
+    note: Option<String>,
+    deadline_secs: Option<u64>,
+    cap_gib: Option<u64>,
+}
+
+impl AgentToolDispatcher {
+    async fn call_lane_workspace(&self, args: LaneWorkspaceArgs) -> Result<Value> {
+        use borg_lanes::workspace::hygiene;
+        ensure!(
+            self.shared_work.is_some(),
+            "workspace coordination requires shared_work capability"
+        );
+        let project = args.project.canonicalize().context("project must exist")?;
+        let team = self
+            .subagents
+            .as_ref()
+            .context("workspace coordination requires multiplayer session directory")?;
+        let journal = self
+            .journal
+            .as_ref()
+            .context("session journal unavailable")?;
+        // Only act on the caller's repository; another project's local paths
+        // must not be addressable through this session-scoped MCP tool.
+        let same_repo = |path: &Path| -> Result<PathBuf> {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+                .output()?;
+            ensure!(output.status.success(), "project is not a Git repository");
+            Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()).canonicalize()?)
+        };
+        ensure!(
+            same_repo(&project)? == same_repo(&self.runtime_root)?,
+            "project must be in the caller's Git repository"
+        );
+        let binding = journal
+            .workspace_binding(self.actor_session_id)
+            .await?
+            .context("workspace binding required")?;
+        let store = team.workspace_store().await?;
+        let mut active = Vec::new();
+        let mut exited = Vec::new();
+        for instance in store.list_instances(true).await? {
+            let id = instance.participant.id;
+            if journal.workspace_binding(id).await?.is_none() {
+                continue;
+            }
+            let owner_running =
+                crate::local_session_owner_is_active(&team.journal_root, id).unwrap_or(false);
+            let socket = crate::session_control_socket_path(&team.journal_root, id);
+            let live = owner_running || crate::session_control_socket_is_reachable(&socket).await;
+            if live {
+                if let Some(cwd) = instance.cwd {
+                    active.push((id, PathBuf::from(cwd)));
+                }
+            } else if instance.exited_at.is_some() {
+                exited.push(id)
+            }
+        }
+        let budget = hygiene::WorkspaceBudgets::from_env()?;
+        let value = match args.op.as_str() {
+            "create" => {
+                let task = args.task.context("task required")?;
+                let root = args
+                    .root
+                    .unwrap_or_else(|| project.parent().unwrap_or(&project).join("borg-wt"));
+                json!(hygiene::create_worktree(
+                    &project,
+                    &root,
+                    &task,
+                    self.actor_session_id,
+                    args.shared_cargo,
+                    &budget
+                )?)
+            }
+            "list" => json!(hygiene::inventory(&project, &active)?),
+            "gc" => {
+                let mut candidates = Vec::new();
+                for mut tree in hygiene::inventory(&project, &active)? {
+                    let exit_confirmed = tree.owner.is_some_and(|id| exited.contains(&id));
+                    tree.owner_gone = exit_confirmed;
+                    let eligible = (tree.gc_reason.is_some()
+                        || (args.force
+                            && (tree.merged || tree.abandoned)
+                            && !tree.owner_live
+                            && tree.owner.is_some()))
+                        && exit_confirmed;
+                    let protection = if tree.owner.is_none() {
+                        "unmanaged or unknown owner"
+                    } else if tree.owner_live {
+                        "live owner"
+                    } else if !tree.merged && !tree.abandoned {
+                        "unmerged branch"
+                    } else if tree.dirty && !args.force {
+                        "dirty; explicit force required"
+                    } else if !exit_confirmed {
+                        "owner exit unconfirmed"
+                    } else {
+                        "none"
+                    };
+                    candidates.push(json!({"tree":tree,"owner_exit_confirmed":exit_confirmed,
+                        "eligible":eligible,"protection":protection,"removed":false}));
+                }
+                json!({"dry_run": true, "candidates":candidates})
+            }
+            "budget" => {
+                let disk = hygiene::disk_available(&project)?;
+                let ram = hygiene::ram_available()?;
+                let admission = hygiene::assess_admission(&budget, disk, ram, 0, 0, 0, 0);
+                if let Some(reason) = &admission.reason {
+                    team.broadcast_message_as(self.actor_session_id,
+                        &format!("Workspace pressure: {reason}; pause new builds and inspect `borg worktree gc`. Do not delete an active or dirty worktree.")).await?;
+                }
+                json!(admission)
+            }
+            "target_status" => {
+                let cap = args
+                    .cap_gib
+                    .unwrap_or(24)
+                    .checked_mul(1024 * 1024 * 1024)
+                    .context("target cap overflows u64")?;
+                json!(hygiene::target_usage(
+                    &hygiene::inventory(&project, &active)?,
+                    cap
+                )?)
+            }
+            "freeze_preview" => json!(hygiene::freeze_preview(
+                &project,
+                &args.globs.context("globs required")?,
+                &active
+            )?),
+            "freeze_status" => json!(hygiene::freeze_status(&project)?),
+            "freeze" => {
+                let work_id = args
+                    .work_id
+                    .context("claimed shared_work work_id required")?;
+                // Shared work remains the durable authority. A local freeze
+                // cannot be started with an unrelated or unclaimed work ID.
+                let mut cursor = 0;
+                let mut created = false;
+                let mut claimant = None;
+                let mut exhausted = false;
+                for _ in 0..100 {
+                    let events = store
+                        .replay(binding.workspace_id, binding.participant_id, cursor, 1000)
+                        .await?;
+                    let len = events.len();
+                    for event in events {
+                        cursor = event.sequence;
+                        match event.kind {
+                            WorkspaceEventKind::WorkCreated { work, .. } if work.id == work_id => {
+                                created = true
+                            }
+                            WorkspaceEventKind::WorkClaimed { claim, .. }
+                                if claim.work_id == work_id =>
+                            {
+                                claimant = Some(claim.claimant_id)
+                            }
+                            _ => {}
+                        }
+                    }
+                    if len < 1000 {
+                        exhausted = true;
+                        break;
+                    }
+                }
+                ensure!(
+                    exhausted && created && claimant == Some(binding.participant_id),
+                    "shared_work must exist here and be claimed by the requesting participant"
+                );
+                let freeze = hygiene::request_freeze(
+                    &project,
+                    args.work_id
+                        .context("claimed shared_work work_id required")?,
+                    self.actor_session_id,
+                    args.globs.context("globs required")?,
+                    args.reason.context("reason required")?,
+                    args.deadline_secs.unwrap_or(1800),
+                    &active,
+                )?;
+                team.broadcast_message_as(self.actor_session_id, &format!(
+                    "Freeze requested for {:?} (shared work {}). Ack freeze {} before deadline {}; preserve dirty edits and coordinate with owner {}.",
+                    freeze.globs, freeze.work_id, freeze.id, freeze.deadline_unix, binding.participant_id)).await?;
+                json!(freeze)
+            }
+            "ack" => json!(hygiene::acknowledge_freeze(
+                &project,
+                args.freeze_id.context("freeze_id required")?,
+                self.actor_session_id
+            )?),
+            "land" => json!(hygiene::land_freeze(
+                &project,
+                args.freeze_id.context("freeze_id required")?,
+                self.actor_session_id,
+                args.note.context("where did X move note required")?,
+                &active
+            )?),
+            "unfreeze" | "abort" => {
+                let freeze = hygiene::finish_freeze(
+                    &project,
+                    args.freeze_id.context("freeze_id required")?,
+                    self.actor_session_id,
+                    args.op == "abort",
+                )?;
+                team.broadcast_message_as(
+                    self.actor_session_id,
+                    &format!(
+                        "Freeze {} {:?} for {:?}. {}",
+                        freeze.id,
+                        freeze.status,
+                        freeze.globs,
+                        freeze
+                            .moved_note
+                            .as_deref()
+                            .unwrap_or("Aborted; no changes landed.")
+                    ),
+                )
+                .await?;
+                json!(freeze)
+            }
+            _ => bail!("unknown lane_workspace operation"),
+        };
+        Ok(value)
     }
 }

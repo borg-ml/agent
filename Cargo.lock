@@ -1024,6 +1024,7 @@ dependencies = [
  "borg-agent-runtime",
  "borg-core",
  "borg-dictation",
+ "borg-lanes",
  "borg-provider",
  "borg-remote",
  "borg-tui",
@@ -1076,6 +1077,7 @@ dependencies = [
  "base64 0.23.1",
  "blu-lang",
  "borg-core",
+ "borg-lanes",
  "borg-provider",
  "borg-search",
  "chrono",
@@ -1152,6 +1154,21 @@ dependencies = [
  "gpui",
  "serde_json",
  "unicode-segmentation",
+ "uuid",
+]
+
+[[package]]
+name = "borg-lanes"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "uuid",
 ]
 

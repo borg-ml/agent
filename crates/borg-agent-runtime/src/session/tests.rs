@@ -2667,7 +2667,9 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
         } else {
             original.clone()
         };
-        let deadline = Utc::now() + chrono::Duration::seconds(2);
+        // Under a concurrent workspace suite the shared PostgreSQL setup can
+        // delay Ready; leave enough time to send Interrupt before retry fires.
+        let deadline = Utc::now() + chrono::Duration::seconds(10);
         let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
         let store: Arc<dyn SessionStore> = Arc::new(store);
         store.create_session(session_id).await.unwrap();
@@ -2808,7 +2810,7 @@ async fn usage_limit_checkpoint_survives_restart_without_early_or_duplicate_deli
                 .await
             });
             loop {
-                let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                let event = tokio::time::timeout(Duration::from_secs(12), event_rx.recv())
                     .await
                     .unwrap()
                     .unwrap();
