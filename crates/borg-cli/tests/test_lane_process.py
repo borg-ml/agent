@@ -114,7 +114,9 @@ class LaneProcess(unittest.TestCase):
                 self.assertIn("not canonical", out.stderr)
                 cap = self.cli("resource", "set-capacity", "--name", "build",
                                "--scope", str(path), "--slots", "2")
-                self.assertNotEqual(cap.returncode, 0)
+                # The capacity CLI canonicalizes this path before setting the
+                # SAME key; the store rejects raw aliases at its own boundary.
+                self.assertEqual(cap.returncode, 0, (cap.stdout, cap.stderr))
         self.assertEqual(len(self.records()), 1, "invalid aliases must never enter the journal")
 
     def test_ram_and_disk_queue_reasons(self):
