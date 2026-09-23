@@ -258,6 +258,10 @@ pub struct LaneRecord {
     pub resume_pending: Vec<String>,
     #[serde(default)]
     pub resume_error: Option<String>,
+    /// Finished resume-controller attempts, so `recover --wait` can tell a
+    /// fresh outcome from an earlier error.
+    #[serde(default)]
+    pub resume_attempts: u64,
     pub evidence: Option<String>,
 }
 
@@ -718,6 +722,7 @@ impl LaneStore {
             yield_services: vec![],
             resume_pending: vec![],
             resume_error: None,
+            resume_attempts: 0,
             evidence: None,
         });
         Ok((ticket, job))
@@ -869,68 +874,92 @@ impl LaneStore {
             !record.quarantined,
             "resource quarantined: automatic service resume refused"
         );
-        for service in &record.resume_pending {
-            #[cfg(test)]
-            let result: Result<()> =
-                if service == "test" && self.root.join("fake-resume-ok").exists() {
+        let outcome = (|| -> Result<()> {
+            for service in &record.resume_pending {
+                #[cfg(test)]
+                let result: Result<()> =
+                    if service == "test" && self.root.join("fake-resume-ok").exists() {
+                        Ok(())
+                    } else {
+                        self.complete_service_resume(service, id)
+                    };
+                #[cfg(not(test))]
+                let result = self.complete_service_resume(service, id);
+                self.locked(|state| {
+                    let row = state
+                        .records
+                        .iter_mut()
+                        .find(|r| r.ticket.id == id)
+                        .context("job disappeared")?;
+                    match &result {
+                        Ok(()) => {
+                            row.resume_pending.retain(|s| s != service);
+                            row.resume_error = None;
+                        }
+                        Err(error) => {
+                            row.resume_error =
+                                Some(format!("service {service} resume pending: {error:#}"));
+                        }
+                    }
                     Ok(())
-                } else {
-                    self.complete_service_resume(service, id)
-                };
-            #[cfg(not(test))]
-            let result = self.complete_service_resume(service, id);
-            self.locked(|state| {
-                let row = state
-                    .records
-                    .iter_mut()
-                    .find(|r| r.ticket.id == id)
-                    .context("job disappeared")?;
-                match &result {
-                    Ok(()) => {
-                        row.resume_pending.retain(|s| s != service);
-                        row.resume_error = None;
-                    }
-                    Err(error) => {
-                        row.resume_error =
-                            Some(format!("service {service} resume pending: {error:#}"));
-                    }
-                }
-                Ok(())
-            })?;
-            result?;
-        }
-        Ok(())
+                })?;
+                result?;
+            }
+            Ok(())
+        })();
+        self.locked(|state| {
+            if let Some(row) = state.records.iter_mut().find(|r| r.ticket.id == id) {
+                row.resume_attempts = row.resume_attempts.saturating_add(1);
+            }
+            Ok(())
+        })?;
+        outcome
     }
 
     /// A Resume RPC only removes the yield token; startup and readiness are
-    /// asynchronous. Keep journal recovery pending until the backend is
-    /// actually Healthy, and never send Resume twice after its token is gone.
+    /// asynchronous and can be slow (a real editor takes about a minute).
+    /// Keep journal recovery pending until the backend is actually Healthy,
+    /// and never send Resume twice after its token is gone. Wait on the
+    /// service's status events within its resume budget; a missed readiness
+    /// window, Failed or a stopped supervisor ends the wait early.
     fn complete_service_resume(&self, service: &str, id: Uuid) -> Result<()> {
+        use crate::services::ServiceState;
         let status = self.service_status(service)?;
         if status.yields.contains_key(&id.to_string()) {
             self.service_control(service, id, "resume", 0)?;
         }
+        let services = self.root.join("services");
+        let budget = crate::services::resume_budget(&services, service);
+        let events = StateEvents::new(&services.join(service)).ok();
         let started = Instant::now();
+        let mut backoff = Duration::from_millis(250);
         loop {
             let status = self.service_status(service)?;
-            if status.yields.is_empty()
-                && matches!(status.state, crate::services::ServiceState::Healthy { .. })
-            {
+            if status.yields.is_empty() && matches!(status.state, ServiceState::Healthy { .. }) {
                 return Ok(());
             }
-            if matches!(
-                status.state,
-                crate::services::ServiceState::Stopped
-                    | crate::services::ServiceState::Failed { .. }
-            ) || started.elapsed() >= Duration::from_secs(30)
-            {
+            let failed = match &status.state {
+                ServiceState::Stopped | ServiceState::Failed { .. } => true,
+                ServiceState::Degraded { reason } => reason == crate::services::READINESS_FAILED,
+                _ => false,
+            };
+            let elapsed = started.elapsed();
+            if failed || elapsed >= budget {
                 anyhow::bail!(
-                    "service {service} not healthy after resume: {:?}: {}",
+                    "service {service} not healthy after resume ({} of {} s budget): {:?}: {}",
+                    elapsed.as_secs(),
+                    budget.as_secs(),
                     status.state,
                     status.reason
                 );
             }
-            std::thread::sleep(Duration::from_millis(250));
+            // Events wake this at once; the capped backoff bounds a missed one.
+            let wait = backoff.min(budget - elapsed);
+            match &events {
+                Some(events) => events.wait(wait)?,
+                None => std::thread::sleep(wait),
+            }
+            backoff = (backoff * 2).min(Duration::from_secs(2));
         }
     }
 
@@ -981,6 +1010,22 @@ impl LaneStore {
             Ok(())
         })
     }
+}
+
+/// Where one finished job's service resume stands after `recover --wait`.
+#[derive(Clone, Debug, Serialize)]
+pub struct ResumeOutcome {
+    pub job_id: Uuid,
+    /// Services still waiting to resume; empty once resumed.
+    pub pending: Vec<String>,
+    /// `resumed`, `failed` (a controller attempt ended in an error) or
+    /// `pending` (no attempt finished before the wait timed out).
+    pub outcome: &'static str,
+    pub error: Option<String>,
+}
+
+fn resume_is_pending(row: &LaneRecord) -> bool {
+    matches!(row.state, TicketState::Finished) && !row.resume_pending.is_empty() && !row.quarantined
 }
 
 fn capacity(capacities: &[Capacity], key: &ResourceKey) -> u32 {
@@ -1859,14 +1904,67 @@ impl LaneStore {
         Ok(())
     }
 
+    /// `recover`, then block on journal events until every service resume it
+    /// started has cleared or finished a failed attempt, or `timeout` passes.
+    pub fn recover_wait(&self, timeout: Duration) -> Result<(Vec<String>, Vec<ResumeOutcome>)> {
+        let events = StateEvents::new(&self.root)?;
+        let tracked: Vec<(Uuid, u64)> = self
+            .snapshot()?
+            .iter()
+            .filter(|row| resume_is_pending(row))
+            .map(|row| (row.ticket.id, row.resume_attempts))
+            .collect();
+        let actions = self.recover(false)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let rows = self.snapshot()?;
+            let outcomes: Vec<ResumeOutcome> = tracked
+                .iter()
+                .filter_map(|(id, attempts)| {
+                    let row = rows.iter().find(|row| row.ticket.id == *id)?;
+                    let outcome = if row.resume_pending.is_empty() {
+                        "resumed"
+                    } else if row.resume_attempts > *attempts {
+                        "failed"
+                    } else {
+                        "pending"
+                    };
+                    Some(ResumeOutcome {
+                        job_id: *id,
+                        pending: row.resume_pending.clone(),
+                        outcome,
+                        error: row.resume_error.clone().filter(|_| outcome != "resumed"),
+                    })
+                })
+                .collect();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() || outcomes.iter().all(|o| o.outcome != "pending") {
+                return Ok((actions, outcomes));
+            }
+            events.wait(remaining.min(Duration::from_secs(2)))?;
+        }
+    }
+
     pub fn recover(&self, dry_run: bool) -> Result<Vec<String>> {
         let mut actions = Vec::new();
-        if !dry_run {
-            for row in self.snapshot()?.into_iter().filter(|r| {
-                matches!(r.state, TicketState::Finished)
-                    && !r.resume_pending.is_empty()
-                    && !r.quarantined
-            }) {
+        for row in self.snapshot()?.into_iter().filter(resume_is_pending) {
+            let services = row.resume_pending.join(", ");
+            if dry_run {
+                actions.push(format!("job {}: would resume {services}", row.ticket.id));
+                continue;
+            }
+            actions.push(format!(
+                "job {}: resuming {services} (detached; `recover --wait` reports the outcome)",
+                row.ticket.id
+            ));
+            #[cfg(test)]
+            {
+                let store = self.clone();
+                let id = row.ticket.id;
+                std::thread::spawn(move || store.resume_services(id));
+            }
+            #[cfg(not(test))]
+            {
                 let executable = std::env::var_os("BORG_LANE_EXECUTABLE")
                     .map(PathBuf::from)
                     .unwrap_or(std::env::current_exe()?);
@@ -2175,6 +2273,7 @@ mod tests {
             yield_services: vec![],
             resume_pending: vec![],
             resume_error: None,
+            resume_attempts: 0,
             evidence: None,
         }
     }
@@ -2499,6 +2598,144 @@ mod tests {
         let row = store.record(id).unwrap();
         assert!(row.resume_pending.is_empty());
         assert!(row.resume_error.is_none());
+    }
+
+    /// A finished job whose "test" service resume is pending.
+    fn pending_resume(store: &LaneStore) -> Uuid {
+        let id = Uuid::new_v4();
+        store
+            .locked(|state| {
+                let mut row = record(
+                    1,
+                    TicketState::Finished,
+                    vec![resource("project", Access::Exclusive)],
+                );
+                row.ticket.id = id;
+                row.yield_services.push("test".into());
+                row.resume_pending.push("test".into());
+                state.records.push(row);
+                Ok(())
+            })
+            .unwrap();
+        id
+    }
+
+    /// Publish the "test" service's status atomically, as a supervisor does.
+    fn fake_service_state(root: &Path, state: serde_json::Value) {
+        let status = serde_json::json!({"id": "test", "state": state, "endpoint": null,
+            "clients": [], "reason": "test", "yields": {}});
+        let temporary = root.join("fake-service-status.json.tmp");
+        fs::write(&temporary, serde_json::to_vec(&status).unwrap()).unwrap();
+        fs::rename(temporary, root.join("fake-service-status.json")).unwrap();
+    }
+
+    /// A 2.4 s resume budget: 300 ms readiness + 50 + 50 ms probe + 2 s launch.
+    fn short_resume_budget(root: &Path) -> Duration {
+        let spec = root.join("services").join("test");
+        fs::create_dir_all(&spec).unwrap();
+        fs::write(
+            spec.join("spec.json"),
+            r#"{"readiness_timeout_ms": 300, "health": {"interval_ms": 50, "timeout_ms": 50}}"#,
+        )
+        .unwrap();
+        crate::services::resume_budget(&root.join("services"), "test")
+    }
+
+    /// Failure mode: a slow-starting service (a real editor needs about a
+    /// minute) leaving its resume pending until an operator retries.
+    #[test]
+    fn slow_start_resume_clears_pending_without_a_manual_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let id = pending_resume(&store);
+        fake_service_state(dir.path(), serde_json::json!("Starting"));
+        let root = dir.path().to_path_buf();
+        let ready = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1500));
+            fake_service_state(&root, serde_json::json!({"Healthy": {"backend": null}}));
+        });
+        store.resume_services(id).unwrap();
+        ready.join().unwrap();
+        let row = store.record(id).unwrap();
+        assert!(row.resume_pending.is_empty(), "{row:?}");
+        assert!(row.resume_error.is_none());
+        assert_eq!(row.resume_attempts, 1);
+    }
+
+    /// Failure mode: a resumed service that never becomes Healthy waiting
+    /// forever, or giving up before its own readiness budget.
+    #[test]
+    fn never_healthy_resume_journals_error_after_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let id = pending_resume(&store);
+        let budget = short_resume_budget(dir.path());
+        assert_eq!(budget, Duration::from_millis(2_400));
+        fake_service_state(dir.path(), serde_json::json!("Starting"));
+        let started = std::time::Instant::now();
+        assert!(store.resume_services(id).is_err());
+        assert!(started.elapsed() >= budget, "gave up early");
+        let row = store.record(id).unwrap();
+        assert_eq!(row.resume_pending, ["test"]);
+        assert!(
+            row.resume_error
+                .unwrap()
+                .contains("not healthy after resume")
+        );
+        // A missed readiness window ends the wait at once. Retry past a gate
+        // briefly held by a descriptor that a parallel test's fork inherited.
+        fake_service_state(
+            dir.path(),
+            serde_json::json!({"Degraded": {"reason": crate::services::READINESS_FAILED}}),
+        );
+        let started = std::time::Instant::now();
+        while store.record(id).unwrap().resume_attempts < 2 {
+            let _ = store.resume_services(id);
+        }
+        assert!(
+            started.elapsed() < budget,
+            "readiness failure waited out the budget"
+        );
+        assert_eq!(store.record(id).unwrap().resume_pending, ["test"]);
+    }
+
+    /// Failure mode: `recover` returning before the resume it started has an
+    /// outcome, so people and scripts fall back to a hidden command.
+    #[test]
+    fn recover_wait_reports_each_resume_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let id = pending_resume(&store);
+        fake_service_state(dir.path(), serde_json::json!("Starting"));
+        let root = dir.path().to_path_buf();
+        let ready = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1000));
+            fake_service_state(&root, serde_json::json!({"Healthy": {"backend": null}}));
+        });
+        let (actions, resumes) = store.recover_wait(Duration::from_secs(20)).unwrap();
+        ready.join().unwrap();
+        assert!(
+            actions
+                .iter()
+                .any(|action| action.starts_with(&format!("job {id}: resuming test"))),
+            "{actions:?}"
+        );
+        assert_eq!(resumes.len(), 1);
+        assert_eq!(resumes[0].outcome, "resumed", "{resumes:?}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        pending_resume(&store);
+        short_resume_budget(dir.path());
+        fake_service_state(dir.path(), serde_json::json!("Starting"));
+        let (_, resumes) = store.recover_wait(Duration::from_secs(20)).unwrap();
+        assert_eq!(resumes[0].outcome, "failed", "{resumes:?}");
+        assert!(
+            resumes[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not healthy after resume"))
+        );
     }
 
     #[test]
