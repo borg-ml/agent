@@ -80,8 +80,12 @@ path-alias fail-open** on that old binary. A newly rebuilt combined binary,
 SHA256 `011c4ba9…`, independently rejected aliased Project/Worktree keys and
 passed a canonical Project service handoff; the final integrated binary must
 repeat this gate. The adapter canonicalizes its project path and rejects
-conflicting UBT project arguments. Post-hook failure/retry, deterministic
-service capacity, owner fencing and real Unreal parity remain blockers.
+conflicting UBT project arguments. On separate pinned binaries, targeted
+core probes also passed failing post-hook quarantine (`011c4ba9…`),
+stopped-supervisor resume retry and same-device disk capacity (`61ece6c1…`).
+ACK-then-unhealthy recovery, model MCP owner fencing, final integrated-binary
+regression and real Unreal parity remain blockers; these targeted passes do
+not enable non-spec exclusive runs.
 Do not use the live shared project's editor or its port.
 
 The stock
