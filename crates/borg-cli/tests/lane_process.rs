@@ -581,7 +581,9 @@ fn running_jobs_touch_the_journal_only_when_progress_changes() {
         let job = lane.submit(&spec);
         let started = lane.cli(&["job", "wait", &job, "--until", "started"], None);
         assert!(started.status.success(), "{}", describe(&started));
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // Past the first progress write and the one after the workload's
+        // own start-up.
+        std::thread::sleep(std::time::Duration::from_millis(1200));
         job
     };
     let idle = run("idle", "exec sleep 30");
@@ -634,6 +636,37 @@ fn finished_records_expire_with_their_job_directories() {
     assert!(lane.record(&old).is_none(), "expired record kept");
     assert!(!old_dir.exists(), "expired job directory kept");
     lane.wait(new["job_id"].as_str().unwrap(), 0);
+}
+
+/// Failure mode: a build killed as stalled while its compiler (a child of
+/// an idle wrapper) is busy with a quiet log; or a job that is actually
+/// idle never counted as stalled.
+#[test]
+fn stall_detection_counts_every_process_of_the_job() {
+    let lane = Lane::new();
+    let run = |name: &str, script: &str| {
+        let mut spec = lane.spec(name, script);
+        spec.timeout_ms = 60_000;
+        spec.stall_timeout_ms = Some(1_500);
+        lane.submit(&spec)
+    };
+    // The leader waits; its child burns CPU for 3 s without output.
+    let busy = run(
+        "busy-child",
+        "bash -c 'while [ $SECONDS -lt 3 ]; do :; done' & wait",
+    );
+    // Output alone is progress too.
+    let chatty = run("chatty", "for i in $(seq 10); do echo $i; sleep 0.3; done");
+    let idle = run("idle", "exec sleep 30");
+    lane.wait(&busy, 0);
+    lane.wait(&chatty, 0);
+    let stalled = lane.wait(&idle, CANCELLED);
+    assert_eq!(stalled["state"]["Finished"]["exit_code"], CANCELLED);
+    let evidence = lane.record(&idle).unwrap().evidence.unwrap_or_default();
+    assert!(evidence.contains("stall"), "{evidence}");
+    let cpu = lane.record(&busy).unwrap().cpu_seconds.unwrap_or_default();
+    // The idle leader alone records 0.0.
+    assert!(cpu > 0.1, "the child's CPU was not counted: {cpu}");
 }
 
 /// A hook that appends its phase and the job's ending to `<root>/<name>.<phase>`.
