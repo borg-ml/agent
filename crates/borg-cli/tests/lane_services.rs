@@ -976,7 +976,7 @@ fn run_atomic(o: Atomic) {
         post_hook,
         timeout_ms: if o.post_hook { 20_000 } else { 10_000 },
         stall_timeout_ms: None,
-        scope_unit_prefix: None,
+        unit_prefix: None,
         coalesce: false,
     };
     if o.per_resource_grace {
@@ -1688,7 +1688,7 @@ fn shared_clients_restore_before_an_exclusive_and_failed_restores_fence_it() {
         post_hook: None,
         timeout_ms: 12_000,
         stall_timeout_ms: None,
-        scope_unit_prefix: None,
+        unit_prefix: None,
         coalesce: false,
     };
     // Both clients are foreign to this holder: Preparing holds the exclusive,

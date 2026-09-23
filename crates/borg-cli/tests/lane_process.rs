@@ -173,7 +173,7 @@ fn supervisor_crash_recovers_only_the_owned_scope() {
     assert!(!lane.degraded, "no systemd user manager");
     let mut spec = lane.spec("orphan", "sleep 60");
     spec.timeout_ms = 70_000;
-    spec.scope_unit_prefix = Some("ab-build-".into());
+    spec.unit_prefix = Some("ab-build".into());
     let job = lane.submit(&spec);
     let record = lane.until(|| {
         lane.record(&job).filter(|record| {
@@ -675,12 +675,12 @@ fn terminal_hooks_receive_exit_state_reason_for_finish_queue_timeout_and_cancel(
 #[test]
 fn invalid_scope_prefix_is_rejected_before_job_submit() {
     let lane = Lane::new();
-    for bad in ["/tmp/", "AB-", "ab.scope", "bad/", "a"] {
+    for bad in ["/tmp/", "AB-", "ab.scope", "bad/", "1a"] {
         let mut spec = lane.spec("invalid-prefix", "true");
-        spec.scope_unit_prefix = Some(bad.into());
+        spec.unit_prefix = Some(bad.into());
         let out = lane.cli(&["job", "submit", "--spec", "-"], Some(&spec));
         assert!(!out.status.success(), "unsafe scope prefix {bad} admitted");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("scope unit prefix"));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("unit_prefix"));
     }
 }
 

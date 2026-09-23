@@ -165,9 +165,9 @@ pub struct JobSpec {
     pub post_hook: Option<Hook>,
     pub timeout_ms: u64,
     pub stall_timeout_ms: Option<u64>,
-    /// Optional systemd scope unit prefix, e.g. `ab-build-` gives `ab-build-<id>.scope`.
+    /// Optional validated systemd scope unit prefix: `ab-build` gives `ab-build-<id>.scope`.
     #[serde(default)]
-    pub scope_unit_prefix: Option<String>,
+    pub unit_prefix: Option<String>,
     pub coalesce: bool,
 }
 
@@ -685,7 +685,7 @@ impl LaneStore {
                     override_.resource.name
                 );
             }
-            scope_unit_prefix(spec)?;
+            unit_prefix(spec)?;
             ensure!(!spec.argv.is_empty(), "a job needs a command");
             ensure!(spec.cwd.is_absolute(), "job cwd must be absolute");
             ensure!(
@@ -721,7 +721,7 @@ impl LaneStore {
                         && spec.abandon_after_ms == other.abandon_after_ms
                         && spec.timeout_ms == other.timeout_ms
                         && spec.stall_timeout_ms == other.stall_timeout_ms
-                        && spec.scope_unit_prefix == other.scope_unit_prefix
+                        && spec.unit_prefix == other.unit_prefix
                         // Only the existing ticket's supervisor enforces a
                         // queue timeout, so a joiner is bound by that ticket's
                         // limit, not its own. Join only an equal limit: the
@@ -1574,23 +1574,22 @@ fn scope_control_group(unit: &str) -> Option<String> {
     if path.is_empty() { None } else { Some(path) }
 }
 
-fn scope_unit_prefix(spec: &JobSpec) -> Result<&str> {
-    let prefix = spec.scope_unit_prefix.as_deref().unwrap_or("borg-lane-");
+fn unit_prefix(spec: &JobSpec) -> Result<&str> {
+    let prefix = spec.unit_prefix.as_deref().unwrap_or("borg-lane");
     ensure!(
-        prefix.len() <= 64
-            && prefix.len() >= 3
+        prefix.len() <= 24
+            && !prefix.is_empty()
             && prefix.starts_with(|c: char| c.is_ascii_lowercase())
-            && prefix.ends_with('-')
             && prefix
                 .bytes()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'),
-        "scope unit prefix must be lowercase ASCII letters, digits and hyphens, start with a letter, end with a hyphen, and be at most 64 bytes"
+        "unit_prefix must start with a lowercase ASCII letter, contain only lowercase letters, digits or hyphens, and be at most 24 bytes"
     );
     Ok(prefix)
 }
 
 fn workload_unit(spec: &JobSpec, id: Uuid) -> Result<String> {
-    Ok(format!("{}{}.scope", scope_unit_prefix(spec)?, id))
+    Ok(format!("{}-{id}.scope", unit_prefix(spec)?))
 }
 
 fn cgroup_cpu_at(path: &Path) -> Option<f64> {
@@ -3024,8 +3023,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LaneStore::new(dir.path()).unwrap();
         let mut spec = coalescing_spec(dir.path(), None);
-        for invalid in ["/tmp/", "AB-", "ab.scope", "ab--/"] {
-            spec.scope_unit_prefix = Some(invalid.into());
+        for invalid in ["/tmp/", "AB-", "ab.scope", "ab--/", "1ab"] {
+            spec.unit_prefix = Some(invalid.into());
             assert!(
                 store
                     .locked(|state| store.enqueue_record(
@@ -3036,7 +3035,11 @@ mod tests {
                     .is_err()
             );
         }
-        spec.scope_unit_prefix = Some("ab-build-".into());
+        spec.unit_prefix = Some("ab-build".into());
+        let serialized = serde_json::to_value(&spec).unwrap();
+        assert_eq!(serialized["unit_prefix"], "ab-build");
+        let decoded: JobSpec = serde_json::from_value(serialized).unwrap();
+        assert_eq!(decoded.unit_prefix.as_deref(), Some("ab-build"));
         let first = store
             .locked(|state| store.enqueue_record(state, spec.lease.clone(), Some(spec.clone())))
             .unwrap()
@@ -3045,7 +3048,7 @@ mod tests {
             workload_unit(&spec, first.id).unwrap(),
             format!("ab-build-{}.scope", first.id)
         );
-        spec.scope_unit_prefix = None;
+        spec.unit_prefix = None;
         let second = store
             .locked(|state| store.enqueue_record(state, spec.lease.clone(), Some(spec.clone())))
             .unwrap()
@@ -3142,7 +3145,7 @@ mod tests {
             }),
             timeout_ms: 2000,
             stall_timeout_ms: None,
-            scope_unit_prefix: None,
+            unit_prefix: None,
             coalesce: false,
         };
         let id = store
@@ -3636,7 +3639,7 @@ mod tests {
             post_hook: None,
             timeout_ms: 2000,
             stall_timeout_ms: None,
-            scope_unit_prefix: None,
+            unit_prefix: None,
             coalesce: false,
         };
         let job = store
@@ -3782,7 +3785,7 @@ mod tests {
                 post_hook: None,
                 timeout_ms: 2000,
                 stall_timeout_ms: None,
-                scope_unit_prefix: None,
+                unit_prefix: None,
                 coalesce: false,
             };
             let job = store
@@ -3923,7 +3926,7 @@ mod tests {
             post_hook: None,
             timeout_ms: 2000,
             stall_timeout_ms: None,
-            scope_unit_prefix: None,
+            unit_prefix: None,
             coalesce: false,
         };
         let mut invalid = spec.clone();
@@ -4031,7 +4034,7 @@ mod tests {
             post_hook: None,
             timeout_ms: 2000,
             stall_timeout_ms: None,
-            scope_unit_prefix: None,
+            unit_prefix: None,
             coalesce: false,
         };
         let job = store
@@ -4135,7 +4138,7 @@ mod tests {
             post_hook: None,
             timeout_ms: 2000,
             stall_timeout_ms: None,
-            scope_unit_prefix: None,
+            unit_prefix: None,
             coalesce: false,
         };
         let id = store
@@ -4197,7 +4200,7 @@ mod tests {
             post_hook: None,
             timeout_ms: 2000,
             stall_timeout_ms: None,
-            scope_unit_prefix: None,
+            unit_prefix: None,
             coalesce: false,
         };
         let job = store
@@ -4250,7 +4253,7 @@ mod tests {
             post_hook: None,
             timeout_ms: 5000,
             stall_timeout_ms: None,
-            scope_unit_prefix: None,
+            unit_prefix: None,
             coalesce: true,
         }
     }
