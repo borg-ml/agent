@@ -12,7 +12,7 @@ import os
 import subprocess
 import sys
 from urllib.parse import quote, urlsplit, urlunsplit
-from uuid import NAMESPACE_OID, uuid4, uuid5
+from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
 
 
 def client_url(admin: str, name: str) -> str:
@@ -25,6 +25,11 @@ def client_url(admin: str, name: str) -> str:
 def sql(admin: str, statement: str) -> None:
     subprocess.run(['psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '--dbname', admin,
                     '-c', statement], check=True, stdout=subprocess.DEVNULL)
+
+
+def terminal_job(status: dict) -> bool:
+    state = (status.get('job') or {}).get('state')
+    return isinstance(state, dict) and ('Finished' in state or 'Cancelled' in state)
 
 
 def main() -> int:
@@ -41,6 +46,8 @@ def main() -> int:
     name = 'borg_native_' + uuid4().hex
     borg = os.environ.get('BORG_NATIVE_BORG', 'borg')
     created = False
+    safe_to_cleanup = True
+    job_id: str | None = None
     try:
         if args.probe_admin_url:
             admin = args.probe_admin_url
@@ -66,17 +73,35 @@ def main() -> int:
         if result.returncode == 0 and not args.probe_admin_url:
             try:
                 job_id = json.loads(result.stdout)['job_id']
+                if not isinstance(job_id, str):
+                    raise ValueError('invalid job ID')
+                UUID(job_id)
             except (ValueError, KeyError, TypeError):
+                safe_to_cleanup = False  # may have enqueued before losing the response
+                raise RuntimeError('job submission status unknown; preserve leased database')
+            safe_to_cleanup = False
+            waited = subprocess.run([borg, 'lane', 'job', 'wait', job_id, '--json'])
+            try:
+                status = json.loads(subprocess.check_output(
+                    [borg, 'lane', 'job', 'status', job_id, '--json'], text=True))
+                safe_to_cleanup = terminal_job(status)
+            except (OSError, subprocess.CalledProcessError, ValueError):
                 pass
-            else:
-                return subprocess.call([borg, 'lane', 'job', 'wait', job_id, '--json'])
+            if not safe_to_cleanup:
+                raise RuntimeError(f'job {job_id} not confirmed terminal; preserving database {name} and lease {lease_id}')
+            return waited.returncode
+        if result.returncode != 0 and not args.probe_admin_url and any('native.py' in arg for arg in command):
+            safe_to_cleanup = False  # submission may have succeeded before CLI disconnected
         return result.returncode
     finally:
+        if not safe_to_cleanup:
+            print(f'RECOVERY: database {name} and lease {lease_id} preserved; '
+                  f'confirm terminal job {job_id or "unknown"} before cleanup', file=sys.stderr)
         try:
-            if created and admin is not None:
+            if created and admin is not None and safe_to_cleanup:
                 sql(admin, f'DROP DATABASE IF EXISTS {name} WITH (FORCE)')
         finally:
-            if lease_id and owner is not None:
+            if lease_id and owner is not None and safe_to_cleanup:
                 subprocess.run([borg, 'lane', 'service', 'release', 'test-postgres',
                                 '--owner', owner, '--lease-id', lease_id], check=True)
 
@@ -84,6 +109,6 @@ def main() -> int:
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (ValueError, OSError, KeyError, StopIteration, subprocess.CalledProcessError) as exc:
+    except (ValueError, RuntimeError, OSError, KeyError, StopIteration, subprocess.CalledProcessError) as exc:
         print(f'native postgres: {exc}', file=sys.stderr)
         sys.exit(2)

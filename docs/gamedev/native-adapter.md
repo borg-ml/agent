@@ -33,7 +33,7 @@ database passwords in job specs.
 
 ## Reproducible probes (2026-09-23)
 
-- `python3 -m unittest discover -s extensions/native/tests -v`: six pass.
+- `python3 -m unittest discover -s extensions/native/tests -v`: eight pass.
 - `borg extensions install ./extensions/native --project --json`: active,
   five Blu workflows registered; `borg extensions doctor --json`: active.
 - In the isolated `/home/shulgin/abundance-wt/gd-native` checkout, explicit
@@ -44,6 +44,14 @@ database passwords in job specs.
   `ctest --test-dir build --print-labels`: **No Labels Exist**, so this checkout
   does not register the `slow` label described in the handoff. `-LE slow`
   would run all tests, not a fast subset. The full suite was not claimed.
+- Initial `cargo test -p borg-agent-runtime` direct probe using the adapter's
+  three-job RAM cap and isolated throwaway Postgres: **877 passed, 2 failed,
+  9 ignored**, lib test phase 34.27 s (build time separate). The failures are
+  `native_mcp::tests::remembered_failure_skips_relaunch_until_config_change_or_cooldown_expiry`
+  and `native_mcp::tests::reported_stderr_is_scrubbed_of_secrets`; neither Rust
+  test was modified by this branch. The latter asserts both that the same
+  redaction marker is absent and present in its error. Do not report the
+  package suite as passing. PostgreSQL-backed test coverage did run.
 - Throwaway PostgreSQL 18.6, `pg_ctl -w start`, three independent clusters vs
   one shared cluster plus three `CREATE DATABASE` operations (PSS summed over
   each server's process tree): independent starts 0.323 s total / 58.52 MiB

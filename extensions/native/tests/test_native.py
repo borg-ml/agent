@@ -38,6 +38,21 @@ class NativePlannerTest(unittest.TestCase):
         self.assertEqual(pg.client_url('postgresql://me@localhost:55451/postgres', 'borg_native_123'),
                          'postgresql://me@localhost:55451/borg_native_123')
 
+    def test_untracked_source_disables_coalescing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            import subprocess
+            subprocess.run(['git', 'init', '-q', str(root)], check=True)
+            (root / 'generated.cpp').write_text('source one')
+            with patch.object(native, 'fingerprint', return_value='fingerprint'):
+                value = native.job_spec(root, 'cmake-build', ['cmake', '--build', str(root), '-j', '2'], {})
+            self.assertFalse(value['coalesce'])
+
+    def test_database_cleanup_only_after_terminal_job(self):
+        self.assertFalse(pg.terminal_job({'job': {'state': 'Queued'}}))
+        self.assertFalse(pg.terminal_job({'job': {'state': {'Running': {'scope': 'active'}}}}))
+        self.assertTrue(pg.terminal_job({'job': {'state': {'Finished': {'exit_code': 1}}}}))
+
     def test_job_spec_is_immediate_and_keeps_worktree_budget(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -105,7 +105,11 @@ def job_spec(root: Path, lane: str, command: list[str], env: dict[str, str]) -> 
             raise ValueError('do not persist a PostgreSQL password in a lane job spec')
         env['BORG_TEST_SESSIONS_URL'] = url
     identity = os.environ.get('BORG_PARTICIPANT_ID') or str(uuid4())
+    # A standalone CLI has no Borg participant/session context: retain unique
+    # correlators, but never imply these are the live agent's identities.
     session = os.environ.get('BORG_SESSION_ID') or str(uuid4())
+    untracked = bool(subprocess.check_output(
+        ['git', '-C', str(root), 'ls-files', '--others', '--exclude-standard'])) if (root / '.git').exists() else False
     return {
         'fingerprint': fingerprint(root, command, env),
         'lease': {
@@ -123,7 +127,7 @@ def job_spec(root: Path, lane: str, command: list[str], env: dict[str, str]) -> 
                       'disk_path': str(root)},
         'pre_hook': None, 'post_hook': None, 'timeout_ms': 30 * 60 * 1000,
         'stall_timeout_ms': None,
-        'coalesce': kind != 'ctest' and 'BORG_TEST_SESSIONS_URL' not in env,
+        'coalesce': kind != 'ctest' and 'BORG_TEST_SESSIONS_URL' not in env and not untracked,
     }
 
 
