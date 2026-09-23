@@ -305,6 +305,28 @@ pub struct AgentCompaction {
 }
 
 #[derive(Debug)]
+pub(crate) struct PartialCompactionUsage {
+    pub(crate) usage: ProviderCallUsage,
+    message: String,
+}
+
+impl PartialCompactionUsage {
+    pub(crate) fn attach(error: anyhow::Error, usage: ProviderCallUsage) -> anyhow::Error {
+        if usage == ProviderCallUsage::default() {
+            return error;
+        }
+        let message = error.to_string();
+        error.context(Self { usage, message })
+    }
+}
+
+impl std::fmt::Display for PartialCompactionUsage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+#[derive(Debug)]
 pub enum AgentTurnControl {
     Steer {
         message_id: Uuid,

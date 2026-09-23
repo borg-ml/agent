@@ -1291,8 +1291,22 @@ impl NativeHarness {
             .context_window(provider, model)
             .await
             .unwrap_or(NATIVE_ASSUMED_CONTEXT_WINDOW_TOKENS);
-        self.compact_with_window(provider, model, effort, fast, conversation, window)
+        let mut usage = ProviderCallUsage::default();
+        match self
+            .compact_with_window(
+                provider,
+                model,
+                effort,
+                fast,
+                conversation,
+                window,
+                &mut usage,
+            )
             .await
+        {
+            Ok(summary) => Ok((summary, usage)),
+            Err(error) => Err(crate::agent::PartialCompactionUsage::attach(error, usage)),
+        }
     }
 
     async fn compact_with_window(
@@ -1303,7 +1317,8 @@ impl NativeHarness {
         fast: bool,
         conversation: Vec<ModelMessage>,
         context_window_tokens: u64,
-    ) -> Result<(String, ProviderCallUsage)> {
+        usage: &mut ProviderCallUsage,
+    ) -> Result<String> {
         anyhow::ensure!(
             !conversation.is_empty(),
             "there is no native conversation to compact yet"
@@ -1329,7 +1344,6 @@ impl NativeHarness {
             COMPACTION_IMAGE_RESERVATION_CHARS,
         )?;
         let mut summary = String::new();
-        let mut usage = ProviderCallUsage::default();
         for chunk in chunks {
             let prompt = if summary.is_empty() {
                 format!(
@@ -1378,6 +1392,7 @@ impl NativeHarness {
                 )
                 .await
                 .map_err(anyhow::Error::new)?;
+            absorb_usage(usage, &result.usage);
             let ModelMessage::Assistant {
                 content,
                 tool_calls,
@@ -1396,9 +1411,8 @@ impl NativeHarness {
                 "native compaction returned an empty summary"
             );
             summary = crate::session::truncate_compaction_context(&next, summary_chars);
-            absorb_usage(&mut usage, &result.usage);
         }
-        Ok((summary, usage))
+        Ok(summary)
     }
 
     /// Compact `messages` in place when `budget` says the next request would
@@ -1491,6 +1505,7 @@ impl NativeHarness {
             },
         )
         .await;
+        let mut compaction_usage = ProviderCallUsage::default();
         let compacted = self
             .compact_with_window(
                 turn.provider,
@@ -1499,11 +1514,12 @@ impl NativeHarness {
                 turn.fast.unwrap_or(false),
                 messages.clone(),
                 context_window_tokens,
+                &mut compaction_usage,
             )
             .await;
+        absorb_usage(usage, &compaction_usage);
         let (summary, retained) = match compacted {
-            Ok((summary, compaction_usage)) => {
-                absorb_usage(usage, &compaction_usage);
+            Ok(summary) => {
                 let retained =
                     retain_recent_native_messages(messages, compaction_budget.keep_recent_tokens);
                 send(
@@ -4672,6 +4688,128 @@ mod tests {
                 .0
                 .contains("Attached image 1 of 1 for this tool result")
         );
+    }
+
+    #[tokio::test]
+    async fn failed_later_compaction_fold_retains_completed_fold_usage() {
+        struct FailsSecondFold {
+            calls: Mutex<usize>,
+        }
+
+        #[async_trait]
+        impl NativeModelClient for FailsSecondFold {
+            async fn context_window(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+            ) -> Option<u64> {
+                Some(10_000)
+            }
+
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                request: ModelTurnRequest,
+                _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                assert!(
+                    matches!(request.messages.first(), Some(ModelMessage::System { content })
+                    if content == crate::session::COMPACTION_SUMMARY_PROMPT)
+                );
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                if *calls == 2 {
+                    return Err(ProviderCallError {
+                        message: "second fold disconnected".into(),
+                        trace: Box::new(ProviderAttemptTrace::default()),
+                        session_id: None,
+                        kind: borg_provider::provider::ProviderErrorKind::ConnectionLost,
+                    });
+                }
+                Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(
+                        Some("first fold".into()),
+                        None,
+                        None,
+                        Vec::new(),
+                    ),
+                    finish_reason: "stop".into(),
+                    usage: ProviderCallUsage {
+                        input_tokens: 32,
+                        cached_input_tokens: 8,
+                        output_tokens: 2,
+                        total_tokens: 42,
+                        cost_microusd: Some(250),
+                        cost_basis: CostBasis::ProviderReported,
+                        ..Default::default()
+                    },
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+
+        let conversation = (0..20)
+            .map(|index| ModelMessage::user(format!("Source {index}: {}", "x".repeat(2_000))))
+            .collect::<Vec<_>>();
+        let harness = NativeHarness {
+            model_client: Arc::new(FailsSecondFold {
+                calls: Mutex::new(0),
+            }),
+            ..NativeHarness::default()
+        };
+        let error = harness
+            .compact(
+                crate::CodingProvider::OpenRouter,
+                "test-model",
+                None,
+                false,
+                conversation.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            borg_provider::provider::classify_provider_error(&error),
+            borg_provider::provider::ProviderErrorKind::ConnectionLost
+        );
+        let partial = error
+            .downcast_ref::<crate::agent::PartialCompactionUsage>()
+            .expect("completed first fold usage survives the failure");
+        assert_eq!(partial.usage.total_tokens, 42);
+        assert_eq!(partial.usage.cached_input_tokens, 8);
+        assert_eq!(partial.usage.cost_microusd, Some(250));
+
+        let root = tempfile::tempdir().unwrap();
+        let (events, completed) = run_turn_events(
+            Arc::new(FailsSecondFold {
+                calls: Mutex::new(0),
+            }),
+            root.path().to_path_buf(),
+            Uuid::new_v4(),
+            conversation,
+            "continue",
+            "",
+            "",
+        )
+        .await;
+        assert!(!completed);
+        let usage = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEventKind::UsageUpdated {
+                    total_tokens,
+                    cached_input_tokens,
+                    cost_microusd,
+                    ..
+                } => Some((*total_tokens, *cached_input_tokens, *cost_microusd)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(usage, [(42, 8, Some(250))]);
+        assert!(events.iter().any(|event| matches!(event,
+            SessionEventKind::ProviderEvent { kind, .. } if kind == "context_compaction_failed")));
     }
 
     #[tokio::test]
