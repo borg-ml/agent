@@ -6538,7 +6538,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
             model: "gpt-5.6-sol".to_string(),
             effort: "xhigh".to_string(),
             state: "main thread".to_string(),
-            usage: "88.6k".to_string(),
+            usage: "472.7m · $133.11 (sub)".to_string(),
             child_id: None,
         },
         AgentRosterEntry {
@@ -6559,9 +6559,11 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
         row.find(value)
             .map(|offset| UnicodeWidthStr::width(&row[..offset]))
     };
-    let model_column = column(&rows[0], "MODEL").expect("model header");
+    let model_column = column(&rows[0], "MODEL NOW").expect("model header");
     assert_eq!(column(&rows[1], "gpt-5.6-sol"), Some(model_column));
     assert_eq!(column(&rows[2], "gpt-5.6-luna"), Some(model_column));
+    assert!(rows[0].contains("TOTAL TOKENS · PRICED $"));
+    assert!(rows[1].contains("$133.11 (sub)"));
     assert!(rows.iter().all(|row| row.width() <= 90));
 
     let narrow = team_roster_table_lines(&entries, 28, None, None, UiLanguage::English)
@@ -6569,7 +6571,7 @@ fn team_roster_uses_aligned_columns_and_keeps_model_visible_when_narrow() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>();
     assert!(narrow[0].contains("AGENT"));
-    assert!(narrow[0].contains("MODEL"));
+    assert!(narrow[0].contains("MODEL NOW"));
     assert!(!narrow[0].contains("STATE"));
     assert!(narrow.iter().all(|row| row.width() <= 28));
 }
@@ -6635,7 +6637,66 @@ fn subagent_subscription_cost_is_marked_as_api_equivalent() {
         ..Default::default()
     };
 
-    assert_eq!(format_subagent_usage(&usage), "  $1.2346 (sub)");
+    assert_eq!(format_subagent_usage(&usage), "  $1.23 (sub)");
+}
+
+#[test]
+fn director_roster_preserves_historical_cost_basis_across_model_switches() {
+    let mut transcript = Transcript::default();
+    transcript.seed_session_state(&SessionState {
+        configuration: Some(borg_remote::SessionConfiguration {
+            cwd: PathBuf::from("/workspace"),
+            provider: CodingProvider::Codex,
+            model: Some("gpt-6-sol".to_string()),
+            effort: Some("ultra".to_string()),
+            fast: false,
+            response_language: ResponseLanguage::Auto,
+            permission_mode: PermissionMode::FullAccess,
+        }),
+        usage: borg_remote::SessionUsage {
+            total_tokens: 472_696_660,
+            cost_microusd: Some(133_107_927),
+            cost_basis: "subscription_equivalent".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    let session_id = Uuid::new_v4();
+    let usage =
+        |total_tokens: u64, cost_microusd, cost_basis: &str| SessionEventKind::UsageUpdated {
+            provider_duration_ms: 1,
+            turn_id: None,
+            provider_context_reused: None,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_input_tokens: total_tokens.saturating_sub(2),
+            cache_creation_input_tokens: 0,
+            total_tokens,
+            cost_microusd,
+            cost_basis: cost_basis.to_string(),
+            cost_usd: None,
+            context_tokens: None,
+            context_window_tokens: None,
+        };
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        1,
+        usage(2_000_000, None, "unavailable"),
+    ));
+    let director = &transcript.agent_roster_entries()[0];
+    assert_eq!(director.model, "gpt-6-sol");
+    assert_eq!(director.usage, "474.7m · $133.11 (sub)");
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        usage(2, Some(500_000), "estimated_from_pricing"),
+    ));
+    assert_eq!(
+        transcript.agent_roster_entries()[0].usage,
+        "474.7m · ~$133.61 (mix)"
+    );
 }
 
 #[test]
@@ -7701,7 +7762,7 @@ fn launch_resume_picker_height_is_stable_and_reserved_once() {
 fn transcript_gutter_is_reserved_only_when_content_overflows() {
     assert_eq!(transcript_width_for_viewport(100, 0, 24), 100);
     assert_eq!(transcript_width_for_viewport(100, 24, 24), 100);
-    assert_eq!(transcript_width_for_viewport(100, 25, 24), 96);
+    assert_eq!(transcript_width_for_viewport(100, 25, 24), 97);
     assert_eq!(transcript_width_for_viewport(4, 25, 24), 4);
 }
 
@@ -7713,11 +7774,11 @@ fn transcript_gutter_is_reserved_only_when_content_overflows() {
 #[test]
 fn input_redraw_measures_history_at_the_committed_frame_width() {
     // Overflowing history committed at the guttered width stays there.
-    assert_eq!(transcript_frame_width(100, true, Some(96)), 96);
+    assert_eq!(transcript_frame_width(100, true, Some(97)), 97);
     // History that fit on screen was committed ungutted and stays ungutted.
     assert_eq!(transcript_frame_width(100, true, Some(100)), 100);
     // An ordinary frame always measures full width and decides for itself.
-    assert_eq!(transcript_frame_width(100, false, Some(96)), 100);
+    assert_eq!(transcript_frame_width(100, false, Some(97)), 100);
     // Nothing committed yet, so there is no width to hold on to.
     assert_eq!(transcript_frame_width(100, true, None), 100);
     // A width from a terminal this narrow no longer belongs to: measure afresh.

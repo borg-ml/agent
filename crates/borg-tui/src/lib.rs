@@ -129,7 +129,7 @@ const MIN_TOOL_RUN_VIEWPORT_HEIGHT: usize = 6;
 const MAX_TOOL_RUN_VIEWPORT_HEIGHT: usize = 30;
 const TOOL_RUN_CHROME_HEIGHT: usize = 2;
 const MIN_SCROLLBAR_THUMB_ROWS: u16 = 5;
-const TRANSCRIPT_SCROLLBAR_GUTTER_WIDTH: u16 = 4;
+const TRANSCRIPT_SCROLLBAR_GUTTER_WIDTH: u16 = 3;
 const DICTATION_BUTTON_WIDTH: u16 = 6;
 const DICTATION_EMOJI_ICON: &str = "🎤";
 const DICTATION_NERD_FONT_ICON: &str = "󰍬";
@@ -8284,7 +8284,7 @@ impl BorgTerminal {
                         .map(|row| {
                             let in_thumb = row >= thumb_top && row < thumb_top + thumb_height;
                             Line::from(Span::styled(
-                                " 🮈▍ ",
+                                " 🮈▍",
                                 Style::default().fg(if in_thumb {
                                     if self.focused_child.is_some() {
                                         if self.scrollbar_hovered || self.dragging_scrollbar {
@@ -10833,10 +10833,10 @@ fn team_roster_table_lines(
     let header = roster_table_row(
         "  ",
         ui_text(language, "AGENT"),
-        ui_text(language, "MODEL"),
+        ui_text(language, "MODEL NOW"),
         ui_text(language, "EFFORT"),
         ui_text(language, "STATE"),
-        ui_text(language, "USAGE"),
+        ui_text(language, "TOTAL TOKENS · PRICED $"),
         columns,
     );
     std::iter::once(Line::from(Span::styled(
@@ -10875,10 +10875,14 @@ fn team_roster_table_columns(entries: &[AgentRosterEntry], width: usize) -> Agen
     };
     let mut columns = AgentRosterColumns {
         name: column_width("AGENT", |entry| &entry.name, 34),
-        model: column_width("MODEL", |entry| &entry.model, 20),
+        model: column_width("MODEL NOW", |entry| &entry.model, 20),
         effort: Some(column_width("EFFORT", |entry| &entry.effort, 8)),
         state: Some(column_width("STATE", |entry| &entry.state, 17)),
-        usage: Some(column_width("USAGE", |entry| &entry.usage, 18)),
+        usage: Some(column_width(
+            "TOTAL TOKENS · PRICED $",
+            |entry| &entry.usage,
+            24,
+        )),
     };
     while roster_columns_width(columns) > width && columns.name > 12 {
         columns.name -= 1;
@@ -11641,10 +11645,16 @@ fn format_subagent_usage(usage: &borg_remote::SubagentUsage) -> String {
     }
     if let Some(cost_microusd) = usage.cost_microusd {
         let cost = cost_microusd as f64 / 1_000_000.0;
+        let amount = if cost >= 1.0 {
+            format!("{cost:.2}")
+        } else {
+            format!("{cost:.4}")
+        };
         let label = match usage.cost_basis.as_str() {
-            "subscription_equivalent" => format!("${cost:.4} (sub)"),
-            "estimated_from_pricing" => format!("~${cost:.4} (est)"),
-            _ => format!("${cost:.4}"),
+            "subscription_equivalent" => format!("${amount} (sub)"),
+            "estimated_from_pricing" => format!("~${amount} (est)"),
+            "mixed" => format!("~${amount} (mix)"),
+            _ => format!("${amount}"),
         };
         parts.push(label);
     }

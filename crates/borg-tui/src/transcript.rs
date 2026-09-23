@@ -1330,6 +1330,15 @@ impl Transcript {
                 if context_tokens.is_some() {
                     self.session_usage.context_tokens = *context_tokens;
                 }
+                if cost_microusd.is_some() {
+                    self.session_usage.cost_basis = if self.session_usage.cost_microusd.is_some()
+                        && self.session_usage.cost_basis != *cost_basis
+                    {
+                        "mixed".to_string()
+                    } else {
+                        cost_basis.clone()
+                    };
+                }
                 self.session_usage.cost_microusd =
                     match (self.session_usage.cost_microusd, cost_microusd) {
                         (Some(current), Some(additional)) => {
@@ -1338,7 +1347,6 @@ impl Transcript {
                         (None, Some(value)) => Some(*value),
                         (current, None) => current,
                     };
-                self.session_usage.cost_basis = cost_basis.clone();
                 if let (Some(context_tokens), Some(context_window_tokens)) =
                     (context_tokens, context_window_tokens)
                 {
