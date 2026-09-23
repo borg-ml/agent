@@ -4430,6 +4430,32 @@ async fn restored_live_child_stays_dormant_and_stops_with_its_root() {
         .unwrap()
         .expect("root stop must release the child writer");
     drop(released_writer);
+
+    // Stopped is not a dead end: an explicit follow-up, wake or prompt (all of
+    // which go through ensure_child_actor) starts the same child session again
+    // instead of failing with "not running".
+    let stopped = coordinator
+        .resolve_snapshot(&child_id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(stopped.status, SubagentStatus::Stopped);
+    coordinator
+        .ensure_child_actor(child_id)
+        .await
+        .expect("explicit wake restarts a stopped child");
+    let revived = coordinator
+        .resolve_snapshot(&child_id.to_string())
+        .await
+        .unwrap();
+    assert_eq!(revived.session_id, child_id);
+    assert!(!revived.status.is_terminal(), "{:?}", revived.status);
+    assert!(
+        crate::SessionWriterLease::try_acquire(&child_path)
+            .unwrap()
+            .is_none(),
+        "revived child owns its writer again"
+    );
+    coordinator.stop_all().await;
     scratch.discard().await;
 }
 
