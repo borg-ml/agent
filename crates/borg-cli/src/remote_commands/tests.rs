@@ -2714,16 +2714,32 @@ async fn resume_switch_rejects_remote_owned_session_before_stopping_current() {
 /// unset let the provider CLI pick one silently, and the status bar then had
 /// nothing to show -- the user sent a message without knowing what answered it.
 #[test]
+fn implicit_codex_backup_is_sol_6_xhigh_but_explicit_provider_keeps_its_defaults() {
+    assert_eq!(
+        automatic_codex_backup_profile(CodingProvider::Codex, false),
+        Some(("gpt-6-sol", "xhigh"))
+    );
+    assert_eq!(
+        automatic_codex_backup_profile(CodingProvider::Codex, true),
+        None
+    );
+    assert_eq!(
+        automatic_codex_backup_profile(CodingProvider::Claude, false),
+        None
+    );
+}
+
+#[test]
 fn every_defaultable_provider_pins_a_model_for_a_fresh_session() {
     assert_eq!(
         default_model_for_provider(CodingProvider::Claude).as_deref(),
-        Some(borg_provider::claude_product_model()),
-        "a Claude session must pin a model rather than record an empty model"
+        Some("claude-opus-5-5"),
+        "a Claude session must default to Opus 5.5"
     );
     assert_eq!(
         borg_provider::claude_default_effort(),
-        "medium",
-        "and pair it with the medium reasoning default"
+        "high",
+        "and pair it with the high reasoning default"
     );
     for provider in [
         CodingProvider::Codex,

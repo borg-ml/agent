@@ -1579,7 +1579,7 @@ async fn probe_provider(
     }
 }
 
-fn provider_subscription_credentials_present(provider: CodingProvider) -> bool {
+pub fn provider_subscription_credentials_present(provider: CodingProvider) -> bool {
     match provider {
         CodingProvider::Codex => borg_provider::openai_subscription::account()
             .ok()

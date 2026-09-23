@@ -532,9 +532,8 @@ pub(crate) struct LocalAgentCliArgs {
     /// Project directory. On resume, omit this to reuse the recorded directory.
     #[arg(long)]
     pub(crate) cwd: Option<PathBuf>,
-    /// Provider for this session. Omitted, it resolves to the first provider
-    /// with usable credentials on this machine, so a fresh launch never opens a
-    /// sign-in prompt for a provider the user is not using.
+    /// Provider for this session. Omitted, prefer Claude subscription, then
+    /// Codex subscription; other providers require an explicit selection.
     #[arg(long, value_enum)]
     pub(crate) provider: Option<RemoteProviderArg>,
     #[arg(long)]
@@ -581,27 +580,33 @@ pub(crate) struct LocalAgentCliArgs {
     pub(crate) session_host: Option<Uuid>,
 }
 
-/// Provider preference used when no `--provider` was given. Codex stays first
-/// so an existing ChatGPT login keeps its behaviour; every later entry is only
-/// reached when the providers before it have no credentials on this machine.
-pub(crate) const DEFAULT_PROVIDER_PREFERENCE: [RemoteProviderArg; 10] = [
-    RemoteProviderArg::Codex,
-    RemoteProviderArg::Claude,
-    RemoteProviderArg::OpenCode,
-    RemoteProviderArg::Grok,
-    RemoteProviderArg::Muse,
-    RemoteProviderArg::Kimi,
-    RemoteProviderArg::Glm,
-    RemoteProviderArg::Qwen,
-    RemoteProviderArg::OpenRouter,
-    RemoteProviderArg::OpenAiCompatible,
-];
+/// Bare sessions prefer Claude subscription, then Codex subscription. Other
+/// providers remain available via `--provider`, never as a billing fallback.
+pub(crate) const DEFAULT_PROVIDER_PREFERENCE: [RemoteProviderArg; 2] =
+    [RemoteProviderArg::Claude, RemoteProviderArg::Codex];
 
 /// The provider a fresh session starts on when the user did not name one.
-/// Picking a connected provider here is what keeps Borg from asking for a
-/// ChatGPT sign-in merely because Codex is first in the catalog.
+/// Only a usable subscription can become the automatic provider. A stored
+/// API key must not quietly turn a bare `borg` invocation into paid API usage.
 pub(crate) fn default_provider() -> RemoteProviderArg {
-    default_provider_with(|candidate| borg_remote::provider_credentials_present(candidate.into()))
+    default_provider_with(default_subscription_ready)
+}
+
+pub(crate) fn default_subscription_ready(candidate: RemoteProviderArg) -> bool {
+    match candidate {
+        RemoteProviderArg::Claude => {
+            borg_remote::provider_subscription_credentials_present(candidate.into())
+                && borg_provider::credentials::api_key(
+                    borg_provider::credentials::ApiKeyCredential::Anthropic,
+                )
+                .is_none()
+        }
+        RemoteProviderArg::Codex => {
+            borg_remote::provider_subscription_credentials_present(candidate.into())
+                && !borg_provider::credentials::openai_uses_api_key()
+        }
+        _ => false,
+    }
 }
 
 fn default_provider_with(
@@ -610,13 +615,13 @@ fn default_provider_with(
     DEFAULT_PROVIDER_PREFERENCE
         .into_iter()
         .find(|candidate| credentials_present(*candidate))
-        // Nothing is connected: keep the historical provider so the sign-in
-        // guidance names one route instead of an arbitrary last entry.
+        // Neither subscription is connected: choose Codex for explicit
+        // sign-in guidance, but never proceed on API-key billing.
         .unwrap_or(RemoteProviderArg::Codex)
 }
 
 impl LocalAgentCliArgs {
-    /// The explicit `--provider`, or the first connected provider.
+    /// The explicit `--provider`, or the preferred subscription provider.
     pub(crate) fn provider(&self) -> RemoteProviderArg {
         self.provider.unwrap_or_else(default_provider)
     }
@@ -1061,6 +1066,14 @@ mod tests {
                 candidate,
                 RemoteProviderArg::Codex | RemoteProviderArg::Claude
             )),
+            RemoteProviderArg::Claude
+        ));
+        assert!(matches!(
+            default_provider_with(|candidate| matches!(candidate, RemoteProviderArg::Codex)),
+            RemoteProviderArg::Codex
+        ));
+        assert!(matches!(
+            default_provider_with(|candidate| matches!(candidate, RemoteProviderArg::OpenRouter)),
             RemoteProviderArg::Codex
         ));
         assert!(matches!(

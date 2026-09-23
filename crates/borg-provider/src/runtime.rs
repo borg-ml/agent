@@ -25,7 +25,7 @@ impl ProviderModelCatalog {
 
 pub const CODEX_SELECTABLE_MODELS: [(&str, &str); 4] = [
     ("gpt-6-astra", "Astra"),
-    ("gpt-5.6-sol", "Sol"),
+    ("gpt-6-sol", "Sol"),
     ("gpt-5.6-terra", "Terra"),
     ("gpt-5.6-luna", "Luna"),
 ];
@@ -76,7 +76,7 @@ pub fn claude_product_model() -> &'static str {
 }
 
 pub fn claude_default_effort() -> &'static str {
-    "medium"
+    "high"
 }
 
 pub fn codex_default_effort() -> &'static str {

@@ -2083,7 +2083,7 @@ async fn rotating_a_sidecar_archives_the_old_identity_and_rebinds_the_lane() {
         .ensure_sidecar(
             "gpt",
             CodingProvider::Codex,
-            Some("gpt-5.6-sol".to_string()),
+            Some("gpt-6-sol".to_string()),
             Some("xhigh".to_string()),
         )
         .await
