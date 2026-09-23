@@ -2651,6 +2651,7 @@ fn running_status_shimmer_leaves_spinner_and_elapsed_time_still() {
     let phase_for = |offset: usize| {
         (RUNNING_SHIMMER_PADDING + offset) as u128 * RUNNING_SHIMMER_CYCLE_MILLIS
             / ("running".width() + RUNNING_SHIMMER_PADDING * 2) as u128
+            + 1
     };
     let mut first = status_control_spans("⠋", "running", RUNNING_STATUS_PEACH, false, Some("2m"));
     let mut second = first.clone();
@@ -2677,6 +2678,24 @@ fn running_status_shimmer_leaves_spinner_and_elapsed_time_still() {
             .map(|span| span.style)
             .collect::<Vec<_>>()
     );
+
+    let Color::Rgb(background_red, background_green, background_blue) = COMMAND_PANEL_BG else {
+        unreachable!()
+    };
+    let Color::Rgb(red, green, blue) = first[2].style.fg.unwrap() else {
+        panic!("the status shimmer uses RGB colors")
+    };
+    assert!(red.abs_diff(background_red) < 20);
+    assert!(green.abs_diff(background_green) < 20);
+    assert!(blue.abs_diff(background_blue) < 20);
+
+    let mut without_duration =
+        status_control_spans("⠋", "running", RUNNING_STATUS_PEACH, false, None);
+    let mut with_duration =
+        status_control_spans("⠋", "running", RUNNING_STATUS_PEACH, false, Some("2m"));
+    apply_running_status_shimmer(&mut without_duration, phase_for(3));
+    apply_running_status_shimmer(&mut with_duration, phase_for(3));
+    assert_eq!(without_duration, with_duration[..with_duration.len() - 1]);
 }
 
 #[test]
