@@ -109,13 +109,17 @@ services branch: only status should be exposed until registered spec policy
 and actual session-derived owner/fencing enforcement are audited. A tool
 argument `confirmed: true` is not a durable human approval for workspace GC.
 
-**Critical cross-module gate:** at first review the service yield state is
-independent of the lane store, the subsystem roots differ, and the lane
-pre-hook executes after the exclusive grant. This cannot yet enforce "editor
-stopped before exclusive job". Require one canonical root/key, a service-held
-shared resource relinquished before exclusive grant (or equivalent
-pre-admission barrier), and crash-tested reacquisition after exclusive
-release; otherwise exclude editor/exclusive integration from release claims.
+**Critical v0 release gate (parent decision):** lanes enters `Preparing` for
+exclusive project key R before grant; blocks new shared grants and synchronously
+pre-yields **every** service bound to R until backend PID is gone, proxy returns
+503, and a fencing token acknowledges `Yielded`. Only then grant the job.
+Every service start/restart/TTL auto-resume checks exclusive leases under the
+**same kernel lock**, never a cached flag. Release runs post-hooks then service
+resume; stale client tokens are rejected. Lanes owns Preparing/hooks/fencing;
+services owns yield ack/start refusal/resume. Bench must add a real-CLI
+cross-module test with an active client lease, prove backend gone before job
+starts, no restart during, resume afterward. Until it passes, **do not ship
+v0**; standalone fake probes and adapter fail-closed behavior are not parity.
 
 Native adapter disk reservation is an estimate, **not** target-only quota/GC;
 workspace currently considers whole-worktree cleanup with owner protection.
