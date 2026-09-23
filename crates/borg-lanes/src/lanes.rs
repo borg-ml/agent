@@ -1316,6 +1316,21 @@ impl LaneStore {
                 Err(std::fs::TryLockError::WouldBlock) => continue,
                 Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
             }
+            // A concurrent owner may have released and finished after our
+            // snapshot, before we probed its lock. Never quarantine or finish
+            // that already-released row based on stale evidence.
+            let active = self.reading(|state| {
+                Ok(state.records.iter().any(|current| {
+                    current.ticket.id == record.ticket.id
+                        && matches!(
+                            current.state,
+                            TicketState::Granted(_) | TicketState::Queued | TicketState::Preparing
+                        )
+                }))
+            })?;
+            if !active {
+                continue;
+            }
             let note = format!(
                 "job {} lost supervisor pid {:?} while {:?}",
                 record.ticket.id, record.supervisor_pid, record.state
