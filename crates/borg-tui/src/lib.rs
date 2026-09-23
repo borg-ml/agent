@@ -8428,7 +8428,7 @@ impl BorgTerminal {
                 .style(Style::default().bg(if is_launch_screen {
                     Color::Reset
                 } else {
-                    COMMAND_PANEL_BG
+                    COMPOSER_BG
                 }))
                 .borders(if is_launch_screen {
                     Borders::LEFT
