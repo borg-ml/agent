@@ -32,6 +32,8 @@ pub(crate) enum LaneCommand {
     Service(crate::lane_service_commands::ServiceArgs),
     #[command(name = "__supervise", hide = true)]
     Supervise { id: Uuid },
+    #[command(name = "__resume_services", hide = true)]
+    ResumeServices { id: Uuid },
 }
 
 #[derive(Debug, Subcommand)]
@@ -97,6 +99,7 @@ pub(crate) async fn run(args: LaneArgs) -> Result<()> {
             service.json |= json;
             crate::lane_service_commands::run(service).await?;
         }
+        LaneCommand::ResumeServices { id } => store.resume_services(id)?,
         LaneCommand::Supervise { id } => {
             let code = store.supervise(id)?;
             if code != 0 {
