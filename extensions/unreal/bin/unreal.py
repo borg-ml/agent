@@ -164,17 +164,24 @@ def build_spec(args: argparse.Namespace, project: Path, engine: Path, cfg: dict)
                  not any(a.lower().startswith(('-clean', '-mode=', '-nodumpsyms')) for a in positional))
     if have_syms:
         ubt_args.append('-NoDumpSyms')
+    # Share a host-wide startup lock with an existing lane if explicitly set.
+    start_lock = os.environ.get('UE_UBT_START_LOCK') or cfg.get('build', {}).get('ubt_start_lock')
+    if start_lock is None:
+        start_lock = state.parent / 'ubt-start.lock'
+    if not isinstance(start_lock, (str, Path)) or not Path(start_lock).expanduser().is_absolute():
+        raise ValueError('build.ubt_start_lock / UE_UBT_START_LOCK must be an absolute path')
+    start_lock = Path(start_lock).expanduser().resolve()
     # Identical pending jobs must have identical argv/env/hooks. Keep log and
     # manifest stable per revision/policy, and clear old artifacts at job start.
     rev = fingerprint(project, engine, [str(script), *ubt_args, sys.executable, str(state),
                                         json.dumps(cfg.get('build', {}), sort_keys=True),
-                                        str(int(action_gb * GIB))])
+                                        str(int(action_gb * GIB)), str(start_lock)])
     log = state / f'{rev}.ubt.log'
     symbols = state / f'{rev}.symbols.json'
     ubt_args.append(f'-Log={log}')
     cmd = [sys.executable, str(ROOT / 'bin/ubt.py'), '--symbols', str(symbols), '--', str(script), *ubt_args]
     env = [['UnrealBuildTool_ParallelExecutor__MemoryPerActionBytes', str(int(action_gb * GIB))],
-           ['UE_UBT_START_LOCK', str(state.parent / 'ubt-start.lock')]]
+           ['UE_UBT_START_LOCK', str(start_lock)]]
     return {'fingerprint': rev, 'lease': {'resources': [
                 {'key': key('Worktree', 'unreal-build-output', project.parent), 'access': 'Exclusive'}],
                 'holder': holder(args, 'Unreal build'), 'queue_timeout_ms': None},

@@ -100,7 +100,8 @@ class AdapterTests(unittest.TestCase):
         (self.project.parent / 'Source/Game.cpp').write_text('int changed;\n')
         again = self.cli('build', '--spec')
         self.assertNotEqual(json.loads(again.stdout)['fingerprint'], old)
-        # Incomplete core CLI must fail closed rather than build directly.
+        # Missing core CLI must fail closed even on a host with Borg installed.
+        self.env['BORG_AGENT_CLI'] = str(self.root / 'missing-borg')
         proc = self.cli('build')
         self.assertNotEqual(proc.returncode, 0)
 
@@ -120,6 +121,28 @@ class AdapterTests(unittest.TestCase):
         config.write_text('[build]\ngb_per_action = 2.0\n')
         new = json.loads(self.cli('build', '--spec').stdout)
         self.assertNotEqual(new['fingerprint'], spec['fingerprint'])
+
+    def test_shared_ubt_start_lock_config_and_environment(self):
+        original = json.loads(self.cli('build', '--spec').stdout)
+        default = dict(original['env'])['UE_UBT_START_LOCK']
+        self.assertTrue(Path(default).is_absolute())
+        shared = self.root / 'existing-lane' / 'ubt-start.lock'
+        config = self.project.parent / '.borg-unreal.toml'
+        config.write_text('[build]\nubt_start_lock = ' + json.dumps(str(shared)) + '\n')
+        selected = self.cli('build', '--spec')
+        self.assertEqual(selected.returncode, 0, selected.stderr)
+        spec = json.loads(selected.stdout)
+        self.assertEqual(dict(spec['env'])['UE_UBT_START_LOCK'], str(shared))
+        self.assertNotEqual(spec['fingerprint'], original['fingerprint'])
+        self.env['UE_UBT_START_LOCK'] = str(self.root / 'override.lock')
+        override = json.loads(self.cli('build', '--spec').stdout)
+        self.assertEqual(dict(override['env'])['UE_UBT_START_LOCK'], self.env['UE_UBT_START_LOCK'])
+        self.assertNotEqual(override['fingerprint'], spec['fingerprint'])
+        self.env['UE_UBT_START_LOCK'] = 'relative.lock'
+        self.assertIn('absolute path', self.cli('build', '--spec').stderr)
+        self.env.pop('UE_UBT_START_LOCK')
+        config.write_text('[build]\nubt_start_lock = "relative.lock"\n')
+        self.assertEqual(self.cli('build', '--spec').returncode, 2)
 
     def test_ubt_helper_and_symbols_hook_with_fake_tools(self):
         build = self.engine / 'Engine/Build/BatchFiles/Linux/Build.sh'

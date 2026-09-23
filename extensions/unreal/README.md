@@ -41,6 +41,7 @@ reserve_ram_gb = 4
 min_free_disk_gb = 20
 reserve_disk_gb = 10
 gb_per_action = 1.5
+# ubt_start_lock = "/run/user/1000/abundance-build-lane/ubt-start.lock"
 [run]
 memory_max_gb = 16
 [editor]
@@ -57,6 +58,13 @@ admission, memory/time limits, and coalescing of **pending** identical inputs.
 The adapter calculates a source/toolchain fingerprint, a per-revision/policy UBT log (reset at job start),
 RAM-derived `-MaxParallelActions`, and `-NoMutex`; a narrow UBT-start lock in
 the Unreal-specific helper protects Trace.uba startup, not build scheduling.
+Set `build.ubt_start_lock` in `.borg-unreal.toml` or export
+`UE_UBT_START_LOCK` (environment wins) to the **same absolute lock file** used
+by an existing host-wide build lane; for Abundance this is
+`$XDG_RUNTIME_DIR/abundance-build-lane/ubt-start.lock` (expand `$XDG_RUNTIME_DIR`
+in the shell/TOML writer). Sharing this one file serializes UBT startup
+across Borg and the legacy pathway, but it does **not** merge their queues,
+reservations or run locks. Do not mix active pathways in one project tree.
 Each helper-launched UBT process (including a startup retry) also receives
 its own private `TMPDIR` and `UBA_FILE_MAPPING_DIR`; they are removed after
 that process exits. This isolates Borg jobs from concurrent Abundance-lane
