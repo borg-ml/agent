@@ -695,6 +695,20 @@ pub struct SessionUsage {
     pub context_window_tokens: Option<u64>,
 }
 
+pub(crate) fn cumulative_cost_basis(
+    current_cost: Option<u64>,
+    current_basis: &str,
+    additional_cost: Option<u64>,
+    additional_basis: &str,
+) -> String {
+    match additional_cost {
+        None => current_basis.to_string(),
+        Some(_) if current_cost.is_none() => additional_basis.to_string(),
+        Some(_) if current_basis == additional_basis => current_basis.to_string(),
+        Some(_) => "mixed".to_string(),
+    }
+}
+
 /// One atomic checkpoint preserves the exact replacement prompt and deadline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingUsageLimitRetry {
@@ -1050,12 +1064,17 @@ impl SessionState {
                     .cache_creation_input_tokens
                     .saturating_add(*cache_creation_input_tokens);
                 self.usage.total_tokens = self.usage.total_tokens.saturating_add(*total_tokens);
+                self.usage.cost_basis = cumulative_cost_basis(
+                    self.usage.cost_microusd,
+                    &self.usage.cost_basis,
+                    *cost_microusd,
+                    cost_basis,
+                );
                 self.usage.cost_microusd = match (self.usage.cost_microusd, cost_microusd) {
                     (Some(current), Some(additional)) => Some(current.saturating_add(*additional)),
                     (None, Some(value)) => Some(*value),
                     (current, None) => current,
                 };
-                self.usage.cost_basis = cost_basis.clone();
                 self.usage.cost_usd = match (self.usage.cost_usd, cost_usd) {
                     (Some(current), Some(additional)) => Some(current + additional),
                     (None, Some(value)) => Some(*value),
@@ -2149,3 +2168,53 @@ pub mod postgres;
 
 #[cfg(test)]
 mod conformance;
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn session_cost_basis_tracks_the_contributions_to_its_total() {
+        let session_id = Uuid::new_v4();
+        let mut state = SessionState::default();
+        for (sequence, cost, basis) in [
+            (1, Some(100), "subscription_equivalent"),
+            (2, None, "unavailable"),
+            (3, Some(50), "provider_reported"),
+        ] {
+            state
+                .apply(&SessionEvent::new(
+                    session_id,
+                    sequence,
+                    SessionEventKind::UsageUpdated {
+                        provider_duration_ms: 0,
+                        turn_id: None,
+                        provider_context_reused: None,
+                        input_tokens: 1,
+                        output_tokens: 1,
+                        cached_input_tokens: 0,
+                        cache_creation_input_tokens: 0,
+                        total_tokens: 2,
+                        cost_microusd: cost,
+                        cost_basis: basis.to_string(),
+                        cost_usd: None,
+                        context_tokens: None,
+                        context_window_tokens: None,
+                    },
+                ))
+                .unwrap();
+            assert_eq!(
+                state.usage.cost_microusd,
+                Some(if sequence < 3 { 100 } else { 150 })
+            );
+            assert_eq!(
+                state.usage.cost_basis,
+                if sequence < 3 {
+                    "subscription_equivalent"
+                } else {
+                    "mixed"
+                }
+            );
+        }
+    }
+}

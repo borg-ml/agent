@@ -59,6 +59,302 @@ fn fresh_replay_reattaches_images_the_model_never_finished_answering() {
     );
 }
 
+#[tokio::test]
+async fn claude_to_native_replay_preserves_available_images_and_marks_omissions() {
+    use borg_provider::provider::ModelMessage;
+
+    let dir = tempdir().unwrap();
+    let image = dir.path().join("available.png");
+    std::fs::write(&image, b"png").unwrap();
+    let unsupported = dir.path().join("unsupported.txt");
+    std::fs::write(&unsupported, b"text").unwrap();
+    let oversized = dir.path().join("oversized.png");
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len(26 * 1024 * 1024)
+        .unwrap();
+    let attachments = vec![
+        image,
+        dir.path().join("missing.png"),
+        unsupported,
+        oversized,
+    ];
+    let session_id = Uuid::new_v4();
+    let claude_turn = Uuid::new_v4();
+    let events = vec![
+        SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::Message {
+                message_id: claude_turn,
+                actor: EventActor::User,
+                text: "inspect these images".to_string(),
+                attachments: attachments.clone(),
+                status: MessageStatus::InProgress,
+                delivery: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::TurnStarted {
+                message_id: claude_turn,
+                provider: CodingProvider::Claude,
+                model: Some("claude-opus-5-5".to_string()),
+                effort: None,
+                fast: false,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            3,
+            SessionEventKind::Message {
+                message_id: claude_turn,
+                actor: EventActor::User,
+                text: "inspect these images".to_string(),
+                attachments,
+                status: MessageStatus::Complete,
+                delivery: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            4,
+            SessionEventKind::TurnCompleted {
+                message_id: claude_turn,
+                provider_session_id: None,
+                final_text: String::new(),
+                error: None,
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            5,
+            SessionEventKind::TurnStarted {
+                message_id: Uuid::new_v4(),
+                provider: CodingProvider::Codex,
+                model: Some("gpt-6-sol".to_string()),
+                effort: None,
+                fast: false,
+            },
+        ),
+    ];
+
+    let replay =
+        native_conversation_with_historical_images(&events, CodingProvider::Codex, dir.path())
+            .await
+            .unwrap();
+    assert_eq!(replay.len(), 1);
+    match &replay[0] {
+        ModelMessage::User {
+            content,
+            attachments,
+        } => {
+            assert!(content.contains("[3 historical images not replayed]"));
+            assert_eq!(attachments.len(), 1);
+            assert_eq!(attachments[0].media_type, "image/png");
+            assert_eq!(attachments[0].data_base64, "cG5n");
+        }
+        other => panic!("expected replayed user image, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn failed_compaction_start_keeps_native_history_and_claude_images() {
+    use borg_provider::provider::ModelMessage;
+
+    let dir = tempdir().unwrap();
+    let image = dir.path().join("screenshot.png");
+    std::fs::write(&image, b"png").unwrap();
+    let session_id = Uuid::new_v4();
+    let claude_turn = Uuid::new_v4();
+    let native_turn = Uuid::new_v4();
+    let event = |sequence, kind| SessionEvent::new(session_id, sequence, kind);
+    let events = vec![
+        event(
+            1,
+            SessionEventKind::Message {
+                message_id: claude_turn,
+                actor: EventActor::User,
+                text: "inspect screenshot".into(),
+                attachments: vec![image],
+                status: MessageStatus::InProgress,
+                delivery: None,
+            },
+        ),
+        event(
+            2,
+            SessionEventKind::TurnStarted {
+                message_id: claude_turn,
+                provider: CodingProvider::Claude,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+        ),
+        event(
+            3,
+            SessionEventKind::TurnCompleted {
+                message_id: claude_turn,
+                provider_session_id: None,
+                final_text: String::new(),
+                error: None,
+            },
+        ),
+        event(
+            4,
+            SessionEventKind::TurnStarted {
+                message_id: native_turn,
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+        ),
+        event(
+            5,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "native_model_message".into(),
+                payload: serde_json::to_value(ModelMessage::user("native follow-up")).unwrap(),
+            },
+        ),
+        event(
+            6,
+            SessionEventKind::TurnCompleted {
+                message_id: native_turn,
+                provider_session_id: None,
+                final_text: String::new(),
+                error: None,
+            },
+        ),
+        event(
+            7,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "context_compaction".into(),
+                payload: json!({"status": "started", "summary": "Compacting context…"}),
+            },
+        ),
+        event(
+            8,
+            SessionEventKind::ProviderEvent {
+                provider: CodingProvider::Codex,
+                kind: "context_compaction_failed".into(),
+                payload: json!({"error": "provider unavailable"}),
+            },
+        ),
+    ];
+
+    let replay =
+        native_conversation_with_historical_images(&events, CodingProvider::Codex, dir.path())
+            .await
+            .unwrap();
+    assert_eq!(replay.len(), 2);
+    match &replay[0] {
+        ModelMessage::User {
+            content,
+            attachments,
+        } => {
+            assert_eq!(content, "inspect screenshot");
+            assert_eq!(attachments.len(), 1);
+            assert_eq!(attachments[0].data_base64, "cG5n");
+        }
+        other => panic!("expected Claude image prompt, got {other:?}"),
+    }
+    assert!(
+        matches!(&replay[1], ModelMessage::User { content, .. } if content == "native follow-up")
+    );
+}
+
+#[tokio::test]
+async fn failed_claude_turn_keeps_recent_images_in_its_interruption_record() {
+    use borg_provider::provider::ModelMessage;
+
+    let dir = tempdir().unwrap();
+    let images = (0..5)
+        .map(|index| {
+            let path = dir.path().join(format!("image-{index}.png"));
+            std::fs::write(&path, [b'0' + index]).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    let session_id = Uuid::new_v4();
+    let claude_turn = Uuid::new_v4();
+    let steer_id = Uuid::new_v4();
+    let message = |sequence, message_id, text: &str, attachments| {
+        SessionEvent::new(
+            session_id,
+            sequence,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                text: text.to_string(),
+                attachments,
+                status: MessageStatus::InProgress,
+                delivery: None,
+            },
+        )
+    };
+    let events = vec![
+        message(1, claude_turn, "inspect originals", images[..4].to_vec()),
+        SessionEvent::new(
+            session_id,
+            2,
+            SessionEventKind::TurnStarted {
+                message_id: claude_turn,
+                provider: CodingProvider::Claude,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+        ),
+        message(3, steer_id, "compare latest", images[4..].to_vec()),
+        SessionEvent::new(
+            session_id,
+            4,
+            SessionEventKind::TurnCompleted {
+                message_id: claude_turn,
+                provider_session_id: None,
+                final_text: String::new(),
+                error: Some("connection closed before message completed".to_string()),
+            },
+        ),
+        SessionEvent::new(
+            session_id,
+            5,
+            SessionEventKind::TurnStarted {
+                message_id: Uuid::new_v4(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+        ),
+    ];
+
+    let replay =
+        native_conversation_with_historical_images(&events, CodingProvider::Codex, dir.path())
+            .await
+            .unwrap();
+    assert_eq!(replay.len(), 1);
+    match &replay[0] {
+        ModelMessage::User {
+            content,
+            attachments,
+        } => {
+            assert!(content.contains("completed actions must not be repeated"));
+            assert!(content.contains("inspect originals"));
+            assert!(content.contains("compare latest"));
+            assert!(content.contains("[1 historical image not replayed]"));
+            assert_eq!(attachments.len(), 4);
+            assert_eq!(attachments[0].filename.as_deref(), Some("image-1.png"));
+            assert_eq!(attachments[3].filename.as_deref(), Some("image-4.png"));
+        }
+        other => panic!("expected interrupted user record, got {other:?}"),
+    }
+}
+
 #[test]
 fn prompt_title_has_a_durable_fallback_for_attachment_only_messages() {
     assert_eq!(prompt_session_title("  \n"), "New conversation");
@@ -1307,7 +1603,9 @@ struct CrossProviderCompactionExecutor {
     released: Arc<Mutex<Vec<CodingProvider>>>,
 }
 
-struct OversizedCompactionExecutor;
+struct OversizedCompactionExecutor {
+    calls: Arc<AtomicUsize>,
+}
 
 fn test_provider_capabilities() -> Vec<crate::ProviderCapability> {
     [
@@ -1654,12 +1952,24 @@ impl AgentTurnExecutor for OversizedCompactionExecutor {
     }
 
     async fn compact_retained_context(&self, _turn: AgentTurn) -> Result<AgentCompaction> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(AgentCompaction {
             summary: format!(
                 "summary-start{}summary-end",
                 "s".repeat(SUBSCRIPTION_INPUT_BUDGET_CHARS * 4)
             ),
-            usage: ProviderCallUsage::default(),
+            usage: ProviderCallUsage {
+                duration_ms: 11,
+                input_tokens: 101,
+                cached_input_tokens: 20,
+                cache_creation_input_tokens: 5,
+                output_tokens: 9,
+                total_tokens: 135,
+                context_tokens: Some(300),
+                context_window_tokens: Some(500),
+                cost_microusd: Some(700),
+                cost_basis: borg_provider::CostBasis::SubscriptionEquivalent,
+            },
             provider_session_id: None,
         })
     }
@@ -8430,13 +8740,28 @@ async fn goal_state_is_recoverable_from_the_session_journal() {
     .await
     .unwrap();
     assert!(active_since.is_some());
+    let usage = SessionEventKind::UsageUpdated {
+        provider_duration_ms: 0,
+        turn_id: None,
+        provider_context_reused: None,
+        input_tokens: 3,
+        output_tokens: 7,
+        cached_input_tokens: 80,
+        cache_creation_input_tokens: 10,
+        total_tokens: 100,
+        cost_microusd: None,
+        cost_basis: "unavailable".to_string(),
+        cost_usd: None,
+        context_tokens: None,
+        context_window_tokens: None,
+    };
     account_goal_tokens(
         &mut journal,
         &event_tx,
         session_id,
         &mut goal,
         &mut active_since,
-        100,
+        goal_token_usage(&usage).unwrap(),
     )
     .await
     .unwrap();
@@ -12087,7 +12412,9 @@ fn subscription_replay_budget_keeps_projection_boundaries_stable() {
 }
 
 #[tokio::test]
-async fn subscription_compaction_truncates_provider_summary_before_replay() {
+async fn subscription_compaction_truncates_summary_and_counts_every_fold() {
+    use borg_provider::provider::ModelMessage;
+
     let root = tempdir().unwrap();
     let session_id = Uuid::new_v4();
     let cwd = root.path().to_path_buf();
@@ -12133,33 +12460,47 @@ async fn subscription_compaction_truncates_provider_summary_before_replay() {
         env: std::collections::BTreeMap::new(),
         allowed_tools: Vec::new(),
     };
-    let executor: Arc<dyn AgentTurnExecutor> = Arc::new(OversizedCompactionExecutor);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor: Arc<dyn AgentTurnExecutor> = Arc::new(OversizedCompactionExecutor {
+        calls: calls.clone(),
+    });
     let prompt_id = Uuid::new_v4();
-    let events = vec![
-        SessionEvent::new(
+    let mut events = vec![SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::TurnStarted {
+            message_id: prompt_id,
+            provider: CodingProvider::Codex,
+            model: Some("test-model".to_string()),
+            effort: Some("medium".to_string()),
+            fast: false,
+        },
+    )];
+    for index in 0..6_u64 {
+        events.push(SessionEvent::new(
             session_id,
-            1,
-            SessionEventKind::TurnStarted {
-                message_id: prompt_id,
+            index + 2,
+            SessionEventKind::ProviderEvent {
                 provider: CodingProvider::Codex,
-                model: Some("test-model".to_string()),
-                effort: Some("medium".to_string()),
-                fast: false,
+                kind: "native_model_message".to_string(),
+                payload: serde_json::to_value(ModelMessage::user(format!(
+                    "durable context {index} {}",
+                    "x".repeat(180_000)
+                )))
+                .unwrap(),
             },
-        ),
-        SessionEvent::new(
-            session_id,
-            2,
-            SessionEventKind::Message {
-                message_id: prompt_id,
-                actor: EventActor::User,
-                text: "durable context".to_string(),
-                attachments: Vec::new(),
-                status: MessageStatus::Complete,
-                delivery: None,
-            },
-        ),
-    ];
+        ));
+    }
+    events.push(SessionEvent::new(
+        session_id,
+        8,
+        SessionEventKind::TurnCompleted {
+            message_id: prompt_id,
+            provider_session_id: None,
+            final_text: String::new(),
+            error: None,
+        },
+    ));
 
     let compaction = compact_subscription_context_for_budget(SubscriptionCompactionRequest {
         executor: &executor,
@@ -12181,6 +12522,20 @@ async fn subscription_compaction_truncates_provider_summary_before_replay() {
     assert!(compaction.summary.chars().count() <= SUBSCRIPTION_INPUT_BUDGET_CHARS);
     assert!(compaction.summary.starts_with("summary-start"));
     assert!(compaction.summary.ends_with("summary-end"));
+    let fold_count = calls.load(Ordering::SeqCst);
+    assert!(fold_count > 1, "the history must require multiple folds");
+    let fold_count = fold_count as u64;
+    assert_eq!(compaction.usage.duration_ms, 11 * fold_count);
+    assert_eq!(compaction.usage.input_tokens, 101 * fold_count);
+    assert_eq!(compaction.usage.cached_input_tokens, 20 * fold_count);
+    assert_eq!(compaction.usage.cache_creation_input_tokens, 5 * fold_count);
+    assert_eq!(compaction.usage.output_tokens, 9 * fold_count);
+    assert_eq!(compaction.usage.total_tokens, 135 * fold_count);
+    assert_eq!(compaction.usage.cost_microusd, Some(700 * fold_count));
+    assert_eq!(
+        compaction.usage.cost_basis,
+        borg_provider::CostBasis::SubscriptionEquivalent
+    );
 }
 
 /// A resumed or forked session loads its context from the compaction boundary

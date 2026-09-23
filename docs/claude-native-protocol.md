@@ -215,3 +215,15 @@ use a genuinely gated tool (e.g. `Write`).
 5. **Context telemetry.** Native Rust requests `get_context_usage` after each assistant
    message, emits the provider-neutral `claude.context_usage` event, and treats missing
    or unsupported responses as advisory rather than failing the turn.
+
+## Remaining tool-ownership boundary
+
+Claude Code still executes its built-in Bash, Read, Write, and ToolSearch calls.
+Borg journals their stream events and handles escalated `can_use_tool` requests,
+but the CLI can approve some calls itself. This is a compatibility gap, not a
+subscription requirement. Borg's MCP surface already covers bounded workspace
+reads and search; shell execution and file mutation still need standalone Borg
+tools with equivalent approval, cancellation, and durable result handling before
+the native built-ins can be restricted. ToolSearch must remain able to discover
+Borg's MCP tools. The subscription login, streaming, continuation, cache, and
+usage paths need a live parity check when that boundary moves.

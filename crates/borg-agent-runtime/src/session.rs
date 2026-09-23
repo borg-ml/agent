@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use borg_provider::provider::SteerAdmission;
+use borg_provider::provider::{ModelInputAttachment, SteerAdmission};
 use chrono::Utc;
 use serde_json::Value;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
@@ -3301,8 +3301,12 @@ async fn run_agent_session_store_kernel_inner(
                                     .model
                                     .as_deref()
                                     .context("native context compaction requires a model")?;
-                                let mut conversation =
-                                    native_conversation(journal.context_events(), launch.provider)?;
+                                let mut conversation = native_conversation_with_historical_images(
+                                    journal.context_events(),
+                                    launch.provider,
+                                    &launch.cwd,
+                                )
+                                .await?;
                                 if conversation.is_empty()
                                     && let Some(context) =
                                         retained_conversation_context(journal.context_events())
@@ -3882,7 +3886,12 @@ async fn run_agent_session_store_kernel_inner(
                                 .context("native context compaction requires a model")?,
                             launch.effort.as_deref(),
                             launch.fast.unwrap_or(false),
-                            native_conversation(journal.context_events(), launch.provider)?,
+                            native_conversation_with_historical_images(
+                                journal.context_events(),
+                                launch.provider,
+                                &launch.cwd,
+                            )
+                            .await?,
                         )
                         .await
                 }
@@ -4469,7 +4478,12 @@ async fn run_agent_session_store_kernel_inner(
             response_language: launch.response_language,
             permission_mode: launch.permission_mode,
             conversation: if native_provider {
-                native_conversation(journal.context_events(), launch.provider)?
+                native_conversation_with_historical_images(
+                    journal.context_events(),
+                    launch.provider,
+                    &launch.cwd,
+                )
+                .await?
             } else {
                 Vec::new()
             },
@@ -6648,7 +6662,152 @@ fn validate_session_state(session_id: Uuid, state: &SessionState) -> Result<()> 
 
 fn native_conversation(
     events: &[SessionEvent],
+    provider: CodingProvider,
+) -> Result<Vec<borg_provider::provider::ModelMessage>> {
+    native_conversation_with_images(events, provider, HashMap::new())
+}
+
+async fn native_conversation_with_historical_images(
+    events: &[SessionEvent],
+    provider: CodingProvider,
+    cwd: &Path,
+) -> Result<Vec<borg_provider::provider::ModelMessage>> {
+    let images = historical_prompt_images(events, cwd).await;
+    native_conversation_with_images(events, provider, images)
+}
+
+async fn historical_prompt_images(
+    events: &[SessionEvent],
+    cwd: &Path,
+) -> HashMap<Uuid, Vec<ModelInputAttachment>> {
+    let turn_providers = events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::TurnStarted {
+                message_id,
+                provider,
+                ..
+            } => Some((*message_id, *provider)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let mut active_provider = None;
+    let mut candidates = HashMap::new();
+    for (index, event) in events.iter().enumerate() {
+        match &event.kind {
+            SessionEventKind::TurnStarted { provider, .. } => active_provider = Some(*provider),
+            SessionEventKind::ContextCleared => {
+                active_provider = None;
+                candidates.clear();
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction" && compaction_restarts_replay(payload) =>
+            {
+                candidates.clear();
+            }
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::User,
+                attachments,
+                status: MessageStatus::InProgress | MessageStatus::Complete | MessageStatus::Failed,
+                ..
+            } if !attachments.is_empty()
+                && turn_providers
+                    .get(message_id)
+                    .copied()
+                    .or(active_provider)
+                    .is_some_and(|provider| !provider.uses_native_harness()) =>
+            {
+                candidates.insert(*message_id, (index, attachments));
+            }
+            _ => {}
+        }
+    }
+    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|(_, (index, _))| std::cmp::Reverse(*index));
+    let mut images = HashMap::new();
+    let mut attempted_images = 0;
+    let mut image_bytes = 0_u64;
+    for (message_id, (_, attachments)) in candidates {
+        if attempted_images == MAX_REPLAYED_ATTACHMENTS {
+            break;
+        }
+        let mut selected = Vec::new();
+        let mut selected_bytes = 0_u64;
+        for path in attachments
+            .iter()
+            .take(crate::native_harness::MAX_NATIVE_USER_IMAGES)
+        {
+            if attempted_images == MAX_REPLAYED_ATTACHMENTS {
+                break;
+            }
+            attempted_images += 1;
+            let path = if path.is_absolute() {
+                path.clone()
+            } else {
+                cwd.join(path)
+            };
+            if !matches!(
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("png" | "jpg" | "jpeg" | "gif" | "webp")
+            ) {
+                continue;
+            }
+            let Ok(metadata) = tokio::fs::metadata(&path).await else {
+                continue;
+            };
+            if !metadata.is_file()
+                || image_bytes
+                    .saturating_add(selected_bytes)
+                    .saturating_add(metadata.len())
+                    > crate::native_harness::MAX_NATIVE_USER_IMAGE_BYTES
+            {
+                continue;
+            }
+            selected_bytes = selected_bytes.saturating_add(metadata.len());
+            selected.push(path);
+        }
+        if selected.is_empty() {
+            continue;
+        }
+        match crate::native_harness::native_user_message(cwd, "", &selected).await {
+            Ok(borg_provider::provider::ModelMessage::User { attachments, .. }) => {
+                image_bytes = image_bytes.saturating_add(selected_bytes);
+                images.insert(message_id, attachments);
+            }
+            Ok(_) => unreachable!("native user image encoding must produce a user message"),
+            Err(error) => {
+                tracing::warn!(%message_id, %error, "historical image unavailable during replay");
+            }
+        }
+    }
+    images
+}
+
+fn replayed_user_message(
+    message_id: Uuid,
+    text: &str,
+    attachments: &[PathBuf],
+    images: &mut HashMap<Uuid, Vec<ModelInputAttachment>>,
+) -> borg_provider::provider::ModelMessage {
+    let encoded = images.remove(&message_id).unwrap_or_default();
+    let unavailable = attachments.len().saturating_sub(encoded.len());
+    let content = if unavailable == 0 {
+        text.to_string()
+    } else {
+        let noun = if unavailable == 1 { "image" } else { "images" };
+        format!("{text}\n\n[{unavailable} historical {noun} not replayed]")
+    };
+    borg_provider::provider::ModelMessage::user_with_attachments(content, encoded)
+}
+
+fn native_conversation_with_images(
+    events: &[SessionEvent],
     _provider: CodingProvider,
+    mut images: HashMap<Uuid, Vec<ModelInputAttachment>>,
 ) -> Result<Vec<borg_provider::provider::ModelMessage>> {
     // Borg's event journal is the source of truth for the conversation. Native
     // providers already emit structured model messages; subscription CLIs
@@ -6686,18 +6845,24 @@ fn native_conversation(
     // admission event may be absent on replay. Every row of a prompt carries
     // the same text; remember it so `TurnStarted` can anchor the prompt at
     // the real start of its turn instead of after the reply.
-    let mut prompt_texts: HashMap<Uuid, (EventActor, String)> = HashMap::new();
+    let mut prompt_texts: HashMap<Uuid, (EventActor, String, Vec<PathBuf>)> = HashMap::new();
     for event in events {
         if let SessionEventKind::Message {
             message_id,
             actor: actor @ (EventActor::User | EventActor::System),
             text,
+            attachments,
             ..
         } = &event.kind
         {
             prompt_texts
                 .entry(*message_id)
-                .or_insert_with(|| (*actor, text.clone()));
+                .and_modify(|(_, _, paths)| {
+                    if paths.is_empty() && !attachments.is_empty() {
+                        *paths = attachments.clone();
+                    }
+                })
+                .or_insert_with(|| (*actor, text.clone(), attachments.clone()));
         }
     }
     let mut active_provider = None;
@@ -6776,14 +6941,14 @@ fn native_conversation(
                 // the turn boundary is the durable anchor for their prompt.
                 if !provider.uses_native_harness()
                     && !placed_prompts.contains(message_id)
-                    && let Some((actor, text)) = prompt_texts.get(message_id)
+                    && let Some((actor, text, attachments)) = prompt_texts.get(message_id)
                 {
                     placed_prompts.insert(*message_id);
                     pending_generic.push(match actor {
                         EventActor::System => borg_provider::provider::ModelMessage::System {
                             content: text.clone(),
                         },
-                        _ => borg_provider::provider::ModelMessage::user(text.clone()),
+                        _ => replayed_user_message(*message_id, text, attachments, &mut images),
                     });
                 }
             }
@@ -6827,6 +6992,7 @@ fn native_conversation(
                 message_id,
                 actor: actor @ (EventActor::User | EventActor::System),
                 text,
+                attachments,
                 status: MessageStatus::InProgress,
                 ..
             } if turn_providers
@@ -6843,7 +7009,7 @@ fn native_conversation(
                         EventActor::System => borg_provider::provider::ModelMessage::System {
                             content: text.clone(),
                         },
-                        _ => borg_provider::provider::ModelMessage::user(text.clone()),
+                        _ => replayed_user_message(*message_id, text, attachments, &mut images),
                     };
                     if native_structured_in_turn {
                         pending_native.push(message);
@@ -6856,6 +7022,7 @@ fn native_conversation(
                 message_id,
                 actor,
                 text,
+                attachments,
                 status: status @ (MessageStatus::Complete | MessageStatus::Failed),
                 ..
             } if !placed_prompts.contains(message_id)
@@ -6873,7 +7040,9 @@ fn native_conversation(
                     EventActor::System => borg_provider::provider::ModelMessage::System {
                         content: text.clone(),
                     },
-                    EventActor::User => borg_provider::provider::ModelMessage::user(text.clone()),
+                    EventActor::User => {
+                        replayed_user_message(*message_id, text, attachments, &mut images)
+                    }
                     EventActor::Assistant => borg_provider::provider::ModelMessage::assistant(
                         Some(text.clone()),
                         None,
@@ -6975,10 +7144,56 @@ fn native_conversation(
             {
                 let partial = &pending_generic;
                 if !partial.is_empty() {
-                    conversation.push(borg_provider::provider::ModelMessage::user(format!(
+                    let mut content = format!(
                         "The connection was interrupted during this attempt. Recorded progress follows; completed actions must not be repeated, and commands without results need their state checked before rerunning.\n\n{}",
                         format_subscription_conversation_with_tool_limit(partial, Some(16 * 1024))
-                    )));
+                    );
+                    let image_count = pending_generic
+                        .iter()
+                        .filter_map(|message| match message {
+                            borg_provider::provider::ModelMessage::User { attachments, .. } => {
+                                Some(attachments.len())
+                            }
+                            _ => None,
+                        })
+                        .sum::<usize>();
+                    let mut skip_older =
+                        image_count.saturating_sub(crate::native_harness::MAX_NATIVE_USER_IMAGES);
+                    let mut images = Vec::new();
+                    let mut image_bytes = 0_u64;
+                    let mut omitted = 0;
+                    for message in &mut pending_generic {
+                        if let borg_provider::provider::ModelMessage::User { attachments, .. } =
+                            message
+                        {
+                            for image in std::mem::take(attachments) {
+                                if skip_older > 0 {
+                                    skip_older -= 1;
+                                    omitted += 1;
+                                    continue;
+                                }
+                                let bytes = (image.data_base64.len() as u64).saturating_mul(3) / 4;
+                                if image_bytes.saturating_add(bytes)
+                                    > crate::native_harness::MAX_NATIVE_USER_IMAGE_BYTES
+                                {
+                                    omitted += 1;
+                                    continue;
+                                }
+                                image_bytes += bytes;
+                                images.push(image);
+                            }
+                        }
+                    }
+                    if omitted > 0 {
+                        let noun = if omitted == 1 { "image" } else { "images" };
+                        content
+                            .push_str(&format!("\n\n[{omitted} historical {noun} not replayed]"));
+                    }
+                    conversation.push(
+                        borg_provider::provider::ModelMessage::user_with_attachments(
+                            content, images,
+                        ),
+                    );
                 }
                 pending_generic.clear();
                 pending_native.clear();
@@ -7089,7 +7304,10 @@ fn close_dangling_tool_calls(messages: &mut Vec<borg_provider::provider::ModelMe
 }
 
 fn compaction_restarts_replay(payload: &Value) -> bool {
-    payload.get("degraded").and_then(Value::as_bool) != Some(true)
+    matches!(
+        payload.get("status").and_then(Value::as_str),
+        None | Some("completed")
+    ) && payload.get("degraded").and_then(Value::as_bool) != Some(true)
         && (payload
             .get("provider_context_preserved")
             .and_then(Value::as_bool)
@@ -7399,7 +7617,7 @@ async fn compact_subscription_context_for_budget(
             "subscription context compaction returned an empty summary"
         );
         summary = truncate_compaction_context(&compaction.summary, summary_budget);
-        usage = compaction.usage;
+        crate::native_harness::absorb_usage(&mut usage, &compaction.usage);
         provider_session_id = compaction.provider_session_id;
     }
 
@@ -7671,6 +7889,102 @@ pub(crate) fn compaction_context_chunks(
     chunks
 }
 
+pub(crate) struct NativeCompactionChunk<'a> {
+    pub(crate) text: String,
+    pub(crate) attachment: Option<&'a borg_provider::provider::ModelInputAttachment>,
+}
+
+/// Keep native user images beside the user frame they came from. An image is
+/// folded on its own so each request has one bounded vision payload and the
+/// summary sees every image in conversation order.
+pub(crate) fn native_compaction_context_chunks<'a>(
+    conversation: &'a [borg_provider::provider::ModelMessage],
+    max_chars: usize,
+    image_reservation_chars: usize,
+) -> Result<Vec<NativeCompactionChunk<'a>>> {
+    use borg_provider::provider::ModelMessage;
+
+    let per_message = (max_chars / 4).max(1_024);
+    let mut projected = prune_conversation_for_compaction(conversation);
+    for message in &mut projected {
+        compact_message_for_budget(message, per_message);
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for (message, source) in projected.iter().zip(conversation) {
+        let frame = format_subscription_frame(&format_subscription_message(message));
+        let attached = match (source, message) {
+            (ModelMessage::User { attachments, .. }, _) if !attachments.is_empty() => {
+                Some((attachments, "user message"))
+            }
+            (
+                ModelMessage::Tool { attachments, .. },
+                ModelMessage::Tool {
+                    attachments: retained,
+                    ..
+                },
+            ) if !retained.is_empty() => Some((attachments, "tool result")),
+            _ => None,
+        };
+        if let Some((attachments, source_kind)) = attached {
+            if !current.is_empty() {
+                chunks.push(NativeCompactionChunk {
+                    text: std::mem::take(&mut current),
+                    attachment: None,
+                });
+            }
+            for (index, attachment) in attachments.iter().enumerate() {
+                let marker = format!(
+                    "\n[Attached image {} of {} for this {source_kind}]",
+                    index + 1,
+                    attachments.len()
+                );
+                let frame_budget = max_chars
+                    .saturating_sub(image_reservation_chars)
+                    .saturating_sub(marker.chars().count());
+                anyhow::ensure!(
+                    frame_budget >= 128,
+                    "native compaction image cannot fit the bounded input window"
+                );
+                chunks.push(NativeCompactionChunk {
+                    text: format!(
+                        "{}{}",
+                        truncate_compaction_context(&frame, frame_budget),
+                        marker
+                    ),
+                    attachment: Some(attachment),
+                });
+            }
+            continue;
+        }
+        let frame = if frame.chars().count() > max_chars {
+            truncate_compaction_context(&frame, max_chars)
+        } else {
+            frame
+        };
+        let separator = usize::from(!current.is_empty());
+        if !current.is_empty()
+            && current.chars().count() + separator + frame.chars().count() > max_chars
+        {
+            chunks.push(NativeCompactionChunk {
+                text: std::mem::take(&mut current),
+                attachment: None,
+            });
+        }
+        if !current.is_empty() {
+            current.push('\n');
+        }
+        current.push_str(&frame);
+    }
+    if !current.is_empty() {
+        chunks.push(NativeCompactionChunk {
+            text: current,
+            attachment: None,
+        });
+    }
+    Ok(chunks)
+}
+
 const MAX_REPLAYED_ATTACHMENTS: usize = 8;
 
 /// Attachments of user prompts admitted after the last successfully completed
@@ -7898,6 +8212,8 @@ pub(crate) fn prune_conversation_for_compaction(
                 ..
             } => {
                 let tool_name = tool_names.get(tool_call_id).map(String::as_str);
+                let retain_attachments =
+                    user_turns < 2 && protected_tool_chars < COMPACTION_PRUNE_PROTECT_CHARS;
                 let replacement = if user_turns < 2 {
                     let remaining =
                         COMPACTION_PRUNE_PROTECT_CHARS.saturating_sub(protected_tool_chars);
@@ -7924,8 +8240,9 @@ pub(crate) fn prune_conversation_for_compaction(
                 } = &mut projected[index]
                 {
                     *content = replacement;
-                    // A pruned result's images are stale evidence too.
-                    attachments.clear();
+                    if !retain_attachments {
+                        attachments.clear();
+                    }
                 }
             }
             _ => {}
@@ -11375,8 +11692,18 @@ fn goal_token_usage(kind: &SessionEventKind) -> Option<u64> {
         SessionEventKind::UsageUpdated {
             input_tokens,
             output_tokens,
+            cached_input_tokens,
+            cache_creation_input_tokens,
+            total_tokens,
             ..
-        } => Some(input_tokens.saturating_add(*output_tokens)),
+        } => Some(
+            (*total_tokens).max(
+                input_tokens
+                    .saturating_add(*cached_input_tokens)
+                    .saturating_add(*cache_creation_input_tokens)
+                    .saturating_add(*output_tokens),
+            ),
+        ),
         _ => None,
     }
 }

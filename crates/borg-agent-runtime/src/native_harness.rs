@@ -16,6 +16,7 @@ use borg_provider::provider::{
 use borg_provider::{CostBasis, ProviderCallUsage};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -45,6 +46,7 @@ const MAX_TOOL_RESULT_ATTACHMENT_BASE64_BYTES: usize = 6 * 1024 * 1024;
 /// Vision tokens per image are a function of pixels, not bytes; a flat
 /// estimate keeps a screenshot from being counted as a megabyte of text.
 const ESTIMATED_TOKENS_PER_IMAGE: u64 = 1_600;
+const COMPACTION_IMAGE_RESERVATION_CHARS: usize = ESTIMATED_TOKENS_PER_IMAGE as usize * 2;
 const MAX_APPROVAL_DETAIL_BYTES: usize = 8 * 1024;
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 120_000;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
@@ -597,6 +599,7 @@ impl NativeHarness {
         };
 
         let mut usage = ProviderCallUsage::default();
+        let outcome: Result<AgentTurnResult> = async {
         // A session adopted onto Borg's harness can arrive with a replay larger
         // than the model's window, and the provider refuses the first request
         // before the post-round check below can run. Resolve the route's
@@ -1197,6 +1200,12 @@ impl NativeHarness {
             )
             .await?;
         }
+        }
+        .await;
+        if outcome.is_err() && (usage.total_tokens > 0 || usage.cost_microusd.is_some()) {
+            send_usage(&events, &usage, Some(turn.message_id)).await;
+        }
+        outcome
     }
 
     pub(crate) async fn consult(
@@ -1314,24 +1323,37 @@ impl NativeHarness {
             chunk_chars >= 1_024,
             "native compaction context window is too small"
         );
-        let chunks = crate::session::compaction_context_chunks(&conversation, chunk_chars);
+        let chunks = crate::session::native_compaction_context_chunks(
+            &conversation,
+            chunk_chars,
+            COMPACTION_IMAGE_RESERVATION_CHARS,
+        )?;
         let mut summary = String::new();
         let mut usage = ProviderCallUsage::default();
         for chunk in chunks {
             let prompt = if summary.is_empty() {
                 format!(
-                    "<prior_provider_conversation>\n{chunk}\n</prior_provider_conversation>\nReturn only the internal continuation checkpoint."
+                    "<prior_provider_conversation>\n{}\n</prior_provider_conversation>\nReturn only the internal continuation checkpoint.",
+                    chunk.text
                 )
             } else {
                 format!(
-                    "<prior_summary>\n{summary}\n</prior_summary>\n\n<prior_provider_conversation>\n{chunk}\n</prior_provider_conversation>\nReturn only the updated internal continuation checkpoint."
+                    "<prior_summary>\n{summary}\n</prior_summary>\n\n<prior_provider_conversation>\n{}\n</prior_provider_conversation>\nReturn only the updated internal continuation checkpoint.",
+                    chunk.text
                 )
             };
             anyhow::ensure!(
-                prompt.chars().count() + crate::session::COMPACTION_SUMMARY_PROMPT.chars().count()
+                prompt.chars().count()
+                    + crate::session::COMPACTION_SUMMARY_PROMPT.chars().count()
+                    + usize::from(chunk.attachment.is_some()) * COMPACTION_IMAGE_RESERVATION_CHARS
                     <= input_chars,
                 "native compaction prompt exceeds its bounded input budget"
             );
+            let user_message = if let Some(attachment) = chunk.attachment {
+                ModelMessage::user_with_attachments(prompt, vec![attachment.clone()])
+            } else {
+                ModelMessage::user(prompt)
+            };
             let result = self
                 .model_client
                 .model_turn(
@@ -1347,7 +1369,7 @@ impl NativeHarness {
                             ModelMessage::System {
                                 content: crate::session::COMPACTION_SUMMARY_PROMPT.to_string(),
                             },
-                            ModelMessage::user(prompt),
+                            user_message,
                         ],
                         tools: Vec::new(),
                         output_schema: None,
@@ -3566,7 +3588,7 @@ async fn send_usage(
     .await;
 }
 
-fn absorb_usage(total: &mut ProviderCallUsage, usage: &ProviderCallUsage) {
+pub(crate) fn absorb_usage(total: &mut ProviderCallUsage, usage: &ProviderCallUsage) {
     let had_usage = total.total_tokens > 0 || total.cost_microusd.is_some();
     total.duration_ms = total.duration_ms.saturating_add(usage.duration_ms);
     total.input_tokens = total.input_tokens.saturating_add(usage.input_tokens);
@@ -4022,7 +4044,10 @@ fn bounded_text(mut output: String, max_bytes: usize) -> String {
     output
 }
 
-async fn native_user_message(
+pub(crate) const MAX_NATIVE_USER_IMAGES: usize = 4;
+pub(crate) const MAX_NATIVE_USER_IMAGE_BYTES: u64 = 25 * 1024 * 1024;
+
+pub(crate) async fn native_user_message(
     cwd: &Path,
     prompt: &str,
     attachments: &[PathBuf],
@@ -4031,7 +4056,7 @@ async fn native_user_message(
         return Ok(ModelMessage::user(prompt));
     }
     anyhow::ensure!(
-        attachments.len() <= 4,
+        attachments.len() <= MAX_NATIVE_USER_IMAGES,
         "native providers accept at most four images per message"
     );
     let mut encoded = Vec::with_capacity(attachments.len());
@@ -4041,9 +4066,10 @@ async fn native_user_message(
             .await
             .with_context(|| format!("inspect attachment {}", path.display()))?;
         anyhow::ensure!(metadata.is_file(), "attachment must be a regular file");
+        let previous_bytes = total_bytes;
         total_bytes = total_bytes.saturating_add(metadata.len());
         anyhow::ensure!(
-            total_bytes <= 25 * 1024 * 1024,
+            total_bytes <= MAX_NATIVE_USER_IMAGE_BYTES,
             "native message images exceed the 25 MiB combined limit"
         );
         let media_type = match path
@@ -4058,9 +4084,21 @@ async fn native_user_message(
             Some("webp") => "image/webp",
             _ => bail!("unsupported native image attachment: {}", path.display()),
         };
-        let bytes = tokio::fs::read(path)
+        let remaining_bytes = MAX_NATIVE_USER_IMAGE_BYTES - previous_bytes;
+        let mut reader = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("open attachment {}", path.display()))?
+            .take(remaining_bytes + 1);
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
             .await
             .with_context(|| format!("read attachment {}", path.display()))?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= remaining_bytes,
+            "native message images exceed the 25 MiB combined limit"
+        );
+        total_bytes = previous_bytes + bytes.len() as u64;
         encoded.push(ModelInputAttachment {
             media_type: media_type.to_string(),
             data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
@@ -4463,7 +4501,7 @@ mod tests {
     #[tokio::test]
     async fn native_compaction_folds_large_cross_provider_context_with_bounded_requests() {
         struct BoundedClient {
-            prompts: Mutex<Vec<String>>,
+            prompts: Mutex<Vec<(String, Vec<ModelInputAttachment>)>>,
         }
         #[async_trait]
         impl NativeModelClient for BoundedClient {
@@ -4489,7 +4527,11 @@ mod tests {
                     message,
                     ModelMessage::System { .. } | ModelMessage::User { .. }
                 )));
-                let ModelMessage::User { content, .. } = &request.messages[1] else {
+                let ModelMessage::User {
+                    content,
+                    attachments,
+                } = &request.messages[1]
+                else {
                     unreachable!()
                 };
                 let input_chars = request
@@ -4501,12 +4543,16 @@ mod tests {
                         }
                         _ => 0,
                     })
-                    .sum::<usize>();
+                    .sum::<usize>()
+                    + attachments.len() * COMPACTION_IMAGE_RESERVATION_CHARS;
                 assert!(
                     input_chars <= 10_000,
                     "compaction input was {input_chars} chars"
                 );
-                self.prompts.lock().unwrap().push(content.clone());
+                self.prompts
+                    .lock()
+                    .unwrap()
+                    .push((content.clone(), attachments.clone()));
                 Ok(ModelTurnResult {
                     message: ModelMessage::assistant(
                         Some("Resume the build fix".into()),
@@ -4528,11 +4574,63 @@ mod tests {
             model_client: client.clone(),
             ..NativeHarness::default()
         };
-        let conversation = (0..20)
+        let mut conversation = (0..20)
             .map(|index| {
                 ModelMessage::user(format!("Source message {index}: {}", "x".repeat(2_000)))
             })
-            .collect();
+            .collect::<Vec<_>>();
+        conversation.insert(
+            1,
+            ModelMessage::Tool {
+                tool_call_id: "old-image".into(),
+                content: "Old ordinary tool result".into(),
+                attachments: vec![ModelInputAttachment {
+                    media_type: "image/png".into(),
+                    data_base64: "ZA==".into(),
+                    filename: None,
+                }],
+            },
+        );
+        conversation.insert(
+            3,
+            ModelMessage::user_with_attachments(
+                "Two screenshots show the original failure",
+                ["YQ==", "Yg=="]
+                    .into_iter()
+                    .map(|data_base64| ModelInputAttachment {
+                        media_type: "image/png".into(),
+                        data_base64: data_base64.into(),
+                        filename: None,
+                    })
+                    .collect(),
+            ),
+        );
+        let last_user = conversation.len() - 1;
+        conversation.insert(
+            last_user,
+            ModelMessage::assistant(
+                None,
+                None,
+                None,
+                vec![ModelToolCall::function(
+                    "image-1".into(),
+                    "view_image".into(),
+                    "{}".into(),
+                )],
+            ),
+        );
+        conversation.insert(
+            last_user + 1,
+            ModelMessage::Tool {
+                tool_call_id: "image-1".into(),
+                content: "Chart from the latest build".into(),
+                attachments: vec![ModelInputAttachment {
+                    media_type: "image/png".into(),
+                    data_base64: "Yw==".into(),
+                    filename: None,
+                }],
+            },
+        );
         let (summary, _) = harness
             .compact(
                 crate::CodingProvider::Codex,
@@ -4545,9 +4643,35 @@ mod tests {
             .unwrap();
         assert_eq!(summary, "Resume the build fix");
         let prompts = client.prompts.lock().unwrap();
-        assert!(prompts.len() > 1);
-        assert!(prompts[1].contains("<prior_summary>\nResume the build fix"));
-        assert!(prompts.last().unwrap().contains("Source message 19"));
+        assert!(prompts.len() > 3, "history must require multiple folds");
+        assert!(
+            prompts[1]
+                .0
+                .contains("<prior_summary>\nResume the build fix")
+        );
+        assert!(prompts.last().unwrap().0.contains("Source message 19"));
+        let images = prompts
+            .iter()
+            .filter(|(_, attachments)| !attachments.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(images.len(), 3);
+        assert_eq!(images[0].1[0].data_base64, "YQ==");
+        assert_eq!(images[1].1[0].data_base64, "Yg==");
+        for (index, (prompt, attachments)) in images[..2].iter().enumerate() {
+            assert_eq!(attachments.len(), 1);
+            assert!(prompt.contains("Two screenshots show the original failure"));
+            assert!(prompt.contains(&format!(
+                "Attached image {} of 2 for this user message",
+                index + 1
+            )));
+        }
+        assert_eq!(images[2].1[0].data_base64, "Yw==");
+        assert!(images[2].0.contains("Chart from the latest build"));
+        assert!(
+            images[2]
+                .0
+                .contains("Attached image 1 of 1 for this tool result")
+        );
     }
 
     #[tokio::test]
@@ -6754,6 +6878,96 @@ mod tests {
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "context_compaction"
                     && payload["status"] == "completed")));
+    }
+
+    #[tokio::test]
+    async fn failed_native_turn_records_completed_model_usage_once() {
+        struct FailsAfterToolCall;
+        #[async_trait]
+        impl NativeModelClient for FailsAfterToolCall {
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                request: ModelTurnRequest,
+                _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                if request
+                    .request_id
+                    .as_deref()
+                    .is_some_and(|id| id.ends_with(":2"))
+                {
+                    return Err(ProviderCallError {
+                        message: "second model call failed".into(),
+                        trace: Box::new(ProviderAttemptTrace::default()),
+                        session_id: None,
+                        kind: borg_provider::provider::ProviderErrorKind::Unknown,
+                    });
+                }
+                Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(
+                        None,
+                        None,
+                        None,
+                        vec![ModelToolCall::function(
+                            "read-once".into(),
+                            "read_file".into(),
+                            r#"{"path":"missing.txt"}"#.into(),
+                        )],
+                    ),
+                    finish_reason: "tool_calls".into(),
+                    usage: ProviderCallUsage {
+                        input_tokens: 32,
+                        cached_input_tokens: 8,
+                        output_tokens: 2,
+                        total_tokens: 42,
+                        ..Default::default()
+                    },
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let (events, completed) = run_turn_events(
+            Arc::new(FailsAfterToolCall),
+            root.path().to_path_buf(),
+            Uuid::new_v4(),
+            Vec::new(),
+            "read",
+            "",
+            "",
+        )
+        .await;
+        assert!(!completed);
+        let usage = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEventKind::UsageUpdated {
+                    turn_id,
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    total_tokens,
+                    ..
+                } => Some((
+                    turn_id,
+                    input_tokens,
+                    cached_input_tokens,
+                    output_tokens,
+                    total_tokens,
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(usage.len(), 1);
+        assert!(usage[0].0.is_some());
+        assert_eq!(
+            (*usage[0].1, *usage[0].2, *usage[0].3, *usage[0].4),
+            (32, 8, 2, 42)
+        );
     }
 
     /// The pre-call guard cannot see a window the route never advertises, and a
