@@ -155,8 +155,27 @@ proxy is verified with live in-flight requests and meaningful health checks.
 
 ### Market positioning
 
-Pending gd_market_scan's verified findings; add concrete competitor comparisons
-without claiming they solve host-local crash-safe resource contention unless
-their docs demonstrate it. Candidate positioning: collaboration-first
-execution infrastructure across engines, rather than a single AI game editor
-or code-completion plugin.
+The market scan (`docs/gamedev/landscape.md` on `gamedev/research`, with
+source register and verification caveats) recommends core+Blu before a
+standalone product. Epic UE 5.8 already ships **Experimental native editor
+MCP**; Horde/UBA and Zen address remote compilation and derived-data cache.
+Build upon them rather than replacing the editor toolset or compiler farm.
+Unity Assistant 2.18 documentation deprecates its MCP server in favor of Unity
+CLI, reinforcing an adapter contract that can switch transport without
+changing resource policy. Community editor bridges exist (especially Unity's
+CoplayDev/unity-mcp), and Ramen/Coplay spans Unreal and Unity AI creation UX.
+The surveyed Claude/Codex/Copilot worktree/parallelism docs do **not document**
+host-wide, crash-safe engine/editor/GPU admission; that is a narrow claim about
+the surveyed docs, not proof no competitor has such infrastructure.
+
+P4 exclusive checkout, Unity UVCS Smart Locks, Diversion, Anchorpoint and Git
+LFS locks already own binary asset edit authority. Borg must *consult and
+enforce* whichever VCS lock system the project uses; its local resource lease
+only coordinates execution and cannot safely supplant VCS asset locks. Private
+GPU displays test visual isolation but OS/driver portability remains unverified.
+Do not launch a hosted multi-tenant editor before legal review of Unreal/Unity
+engine seat, hosting and redistribution terms. Pilot on one host and one studio
+with p50/p90 request-to-test, duplicate builds avoided, peak disk/VRAM and
+asset-lock violations. Abundance measurements prove local feasibility, not
+market willingness to pay; a standalone control plane should reuse Borg's
+implementation only after paid pilots, never fork its semantics.
