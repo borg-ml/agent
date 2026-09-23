@@ -63,6 +63,10 @@ class AdapterTests(unittest.TestCase):
         self.assertGreater(spec['admission']['min_free_disk_bytes'], 0)
         self.assertTrue(spec['coalesce'])
         old = spec['fingerprint']
+        same = json.loads(self.cli('build', '--spec').stdout)
+        self.assertEqual(same['fingerprint'], old)
+        self.assertEqual(same['argv'], spec['argv'])
+        self.assertEqual(same['post_hook'], spec['post_hook'])
         (self.project.parent / 'Source/Game.cpp').write_text('int changed;\n')
         again = self.cli('build', '--spec')
         self.assertNotEqual(json.loads(again.stdout)['fingerprint'], old)
@@ -82,6 +86,10 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn('-NoDumpSyms', spec['argv'])
         self.assertIsNone(spec['post_hook'])
         self.assertFalse(spec['coalesce'])
+        config = self.project.parent / '.borg-unreal.toml'
+        config.write_text('[build]\ngb_per_action = 2.0\n')
+        new = json.loads(self.cli('build', '--spec').stdout)
+        self.assertNotEqual(new['fingerprint'], spec['fingerprint'])
 
     def test_ubt_helper_and_symbols_hook_with_fake_tools(self):
         build = self.engine / 'Engine/Build/BatchFiles/Linux/Build.sh'
