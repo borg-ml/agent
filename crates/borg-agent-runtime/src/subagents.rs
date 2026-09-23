@@ -5038,7 +5038,7 @@ impl SubagentCoordinator {
         Ok(table
             .entries
             .get(&id)
-            .expect("resolved subagent exists")
+            .with_context(|| format!("target {target} is not a child agent"))?
             .snapshot
             .clone())
     }
