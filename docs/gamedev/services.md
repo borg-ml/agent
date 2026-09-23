@@ -129,7 +129,7 @@ child in the backend subgroup and exited its leader. Recovery verified the
 child gone, restarted on the alternate port (`restarts=1`), then the owned
 fixture was stopped; its unit was inactive and subgroup removed.
 
-Independent no-hook two-service scoped gate (external probe, tested CLI SHA256
+Historical no-hook two-service scoped gate (external probe, pre-alias-fix CLI SHA256
 `4022be198a99c3e8f8cac3069387f222bd2cb4e1bfdfb7a4135e8048c19a34b2`):
 the test exited 0 on a real systemd-user job; both backend PIDs, detached descendants and delegated
 subgroups were gone before exclusive grant, both proxies returned 503, a
@@ -142,10 +142,24 @@ process; `KillMode=control-group` killed its detached backend child and the
 unit became inactive. The lack of a safe non-systemd process-tree scope still
 prevents a standalone `setsid` production fallback.
 
-Production two-service capacity smoke on integrated CLI SHA256
+Production two-service disk capacity smoke on pre-alias-fix CLI SHA256
 `73aed7d927988e189b245d631aa7f67830094c6b41e1f2975da29bb190c88e59`:
 service A became Healthy with 10.8 GB reserved disk; separate service B on
 the same filesystem stayed Degraded with no backend and the exact "disk
 admission queued" reason. Yielding A admitted B to Healthy; both owned
 systemd-user units stopped inactive/dead with empty control groups. See
 `/tmp/gd-real-capacity-probe.log` (synthetic HTTP, not Unreal).
+
+Final canonical-key public-CLI gate (integrated lane+service binary SHA256
+`011c4ba94835500d40910d3dab6096533d245a55f0ea7f72c1112b1450e5e99d`):
+Project `..` and symlink aliases, and Worktree `..` and symlink aliases, were
+rejected before admission. A canonical Project same-key exclusive job then
+yielded its active service before grant, restored its client, fenced restart
+and returned 503 until auto-resume on release. On the same binary, two
+independent services on disjoint Host keys each requested ~60% of available
+RAM: the second had no backend with an explicit "RAM admission queued" reason,
+then became Healthy after the first yielded. These are fake-service CLI probes,
+not a live Unreal editor or authenticated mutating MCP adapter. The earlier
+pre-alias-fix scoped and disk-budget smokes remain useful evidence for those
+individual behaviors but do not establish canonical Project-key safety by
+themselves.
