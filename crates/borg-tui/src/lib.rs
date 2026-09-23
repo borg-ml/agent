@@ -16,9 +16,9 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use ratatui_image::{
-    Resize, StatefulImage,
+    Resize,
     picker::{Picker as ImagePicker, ProtocolType, cap_parser::QueryStdioOptions},
-    protocol::StatefulProtocol,
+    sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
 use std::process::Command;
 use std::sync::{Arc, mpsc};
@@ -1641,11 +1641,9 @@ pub struct BorgTerminal {
     /// Terminal graphics protocol detected at startup (Kitty/Sixel/iTerm2);
     /// `None` keeps the half-block fallback drawn by the transcript.
     image_picker: Option<ImagePicker>,
-    /// Fitted previews survive viewport clipping while scrolling over an image.
-    image_fits: HashMap<(PathBuf, u16, u16), image::DynamicImage>,
     image_scroll_settles_at: Option<Instant>,
     /// Encoded previews keyed by source path and tile size in cells.
-    image_protocols: HashMap<(PathBuf, u16, u16, usize, u16), StatefulProtocol>,
+    image_protocols: HashMap<(PathBuf, u16, u16), SlicedProtocol>,
     picker_hit_areas: Vec<(Rect, usize)>,
     hovered_tool: Option<usize>,
     hovered_tool_run: Option<(usize, usize)>,
@@ -2874,7 +2872,6 @@ impl BorgTerminal {
             message_hit_areas: Vec::new(),
             link_hit_areas: Vec::new(),
             image_picker,
-            image_fits: HashMap::new(),
             image_scroll_settles_at: None,
             image_protocols: HashMap::new(),
             picker_hit_areas: Vec::new(),
@@ -8144,17 +8141,12 @@ impl BorgTerminal {
                             width,
                             height: (end - first) as u16,
                         };
-                        let key = (
-                            slot.path.clone(),
-                            area.width,
-                            slot.rows as u16,
-                            skipped_rows,
-                            area.height,
-                        );
+                        // One encoded tile per image: scrolling places it at an
+                        // offset instead of encoding and transmitting a new crop
+                        // for every clipped position.
+                        let key = (slot.path.clone(), area.width, slot.rows as u16);
                         if !self.image_protocols.contains_key(&key) {
-                            // A moving viewport would create a new encoded image at
-                            // every clipped row. Draw the text immediately and
-                            // encode the visible image once the motion settles.
+                            // Encode once the motion settles; draw the text meanwhile.
                             if self.scroll_motion.is_active()
                                 || self
                                     .image_scroll_settles_at
@@ -8162,43 +8154,29 @@ impl BorgTerminal {
                             {
                                 continue;
                             }
-                            if self.image_protocols.len() >= 64 {
+                            if self.image_protocols.len() >= 16 {
                                 self.image_protocols.clear();
                             }
-                            let font = picker.font_size();
-                            let fit_key = (slot.path.clone(), width, slot.rows as u16);
-                            if !self.image_fits.contains_key(&fit_key) {
-                                if self.image_fits.len() >= 8 {
-                                    self.image_fits.clear();
-                                }
-                                let Some(image) = attachments::load_preview_image(&slot.path)
-                                else {
-                                    continue;
-                                };
-                                // Fit once for the full tile, not once for each scroll clip.
-                                let fitted = Resize::Fit(None).resize(
-                                    &image,
-                                    font,
-                                    ratatui::layout::Size::new(width, slot.rows as u16),
-                                    None,
-                                );
-                                self.image_fits.insert(fit_key.clone(), fitted);
-                            }
-                            let fitted = &self.image_fits[&fit_key];
-                            let visible = fitted.crop_imm(
-                                0,
-                                skipped_rows as u32 * u32::from(font.height),
-                                fitted.width(),
-                                u32::from(area.height) * u32::from(font.height),
-                            );
-                            self.image_protocols
-                                .insert(key.clone(), picker.new_resize_protocol(visible));
+                            let Some(image) = attachments::load_preview_image(&slot.path) else {
+                                continue;
+                            };
+                            let Ok(protocol) = SlicedProtocol::new_with_resize(
+                                picker,
+                                image,
+                                ratatui::layout::Size::new(area.width, slot.rows as u16),
+                                Resize::Fit(None),
+                            ) else {
+                                continue;
+                            };
+                            self.image_protocols.insert(key.clone(), protocol);
                         }
-                        if let Some(protocol) = self.image_protocols.get_mut(&key) {
-                            frame.render_stateful_widget(
-                                StatefulImage::<StatefulProtocol>::new().resize(Resize::Fit(None)),
+                        if let Some(protocol) = self.image_protocols.get(&key) {
+                            frame.render_widget(
+                                SlicedImage::new(
+                                    protocol,
+                                    SignedPosition::from((0, -(skipped_rows as i16))),
+                                ),
                                 area,
-                                protocol,
                             );
                         }
                     }
