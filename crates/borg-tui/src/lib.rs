@@ -88,7 +88,6 @@ const BORG_ORANGE: Color = Color::Rgb(255, 142, 36);
 const BORG_ORANGE_HOVER: Color = Color::Rgb(255, 184, 92);
 const RUNNING_STATUS_PEACH: Color = Color::Rgb(255, 132, 112);
 const SUBAGENT_PINK: Color = Color::Rgb(255, 105, 180);
-const SUBAGENT_PINK_HOVER: Color = Color::Rgb(255, 170, 215);
 const USER_LABEL_BLUE: Color = Color::Rgb(74, 163, 255);
 const USER_TEXT: Color = Color::Rgb(198, 228, 255);
 const BACKGROUND_RUNNING_TEXT: Color = Color::Rgb(142, 199, 255);
@@ -129,8 +128,8 @@ const DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT: usize = 8;
 const MIN_TOOL_RUN_VIEWPORT_HEIGHT: usize = 6;
 const MAX_TOOL_RUN_VIEWPORT_HEIGHT: usize = 30;
 const TOOL_RUN_CHROME_HEIGHT: usize = 2;
-const MIN_SCROLLBAR_THUMB_ROWS: u16 = 5;
-const TRANSCRIPT_SCROLLBAR_GUTTER_WIDTH: u16 = 3;
+const MIN_SCROLLBAR_THUMB_ROWS: u16 = 6;
+const TRANSCRIPT_SCROLLBAR_GUTTER_WIDTH: u16 = 2;
 const DICTATION_BUTTON_WIDTH: u16 = 6;
 const DICTATION_EMOJI_ICON: &str = "🎤";
 const DICTATION_NERD_FONT_ICON: &str = "󰍬";
@@ -7945,7 +7944,7 @@ impl BorgTerminal {
             }
             if !is_launch_screen {
                 frame.render_widget(
-                    Block::default().style(Style::default().bg(Color::Black)),
+                    Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0))),
                     Rect {
                         y: chunks[0].bottom().saturating_sub(1),
                         height: chunks[0].height.min(1),
@@ -8340,24 +8339,19 @@ impl BorgTerminal {
                     let rows = (0..area.height)
                         .map(|row| {
                             let in_thumb = row >= thumb_top && row < thumb_top + thumb_height;
-                            Line::from(Span::styled(
-                                " 🮈▍",
-                                Style::default().fg(if in_thumb {
-                                    if self.focused_child.is_some() {
-                                        if self.scrollbar_hovered || self.dragging_scrollbar {
-                                            SUBAGENT_PINK_HOVER
-                                        } else {
-                                            SUBAGENT_PINK
-                                        }
-                                    } else if self.scrollbar_hovered || self.dragging_scrollbar {
-                                        BORG_ORANGE_HOVER
+                            let (glyph, color) = if in_thumb {
+                                (
+                                    " ▐",
+                                    if self.scrollbar_hovered || self.dragging_scrollbar {
+                                        Color::Rgb(205, 214, 226)
                                     } else {
-                                        BORG_ORANGE
-                                    }
-                                } else {
-                                    Color::DarkGray
-                                }),
-                            ))
+                                        Color::Rgb(155, 165, 180)
+                                    },
+                                )
+                            } else {
+                                (" ▕", Color::Rgb(67, 72, 81))
+                            };
+                            Line::from(Span::styled(glyph, Style::default().fg(color)))
                         })
                         .collect::<Vec<_>>();
                     frame.render_widget(Paragraph::new(rows), area);
@@ -8436,7 +8430,7 @@ impl BorgTerminal {
             }
             if !is_launch_screen {
                 frame.render_widget(
-                    Block::default().style(Style::default().bg(COMMAND_PANEL_BG)),
+                    Block::default().style(Style::default().bg(COMPOSER_BG)),
                     Rect {
                         x: area.x,
                         y: composer_area.y,
@@ -9192,7 +9186,7 @@ impl BorgTerminal {
                 };
                 frame.render_widget(
                     Paragraph::new(controls)
-                        .style(Style::default().fg(Color::DarkGray).bg(COMMAND_PANEL_BG)),
+                        .style(Style::default().fg(Color::DarkGray).bg(COMPOSER_BG)),
                     controls_area,
                 );
                 if footer_metadata.is_some() && metadata_width > 0 {
@@ -9223,7 +9217,7 @@ impl BorgTerminal {
                     frame.render_widget(
                         Paragraph::new(metadata_line)
                             .alignment(Alignment::Right)
-                            .style(Style::default().bg(COMMAND_PANEL_BG)),
+                            .style(Style::default().bg(COMPOSER_BG)),
                         metadata_rect,
                     );
                     self.git_status_area = footer_git_status
@@ -9450,7 +9444,7 @@ impl BorgTerminal {
                 frame.render_widget(Clear, copy_area);
                 frame.render_widget(
                     Paragraph::new(copy_notice_line(notice.to_string()))
-                        .style(Style::default().bg(COMMAND_PANEL_BG)),
+                        .style(Style::default().bg(COMPOSER_BG)),
                     copy_area,
                 );
             }
