@@ -7900,11 +7900,7 @@ impl BorgTerminal {
                 )
             } else {
                 (
-                    Rect {
-                        y: chunks[2].y.saturating_add(1),
-                        height: chunks[2].height.saturating_sub(1),
-                        ..chunks[2]
-                    },
+                    chunks[2],
                     Rect {
                         height: chunks[0].height.saturating_sub(1),
                         ..chunks[0]
@@ -7969,8 +7965,12 @@ impl BorgTerminal {
             }
             if !is_launch_screen {
                 frame.render_widget(
-                    Block::default().style(Style::default().bg(COMMAND_PANEL_BG)),
-                    chunks[2],
+                    Block::default().style(Style::default().bg(Color::Black)),
+                    Rect {
+                        y: chunks[0].bottom().saturating_sub(1),
+                        height: chunks[0].height.min(1),
+                        ..chunks[0]
+                    },
                 );
             }
             if !transcript_area.is_empty() {
@@ -8394,7 +8394,7 @@ impl BorgTerminal {
                 let button_width = label.width() as u16;
                 let button = Rect {
                     x: chunks[2].right().saturating_sub(button_width + 1),
-                    y: chunks[2].y,
+                    y: chunks[0].bottom().saturating_sub(1),
                     width: button_width,
                     height: 1,
                 };
@@ -8409,7 +8409,7 @@ impl BorgTerminal {
                             .bg(if self.jump_to_bottom_hovered {
                                 MESSAGE_HOVER_BG
                             } else {
-                                COMMAND_PANEL_BG
+                                Color::Black
                             }),
                     ),
                     button,
@@ -14755,7 +14755,7 @@ fn terminal_vertical_chunks(
         .constraints([
             Constraint::Min(3),
             Constraint::Length(queued_height),
-            Constraint::Length(2 * u16::from(!is_launch_screen)),
+            Constraint::Length(u16::from(!is_launch_screen)),
             // On the launch screen the composer is nested in chunk zero. Do
             // not reserve it a second time at the bottom of the root layout.
             Constraint::Length(composer_height * u16::from(!is_launch_screen)),
