@@ -2877,6 +2877,13 @@ async fn run_local_agent_session(
     let mut session_host_idle_since = None;
     let mut last_ctrl_c = None;
     let mut terminal_dirty = false;
+    // Rebuilding from durable history while a coalesced live row is on screen
+    // would roll that row back to its first-paint snapshot.
+    let mut transcript_live_tail = history
+        .iter()
+        .any(|event| event.sequence == 0 && coalesced_transcript_event(&event.kind));
+    let mut history_has_coalesced_events = history.iter().any(|event| event.sequence == 0);
+    let mut transcript_rebuild_pending = false;
     let mut interaction_dirty = false;
     let mut tool_started_frame_hold_until = None;
     let mut tui_fps = tui_refresh_rate(u64::from(editor_preferences.presentation.refresh_rate_fps));
@@ -3511,7 +3518,11 @@ async fn run_local_agent_session(
                                 &team_snapshots,
                                 &child_histories,
                             );
-                            terminal.replace_history(&history);
+                            if transcript_live_tail {
+                                transcript_rebuild_pending = true;
+                            } else {
+                                terminal.replace_history(&history);
+                            }
                             terminal_dirty = true;
                         }
                     }
@@ -3519,7 +3530,11 @@ async fn run_local_agent_session(
                         tracing::warn!(%error, "could not hydrate subagent history after first paint");
                         if let Some(terminal) = terminal.as_mut() {
                             terminal.finish_child_history_hydration();
-                            terminal.replace_history(&history);
+                            if transcript_live_tail {
+                                transcript_rebuild_pending = true;
+                            } else {
+                                terminal.replace_history(&history);
+                            }
                             terminal_dirty = true;
                         }
                     }
@@ -3527,7 +3542,11 @@ async fn run_local_agent_session(
                         tracing::warn!(%error, "subagent history hydration task failed");
                         if let Some(terminal) = terminal.as_mut() {
                             terminal.finish_child_history_hydration();
-                            terminal.replace_history(&history);
+                            if transcript_live_tail {
+                                transcript_rebuild_pending = true;
+                            } else {
+                                terminal.replace_history(&history);
+                            }
                             terminal_dirty = true;
                         }
                     }
@@ -3561,8 +3580,12 @@ async fn run_local_agent_session(
                         merge_tui_history_page(&mut history, older);
                         history_start_reached = history_page_before_sequence <= 1;
                         if let Some(terminal) = terminal.as_mut() {
-                            terminal.replace_history(&history);
-                            terminal.seed_session_state(delivered_projection.state());
+                            if transcript_live_tail {
+                                transcript_rebuild_pending = true;
+                            } else {
+                                terminal.replace_history(&history);
+                                terminal.seed_session_state(delivered_projection.state());
+                            }
                             terminal_dirty = true;
                         }
                     }
@@ -4075,11 +4098,32 @@ async fn run_local_agent_session(
                     tracing::info!(%session_id, "recovering obsolete owner after schema rejection");
                 } else if let Some(terminal) = terminal.as_mut() {
                     terminal_dirty |= terminal.apply_session_event(&event);
+                    if event.sequence == 0 && coalesced_transcript_event(&event.kind) {
+                        transcript_live_tail = true;
+                    }
                     if history
                         .last()
                         .is_none_or(|loaded| loaded.sequence < event.sequence)
                     {
                         history.push(event.clone());
+                    }
+                    if matches!(
+                        &event.kind,
+                        SessionEventKind::TurnCompleted { error: None, .. }
+                    ) {
+                        // A successful durable turn boundary supersedes its
+                        // coalesced streaming snapshots.
+                        if history_has_coalesced_events {
+                            history.retain(|event| event.sequence > 0);
+                            history_has_coalesced_events = false;
+                        }
+                        transcript_live_tail = false;
+                    }
+                    if transcript_rebuild_pending && !transcript_live_tail {
+                        terminal.replace_history(&history);
+                        terminal.seed_session_state(delivered_projection.state());
+                        transcript_rebuild_pending = false;
+                        terminal_dirty = true;
                     }
                     if terminal_dirty && session_event_needs_immediate_frame(&event.kind) {
                         if render_frame_interval <= ACTIVITY_FRAME_INTERVAL {
@@ -8393,6 +8437,21 @@ async fn recent_tui_history(
         events: selected,
         page_before,
     })
+}
+
+fn coalesced_transcript_event(kind: &SessionEventKind) -> bool {
+    match kind {
+        SessionEventKind::Message {
+            actor: EventActor::User | EventActor::Assistant,
+            ..
+        }
+        | SessionEventKind::ReasoningDelta { .. } => true,
+        SessionEventKind::ProviderEvent { kind, .. } => matches!(
+            kind.as_str(),
+            "action/preparing" | "action/generation_status" | "tool_call_started"
+        ),
+        _ => false,
+    }
 }
 
 fn recent_tui_history_after(latest_sequence: u64) -> u64 {

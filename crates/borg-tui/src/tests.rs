@@ -902,6 +902,43 @@ fn child_history_merge_uses_journal_order_when_timestamps_invert() {
 }
 
 #[test]
+fn child_history_merge_keeps_live_reasoning_before_its_completion() {
+    let session_id = Uuid::new_v4();
+    let now = Utc::now();
+    let mut delta = SessionEvent::new(
+        session_id,
+        0,
+        SessionEventKind::ReasoningDelta {
+            text: "Checking the source".to_string(),
+        },
+    );
+    delta.created_at = now;
+    let mut completed = SessionEvent::new(session_id, 2, SessionEventKind::ReasoningCompleted);
+    completed.created_at = now + chrono::Duration::milliseconds(1);
+
+    let events = merge_child_history(&[completed], vec![delta]);
+    assert!(matches!(
+        events[0].kind,
+        SessionEventKind::ReasoningDelta { .. }
+    ));
+    assert!(matches!(
+        events[1].kind,
+        SessionEventKind::ReasoningCompleted
+    ));
+    let mut transcript = Transcript::default();
+    for event in &events {
+        transcript.apply(event);
+    }
+    assert!(matches!(
+        transcript.order.first(),
+        Some(TranscriptEntry::Tool {
+            completed_at: Some(_),
+            ..
+        })
+    ));
+}
+
+#[test]
 fn child_transcript_starts_with_a_director_context_boundary() {
     let mut transcript = Transcript::default();
     transcript.show_director_context_boundary();
