@@ -63,6 +63,18 @@ pub struct RestartPolicy {
     pub max_restarts: u32,
     pub backoff_ms: u64,
     pub debounce_ms: u64,
+    /// Exit codes an active or candidate backend may end with to be
+    /// relaunched after `backoff_ms` without counting as a failure toward
+    /// `max_restarts` (`restarts` still counts it).
+    #[serde(default)]
+    pub transient_exit_codes: Vec<i32>,
+}
+
+impl RestartPolicy {
+    fn transient(&self, exit: Option<std::process::ExitStatus>) -> Option<i32> {
+        exit.and_then(|status| status.code())
+            .filter(|code| self.transient_exit_codes.contains(code))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1549,15 +1561,34 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             }
         }
         if let Some(b) = candidate.as_mut() {
-            let gone = b.child.try_wait()?.is_some();
+            let exit = b.child.try_wait()?;
             let overdue = now.saturating_sub(b.started_ms) >= spec.readiness_timeout_ms;
-            if gone || overdue {
+            if exit.is_some() || overdue {
                 stop_child(&mut b.child, &spec, b.port, b.scope.as_deref()).await?;
                 candidate = None;
-                failures += 1;
-                next_launch = now + backoff(&spec, failures);
+                let transient = spec.restart.transient(exit);
+                next_launch = match transient {
+                    Some(_) => now + spec.restart.backoff_ms,
+                    None => {
+                        failures += 1;
+                        now + backoff(&spec, failures)
+                    }
+                };
                 status.restarts += 1;
-                if failures > spec.restart.max_restarts {
+                if let Some(code) = transient {
+                    let reason = format!("backend exited with transient code {code}");
+                    transition(
+                        &dir,
+                        &mut status,
+                        &front,
+                        ServiceState::Degraded {
+                            reason: reason.clone(),
+                        },
+                        reason,
+                        active.as_ref().and_then(|b| b.port),
+                    )
+                    .await?;
+                } else if failures > spec.restart.max_restarts {
                     transition(
                         &dir,
                         &mut status,
@@ -1615,16 +1646,21 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             }
         }
         if let Some(b) = active.as_mut() {
-            if b.child.try_wait()?.is_some() {
+            if let Some(exit) = b.child.try_wait()? {
                 let mut dead = active.take().expect("active present");
+                let transient = spec.restart.transient(Some(exit));
+                let reason = match transient {
+                    Some(code) => format!("backend exited with transient code {code}"),
+                    None => "backend crashed".to_owned(),
+                };
                 transition(
                     &dir,
                     &mut status,
                     &front,
                     ServiceState::Degraded {
-                        reason: "backend crashed".into(),
+                        reason: reason.clone(),
                     },
-                    "backend crashed",
+                    reason,
                     None,
                 )
                 .await?;
@@ -1634,8 +1670,13 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                 stop_child(&mut dead.child, &spec, dead.port, dead.scope.as_deref()).await?;
                 status.backend_pid = None;
                 status.restarts += 1;
-                failures += 1;
-                next_launch = now + backoff(&spec, failures);
+                next_launch = match transient {
+                    Some(_) => now + spec.restart.backoff_ms,
+                    None => {
+                        failures += 1;
+                        now + backoff(&spec, failures)
+                    }
+                };
                 if let Err(error) =
                     restore_clients(&spec, &mut status, &dir, &gate, dead.port).await
                 {
@@ -2233,6 +2274,7 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
                 max_restarts: 4,
                 backoff_ms: 50,
                 debounce_ms: 200,
+                transient_exit_codes: vec![],
             },
             endpoint: Some(Endpoint {
                 listen: format!("127.0.0.1:{front}"),
@@ -3603,6 +3645,68 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
             matches!(s.state, ServiceState::Healthy { .. })
         })
         .await;
+        cleanup(&manager, task).await;
+    }
+
+    /// Failure mode: a backend that exits with a known, benign code (an
+    /// editor restarting itself) using up the restart budget and leaving
+    /// the service Failed; or any other code being treated as benign.
+    #[tokio::test]
+    async fn transient_exit_codes_relaunch_without_counting_failures() {
+        let (_root, manager, front, task) = setup_with(|spec| {
+            spec.restart.max_restarts = 0;
+            spec.restart.transient_exit_codes = vec![11];
+        })
+        .await;
+        for round in 1..=3 {
+            let before = manager.read_status("fake").unwrap();
+            let _ = get(front, "/crash").await; // exits 11
+            let after = state(&manager, |s| {
+                matches!(s.state, ServiceState::Healthy { .. })
+                    && s.backend_pid.is_some()
+                    && s.backend_pid != before.backend_pid
+            })
+            .await;
+            assert_eq!(
+                after.restarts,
+                before.restarts + 1,
+                "round {round}: {after:?}"
+            );
+        }
+        cleanup(&manager, task).await;
+
+        // Any other code still counts: with no restarts allowed, it fails.
+        let (_root, manager, front, task) = setup_with(|spec| {
+            spec.restart.max_restarts = 0;
+            spec.restart.transient_exit_codes = vec![12];
+        })
+        .await;
+        let _ = get(front, "/crash").await;
+        // The supervisor gives up (Failed, then it stops) instead of relaunching.
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("supervisor kept relaunching a non-transient exit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(manager.read_status("fake").unwrap().restarts, 1);
+    }
+
+    /// Failure mode: a replacement that exits with a transient code before it
+    /// is ready counting toward the restart limit.
+    #[tokio::test]
+    async fn a_candidate_exiting_with_a_transient_code_is_relaunched() {
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = spec(root.path());
+        spec.argv = vec!["sh".into(), "-c".into(), "exit 11".into()];
+        spec.restart.max_restarts = 0;
+        spec.restart.transient_exit_codes = vec![11];
+        let services = root.path().join("services");
+        let dir = service_dir(&services, "fake").unwrap();
+        write_json(&dir.join("spec.json"), &spec).unwrap();
+        let manager = ServiceManager::new(services.clone(), PathBuf::new());
+        let task = tokio::spawn(async move { supervise(&services, "fake").await });
+        let relaunched = state(&manager, |s| s.restarts >= 3).await;
+        assert!(!task.is_finished(), "{relaunched:?}");
         cleanup(&manager, task).await;
     }
 
