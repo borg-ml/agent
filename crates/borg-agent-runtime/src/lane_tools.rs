@@ -14,9 +14,12 @@ use borg_lanes::adapter::JobTemplate;
 use borg_lanes::lanes::{
     Access, Holder, JobHandle, JobSpec, JobState, LaneRecord, LaneStore, TicketState,
 };
-use borg_lanes::services::{ServiceManager, ServiceRequest, ServiceSpec, ServiceStatus};
+use borg_lanes::services::{
+    ClientLease, ServiceManager, ServiceRequest, ServiceSpec, ServiceStatus,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// Identity and authority fields a model might try to supply. The holder is
@@ -335,7 +338,10 @@ impl LaneTools {
                             "ticket": record.ticket.sequence,
                             "state": record.job.as_ref().map(|job| json!(job.state))
                                 .unwrap_or_else(|| json!(ticket_state_name(&record.state))),
-                            "wait_reason": record.wait_reason,
+                            "wait_reason": record
+                                .wait_reason
+                                .as_deref()
+                                .map(|reason| redact_holders(reason, caller, &[])),
                         })
                     })
                     .collect();
@@ -541,7 +547,8 @@ fn ticket_state_name(state: &TicketState) -> &'static str {
     }
 }
 
-/// Status with other sessions' identities reduced to "another session".
+/// Status as a model sees it: every holder is "you" or a tagged "another
+/// agent", including ids inside `reason` and a failed `state`.
 fn service_value(status: &ServiceStatus, caller: &Caller) -> Value {
     let clients: Vec<Value> = status
         .clients
@@ -549,21 +556,125 @@ fn service_value(status: &ServiceStatus, caller: &Caller) -> Value {
         .map(|lease| {
             json!({
                 "yours": caller.owns(&lease.owner),
+                "holder": holder_label(caller, lease.owner.participant_id, Some(lease.owner.session_id)),
                 "purpose": lease.purpose,
                 "expires_at_unix_ms": lease.expires_at_unix_ms,
             })
         })
         .collect();
+    let mut state = json!(status.state);
+    redact_strings(&mut state, caller, &status.clients);
     json!({
         "id": status.id,
-        "state": status.state,
-        "reason": status.reason,
+        "state": state,
+        "reason": redact_holders(&status.reason, caller, &status.clients),
         "endpoint": status.endpoint,
         "backend_pid": status.backend_pid,
         "restarts": status.restarts,
         "yielded": !status.yields.is_empty(),
         "clients": clients,
     })
+}
+
+/// The caller's own participant and session read "you". Anyone else is
+/// "another agent" plus a tag keyed per process: stable within one run, so
+/// holders can be told apart, but not reversible to the id. Only the human
+/// CLI shows raw holder ids.
+fn holder_label(caller: &Caller, participant: Uuid, session: Option<Uuid>) -> String {
+    if participant == caller.participant_id && session.unwrap_or(participant) == caller.session_id {
+        return "you".into();
+    }
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        let mut key = [0; 32];
+        key[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+        key[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+        key
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(key);
+    hasher.update(participant.as_bytes());
+    hasher.update(session.unwrap_or_else(Uuid::nil).as_bytes());
+    format!("another agent {}", &hex::encode(hasher.finalize())[..8])
+}
+
+/// Relabel holder ids in lane/service text: a `participant/session` pair,
+/// an id after `holder ` or `owner=` (its session found through the
+/// following `lease_id=` or the client list), and any bare id of a client
+/// or of the caller. Ticket and lease ids stay as they are.
+fn redact_holders(text: &str, caller: &Caller, clients: &[ClientLease]) -> String {
+    let client_with = |id: Uuid| {
+        clients
+            .iter()
+            .find(|c| c.owner.participant_id == id || c.owner.session_id == id)
+            .map(|c| (c.owner.participant_id, Some(c.owner.session_id)))
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((at, id)) = next_uuid(rest) {
+        let (before, after) = (&rest[..at], &rest[at + 36..]);
+        out.push_str(before);
+        let paired = after.strip_prefix('/').and_then(leading_uuid);
+        let (holder, used) = if let Some(session) = paired {
+            (Some((id, Some(session))), 73)
+        } else if before.ends_with("holder ") || before.ends_with("owner=") {
+            let leased = after
+                .strip_prefix(" lease_id=")
+                .and_then(leading_uuid)
+                .and_then(|lease| clients.iter().find(|c| c.id == lease))
+                .filter(|c| c.owner.participant_id == id)
+                .map(|c| (id, Some(c.owner.session_id)));
+            (
+                Some(leased.or_else(|| client_with(id)).unwrap_or((id, None))),
+                36,
+            )
+        } else if id == caller.session_id {
+            (Some((caller.participant_id, Some(id))), 36)
+        } else if id == caller.participant_id {
+            (Some(client_with(id).unwrap_or((id, None))), 36)
+        } else {
+            (client_with(id), 36)
+        };
+        match holder {
+            Some((participant, session)) => {
+                out.push_str(&holder_label(caller, participant, session))
+            }
+            None => out.push_str(&rest[at..at + used]),
+        }
+        rest = &rest[at + used..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn redact_strings(value: &mut Value, caller: &Caller, clients: &[ClientLease]) {
+    match value {
+        Value::String(text) => *text = redact_holders(text, caller, clients),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| redact_strings(item, caller, clients)),
+        Value::Object(fields) => fields
+            .values_mut()
+            .for_each(|item| redact_strings(item, caller, clients)),
+        _ => {}
+    }
+}
+
+/// The first hyphenated UUID in `text` that is not part of a longer token.
+fn next_uuid(text: &str) -> Option<(usize, Uuid)> {
+    let bytes = text.as_bytes();
+    let token = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'-';
+    (0..bytes.len().saturating_sub(35)).find_map(|at| {
+        if (at > 0 && token(bytes[at - 1])) || bytes.get(at + 36).is_some_and(|&b| token(b)) {
+            return None;
+        }
+        let id = Uuid::try_parse(text.get(at..at + 36)?).ok()?;
+        Some((at, id))
+    })
+}
+
+fn leading_uuid(text: &str) -> Option<Uuid> {
+    next_uuid(text).and_then(|(at, id)| (at == 0).then_some(id))
 }
 
 /// Capture-class read: a GET of an exact audited read-only path through the
@@ -831,6 +942,28 @@ pub(crate) mod tests {
         write_test_service(&fixture.tools.root, &fixture.project, owner);
     }
 
+    /// An exclusive job by `waiter`, Preparing on the "editor" service, whose
+    /// wait reason names `foreign`'s client lease as the lane journal does.
+    pub(crate) fn plant_foreign_wait(root: &Path, waiter: &Caller, foreign: &Caller) {
+        let record = json!({
+            "ticket": {"id": Uuid::new_v4(), "sequence": 1},
+            "request": {"resources": [], "holder": waiter.holder("exclusive"), "queue_timeout_ms": null},
+            "state": "Preparing", "job": null, "spec": null, "created_ms": 0,
+            "started_ms": null, "finished_ms": null, "supervisor_pid": null,
+            "wait_reason": format!(
+                "foreign client lease: service editor holder {}/{} until {} or grace indefinite",
+                foreign.participant_id, foreign.session_id, u64::MAX
+            ),
+            "progress": null, "parallelism_hint": null, "cpu_seconds": null,
+            "evidence": null, "yield_services": ["editor"],
+        });
+        std::fs::write(
+            root.join("state.json"),
+            json!({"sequence": 1, "records": [record], "capacities": []}).to_string(),
+        )
+        .unwrap();
+    }
+
     /// A registered "editor" service bound to `project`, leased by `owner`.
     pub(crate) fn write_test_service(root: &Path, project: &Path, owner: Option<&Caller>) {
         let directory = root.join("services").join("editor");
@@ -988,6 +1121,120 @@ pub(crate) mod tests {
             error.to_string().contains("borg lane job submit --spec"),
             "{error}"
         );
+    }
+
+    /// Failure mode: a model reading another agent's participant or session
+    /// id from lane/service text -- a foreign-client notice or a failed
+    /// client restore, in `reason` or a failed `state`.
+    #[test]
+    fn model_facing_reasons_relabel_every_holder() {
+        let me = caller(1);
+        let other = caller(2);
+        let third = caller(3);
+        let notice = |holder: &Caller| {
+            format!(
+                "foreign client lease: service editor holder {}/{} until 1790000000000 or grace indefinite",
+                holder.participant_id, holder.session_id
+            )
+        };
+        let restore = |owner: &Caller, lease: u128| {
+            format!(
+                "restore client owner={} lease_id={} failed: service hook failed: exit status: 4",
+                owner.participant_id,
+                Uuid::from_u128(lease)
+            )
+        };
+        let lease = |owner: &Caller, id: u128| ClientLease {
+            id: Uuid::from_u128(id),
+            service_id: "editor".into(),
+            owner: owner.holder("editing"),
+            expires_at_unix_ms: u64::MAX,
+            purpose: "editing".into(),
+        };
+        let clients = [lease(&me, 70), lease(&other, 71)];
+        assert_eq!(
+            redact_holders(&notice(&me), &me, &[]),
+            "foreign client lease: service editor holder you until 1790000000000 or grace indefinite"
+        );
+        assert!(
+            redact_holders(&restore(&me, 70), &me, &clients).starts_with(&format!(
+                "restore client owner=you lease_id={}",
+                Uuid::from_u128(70)
+            ))
+        );
+        // One foreign holder keeps one tag across both shapes; another differs.
+        let tagged = redact_holders(&notice(&other), &me, &clients);
+        let tag = tagged["foreign client lease: service editor holder ".len()..]
+            .split(" until")
+            .next()
+            .unwrap()
+            .to_owned();
+        assert!(
+            tag.starts_with("another agent ") && tag.len() == "another agent ".len() + 8,
+            "{tagged}"
+        );
+        assert!(
+            redact_holders(&restore(&other, 71), &me, &clients)
+                .contains(&format!("owner={tag} lease_id=")),
+        );
+        assert_ne!(redact_holders(&notice(&third), &me, &clients), tagged);
+        let status = ServiceStatus {
+            id: "editor".into(),
+            state: ServiceState::Failed {
+                reason: restore(&other, 71),
+            },
+            endpoint: None,
+            clients: clients.to_vec(),
+            reason: format!("{}; {}", restore(&other, 71), notice(&third)),
+            backend_pid: None,
+            supervisor_pid: None,
+            restarts: 0,
+            yields: Default::default(),
+        };
+        let shown = service_value(&status, &me).to_string();
+        for id in [
+            other.participant_id,
+            other.session_id,
+            third.participant_id,
+            third.session_id,
+        ] {
+            assert!(!shown.contains(&id.to_string()), "{shown}");
+        }
+        assert!(shown.contains(&tag), "{shown}");
+    }
+
+    /// Failure mode: a queued exclusive's own session seeing the foreign
+    /// client it waits on by id, through `lane_job list` or service status.
+    #[tokio::test]
+    async fn foreign_client_waits_name_no_ids_to_models() {
+        let fixture = fixture();
+        let (me, other) = (caller(1), caller(2));
+        bind_service(&fixture, Some(&other));
+        plant_foreign_wait(&fixture.tools.root, &me, &other);
+        let (listed, _) = fixture.tools.job(&me, json!({"op": "list"})).await.unwrap();
+        let reason = listed["jobs"][0]["wait_reason"].as_str().unwrap();
+        assert!(reason.contains("holder another agent "), "{reason}");
+        for viewer in [&me, &other, &caller(3)] {
+            let status = fixture
+                .tools
+                .service(viewer, json!({"op": "status", "id": "editor"}))
+                .await
+                .unwrap();
+            let shown = status.to_string();
+            assert!(shown.contains("foreign client lease"), "{shown}");
+            for id in [other.participant_id, other.session_id] {
+                assert!(!shown.contains(&id.to_string()), "{shown}");
+            }
+            let own = std::ptr::eq(viewer, &other);
+            assert_eq!(
+                status["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("holder you until"),
+                own
+            );
+            assert_eq!(status["clients"][0]["holder"] == "you", own);
+        }
     }
 
     /// Failure mode: one session acting with another's service lease

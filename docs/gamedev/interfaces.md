@@ -128,6 +128,13 @@ nonexclusive jobs and service lease/read tools and defer lease-respecting
 preemption to v0.1. A CLI accessible through a shell is not a security
 boundary, so do not market this fallback as a sandbox.
 
+The MCP bridge never shows a model another agent's participant or session id.
+In service `reason`, `state` and client entries, and in a job's `wait_reason`,
+the caller's own holder reads `you`. Any other holder reads `another agent`
+plus an 8-hex tag: a SHA-256 keyed with a per-process random key, so holders
+can be told apart within one run but the ids cannot be recovered. Timing,
+ticket and lease ids are kept. The human `borg lane` CLI shows full ids.
+
 ## Workspace contract
 
 `workspace::{WorktreeSpec,WorktreeRecord,CachePolicy,FreezeRequest,Freeze,
