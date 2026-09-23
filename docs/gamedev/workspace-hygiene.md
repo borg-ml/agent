@@ -34,7 +34,10 @@ record in the Git common directory is only a handshake.
   call `assess_budget(&AdmissionBudget, reserved_ram, reserved_disk)` at
   dispatch and queue with its explicit reason; this is an API and **not** a
   substitute for an actual lane supervisor maintaining cross-process
-  reservations.
+  reservations. For concurrent builds in distinct directories on the same
+  volume, use `workspace::same_filesystem(path_a, path_b)` to sum disk
+  reservations by device rather than comparing `disk_path` strings. The lane
+  dispatch code must invoke this under its admission lock.
 - A session can create a Borg command watch over `borg worktree --project P
   monitor --interval-secs 60` with `notify_on=match` and pattern
   `workspace pressure`. The timer emits only on pressure; it is not an
