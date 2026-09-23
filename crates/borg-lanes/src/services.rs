@@ -499,10 +499,28 @@ async fn probe(spec: &ServiceSpec, port: Option<u16>) -> bool {
                 } else { "" };
                 let method = if body.is_empty() { "GET" } else { "POST" };
                 stream.write_all(format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
-                let mut reply = vec![0; 4096];
-                let count = stream.read(&mut reply).await?;
-                let response = String::from_utf8_lossy(&reply[..count]);
-                Ok(response.starts_with("HTTP/1.1 2") || response.starts_with("HTTP/1.0 2"))
+                let mut reply = Vec::new();
+                loop {
+                    let mut buf = [0; 4096];
+                    let count = stream.read(&mut buf).await?;
+                    if count == 0 { return Ok(false); }
+                    reply.extend_from_slice(&buf[..count]);
+                    ensure!(reply.len() <= 16_384, "health response too large");
+                    let Some(head_end) = reply.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                    let head = &reply[..head_end];
+                    let success = head.starts_with(b"HTTP/1.1 2") || head.starts_with(b"HTTP/1.0 2");
+                    if !success || matches!(spec.health.kind, HealthKind::Http) { return Ok(success); }
+                    let body = String::from_utf8_lossy(&reply[head_end + 4..]);
+                    for line in body.lines() {
+                        let value = line.trim().strip_prefix("data: ").unwrap_or(line.trim());
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(value) {
+                            if json.get("error").is_some() { return Ok(false); }
+                            if json.pointer("/result/protocolVersion").and_then(|v| v.as_str()).is_some() {
+                                return Ok(true);
+                            }
+                        }
+                    }
+                }
             }
         }
     }).await.is_ok_and(|result: Result<bool>| result.unwrap_or(false))
@@ -1435,6 +1453,10 @@ port, record, flag = int(sys.argv[1]), sys.argv[2], sys.argv[3]
 with open(record, 'a') as f: f.write(str(port) + '\n')
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args): pass
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get('Content-Length', '0')))
+        data = b'{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}' if self.path == '/mcp' else b'{}'
+        self.send_response(200); self.send_header('Content-Length', str(len(data))); self.end_headers(); self.wfile.write(data)
     def do_GET(self):
         if self.path == '/crash': os._exit(11)
         if os.path.exists(flag) and self.path == '/health': time.sleep(2)
@@ -1839,6 +1861,23 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
                 .unwrap()
                 .contains(&second.participant_id.to_string())
         );
+        cleanup(&manager, task).await;
+    }
+
+    #[tokio::test]
+    async fn mcp_probe_requires_initialize_result_not_just_http_200() {
+        let (root, manager, _front, task) = setup().await;
+        let mut spec: ServiceSpec = read_json(&manager.root.join("fake/spec.json")).unwrap();
+        spec.health.kind = HealthKind::McpInitialize;
+        spec.health.argv = vec!["/mcp".into()];
+        let port = manager.read_status("fake").unwrap().state_backend();
+        assert!(probe(&spec, port).await);
+        spec.health.argv = vec!["/invalid".into()];
+        assert!(
+            !probe(&spec, port).await,
+            "HTTP 200 without MCP result is unhealthy"
+        );
+        assert!(root.path().join("launches").exists());
         cleanup(&manager, task).await;
     }
 
