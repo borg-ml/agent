@@ -222,6 +222,7 @@ pub struct AgentToolDispatcher {
     resource_limits: Option<HostResourceLimits>,
     execution_provider: Arc<RwLock<Arc<dyn crate::ExecutionProvider>>>,
     persistent_runtimes: PersistentRuntimeRegistry,
+    #[cfg(unix)]
     lanes: crate::lane_tools::LaneTools,
     runtime_mcp: Arc<Mutex<RuntimeMcpState>>,
     harness_lock: Arc<Mutex<()>>,
@@ -828,6 +829,7 @@ impl AgentToolDispatcher {
             resource_limits: None,
             execution_provider: Arc::new(RwLock::new(execution_provider)),
             persistent_runtimes: PersistentRuntimeRegistry::default(),
+            #[cfg(unix)]
             lanes: crate::lane_tools::LaneTools::default(),
             runtime_mcp: Arc::new(Mutex::new(RuntimeMcpState::default())),
             harness_lock: Arc::new(Mutex::new(())),
@@ -838,6 +840,7 @@ impl AgentToolDispatcher {
 
     /// The lanes/services caller: always this dispatcher's own session, so a
     /// sub-agent never acts with its parent's (or anyone's) leases.
+    #[cfg(unix)]
     fn lane_caller(&self) -> crate::lane_tools::Caller {
         crate::lane_tools::Caller {
             participant_id: self
@@ -849,7 +852,7 @@ impl AgentToolDispatcher {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_lane_tools(mut self, lanes: crate::lane_tools::LaneTools) -> Self {
         self.lanes = lanes;
         self
@@ -1792,6 +1795,7 @@ impl AgentToolDispatcher {
                     result = self.persistent_runtimes.computer_use(self.actor_session_id, arguments) => result,
                 }
             }
+            #[cfg(unix)]
             "lane_job" | "lane_service" => {
                 ensure!(
                     self.runtime_permission == crate::PermissionMode::FullAccess
@@ -1947,6 +1951,7 @@ impl AgentToolDispatcher {
                         .await,
                 )
             }
+            #[cfg(unix)]
             "lane_workspace" => {
                 let args: LaneWorkspaceArgs = serde_json::from_value(arguments)?;
                 self.call_lane_workspace(args).await
@@ -6806,14 +6811,6 @@ pub fn agent_tool_specs_for_surface(
                 "required": ["op"], "additionalProperties": false
             }),
         ),
-        {
-            let (name, description, schema) = crate::lane_tools::lane_job_spec();
-            tool(name, description, schema)
-        },
-        {
-            let (name, description, schema) = crate::lane_tools::lane_service_spec();
-            tool(name, description, schema)
-        },
         tool(
             "list_files",
             "List one workspace directory without following symlinks.",
@@ -7169,6 +7166,13 @@ pub fn agent_tool_specs_for_surface(
             }),
         ),
     ];
+    #[cfg(unix)]
+    for (name, description, schema) in [
+        crate::lane_tools::lane_job_spec(),
+        crate::lane_tools::lane_service_spec(),
+    ] {
+        specs.push(tool(name, description, schema));
+    }
     if surface.web_search {
         specs.push(web_search_tool_spec());
     }
@@ -7230,7 +7234,7 @@ pub fn agent_tool_specs_for_surface(
             )
         });
     }
-    if surface.shared_work {
+    if cfg!(unix) && surface.shared_work {
         specs.push(tool(
             "lane_workspace",
             "Manage local Git worktrees and a shared-work-linked freeze handshake. GC is read-only from MCP; deletion requires a human at the local CLI terminal with journal-confirmed exited owner. Freeze is advisory until the exclusive project lane is acquired; first create/claim shared_work and communicate with affected agents.",
@@ -8911,6 +8915,7 @@ mod socket_path_tests {
     }
 }
 
+#[cfg(unix)]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LaneWorkspaceArgs {
@@ -8931,6 +8936,7 @@ struct LaneWorkspaceArgs {
     cap_gib: Option<u64>,
 }
 
+#[cfg(unix)]
 impl AgentToolDispatcher {
     async fn call_lane_workspace(&self, args: LaneWorkspaceArgs) -> Result<Value> {
         use borg_lanes::workspace::hygiene;

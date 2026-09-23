@@ -162,7 +162,9 @@ pub fn disk_available(path: &Path) -> Result<u64> {
     );
     // SAFETY: statvfs succeeded and initialized the allocation.
     let stat = unsafe { stat.assume_init() };
-    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+    // fsblkcnt_t and c_ulong are narrower than u64 on some Unixes (macOS).
+    #[allow(clippy::unnecessary_cast)]
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
 #[cfg(not(unix))]
