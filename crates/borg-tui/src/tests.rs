@@ -9433,18 +9433,18 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
     }];
     let six = (0..6).map(|_| prompts[0].clone()).collect::<Vec<_>>();
     let seven = (0..7).map(|_| prompts[0].clone()).collect::<Vec<_>>();
-    assert_eq!(queued_prompt_panel_height(&[], 60), 0);
-    assert_eq!(queued_prompt_panel_height(&prompts, 60), 3);
-    assert_eq!(queued_prompt_panel_height(&six, 60), 8);
-    assert_eq!(queued_prompt_panel_height(&seven, 60), 9);
+    assert_eq!(queued_prompt_panel_height(&[], 60, true), 0);
+    assert_eq!(queued_prompt_panel_height(&prompts, 60, true), 3);
+    assert_eq!(queued_prompt_panel_height(&six, 60, true), 8);
+    assert_eq!(queued_prompt_panel_height(&seven, 60, true), 9);
 
-    let area = Rect::new(0, 0, 60, queued_prompt_panel_height(&prompts, 60));
+    let area = Rect::new(0, 0, 60, queued_prompt_panel_height(&prompts, 60, true));
     let mut buffer = ratatui::buffer::Buffer::empty(area);
     let widget = Paragraph::new(queued_prompt_lines(&prompts, area.width, None)).block(
         Block::default()
             .borders(Borders::TOP | Borders::LEFT)
             .border_style(Style::default().fg(Color::DarkGray))
-            .title(" Pending Input · 1 "),
+            .title(pending_input_title(UiLanguage::Auto, 1, true, area.width)),
     );
     ratatui::widgets::Widget::render(widget, area, &mut buffer);
     let content = (0..area.width)
@@ -9456,6 +9456,100 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
     assert!(content.contains("Next"));
     assert!(content.contains("visible follow-up"));
     assert!(hint.contains("↑ edit / recall pending"));
+}
+
+#[test]
+fn collapsed_pending_input_keeps_the_queue_count_and_reclaims_transcript_rows() {
+    let prompts = (0..23)
+        .map(|_| PendingPromptProjection {
+            message_id: Uuid::new_v4(),
+            text: "long pending input ".repeat(15),
+            delivery: PromptDelivery::Queue,
+        })
+        .collect::<Vec<_>>();
+    assert!(queued_prompt_panel_height(&prompts, 80, true) > 20);
+    assert_eq!(queued_prompt_panel_height(&prompts, 80, false), 1);
+
+    let area = Rect::new(0, 0, 80, 1);
+    let mut buffer = ratatui::buffer::Buffer::empty(area);
+    let widget = Paragraph::new(Vec::<Line>::new()).block(
+        Block::default()
+            .borders(Borders::TOP | Borders::LEFT)
+            .title(pending_input_title(
+                UiLanguage::Auto,
+                prompts.len(),
+                false,
+                area.width,
+            )),
+    );
+    ratatui::widgets::Widget::render(widget, area, &mut buffer);
+    let header = (0..area.width)
+        .map(|x| buffer[(x, 0)].symbol())
+        .collect::<String>();
+    assert!(header.contains("Pending Input · 23 · click to expand"));
+    assert!(!header.contains("long pending input"));
+    for (width, expected) in [(20, "23 pending"), (8, "▸ 23")] {
+        let narrow = Rect::new(0, 0, width, 1);
+        let mut buffer = ratatui::buffer::Buffer::empty(narrow);
+        let widget = Paragraph::new(Vec::<Line>::new()).block(
+            Block::default()
+                .borders(Borders::TOP | Borders::LEFT)
+                .title(pending_input_title(UiLanguage::Auto, 23, false, width)),
+        );
+        ratatui::widgets::Widget::render(widget, narrow, &mut buffer);
+        let header = (0..width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect::<String>();
+        assert!(header.contains(expected), "{header}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires a PTY; verifies Pending Input title click and empty-queue hit area"]
+async fn pending_input_title_click_toggles_and_empty_queue_clears_hit_area() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        Uuid::new_v4(),
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    terminal.queued_prompts.push(PendingPromptProjection {
+        message_id: Uuid::new_v4(),
+        text: "visible follow-up".to_string(),
+        delivery: PromptDelivery::Queue,
+    });
+    let click = |area: Rect| TerminalInputEvent {
+        event: Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x.saturating_add(1),
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        }),
+        scroll_repetitions: 1,
+    };
+
+    terminal.draw().unwrap();
+    let header = terminal.pending_input_header_area.unwrap();
+    assert_eq!(header.height, 1);
+    assert!(matches!(
+        terminal.handle_event(click(header)).unwrap(),
+        UiAction::None
+    ));
+    assert!(!terminal.pending_input_expanded);
+    terminal.draw().unwrap();
+    let header = terminal.pending_input_header_area.unwrap();
+    assert!(matches!(
+        terminal.handle_event(click(header)).unwrap(),
+        UiAction::None
+    ));
+    assert!(terminal.pending_input_expanded);
+
+    terminal.queued_prompts.clear();
+    terminal.draw().unwrap();
+    assert!(terminal.pending_input_header_area.is_none());
+    terminal.shutdown().await;
 }
 
 #[test]
