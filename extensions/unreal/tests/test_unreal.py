@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import unittest
@@ -277,7 +278,7 @@ class AdapterTests(unittest.TestCase):
         editor = self.engine / 'Engine/Binaries/Linux/UnrealEditor'
         quit_marker = self.root / 'quit.called'
         editor.write_text("""#!/usr/bin/env python3
-import json, sys
+import json, sys, threading
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 port = int(next(a.split('=', 1)[1] for a in sys.argv
@@ -293,6 +294,7 @@ class Handler(BaseHTTPRequestHandler):
             if tool == 'exec_console':
                 command = request['params']['arguments']['arguments']['command']
                 Path('FAKE_QUIT_MARKER').write_text(command)
+                threading.Timer(0.2, server.shutdown).start()
             result = {'content': [{'type': 'text',
                                    'text': json.dumps({'returnValue': False})}]}
         body = json.dumps({'jsonrpc': '2.0', 'id': request.get('id'),
@@ -304,7 +306,9 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
     def log_message(self, *args):
         pass
-HTTPServer(('127.0.0.1', port), Handler).serve_forever()
+server = HTTPServer(('127.0.0.1', port), Handler)
+server.serve_forever()
+server.server_close()
 """.replace('FAKE_QUIT_MARKER', str(quit_marker)))
         editor.chmod(0o755)
         def free_port():
@@ -408,6 +412,76 @@ HTTPServer(('127.0.0.1', port), Handler).serve_forever()
                     with socket.socket() as sock:
                         sock.settimeout(1)
                         self.assertNotEqual(sock.connect_ex(('127.0.0.1', port)), 0)
+
+    def test_graceful_quit_waits_for_backend_and_times_out_without_killing_it(self):
+        """Private fake MCP server: StopPIE -> QUIT -> port close -> process exit."""
+        fake = self.root / 'fake_editor.py'
+        marker = self.root / 'quit-events.txt'
+        fake.write_text("""import json, sys, threading, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+port, marker, mode = int(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        request = json.loads(self.rfile.read(int(self.headers.get('Content-Length', '0'))))
+        if request.get('method') == 'tools/call':
+            name = request['params']['arguments']['tool_name']
+            if name in ('StopPIE', 'exec_console'):
+                with marker.open('a') as events:
+                    events.write(name + '\\n')
+            if name == 'exec_console' and mode == 'exit':
+                threading.Timer(0.3, server.shutdown).start()
+            value = name == 'IsPIERunning'
+            result = {'content': [{'type': 'text',
+                                   'text': json.dumps({'returnValue': value})}]}
+        else:
+            result = {'protocolVersion': '2025-11-25'}
+        body = json.dumps({'jsonrpc': '2.0', 'id': request.get('id'),
+                           'result': result}).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_DELETE(self):
+        self.send_response(202)
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+server = HTTPServer(('127.0.0.1', port), Handler)
+print('ready', flush=True)
+server.serve_forever()
+server.server_close()
+time.sleep(0.3)  # Closing MCP is not enough: the process must exit too.
+""")
+        for mode in ('exit', 'linger'):
+            with self.subTest(mode=mode):
+                marker.unlink(missing_ok=True)
+                with socket.socket() as sock:
+                    sock.bind(('127.0.0.1', 0))
+                    port = sock.getsockname()[1]
+                child = subprocess.Popen([sys.executable, str(fake), str(port),
+                                          str(marker), mode], stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, text=True)
+                try:
+                    self.assertEqual(child.stdout.readline().strip(), 'ready')
+                    before = time.monotonic()
+                    hook = subprocess.run([sys.executable, str(ROOT / 'editor/quit.py'),
+                                           '--port', str(port), '--pid', str(child.pid),
+                                           '--timeout-seconds', '1.5' if mode == 'exit' else '0.6'],
+                                          capture_output=True, text=True, timeout=5)
+                    if mode == 'exit':
+                        self.assertEqual(hook.returncode, 0, hook.stderr)
+                        self.assertGreaterEqual(time.monotonic() - before, 0.5)
+                        self.assertEqual(child.wait(timeout=2), 0)
+                    else:
+                        self.assertEqual(hook.returncode, 1, hook.stderr)
+                        self.assertIsNone(child.poll())  # Hook never kills the editor.
+                    self.assertEqual(marker.read_text().splitlines(),
+                                     ['StopPIE', 'exec_console'])
+                finally:
+                    if child.poll() is None:
+                        child.terminate()
+                    child.communicate(timeout=3)
 
     def test_exclusive_template_fails_closed_and_service_spec(self):
         result = self.cli('run', 'commandlet', '--spec', '--', sys.executable, '-c', 'print("ok")')
