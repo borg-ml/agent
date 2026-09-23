@@ -1026,6 +1026,9 @@ pub struct SessionCapabilities {
     /// by local and enrolled hosts.
     #[serde(default)]
     pub provider_capabilities: Vec<ProviderCapability>,
+    /// Opt in to subscription-funded Luna titles for new non-Codex threads.
+    #[serde(default)]
+    pub luna_titles_for_all_providers: bool,
     /// Populated by an enrolled host after fetching the authenticated Web
     /// context grant. It is intentionally omitted from serialized launch
     /// state so short-lived credentials never enter the relay journal.
@@ -1074,6 +1077,7 @@ impl Default for SessionCapabilities {
             watcher_yield: false,
             steer_reply_prompt: SteerReplyPrompt::default(),
             provider_capabilities: Vec::new(),
+            luna_titles_for_all_providers: false,
             runtime_mcp_context: None,
             runtime_provider_context: None,
             system_prompt_appendix: None,
@@ -2326,6 +2330,14 @@ impl WorkflowRuntime {
 #[ts(export)]
 pub enum SessionEventKind {
     SessionStarted,
+    /// A durable name for this session, independent of its changing preview.
+    SessionTitled {
+        title: String,
+        #[serde(default)]
+        generated: bool,
+        #[serde(default)]
+        usage_tokens: Option<u64>,
+    },
     SessionConfigured {
         cwd: PathBuf,
         provider: CodingProvider,

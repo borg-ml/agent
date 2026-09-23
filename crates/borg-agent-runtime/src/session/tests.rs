@@ -9,6 +9,72 @@ use tokio::sync::Notify;
 use borg_provider::ProviderCallUsage;
 
 use super::*;
+
+#[test]
+fn prompt_title_has_a_durable_fallback_for_attachment_only_messages() {
+    assert_eq!(prompt_session_title("  \n"), "New conversation");
+    assert_eq!(
+        prompt_session_title("  **Plan this work**\nMore detail"),
+        "Plan this work"
+    );
+}
+
+#[cfg(feature = "subscription-adapters")]
+#[test]
+fn luna_title_requires_explicit_cross_provider_opt_in_and_subscription_billing() {
+    let mut launch: LaunchSession = serde_json::from_value(json!({
+        "request_id": Uuid::new_v4(),
+        "cwd": "/tmp",
+        "provider": "claude",
+        "model": null,
+        "effort": null,
+        "permission_mode": "auto",
+        "name": null,
+        "initial_prompt": null
+    }))
+    .unwrap();
+    assert!(!launch.capabilities.luna_titles_for_all_providers);
+    launch.capabilities.provider_capabilities = vec![
+        serde_json::from_value(json!({
+            "provider": "codex",
+            "installed": true,
+            "version": null,
+            "authenticated": true,
+            "auth_detail": null,
+            "can_spawn": true,
+            "billing": "subscription"
+        }))
+        .unwrap(),
+    ];
+    assert!(!eligible_luna_title(&launch, false));
+    launch.capabilities.luna_titles_for_all_providers = true;
+    assert!(eligible_luna_title(&launch, false));
+    assert!(
+        !eligible_luna_title(&launch, true),
+        "API keys cannot bill title turns"
+    );
+    launch.capabilities.provider_capabilities[0].billing = Some(crate::BillingLane::ApiKey);
+    assert!(!eligible_luna_title(&launch, false));
+    launch.capabilities.provider_capabilities[0].billing = Some(crate::BillingLane::Subscription);
+    launch.capabilities.provider_capabilities[0].can_spawn = false;
+    assert!(!eligible_luna_title(&launch, false));
+    launch.capabilities.provider_capabilities[0].can_spawn = true;
+    launch.capabilities.runtime_provider_context = Some(crate::RuntimeProviderContext {
+        persist_session: Some(false),
+        ..Default::default()
+    });
+    assert!(
+        !eligible_luna_title(&launch, false),
+        "controller access cannot use host credentials"
+    );
+    launch.capabilities.runtime_provider_context = None;
+    launch.capabilities.luna_titles_for_all_providers = false;
+    launch.provider = CodingProvider::Codex;
+    assert!(
+        eligible_luna_title(&launch, false),
+        "Codex subscription is eligible by default"
+    );
+}
 use crate::{
     AgentCompaction, AgentTurnResult, CodingProvider, LocalAgentTurnExecutor, PermissionMode,
     PostgresSessionStore,
@@ -4450,6 +4516,9 @@ async fn user_stop_gate_holds_background_turns_until_a_human_prompt() {
         .await
         .unwrap();
     actor.await.unwrap().unwrap();
+    let state = store.state(session_id).await.unwrap();
+    assert_eq!(state.title.as_deref(), Some("first"));
+    assert!(!state.title_generated);
 
     // Drop the guard before the scratch database is discarded: the
     // assertions need it, the teardown await must not hold it.
@@ -4464,6 +4533,13 @@ async fn user_stop_gate_holds_background_turns_until_a_human_prompt() {
         );
 
         let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, SessionEventKind::SessionTitled { .. }))
+                .count(),
+            1
+        );
         assert_eq!(
             events
                 .iter()

@@ -881,6 +881,7 @@ pub enum UiAction {
     SetCompletionNotifications(CompletionAlertPolicy),
     SetCompletionSound(CompletionAlertPolicy),
     SetAutoCopySelection(bool),
+    SetLunaTitlesForAllProviders(bool),
     SetDictationIcon(DictationIconStyle),
     /// Completes the enable-dictation flow: persist model/accelerator/icon,
     /// mark dictation enabled, and begin recording (which prompts the OS for
@@ -1625,6 +1626,7 @@ pub struct BorgTerminal {
     completion_notifications: CompletionAlertPolicy,
     completion_sound: CompletionAlertPolicy,
     auto_copy_selection: bool,
+    luna_titles_for_all_providers: bool,
     horizontal_margin: u16,
     composer_max_height: u16,
     show_footer: bool,
@@ -1900,6 +1902,7 @@ enum PickerKind {
     CompletionNotifications,
     CompletionSound,
     AutoCopySelection,
+    LunaTitlesForAllProviders,
     DictationModel,
     DictationAccelerator,
     DictationIcon,
@@ -2857,6 +2860,7 @@ impl BorgTerminal {
             completion_notifications: CompletionAlertPolicy::Unfocused,
             completion_sound: CompletionAlertPolicy::Unfocused,
             auto_copy_selection: true,
+            luna_titles_for_all_providers: false,
             horizontal_margin: HORIZONTAL_MARGIN,
             composer_max_height: 8,
             show_footer: true,
@@ -4745,6 +4749,7 @@ impl BorgTerminal {
             "Completion notifications".to_string(),
             "Completion sound".to_string(),
             "Auto-copy selections".to_string(),
+            "Luna titles across providers".to_string(),
             "Microphone icon".to_string(),
             "Transcript colours".to_string(),
             format!("User label · {user_label}"),
@@ -4770,6 +4775,7 @@ impl BorgTerminal {
             "/notifications",
             "/sound",
             "auto-copy",
+            "luna-titles",
             "/icons",
             "/colors",
             "/user-label",
@@ -5139,6 +5145,19 @@ impl BorgTerminal {
             "Completion notifications",
             self.completion_notifications,
         );
+    }
+
+    pub fn open_luna_titles_for_all_providers_picker(&mut self) {
+        self.picker = Some(Picker::new(
+            PickerKind::LunaTitlesForAllProviders,
+            "Send first prompt to Codex subscription for Luna titles",
+            ["On", "Off"],
+            Some(if self.luna_titles_for_all_providers {
+                "On"
+            } else {
+                "Off"
+            }),
+        ));
     }
 
     pub fn open_auto_copy_selection_picker(&mut self) {
@@ -6143,6 +6162,10 @@ impl BorgTerminal {
         std::mem::take(&mut self.event_redraw_needed)
     }
 
+    pub fn set_luna_titles_for_all_providers(&mut self, enabled: bool) {
+        self.luna_titles_for_all_providers = enabled;
+    }
+
     pub fn set_auto_copy_selection(&mut self, enabled: bool) {
         self.auto_copy_selection = enabled;
     }
@@ -6868,6 +6891,10 @@ impl BorgTerminal {
                 }
             }
             PickerKind::Commands => unreachable!("handled above"),
+            PickerKind::Settings if picker.options[picker.selected].value == "luna-titles" => {
+                self.open_luna_titles_for_all_providers_picker();
+                UiAction::None
+            }
             PickerKind::Settings if picker.options[picker.selected].value == "auto-copy" => {
                 self.open_auto_copy_selection_picker();
                 UiAction::None
@@ -6990,6 +7017,9 @@ impl BorgTerminal {
             PickerKind::CompletionSound => UiAction::SetCompletionSound(
                 completion_alert_policy_from_picker(&picker.selected_value()),
             ),
+            PickerKind::LunaTitlesForAllProviders => {
+                UiAction::SetLunaTitlesForAllProviders(picker.selected_value() == "On")
+            }
             PickerKind::AutoCopySelection => {
                 UiAction::SetAutoCopySelection(picker.selected_value() == "On")
             }
@@ -11860,6 +11890,7 @@ fn transcript_action_color(kind: TranscriptActionKind, state: TranscriptActionSt
 fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
     match kind {
         SessionEventKind::SessionStarted
+        | SessionEventKind::SessionTitled { .. }
         | SessionEventKind::SessionConfigured { .. }
         | SessionEventKind::ProviderCapabilitiesUpdated { .. }
         | SessionEventKind::EffectiveCapabilitiesUpdated { .. }

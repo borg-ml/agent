@@ -3032,6 +3032,29 @@ async fn resume_picker_titles_and_previews_sessions_from_the_latest_response() {
             .unwrap();
     }
 
+    let activity_before_title = store.state(target).await.unwrap().activity_at;
+    for (title, generated) in [
+        ("First setup request", false),
+        ("Concise persisted title", true),
+    ] {
+        store
+            .append(SessionEvent::new(
+                target,
+                0,
+                SessionEventKind::SessionTitled {
+                    title: title.to_string(),
+                    generated,
+                    usage_tokens: generated.then_some(19),
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    let state = store.state(target).await.unwrap();
+    assert_eq!(state.title.as_deref(), Some("Concise persisted title"));
+    assert_eq!(state.title_usage_tokens, Some(19));
+    assert_eq!(state.activity_at, activity_before_title);
+
     let options = recent_session_options(dir.path(), &store, current, dir.path(), 8)
         .await
         .unwrap();
@@ -3040,11 +3063,17 @@ async fn resume_picker_titles_and_previews_sessions_from_the_latest_response() {
         .find(|option| option.id == target)
         .expect("target session should be resumable");
 
-    assert!(target.label.contains("Latest formatted response"));
+    assert!(target.label.contains("Concise persisted title"));
+    assert!(!target.label.contains("Latest formatted response"));
     assert!(target.label.contains("gpt-resume-filter"));
     assert!(!target.label.contains("First setup request"));
     assert!(target.preview.starts_with("Latest **formatted** response"));
     assert!(target.preview.contains("**Model:** `gpt-resume-filter`"));
+    assert!(
+        target
+            .preview
+            .contains("**Title model:** `gpt-6-luna@low` · 19 tokens")
+    );
     assert!(target.preview.contains("Latest prompt:"));
     assert!(target.preview.contains("Latest formatted request"));
     scratch.discard().await;
