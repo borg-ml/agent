@@ -45,13 +45,13 @@ working first-party CLI/MCP.
 | Branch | Observed checkpoint | Contract/API consistency and evidence | Remaining review |
 | --- | --- | --- | --- |
 | `gamedev/design` | `1a1a540` | skeleton `cargo check -p borg-lanes --offline` and `cargo clippy -p borg-lanes --offline -- -D warnings` passed; fmt and diff check clean. Public types only, no scheduler. | Market review edits and integration doc pending commit. |
-| `gamedev/lanes` | `1a1a540` shared base, no implementation commit at first look | Contract D5 gives it CLI entry, D7 requests fencing and snapshot/subscription. | inspect implementation, real FIFO/coalesce/recovery/CLI tests. |
-| `gamedev/services` | `ede51c5` shared base, no implementation commit at first look | Additive health/readiness and owner state approved. | inspect proxy A/B behavior, owner lease enforcement, scope ownership and tests. |
+| `gamedev/lanes` | Uncommitted scheduler/CLI draft on `1a1a540` | CLI shape published: `borg lane job submit --spec SPEC.json --json`, `wait ID --json`, `status [ID] --json`. Reviewer found unsafe no-systemd process-tree fallback, running coalesce lacks revision recheck, recovery lock-error ambiguity, and async post-hook unscoped; owner notified. | do not merge until safety fixes and real FIFO/coalesce/recovery/wait tests pass. |
+| `gamedev/services` | `39807be` service supervisor/proxy | Additive health/readiness, client lease and A/B proxy. First inspection found `KillMode=process`/detached fallback can orphan backend, raw MCP proxy does not enforce owner, 25/50 ms filesystem polling; owner has blocking fixes. | require cgroup-owned backend tree, fail-safe fallback, event-driven control, scope/lease tests and explicit proxy restriction. |
 | `gamedev/workspace` | `0ef939c` initial inventory/admission | Prototype implemented in `borg-agent-runtime/src/workspace_hygiene.rs` with its own `WorktreeRecord`; this duplicates crate authority. Owner asked to move into `borg-lanes/src/workspace/`. | review moved code, GC dry-run/dirty exclusions, freeze ack/dependency safety. |
-| `gamedev/unreal` | `ede51c5` shared base, package in progress | Owner confirmed `extensions/unreal/` and Blu workflows. | inspect manifest trust, UBT startup/project gates, editor restore/proxy and read-only migration evidence. |
-| `gamedev/native` | `ede51c5` shared base, package in progress | Owner confirmed `extensions/native/`, cargo/CMake templates. | inspect executable quoting, project root validation, test fixture locks and smoke tests. |
-| `gamedev/bench` | `bc989be` | Four deterministic simulator tests ran with `python3 -m unittest -q scripts/test_gamedev_benchmark.py`: OK (0.002 s). Baselines are modeled, not observed throughput. | owner adding real CLI replay; inspect safety of bounded process materialization. |
-| `gamedev/research` | uncommitted `docs/gamedev/landscape.md` at first look | Sourced survey (Epic/Unity/Godot and VCS locking) read and thesis applied to design; author asked to commit. | confirm refs and source caveats retained. |
+| `gamedev/unreal` | Uncommitted `extensions/unreal/` draft | Engine discovery and tests exist, but copied `build_lane.py` (~1,883 lines), editor lane (~741 lines) and run guard duplicate core scheduling/supervision. Owner asked to pivot to thin policy/CLI adapter. | do not merge duplicated default authority; validate trust, CLI schema, editor owner-gating and fake-engine tests. |
+| `gamedev/native` | `ccfdeab` native Blu package | Three planner tests: `python3 -m unittest discover -s extensions/native/tests -q` OK (0.001 s); owner reports isolated Abundance CMake targeted build/ctest, doctor active. Script fails closed if CLI absent. | align exact submit JSON/async watcher semantics; independently reproduce install doctor and smoke when CLI exists; GC `--apply` needs human confirmation. |
+| `gamedev/bench` | `b0905bc` | Four deterministic simulator tests ran with `python3 -m unittest -q scripts/test_gamedev_benchmark.py`: OK (0.002 s). Owner reports modeled 6×8 naive 177.7 s/FIFO 174.9 s/Borg 56.4 s; not observed throughput. | real CLI replay missing; inspect safety of bounded process materialization. |
+| `gamedev/research` | `17e9296` sourced `docs/gamedev/landscape.md` | Survey read: Epic native UE 5.8 MCP/Horde/Zen, Unity CLI switch, VCS asset locks; thesis and caveats incorporated into design. | Preserve citation/verification qualifiers on merge. |
 
 ## Expected conflicts and resolution
 
@@ -63,9 +63,12 @@ working first-party CLI/MCP.
 - `cli.rs`/`main.rs` must have **one** owner (lanes). Service/workspace branches
   export isolated modules and request entry wiring by lanes owner. Reapply
   small match arms rather than taking either whole version if base's CLI moved.
-- `lib.rs` module registration and `workspace.rs` imports may collide when
-  moving helper modules; keep one public worktree record and one admission
-  policy. Shared-work events still belong to Borg workspace journal.
+- Workspace branch has uncommitted edits to `cli.rs`/`main.rs`, `agent_mcp.rs`,
+  `subagents.rs` as well as its module. Owner asked to split core/hygiene from
+  optional CLI/MCP wiring; lanes owner integrates CLI entry, and runtime tool
+  registration must be permission-reviewed separately. Keep one public
+  worktree record and one admission policy. Shared-work events still belong
+  to Borg workspace journal.
 - Extension manifests must not declare unknown `[api.lanes]` against Blu v1;
   use validated workflows, allowlisted MCP servers, skills, and planned
   adapter data until a schema version is implemented.
@@ -88,6 +91,15 @@ working first-party CLI/MCP.
 5. Worktree disk cap GC must be opt-in/destructive-action gated and avoid
    active, user-created or dirty trees. `/home` disk-full is a real acceptance
    failure even if queues get faster.
-6. Competitor market scan is research, not a performance benchmark or legal
+6. Unreal extension must not vendor a second long-lived queue/editor supervisor
+   as its default: reusing Abundance scripts is a transitional migration
+   recipe, not the core+Blu end state. Until core CLI/API parity exists, fail
+   closed and report unsupported features explicitly.
+7. Competitor market scan is research, not a performance benchmark or legal
    approval for hosted/shared editor licensing. Pilot and measure before a
    standalone control plane decision.
+
+Draft CLI reminder: `--spec` accepts serialized `JobSpec`, not adapter/template
+shorthand. A model-facing caller must not construct arbitrary process argv
+without trusted adapter-template validation. Native/Unreal workers received
+this CLI shape and should avoid synchronous model-tool waits.
