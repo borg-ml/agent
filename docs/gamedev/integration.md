@@ -52,14 +52,15 @@ parent requires D11 atomic editor/exclusive handoff and real-CLI proof.
 
 | Branch | Observed checkpoint | Contract/API consistency and evidence | Remaining review |
 | --- | --- | --- | --- |
-| `gamedev/design` | `0643bf1`, clean, based on `4e01e0e` | Rust skeleton strict Clippy/fmt/tests and LSP passed before later documentation-only commits; public types, not a scheduler. | Parent owns integrated release decision; no integrated branch yet. |
+| `gamedev/integrated` | source `424f7be` in `gd-design` (guide update follows) | Lane/service/workspace/native/Unreal/MCP merges plus 16 bench-only cherry-picks. Ten consecutive six-thread lane-lib runs (30/30 each), integrated native Python 12/12, Unreal 6 pass/2 skip, bench model 6/6; test-only flock deadline and TCP reset assertions committed. | Full workspace rerun paused when host MemAvailable fell to 5.1 GiB; final strict fmt/Clippy, full suite and rebuilt-CLI probes still pending. No push or main merge. |
+| `gamedev/design` | `526c6e0`, clean, based on `4e01e0e` | Rust skeleton strict Clippy/fmt/tests and LSP passed before later documentation-only commits; public types, not a scheduler. | Integrated branch exists in `gd-design`; parent owns release decision. |
 | `gamedev/lanes` | `9c71cfa`, clean | Independent pinned CLI SHA `61ece6…` passed real-systemd scoped two-service handoff, failed post-hook quarantine, deterministic same-device disk admission, stopped-supervisor retry and ACK-then-unhealthy recovery; alias test also passed on `011c4ba9…`. Lane owner reports 26 crate tests, strict Clippy/fmt and process tests. | Foreign client leases do **not** atomically delay exclusive preemption: model-facing exclusive disabled for v0 unless optional v0.1 work lands and passes public tests/review. Final integrated binary not yet rebuilt. |
 | `gamedev/services` | `e29b2af`, clean atop lane readiness source | Delegated owned backend scope/cgroup, proxy fence and Healthy-before-resume-clear. Independently passed real-systemd descendant, post-hook and recovery probes on SHA `61ece6…`; owner also reproduced disk/alias/ACK-unhealthy and reported strict checks. | Distinguish fake backend from real Unreal parity; integrate and rerun scoped gates. |
 | `gamedev/workspace` | `d96869e`, clean | Workspace admission/GC/freeze policy; 7 targeted Rust tests independently passed. Fail-closed budget overrides, same-filesystem helper and per-agent cap decision exported. | Reconcile five workspace/lanes merge conflicts; per-agent fairness enforcement is v0.1, not a v0 gate. |
-| `gamedev/unreal` | `03feb37`, clean | Thin Blu Unreal adapter: 8 independent Python tests run (6 passed, 2 environment-dependent skips) (log `/tmp/gd-unreal-final-premerge-tests.log`). | Fake editor smoke and design are not real UE runtime parity; migration acceptance remains separate. |
-| `gamedev/native` | `3432b79`, clean | Native Blu package: 12 independent Python tests passed (log `/tmp/gd-native-final-premerge-tests.log`); owner separately reports installed Blu smoke. | Revalidate optional installed workflows with integrated CLI; GC apply still needs human confirmation. |
+| `gamedev/unreal` | `d27b94a`, clean | Thin Blu Unreal adapter: 8 independent Python tests run (6 passed, 2 environment-dependent skips) (log `/tmp/gd-unreal-final-premerge-tests.log`). | Fake editor smoke and design are not real UE runtime parity; migration acceptance remains separate. |
+| `gamedev/native` | `8c9ba6e`, clean | Native Blu package: 12 independent Python tests passed (log `/tmp/gd-native-final-premerge-tests.log`); owner separately reports installed Blu smoke. | Revalidate optional installed workflows with integrated CLI; GC apply still needs human confirmation. |
 | `gamedev/bench` | `8b2a727` v0 range; later optional probes WIP | Six independent model tests passed (log `/tmp/gd-bench-final-premerge-tests.log`); public health-toggle, failed-resume, failed-hook and same-device probes committed. Independent pinned SHA `61ece6…` gates are recorded below with copied probe hashes; fairness findings are informational. | Cherry-pick only benchmark-specific `62bddc0..8b2a727` due older branch base; optional foreign-lease probes remain WIP outside the v0 checkpoint. |
-| `gamedev/mcp-bridge` | `0bdedf1` initial checkpoint | Session-derived holder and registered template bridge unit/live checks reported by owner, not independently accepted. | **Blocked:** best-effort service snapshot allows model exclusive, restart lacks handler actor fence, response read buffers without cap; owner preparing blanket-deny/no-restart/bounded-read/per-actor follow-up. Do not merge this checkpoint. |
+| `gamedev/mcp-bridge` | `ca2815e` imported into integrated | Actor-derived holder, registered template, blanket-denied model exclusives, no model restart, bounded GET and configured-CLI submit; owner reports targeted unit/live tests. | Integrated actor-pair coalesced access regression passed at `5143197`; final integrated-binary MCP live check and public probes pending. Owner later committed equivalent actor-pair fix at `89b60d3`, not imported. |
 | `gamedev/research` | `17e9296` sourced `docs/gamedev/landscape.md` | Survey read: Epic native UE 5.8 MCP/Horde/Zen, Unity CLI switch, VCS asset locks; thesis and caveats incorporated into design. | Preserve citation/verification qualifiers on merge. |
 
 ## Expected conflicts and resolution
@@ -87,9 +88,12 @@ parent requires D11 atomic editor/exclusive handoff and real-CLI proof.
 
 ## Gaps / decisions for parent
 
-1. First-party MCP tools and typed lane watchers are **specified**, not wired;
-   an agent can initially use workflow-backed `borg lane job wait` through
-   existing command watch. Decide whether MCP promotion is a launch gate.
+1. First-party restricted `lane_job`/`lane_service` MCP tools are wired in
+   `gamedev/integrated`; they derive caller identity in the trusted runtime,
+   reject all model-exclusive jobs and expose no model service restart.
+   `borg lane job wait` and existing command watch handle terminal waiting;
+   a separate typed lane watcher is optional, not a v0 release gate.
+   Final integrated-binary MCP live/public checks remain pending.
 2. Durable supervisor and kernel lock lifetime need hard crash/reclaim tests,
    not just a single-process queue test. Never recover by matching process
    names. Non-systemd hosts must fail safe until a supported equivalent exists.
@@ -124,7 +128,7 @@ parent requires D11 atomic editor/exclusive handoff and real-CLI proof.
    Real UE runtime parity is migration acceptance, not a Borg v0 gate.
 
 
-**Selected v0 model-exclusive fallback (bridge enforcement not yet verified):**
+**Selected v0 model-exclusive fallback (committed bridge; final-binary checks pending):**
 reject **all** model-facing exclusive templates with a clear
 `coordinate with the editor lease holder, then use borg lane job submit --spec <trusted-JobSpec-JSON>` message, independent of
 which service specs happen to be visible. Retain nonexclusive jobs and model
@@ -144,10 +148,11 @@ shorthand. A model-facing caller must not construct arbitrary process argv
 without trusted adapter-template validation. Native/Unreal workers received
 this CLI shape and should avoid synchronous model-tool waits.
 
-Model-facing service MCP owner is **final parent integration**, not the
-services branch: only status should be exposed until registered spec policy
-and actual session-derived owner/fencing enforcement are audited. A tool
-argument `confirmed: true` is not a durable human approval for workspace GC.
+The integrated model-facing service MCP is a restricted `status`/`lease`/
+`release`/audited exact-path `read` bridge, not a raw mutating editor proxy.
+It derives actor identity at the runtime boundary; restart remains disabled
+without a handler-level actor fence. A tool argument `confirmed: true` is not
+human approval for workspace GC.
 
 **D11 canonical-key regression and resolution (2026-09-23):** the committed Host-key
 two-service pass below is **not** Project-key parity. On pinned binary
@@ -296,10 +301,9 @@ no restart during, and resume afterward. The scoped no-hook two-service
 case above and the successful ordered post-hook barrier pass on the pinned
 binary are scoped successes. The Project path-alias fail-open is fixed and
 independently passed on the newer pinned binary above; disk admission
-and stopped-supervisor resume recovery also passed on `61ece6…`. ACK-then-unhealthy resume readiness/retry also passed on `61ece6…`; finish
-session-derived editor owner fencing, then rerun all gates on the final
-integrated binary before
-any v0 release. Fake Unreal adapters still do not establish real UE parity.
+and stopped-supervisor resume recovery also passed on `61ece6…`. ACK-then-unhealthy resume readiness/retry also passed on `61ece6…`;
+actor-derived MCP owner fencing and the v0 model-exclusive fallback are now
+merged. Rerun all gates on the final integrated binary before any v0 release. Fake Unreal adapters still do not establish real UE parity.
 
 Native adapter disk reservation is an estimate, **not** target-only quota/GC;
 workspace currently considers whole-worktree cleanup with owner protection.
