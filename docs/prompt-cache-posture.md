@@ -12,7 +12,7 @@ discipline is the most explicit of the harnesses available to read.
 | Anthropic API | Explicit `cache_control` breakpoints, at most four per request | One on the system block, one on the last tool definition, and one on the newest text so the marker advances with the conversation |
 | Codex (ChatGPT subscription, Responses API) | Implicit prefix cache, keyed by `prompt_cache_key`, with turn-scoped sticky routing | Stable per-session key, deterministic `instructions`, `store: false`, reasoning items replayed through `provider_state`, and the `x-codex-turn-state` token from a turn's first response replayed on the rest of that turn |
 | OpenAI-compatible family: Go gateway, Kimi, GLM, Qwen, OpenRouter, configured endpoints | Implicit prefix cache, keyed by `prompt_cache_key` for vendors that honour it | Same stable key; some profiles also send the session id |
-| Claude subscription (Claude Code binary) | The binary owns its own breakpoints: a global-scope block before `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`, an org-scope block after it, and a rolling message marker with a one-hour TTL | Borg supplies the system prompt, the pooled process and the prompt text; a reused process appends only the new turn |
+| Claude subscription (Claude Code binary) | The binary owns its own breakpoints: a global-scope block before `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`, an org-scope block after it, and a rolling message marker with a one-hour TTL | Borg supplies the system prompt, the pooled process and the prompt text; a reused process appends only the new turn. An idle process is kept for the cache's hour, four at most across the host, and model or effort changes are applied to the live process |
 
 ## Invariants
 
@@ -64,9 +64,10 @@ at Borg restarts and cost about 5M write tokens over the period.
 
 ## Gaps, in the order they are worth closing
 
-1. **Cold Claude processes after a restart.** The replacement process gets the
-   canonical projection, so its first request rewrites a history the previous
-   process still has cached. Resuming Claude Code's own session record would
+1. **Cold Claude processes after a restart or eviction.** The replacement
+   process gets the canonical projection, so its first request rewrites a
+   history the previous process still has cached. Beyond the four newest idle
+   processes this happens to any session left idle. Resuming Claude Code's own session record would
    reuse it, at the cost of a provider-owned durable state Borg does not keep
    today.
 2. **Volatile status in the Claude system prompt.** Provider usage percentages

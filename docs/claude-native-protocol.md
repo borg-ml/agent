@@ -211,9 +211,10 @@ use a genuinely gated tool (e.g. `Write`).
    termination. Borg releases the process on provider switch or failed turns.
    Host-local leases keep the newest four idle Claude processes across Borg
    session owners; older owners release their own idle processes within three
-   seconds, and every idle process expires after 15 minutes. Active turns are
-   never evicted. An evicted session rebuilds context from Borg's durable journal
-   before its next turn. Older Borg binaries do not participate in these leases.
+   seconds, and every idle process expires after an hour, the lifetime Claude
+   Code gives a subscriber's prompt cache. Active turns are never evicted. An
+   evicted session rebuilds context from Borg's durable journal before its next
+   turn. Older Borg binaries do not participate in these leases.
 5. **Context telemetry.** Native Rust requests `get_context_usage` after each assistant
    message, emits the provider-neutral `claude.context_usage` event, and treats missing
    or unsupported responses as advisory rather than failing the turn.
