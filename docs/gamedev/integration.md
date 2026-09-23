@@ -112,13 +112,13 @@ parent requires D11 atomic editor/exclusive handoff and real-CLI proof.
    many FIFO slots. Workspace exposes a per-agent cap helper, not integrated
    job dispatch enforcement. Bench should report per-agent waits/fairness;
    wire an agent-aware reservation/fairness policy in v0.1.
-9. Pinned post-readiness CLI `61ece6…` independently passed the deterministic
-   two-service disk budget gate; pinned `011c4ba9…` passed failed bound
-   post-hook quarantine and canonical Project/Worktree identity. Stopped-
-   supervisor resume error/recover passed on `61ece6…`. **Remaining v0 gates:**
-   ACK-then-unhealthy backend readiness/retry; session-derived editor
-   owner/fencing at the model MCP boundary; rerun every gate on the final
-   integrated binary. Real UE runtime parity is a project migration
+9. Pinned post-readiness CLI `61ece6…` independently passed deterministic
+   two-service disk budget admission, scoped descendant handoff, bound
+   post-hook failure quarantine, stopped-supervisor resume recovery, and
+   ACK-then-unhealthy backend recovery. Project/Worktree alias protection
+   passed on pinned `011c4ba9…`. **Remaining v0 gates:** session-derived
+   editor owner/fencing at the model MCP boundary and rerun every gate on
+   the final integrated binary. Real UE runtime parity is a migration
    acceptance test, not a Borg branch v0 gate.
 
 
@@ -217,10 +217,19 @@ retained `resume_pending=[bench-editor-a]` and explicit `resume_error`;
 restarting the test-owned service plus `lane job recover` cleared both and
 returned two Healthy backends. Copied WIP probe SHA256
 `a67aca149d1b8a17774bc72952bcbc3c863f9550e69f2c5c1e2d550b90343215`,
-log `/tmp/gd-resume-retry.log`. **ACK-then-unhealthy** is a distinct
-remaining gate: force Resume to ACK Starting, then health to fail; verify
-pending/error persists and recovery clears only after Healthy without
-duplicate Resume.
+log `/tmp/gd-resume-retry.log`. **ACK-then-unhealthy** also independently passed on **the same stable CLI SHA**:
+with the test backend's health disabled, Resume removed the yield token yet
+`resume_pending=[bench-editor-a]` remained and error reported `not healthy
+after resume: Starting: waiting for health`. Re-enabling health and running
+`lane job recover` cleared pending/error only once the service became Healthy.
+Exit 0, job `825d7488-09a2-464b-b4e2-9ff8f28278c7`, copied WIP probe
+SHA256 `d7365a086ff35c25eb5ca4e0c39054252fa26fc38ebfc267c79bc45d81576dd6`
+and fake backend SHA256
+`0e9daeac09d1e5f7e3de3c8b5e5bae8f798b71264f937e74a6e830d798afe140`,
+log `/tmp/gd-ack-unhealthy.log`. The lane recovery path checks Healthy
+without issuing another Resume when the yield token is already absent.
+This clears the core readiness failure/retry gate for pinned SHA `61ece6…`,
+not a real-Unreal parity claim.
 
 **D11 scoped evidence (2026-09-23):** a stale worktree executable
 that predated delegated backend cgroups let a detached child survive yield
@@ -270,9 +279,9 @@ no restart during, and resume afterward. The scoped no-hook two-service
 case above and the successful ordered post-hook barrier pass on the pinned
 binary are scoped successes. The Project path-alias fail-open is fixed and
 independently passed on the newer pinned binary above; disk admission
-and stopped-supervisor resume recovery also passed on `61ece6…`. Finish
-ACK-then-unhealthy resume readiness/retry and session-derived editor owner
-fencing, then rerun all gates on the final integrated binary before
+and stopped-supervisor resume recovery also passed on `61ece6…`. ACK-then-unhealthy resume readiness/retry also passed on `61ece6…`; finish
+session-derived editor owner fencing, then rerun all gates on the final
+integrated binary before
 any v0 release. Fake Unreal adapters still do not establish real UE parity.
 
 Native adapter disk reservation is an estimate, **not** target-only quota/GC;
