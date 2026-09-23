@@ -4158,10 +4158,19 @@ async fn run_agent_session_store_kernel_inner(
         let (provider_events_tx, mut provider_events) = mpsc::channel(128);
         let (control_tx, control_rx) = mpsc::channel(32);
         let mut retained_for_turn = retained_context.take();
+        let unseen_notices = if reuse_subscription_context {
+            unseen_settled_notices(journal.context_events())
+        } else {
+            String::new()
+        };
         let mut provider_prompt = if native_provider {
             prompt.text.clone()
         } else if reuse_subscription_context {
-            format_subscription_frame(&format_subscription_actor_value(prompt.actor, &prompt.text))
+            unseen_notices.clone()
+                + &format_subscription_frame(&format_subscription_actor_value(
+                    prompt.actor,
+                    &prompt.text,
+                ))
         } else {
             format_subscription_provider_prompt(
                 retained_for_turn.as_deref(),
@@ -4173,7 +4182,8 @@ async fn run_agent_session_store_kernel_inner(
             // A healthy pooled process receives only this delta. Measuring the
             // complete canonical replay here was the source of premature
             // compaction while the provider still had ample context space.
-            subscription_prompt_chars(None, prompt.actor, &prompt.text)
+            unseen_notices.chars().count()
+                + subscription_prompt_chars(None, prompt.actor, &prompt.text)
         } else {
             provider_prompt.chars().count()
         };
@@ -4353,7 +4363,11 @@ async fn run_agent_session_store_kernel_inner(
         let mut prompt_delta = if native_provider {
             prompt.text.clone()
         } else {
-            format_subscription_frame(&format_subscription_actor_value(prompt.actor, &prompt.text))
+            unseen_notices
+                + &format_subscription_frame(&format_subscription_actor_value(
+                    prompt.actor,
+                    &prompt.text,
+                ))
         };
         if resuming_interrupted_turn && prompt.visible {
             // Same durable id, so cancelling, recovery and the message
@@ -8272,6 +8286,37 @@ fn truncate_compaction_tool_result(output: &str, max_chars: usize) -> String {
 /// sequence of typed records. Framing each canonical record keeps the prefix
 /// byte-for-byte stable as new records are appended, without making a provider
 /// transcript format part of Borg's persistence model.
+/// System notices settled after the last completed turn without opening one,
+/// such as non-waking team messages. A full replay includes them, but a
+/// resumed provider session receives only each turn's own input, so they are
+/// framed ahead of the next delta. Without a completed turn in view nothing is
+/// known to be unseen.
+fn unseen_settled_notices(context: &[SessionEvent]) -> String {
+    let Some(last_turn) = context
+        .iter()
+        .rposition(|event| matches!(event.kind, SessionEventKind::TurnCompleted { .. }))
+    else {
+        return String::new();
+    };
+    context[last_turn + 1..]
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::Message {
+                actor: EventActor::System,
+                status: MessageStatus::Complete,
+                text,
+                ..
+            } => Some(
+                format_subscription_frame(&format_subscription_actor_value(
+                    EventActor::System,
+                    text,
+                )) + "\n",
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
 fn format_subscription_frame(value: &Value) -> String {
     format!(
         "<borg-message>{}</borg-message>",
