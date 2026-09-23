@@ -21,7 +21,7 @@ use ratatui_image::{
     sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
 use std::process::Command;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -8577,7 +8577,7 @@ impl BorgTerminal {
             );
             if session_is_active && self.running_sweeps {
                 let mut status_line = Line::from(status_spans);
-                apply_running_activity_pulse(&mut status_line, running_status_pulse_phase());
+                apply_running_activity_pulse(&mut status_line, running_shimmer_phase());
                 status_spans = status_line.spans;
             }
             let status_width = status_spans.iter().map(|span| span.width()).sum::<usize>();
@@ -15928,22 +15928,22 @@ fn replace_tool_activity_glyph(line: &mut Line<'static>, glyph: &str) {
     span.content = Cow::Owned(content);
 }
 
-const RUNNING_PULSE_RADIUS: usize = 2;
-const TOOL_ACTIVITY_PULSE_STEP_MILLIS: u128 = 20;
-const RUNNING_STATUS_PULSE_STEP_MILLIS: u128 = 80;
-const RUNNING_PULSE_PAUSE_STEPS: usize = 32;
+const RUNNING_SHIMMER_PADDING: usize = 10;
+const RUNNING_SHIMMER_HALF_WIDTH: f32 = 5.0;
+const RUNNING_SHIMMER_CYCLE_MILLIS: u128 = 2_000;
+static RUNNING_SHIMMER_START: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Clone, Copy)]
 struct ToolActivityAnimation {
     glyph: &'static str,
-    pulse_phase: usize,
+    shimmer_phase: u128,
 }
 
 impl ToolActivityAnimation {
     fn current() -> Self {
         Self {
             glyph: activity_glyph(SessionStatus::Running),
-            pulse_phase: tool_activity_pulse_phase(),
+            shimmer_phase: running_shimmer_phase(),
         }
     }
 
@@ -15956,7 +15956,7 @@ impl ToolActivityAnimation {
         if replace_glyph {
             replace_tool_activity_glyph(line, self.glyph);
         }
-        apply_running_activity_pulse_with_width(line, self.pulse_phase, content_width);
+        apply_running_activity_pulse_with_width(line, self.shimmer_phase, content_width);
     }
 }
 
@@ -15964,21 +15964,15 @@ fn tool_activity_animation(enabled: bool, running: bool) -> Option<ToolActivityA
     (enabled && running).then(ToolActivityAnimation::current)
 }
 
-fn tool_activity_pulse_phase() -> usize {
-    activity_pulse_phase(TOOL_ACTIVITY_PULSE_STEP_MILLIS)
+fn running_shimmer_phase() -> u128 {
+    RUNNING_SHIMMER_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        % RUNNING_SHIMMER_CYCLE_MILLIS
 }
 
-fn running_status_pulse_phase() -> usize {
-    activity_pulse_phase(RUNNING_STATUS_PULSE_STEP_MILLIS)
-}
-
-fn activity_pulse_phase(step_millis: u128) -> usize {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| (elapsed.as_millis() / step_millis) as usize)
-}
-
-fn apply_running_activity_pulse(line: &mut Line<'static>, phase: usize) {
+fn apply_running_activity_pulse(line: &mut Line<'static>, phase: u128) {
     let content_width = running_activity_content_width(line);
     apply_running_activity_pulse_with_width(line, phase, content_width);
 }
@@ -15993,7 +15987,7 @@ fn running_activity_content_width(line: &Line<'static>) -> usize {
 
 fn apply_running_activity_pulse_with_width(
     line: &mut Line<'static>,
-    phase: usize,
+    phase: u128,
     content_width: usize,
 ) {
     if line.spans.len() < 2 {
@@ -16003,24 +15997,23 @@ fn apply_running_activity_pulse_with_width(
         return;
     }
 
-    let sweep_width = content_width.saturating_add(RUNNING_PULSE_RADIUS * 2);
-    let cycle = sweep_width.saturating_add(RUNNING_PULSE_PAUSE_STEPS);
-    let phase = phase % cycle;
-    if phase >= sweep_width {
-        return;
-    }
-    let pulse_center = phase as isize - RUNNING_PULSE_RADIUS as isize;
+    let period = content_width.saturating_add(RUNNING_SHIMMER_PADDING * 2);
+    let shimmer_center = ((phase % RUNNING_SHIMMER_CYCLE_MILLIS) * period as u128
+        / RUNNING_SHIMMER_CYCLE_MILLIS) as usize;
     let mut offset = 0usize;
     let mut spans = Vec::with_capacity(line.spans.len() + 2);
     spans.push(line.spans[0].clone());
     for span in line.spans.iter().skip(1) {
         for grapheme in span.content.graphemes(true) {
-            let distance = (offset as isize - pulse_center).unsigned_abs();
-            let style = match distance {
-                0 => brighten_style(span.style, 2),
-                1 => brighten_style(span.style, 1),
-                _ => span.style,
+            let distance = offset
+                .saturating_add(RUNNING_SHIMMER_PADDING)
+                .abs_diff(shimmer_center) as f32;
+            let intensity = if distance <= RUNNING_SHIMMER_HALF_WIDTH {
+                0.5 * (1.0 + (std::f32::consts::PI * distance / RUNNING_SHIMMER_HALF_WIDTH).cos())
+            } else {
+                0.0
             };
+            let style = shimmer_style(span.style, intensity);
             append_styled_grapheme(&mut spans, grapheme, style);
             offset = offset.saturating_add(UnicodeWidthStr::width(grapheme));
         }
@@ -16041,8 +16034,29 @@ fn append_styled_grapheme(spans: &mut Vec<Span<'static>>, grapheme: &str, style:
     }
 }
 
-fn brighten_style(style: Style, steps: u8) -> Style {
-    style.fg(brighten_color(style.fg.unwrap_or(Color::White), steps))
+fn shimmer_style(style: Style, intensity: f32) -> Style {
+    if intensity < 0.05 {
+        return style;
+    }
+    let color = style.fg.unwrap_or(Color::White);
+    let lift = |red: u8, green: u8, blue: u8| {
+        let channel =
+            |value: u8| (f32::from(value) + (255.0 - f32::from(value)) * intensity * 0.65) as u8;
+        Color::Rgb(channel(red), channel(green), channel(blue))
+    };
+    let color = match color {
+        Color::Rgb(red, green, blue) => lift(red, green, blue),
+        Color::DarkGray => lift(100, 100, 100),
+        Color::Gray => lift(170, 170, 170),
+        Color::White => Color::White,
+        other => brighten_color(other, if intensity >= 0.6 { 2 } else { 1 }),
+    };
+    let style = style.fg(color);
+    if intensity >= 0.6 {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
 }
 
 fn brighten_color(color: Color, steps: u8) -> Color {
@@ -16055,7 +16069,7 @@ fn brighten_color(color: Color, steps: u8) -> Color {
         }
         Color::DarkGray => Color::Gray,
         Color::Gray => Color::White,
-        Color::White => Color::Gray,
+        Color::White => Color::White,
         Color::Red => Color::LightRed,
         Color::Green => Color::LightGreen,
         Color::Yellow => Color::LightYellow,

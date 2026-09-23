@@ -2419,14 +2419,13 @@ async fn run_local_agent_session(
         (Vec::new(), Vec::new())
     };
     // The root transcript needs the complete child identity set before its
-    // first replay. The recovery projection contains only the latest activity
-    // per child, so this read is small even for a long-running team session.
+    // first replay. Include a fork's takeover roster: child activity is not
+    // inherited with the root transcript.
     let team_snapshots = if resuming && can_prompt && !fallback_terminal {
-        let team = store
-            .recovery_parts(session_id, RecoveryParts::SUBAGENTS)
+        let team = restored_team_history(store.as_ref(), session_id)
             .await
             .context("failed to restore the team roster before transcript replay")?;
-        latest_subagent_snapshots(&team.subagent_events)
+        latest_subagent_snapshots(&team)
     } else {
         tail_team_snapshots
     };
@@ -8756,10 +8755,7 @@ async fn load_subagent_thread_state(
     Vec<SubagentSnapshot>,
     HashMap<Uuid, Vec<SessionEvent>>,
 )> {
-    let team_history = store
-        .recovery_parts(session_id, RecoveryParts::SUBAGENTS)
-        .await?
-        .subagent_events;
+    let team_history = restored_team_history(store, session_id).await?;
     let mut team_snapshots = latest_subagent_snapshots(&team_history);
     reconcile_subagent_snapshots(store, sessions_dir, &mut team_snapshots).await;
     // A large team hydrates one bounded tail per child. Run those reads with
@@ -8794,6 +8790,20 @@ async fn load_subagent_thread_state(
     )
     .await;
     Ok((team_history, team_snapshots, child_histories))
+}
+
+async fn restored_team_history(
+    store: &dyn SessionStore,
+    session_id: Uuid,
+) -> Result<Vec<SessionEvent>> {
+    let mut team_history = store.fork_team_events(session_id).await?;
+    team_history.extend(
+        store
+            .recovery_parts(session_id, RecoveryParts::SUBAGENTS)
+            .await?
+            .subagent_events,
+    );
+    Ok(team_history)
 }
 
 async fn reconcile_subagent_snapshots(

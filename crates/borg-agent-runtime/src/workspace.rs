@@ -29,6 +29,17 @@ pub struct Participant {
     pub created_at: DateTime<Utc>,
 }
 
+/// One entry of an authenticated directory sync: what the owning host reports
+/// about an instance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryInstance {
+    pub participant: Participant,
+    pub host_id: Option<Uuid>,
+    pub workspace_id: Option<Uuid>,
+    pub cwd: Option<String>,
+    pub status: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentInstance {
     #[serde(flatten)]
@@ -543,7 +554,11 @@ pub trait WorkspaceStore: Send + Sync {
         workspace_id: Option<Uuid>,
     ) -> Result<()>;
 
-    /// Cache one entry of an authenticated directory sync.
+    /// Cache one authenticated directory sync, atomically.
+    ///
+    /// A sync reports every instance the directory knows, stopped ones
+    /// included, so it is written as one transaction: a commit per entry made
+    /// each sync hundreds of synchronous disk flushes.
     ///
     /// Separate from [`WorkspaceStore::upsert_instance`] because it carries what
     /// the owning host reports about the instance: where it runs, and whether
@@ -555,14 +570,7 @@ pub trait WorkspaceStore: Send + Sync {
     /// tombstone again. Fields the directory leaves empty never erase what was
     /// learned locally, because a directory entry is a thin mirror -- it even
     /// omits the workspace most of the time.
-    async fn upsert_directory_instance(
-        &self,
-        participant: Participant,
-        host_id: Option<Uuid>,
-        workspace_id: Option<Uuid>,
-        cwd: Option<&str>,
-        status: Option<&str>,
-    ) -> Result<()>;
+    async fn upsert_directory_instances(&self, instances: &[DirectoryInstance]) -> Result<()>;
 
     /// Transition a delivery addressed by message id rather than sequence.
     ///

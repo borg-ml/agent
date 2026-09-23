@@ -144,13 +144,13 @@ pub use tool_presentation::{
 };
 pub use workspace::{
     AgentInstance, AtomicWorkClaim, Audience, DeliveryAttempt, DeliveryCursor, DeliveryMode,
-    DeliveryState, HostAttachment, HostIdentity, MessageAttachment, NewWorkspaceMessage,
-    Participant, ParticipantKind, PresenceLease, Provenance, RecipientDelivery, SharedWork,
-    StructuredMention, Thread, WorkDependency, WorkReview, Workspace, WorkspaceArtifact,
-    WorkspaceDecision, WorkspaceEvent, WorkspaceEventKind, WorkspaceHost,
-    WorkspaceHostCapabilities, WorkspaceMembership, WorkspaceMessage, WorkspaceMessageBody,
-    WorkspaceMessageReceipt, WorkspaceReference, WorkspaceReviewRequest, WorkspaceRole,
-    WorkspaceRosterEntry, WorkspaceStore, local_human_participant_id,
+    DeliveryState, DirectoryInstance, HostAttachment, HostIdentity, MessageAttachment,
+    NewWorkspaceMessage, Participant, ParticipantKind, PresenceLease, Provenance,
+    RecipientDelivery, SharedWork, StructuredMention, Thread, WorkDependency, WorkReview,
+    Workspace, WorkspaceArtifact, WorkspaceDecision, WorkspaceEvent, WorkspaceEventKind,
+    WorkspaceHost, WorkspaceHostCapabilities, WorkspaceMembership, WorkspaceMessage,
+    WorkspaceMessageBody, WorkspaceMessageReceipt, WorkspaceReference, WorkspaceReviewRequest,
+    WorkspaceRole, WorkspaceRosterEntry, WorkspaceStore, local_human_participant_id,
 };
 pub use workspace_snapshot::{
     DEFAULT_MAX_SNAPSHOT_BYTES, DEFAULT_MAX_SNAPSHOT_FILES, MAX_SNAPSHOT_FILE_BYTES,

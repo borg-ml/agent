@@ -25,11 +25,11 @@ use crate::receipt::{ReceiptBackend, ReceiptState};
 use crate::session::AbortTask;
 use crate::{
     AgentRuntimeCommandEnvelope, AgentRuntimeEventEnvelope, AgentTurnExecutor, Audience,
-    CodingProvider, HostCapabilities, HostCommand, HostCommandEnvelope, HostExecutionProfile,
-    HostHeartbeat, HostResourceLimits, HostShellCommandOutcome, HostShellCommandRequest,
-    HostShellCommandResponse, LaunchSession, LspPathPolicy, OpenTerminalOutcome,
-    OpenTerminalRequest, OpenTerminalResponse, Participant, ParticipantKind, PermissionMode,
-    ProviderAuthMethod, ProviderCapability, REMOTE_PROTOCOL_VERSION, RemoteHost,
+    CodingProvider, DirectoryInstance, HostCapabilities, HostCommand, HostCommandEnvelope,
+    HostExecutionProfile, HostHeartbeat, HostResourceLimits, HostShellCommandOutcome,
+    HostShellCommandRequest, HostShellCommandResponse, LaunchSession, LspPathPolicy,
+    OpenTerminalOutcome, OpenTerminalRequest, OpenTerminalResponse, Participant, ParticipantKind,
+    PermissionMode, ProviderAuthMethod, ProviderCapability, REMOTE_PROTOCOL_VERSION, RemoteHost,
     RemoteHostIdentity, RuntimeMcpContext, SessionEvent, SessionLiveEvent, SessionPayloadRef,
     SessionStore, SessionWriterLease, WorkspaceAttachment, WorkspaceCommandErrorCode,
     WorkspaceCommandOutcome, WorkspaceCommandRequest, WorkspaceCommandResponse, WorkspaceEventKind,
@@ -5691,24 +5691,24 @@ async fn sync_instance_directory(
         .error_for_status()?
         .json()
         .await?;
-    let count = directory.participants.len();
-    for remote in directory.participants {
-        store
-            .upsert_directory_instance(
-                Participant {
-                    id: remote.id,
-                    display_name: remote.display_name,
-                    kind: remote.kind,
-                    created_at: remote.created_at,
-                },
-                remote.host_id,
-                remote.workspace_id,
-                remote.cwd.as_deref(),
-                remote.status.as_deref(),
-            )
-            .await?;
-    }
-    Ok(count)
+    let instances = directory
+        .participants
+        .into_iter()
+        .map(|remote| DirectoryInstance {
+            participant: Participant {
+                id: remote.id,
+                display_name: remote.display_name,
+                kind: remote.kind,
+                created_at: remote.created_at,
+            },
+            host_id: remote.host_id,
+            workspace_id: remote.workspace_id,
+            cwd: remote.cwd,
+            status: remote.status,
+        })
+        .collect::<Vec<_>>();
+    store.upsert_directory_instances(&instances).await?;
+    Ok(instances.len())
 }
 
 /// Refresh relay projections without taking over or restarting the session actor.
