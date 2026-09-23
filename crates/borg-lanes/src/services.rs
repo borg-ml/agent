@@ -190,6 +190,49 @@ pub(crate) fn resume_budget(services: &Path, id: &str) -> Duration {
         });
     Duration::from_millis(window.saturating_add(2_000))
 }
+/// How long a client waits for the supervisor to answer a request (`lane
+/// service stop`, `yield`, a forced `restart`, and the yield a lane job
+/// asks for before an exclusive grant). Such a request restores each client
+/// and stops up to two backends through the graceful stop hook, and the
+/// supervisor may first have to finish stopping one (a cold restart), so
+/// the wait covers the spec's own hook timeouts; never less than two
+/// minutes, which also applies without a readable spec.
+pub fn request_timeout(services: &Path, id: &str) -> Duration {
+    let floor = Duration::from_secs(120);
+    let valid = !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !valid {
+        return floor;
+    }
+    read_json::<ServiceSpec>(&services.join(id).join("spec.json"))
+        .map_or(floor, |spec| floor.max(request_budget(&spec)))
+}
+
+fn request_budget(spec: &ServiceSpec) -> Duration {
+    // The hook, then up to 3 s for the leader and 5 s for its cgroup.
+    let stop = spec
+        .graceful_stop
+        .as_ref()
+        .map_or(0, |hook| hook.timeout_ms)
+        .saturating_add(10_000);
+    let clients = match spec.client_mode {
+        ClientMode::Exclusive => 1,
+        ClientMode::Shared { max_clients } => max_clients as u64,
+    };
+    let restore = spec
+        .restore
+        .as_ref()
+        .map_or(0, |hook| hook.timeout_ms)
+        .saturating_mul(clients);
+    Duration::from_millis(
+        stop.saturating_mul(3)
+            .saturating_add(restore)
+            .saturating_add(30_000),
+    )
+}
+
 fn default_idle_after_ms() -> u64 {
     60_000
 }
@@ -3794,6 +3837,32 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
             .unwrap()
             .unwrap();
         assert_eq!(manager.read_status("fake").unwrap().restarts, 1);
+    }
+
+    /// Failure mode: `lane service stop` or a lane job's yield giving up at
+    /// a fixed two minutes while the editor's 150 s graceful stop still runs.
+    #[test]
+    fn requests_wait_as_long_as_the_hooks_they_run() {
+        let root = tempfile::tempdir().unwrap();
+        let services = root.path().join("services");
+        let floor = Duration::from_secs(120);
+        assert_eq!(request_timeout(&services, "fake"), floor);
+        assert_eq!(request_timeout(&services, "../fake"), floor);
+        let mut spec = spec(root.path());
+        let dir = service_dir(&services, "fake").unwrap();
+        write_json(&dir.join("spec.json"), &spec).unwrap();
+        assert_eq!(request_timeout(&services, "fake"), floor);
+        spec.graceful_stop = Some(Hook {
+            argv: vec!["true".into()],
+            timeout_ms: 150_000,
+        });
+        spec.client_mode = ClientMode::Shared { max_clients: 4 };
+        write_json(&dir.join("spec.json"), &spec).unwrap();
+        // Three 160 s stops, four 1.5 s restores and 30 s.
+        assert_eq!(
+            request_timeout(&services, "fake"),
+            Duration::from_millis(3 * 160_000 + 4 * 1_500 + 30_000)
+        );
     }
 
     /// Failure mode: a cold-restart service (an editor too big to run twice)
