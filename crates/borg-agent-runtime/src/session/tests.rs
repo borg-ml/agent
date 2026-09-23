@@ -8087,6 +8087,157 @@ async fn resuming_a_goal_mid_turn_releases_the_stop_latch() {
     scratch.discard().await;
 }
 
+/// Escape parks a goal until the next human prompt. A pre-stop prompt must
+/// not resume it, and a separate /goal pause must remain paused.
+#[tokio::test]
+async fn fresh_human_input_resumes_only_an_interrupted_goal() {
+    for (stopped, pre_stop_turn) in [(true, false), (true, true), (false, false)] {
+        let root = tempdir().unwrap();
+        let session_id = Uuid::new_v4();
+        let (scratch, store, mut journal) = runtime_store(session_id).await;
+        let mut goal = SessionGoal::new("Finish verification".to_string(), None);
+        goal.status = GoalStatus::Paused;
+        let mut events = vec![
+            SessionEventKind::SessionStarted,
+            SessionEventKind::SessionConfigured {
+                cwd: root.path().to_path_buf(),
+                provider: CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+                response_language: crate::ResponseLanguage::Auto,
+                permission_mode: PermissionMode::Manual,
+            },
+            SessionEventKind::GoalUpdated { goal },
+        ];
+        if stopped {
+            events.push(SessionEventKind::UserStopChanged { engaged: true });
+        }
+        if pre_stop_turn {
+            events.push(SessionEventKind::Message {
+                message_id: Uuid::new_v4(),
+                actor: EventActor::User,
+                text: "queued before Escape".to_string(),
+                attachments: Vec::new(),
+                status: MessageStatus::Queued,
+                delivery: Some(PromptDelivery::Queue),
+            });
+        }
+        for kind in events {
+            journal
+                .append(SessionEvent::new(session_id, 0, kind))
+                .await
+                .unwrap();
+        }
+        drop(journal);
+
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let actor_store = Arc::clone(&store);
+        let actor = tokio::spawn({
+            let journal_path = root.path().join("session.lock");
+            let cwd = root.path().to_path_buf();
+            async move {
+                run_session_actor(
+                    &journal_path,
+                    session_id,
+                    LaunchSession {
+                        request_id: Uuid::new_v4(),
+                        cwd,
+                        provider: CodingProvider::Codex,
+                        model: None,
+                        effort: None,
+                        fast: Some(false),
+                        response_language: crate::ResponseLanguage::Auto,
+                        permission_mode: PermissionMode::Manual,
+                        name: None,
+                        initial_prompt: None,
+                        capabilities: Default::default(),
+                        subagent_concurrency_limit: None,
+                        extension_skill_roots: Vec::new(),
+                        team_policy: None,
+                    },
+                    command_rx,
+                    event_tx,
+                    Arc::new(HungProviderExecutor),
+                    actor_store,
+                )
+                .await
+            }
+        });
+        // The pre-stop queued turn is already running; the other cases are idle.
+        let expected = if pre_stop_turn {
+            SessionStatus::Running
+        } else {
+            SessionStatus::Ready
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = event_rx.recv().await {
+                if matches!(event.kind, SessionEventKind::StatusChanged { status, .. } if status == expected) {
+                    break;
+                }
+            }
+        }).await.expect("session is ready for the fresh prompt");
+        assert_eq!(
+            store.state(session_id).await.unwrap().goal.unwrap().status,
+            GoalStatus::Paused
+        );
+
+        command_tx
+            .send(HostCommand::Prompt {
+                session_id,
+                message_id: Uuid::new_v4(),
+                text: "continue verification".to_string(),
+                attachments: Vec::new(),
+                output_schema: None,
+                delivery: PromptDelivery::Steer,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = event_rx.recv().await {
+                if matches!(event.kind, SessionEventKind::Message { actor: EventActor::User, ref text, .. } if text == "continue verification") {
+                    break;
+                }
+            }
+        }).await.expect("fresh prompt is admitted");
+        let state = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let state = store.state(session_id).await.unwrap();
+                if !stopped
+                    || (!state.user_stopped
+                        && state
+                            .goal
+                            .as_ref()
+                            .is_some_and(|goal| goal.status == GoalStatus::Active))
+                {
+                    break state;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fresh input resumes the interrupted goal");
+        assert_eq!(
+            state.goal.unwrap().status,
+            if stopped {
+                GoalStatus::Active
+            } else {
+                GoalStatus::Paused
+            }
+        );
+        if stopped {
+            assert!(!state.user_stopped);
+        }
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), actor).await;
+        scratch.discard().await;
+    }
+}
+
 #[tokio::test]
 async fn goal_state_is_recoverable_from_the_session_journal() {
     let session_id = Uuid::new_v4();

@@ -3577,7 +3577,15 @@ async fn run_agent_session_store_kernel_inner(
             // A human prompt that arrived after the stop clears the gate; one
             // already queued when the stop engaged runs without clearing it.
             if !stale_user_prompts.remove(&prompt.message_id) {
-                set_user_stop(&mut journal, &events, session_id, &mut user_stop, false).await?;
+                resume_interrupted_goal_on_human_input(
+                    &mut journal,
+                    &events,
+                    session_id,
+                    &mut goal,
+                    &mut goal_active_since,
+                    &mut user_stop,
+                )
+                .await?;
                 stale_user_prompts.clear();
             }
         }
@@ -5283,14 +5291,10 @@ async fn run_agent_session_store_kernel_inner(
                                     }
                                     // New human input on the active path is the
                                     // resume authority: clear the durable latch.
-                                    set_user_stop(
-                                        &mut journal,
-                                        &events,
-                                        session_id,
-                                        &mut user_stop,
-                                        false,
-                                    )
-                                    .await?;
+                                    resume_interrupted_goal_on_human_input(
+                                        &mut journal, &events, session_id, &mut goal,
+                                        &mut goal_active_since, &mut user_stop,
+                                    ).await?;
                                     stale_user_prompts.clear();
                                 }
                                 let prompt = QueuedPrompt {
@@ -5416,14 +5420,10 @@ async fn run_agent_session_store_kernel_inner(
                                     .await?;
                                     continue;
                                 }
-                                set_user_stop(
-                                    &mut journal,
-                                    &events,
-                                    session_id,
-                                    &mut user_stop,
-                                    false,
-                                )
-                                .await?;
+                                resume_interrupted_goal_on_human_input(
+                                    &mut journal, &events, session_id, &mut goal,
+                                    &mut goal_active_since, &mut user_stop,
+                                ).await?;
                                 stale_user_prompts.clear();
                             }
                             if admission_state == PromptAdmissionState::New {
@@ -10390,6 +10390,34 @@ async fn pause_active_goal(
         .await?;
     }
     Ok(())
+}
+
+/// Fresh human input releases an Escape stop and the goal it paused.
+/// A standalone /goal pause leaves the stop latch clear and stays paused.
+async fn resume_interrupted_goal_on_human_input(
+    journal: &mut RuntimeSessionStore,
+    events: &mpsc::Sender<SessionEvent>,
+    session_id: Uuid,
+    goal: &mut Option<SessionGoal>,
+    active_since: &mut Option<Instant>,
+    user_stop: &mut bool,
+) -> Result<()> {
+    if *user_stop
+        && goal
+            .as_ref()
+            .is_some_and(|goal| goal.status == GoalStatus::Paused)
+    {
+        apply_goal_action(
+            journal,
+            events,
+            session_id,
+            goal,
+            active_since,
+            GoalAction::Resume,
+        )
+        .await?;
+    }
+    set_user_stop(journal, events, session_id, user_stop, false).await
 }
 
 /// Toggle the explicit user-stop gate and persist the transition. Engaged by a
