@@ -4448,6 +4448,26 @@ fn deferred_edit_output_rehydrates_as_a_copyable_diff() {
 }
 
 #[test]
+fn collapsed_composer_never_places_the_hardware_cursor_on_the_statusline() {
+    assert_eq!(
+        composer_frame_cursor(Rect::new(0, 6, 80, 0), (0, 0), 0, false),
+        None
+    );
+    assert_eq!(
+        composer_frame_cursor(Rect::new(0, 6, 80, 1), (0, 0), 0, false),
+        None
+    );
+    assert_eq!(
+        composer_frame_cursor(Rect::new(0, 6, 3, 3), (0, 0), 0, false),
+        None
+    );
+    assert_eq!(
+        composer_frame_cursor(Rect::new(0, 6, 80, 3), (0, 0), 0, false),
+        Some(Position { x: 3, y: 7 })
+    );
+}
+
+#[test]
 fn composer_cursor_uses_terminal_cell_width() {
     assert_eq!(composer_cursor_position("a漢b", "a漢".len(), 3), (1, 0));
     assert_eq!(composer_cursor_position("a漢b", "a漢b".len(), 3), (1, 1));
