@@ -127,6 +127,9 @@ struct NativeCompactionContext<'a> {
     /// which are the only results micro-compaction may clear. A result this
     /// turn produced is the evidence the model is working from.
     earlier_tool_calls: &'a HashSet<String>,
+    /// The turn's shared request fields, so a summary can be asked for on the
+    /// prefix the provider already cached.
+    prefix: &'a ModelTurnRequest,
     /// Compact even when the pre-call estimate says the request fits. Set only
     /// after the provider has already refused for context length, where the
     /// estimate is demonstrably wrong or its window unknown.
@@ -604,7 +607,18 @@ impl NativeHarness {
             .model_client
             .context_window(turn.provider, &model)
             .await;
-        let turn_routing = borg_provider::provider::TurnRouting::default();
+        // Every request this turn sends, compaction included, shares these
+        // fields, so each one extends the prefix the previous one cached.
+        let request_template = ModelTurnRequest {
+            fast: turn.fast.unwrap_or(false),
+            request_id: None,
+            session_id: Some(provider_session_id.clone()),
+            prompt_cache_key: Some(prompt_cache_key.clone()),
+            turn_routing: Default::default(),
+            messages: Vec::new(),
+            tools: tools.clone(),
+            output_schema: turn.output_schema.clone(),
+        };
         let mut assistant_message_id = Uuid::new_v4();
         let mut model_round = 0_usize;
         let mut tool_round = 0_usize;
@@ -639,20 +653,16 @@ impl NativeHarness {
                         warmer: warmer.as_ref(),
                         events: &events,
                         earlier_tool_calls: &earlier_tool_calls,
+                        prefix: &request_template,
                         force: false,
                     },
                 )
                 .await?;
             }
             let request = ModelTurnRequest {
-                fast: turn.fast.unwrap_or(false),
                 request_id: Some(format!("{}:{model_round}", turn.message_id)),
-                session_id: Some(provider_session_id.clone()),
-                prompt_cache_key: Some(prompt_cache_key.clone()),
-                turn_routing: turn_routing.clone(),
                 messages: messages.clone(),
-                tools: tools.clone(),
-                output_schema: turn.output_schema.clone(),
+                ..request_template.clone()
             };
             // Kept verbatim, `prompt_cache_key` included: a refresh that
             // differed in any field would extend a different cache entry from
@@ -744,6 +754,7 @@ impl NativeHarness {
                             warmer: warmer.as_ref(),
                             events: &events,
                             earlier_tool_calls: &earlier_tool_calls,
+                            prefix: &request_template,
                             force: true,
                         },
                     )
@@ -1191,6 +1202,7 @@ impl NativeHarness {
                     warmer: warmer.as_ref(),
                     events: &events,
                     earlier_tool_calls: &earlier_tool_calls,
+                    prefix: &request_template,
                     force: false,
                 },
             )

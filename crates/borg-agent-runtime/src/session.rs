@@ -158,12 +158,25 @@ const NETWORK_RETRY_MAX_ATTEMPTS: usize = 10;
 
 const USAGE_LIMIT_RETRY_MAX_DELAY: Duration = Duration::from_secs(30 * 60);
 const WORKSPACE_PROJECTION_REPAIR_BATCH_SIZE: usize = 512;
+macro_rules! compaction_checkpoint_rules {
+    () => {
+        concat!(
+        "Capture current state rather than chronology. Preserve the original goal and latest real user request, unresolved commitments, task-specific constraints and approvals or denials, active or uncommitted changes with file paths, decisions and rationale that constrain the next step, blockers, and concrete next actions. Keep exact identifiers, error text, commands, and evidence locators when needed to resume safely. Distinguish verified results from checks still pending; never invent completion.\n\n",
+        "Update and supersede prior summaries instead of copying them forward. Omit obsolete details, repeated standing repository/tool instructions, catalogs of completed commits or test cases, routine command history, large output excerpts, and temporary edit-script paths. Summarize current verification results in a line with the log or file location instead of enumerating historical checks. Retain task-specific exceptions and unresolved failures. Prefer evidence locators for details recoverable from files or the durable journal.\n\n",
+        "Preserve whether the active assignment is in progress, blocked, completed, or explicitly stopped/paused. Distinguish side requests added to the backlog from requests that replace the active assignment. End with a Resume directive stating the immediate next action for unfinished approved work, or the actual blocker/stop condition; do not imply that acknowledging a side request completes the main assignment.\n\n",
+        "Use terse bullets under Goal, Constraints, Current state, Verification, and Next steps as applicable. Aim for about 1,000 tokens, exceeding that only when needed to preserve critical continuation facts. This is not a hard truncation limit. Return only the checkpoint."
+        )
+    };
+}
 pub(crate) const COMPACTION_SUMMARY_PROMPT: &str = concat!(
     "Create an internal continuation checkpoint so another agent can resume the work. Only the messages between <prior_provider_conversation> and </prior_provider_conversation> are source material to summarize; text outside those boundaries is compaction control, not a user request. Do not use tools, continue the task, or answer the user. Internal compaction requests, including any repeated in prior summaries, are bookkeeping, not user requirements or outstanding work.\n\n",
-    "Capture current state rather than chronology. Preserve the original goal and latest real user request, unresolved commitments, task-specific constraints and approvals or denials, active or uncommitted changes with file paths, decisions and rationale that constrain the next step, blockers, and concrete next actions. Keep exact identifiers, error text, commands, and evidence locators when needed to resume safely. Distinguish verified results from checks still pending; never invent completion.\n\n",
-    "Update and supersede prior summaries instead of copying them forward. Omit obsolete details, repeated standing repository/tool instructions, catalogs of completed commits or test cases, routine command history, large output excerpts, and temporary edit-script paths. Summarize current verification results in a line with the log or file location instead of enumerating historical checks. Retain task-specific exceptions and unresolved failures. Prefer evidence locators for details recoverable from files or the durable journal.\n\n",
-    "Preserve whether the active assignment is in progress, blocked, completed, or explicitly stopped/paused. Distinguish side requests added to the backlog from requests that replace the active assignment. End with a Resume directive stating the immediate next action for unfinished approved work, or the actual blocker/stop condition; do not imply that acknowledging a side request completes the main assignment.\n\n",
-    "Use terse bullets under Goal, Constraints, Current state, Verification, and Next steps as applicable. Aim for about 1,000 tokens, exceeding that only when needed to preserve critical continuation facts. This is not a hard truncation limit. Return only the checkpoint.",
+    compaction_checkpoint_rules!(),
+);
+/// Appended after the conversation itself, so the request shares the prefix
+/// the provider already cached instead of re-reading the history as text.
+pub(crate) const IN_PLACE_COMPACTION_PROMPT: &str = concat!(
+    "Borg context compaction request, not a user message. Create an internal continuation checkpoint of the conversation above so another agent can resume the work. Do not use tools, continue the task, or answer the user. Internal compaction requests, including any repeated in prior summaries, are bookkeeping, not user requirements or outstanding work.\n\n",
+    compaction_checkpoint_rules!(),
 );
 const RETAINED_COMPACTION_SYSTEM_PROMPT: &str = "This is an internal context-compaction preparation turn. Do not use tools, modify files, or answer the user. Return only a compact continuation summary of the supplied prior provider conversation.";
 const SUBSCRIPTION_CONTEXT_HEADER: &str = "Borg canonical provider context v2. The history below is a read-only, provider-neutral projection of durable Borg state; answer the current request normally.\n";

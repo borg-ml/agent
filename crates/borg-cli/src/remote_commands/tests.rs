@@ -6,6 +6,39 @@ use tempfile::tempdir;
 #[cfg(unix)]
 use tokio::io::AsyncReadExt;
 
+// A process that survives an atomic update must be able to launch a session
+// host; type checking cannot catch Linux's ` (deleted)` current_exe value.
+#[cfg(target_os = "linux")]
+#[test]
+fn detached_host_uses_replacement_after_atomic_update() {
+    let directory = tempdir().unwrap();
+    let installed = directory.path().join("borg");
+    std::os::unix::fs::symlink(std::env::current_exe().unwrap(), &installed).unwrap();
+    let deleted = PathBuf::from(format!("{} (deleted)", installed.display()));
+
+    let replacement = detached_host_executable(&deleted).unwrap();
+    assert_eq!(replacement, installed);
+    assert!(
+        std::process::Command::new(replacement)
+            .arg("--help")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    fs::remove_file(&installed).unwrap();
+    let live = detached_host_executable(&deleted).unwrap();
+    assert_eq!(live, PathBuf::from("/proc/self/exe"));
+    assert!(
+        std::process::Command::new(live)
+            .arg("--help")
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
+
 #[test]
 fn force_quit_does_not_wait_for_runtime_teardown() {
     const CHILD: &str = "BORG_TEST_FORCE_QUIT_CHILD";
