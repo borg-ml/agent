@@ -3093,6 +3093,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let job = JobSpec {
+            unit_prefix: None,
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
             foreign_client_grace_by_resource: vec![],
             abandon_after_ms: None,
