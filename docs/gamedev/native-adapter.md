@@ -22,7 +22,7 @@ between client databases.
 The wrapper `extensions/native/postgres.py` leases the supervised `test-postgres`
 service, creates a client database and gives `BORG_TEST_SESSIONS_URL` to the
 Cargo job; after `borg lane job wait` it drops only that database and releases
-its own lease even if tests fail. `services/test_postgres.py --start` initializes
+its own lease even if tests fail. `python3 extensions/native/services/test_postgres.py --start` initializes
 an owned throwaway `/tmp` cluster with peer-only Unix socket authentication and
 starts it through `borg lane service`. Set the printed
 `BORG_TEST_POSTGRES_ADMIN_URL` in the client environment. This requires the
@@ -61,6 +61,10 @@ database passwords in job specs.
   runtime from lane state, 877 passed / 0 failed / 9 ignored / 2 filtered,
   PostgreSQL-backed tests included. These jobs used a private throwaway
   PostgreSQL server, not the not-yet-wired supervised service.
+- Borg SQLx Postgres coverage through peer-compatible socket URL
+  `postgresql://shulgin@localhost/postgres?host=/tmp/gd-native-pg-benchmark&port=55471`:
+  `workspace_conformance::the_shared_read_surface_answers_identically`
+  passed (1/1, 0.25 s), confirming the generated service URL format.
 - Throwaway PostgreSQL 18.6, `pg_ctl -w start`, three independent clusters vs
   one shared cluster plus three `CREATE DATABASE` operations (PSS summed over
   each server's process tree): independent starts 0.323 s total / 58.52 MiB
@@ -71,7 +75,9 @@ database passwords in job specs.
 ## Remaining integration/decisions
 
 - Actual coordinated two-agent `cargo test -p borg-agent-runtime` contention
-  numbers require the lane CLI and two warm private targets. The initial
+  numbers require two warm private targets; the second target warm-up was queued
+  by the real lane with an actionable RAM budget reason and cancelled before
+  execution when host MemAvailable dropped below its admission threshold. The initial
   direct-probe compile is explicitly **not** a coordinated result.
 - Workspace core currently provides a 32 GiB **per-agent** disk cap,
   read-only `borg worktree --project ROOT target-status` (after workspace-core
