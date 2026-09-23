@@ -8,24 +8,31 @@ uncommitted edits. No branch here has been pushed.
 
 ## Base and merge order
 
-`gamedev/design` started at `cua/integrated` (`3e74f31`). Design checkpoints:
-`ede51c5` (interface) → `1a1a540` (architecture and module/CLI ownership),
-plus subsequent review edits. Rebase design onto `borg/agent-productivity`
-**when the parent announces it**; do not merge the old base a second time.
-Every implementer rebases onto the final design ref, then parent integrates:
+`gamedev/design` started at `cua/integrated` (`3e74f31`) and was rebased
+**only in its own worktree** onto the parent-finalized
+`borg/agent-productivity` (`4e01e0e`), without conflict. The original
+`ede51c5` interface and subsequent design commits have rewritten hashes;
+do not merge the old base a second time. Lane owner rebases next on final
+design, services then on the stabilized lane API, and the workspace bridge
+resolves its CLI entry changes with lane owner rather than independently
+merging them. Bench/adapters follow the integrated CLI; research is independent.
+Parent integration order:
 
 1. `gamedev/design`: shared crate, workspace manifests and interface/design
-   docs. Parent should first confirm `cargo check -p borg-lanes`, fmt and
-   clippy on the rebased base.
+   docs. Rebased validation: offline `cargo check -p borg-lanes`, clippy
+   `--all-targets -- -D warnings`, tests (0 skeleton tests), fmt and targeted/
+   workspace rust-analyzer diagnostics (173 files, zero diagnostics) passed.
 2. `gamedev/lanes`: atomic resource scheduler, job supervisor and *sole*
    owner of `borg-cli/src/{cli.rs,main.rs}` lane entry. Merge first among
    implementers because adapters/bench need stable `borg lane job` JSON API.
 3. `gamedev/services`: only its `services.rs`, tests and isolated service CLI
-   module; let lanes owner wire its subcommands into CLI entry after rebasing.
-   Require same resource admission authority and stale-client fencing.
+   module; lane owner has already wired the service subcommands at checkpoint
+   `9a1ed00`. Rebase services after lanes stabilizes D11; require same
+   resource admission authority and stale-client fencing.
 4. `gamedev/workspace`: worktree inventory, budgets, freeze and isolated
-   workspace CLI module. Ensure its provisional runtime helper is moved into
-   `borg-lanes/src/workspace/` rather than creating a duplicate API/authority.
+   workspace CLI module. Helper now lives in `borg-lanes/src/workspace/`;
+   integrate its optional CLI/MCP bridge only after coordinating the lanes-
+   owned entrypoint. Public `WorkspaceCoordinator` remains a skeleton.
 5. `gamedev/unreal` and `gamedev/native`: distinct Blu packages. Ensure they
    use the real CLI schema, not speculative `[api.lanes]`, and keep Abundance
    shared tree read-only. Adapters may merge independently after lanes CLI.
@@ -38,13 +45,14 @@ Every implementer rebases onto the final design ref, then parent integrates:
 If lanes CLI fails to make the integration cut, merge only design plus
 self-contained module implementations; mark both adapters and benchmark
 integration as unverified rather than presenting prototype shims as Borg's
-working first-party CLI/MCP.
+working first-party CLI/MCP. **That is a design-only preview, not v0 release:**
+parent requires D11 atomic editor/exclusive handoff and real-CLI proof.
 
 ## Branch evidence at first review
 
 | Branch | Observed checkpoint | Contract/API consistency and evidence | Remaining review |
 | --- | --- | --- | --- |
-| `gamedev/design` | `5cbc41e` | skeleton `cargo check -p borg-lanes --offline` and `cargo clippy -p borg-lanes --offline -- -D warnings` passed; fmt and diff check clean. Public types only, no scheduler. | Conditional integration doc in progress; final productivity-base announcement pending. |
+| `gamedev/design` | rebased on final `4e01e0e` | Offline skeleton check, clippy `--all-targets -D warnings`, fmt/tests and Rust LSP (173 files, zero diagnostics) passed; public types only, no scheduler. | Conditional review remains; no merge approval until D11 cross-module proof. |
 | `gamedev/lanes` | `dee1b25` scheduler/CLI auto-yield checkpoint (through `e2c92f8`) | Independently ran `cargo test -p borg-lanes lanes::tests --offline`: 6 passed (0.34 s), plus `python3 crates/borg-cli/tests/test_lane_process.py target/debug/borg`: 5 passed (2.084 s), including isolated killed-supervisor systemd scope recovery. Shared service lease, Preparing and same-lock grant recheck added. | Automatic all-active-service discovery/yield now implemented from shared service leases, but post-hook/resume ordering, resume failure observability and real-CLI two-service no-hook regression remain unproved. Do not merge as v0 handoff yet. |
 | `gamedev/services` | `1c83671` atop lanes `e2c92f8` | Independently reran `CARGO_BUILD_JOBS=6 nice -n 10 cargo test -p borg-lanes services::tests --offline`: 8 passed again (1.56 s after compile); unit cfg bypasses production delegated cgroup path, including active-lease restoration, unfenced proxy default-deny and exclusive-lease restart refusal; service holds a shared lane lease during backend lifetime and scopes each backend generation under delegated supervisor unit; real cgroup cleanup not yet independently exercised. Earlier A/B probe unavailable 0 / 327 ms. MCP initialize validation, active-client restore on yield and default-deny unfenced proxy (audited allowlist pending), UnixStream control, `KillMode=control-group`, no-systemd fail-closed, raw proxy mutations denied by default. | verify supervisor-crash cgroup cleanup, every bound service discovers same lane gate and blocks startup/resume for whole exclusive lease, CLI wiring and real-CLI regression, owner/fence enforcement. |
 | `gamedev/workspace` | `c4d55aa` workspace checkpoint (through `75a882a`) | Independently ran `CARGO_BUILD_JOBS=6 nice -n 10 cargo test -p borg-lanes workspace:: --offline`: 5 passed (0.08 s; 1m20s compilation wait), including dirty/live GC exclusion and ack/clean-path freeze; owner reports clippy/fmt. Moved inventory/budget/GC/freeze into `borg-lanes::workspace::hygiene`, Borg GC dry-run 14 listed/0 eligible (3.482 s); Abundance 10/0 (2.742 s); target-status two over 24 GiB, no cleanup. Freeze checks acks/clean trees but does not acquire project lane gate: advisory only (MCP validates claim; core helper/CLI require caller coordination). Trait `WorkspaceCoordinator` still skeleton; helper owns separate richer record, budget API not wired into lane dispatch. Bridge GC now static-verified dry-run-only, no model apply/confirmed fields. CLI apply requires TTY per-path confirmation and journal owner-exit recheck. Freeze now checks work_id claim; still advisory without project gate. | align public trait/record or document partial implementation; bridge CLI integration still conflicts with lanes-owned entry; wire one admission authority and enforce freeze lane gate before claiming lock. |
