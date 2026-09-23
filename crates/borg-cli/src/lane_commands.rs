@@ -42,6 +42,9 @@ pub(crate) enum JobCommand {
     Submit {
         #[arg(long)]
         spec: String,
+        /// Override the five-minute foreign-client wait; zero waits indefinitely.
+        #[arg(long)]
+        foreign_lease_grace_seconds: Option<u64>,
     },
     /// Block on the supervisor's kernel completion lock, without polling.
     Wait {
@@ -107,7 +110,10 @@ pub(crate) async fn run(args: LaneArgs) -> Result<()> {
             }
         }
         LaneCommand::Job { command } => match command {
-            JobCommand::Submit { spec } => {
+            JobCommand::Submit {
+                spec,
+                foreign_lease_grace_seconds,
+            } => {
                 let text = if spec == "-" {
                     let mut buf = String::new();
                     std::io::stdin().read_to_string(&mut buf)?;
@@ -115,7 +121,15 @@ pub(crate) async fn run(args: LaneArgs) -> Result<()> {
                 } else {
                     std::fs::read_to_string(&spec).with_context(|| format!("reading {spec}"))?
                 };
-                let spec: JobSpec = serde_json::from_str(&text).context("invalid JobSpec JSON")?;
+                let mut spec: JobSpec =
+                    serde_json::from_str(&text).context("invalid JobSpec JSON")?;
+                if let Some(seconds) = foreign_lease_grace_seconds {
+                    ensure!(
+                        seconds <= 86_400,
+                        "foreign lease grace must be <= 86400 seconds"
+                    );
+                    spec.foreign_client_grace_ms = seconds * 1000;
+                }
                 print_job(&store.enqueue_job(spec)?, json)?;
             }
             JobCommand::Wait { id } => {

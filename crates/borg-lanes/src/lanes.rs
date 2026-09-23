@@ -129,8 +129,16 @@ pub struct Hook {
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct JobFingerprint(pub String);
 
+fn default_foreign_client_grace_ms() -> u64 {
+    300_000
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JobSpec {
+    /// Foreign client leases delay preemption for this many milliseconds.
+    /// Zero waits indefinitely; default is five minutes.
+    #[serde(default = "default_foreign_client_grace_ms")]
+    pub foreign_client_grace_ms: u64,
     pub fingerprint: JobFingerprint,
     pub lease: LeaseRequest,
     pub argv: Vec<String>,
@@ -229,6 +237,9 @@ pub struct LaneRecord {
     /// Only a Granted row reserves service RAM and filesystem space.
     #[serde(default)]
     pub service_admission: Option<AdmissionBudget>,
+    /// Set once when the exclusive first enters Preparing (not reset by retries).
+    #[serde(default)]
+    pub preparing_since_ms: Option<u64>,
     /// Active service IDs captured atomically when this exclusive enters Preparing.
     #[serde(default)]
     pub yield_services: Vec<String>,
@@ -244,6 +255,9 @@ struct Journal {
     sequence: u64,
     records: Vec<LaneRecord>,
     capacities: Vec<Capacity>,
+    /// Client lease mutations also wake journal waiters.
+    #[serde(default)]
+    client_revision: u64,
 }
 
 /// One host-local lane store. Clones share held in-process lease FDs; cross-
@@ -330,6 +344,63 @@ impl LaneStore {
             File::open(&self.root)?.sync_all()?;
         }
         result
+    }
+
+    /// The service supervisor serializes every client grant, renewal and
+    /// release with exclusive Preparing decisions. The callback publishes its
+    /// own service state atomically *while* this metadata lock is held; jobs
+    /// read that file under the same lock. Never call lane APIs in `change`.
+    pub(crate) fn service_client_change<T>(
+        &self,
+        service_id: &str,
+        resources: &[ResourceRequest],
+        acquiring: bool,
+        change: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.locked(|journal| {
+            if acquiring {
+                let tag = format!("service:{service_id}");
+                ensure!(
+                    journal.records.iter().any(|r| {
+                        r.service_lease
+                            && r.request.holder.purpose == tag
+                            && matches!(r.state, TicketState::Granted(_))
+                    }),
+                    "service {service_id} holds no active lane lease for client grant"
+                );
+                if let Some(exclusive) = journal.records.iter().find(|r| {
+                    matches!(r.state, TicketState::Preparing | TicketState::Granted(_))
+                        && !r.service_lease
+                        && r.request.resources.iter().any(|claim| {
+                            matches!(claim.access, Access::Exclusive)
+                                && resources.iter().any(|bound| bound.key == claim.key)
+                        })
+                }) {
+                    bail!(
+                        "exclusive lane ticket {} is preparing or active; new client lease denied",
+                        exclusive.ticket.id
+                    );
+                }
+            }
+            let value = change()?;
+            journal.client_revision = journal.client_revision.saturating_add(1);
+            Ok(value)
+        })
+    }
+
+    /// Advisory for the service's public status; the journal lock and client
+    /// transaction, not this display, decide admission.
+    pub(crate) fn service_preemption_notice(&self, service_id: &str) -> Result<Option<String>> {
+        self.reading(|journal| {
+            Ok(journal.records.iter().find_map(|row| {
+                (matches!(row.state, TicketState::Preparing)
+                    && row.yield_services.iter().any(|id| id == service_id))
+                .then_some(row.wait_reason.as_deref())
+                .flatten()
+                .filter(|reason| reason.starts_with("foreign client lease:"))
+                .map(str::to_owned)
+            }))
+        })
     }
 
     /// Global capacities are host-scoped keys; missing keys default to one.
@@ -613,6 +684,7 @@ impl LaneStore {
             quarantined: false,
             service_lease: false,
             service_admission: None,
+            preparing_since_ms: None,
             yield_services: vec![],
             resume_pending: vec![],
             resume_error: None,
@@ -1188,6 +1260,7 @@ impl LaneStore {
             {
                 entry.yield_services = services;
                 entry.state = TicketState::Preparing;
+                entry.preparing_since_ms = Some(milliseconds());
                 entry.wait_reason = Some("waiting for synchronous pre-exclusive yield".to_owned());
                 return Ok(None);
             }
@@ -1195,16 +1268,108 @@ impl LaneStore {
         })
     }
 
+    /// Called only while holding state.lock. Service client mutation publishes
+    /// this file under the same lock, closing late-grant/read races.
+    fn foreign_client_wait(&self, state: &Journal, id: Uuid) -> Result<Option<String>> {
+        let row = state
+            .records
+            .iter()
+            .find(|row| row.ticket.id == id)
+            .context("preparing job disappeared")?;
+        let spec = row.spec.as_ref().context("preparing ticket has no job")?;
+        let now = milliseconds();
+        let since = row.preparing_since_ms.unwrap_or(now);
+        if spec.foreign_client_grace_ms != 0
+            && now.saturating_sub(since) >= spec.foreign_client_grace_ms
+        {
+            return Ok(None);
+        }
+        for service_id in &row.yield_services {
+            // Already stopped/yielded services cannot have a running editor
+            // holding new client settings; avoid waiting on stale status.
+            let tag = format!("service:{service_id}");
+            if !state.records.iter().any(|holder| {
+                holder.service_lease
+                    && holder.request.holder.purpose == tag
+                    && matches!(holder.state, TicketState::Granted(_))
+            }) {
+                continue;
+            }
+            ensure!(
+                service_id
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'),
+                "invalid bound service id"
+            );
+            let path = self
+                .root
+                .join("services")
+                .join(service_id)
+                .join("state.json");
+            ensure!(
+                fs::metadata(&path)?.len() <= 1_048_576,
+                "service status too large"
+            );
+            let status: crate::services::ServiceStatus = serde_json::from_slice(&fs::read(path)?)?;
+            ensure!(status.id == *service_id, "service status identity mismatch");
+            for client in &status.clients {
+                if client.expires_at_unix_ms > now
+                    && (client.owner.participant_id != row.request.holder.participant_id
+                        || client.owner.session_id != row.request.holder.session_id)
+                {
+                    let grace = if spec.foreign_client_grace_ms == 0 {
+                        "indefinite".to_owned()
+                    } else {
+                        since
+                            .saturating_add(spec.foreign_client_grace_ms)
+                            .to_string()
+                    };
+                    return Ok(Some(format!(
+                        "foreign client lease: service {service_id} holder {}/{} until {} or grace {grace}",
+                        client.owner.participant_id,
+                        client.owner.session_id,
+                        client.expires_at_unix_ms
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn wait_grant(&self, id: Uuid) -> Result<Lease> {
         let entered = std::time::Instant::now();
         let event = StateEvents::new(&self.root)?;
         loop {
             self.recover(false)?;
-            if let Some(lease) = self.try_grant(id)? {
+            if !matches!(self.record(id)?.state, TicketState::Preparing)
+                && let Some(lease) = self.try_grant(id)?
+            {
                 return Ok(lease);
             }
             let record = self.record(id)?;
             if matches!(record.state, TicketState::Preparing) {
+                let waiting = self.locked(|state| {
+                    let reason = self.foreign_client_wait(state, id).unwrap_or_else(|error| {
+                        Some(format!("service client state unavailable: {error:#}"))
+                    });
+                    let row = state
+                        .records
+                        .iter_mut()
+                        .find(|row| row.ticket.id == id)
+                        .context("preparing job disappeared")?;
+                    row.wait_reason = reason.clone();
+                    Ok(reason)
+                })?;
+                if waiting.is_some() {
+                    if let Some(limit) = record.request.queue_timeout_ms
+                        && entered.elapsed().as_millis() >= u128::from(limit)
+                    {
+                        self.cancel_ticket(id, "queue timeout waiting for foreign client lease")?;
+                        bail!("queue timeout for ticket {id}");
+                    }
+                    event.wait(Duration::from_secs(2))?;
+                    continue;
+                }
                 let spec = record.spec.context("preparing ticket has no job")?;
                 // All active service bindings are journalled as shared leases.
                 // Request EVERY bound service to yield, regardless of optional
@@ -1957,6 +2122,7 @@ mod tests {
             quarantined: false,
             service_lease: false,
             service_admission: None,
+            preparing_since_ms: None,
             yield_services: vec![],
             resume_pending: vec![],
             resume_error: None,
@@ -2028,6 +2194,7 @@ mod tests {
     fn fifo_exclusive_not_overtaken_by_shared() {
         // A running shared reader must not allow a later reader to starve a queued writer.
         let state = Journal {
+            client_revision: 0,
             sequence: 3,
             capacities: vec![Capacity {
                 key: key("gpu"),
@@ -2063,6 +2230,7 @@ mod tests {
     #[test]
     fn disjoint_jobs_admit_without_waiting_for_blocked_tree() {
         let state = Journal {
+            client_revision: 0,
             sequence: 3,
             capacities: vec![],
             records: vec![
@@ -2084,6 +2252,7 @@ mod tests {
     #[test]
     fn capacity_respects_weights_and_atomic_multi_key_requests() {
         let state = Journal {
+            client_revision: 0,
             sequence: 2,
             capacities: vec![Capacity {
                 key: key("ram"),
@@ -2113,6 +2282,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LaneStore::new(dir.path()).unwrap();
         let spec = JobSpec {
+            foreign_client_grace_ms: default_foreign_client_grace_ms(),
             fingerprint: JobFingerprint("post-fail".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -2418,6 +2588,236 @@ mod tests {
         assert!(reason.contains("budget inspection unavailable"), "{reason}");
         store.release_lease(&lease).unwrap();
     }
+    fn test_service_status(root: &Path, clients: &[crate::services::ClientLease]) {
+        let dir = root.join("services/test");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "id": "test", "state": {"Healthy": {"backend": null}},
+                "endpoint": null, "clients": clients, "reason": "ready", "yields": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn foreign_client_preparing_waits_for_release_while_own_client_does_not() {
+        use crate::services::ClientLease;
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let bound = vec![resource("project", Access::Shared { slots: 1 })];
+        let service = store
+            .try_acquire_service(
+                LeaseRequest {
+                    resources: bound.clone(),
+                    holder: service_holder(),
+                    queue_timeout_ms: None,
+                },
+                &test_budget(dir.path()),
+            )
+            .unwrap()
+            .unwrap();
+        let mut foreign_owner = holder();
+        foreign_owner.participant_id = Uuid::new_v4();
+        foreign_owner.session_id = Uuid::new_v4();
+        let foreign = ClientLease {
+            id: Uuid::new_v4(),
+            service_id: "test".into(),
+            owner: foreign_owner,
+            expires_at_unix_ms: milliseconds() + 60_000,
+            purpose: "editor work".into(),
+        };
+        test_service_status(dir.path(), std::slice::from_ref(&foreign));
+        let spec = JobSpec {
+            foreign_client_grace_ms: 0, // Forever until explicit release/expiry.
+            fingerprint: JobFingerprint("foreign-client".into()),
+            lease: LeaseRequest {
+                resources: vec![resource("project", Access::Exclusive)],
+                holder: holder(),
+                queue_timeout_ms: Some(5000),
+            },
+            argv: vec!["true".into()],
+            cwd: dir.path().into(),
+            env: vec![],
+            memory_max_bytes: None,
+            admission: test_budget(dir.path()),
+            // The test service yield stub ACKs immediately. A bounded hook
+            // models the real RPC barrier while the test releases its lease.
+            pre_hook: Some(Hook {
+                argv: vec!["sh".into(), "-c".into(), "sleep 0.4".into()],
+                timeout_ms: 2000,
+            }),
+            post_hook: None,
+            timeout_ms: 2000,
+            stall_timeout_ms: None,
+            coalesce: false,
+        };
+        let job = store
+            .locked(|state| {
+                Ok(store
+                    .enqueue_record(state, spec.lease.clone(), Some(spec))?
+                    .1
+                    .unwrap())
+            })
+            .unwrap();
+        let lock = stable_file(&store.ticket_path(job.id)).unwrap();
+        lock.lock().unwrap();
+        assert!(store.try_grant(job.id).unwrap().is_none());
+        assert!(matches!(
+            store.record(job.id).unwrap().state,
+            TicketState::Preparing
+        ));
+        store
+            .locked(|state| {
+                let reason = store.foreign_client_wait(state, job.id)?.unwrap();
+                assert!(
+                    reason.starts_with("foreign client lease: service test"),
+                    "{reason}"
+                );
+                Ok(())
+            })
+            .unwrap();
+        // A late client grant/renew loses to the Preparing reservation.
+        let error = store
+            .service_client_change("test", &bound, true, || Ok(()))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("new client lease denied"),
+            "{error}"
+        );
+        let waiter = store.clone();
+        let task = std::thread::spawn(move || waiter.wait_grant(job.id));
+        let entered = std::time::Instant::now();
+        loop {
+            let row = store.record(job.id).unwrap();
+            if row
+                .wait_reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("foreign client lease:"))
+            {
+                break;
+            }
+            assert!(
+                entered.elapsed() < Duration::from_secs(2),
+                "foreign wait not reported"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(
+            store.record(job.id).unwrap().state,
+            TicketState::Preparing
+        ));
+        assert!(
+            store
+                .service_preemption_notice("test")
+                .unwrap()
+                .unwrap()
+                .contains("foreign client lease:")
+        );
+        // The requester's own lease must not delay the same job.
+        let own = ClientLease {
+            owner: holder(),
+            ..foreign.clone()
+        };
+        store
+            .service_client_change("test", &bound, false, || {
+                test_service_status(dir.path(), std::slice::from_ref(&own));
+                Ok(())
+            })
+            .unwrap();
+        store
+            .locked(|state| {
+                assert!(store.foreign_client_wait(state, job.id)?.is_none());
+                Ok(())
+            })
+            .unwrap();
+        // The fake service relinquishes its shared backend lease after yield.
+        store.release_lease(&service).unwrap();
+        let exclusive = task.join().unwrap().unwrap();
+        assert_eq!(exclusive.ticket.id, job.id);
+        store.finish(job.id, 0, "test complete").unwrap();
+    }
+
+    #[test]
+    fn foreign_grace_expiry_does_not_reset_after_recovery() {
+        use crate::services::ClientLease;
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let service = store
+            .try_acquire_service(
+                LeaseRequest {
+                    resources: vec![resource("project", Access::Shared { slots: 1 })],
+                    holder: service_holder(),
+                    queue_timeout_ms: None,
+                },
+                &test_budget(dir.path()),
+            )
+            .unwrap()
+            .unwrap();
+        let foreign = ClientLease {
+            id: Uuid::new_v4(),
+            service_id: "test".into(),
+            owner: Holder {
+                participant_id: Uuid::new_v4(),
+                session_id: Uuid::new_v4(),
+                ..holder()
+            },
+            expires_at_unix_ms: milliseconds() + 60_000,
+            purpose: "editor work".into(),
+        };
+        test_service_status(dir.path(), &[foreign]);
+        let spec = JobSpec {
+            foreign_client_grace_ms: 500,
+            fingerprint: JobFingerprint("grace-client".into()),
+            lease: LeaseRequest {
+                resources: vec![resource("project", Access::Exclusive)],
+                holder: holder(),
+                queue_timeout_ms: None,
+            },
+            argv: vec!["true".into()],
+            cwd: dir.path().into(),
+            env: vec![],
+            memory_max_bytes: None,
+            admission: test_budget(dir.path()),
+            pre_hook: None,
+            post_hook: None,
+            timeout_ms: 2000,
+            stall_timeout_ms: None,
+            coalesce: false,
+        };
+        let job = store
+            .locked(|state| {
+                Ok(store
+                    .enqueue_record(state, spec.lease.clone(), Some(spec))?
+                    .1
+                    .unwrap())
+            })
+            .unwrap();
+        assert!(store.try_grant(job.id).unwrap().is_none());
+        store
+            .locked(|state| {
+                let row = state
+                    .records
+                    .iter_mut()
+                    .find(|r| r.ticket.id == job.id)
+                    .unwrap();
+                row.preparing_since_ms = Some(milliseconds() - 1000);
+                Ok(())
+            })
+            .unwrap();
+        // A new LaneStore (e.g. after supervisor recovery) sees durable grace.
+        let recovered = LaneStore::new(dir.path()).unwrap();
+        recovered
+            .locked(|state| {
+                assert!(recovered.foreign_client_wait(state, job.id)?.is_none());
+                Ok(())
+            })
+            .unwrap();
+        store.release_lease(&service).unwrap();
+    }
+
     #[test]
     fn service_lease_yields_before_exclusive_grant_and_blocks_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -2431,7 +2831,9 @@ mod tests {
             .try_acquire_service(service_request.clone(), &test_budget(dir.path()))
             .unwrap()
             .unwrap();
+        test_service_status(dir.path(), &[]);
         let spec = JobSpec {
+            foreign_client_grace_ms: default_foreign_client_grace_ms(),
             fingerprint: JobFingerprint("yield-r1".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -2535,6 +2937,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let spec = JobSpec {
+            foreign_client_grace_ms: default_foreign_client_grace_ms(),
             fingerprint: JobFingerprint("auto-bound".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -2588,7 +2991,9 @@ mod tests {
             )
             .unwrap()
             .unwrap();
+        test_service_status(dir.path(), &[]);
         let spec = JobSpec {
+            foreign_client_grace_ms: default_foreign_client_grace_ms(),
             fingerprint: JobFingerprint("no-yield".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -2641,6 +3046,7 @@ mod tests {
     }
     fn coalescing_spec(dir: &Path, queue_timeout_ms: Option<u64>) -> JobSpec {
         JobSpec {
+            foreign_client_grace_ms: default_foreign_client_grace_ms(),
             fingerprint: JobFingerprint("source-r1".into()),
             lease: LeaseRequest {
                 resources: vec![resource("build", Access::Exclusive)],

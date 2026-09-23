@@ -773,6 +773,7 @@ pub(crate) mod tests {
 
     pub(crate) fn spec(project: &Path, access: Access) -> JobSpec {
         JobSpec {
+            foreign_client_grace_ms: 0,
             fingerprint: JobFingerprint("fp".into()),
             lease: LeaseRequest {
                 resources: vec![ResourceRequest {
