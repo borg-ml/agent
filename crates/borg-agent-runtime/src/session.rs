@@ -4503,6 +4503,13 @@ async fn run_agent_session_store_kernel_inner(
         // pile up and fire in a burst on wake. One tick on wake is all we need.
         watchdog_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
+            // Input that has not reached the model yet: a steer the provider
+            // has not accepted, or accepted but not consumed. A blocking
+            // `wait_agent` ends on it, because the provider only folds the
+            // steer in once the running tool call returns.
+            dispatcher.set_input_pending(
+                !pending_steers.is_empty() || !steers_awaiting_consumption.is_empty(),
+            );
             tokio::select! {
                 biased;
                 result = async { title_result_rx.as_mut().expect("guarded title receiver").await }, if title_result_rx.is_some() => {
@@ -6316,6 +6323,7 @@ async fn run_agent_session_store_kernel_inner(
                 }
             }
         }
+        dispatcher.set_input_pending(false);
         if let Some(sender) = autonomy_result_sender {
             let result = autonomy_result
                 .unwrap_or_else(|| Err(anyhow::anyhow!("autonomy turn ended without a result")));
