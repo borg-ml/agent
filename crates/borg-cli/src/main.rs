@@ -17,7 +17,6 @@ mod importer;
 mod inspect;
 mod lane_commands;
 mod lane_service_commands;
-mod limits;
 mod protection;
 mod remote_commands;
 mod session_commands;
@@ -35,7 +34,8 @@ use std::sync::Mutex;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
 use crate::cli::{
-    CapabilitiesArgs, Cli, Command, ExtensionCommand, ExtensionsArgs, LocalAgentCliArgs,
+    CapabilitiesArgs, Cli, Command, ExtensionCommand, ExtensionsArgs, LimitsArgs, LimitsCommand,
+    LocalAgentCliArgs,
 };
 use crate::remote_commands::{print_local_workspaces, run_local_agent, run_remote_command};
 
@@ -106,9 +106,7 @@ fn spawn_allocator_trim() {}
 
 async fn run() -> Result<()> {
     let cli = Cli::parse_borg();
-    let no_limits = cli.no_limits;
     let command = cli.command_or_agent();
-    limits::reexec_local_agent_if_enabled(&command, no_limits)?;
     let writer = log_writer();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -148,7 +146,10 @@ async fn run() -> Result<()> {
         Command::Collab { command } => collab::run(command).await,
         Command::Doctor { json, deep } => doctor(json, deep).await,
         Command::Bug(args) => bug::run(args).await,
-        Command::Limits(args) => limits::run(args).await,
+        Command::Limits(LimitsArgs {
+            command: LimitsCommand::Protect(args),
+            json,
+        }) => protection::run(args, json),
         Command::AgentMcp => agent_mcp::run().await,
     }
 }

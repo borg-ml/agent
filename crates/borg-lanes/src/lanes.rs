@@ -1739,16 +1739,6 @@ impl LaneStore {
             if let Some(max) = spec.memory_max_bytes {
                 command.args(["-p", &format!("MemoryMax={max}")]);
             }
-            if fs::read_to_string("/proc/self/cgroup").is_ok_and(|s| s.contains("/app-borg.slice/"))
-                && Command::new("systemctl")
-                    .args(["--user", "cat", "app-borg-workloads.slice"])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .is_ok_and(|s| s.success())
-            {
-                command.arg("--slice=app-borg-workloads.slice");
-            }
             command.arg("--").arg(&spec.argv[0]).args(&spec.argv[1..]);
             command
         } else {
