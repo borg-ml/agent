@@ -35,11 +35,19 @@ FIFO can accumulate *more aggregate queue time* than opportunistic poll retries 
 
 ## Bounded fake-process replay
 
-For an actual CPU/RSS smoke test: `python3 scripts/gamedev_benchmark.py --agents 1 --jobs 1 --scale 200 --cores 8 --policy borg --materialize`. The default physical replay caps 8 live processes, 8 logical cores and 8 GiB RSS (default 32 MiB of touched RAM per modeled GiB, maximum 64 MiB/GiB); each fake process burns approximately 0.25 CPU, with seconds divided by `--scale`. The *analytic* per-job CPU and RAM values above remain the calibration values; the fake process intentionally shrinks both to avoid competing with live developers. The smoke run took 0.134 s and touched 64 MiB, exit failures 0. Materialization is optional and cannot validate UBT throughput or cold editor latency.
+For an actual CPU/RSS smoke test: `python3 scripts/gamedev_benchmark.py --agents 1 --jobs 1 --scale 200 --cores 8 --policy borg --materialize`. Materialized replay permits at most 8 live workers and 8 modeled CPU cores, and caps the **sum of requested fake buffers** at 8 GiB (default 32 MiB touched per modeled GiB, maximum 64 MiB/GiB). This is not a host RSS or CPU-affinity limit: Python process overhead adds RSS, and each fake worker burns approximately 0.25 CPU, with seconds divided by `--scale`. The *analytic* per-job CPU and RAM values above remain the calibration values; the fake process intentionally shrinks both to avoid competing with live developers. The smoke run took 0.134 s and touched 64 MiB, exit failures 0. Materialization is optional and cannot validate UBT throughput or cold editor latency.
+
+A second, bounded 3-agent × 3-job concurrency check used
+`python3 scripts/gamedev_benchmark.py --agents 3 --jobs 3 --seed 23 --scale 200 --cores 8 --policy borg --ram-mib-per-gib 4 --materialize --json`.
+It modeled 8 launches/1 safe pending join and 1.524 s makespan; the actual fake
+workers replayed in 1.686 s with **72 MiB peak requested/touched fake buffers and zero worker
+failures** (`/tmp/gd-bench-materialize-3x3.json`). This verifies bounded worker
+execution/cleanup, not CLI policy correctness or an Unreal speedup; wall time
+varies with shared-host load.
 
 ## Real CLI status
 
-The CLI contract is in `docs/gamedev/interfaces.md`: `borg lane job submit|wait|status --json` and service start/status/lease/yield/resume. The lane CLI initially landed at `37c5ee8`; the integrated lane+service CLI and automatic handoff are verified below on the hash-pinned candidate built from source through `5429399`. The drivers execute only public JSON CLI commands with fake jobs in isolated lane state directories, never direct Rust calls or hand-made supervisor state. The isolated service proxy restart/switchover and scoped two-service handoff are verified below. Project-path alias rejection, RAM admission, failed bound post-hook and failed service-resume retry have separate post-fix public-CLI results below; orphan/crash ownership recovery remains untested. Report any divergence with CLI invocation, JSON output and minimal reproduction to `gd_lanes_core`/`gd_services_core`.
+The CLI contract is in `docs/gamedev/interfaces.md`: `borg lane job submit|wait|status --json` and service start/status/lease/yield/resume. The lane CLI initially landed at `37c5ee8`; the lane-owner lane+service CLI and automatic handoff are verified below on the hash-pinned candidate built from source through `5429399` (**not** the final `gamedev/integrated` CLI). The drivers execute only public JSON CLI commands with fake jobs in isolated lane state directories, never direct Rust calls or hand-made supervisor state. The isolated service proxy restart/switchover and scoped two-service handoff are verified below. Project-path alias rejection, RAM admission, failed bound post-hook and failed service-resume retry have separate post-fix public-CLI results below; orphan/crash ownership recovery remains untested. Report any divergence with CLI invocation, JSON output and minimal reproduction to `gd_lanes_core`/`gd_services_core`.
 
 ### Public-CLI drivers (hash-pinned binary verified below)
 
@@ -62,7 +70,7 @@ python3 scripts/gamedev_service_probe.py --borg target/debug/borg --atomic-unhea
 python3 scripts/gamedev_real_benchmark.py --borg target/debug/borg --burst-fairness
 ```
 
-The job driver submits the **same seeded workload generator** as the simulator through `lane --json job submit --spec -`, blocks via `job wait`, and reads timing from `job status --json`. It creates only an isolated temporary project/lane directory, with a 20-slot synthetic host memory resource. Each fake job touches 16 MiB/model GiB (≤320 MiB across admitted jobs) and consumes about 0.25 CPU; the driver explicitly uses `BORG_LANE_SCOPE=0` and `BORG_LANE_DEGRADED=1` for low-impact job coordination smoke, so it does not prove scoped recovery; the D11 tests below require real user-systemd scopes. First builds have a 0.5 s minimum to permit coalescing despite CLI startup; subsequent tasks have a 0.04 s minimum. Real mode measures CLI coordination plus tiny fake jobs, **not** nominal UBT/Unreal time or systemd crash recovery. The service probe drives only the JSON CLI and a local synthetic HTTP backend, tests lease/release, stable front port across restart and exclusive yield/resume, and stops only its own service. These commands passed against the hash-pinned integrated candidate below; CI must build its own current binary and fail on any invariant rather than trusting this historical result.
+The job driver submits the **same seeded workload generator** as the simulator through `lane --json job submit --spec -`, blocks via `job wait`, and reads timing from `job status --json`. It creates only an isolated temporary project/lane directory, with a 20-slot synthetic host memory resource. Each fake job touches 16 MiB/model GiB (≤320 MiB across admitted jobs) and consumes about 0.25 CPU; the driver explicitly uses `BORG_LANE_SCOPE=0` and `BORG_LANE_DEGRADED=1` for low-impact job coordination smoke, so it does not prove scoped recovery; the D11 tests below require real user-systemd scopes. First builds have a 0.5 s minimum to permit coalescing despite CLI startup; subsequent tasks have a 0.04 s minimum. Real mode measures CLI coordination plus tiny fake jobs, **not** nominal UBT/Unreal time or systemd crash recovery. The service probe drives only the JSON CLI and a local synthetic HTTP backend, tests lease/release, stable front port across restart and exclusive yield/resume, and stops only its own service. These commands passed against the hash-pinned lane-owner candidate below, not the final integrated v0 CLI; CI must build its own current binary and fail on any invariant rather than trusting this historical result.
 
 ### Observed lane CLI (fake processes, not Unreal)
 
@@ -91,7 +99,7 @@ The basic public CLI service lifecycle smoke **passed** on an own-worktree `borg
 
 The required two-service **no-hook** command above **failed as expected before auto-discovery was implemented**: job `cbb19e38-d959-4a10-9f40-23dcb1b44744` had `started_ms: null`, public `job status --json` reported `wait_reason: exclusive resource bench-exclusive-13736b581f754dc6989f56ad51f353b9 busy`, and `job wait` returned 125 on queue timeout. Both test-owned services were stopped afterward; isolated state remains at `/tmp/borg-service-bench-i0b4kjyj` for owner debugging. The first attempt failed for a separate fixture setting (`BORG_LANE_SCOPE=0` also required explicit `BORG_LANE_DEGRADED=1` for an intentionally unscoped job); the reported historical failure above includes that setting and is genuinely resource contention. This pre-auto-discovery checkpoint was superseded by the fresh scoped PASS below.
 
-#### Fresh integrated D11 and running-join results
+#### Fresh lane-owner D11 and running-join results
 
 After the lane owner rebuilt its binary, record its SHA-256 and mtime before making any claim. For the verified binary (`SHA-256 4022be198a99c3e8f8cac3069387f222bd2cb4e1bfdfb7a4135e8048c19a34b2`; mtime `2026-09-23 03:43:04 +0100`), the lane source through `5429399` includes automatic bound-service discovery, pending-only coalescing and delegated backend-generation cgroups; `57085ef` afterward changed docs only.
 
@@ -157,14 +165,85 @@ The lane owner rebuilt `gamedev/lanes` through `2d347be` after fixing Resume RPC
 
 The bounded 6×8 public CLI replay on this same pinned binary produced 48 requests, **45 unique launches / 3 pending joins**, 14.124 s wall, 10/20 synthetic GiB peak, 0 job/OOM failures, per-agent observed waits p50/p95 **8.91/9.595 s**, Jain solo-work fairness **0.8459**. Shared-host startup/load variance makes this a regression replay, **not** a measured improvement over the simulator or older-hash runs. Model-facing exclusive dispatch with an active *foreign client lease* needs its own uniform CLI/MCP policy and regression: these lane CLI handoff tests must not be construed as clearance for a model-facing automatic exclusive. If that feature is deferred, disable model-facing exclusive explicitly and use manually coordinated `borg lane run --exclusive`.
 
+### Final v0 integrated-main CLI gates (synthetic; 2026-09-23)
+
+The final integrated source is `gamedev/integrated-main @fb47f53b350503d832e7837c41eb84b8a974dd1e`
+(main `ed2e5f3`, release-prep 0.10 `18ecf177`, then gamedev v0). The owner
+built a dev-profile `borg 0.10.0` binary, pinned read-only at
+`/tmp/gd-v0/borg-fb47f53b`; SHA-256
+`9a5e52c71ae4da9e1a3eebd46a6282fb95e0f4f692760178e86ad6b672f19253`.
+The runner copied that binary into `/tmp/gd-bench-final-1w53Pboy/borg`, checked
+its SHA before **and after every probe, including failed probes**, and archived
+the four `scripts/gamedev_*.py` files plus `test_gamedev_benchmark.py` at the exact
+integrated ref (each matches the accepted `8b2a727` benchmark snapshot). The
+archived Python tests passed **6/6** and all scripts compiled. The integrator
+also reported full Cargo workspace tests (1880 passed, 0 failed, 32 ignored),
+strict clippy and fmt for that ref; the benchmark's own CLI findings are below.
+
+Reproduce from the `fb47f53b` script snapshot with a locally built,
+**source-matched** binary. Verify SHA before and after each command; `--borg`
+must name a pin-copied binary, not a potentially rebuilding worktree output.
+For user-systemd service gates, require `BORG_BENCH_REQUIRE_SCOPE=1` and use
+only synthetic jobs and the probe's isolated `/tmp/borg-service-bench-*` state.
+The separate real-driver probes deliberately use isolated, degraded unscoped
+fake jobs and do **not** verify scoped crash recovery.
+
+| final public-JSON-CLI gate | result on pinned `fb47f53b` |
+| --- | --- |
+| `--atomic` no-hook two-service exclusive | **PASS**; scoped handoff and automatic resume |
+| `--atomic-descendant` | **PASS**; delegated descendants fenced |
+| `--atomic-post-hook` | **PASS**; bound post-hook completed before resume |
+| `--atomic-post-hook-fail` | **PASS**; workload finished, failed hook quarantined both services |
+| `--atomic-failed-resume` | **PASS**; pending/error journaled, public recover restored Healthy |
+| `--atomic-unhealthy-resume` | **PASS**; ACK did not clear pending while backend unhealthy; after health returned, public recover cleared pending/error without a second Resume |
+| `--atomic-project-alias` | **PASS**; alias rejected and canonical Project path handoff completed |
+| `--check-service-disk-budget` | **PASS**; same-device admission reserved 7,927,745,739 bytes per bound service |
+| `--check-running-join` | **PASS**; already-running identical fingerprint did not join; same-key FIFO held |
+| `--check-budget` | **PASS**; impossible disk admission caused wait exit 125 without a start |
+| `--agents 6 --jobs 8 --scale 200` | **PASS**; 48 requests, 45 unique launches/3 pending joins, zero fake-job failures/OOM |
+| `--burst-fairness` | **INFORMATIONAL**; max/min mean wait/request 2.427×, not a per-agent fairness cap |
+
+On that **measured fake-process public CLI** 6×8 replay, wall time was
+**15.127 s**, aggregate agent queue wait **0.01641 h**, per-agent wait p50/p95
+**9.731/11.245 s**, solo-throughput Jain fairness **0.8388**, and peak synthetic
+RAM reservation **11/20 GiB**. Enqueue-to-start median/p95 was **1304/1845 ms**;
+terminal status CLI latency median/p95 was **33.22/63.39 ms**; measured fake CPU
+utilization over eight cores was **3.31%**. The separately calibrated 6×8
+*simulation* predicts **57.4 s** for modeled Borg at scale 10 and is not a
+measured speedup comparison: real CLI startup, tiny fake jobs, different scaling
+and shared-host load dominate this replay. These scoped tests do not validate
+Unreal editor parity, arbitrary crash ownership recovery, or model-facing
+foreign-client exclusive policy. Evidence: retained
+`/tmp/gd-bench-final-1w53Pboy/` provenance, Python-test output, and one JSON
+log per gate; runner console `/tmp/gd-bench-v0-fb47f53b-matrix.log` ends in
+`FINAL INTEGRATED CLI PASS`.
+
 ### Optional v0.1 foreign-client policy (owner branch, not the integrated v0 binary)
 
 `gamedev/lanes-v01 @7806669` adds lane-journal-locked service-client admission while an exclusive ticket is Preparing. The owner-built binary (`2026-09-23 04:51:24 +0100`) was **copied** to `target/debug/borg-bench-v01-pin`; SHA-256 `77c657df4b175d5a78a5469715c2e2b744e556879b54cfc6e0dce3406efa44e0` remained unchanged **before and after every** public-JSON-CLI probe. The final probe script SHA-256 was `5ad7a9e7a55f7490f97b9ed5d1314c69098057bd090653a28ff713d2db36e26d`. Use `BORG_BENCH_REQUIRE_SCOPE=1` to prohibit degraded jobs/services; all probes used isolated fake jobs, two owned supervised services, and real user-systemd scopes. A service lease's `--owner UUID` sets **both** Holder participant_id and session_id to that UUID; the synthetic job holder must match both for the own-holder case. The foreign-holder cases use a different UUID.
 
+Reproduce the **historical** five-mode PASS with the exact `f5de743` fixture,
+not the current working-tree probe: its tightened idle-hook gate intentionally
+fails against the old binary (negative control below). From `gamedev/bench`,
+with the old owner binary already copied to `target/debug/borg-bench-v01-pin`:
+
 ```sh
-PIN=target/debug/borg-bench-v01-pin  # copy the matching owner binary first; verify SHA before/after
+set -e
+PIN=$(realpath target/debug/borg-bench-v01-pin)
+RUN=$(mktemp -d /tmp/gd-bench-v01-historical-XXXXXXXX)
+mkdir -p "$RUN/scripts"
+git show f5de743:scripts/gamedev_service_probe.py > "$RUN/scripts/gamedev_service_probe.py"
+git show f5de743:scripts/gamedev_fake_service.py > "$RUN/scripts/gamedev_fake_service.py"
+printf '%s  %s\n' 5ad7a9e7a55f7490f97b9ed5d1314c69098057bd090653a28ff713d2db36e26d "$RUN/scripts/gamedev_service_probe.py" | sha256sum -c
+check_pin() { printf '%s  %s\n' 77c657df4b175d5a78a5469715c2e2b744e556879b54cfc6e0dce3406efa44e0 "$PIN" | sha256sum -c; }
 for flag in atomic-own-lease atomic-foreign-lease atomic-foreign-grace atomic-foreign-indefinite atomic-late-lease; do
-  BORG_BENCH_REQUIRE_SCOPE=1 python3 scripts/gamedev_service_probe.py --borg "$PIN" --"$flag"
+  check_pin
+  if ! (cd "$RUN" && BORG_BENCH_REQUIRE_SCOPE=1 python3 scripts/gamedev_service_probe.py --borg "$PIN" --"$flag"); then
+    check_pin  # provenance still checked after a failed probe
+    echo "historical $flag failed; do not claim PASS" >&2
+    exit 1
+  fi
+  check_pin
 done
 ```
 
@@ -175,5 +254,21 @@ done
 | `--atomic-foreign-grace` | **PASS** job `5a5b8149-248b-41b8-8dc5-62c1f9c07df2`: both services stayed Healthy during the wait and the holder-visible notice matched; a 5 s override allowed the exclusive to yield and resume without a manual release; start minus creation was at least 3.5 s. |
 | `--atomic-foreign-indefinite` | **PASS within bounded observation** job `f16c459b-a3b4-4d75-84cf-c0a2f749c3e6`: override 0 reported `grace indefinite`, both services remained Healthy with the client active and no workload start during a **2 s event-driven** observation; public lease release then permitted yield/resume. This tests the zero-grace boundary, not an arbitrary-duration liveness proof. |
 | `--atomic-late-lease` | **PASS** job `da416942-7015-4b4d-b242-78e54863903b`: while the foreign client held Preparing and both original backends stayed Healthy, a new client lease for bound service B and a renewal of the existing client on A were each rejected; no ghost B client or changed A lease expiry. Releasing A allowed normal yield/resume. CLI override grace 30 s. |
+
+The SHA `77c657df…` `--atomic-late-lease` result above covered lease refusal but
+**did not arm an active hook on an idle service**. A stricter scoped negative
+control against that *same, pre-fix* copied binary set `idle_after_ms: 100` on
+service B, waited for its idle-hook marker, then submitted the foreign-A
+Preparing job and attempted a late B lease. The lease was refused, but B's
+active hook **still ran** (`/tmp/borg-service-bench-jxde75ha/bench-editor-b.active`):
+`BORG_BENCH_REQUIRE_SCOPE=1 python3 scripts/gamedev_service_probe.py --borg target/debug/borg-bench-v01-pin --atomic-late-lease`
+exited 1; log `/tmp/gd-bench-idle-late-prehook-fix-negative.log`. Its isolated
+root was retained for diagnosis; both test-owned services were stopped with no
+backend or clients. This is evidence of the **old** hook-order gap, not a test of
+owner source `gamedev/lanes-v01 @384fa9e`, which moves activation after the
+under-lock grant and rolls back a failed hook. The tightened idle-hook denial,
+failing-active-hook rollback, and two-key per-resource grace probes remain
+**unverified until a new source-matched binary is rebuilt and hash-pinned**; do
+not enable model-facing exclusive from the SHA `77c657df…` table.
 
 These are **optional owner-branch results only**: independent review and an integrated-binary rerun are required before enabling model-facing exclusive. The current v0 integrated bridge source instead rejects model-facing exclusive and instructs coordinated manual `borg lane run --exclusive`. Neither the synthetic fake-service results nor the coordinator-lease native experiment establish real Unreal editor parity or stock PostgreSQL multi-client lease support. Logs: `/tmp/gd-bench-v01-documented-atomic-*.log`; successful temp service roots and owned units were cleaned by the probe.
