@@ -38,7 +38,7 @@ For an actual CPU/RSS smoke test: `python3 scripts/gamedev_benchmark.py --agents
 
 ## Real CLI status
 
-The CLI contract is in `docs/gamedev/interfaces.md`: `borg lane job submit|wait|status --json` and service start/status/lease/yield/resume. This is a proposed interface until the owning branches land. The real-mode driver will execute only public CLI commands with fake jobs in an isolated lane state directory; do not substitute direct Rust API calls or hand-made state files. Tests of ownership, recovery and proxy switchover are still pending a real CLI. Report any divergence with CLI invocation, JSON output, and minimal reproduction to `gd_lanes_core`/`gd_services_core`.
+The CLI contract is in `docs/gamedev/interfaces.md`: `borg lane job submit|wait|status --json` and service start/status/lease/yield/resume. The lane CLI landed on `gamedev/lanes` at `37c5ee8`; the service CLI is still awaiting integration. The drivers execute only public JSON CLI commands with fake jobs in isolated lane state directories, never direct Rust calls or hand-made supervisor state. Crash ownership/systemd recovery and service proxy switchover remain unverified. Report any divergence with CLI invocation, JSON output and minimal reproduction to `gd_lanes_core`/`gd_services_core`.
 
 ### Public-CLI drivers (pending binary verification)
 
@@ -46,7 +46,21 @@ After the lane implementation is committed and built in this worktree:
 
 ```sh
 python3 scripts/gamedev_real_benchmark.py --borg target/debug/borg --agents 3 --jobs 3 --scale 200
+python3 scripts/gamedev_real_benchmark.py --borg target/debug/borg --check-budget
 python3 scripts/gamedev_service_probe.py --borg target/debug/borg
 ```
 
 The job driver submits the **same seeded workload generator** as the simulator through `lane --json job submit --spec -`, blocks via `job wait`, and reads timing from `job status --json`. It creates only an isolated temporary project/lane directory, with a 20-slot synthetic host memory resource. Each fake job touches 16 MiB/model GiB (≤320 MiB across admitted jobs) and consumes about 0.25 CPU; disable systemd scope integration for the smoke with `BORG_LANE_SCOPE=0` so the shared host is not affected. First builds have a 0.5 s minimum to permit coalescing despite CLI startup; subsequent tasks have a 0.04 s minimum. Real mode measures CLI coordination plus tiny fake jobs, **not** nominal UBT/Unreal time or systemd crash recovery. The service probe drives only the JSON CLI and a local synthetic HTTP backend, tests lease/release, stable front port across restart and exclusive yield/resume, and stops only its own service. Do not treat pending scripts as passing CI until compiled public CLI binaries have exercised them; a failing smoke must be reported to the owning core agent with the CLI repro.
+
+### Observed lane CLI (fake processes, not Unreal)
+
+Executed 2026-09-23 using the owner-built binary from `gamedev/lanes` at `37c5ee8`, with `BORG_LANE_SCOPE=0`, `--scale 200` and a fresh isolated temp directory per run. These results include per-command CLI/process startup, the 0.5 s minimum first-build time, 0.04 s later minimum and 16 MiB/model GiB touched memory, so **do not compare their makespan to the analytic model as a lane speedup**.
+
+| workload | requests | unique launches / joins | observed wall s | aggregate wait h | peak reserved GiB / cap | measured CPU utilisation (8 cores) | failures / OOM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3 agents × 3 jobs | 9 | 7 / 2 | 2.831 | 0.00088 | 6 / 20 | 3.44% | 0 / 0 |
+| 6 agents × 8 jobs | 48 | 44 / 4 | 8.635 | 0.00996 | 10 / 20 | 3.21% | 0 / 0 |
+
+The real driver verifies no exclusive-key overlaps and no over-capacity spans using public `job status --json` timestamps; an invariant failure aborts the test and retains its `/tmp/borg-bench-*` state path for diagnosis. `cpu_utilization_8_cores` sums status `cpu_seconds` over unique jobs, divided by wall × 8; these 0.25-CPU fake jobs are deliberately light. Runs have timing variance from the shared host, so no single-run confidence interval is claimed.
+
+The low-disk regression requests more free space than `/tmp` has and sets a 500 ms queue deadline. Public `job wait` exited **125**, `job status` showed no start timestamp, and the recorded reason was `waiting for disk ... free 18373660672, need 19374127616 bytes`. This is an expected budget refusal, not an OOM. The test never allocates that disk space or launches its fake worker. Crash-owned scope handling and fingerprint mutation mid-build remain untested here; exercise those only in an isolated test host with an explicit scope ownership fixture, not by killing another agent's processes.
