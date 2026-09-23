@@ -203,6 +203,9 @@ pub struct LaneRecord {
     pub quarantined: bool,
     #[serde(default)]
     pub service_lease: bool,
+    /// Only a Granted row reserves service RAM and filesystem space.
+    #[serde(default)]
+    pub service_admission: Option<AdmissionBudget>,
     /// Active service IDs captured atomically when this exclusive enters Preparing.
     #[serde(default)]
     pub yield_services: Vec<String>,
@@ -332,7 +335,11 @@ impl LaneStore {
     /// Nonblocking shared claim by the long-lived service supervisor. The
     /// returned lease is valid only while this LaneStore instance retains its
     /// kernel FD; a service restart must acquire a NEW token before backend start.
-    pub fn try_acquire_service(&self, request: LeaseRequest) -> Result<Option<Lease>> {
+    pub fn try_acquire_service(
+        &self,
+        request: LeaseRequest,
+        budget: &AdmissionBudget,
+    ) -> Result<Option<Lease>> {
         ensure!(
             request
                 .resources
@@ -353,22 +360,52 @@ impl LaneStore {
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
             "invalid service holder id"
         );
+        let service_id = service_id.to_owned();
         let mut held: Option<File> = None;
         let lease = self.locked(|state| {
+            // Preview a fresh position WITHOUT creating a new lock inode for
+            // each denied retry. Only a successful attempt gets a new ticket.
+            if let Some(index) = state.records.iter().position(|r| {
+                r.service_lease
+                    && r.request.holder.purpose == format!("service:{service_id}")
+                    && matches!(r.state, TicketState::Cancelled { .. })
+            }) {
+                let mut preview = state.clone();
+                let candidate = &mut preview.records[index];
+                candidate.ticket.sequence = state.sequence.saturating_add(1);
+                candidate.state = TicketState::Queued;
+                let id = candidate.ticket.id;
+                let reason = dispatch_reason(&preview, id)?;
+                let reason = if reason.is_some() {
+                    reason
+                } else {
+                    budget_reason(state, budget)?
+                };
+                if let Some(reason) = reason {
+                    state.records[index].wait_reason = Some(reason.clone());
+                    state.records[index].state = TicketState::Cancelled { reason };
+                    return Ok(None);
+                }
+                state.records.remove(index);
+            }
             let (ticket, _) = self.enqueue_record(state, request, None)?;
             let lock = stable_file(&self.ticket_path(ticket.id))?;
             lock.lock()?;
             held = Some(lock);
-            if dispatch_reason(state, ticket.id)?.is_some() {
-                state.records.retain(|r| r.ticket.id != ticket.id);
-                return Ok(None);
-            }
+            let reason = dispatch_reason(state, ticket.id)?.or(budget_reason(state, budget)?);
             let entry = state
                 .records
                 .iter_mut()
                 .find(|r| r.ticket.id == ticket.id)
                 .context("service ticket missing")?;
             entry.service_lease = true;
+            entry.service_admission = Some(budget.clone());
+            if let Some(reason) = reason {
+                entry.wait_reason = Some(reason.clone());
+                entry.state = TicketState::Cancelled { reason };
+                entry.finished_ms = Some(milliseconds());
+                return Ok(None);
+            }
             Ok(Some(grant_entry(entry)))
         })?;
         if let Some(lease) = &lease {
@@ -523,6 +560,7 @@ impl LaneStore {
             post_scope: None,
             quarantined: false,
             service_lease: false,
+            service_admission: None,
             yield_services: vec![],
             resume_pending: vec![],
             resume_error: None,
@@ -900,23 +938,33 @@ fn same_filesystem(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn budget_reason(state: &Journal, spec: &JobSpec) -> Result<Option<String>> {
+fn budget_reason(state: &Journal, budget: &AdmissionBudget) -> Result<Option<String>> {
     let reserved_ram: u64 = state
         .records
         .iter()
         .filter(|r| matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
-        .filter_map(|r| r.spec.as_ref())
-        .map(|s| s.admission.reserve_ram_bytes)
+        .filter_map(|r| {
+            r.spec
+                .as_ref()
+                .map(|s| &s.admission)
+                .or(r.service_admission.as_ref())
+        })
+        .map(|b| b.reserve_ram_bytes)
         .fold(0_u64, u64::saturating_add);
     let reserved_disk: u64 = state
         .records
         .iter()
         .filter(|r| matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
-        .filter_map(|r| r.spec.as_ref())
-        .filter(|s| same_filesystem(&s.admission.disk_path, &spec.admission.disk_path))
-        .map(|s| s.admission.reserve_disk_bytes)
+        .filter_map(|r| {
+            r.spec
+                .as_ref()
+                .map(|s| &s.admission)
+                .or(r.service_admission.as_ref())
+        })
+        .filter(|other| same_filesystem(&other.disk_path, &budget.disk_path))
+        .map(|other| other.reserve_disk_bytes)
         .fold(0_u64, u64::saturating_add);
-    match crate::workspace::assess_budget(&spec.admission, reserved_ram, reserved_disk) {
+    match crate::workspace::assess_budget(budget, reserved_ram, reserved_disk) {
         Ok(admission) => Ok((!admission.admitted).then_some(admission.reason)),
         Err(error) => Ok(Some(format!("budget inspection unavailable: {error:#}"))),
     }
@@ -983,7 +1031,7 @@ impl LaneStore {
                     .find(|r| r.ticket.id == id)
                     .and_then(|r| r.spec.as_ref())
                 {
-                    Some(spec) => budget_reason(state, spec)?,
+                    Some(spec) => budget_reason(state, &spec.admission)?,
                     None => None,
                 }
             };
@@ -1759,6 +1807,15 @@ mod tests {
             purpose: "test".into(),
         }
     }
+    fn test_budget(path: &Path) -> AdmissionBudget {
+        AdmissionBudget {
+            min_available_ram_bytes: 0,
+            reserve_ram_bytes: 0,
+            min_free_disk_bytes: 0,
+            reserve_disk_bytes: 0,
+            disk_path: path.into(),
+        }
+    }
     fn service_holder() -> Holder {
         Holder {
             purpose: "service:test".into(),
@@ -1793,6 +1850,7 @@ mod tests {
             post_scope: None,
             quarantined: false,
             service_lease: false,
+            service_admission: None,
             yield_services: vec![],
             resume_pending: vec![],
             resume_error: None,
@@ -1895,6 +1953,91 @@ mod tests {
         );
     }
     #[test]
+    fn service_disk_reservation_is_atomic_and_shared_with_jobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_path = dir.path().join("a");
+        let b_path = dir.path().join("b");
+        fs::create_dir(&a_path).unwrap();
+        fs::create_dir(&b_path).unwrap();
+        let available = crate::workspace::hygiene::disk_available(&a_path).unwrap();
+        let reserve = available.saturating_mul(3) / 5;
+        let store = LaneStore::new(dir.path().join("state")).unwrap();
+        let budget_a = AdmissionBudget {
+            reserve_disk_bytes: reserve,
+            ..test_budget(&a_path)
+        };
+        let budget_b = AdmissionBudget {
+            reserve_disk_bytes: reserve,
+            ..test_budget(&b_path)
+        };
+        let request = |id: &str| LeaseRequest {
+            resources: vec![resource(id, Access::Shared { slots: 1 })],
+            holder: Holder {
+                purpose: format!("service:{id}"),
+                ..holder()
+            },
+            queue_timeout_ms: None,
+        };
+        let first = store
+            .try_acquire_service(request("first"), &budget_a)
+            .unwrap()
+            .unwrap();
+        let job_budget = AdmissionBudget {
+            min_free_disk_bytes: available / 2,
+            ..test_budget(&b_path)
+        };
+        let job_reason = store
+            .reading(|state| budget_reason(state, &job_budget))
+            .unwrap()
+            .unwrap();
+        assert!(job_reason.contains("disk"), "{job_reason}");
+        assert!(
+            store
+                .try_acquire_service(request("second"), &budget_b)
+                .unwrap()
+                .is_none()
+        );
+        let deferred = store
+            .snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.request.holder.purpose == "service:second")
+            .unwrap();
+        assert!(matches!(deferred.state, TicketState::Cancelled { .. }));
+        assert!(deferred.wait_reason.unwrap().contains("disk"));
+        assert!(
+            store
+                .try_acquire_service(request("second"), &budget_b)
+                .unwrap()
+                .is_none()
+        );
+        let retries = store
+            .snapshot()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.request.holder.purpose == "service:second")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retries.len(),
+            1,
+            "retries must not create unbounded tickets"
+        );
+        assert_eq!(retries[0].ticket.id, deferred.ticket.id);
+        store.release_lease(&first).unwrap();
+        let second = store
+            .try_acquire_service(request("second"), &budget_b)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.generation, first.generation + 2);
+        store.release_lease(&second).unwrap();
+        assert!(
+            store
+                .reading(|state| budget_reason(state, &job_budget))
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[test]
     fn service_lease_yields_before_exclusive_grant_and_blocks_restart() {
         let dir = tempfile::tempdir().unwrap();
         let store = LaneStore::new(dir.path()).unwrap();
@@ -1904,7 +2047,7 @@ mod tests {
             queue_timeout_ms: None,
         };
         let service = store
-            .try_acquire_service(service_request.clone())
+            .try_acquire_service(service_request.clone(), &test_budget(dir.path()))
             .unwrap()
             .unwrap();
         let spec = JobSpec {
@@ -1963,7 +2106,7 @@ mod tests {
         // Preparing blocks a new backend even before the old backend yields.
         assert!(
             store
-                .try_acquire_service(service_request.clone())
+                .try_acquire_service(service_request.clone(), &test_budget(dir.path()))
                 .unwrap()
                 .is_none()
         );
@@ -1980,14 +2123,17 @@ mod tests {
         // Timed resume/crash restart must fail until this exclusive is finished.
         assert!(
             store
-                .try_acquire_service(service_request.clone())
+                .try_acquire_service(service_request.clone(), &test_budget(dir.path()))
                 .unwrap()
                 .is_none()
         );
         store
             .finish(exclusive.ticket.id, 0, "test complete")
             .unwrap();
-        let resumed = store.try_acquire_service(service_request).unwrap().unwrap();
+        let resumed = store
+            .try_acquire_service(service_request, &test_budget(dir.path()))
+            .unwrap()
+            .unwrap();
         assert!(resumed.generation > service.generation);
         store.release_lease(&resumed).unwrap();
     }
@@ -1997,11 +2143,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LaneStore::new(dir.path()).unwrap();
         let held = store
-            .try_acquire_service(LeaseRequest {
-                resources: vec![resource("project", Access::Shared { slots: 1 })],
-                holder: service_holder(),
-                queue_timeout_ms: None,
-            })
+            .try_acquire_service(
+                LeaseRequest {
+                    resources: vec![resource("project", Access::Shared { slots: 1 })],
+                    holder: service_holder(),
+                    queue_timeout_ms: None,
+                },
+                &test_budget(dir.path()),
+            )
             .unwrap()
             .unwrap();
         let spec = JobSpec {
@@ -2048,11 +2197,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LaneStore::new(dir.path()).unwrap();
         let held = store
-            .try_acquire_service(LeaseRequest {
-                resources: vec![resource("project", Access::Shared { slots: 1 })],
-                holder: service_holder(),
-                queue_timeout_ms: None,
-            })
+            .try_acquire_service(
+                LeaseRequest {
+                    resources: vec![resource("project", Access::Shared { slots: 1 })],
+                    holder: service_holder(),
+                    queue_timeout_ms: None,
+                },
+                &test_budget(dir.path()),
+            )
             .unwrap()
             .unwrap();
         let spec = JobSpec {
