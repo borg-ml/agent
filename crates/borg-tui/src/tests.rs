@@ -13449,6 +13449,52 @@ fn transcript_selection_omits_visual_chrome_and_normalizes_diff_copy() {
 }
 
 #[test]
+fn selecting_a_markdown_quote_excludes_its_visual_gutter() {
+    let mut line = markdown_lines("> copy only these words", 80, None)
+        .into_iter()
+        .find(|line| line.to_string().contains("copy only these words"))
+        .expect("quoted message line");
+    line.spans.insert(0, Span::raw("  "));
+    let gutter_end = line.spans[0].width() + line.spans[1].width();
+    apply_line_background(&mut line, 80, MESSAGE_BG);
+    let mut lines = vec![line];
+    let selected = selected_transcript_text(
+        &lines,
+        TranscriptPoint { row: 0, column: 0 },
+        TranscriptPoint {
+            row: 0,
+            column: usize::MAX,
+        },
+    );
+    assert_eq!(selected.as_deref(), Some("copy only these words"));
+
+    apply_text_selection(
+        &mut lines,
+        0,
+        TranscriptPoint { row: 0, column: 0 },
+        TranscriptPoint {
+            row: 0,
+            column: usize::MAX,
+        },
+    );
+    let selection_bg = Some(Color::Rgb(45, 83, 120));
+    assert!(
+        lines[0]
+            .spans
+            .iter()
+            .take(gutter_end)
+            .all(|span| span.style.bg != selection_bg)
+    );
+    assert!(
+        lines[0]
+            .spans
+            .iter()
+            .skip(gutter_end)
+            .any(|span| span.style.bg == selection_bg)
+    );
+}
+
+#[test]
 fn composer_selection_highlights_text_without_the_prompt_marker() {
     let value = "hello\nworld";
     let ranges = display_ranges(value, 40, true);

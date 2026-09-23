@@ -13314,7 +13314,17 @@ fn selection_line_ranges(line: &Line<'static>) -> Vec<(usize, usize)> {
             .collect();
     }
     let prefix = if first == "  " {
-        2
+        2 + line.spans.get(1).map_or(0, |span| {
+            let gutter = span.content.as_ref();
+            if (span.style.fg == Some(BORG_ORANGE_HOVER) || span.style.fg == Some(Color::Gray))
+                && gutter.ends_with(' ')
+                && gutter.trim_end().split(' ').all(|part| part == "│")
+            {
+                span.width()
+            } else {
+                0
+            }
+        })
     } else if first.starts_with("│   │ ")
         || first.starts_with("  │ ")
         || matches!(first, "+ " | "− ")
