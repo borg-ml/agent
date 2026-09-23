@@ -2,10 +2,13 @@
 import hashlib
 import json
 import os
+import socket
 import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 import unittest
 from pathlib import Path
 
@@ -52,6 +55,9 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.cli('editor', 'spec').returncode, 2)
 
     def test_build_job_core_schema_and_input_revision(self):
+        # Keep RAM-derived -MaxParallelActions stable for this fingerprint test.
+        (self.project.parent / '.borg-unreal.toml').write_text(
+            '[build]\ngb_per_action = 0.01\n')
         one = self.cli('build', '--spec')
         self.assertEqual(one.returncode, 0, one.stderr)
         spec = json.loads(one.stdout)
@@ -176,6 +182,89 @@ class AdapterTests(unittest.TestCase):
             record = next(r for r in json.loads(status.stdout)
                           if r['job']['id'] == stages[-1]['job_id'])
             self.assertIn('.scope', record['scope_cgroup'])
+
+    @unittest.skipUnless(os.environ.get('BORG_UNREAL_TEST_SERVICE_CLI'),
+                         'set BORG_UNREAL_TEST_SERVICE_CLI for the fake service smoke')
+    def test_isolated_core_service_with_fake_editor(self):
+        """Fake MCP health/proxy/stop, not live Unreal or D11 handoff."""
+        binary = Path(os.environ['BORG_UNREAL_TEST_SERVICE_CLI']).resolve(strict=True)
+        runtime = os.environ.get('XDG_RUNTIME_DIR')
+        bus = os.environ.get('DBUS_SESSION_BUS_ADDRESS')
+        if not runtime or not bus or not Path(runtime).is_dir():
+            self.fail('service smoke needs a working systemd user bus')
+        self.env.update(XDG_RUNTIME_DIR=runtime, DBUS_SESSION_BUS_ADDRESS=bus,
+                        BORG_LANE_DIR=str(self.root / 'service-lane'))
+        self.env.pop('BORG_LANE_DEGRADED', None)
+        self.env.pop('BORG_LANE_SCOPE', None)
+        editor = self.engine / 'Engine/Binaries/Linux/UnrealEditor'
+        editor.write_text("""#!/usr/bin/env python3
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+port = int(next(a.split('=', 1)[1] for a in sys.argv
+                if a.startswith('-ModelContextProtocolPort=')))
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'result': {
+            'protocolVersion': '2025-11-25', 'capabilities': {},
+            'serverInfo': {'name': 'fake-unreal', 'version': '1'}}}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+HTTPServer(('127.0.0.1', port), Handler).serve_forever()
+""")
+        editor.chmod(0o755)
+        def free_port():
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1', 0))
+                return sock.getsockname()[1]
+        ports = []
+        while len(ports) < 3:
+            port = free_port()
+            if port not in ports and port != 8231:
+                ports.append(port)
+        (self.project.parent / '.borg-unreal.toml').write_text(
+            '[editor]\nport = {}\nbackend_ports = [{}, {}]\n'
+            'memory_max_gb = 1\nmin_available_ram_gb = 0\nreserve_ram_gb = 0\n'
+            'min_free_disk_gb = 0\nreserve_disk_gb = 0\n'.format(*ports))
+        generated = self.cli('editor', 'spec')
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+        definition = json.loads(generated.stdout)
+        self.assertFalse(definition['adapter_enforces_leases'])
+        definition['readiness_timeout_ms'] = 12_000
+        definition['restart']['max_restarts'] = 0
+        # The fake has no QUIT_EDITOR tool; Borg still owns stop/scope cleanup.
+        definition['graceful_stop'] = {'argv': ['/usr/bin/true'], 'timeout_ms': 1000}
+        spec_file = self.root / 'service.json'
+        spec_file.write_text(json.dumps(definition))
+        service = definition['id']
+        attempted = False
+        try:
+            attempted = True  # even a timed-out CLI may have started the service
+            start = subprocess.run([str(binary), 'lane', 'service', 'start', service,
+                                    '--definition', str(spec_file), '--wait-ready', '20', '--json'],
+                                   env=self.env, capture_output=True, text=True, timeout=35)
+            self.assertEqual(start.returncode, 0, start.stderr + start.stdout)
+            self.assertIn('Healthy', str(json.loads(start.stdout)['state']))
+            request = urllib.request.Request(f'http://127.0.0.1:{ports[0]}/mcp',
+                                             data=b'{}', method='POST')
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                urllib.request.urlopen(request, timeout=4).read()
+            self.assertEqual(denied.exception.code, 403)
+            denied.exception.close()
+        finally:
+            if attempted:
+                stopped = subprocess.run([str(binary), 'lane', 'service', 'stop', service, '--json'],
+                                         env=self.env, capture_output=True, text=True, timeout=25)
+                self.assertEqual(stopped.returncode, 0, stopped.stderr)
+                self.assertEqual(json.loads(stopped.stdout)['state'], 'Stopped')
+                for port in ports:
+                    with socket.socket() as sock:
+                        sock.settimeout(1)
+                        self.assertNotEqual(sock.connect_ex(('127.0.0.1', port)), 0)
 
     def test_exclusive_template_fails_closed_and_service_spec(self):
         result = self.cli('run', 'commandlet', '--spec', '--', sys.executable, '-c', 'print("ok")')
