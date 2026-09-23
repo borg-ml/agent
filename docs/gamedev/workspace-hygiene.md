@@ -110,6 +110,24 @@ filesystems; real freed blocks may be lower.
   to local directory matching; the paths and files are still shown. Nothing
   was frozen or altered.
 
+### Final CLI replay after concurrent agent updates
+
+With the final debug binary, `borg worktree --project ~/agent gc` took
+**3.482 s** and listed **14** checked-out trees, **0 eligible**, **0 B safely
+reclaimable**. `borg worktree --project /home/shulgin/abundance gc` took
+**2.742 s**, listed **10** trees, **0 eligible**. The report includes protection
+reasons and sizes; the main Borg checkout was ~297 GiB total logical usage,
+Abundance main ~101 GiB, `header-split` ~7.6 GiB. These figures are transient
+and may count CoW shared extents. `borg worktree --project ~/agent
+ target-status --cap-gib 24` took **1.082 s**, reported **14** targets,
+**2 over cap** (`~/agent/target` ~42.8 GiB and `window-capture/target` ~39.2
+GiB). `freeze-preview 'Source/**/*.h'` took **1.174 s** and now listed **2**
+dirty worktrees (main: 6 matching headers, header-split-xform: 23): the
+header-split tree changed while other agents worked. `gc --apply` from
+non-interactive shell returned `GC deletion requires a human at a terminal...`
+and made no modifications. The earlier three-owner snapshot is retained above
+as a demonstration of why this report must be live, not cached.
+
 ## Limitations / integration decisions
 
 The architect's v0 `WorkspaceCoordinator` records do not include an owner
