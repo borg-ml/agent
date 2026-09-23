@@ -419,6 +419,7 @@ impl Fixture {
                 kind: HealthKind::Http,
                 interval_ms: 100,
                 timeout_ms: 1_000,
+                unhealthy_after_ms: None,
             },
             restart: RestartPolicy {
                 max_restarts: 3,
@@ -751,6 +752,7 @@ fn mcp_initialize_health_reads_whole_replies_and_ends_sessions() {
         kind: HealthKind::McpInitialize,
         interval_ms: 100,
         timeout_ms: 1_000,
+        unhealthy_after_ms: None,
     };
     spec.readiness_timeout_ms = 6_000;
     spec.restart.max_restarts = 1;
