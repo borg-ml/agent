@@ -54,7 +54,7 @@ The job driver submits the **same seeded workload generator** as the simulator t
 
 ### Observed lane CLI (fake processes, not Unreal)
 
-Executed 2026-09-23 using the owner-built binary from `gamedev/lanes` at `37c5ee8` (checkpoint **before** the owner disabled unsafe running joins), with `BORG_LANE_SCOPE=0`, `--scale 200` and a fresh isolated temp directory per run. These results include per-command CLI/process startup, the 0.5 s minimum first-build time, 0.04 s later minimum and 16 MiB/model GiB touched memory, so **do not compare their makespan to the analytic model as a lane speedup**.
+Executed 2026-09-23 using the owner-built binary from `gamedev/lanes` at `37c5ee8` (checkpoint **before** the owner disabled unsafe running joins), with `BORG_LANE_SCOPE=0`/`BORG_LANE_DEGRADED=1` in versions that require explicit unscoped testing, `--scale 200` and a fresh isolated temp directory per run. These results include per-command CLI/process startup, the 0.5 s minimum first-build time, 0.04 s later minimum and 16 MiB/model GiB touched memory, so **do not compare their makespan to the analytic model as a lane speedup**.
 
 | workload | requests | unique launches / joins | observed wall s | aggregate wait h | peak reserved GiB / cap | measured CPU utilisation (8 cores) | failures / OOM |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -72,3 +72,23 @@ python3 scripts/gamedev_service_probe.py --borg target/debug/borg --atomic
 ```
 
 This is a **required real-CLI integration regression, not an optional synthetic-model check**. It starts **two** fake HTTP services bound to the exact same isolated resource key R (2 shared slots), takes an active client lease, then submits an exclusive R job **without pre/post hooks**. Inside the job it demands both backend PIDs gone, both stable front proxies returning 503, client restoration, and restart denial; after the job it demands automatic resume and both healthy front endpoints. State is isolated under `/tmp/borg-service-bench-*`; it is retained on failure. The first pass uses a unique Host key to test the shared lock/handoff mechanism; actual `Project(path)` alias/canonicalization needs its own public-CLI check because `resource set-capacity --scope PATH` currently creates a Worktree key. No service on the real game or another developer's process is touched. **Until the no-hook two-service probe passes on the integrated CLI, D11 is not verified and v0 must not be marked release-ready.**
+
+#### D11 observed result: FAIL on 9a1ed00
+
+The basic public CLI service lifecycle smoke **passed** on an own-worktree `borg` binary built from `gamedev/lanes` at `9a1ed00`: fake HTTP backend Healthy, client lease/release, stable proxy across restart, explicit yield, event-driven resume, and a new backend PID with front HTTP 200.
+
+The required two-service **no-hook** command above **failed as expected before auto-discovery was implemented**: job `cbb19e38-d959-4a10-9f40-23dcb1b44744` had `started_ms: null`, public `job status --json` reported `wait_reason: exclusive resource bench-exclusive-13736b581f754dc6989f56ad51f353b9 busy`, and `job wait` returned 125 on queue timeout. Both test-owned services were stopped afterward; isolated state remains at `/tmp/borg-service-bench-i0b4kjyj` for owner debugging. The first attempt failed for a separate reason (`BORG_LANE_DEGRADED=1` was required to test without a systemd user manager); the reported D11 failure above includes that explicit test-only setting and is genuinely resource contention. **No release pass is claimed.**
+
+#### Post-auto-yield and scoped cgroup observations
+
+The rebuilt lane binary at `a26778e` **passed the no-hook two-service coordination mechanism** with `--atomic` (explicit degraded/unscoped mode): job `384d0650-1836-4f09-ae8a-1037c984db21` started only after both backends yielded; both fronts returned 503, an active client was restored, restart remained fenced, both services auto-resumed with new backend PIDs. This is **not** a scoped production D11 pass.
+
+For the cgroup release gate on a host with a real user-systemd manager, run:
+
+```sh
+python3 scripts/gamedev_service_probe.py --borg target/debug/borg --atomic-descendant
+```
+
+The optional fixture starts a detached child (`start_new_session`) inside each synthetic backend generation. The exclusive worker reads only its own child process identity and kernel cgroup membership and demands both children dead and both dedicated backend cgroups empty **before** it performs work. It uses user systemd scopes, never `BORG_LANE_DEGRADED=1`; a missing user manager is a test failure, not a skipped pass. On failure, cleanup signals only the exact test child PID after validating its start tick and command line. This test does not directly edit Borg's private lane state.
+
+On the lane binary at `a26778e` **this scoped gate failed open**: exclusive job `821d209b-4e17-457a-a742-2e709e56fc34` started (public `started_ms=1790131287396`) and its worker exited 1 because detached child PID `1434445` from `bench-editor-b` survived yield inside `borg-service-bench-editor-b-2f181203d9f64e7296964089c365d405.service`. Both test-owned services were stopped and test children gone afterward; `/tmp/borg-service-bench-r4edwyx3` is retained for the owners. The service owner's separate delegated backend-generation cgroup fix (`6337cf5`) was **not yet** part of the lane binary used for this failure. Re-run on the combined scoped implementation before release; a green degraded test alone is insufficient.

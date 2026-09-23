@@ -6,6 +6,7 @@ import argparse
 from contextlib import contextmanager
 import json
 import os
+import signal
 from pathlib import Path
 import shutil
 import socket
@@ -40,7 +41,8 @@ def command(binary: Path, root: Path, *args: str) -> dict:
     cmd = [str(binary), "lane", "--json", "service", *args]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
                             env={**os.environ, "BORG_LANES_ROOT": str(root),
-                                 "BORG_LANE_DIR": str(root), "BORG_LANE_SCOPE": "0",
+                                 "BORG_LANE_DIR": str(root), "BORG_LANE_SCOPE": "1" if os.environ.get("BORG_BENCH_REQUIRE_SCOPE") else "0",
+                                 "BORG_LANE_DEGRADED": "0" if os.environ.get("BORG_BENCH_REQUIRE_SCOPE") else "1",
                                  "BORG_LANE_EXECUTABLE": str(binary)})
     if result.returncode:
         raise RuntimeError(f"{cmd!r}: exit {result.returncode}: {result.stderr.strip()}")
@@ -63,8 +65,12 @@ def run(binary: Path) -> dict:
             port = available_port()
             if port not in ports:
                 ports.append(port)
+        name = "bench-service-" + uuid.uuid4().hex
+        lane(binary, root, "resource", "set-capacity", "--name", name, "--slots", "1")
+        resource = {"key": {"scope": "Host", "name": name},
+                    "access": {"Shared": {"slots": 1}}}
         spec = {"id": "bench-editor", "argv": [sys.executable, str(backend), "{port}"],
-                "cwd": str(root), "env": [], "resources": [],
+                "cwd": str(root), "env": [], "resources": [resource],
                 "adapter_enforces_leases": False, "read_only_paths": ["/", "/health"],
                 "memory_max_bytes": 128 * 1024 * 1024,
                 "admission": {"min_available_ram_bytes": 0, "reserve_ram_bytes": 0,
@@ -77,10 +83,10 @@ def run(binary: Path) -> dict:
                              "backend_ports": ports[1:]}, "restore": None}
         definition = root / "service.json"
         definition.write_text(json.dumps(spec))
-        started = False
+        attempted = False
         try:
+            attempted = True
             status = command(binary, root, "start", "bench-editor", "--definition", str(definition))
-            started = True
             before = health_at(ports[0])
             leased = command(binary, root, "lease", "bench-editor", "--owner", "bench",
                              "--ttl-seconds", "10", "--purpose", "capture")
@@ -90,15 +96,17 @@ def run(binary: Path) -> dict:
             command(binary, root, "yield", "bench-editor", "--by", "bench-import", "--for-seconds", "3")
             yielded = command(binary, root, "status", "bench-editor")
             command(binary, root, "resume", "bench-editor", "--by", "bench-import")
+            resumed(binary, root, "bench-editor")
             restored = health_at(ports[0])
             return {"mode": "service-cli", "started": status.get("state"),
                     "lease_id": leased.get("id"), "before": before.strip(),
                     "after_restart": after.strip(), "yielded": yielded.get("state"),
                     "after_resume": restored.strip(), "front_port_stable": ports[0]}
         finally:
-            if started:
-                # Only the service created in this isolated root can be stopped.
-                stopped = command(binary, root, "stop", "bench-editor")
+            if attempted:
+                # Only this isolated service is eligible for cleanup.
+                current = command(binary, root, "status", "bench-editor")
+                stopped = command(binary, root, "stop", "bench-editor") if current.get("supervisor_pid") else current
                 if stopped.get("state") not in ("Stopped", {"Stopped": None}):
                     status = command(binary, root, "status", "bench-editor")
                     if status.get("state") not in ("Stopped", {"Stopped": None}):
@@ -112,7 +120,8 @@ def lane(binary: Path, root: Path, *args: str, input_data: dict | None = None,
     result = subprocess.run(cmd, input=json.dumps(input_data) if input_data is not None else None,
                             capture_output=True, text=True, timeout=timeout,
                             env={**os.environ, "BORG_LANES_ROOT": str(root),
-                                 "BORG_LANE_DIR": str(root), "BORG_LANE_SCOPE": "0",
+                                 "BORG_LANE_DIR": str(root), "BORG_LANE_SCOPE": "1" if os.environ.get("BORG_BENCH_REQUIRE_SCOPE") else "0",
+                                 "BORG_LANE_DEGRADED": "0" if os.environ.get("BORG_BENCH_REQUIRE_SCOPE") else "1",
                                  "BORG_LANE_EXECUTABLE": str(binary)})
     if result.returncode:
         if not allow_failure:
@@ -121,7 +130,8 @@ def lane(binary: Path, root: Path, *args: str, input_data: dict | None = None,
     return json.loads(result.stdout) if result.stdout.strip() else {}
 
 
-def atomic_worker(binary: Path, root: Path, ports: list[int], marker: Path) -> None:
+def atomic_worker(binary: Path, root: Path, ports: list[int], marker: Path,
+                  child_markers: Path | None = None) -> None:
     """Run only inside the granted exclusive job; inspect both services through CLI."""
     checks = {}
     for i, service_id in enumerate(("bench-editor-a", "bench-editor-b")):
@@ -143,6 +153,20 @@ def atomic_worker(binary: Path, root: Path, ports: list[int], marker: Path) -> N
             raise RuntimeError(f"{service_id} restarted during exclusive lease")
         checks[service_id] = {"yielded_before_grant": True, "client_restored": True,
                               "proxy_503": True, "restart_fenced": True}
+    if child_markers is not None:
+        descendants = [json.loads(p.read_text()) for p in child_markers.glob("*.json")]
+        if len(descendants) < 2:
+            raise RuntimeError(f"expected two detached child records, got {descendants!r}")
+        for record in descendants:
+            if live_test_child(record):
+                raise RuntimeError(f"detached child survived backend yield: {record!r}")
+            group = record["cgroup"]
+            if "borg-" not in group:
+                raise RuntimeError(f"backend child had no dedicated Borg cgroup: {group!r}")
+            procs = Path("/sys/fs/cgroup") / group.lstrip("/") / "cgroup.procs"
+            if procs.exists() and procs.read_text().strip():
+                raise RuntimeError(f"backend generation cgroup not empty after yield: {procs}")
+        checks["detached_scope"] = {"descendants": len(descendants), "empty_before_grant": True}
     end = time.monotonic() + .3
     while time.monotonic() < end:
         _ = sum(range(50))
@@ -165,7 +189,31 @@ def resumed(binary: Path, root: Path, service_id: str) -> dict:
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
 
 
-def run_atomic(binary: Path) -> dict:
+def live_test_child(record: dict) -> bool:
+    stat = Path(f"/proc/{record['pid']}/stat")
+    try:
+        fields = stat.read_text().split()
+    except FileNotFoundError:
+        return False
+    # A zombie cannot hold resources, and PID reuse must never identify another process.
+    return fields[21] == record["start_ticks"] and fields[2] != "Z"
+
+
+def cleanup_test_children(child_markers: Path) -> bool:
+    """Terminate only our verified fake descendants if a buggy scope left them alive."""
+    leaked = False
+    for marker in child_markers.glob("*.json"):
+        record = json.loads(marker.read_text())
+        if live_test_child(record):
+            cmdline = Path(f"/proc/{record['pid']}/cmdline").read_bytes()
+            if b"gamedev_fake_service.py" not in cmdline or b"--detached-child" not in cmdline:
+                raise RuntimeError(f"refusing to signal ambiguous PID {record['pid']}")
+            os.kill(record["pid"], signal.SIGTERM)
+            leaked = True
+    return leaked
+
+
+def run_atomic(binary: Path, descendant: bool = False) -> dict:
     binary = binary.resolve(strict=True)
     backend = Path(__file__).with_name("gamedev_fake_service.py").resolve()
     with isolated_root() as root:
@@ -176,6 +224,9 @@ def run_atomic(binary: Path) -> dict:
                 ports.append(port)
         project = root / "project"
         project.mkdir()
+        child_markers = root / "detached-children"
+        if descendant:
+            child_markers.mkdir()
         # Host scope is isolated by a unique name; both services share precisely R.
         name = "bench-exclusive-" + uuid.uuid4().hex
         resource_key = {"scope": "Host", "name": name}
@@ -190,7 +241,9 @@ def run_atomic(binary: Path) -> dict:
             before = {}
             for i, service_id in enumerate(("bench-editor-a", "bench-editor-b")):
                 spec = {"id": service_id, "argv": [sys.executable, str(backend), "{port}"],
-                        "cwd": str(project), "env": [], "resources": [resource],
+                        "cwd": str(project),
+                        "env": [["BENCH_CHILD_MARKER_DIR", str(child_markers)]] if descendant else [],
+                        "resources": [resource],
                         "adapter_enforces_leases": False, "read_only_paths": ["/", "/health"],
                         "memory_max_bytes": 128 * 1024 * 1024,
                         "admission": admission,
@@ -201,8 +254,8 @@ def run_atomic(binary: Path) -> dict:
                                      "backend_ports": ports[2+i*2:4+i*2]}, "restore": None}
                 definition = root / f"{service_id}.json"
                 definition.write_text(json.dumps(spec))
-                command(binary, root, "start", service_id, "--definition", str(definition))
                 started.append(service_id)
+                command(binary, root, "start", service_id, "--definition", str(definition))
                 status = command(binary, root, "status", service_id)
                 if status.get("backend_pid") is None:
                     raise RuntimeError(f"{service_id} never became healthy")
@@ -216,7 +269,8 @@ def run_atomic(binary: Path) -> dict:
                            "host_pid": None, "purpose": "atomic editor handoff probe"},
                 "queue_timeout_ms": 10000},
                 "argv": [sys.executable, str(Path(__file__).resolve()), "--borg", str(binary),
-                         "--atomic-worker", str(root), f"{ports[0]},{ports[1]}", str(marker)],
+                         "--atomic-worker", str(root), f"{ports[0]},{ports[1]}", str(marker),
+                         str(child_markers) if descendant else "-"],
                 "cwd": str(project), "env": [], "memory_max_bytes": 128 * 1024 * 1024,
                 "admission": admission,
                 # This is essential: no adapter-provided yield/resume hook can mask
@@ -235,7 +289,7 @@ def run_atomic(binary: Path) -> dict:
                 health_at(ports[i])
             return {"mode": "D11-atomic-cli", "job_id": job_id, "backend_before": before,
                     "checks": json.loads(marker.read_text()), "backend_after": after,
-                    "auto_resumed": True, "job_hooks": False}
+                    "auto_resumed": True, "job_hooks": False, "scoped_descendants": descendant}
         finally:
             if job_id is not None:
                 try:
@@ -248,22 +302,35 @@ def run_atomic(binary: Path) -> dict:
                 except Exception:
                     pass  # Preserve this test-owned state for diagnosis.
             for service_id in reversed(started):
-                stopped = command(binary, root, "stop", service_id)
+                current = command(binary, root, "status", service_id)
+                stopped = command(binary, root, "stop", service_id) if current.get("supervisor_pid") else current
                 if stopped.get("state") != "Stopped":
                     raise RuntimeError(f"synthetic {service_id} did not stop: {stopped!r}")
+            if descendant and cleanup_test_children(child_markers):
+                raise RuntimeError("backend scope leaked a detached test child after stop")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--borg", required=True, type=Path)
-    ap.add_argument("--atomic", action="store_true", help="run D11 exclusive project handoff")
-    ap.add_argument("--atomic-worker", nargs=3, metavar=("ROOT", "PORT", "MARKER"))
+    ap.add_argument("--atomic", action="store_true", help="run degraded-mode D11 coordination gate")
+    ap.add_argument("--atomic-descendant", action="store_true",
+                    help="systemd-only two-service gate with detached child cgroup assertions")
+    ap.add_argument("--atomic-worker", nargs=4, metavar=("ROOT", "PORT", "MARKER", "CHILD_DIR"))
     args = ap.parse_args()
     if args.atomic_worker:
-        root, port, marker = args.atomic_worker
-        atomic_worker(args.borg, Path(root), [int(p) for p in port.split(",")], Path(marker))
+        root, port, marker, child_dir = args.atomic_worker
+        atomic_worker(args.borg, Path(root), [int(p) for p in port.split(",")], Path(marker),
+                      Path(child_dir) if child_dir != "-" else None)
     else:
-        print(json.dumps(run_atomic(args.borg) if args.atomic else run(args.borg), indent=2))
+        if args.atomic_descendant:
+            manager = subprocess.run(["systemctl", "--user", "show-environment"],
+                                     capture_output=True, timeout=3)
+            if manager.returncode:
+                raise RuntimeError("systemd user manager unavailable; cannot test cgroup gate")
+            os.environ["BORG_BENCH_REQUIRE_SCOPE"] = "1"
+        print(json.dumps(run_atomic(args.borg, descendant=args.atomic_descendant)
+                         if args.atomic or args.atomic_descendant else run(args.borg), indent=2))
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ def cli(binary: Path, root: Path, *args: str, input_data: dict | None = None,
     cmd = [str(binary), "lane", "--state-dir", str(root), "--json", *args]
     result = subprocess.run(cmd, input=json.dumps(input_data) if input_data is not None else None,
                             capture_output=True, text=True, timeout=timeout, check=False,
-                            env={**os.environ, "BORG_LANE_SCOPE": "0",
+                            env={**os.environ, "BORG_LANE_SCOPE": "0", "BORG_LANE_DEGRADED": "1",
                                  "BORG_LANE_EXECUTABLE": str(binary)})
     if result.returncode:
         raise RuntimeError(f"{cmd!r}: exit {result.returncode}: {result.stderr.strip()} {result.stdout.strip()}")
@@ -212,7 +212,7 @@ def probe_disk_budget(binary: Path) -> dict:
         job_id = submitted["job_id"]
         cmd = [str(binary), "lane", "--state-dir", str(lane), "--json", "job", "wait", job_id]
         waiting = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
-                                 env={**os.environ, "BORG_LANE_SCOPE": "0"})
+                                 env={**os.environ, "BORG_LANE_SCOPE": "0", "BORG_LANE_DEGRADED": "1"})
         status = cli(binary, lane, "job", "status", job_id)
         assert isinstance(status, dict)
         reason = status.get("wait_reason") or status.get("evidence") or ""
