@@ -81,15 +81,26 @@ def window(key):
     return objects[key]
 
 
+def extents_type():
+    """Wayland toolkits cannot know their screen position (GTK4 reports 0,0), but
+    window-relative extents are exact; X11 screen extents are real pixels."""
+    return Atspi.CoordType.WINDOW if session_type() == "wayland" else Atspi.CoordType.SCREEN
+
+
+def enabled(state):
+    # GTK4 exposes SENSITIVE without ENABLED for usable widgets.
+    return state.contains(Atspi.StateType.ENABLED) or state.contains(Atspi.StateType.SENSITIVE)
+
+
 def describe(obj, parent):
     state = states(obj)
     node = {"id": identify(obj), "parent": parent, "role": obj.get_role_name(),
             "name": (obj.get_name() or "")[:1024],
-            "enabled": state.contains(Atspi.StateType.ENABLED),
+            "enabled": enabled(state),
             "focused": state.contains(Atspi.StateType.FOCUSED),
             "showing": state.contains(Atspi.StateType.SHOWING)}
     try:
-        r = obj.get_component_iface().get_extents(Atspi.CoordType.SCREEN)
+        r = obj.get_component_iface().get_extents(extents_type())
         if r.width > 0 and r.height > 0:
             node["bounds"] = {"x": r.x, "y": r.y, "width": r.width, "height": r.height}
     except Exception:
@@ -160,7 +171,9 @@ def snapshot(args):
         raise ValueError("unknown diff baseline; observe without since")
     result = {"window_id": wid, "observation_id": token, "truncated": truncated,
               "coordinate_space": ("window-relative AT-SPI coordinates; add the window bounds origin for "
-                                   "private display pixels") if is_private(wid) else "AT-SPI screen logical coordinates"}
+                                   "private display pixels") if is_private(wid)
+              else "AT-SPI window-relative logical coordinates (Wayland)" if session_type() == "wayland"
+              else "AT-SPI screen logical coordinates"}
     if requested:
         assert previous is not None
         old = previous["nodes"]
@@ -199,7 +212,7 @@ def target(args):
         raise ValueError("element ancestry is too deep")
     if not alive(obj) or describe(obj, observed["nodes"][key]["parent"]) != observed["nodes"][key]:
         raise ValueError("element changed since observation; observe again")
-    if not states(obj).contains(Atspi.StateType.ENABLED):
+    if not enabled(states(obj)):
         raise ValueError("element is disabled")
     return win, obj
 
