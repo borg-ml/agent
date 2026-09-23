@@ -939,6 +939,19 @@ impl ServiceGate {
         }
         Ok(self.lease.is_some())
     }
+    fn denial_reason(&self) -> Result<String> {
+        let records = self.store.snapshot()?;
+        Ok(records
+            .iter()
+            .rev()
+            .find(|r| {
+                r.service_lease
+                    && r.request.holder.participant_id == self.request.holder.participant_id
+                    && matches!(r.state, crate::lanes::TicketState::Cancelled { .. })
+            })
+            .and_then(|r| r.wait_reason.clone())
+            .unwrap_or_else(|| "waiting for lane resource admission".into()))
+    }
     fn release(&mut self) -> Result<()> {
         if let Some(lease) = &self.lease {
             self.store.release_lease(lease)?;
@@ -1146,17 +1159,16 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
         if status.yields.is_empty() && active.is_none() && candidate.is_none() && now >= next_launch
         {
             if !gate.acquire()? {
-                if !matches!(status.state, ServiceState::Degraded { .. })
-                    || status.reason != "waiting for lane resource admission"
-                {
+                let reason = gate.denial_reason()?;
+                if status.reason != reason {
                     transition(
                         &dir,
                         &mut status,
                         &front,
                         ServiceState::Degraded {
-                            reason: "waiting for lane resource admission".into(),
+                            reason: reason.clone(),
                         },
-                        "waiting for lane resource admission",
+                        reason,
                         None,
                     )
                     .await?;
@@ -2026,6 +2038,162 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
             start.elapsed()
         );
         cleanup(&manager, task).await;
+    }
+
+    async fn budget_contenders(disk_budget: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let lane_root = root.path().join("lanes");
+        let services = lane_root.join("services");
+        let disk_a = root.path().join("disk-a");
+        let disk_b = root.path().join("disk-b");
+        fs::create_dir(&disk_a).unwrap();
+        fs::create_dir(&disk_b).unwrap();
+        let mut first = spec(root.path());
+        first.id = "first".into();
+        first.resources[0].key.name = "budget-first".into();
+        first.admission.disk_path = disk_a;
+        let mut second = spec(root.path());
+        second.id = "second".into();
+        second.resources[0].key.name = "budget-second".into();
+        second.admission.disk_path = disk_b;
+        let available = if disk_budget {
+            use std::os::unix::ffi::OsStrExt;
+            let path =
+                std::ffi::CString::new(first.admission.disk_path.as_os_str().as_bytes()).unwrap();
+            let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+            assert_eq!(
+                unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) },
+                0
+            );
+            let stat = unsafe { stat.assume_init() };
+            stat.f_bavail.saturating_mul(stat.f_frsize)
+        } else {
+            fs::read_to_string("/proc/meminfo")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("MemAvailable:"))
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                * 1024
+        };
+        let reserve = available / 5 * 3; // each fits; both cannot fit together.
+        assert!(reserve > 0);
+        if disk_budget {
+            first.admission.reserve_disk_bytes = reserve;
+            second.admission.reserve_disk_bytes = reserve;
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                fs::metadata(&first.admission.disk_path).unwrap().dev(),
+                fs::metadata(&second.admission.disk_path).unwrap().dev()
+            );
+        } else {
+            first.admission.reserve_ram_bytes = reserve;
+            second.admission.reserve_ram_bytes = reserve;
+        }
+        for s in [&first, &second] {
+            let dir = service_dir(&services, &s.id).unwrap();
+            write_json(&dir.join("spec.json"), s).unwrap();
+        }
+        let manager = ServiceManager::new(services.clone(), PathBuf::new());
+        let first_root = services.clone();
+        let first_task = tokio::spawn(async move { supervise(&first_root, "first").await });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !matches!(
+            manager.read_status("first").unwrap().state,
+            ServiceState::Healthy { .. }
+        ) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "first admission stalled"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let second_root = services.clone();
+        let second_task = tokio::spawn(async move { supervise(&second_root, "second").await });
+        let expected = if disk_budget {
+            "disk admission queued"
+        } else {
+            "RAM admission queued"
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = manager.read_status("second").unwrap();
+            if status.reason.contains(expected) {
+                assert!(status.backend_pid.is_none());
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "second did not queue: {status:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        // Several denied retries must coalesce to one visible admission row.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let store = LaneStore::new(&lane_root).unwrap();
+        let waiting = store
+            .snapshot()
+            .unwrap()
+            .into_iter()
+            .filter(|r| {
+                r.service_lease
+                    && r.request.holder.purpose == "service:second"
+                    && matches!(r.state, crate::lanes::TicketState::Cancelled { .. })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(waiting.len(), 1, "denial retries must not grow the journal");
+        manager
+            .send(
+                "first",
+                ServiceRequest::Yield {
+                    by: "budget-release".into(),
+                    reason: "handoff".into(),
+                    ttl_ms: 5_000,
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !matches!(
+            manager.read_status("second").unwrap().state,
+            ServiceState::Healthy { .. }
+        ) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "second did not admit after yield"
+            );
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        cleanup_service(&manager, "second", second_task).await;
+        cleanup_service(&manager, "first", first_task).await;
+    }
+    async fn cleanup_service(
+        manager: &ServiceManager,
+        id: &str,
+        task: tokio::task::JoinHandle<Result<()>>,
+    ) {
+        manager
+            .send(id, ServiceRequest::Stop, Duration::from_secs(5))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(6), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn service_disk_reservations_share_device_and_yield_releases_capacity() {
+        budget_contenders(true).await;
+    }
+    #[tokio::test]
+    async fn service_ram_reservations_queue_then_yield_releases_capacity() {
+        budget_contenders(false).await;
     }
 
     #[tokio::test]
