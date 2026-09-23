@@ -49,7 +49,7 @@ pub(crate) async fn run(args: WorktreeArgs) -> Result<()> {
             (10..=3600).contains(interval_secs),
             "monitor interval must be 10..3600 seconds"
         );
-        let budget = WorkspaceBudgets::default();
+        let budget = WorkspaceBudgets::from_env()?;
         loop {
             let available = hygiene::disk_available(&repo)?;
             let ram = hygiene::ram_available()?;
@@ -63,7 +63,7 @@ pub(crate) async fn run(args: WorktreeArgs) -> Result<()> {
         }
     }
     let (active, exited) = local_instances().await;
-    let budgets = WorkspaceBudgets::default();
+    let budgets = WorkspaceBudgets::from_env()?;
     let value = match args.command {
         WorktreeCommand::New {
             task,
