@@ -154,6 +154,10 @@ pub struct JobSpec {
     /// it for this long since submit; None keeps it regardless.
     #[serde(default)]
     pub abandon_after_ms: Option<u64>,
+    /// Scope unit prefix: the workload runs as `<prefix>-<id>.scope`.
+    /// Must match `[a-z][a-z0-9-]{0,23}`; None means `borg-lane`.
+    #[serde(default)]
+    pub unit_prefix: Option<String>,
     pub fingerprint: JobFingerprint,
     pub lease: LeaseRequest,
     pub argv: Vec<String>,
@@ -166,6 +170,24 @@ pub struct JobSpec {
     pub timeout_ms: u64,
     pub stall_timeout_ms: Option<u64>,
     pub coalesce: bool,
+}
+
+impl JobSpec {
+    /// The systemd scope unit its workload runs in.
+    pub fn scope_unit(&self, id: Uuid) -> String {
+        format!(
+            "{}-{id}.scope",
+            self.unit_prefix.as_deref().unwrap_or("borg-lane")
+        )
+    }
+}
+
+fn valid_unit_prefix(prefix: &str) -> bool {
+    prefix.len() <= 24
+        && prefix.starts_with(|c: char| c.is_ascii_lowercase())
+        && prefix
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -642,6 +664,12 @@ impl LaneStore {
                     override_.resource.name
                 );
             }
+            if let Some(prefix) = &spec.unit_prefix {
+                ensure!(
+                    valid_unit_prefix(prefix),
+                    "unit_prefix must match [a-z][a-z0-9-]{{0,23}}: {prefix:?}"
+                );
+            }
             ensure!(!spec.argv.is_empty(), "a job needs a command");
             ensure!(spec.cwd.is_absolute(), "job cwd must be absolute");
             ensure!(
@@ -675,6 +703,7 @@ impl LaneStore {
                         && spec.foreign_client_grace_by_resource
                             == other.foreign_client_grace_by_resource
                         && spec.abandon_after_ms == other.abandon_after_ms
+                        && spec.unit_prefix == other.unit_prefix
                         && spec.timeout_ms == other.timeout_ms
                         && spec.stall_timeout_ms == other.stall_timeout_ms
                         // Only the existing ticket's supervisor enforces a
@@ -1941,7 +1970,7 @@ impl LaneStore {
             .append(true)
             .open(self.job_dir(id).join("output.log"))?;
         let stderr = log.try_clone()?;
-        let unit = format!("borg-lane-{id}.scope");
+        let unit = spec.scope_unit(id);
         let mut command = if scoped {
             let mut command = Command::new("systemd-run");
             command
@@ -2315,7 +2344,11 @@ impl LaneStore {
             }) = &record.job
             {
                 if !scope.is_empty() {
-                    let expected = format!("borg-lane-{}.scope", record.ticket.id);
+                    // The unit this job's own spec names, not any lookalike.
+                    let expected = record.spec.as_ref().map_or_else(
+                        || format!("borg-lane-{}.scope", record.ticket.id),
+                        |spec| spec.scope_unit(record.ticket.id),
+                    );
                     let current = scope_control_group(scope);
                     if scope != &expected
                         || !current
@@ -2724,6 +2757,7 @@ mod tests {
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
             foreign_client_grace_by_resource: vec![],
             abandon_after_ms: None,
+            unit_prefix: None,
             fingerprint: JobFingerprint("post-fail".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3213,6 +3247,7 @@ mod tests {
             foreign_client_grace_ms: 0, // Forever until explicit release/expiry.
             foreign_client_grace_by_resource: vec![],
             abandon_after_ms: None,
+            unit_prefix: None,
             fingerprint: JobFingerprint("foreign-client".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3363,6 +3398,7 @@ mod tests {
                 foreign_client_grace_ms: grace_ms,
                 foreign_client_grace_by_resource: vec![],
                 abandon_after_ms: None,
+                unit_prefix: None,
                 fingerprint: JobFingerprint("shared-foreign".into()),
                 lease: LeaseRequest {
                     resources: vec![resource("fake-exclusive", Access::Exclusive)],
@@ -3496,6 +3532,7 @@ mod tests {
         let spec = JobSpec {
             foreign_client_grace_ms: 500,
             abandon_after_ms: None,
+            unit_prefix: None,
             foreign_client_grace_by_resource: vec![ForeignClientGrace {
                 resource: resource("editor", Access::Exclusive).key,
                 grace_ms: 0,
@@ -3601,6 +3638,7 @@ mod tests {
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
             foreign_client_grace_by_resource: vec![],
             abandon_after_ms: None,
+            unit_prefix: None,
             fingerprint: JobFingerprint("yield-r1".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3707,6 +3745,7 @@ mod tests {
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
             foreign_client_grace_by_resource: vec![],
             abandon_after_ms: None,
+            unit_prefix: None,
             fingerprint: JobFingerprint("auto-bound".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3765,6 +3804,7 @@ mod tests {
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
             foreign_client_grace_by_resource: vec![],
             abandon_after_ms: None,
+            unit_prefix: None,
             fingerprint: JobFingerprint("no-yield".into()),
             lease: LeaseRequest {
                 resources: vec![resource("project", Access::Exclusive)],
@@ -3820,6 +3860,7 @@ mod tests {
             foreign_client_grace_ms: default_foreign_client_grace_ms(),
             foreign_client_grace_by_resource: vec![],
             abandon_after_ms: None,
+            unit_prefix: None,
             fingerprint: JobFingerprint("source-r1".into()),
             lease: LeaseRequest {
                 resources: vec![resource("build", Access::Exclusive)],
@@ -3917,6 +3958,43 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].id < pair[1].id && pair[0].sequence < pair[1].sequence)
         );
+    }
+
+    /// Failure mode: a scope unit named from arbitrary input, or a custom
+    /// prefix that recovery would not recognise as the job's own unit.
+    #[test]
+    fn unit_prefixes_are_validated_and_name_the_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let spec = coalescing_spec(dir.path(), None);
+        let id = Uuid::nil();
+        assert_eq!(spec.scope_unit(id), format!("borg-lane-{id}.scope"));
+        for (prefix, valid) in [
+            ("ab-build", true),
+            ("a", true),
+            ("a23456789012345678901234", true),
+            ("a234567890123456789012345", false),
+            ("Ab", false),
+            ("1ab", false),
+            ("ab_build", false),
+            ("ab/build", false),
+            ("", false),
+        ] {
+            let spec = JobSpec {
+                unit_prefix: Some(prefix.into()),
+                argv: vec![format!("run-{prefix}")],
+                ..spec.clone()
+            };
+            let submitted = store.locked(|state| {
+                store.enqueue_record(state, spec.lease.clone(), Some(spec.clone()))
+            });
+            assert_eq!(submitted.is_ok(), valid, "{prefix:?}");
+        }
+        let prefixed = JobSpec {
+            unit_prefix: Some("ab-build".into()),
+            ..spec
+        };
+        assert_eq!(prefixed.scope_unit(id), format!("ab-build-{id}.scope"));
     }
 
     #[test]
