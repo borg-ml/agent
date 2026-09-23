@@ -75,7 +75,7 @@ def workloads(agents: int, jobs: int, seed: int) -> list[list[Request]]:
 
 
 def simulate(tasks: list[list[Request]], policy: str, ram_limit: int = 20, cores: int = 24,
-             poll_seconds: int = 10, scale: float = 10) -> dict:
+             poll_seconds: int = 10, scale: float = 10, coalesce_running: bool = False) -> dict:
     """Event-driven: agents issue their next request only when the previous completes."""
     if ram_limit < max(r.ram for row in tasks for r in row) or cores < 1:
         raise ValueError("budget cannot admit a single job")
@@ -174,7 +174,7 @@ def simulate(tasks: list[list[Request]], policy: str, ram_limit: int = 20, cores
                 continue
             # Join pending or running identical builds only if the same source
             # fingerprint; a later edit cannot join the in-flight build.
-            match = next((w for w in [*pending, *running]
+            match = next((w for w in [*pending, *(running if coalesce_running else [])]
                           if policy == "borg" and req.kind in BUILD and w.req.kind == req.kind
                           and w.req.key == req.key and w.req.fingerprint == req.fingerprint), None)
             if match:
@@ -215,7 +215,8 @@ def simulate(tasks: list[list[Request]], policy: str, ram_limit: int = 20, cores
             "cpu_utilization": round(busy_cpu_seconds / (max(finished_at, default=1) * cores), 4),
             "oom": oom, "failures": failures, "fairness_jain": round(fairness, 4),
             "launches": launches, "coalesced": joins, "refusals": refused,
-            "service_yields": yields, "spans": sorted(spans, key=lambda s: (s["start"], s["key"]))}
+            "service_yields": yields, "coalesce_running_verified": coalesce_running,
+            "spans": sorted(spans, key=lambda s: (s["start"], s["key"]))}
 
 
 def worker(seconds: float, ram_mib: int, cpu_fraction: float) -> None:
@@ -274,6 +275,8 @@ def main() -> None:
     parser.add_argument("--cores", type=int, default=24)
     parser.add_argument("--policy", choices=("all", "naive", "fifo", "borg"), default="all")
     parser.add_argument("--materialize", action="store_true")
+    parser.add_argument("--coalesce-running", action="store_true",
+                        help="hypothetical: join running build only when input revision is independently verified")
     parser.add_argument("--ram-mib-per-gib", type=int, default=32)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--worker", nargs=3, metavar=("SECONDS", "RAM_MIB", "CPU_FRACTION"))
@@ -287,7 +290,8 @@ def main() -> None:
         parser.error("materialized runs require <=8 agents, <=20 modeled GiB and <=8 cores")
     tasks = workloads(args.agents, args.jobs, args.seed)
     policies = ("naive", "fifo", "borg") if args.policy == "all" else (args.policy,)
-    results = [simulate(tasks, p, args.ram_gib, args.cores, scale=args.scale) for p in policies]
+    results = [simulate(tasks, p, args.ram_gib, args.cores, scale=args.scale,
+                        coalesce_running=args.coalesce_running) for p in policies]
     if args.materialize:
         for result in results:
             result["replay"] = materialize(result["spans"], args.ram_mib_per_gib)
