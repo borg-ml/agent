@@ -1605,6 +1605,7 @@ struct CrossProviderCompactionExecutor {
 
 struct OversizedCompactionExecutor {
     calls: Arc<AtomicUsize>,
+    fail_on_second: bool,
 }
 
 fn test_provider_capabilities() -> Vec<crate::ProviderCapability> {
@@ -1952,7 +1953,14 @@ impl AgentTurnExecutor for OversizedCompactionExecutor {
     }
 
     async fn compact_retained_context(&self, _turn: AgentTurn) -> Result<AgentCompaction> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
+        let previous_calls = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_on_second && previous_calls == 1 {
+            return Err(borg_provider::provider::ProviderStreamError {
+                kind: borg_provider::provider::ProviderErrorKind::ConnectionLost,
+                message: "second compaction fold disconnected".to_string(),
+            }
+            .into());
+        }
         Ok(AgentCompaction {
             summary: format!(
                 "summary-start{}summary-end",
@@ -12412,7 +12420,7 @@ fn subscription_replay_budget_keeps_projection_boundaries_stable() {
 }
 
 #[tokio::test]
-async fn subscription_compaction_truncates_summary_and_counts_every_fold() {
+async fn subscription_compaction_counts_every_fold_and_reports_partial_failure() {
     use borg_provider::provider::ModelMessage;
 
     let root = tempdir().unwrap();
@@ -12463,6 +12471,7 @@ async fn subscription_compaction_truncates_summary_and_counts_every_fold() {
     let calls = Arc::new(AtomicUsize::new(0));
     let executor: Arc<dyn AgentTurnExecutor> = Arc::new(OversizedCompactionExecutor {
         calls: calls.clone(),
+        fail_on_second: false,
     });
     let prompt_id = Uuid::new_v4();
     let mut events = vec![SessionEvent::new(
@@ -12536,6 +12545,37 @@ async fn subscription_compaction_truncates_summary_and_counts_every_fold() {
         compaction.usage.cost_basis,
         borg_provider::CostBasis::SubscriptionEquivalent
     );
+
+    let failed_calls = Arc::new(AtomicUsize::new(0));
+    let failing_executor: Arc<dyn AgentTurnExecutor> = Arc::new(OversizedCompactionExecutor {
+        calls: failed_calls.clone(),
+        fail_on_second: true,
+    });
+    let error = match compact_subscription_context_for_budget(SubscriptionCompactionRequest {
+        executor: &failing_executor,
+        session_id,
+        launch: &launch,
+        agent_mcp_server: &agent_mcp_server,
+        dispatcher: &dispatcher,
+        events: &events,
+        actor: EventActor::User,
+        current_prompt: "continue",
+        retained_tail_budget_chars: subscription_retained_tail_budget_chars(
+            SUBSCRIPTION_INPUT_BUDGET_CHARS,
+        ),
+    })
+    .await
+    {
+        Ok(_) => panic!("the second fold should fail"),
+        Err(error) => error,
+    };
+    assert_eq!(failed_calls.load(Ordering::SeqCst), 2);
+    let partial = error
+        .downcast_ref::<crate::agent::PartialCompactionUsage>()
+        .expect("completed fold usage survives the later failure");
+    assert_eq!(partial.usage.total_tokens, 135);
+    assert_eq!(partial.usage.cost_microusd, Some(700));
+    assert!(compaction_failure_is_provider_side(&error));
 }
 
 /// A resumed or forked session loads its context from the compaction boundary

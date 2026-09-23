@@ -3529,6 +3529,17 @@ async fn run_agent_session_store_kernel_inner(
                                 if provider_context_compaction {
                                     subscription_context_reusable = false;
                                 }
+                                if let Some(partial) =
+                                    error.downcast_ref::<crate::agent::PartialCompactionUsage>()
+                                {
+                                    record(
+                                        &mut journal,
+                                        &events,
+                                        session_id,
+                                        native_usage_event(&partial.usage, None),
+                                    )
+                                    .await?;
+                                }
                                 let message = error.to_string();
                                 record(
                                     &mut journal,
@@ -3941,6 +3952,17 @@ async fn run_agent_session_store_kernel_inner(
                         .await?;
                     }
                     Err(error) => {
+                        if let Some(partial) =
+                            error.downcast_ref::<crate::agent::PartialCompactionUsage>()
+                        {
+                            record(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                native_usage_event(&partial.usage, Some(prompt.message_id)),
+                            )
+                            .await?;
+                        }
                         let message = format!(
                             "Automatic context compaction failed; continuing without discarding history: {error:#}"
                         );
@@ -4081,6 +4103,17 @@ async fn run_agent_session_store_kernel_inner(
                     retained_context = retained_conversation_context(journal.context_events());
                 }
                 Err(error) => {
+                    if let Some(partial) =
+                        error.downcast_ref::<crate::agent::PartialCompactionUsage>()
+                    {
+                        record(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            native_usage_event(&partial.usage, None),
+                        )
+                        .await?;
+                    }
                     // Compaction could not run; restore the oversized context.
                     retained_context = Some(full_context);
                     // Why it failed decides what may happen next. A provider
@@ -7592,41 +7625,54 @@ async fn compact_subscription_context_for_budget(
     let mut summary = String::new();
     let mut usage = borg_provider::ProviderCallUsage::default();
     let mut provider_session_id = None;
-    for chunk in &chunks {
-        let prompt = if summary.is_empty() {
-            retained_compaction_prompt(chunk)
-        } else {
-            retained_fold_compaction_prompt(&summary, chunk)
-        };
+    let mut completed_folds = 0;
+    let folding: Result<()> = async {
+        for chunk in &chunks {
+            let prompt = if summary.is_empty() {
+                retained_compaction_prompt(chunk)
+            } else {
+                retained_fold_compaction_prompt(&summary, chunk)
+            };
+            anyhow::ensure!(
+                prompt.chars().count() <= SUBSCRIPTION_INPUT_BUDGET_CHARS,
+                "subscription compaction prompt exceeds the {}-character provider input budget",
+                SUBSCRIPTION_INPUT_BUDGET_CHARS
+            );
+            let compaction = run_retained_compaction(
+                executor,
+                session_id,
+                launch,
+                agent_mcp_server,
+                dispatcher,
+                prompt,
+            )
+            .await?;
+            completed_folds += 1;
+            crate::native_harness::absorb_usage(&mut usage, &compaction.usage);
+            anyhow::ensure!(
+                !compaction.summary.trim().is_empty(),
+                "subscription context compaction returned an empty summary"
+            );
+            summary = truncate_compaction_context(&compaction.summary, summary_budget);
+            provider_session_id = compaction.provider_session_id;
+        }
+
         anyhow::ensure!(
-            prompt.chars().count() <= SUBSCRIPTION_INPUT_BUDGET_CHARS,
-            "subscription compaction prompt exceeds the {}-character provider input budget",
+            subscription_prompt_chars(Some(&summary), actor, current_prompt)
+                <= SUBSCRIPTION_INPUT_BUDGET_CHARS,
+            "subscription context compaction summary exceeds the {}-character provider input budget",
             SUBSCRIPTION_INPUT_BUDGET_CHARS
         );
-        let compaction = run_retained_compaction(
-            executor,
-            session_id,
-            launch,
-            agent_mcp_server,
-            dispatcher,
-            prompt,
-        )
-        .await?;
-        anyhow::ensure!(
-            !compaction.summary.trim().is_empty(),
-            "subscription context compaction returned an empty summary"
-        );
-        summary = truncate_compaction_context(&compaction.summary, summary_budget);
-        crate::native_harness::absorb_usage(&mut usage, &compaction.usage);
-        provider_session_id = compaction.provider_session_id;
+        Ok(())
     }
-
-    anyhow::ensure!(
-        subscription_prompt_chars(Some(&summary), actor, current_prompt)
-            <= SUBSCRIPTION_INPUT_BUDGET_CHARS,
-        "subscription context compaction summary exceeds the {}-character provider input budget",
-        SUBSCRIPTION_INPUT_BUDGET_CHARS
-    );
+    .await;
+    folding.map_err(|error| {
+        if completed_folds > 0 {
+            crate::agent::PartialCompactionUsage::attach(error, usage.clone())
+        } else {
+            error
+        }
+    })?;
     // The summary is the floor; whatever verbatim tail still fits under the
     // hard input budget is kept on top of it. Trimming the tail rather than the
     // summary keeps the lossy step the one the summarizer already made. The fit
