@@ -273,6 +273,9 @@ pub(crate) struct CapabilityConfig {
     pub(crate) telemetry: bool,
     pub(crate) auto_resume_usage_limits: bool,
     pub(crate) watcher_yield: bool,
+    /// Let Claude sessions use Claude Code's Agent tool, whose subagents run
+    /// inside the session's Claude process instead of starting new ones.
+    pub(crate) claude_native_subagents: bool,
     /// Providers whose mid-turn human messages are framed with an instruction
     /// to address them next: `true` (default set), `false`, or a list.
     pub(crate) steer_reply_prompt: borg_remote::SteerReplyPrompt,
@@ -295,6 +298,7 @@ impl Default for CapabilityConfig {
             telemetry: false,
             auto_resume_usage_limits: true,
             watcher_yield: false,
+            claude_native_subagents: false,
             steer_reply_prompt: borg_remote::SteerReplyPrompt::default(),
             harness: borg_remote::HarnessMode::Borg,
         }
@@ -317,6 +321,7 @@ impl From<&CapabilityConfig> for borg_remote::SessionCapabilities {
             steer_reply_prompt: value.steer_reply_prompt.clone(),
             provider_capabilities: Vec::new(),
             luna_titles_for_all_providers: false,
+            claude_native_subagents: value.claude_native_subagents,
             runtime_mcp_context: None,
             runtime_provider_context: None,
             system_prompt_appendix: None,
@@ -1784,6 +1789,17 @@ reasoning_format = "deepseek"
         let configured: AgentConfig =
             toml::from_str("[capabilities]\nwatcher_yield = true\n").unwrap();
         assert!(borg_remote::SessionCapabilities::from(&configured.capabilities).watcher_yield);
+    }
+
+    #[test]
+    fn claude_native_subagents_require_explicit_opt_in() {
+        assert!(!AgentConfig::default().capabilities.claude_native_subagents);
+        let configured: AgentConfig =
+            toml::from_str("[capabilities]\nclaude_native_subagents = true\n").unwrap();
+        assert!(
+            borg_remote::SessionCapabilities::from(&configured.capabilities)
+                .claude_native_subagents
+        );
     }
 
     #[test]

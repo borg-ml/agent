@@ -716,6 +716,8 @@ pub struct ChatStreamRequest {
     pub persist_session: Option<bool>,
     pub web_search_allowed: bool,
     pub resume_unavailable_prompt: Option<String>,
+    /// Offer Claude Code's Agent tool, whose subagents run in this process.
+    pub native_subagents: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1861,13 +1863,17 @@ fn claude_command_args(
         "stream-json".to_string(),
         "--verbose".to_string(),
         "--include-partial-messages".to_string(),
-        // Borg owns delegation: Claude Code's native subagent tools must not
-        // be offered to the model at all.
         // Delegation and monitoring go through Borg's own tools so every
-        // provider shares one implementation, journal, and UI; the native
-        // equivalents would run invisibly to Borg.
+        // provider shares one implementation, journal, and UI. The opt-in
+        // exception is Claude Code's Agent tool: its subagents share this
+        // process instead of each starting another Claude runtime.
         "--disallowedTools".to_string(),
-        "Agent,Task,Monitor,Watch".to_string(),
+        if request.native_subagents {
+            "Monitor,Watch"
+        } else {
+            "Agent,Task,Monitor,Watch"
+        }
+        .to_string(),
     ];
     if permission == LocalAgentPermission::FullAccess {
         args.push("--dangerously-skip-permissions".to_string());
@@ -2103,6 +2109,7 @@ mod tests {
             persist_session: Some(false),
             web_search_allowed: false,
             resume_unavailable_prompt: None,
+            native_subagents: false,
         };
         assert_eq!(
             claude_command_args(&request, LocalAgentPermission::Manual, None),
@@ -2122,6 +2129,17 @@ mod tests {
                 "--resume",
                 "session-1",
             ]
+        );
+        let native = ChatStreamRequest {
+            native_subagents: true,
+            ..request.clone()
+        };
+        let native_args = claude_command_args(&native, LocalAgentPermission::Manual, None);
+        assert!(
+            native_args
+                .windows(2)
+                .any(|args| args[0] == "--disallowedTools" && args[1] == "Monitor,Watch"),
+            "an opted-in session is offered Claude Code's Agent tool and nothing else"
         );
         let auto_args = claude_command_args(&request, LocalAgentPermission::Auto, None);
         assert!(
@@ -2205,6 +2223,7 @@ mod tests {
             persist_session: Some(false),
             web_search_allowed: false,
             resume_unavailable_prompt: None,
+            native_subagents: false,
         };
 
         let mcp_setup =
