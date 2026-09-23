@@ -86,9 +86,15 @@ Validate without UE using `python3 -m unittest discover -s extensions/unreal/tes
 Default tests use a fake engine and do not establish real Unreal build or
 editor service readiness. An optional integration smoke uses only an isolated
 fake project/engine and lane state: set `BORG_UNREAL_TEST_CLI` to an already-built
-Borg binary with the lane job CLI, then run the same unittest command. That
-opt-in test sets `BORG_LANE_DEGRADED=1` and `BORG_LANE_SCOPE=0` **only for the
-fake job**; do not use degraded/unscoped execution for production builds.
-Without a systemd user manager, this host's core supervisor refused a scoped
-fake job with exit 125; the isolated opt-in fake build finished with exit 0. Consult `docs/gamedev/interfaces.md`
-for core contracts and rollout prerequisites.
+Borg binary with the lane job CLI, then run the same unittest command. By
+default, the opt-in test sets `BORG_LANE_DEGRADED=1` and `BORG_LANE_SCOPE=0` **only for the
+fake job**; do not use degraded/unscoped execution for production builds. To
+exercise real scoped ownership too, set `BORG_UNREAL_TEST_SCOPED=1` plus
+`XDG_RUNTIME_DIR=/run/user/$(id -u)` and
+`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus` before running the
+opt-in test. This host's systemd user manager works: the scoped fake build
+finished with exit 0 and a `borg-lane-…scope` cgroup. An earlier exit 125 was
+caused by setting XDG_RUNTIME_DIR to an isolated temp directory without a user
+bus, not by a missing manager. This is still not real Unreal editor/build
+validation. Consult `docs/gamedev/interfaces.md` for core contracts and
+rollout prerequisites.
