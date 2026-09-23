@@ -84,6 +84,7 @@ pub(super) fn subagent_activity(
             detail: None,
             final_text: None,
             usage: crate::SubagentUsage::default(),
+            interrupted_by: None,
         },
         event: None,
     }

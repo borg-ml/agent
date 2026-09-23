@@ -1691,6 +1691,7 @@ fn initial_subagent_state_uses_only_the_loaded_root_tail() {
         detail: None,
         final_text: None,
         usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
     };
     let events = vec![
         SessionEvent::new(root, 1, SessionEventKind::SessionStarted),
@@ -1732,6 +1733,7 @@ fn resumed_roster_never_claims_an_unowned_child_is_running() {
         detail: None,
         final_text: None,
         usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
     };
 
     reconcile_dormant_subagent_snapshot(directory.path(), &mut snapshot);
@@ -1790,6 +1792,7 @@ async fn resumed_roster_prefers_the_child_terminal_ledger_over_a_stale_parent_mi
         detail: Some("turn phase: provider active".to_string()),
         final_text: None,
         usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
     }];
 
     reconcile_subagent_snapshots(&store, directory.path(), &mut snapshots).await;
@@ -2012,6 +2015,7 @@ fn team_history_restores_every_agent_and_child_approval() {
         detail: None,
         final_text: None,
         usage: borg_remote::SubagentUsage::default(),
+        interrupted_by: None,
     };
     let approval_id = "approval-1".to_string();
     let approval = SessionEvent::new(

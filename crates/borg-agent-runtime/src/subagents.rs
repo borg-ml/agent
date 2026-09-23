@@ -132,6 +132,13 @@ pub struct SubagentSnapshot {
     pub final_text: Option<String>,
     #[serde(default)]
     pub usage: SubagentUsage,
+    /// The agent whose `interrupt_agent` stopped this child's last turn. Its
+    /// next follow-up resumes the child; a stop the human made is not
+    /// recorded here and still holds against agent wakes. Journaled with the
+    /// snapshot so a parent that restarts can still lift its own interrupt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(skip)]
+    pub interrupted_by: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -2789,10 +2796,6 @@ struct SubagentEntry {
     /// action wakes them. This prevents resuming an idle root from silently
     /// starting providers in the background.
     dormant: bool,
-    /// The agent whose `interrupt_agent` stopped this child's last turn. Its
-    /// next follow-up resumes the child; a stop the human made is not
-    /// recorded here and still holds against agent wakes.
-    interrupted_by: Option<Uuid>,
 }
 
 struct SubagentTable {
@@ -2833,6 +2836,7 @@ impl SubagentTable {
             detail: None,
             final_text: None,
             usage: SubagentUsage::default(),
+            interrupted_by: None,
         };
         self.task_names.insert(task_name, snapshot.session_id);
         self.entries.insert(
@@ -2843,7 +2847,6 @@ impl SubagentTable {
                 inbox: Vec::new(),
                 assignment_claimed: false,
                 dormant: false,
-                interrupted_by: None,
             },
         );
         Ok(snapshot)
@@ -3643,7 +3646,6 @@ impl SubagentCoordinator {
                         inbox: Vec::new(),
                         assignment_claimed: false,
                         dormant: !snapshot.status.is_terminal() && !recovery_failed,
-                        interrupted_by: None,
                     },
                 );
             }
@@ -5487,14 +5489,14 @@ impl SubagentCoordinator {
         let mut messages = std::mem::take(&mut entry.inbox);
         messages.push(inbox_message);
         self.mark_seen(actor_session_id, &entry.snapshot).await;
-        if entry.interrupted_by == Some(actor_session_id)
+        if entry.snapshot.interrupted_by == Some(actor_session_id)
             && let Some(commands) = &entry.commands
         {
             commands
                 .send(HostCommand::ResumeFromInterrupt { session_id: id })
                 .await
                 .map_err(|_| anyhow::anyhow!("subagent command channel closed"))?;
-            entry.interrupted_by = None;
+            entry.snapshot.interrupted_by = None;
             // Measured live: a resumed child read the interrupt as the human
             // rejecting its work and refused its parent's follow-up as a peer
             // wake that a human stop overrides. Say what actually happened.
@@ -5660,17 +5662,17 @@ impl SubagentCoordinator {
     /// caller afterwards; here any earlier agent interrupt is forgotten, so a
     /// later human stop is never lifted by that agent's follow-up.
     pub async fn interrupt(&self, target: &str) -> Result<()> {
-        self.forget_interrupter(target).await;
+        self.set_interrupter(target, None).await;
         self.send_command(target, |session_id| HostCommand::Interrupt { session_id })
             .await
     }
 
-    async fn forget_interrupter(&self, target: &str) {
+    async fn set_interrupter(&self, target: &str, interrupter: Option<Uuid>) {
         let mut table = self.table.lock().await;
         if let Ok(id) = table.resolve(target)
             && let Some(entry) = table.entries.get_mut(&id)
         {
-            entry.interrupted_by = None;
+            entry.snapshot.interrupted_by = interrupter;
         }
     }
 
@@ -5684,7 +5686,7 @@ impl SubagentCoordinator {
     pub async fn stop(&self, target: &str) -> Result<()> {
         // A stopped child may be revived by an explicit follow-up; that must
         // not be announced as a parent lifting its own interrupt.
-        self.forget_interrupter(target).await;
+        self.set_interrupter(target, None).await;
         self.send_command(target, |session_id| HostCommand::Stop { session_id })
             .await
     }
@@ -6161,10 +6163,19 @@ impl SubagentCoordinator {
             }
             "interrupt_agent" => {
                 let args: TargetArgs = serde_json::from_value(arguments)?;
-                self.interrupt(&args.target).await?;
-                let id = self.table.lock().await.resolve(&args.target)?;
-                if let Some(entry) = self.table.lock().await.entries.get_mut(&id) {
-                    entry.interrupted_by = Some(actor_session_id);
+                // Recorded before the command, so the child's own stop report
+                // journals the snapshot with it: a restarted parent restores
+                // it and its follow-up can still lift the stop.
+                self.set_interrupter(&args.target, Some(actor_session_id))
+                    .await;
+                if let Err(error) = self
+                    .send_command(&args.target, |session_id| HostCommand::Interrupt {
+                        session_id,
+                    })
+                    .await
+                {
+                    self.set_interrupter(&args.target, None).await;
+                    return Err(error);
                 }
                 Ok(json!({ "accepted": true }))
             }
@@ -8644,7 +8655,7 @@ async fn update_from_session_event(
             if matches!(event.kind, SessionEventKind::TurnStarted { .. }) {
                 // A new turn by any route ends that interrupt. Not a Running
                 // status: the interrupt itself records Running ("cancelling").
-                entry.interrupted_by = None;
+                entry.snapshot.interrupted_by = None;
             }
         }
         SessionEventKind::StatusChanged { status, detail } => {
