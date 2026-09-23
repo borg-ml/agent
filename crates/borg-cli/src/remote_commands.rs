@@ -2679,6 +2679,7 @@ async fn run_local_agent_session(
             editor_preferences.interaction.completion_notifications,
             editor_preferences.interaction.completion_sound,
         );
+        terminal.set_auto_copy_selection(editor_preferences.interaction.auto_copy_selection);
         terminal.set_transcript_labels(
             editor_preferences.transcript.user_label.clone(),
             editor_preferences.transcript.assistant_label.clone(),
@@ -3774,6 +3775,9 @@ async fn run_local_agent_session(
                                 terminal.set_completion_alerts(
                                     editor_preferences.interaction.completion_notifications,
                                     editor_preferences.interaction.completion_sound,
+                                );
+                                terminal.set_auto_copy_selection(
+                                    editor_preferences.interaction.auto_copy_selection,
                                 );
                                 terminal.set_transcript_labels(
                                     editor_preferences.transcript.user_label.clone(),
@@ -5474,6 +5478,19 @@ async fn run_local_agent_session(
                         terminal.set_notice(format!(
                             "Completion notifications: {}",
                             completion_alert_policy_name(policy)
+                        ));
+                    }
+                    UiAction::SetAutoCopySelection(enabled) => {
+                        editor_preferences.interaction.auto_copy_selection = enabled;
+                        dispatch_editor_preferences_save(
+                            &editor_preferences_tx,
+                            &editor_preferences,
+                        );
+                        let terminal = terminal.as_mut().expect("terminal");
+                        terminal.set_auto_copy_selection(enabled);
+                        terminal.set_notice(format!(
+                            "Auto-copy mouse selections: {}",
+                            if enabled { "on" } else { "off" }
                         ));
                     }
                     UiAction::SetCompletionSound(policy) => {

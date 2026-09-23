@@ -562,33 +562,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/model", "choose the model"),
     ("/effort", "choose reasoning effort"),
-    ("/language", "choose response and drafting language"),
-    ("/ui-language", "choose the interface language"),
     ("/lsp", "view language server support"),
     ("/extensions", "view the live Blu extension runtime"),
-    ("/fast", "toggle provider priority/fast mode"),
-    (
-        "/followups",
-        "choose message delivery: redirect now or wait for this turn to finish",
-    ),
-    ("/refresh", "choose terminal refresh rate"),
-    ("/sleep", "keep the machine awake, even with the lid down"),
-    ("/expand-edits", "auto-expand edit diffs"),
-    ("/expand-tools", "auto-expand other tool details"),
-    ("/expand-thinking", "auto-expand thinking while it streams"),
-    ("/tool-click", "choose full-screen or inline action opening"),
-    (
-        "/action-descriptors",
-        "show generation descriptors before tools",
-    ),
-    (
-        "/notifications",
-        "choose when completion notifications appear",
-    ),
-    ("/sound", "choose when the completion sound plays"),
-    ("/icons", "choose the dictation icon"),
-    ("/colors", "view configurable transcript colours"),
-    ("/color", "set a transcript colour"),
     ("/usage", "view account limits and session usage"),
     ("/status", "alias for /usage"),
     ("/clear", "clear conversation context"),
@@ -906,6 +881,7 @@ pub enum UiAction {
     SetRunningSweeps(bool),
     SetCompletionNotifications(CompletionAlertPolicy),
     SetCompletionSound(CompletionAlertPolicy),
+    SetAutoCopySelection(bool),
     SetDictationIcon(DictationIconStyle),
     /// Completes the enable-dictation flow: persist model/accelerator/icon,
     /// mark dictation enabled, and begin recording (which prompts the OS for
@@ -1649,6 +1625,7 @@ pub struct BorgTerminal {
     thread_find: Option<ThreadFindState>,
     completion_notifications: CompletionAlertPolicy,
     completion_sound: CompletionAlertPolicy,
+    auto_copy_selection: bool,
     horizontal_margin: u16,
     composer_max_height: u16,
     show_footer: bool,
@@ -1923,6 +1900,7 @@ enum PickerKind {
     RunningSweeps,
     CompletionNotifications,
     CompletionSound,
+    AutoCopySelection,
     DictationModel,
     DictationAccelerator,
     DictationIcon,
@@ -2879,6 +2857,7 @@ impl BorgTerminal {
             thread_find: None,
             completion_notifications: CompletionAlertPolicy::Unfocused,
             completion_sound: CompletionAlertPolicy::Unfocused,
+            auto_copy_selection: true,
             horizontal_margin: HORIZONTAL_MARGIN,
             composer_max_height: 8,
             show_footer: true,
@@ -4773,6 +4752,7 @@ impl BorgTerminal {
             "Running sweep animations".to_string(),
             "Completion notifications".to_string(),
             "Completion sound".to_string(),
+            "Auto-copy selections".to_string(),
             "Microphone icon".to_string(),
             "Transcript colours".to_string(),
             format!("User label · {user_label}"),
@@ -4797,6 +4777,7 @@ impl BorgTerminal {
             "/animations",
             "/notifications",
             "/sound",
+            "auto-copy",
             "/icons",
             "/colors",
             "/user-label",
@@ -5166,6 +5147,19 @@ impl BorgTerminal {
             "Completion notifications",
             self.completion_notifications,
         );
+    }
+
+    pub fn open_auto_copy_selection_picker(&mut self) {
+        self.picker = Some(Picker::new(
+            PickerKind::AutoCopySelection,
+            "Auto-copy mouse selections",
+            ["On", "Off"],
+            Some(if self.auto_copy_selection {
+                "On"
+            } else {
+                "Off"
+            }),
+        ));
     }
 
     pub fn open_completion_sound_picker(&mut self) {
@@ -6013,6 +6007,11 @@ impl BorgTerminal {
                             {
                                 self.composer_selection = None;
                             }
+                            if self.auto_copy_selection
+                                && let Some(request) = self.copy_composer_selection_request()
+                            {
+                                return Ok(UiAction::TerminalIo(request));
+                            }
                             return Ok(UiAction::None);
                         }
                         if self
@@ -6027,6 +6026,11 @@ impl BorgTerminal {
                         );
                         if let Some(click) = click {
                             return Ok(self.run_pending_transcript_click(click));
+                        }
+                        if self.auto_copy_selection
+                            && let Some(request) = self.copy_text_selection_request()
+                        {
+                            return Ok(UiAction::TerminalIo(request));
                         }
                     }
                     MouseEventKind::ScrollUp => {
@@ -6145,6 +6149,10 @@ impl BorgTerminal {
 
     pub fn take_event_redraw_needed(&mut self) -> bool {
         std::mem::take(&mut self.event_redraw_needed)
+    }
+
+    pub fn set_auto_copy_selection(&mut self, enabled: bool) {
+        self.auto_copy_selection = enabled;
     }
 
     pub fn set_completion_alerts(
@@ -6868,6 +6876,10 @@ impl BorgTerminal {
                 }
             }
             PickerKind::Commands => unreachable!("handled above"),
+            PickerKind::Settings if picker.options[picker.selected].value == "auto-copy" => {
+                self.open_auto_copy_selection_picker();
+                UiAction::None
+            }
             PickerKind::Settings => UiAction::Submit {
                 target: None,
                 text: picker.selected_value(),
@@ -6986,6 +6998,9 @@ impl BorgTerminal {
             PickerKind::CompletionSound => UiAction::SetCompletionSound(
                 completion_alert_policy_from_picker(&picker.selected_value()),
             ),
+            PickerKind::AutoCopySelection => {
+                UiAction::SetAutoCopySelection(picker.selected_value() == "On")
+            }
             PickerKind::DictationModel => {
                 self.pending_dictation_model = Some(picker.selected_value());
                 // Only offer the accelerator step where a GPU runtime exists;
@@ -12963,17 +12978,24 @@ fn apply_composer_selection(
 ///
 /// Only the gutter `syntax_lines` actually draws counts: blanks, then the
 /// dashed bar, then one space, in the gutter's own colour. Matching the
-/// character anywhere in the first span would let a message that merely
-/// contains it be read as a continuation, which drops that span from the
-/// selection and splices the line onto the one above it.
+/// character in unrelated message text would let it be read as a
+/// continuation, dropping content and splicing the line onto the one above.
+/// A message margin may precede the actual gutter span.
+fn code_gutter_span<'a>(line: &'a Line<'static>) -> Option<(usize, &'a Span<'static>)> {
+    let first = line.spans.first()?;
+    let (margin, gutter) = if matches!(first.content.as_ref(), "  " | "  │ ") {
+        (first.width(), line.spans.get(1)?)
+    } else {
+        (0, first)
+    };
+    (gutter.style.fg == Some(Color::DarkGray)).then_some((margin, gutter))
+}
+
 fn is_wrapped_code_continuation(line: &Line<'static>) -> bool {
-    let Some(span) = line.spans.first() else {
+    let Some((_, gutter)) = code_gutter_span(line) else {
         return false;
     };
-    if span.style.fg != Some(Color::DarkGray) {
-        return false;
-    }
-    let Some(indent) = span.content.strip_suffix("┊ ") else {
+    let Some(indent) = gutter.content.strip_suffix("┊ ") else {
         return false;
     };
     !indent.is_empty() && indent.chars().all(|character| character == ' ')
@@ -12981,10 +13003,10 @@ fn is_wrapped_code_continuation(line: &Line<'static>) -> bool {
 
 /// The first row of a code line, carrying its source line number.
 fn is_numbered_code_row(line: &Line<'static>) -> bool {
-    let Some(span) = line.spans.first() else {
+    let Some((_, gutter)) = code_gutter_span(line) else {
         return false;
     };
-    let content = span.content.as_ref();
+    let content = gutter.content.as_ref();
     let Some(bar) = content.find('│') else {
         return false;
     };
@@ -13045,7 +13067,8 @@ fn selection_line_ranges(line: &Line<'static>) -> Vec<(usize, usize)> {
         return ranges;
     }
     if is_code_gutter_row(line) {
-        let gutter = first.width();
+        let (margin, gutter) = code_gutter_span(line).expect("code row has a gutter");
+        let gutter = margin.saturating_add(gutter.width());
         let content_end = selection_content_columns(line);
         return (gutter < content_end)
             .then_some((gutter, content_end))

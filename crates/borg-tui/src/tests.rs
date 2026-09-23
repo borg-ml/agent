@@ -7774,6 +7774,37 @@ fn invalidated_activity_redraw_recomputes_scrollbar_safe_width() {
     assert!(!reuse_current_transcript_width(false, true));
 }
 
+#[test]
+fn low_frequency_settings_do_not_clutter_slash_suggestions() {
+    for command in [
+        "/language",
+        "/ui-language",
+        "/fast",
+        "/followups",
+        "/refresh",
+        "/sleep",
+        "/expand-edits",
+        "/expand-tools",
+        "/expand-thinking",
+        "/tool-click",
+        "/action-descriptors",
+        "/notifications",
+        "/sound",
+        "/auto-copy",
+        "/icons",
+        "/colors",
+        "/color",
+    ] {
+        assert!(
+            slash_matches(command).is_empty(),
+            "{command} is still suggested"
+        );
+    }
+    for command in ["/settings", "/model", "/effort"] {
+        assert_eq!(slash_matches(command)[0].0, command);
+    }
+}
+
 /// Only commands whose bare form is not a command need finishing by hand;
 /// everything else must run outright or the palette is just a typing aid.
 #[test]
@@ -12223,6 +12254,27 @@ fn transcript_text_selection_uses_stable_document_rows() {
         selected_transcript_text(&lines, start, end).as_deref(),
         Some("two\nthree four\nfi")
     );
+}
+
+#[test]
+fn wrapped_code_copy_excludes_the_message_margin_and_gutters() {
+    // Message rendering adds a margin before the code gutter. A wrapped shell
+    // command must not copy that gutter or insert display-only line breaks.
+    let command = "sudo sed -i 's/wine/UnrealEditor|ShaderCompile|clangd|wine/' /etc/systemd/system/earlyoom.service.d/20-borg-policy.conf && sudo systemctl daemon-reload";
+    let mut lines = rendering::code_block_lines("bash", command, 48);
+    assert!(lines.len() > 1);
+    for line in &mut lines {
+        line.spans.insert(0, Span::raw("  "));
+    }
+    let copied = selected_transcript_text(
+        &lines,
+        TranscriptPoint { row: 0, column: 6 },
+        TranscriptPoint {
+            row: lines.len() - 1,
+            column: usize::MAX,
+        },
+    );
+    assert_eq!(copied.as_deref(), Some(command));
 }
 
 #[test]

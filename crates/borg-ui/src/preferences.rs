@@ -129,6 +129,8 @@ pub struct InteractionPreferences {
     pub lid_sleep_setup: LidSleepSetup,
     pub completion_notifications: CompletionAlertPolicy,
     pub completion_sound: CompletionAlertPolicy,
+    /// Copy mouse-selected text to the clipboard when the drag ends.
+    pub auto_copy_selection: bool,
     /// Set once the user has completed the enable-dictation flow (which also
     /// grants microphone access). Until then, the dictation key opens that
     /// flow instead of recording.
@@ -144,6 +146,7 @@ impl Default for InteractionPreferences {
             lid_sleep_setup: LidSleepSetup::Ask,
             completion_notifications: CompletionAlertPolicy::Unfocused,
             completion_sound: CompletionAlertPolicy::Unfocused,
+            auto_copy_selection: true,
             dictation_enabled: false,
         }
     }
@@ -535,6 +538,7 @@ keep = true
                 lid_sleep_setup: LidSleepSetup::Declined,
                 completion_notifications: CompletionAlertPolicy::Always,
                 completion_sound: CompletionAlertPolicy::Off,
+                auto_copy_selection: false,
                 dictation_enabled: true,
             },
             presentation: PresentationPreferences {
@@ -610,6 +614,7 @@ keep = true
         let preferences: EditorPreferences =
             toml::from_str(include_str!("../../../configs/editor.example.toml")).unwrap();
         preferences.validate().unwrap();
+        assert!(preferences.interaction.auto_copy_selection);
         assert_eq!(
             preferences.interaction.active_messages,
             ActiveMessageBehavior::Steer
