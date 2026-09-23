@@ -840,6 +840,9 @@ pub enum UiAction {
     RecallQueuedPrompts {
         target: Option<Uuid>,
     },
+    FlushPendingInput {
+        target: Option<Uuid>,
+    },
     Rewind {
         sequence: u64,
         text: String,
@@ -4417,6 +4420,27 @@ impl BorgTerminal {
             self.event_redraw_needed = true;
         }
         true
+    }
+
+    fn has_pending_input_for_escape(&self) -> bool {
+        !self.active_queued_prompts().is_empty()
+    }
+
+    fn flush_pending_input(&mut self) -> UiAction {
+        let target = self.focused_child;
+        let root_retrying = target.is_none()
+            && (self.connection_retry_at.is_some() || self.usage_retry_at.is_some());
+        if self.active_status() != SessionStatus::Running || root_retrying {
+            self.notice = Some("Pending input stays queued until the session resumes".to_string());
+            return UiAction::None;
+        }
+        if let Some(child) = target {
+            self.child_active_turn_followups.remove(&child);
+        } else {
+            self.active_turn_followup = false;
+        }
+        self.notice = Some("Sending pending input".to_string());
+        UiAction::FlushPendingInput { target }
     }
 
     pub fn hydrate_payload(
@@ -9697,6 +9721,9 @@ impl BorgTerminal {
         }
         if let Some(target) = focused_child_interrupt_target(&self.keymap, &key, self.focused_child)
         {
+            if !ctrl_c && self.has_pending_input_for_escape() {
+                return Ok(self.flush_pending_input());
+            }
             return Ok(if self.begin_user_interrupt() {
                 UiAction::Interrupt {
                     target: Some(target),
@@ -9723,6 +9750,12 @@ impl BorgTerminal {
             self.rewind_primed = false;
             self.notice = Some("Press Ctrl-C again to exit".to_string());
             return Ok(UiAction::None);
+        }
+        if !ctrl_c
+            && self.keymap.matches(KeyAction::Interrupt, &key)
+            && self.has_pending_input_for_escape()
+        {
+            return Ok(self.flush_pending_input());
         }
         if self.keymap.matches(KeyAction::Interrupt, &key)
             && self.composer.text.is_empty()
