@@ -1,6 +1,8 @@
 """Template contract tests against a private fake engine; never launch Unreal."""
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -97,7 +99,11 @@ class AdapterTests(unittest.TestCase):
                          'for arg; do case "$arg" in -Log=*) log="${arg#-Log=}";; esac; done\n'
                          'echo "[1/1] Compile" > "$log"\n'
                          'mkdir -p "' + str(self.project.parent / 'Binaries/Linux') + '"\n'
-                         'echo changed > "' + str(self.project.parent / 'Binaries/Linux/libGame.so') + '"\n')
+                         'echo changed > "' + str(self.project.parent / 'Binaries/Linux/libGame.so') + '"\n'
+                         'for fd in /proc/$$/fd/*; do\n'
+                         '  link=$(readlink "$fd" 2>/dev/null || :)\n'
+                         '  case "$link" in *ubt-start.lock*) exit 91;; esac\n'
+                         'done\n')
         manifest = self.root / 'changed.json'
         log = self.root / 'build.log'
         env = dict(self.env, UE_UBT_START_LOCK=str(self.root / 'ubt.lock'))
@@ -109,8 +115,10 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         library = self.project.parent / 'Binaries/Linux/libGame.so'
         self.assertEqual(json.loads(manifest.read_text()), [str(library)])
+        debug = library.with_suffix('.debug')
+        debug.write_text('full DWARF')
         tools = self.engine / 'Engine/Binaries/Linux'
-        (tools / 'dump_syms').write_text('#!/bin/sh\n[ "$1" = "-c" ] && [ "$2" = "-o" ] || exit 1\necho raw > "$3"\n')
+        (tools / 'dump_syms').write_text('#!/bin/sh\n[ "$1" = "-c" ] && [ "$2" = "-o" ] || exit 1\nprintf "%s\\n" "$4" > "$3"\n')
         (tools / 'BreakpadSymbolEncoder').write_text('#!/bin/sh\ncat "$1" > "$2"\n')
         for name in ('dump_syms', 'BreakpadSymbolEncoder'):
             (tools / name).chmod(0o755)
@@ -118,25 +126,42 @@ class AdapterTests(unittest.TestCase):
                                  '--engine', str(self.engine), '--manifest', str(manifest)],
                                 capture_output=True, text=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(library.with_suffix('.sym').read_text(), 'raw\n')
+        self.assertEqual(library.with_suffix('.sym').read_text(), str(debug) + '\n')
 
     @unittest.skipUnless(os.environ.get('BORG_UNREAL_TEST_CLI'),
                          'set BORG_UNREAL_TEST_CLI to an integrated Borg lane binary')
     def test_isolated_core_job_with_fake_engine(self):
-        """Explicit test-only unscoped core smoke; never run against real UE."""
+        """Opt-in isolated fake core job; scoped only with an explicit user bus."""
         binary = Path(os.environ['BORG_UNREAL_TEST_CLI']).resolve(strict=True)
         self.assertTrue(binary.is_file())
         builder = self.engine / 'Engine/Build/BatchFiles/Linux/Build.sh'
         builder.write_text('#!/bin/sh\n'
                            'for arg; do case "$arg" in -Log=*) log="${arg#-Log=}";; esac; done\n'
+                           'for fd in /proc/$$/fd/*; do\n'
+                           '  link=$(readlink "$fd" 2>/dev/null || :)\n'
+                           '  case "$link" in *ubt-start.lock*|*/locks/*) exit 91;; esac\n'
+                           'done\n'
                            'printf "[1/1] Fake compile\\n" > "$log"\n'
                            'echo fake-compiler-finished\n')
         self.project.parent.joinpath('.borg-unreal.toml').write_text(
             '[build]\nmin_available_ram_gb=0\nreserve_ram_gb=0\n'
             'min_free_disk_gb=0\nreserve_disk_gb=0\n')
         self.env.update(BORG_AGENT_CLI=str(binary),
-                        BORG_LANE_DIR=str(self.root / 'isolated-lane-state'),
-                        BORG_LANE_SCOPE='0', BORG_LANE_DEGRADED='1')
+                        BORG_LANE_DIR=str(self.root / 'isolated-lane-state'))
+        if os.environ.get('BORG_UNREAL_TEST_SCOPED') == '1':
+            runtime = os.environ.get('XDG_RUNTIME_DIR')
+            bus = os.environ.get('DBUS_SESSION_BUS_ADDRESS')
+            if not runtime or not bus or not Path(runtime).is_dir():
+                self.fail('scoped smoke needs XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS')
+            self.env['XDG_RUNTIME_DIR'] = runtime
+            self.env['DBUS_SESSION_BUS_ADDRESS'] = bus
+            self.env.pop('BORG_LANE_DEGRADED', None)
+            self.env.pop('BORG_LANE_SCOPE', None)
+            state = Path(runtime) / 'borg/unreal' / hashlib.sha256(
+                str(self.project).encode()).hexdigest()[:16]
+            self.addCleanup(shutil.rmtree, state, ignore_errors=True)
+        else:
+            self.env.update(BORG_LANE_SCOPE='0', BORG_LANE_DEGRADED='1')
         result = self.cli('build', '--wait')
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         stages = [json.loads(line) for line in result.stdout.splitlines()]
@@ -144,6 +169,13 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(stages[-1]['state'], {'Finished': {'exit_code': 0}})
         self.assertEqual(stages[0]['job_id'], stages[-1]['job_id'])
         self.assertTrue(Path(stages[-1]['log_path']).is_file())
+        if os.environ.get('BORG_UNREAL_TEST_SCOPED') == '1':
+            status = subprocess.run([str(binary), 'lane', 'job', 'status', '--json'],
+                                    env=self.env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(status.returncode, 0, status.stderr)
+            record = next(r for r in json.loads(status.stdout)
+                          if r['job']['id'] == stages[-1]['job_id'])
+            self.assertIn('.scope', record['scope_cgroup'])
 
     def test_exclusive_template_fails_closed_and_service_spec(self):
         result = self.cli('run', 'commandlet', '--spec', '--', sys.executable, '-c', 'print("ok")')
