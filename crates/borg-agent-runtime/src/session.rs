@@ -3370,6 +3370,7 @@ async fn run_agent_session_store_kernel_inner(
                                             .clone()
                                             .unwrap_or_default(),
                                         declaration_base: None,
+                                        prompt_context_base: Default::default(),
                                         claude_native_subagents: false,
                                         volatile_system_prompt_appendix:
                                             crate::provider_capabilities_prompt(
@@ -4533,6 +4534,7 @@ async fn run_agent_session_store_kernel_inner(
             declaration_base: native_provider
                 .then(|| native_declarations(journal.context_events()))
                 .flatten(),
+            prompt_context_base: prompt_context_base(journal.context_events()),
             claude_native_subagents: launch.provider == CodingProvider::Claude
                 && launch.capabilities.claude_native_subagents,
             volatile_system_prompt_appendix: crate::provider_capabilities_prompt(
@@ -6690,7 +6692,7 @@ fn validate_session_state(session_id: Uuid, state: &SessionState) -> Result<()> 
     Ok(())
 }
 
-fn native_conversation(
+pub(crate) fn native_conversation(
     events: &[SessionEvent],
     provider: CodingProvider,
 ) -> Result<Vec<borg_provider::provider::ModelMessage>> {
@@ -6983,11 +6985,12 @@ fn native_conversation_with_images(
                 }
             }
             SessionEventKind::ProviderEvent { kind, payload, .. }
-                if kind == "native_prompt_context" =>
+                if kind == crate::prompt_context::PROMPT_CONTEXT_EVENT =>
             {
-                let message = serde_json::from_value(payload.clone()).context(
-                    "durable native prompt context does not match the model-turn contract",
-                )?;
+                let context: crate::prompt_context::PromptContext =
+                    serde_json::from_value(payload.clone())
+                        .context("durable prompt context does not match its contract")?;
+                let message = borg_provider::provider::ModelMessage::user(context.content);
                 if native_structured_in_turn
                     || active_provider.is_some_and(|provider| provider.uses_native_harness())
                 {
@@ -7394,6 +7397,35 @@ fn native_declarations(events: &[SessionEvent]) -> Option<crate::prompt_context:
                     && let Ok(delta) = serde_json::from_value(payload.clone())
                 {
                     base.apply(&delta);
+                }
+            }
+            _ => {}
+        }
+    }
+    base
+}
+
+/// Each prompt-context slot's last recorded text in the current context
+/// generation: what the replayed history already shows the model.
+pub(crate) fn prompt_context_base(
+    events: &[SessionEvent],
+) -> HashMap<crate::prompt_context::ContextSlot, String> {
+    let mut base = HashMap::new();
+    for event in events {
+        match &event.kind {
+            SessionEventKind::ContextCleared => base.clear(),
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction" && compaction_restarts_replay(payload) =>
+            {
+                base.clear();
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == crate::prompt_context::PROMPT_CONTEXT_EVENT =>
+            {
+                if let Ok(context) =
+                    serde_json::from_value::<crate::prompt_context::PromptContext>(payload.clone())
+                {
+                    base.insert(context.slot, context.content);
                 }
             }
             _ => {}
@@ -7887,6 +7919,7 @@ async fn run_retained_compaction(
             extension_api: crate::ExtensionApiSnapshot::default(),
             system_prompt_appendix: RETAINED_COMPACTION_SYSTEM_PROMPT.to_string(),
             declaration_base: None,
+            prompt_context_base: Default::default(),
             claude_native_subagents: false,
             volatile_system_prompt_appendix: crate::provider_capabilities_prompt(
                 &launch.capabilities.provider_capabilities,

@@ -11391,8 +11391,12 @@ fn mutable_prompt_context_replays_after_the_user_tail_without_breaking_prefix_or
             3,
             SessionEventKind::ProviderEvent {
                 provider: CodingProvider::OpenRouter,
-                kind: "native_prompt_context".to_string(),
-                payload: serde_json::to_value(ModelMessage::user("appendix")).unwrap(),
+                kind: crate::prompt_context::PROMPT_CONTEXT_EVENT.to_string(),
+                payload: serde_json::to_value(crate::prompt_context::PromptContext {
+                    slot: crate::prompt_context::ContextSlot::Harness,
+                    content: "appendix".to_string(),
+                })
+                .unwrap(),
             },
         ),
         SessionEvent::new(
@@ -11460,8 +11464,12 @@ fn mutable_prompt_context_replays_after_the_user_tail_without_breaking_prefix_or
             3,
             SessionEventKind::ProviderEvent {
                 provider: CodingProvider::OpenCode,
-                kind: "native_prompt_context".to_string(),
-                payload: serde_json::to_value(ModelMessage::user("appendix")).unwrap(),
+                kind: crate::prompt_context::PROMPT_CONTEXT_EVENT.to_string(),
+                payload: serde_json::to_value(crate::prompt_context::PromptContext {
+                    slot: crate::prompt_context::ContextSlot::Harness,
+                    content: "appendix".to_string(),
+                })
+                .unwrap(),
             },
         ),
         SessionEvent::new(

@@ -239,6 +239,10 @@ pub struct AgentTurn {
     /// and a rebuilt base would silently differ from the one the model was
     /// shown.
     pub(crate) declaration_base: Option<crate::prompt_context::Declarations>,
+    /// Each prompt-context slot's last recorded text in this context
+    /// generation, so the turn appends a slot only when it changed.
+    pub(crate) prompt_context_base:
+        std::collections::HashMap<crate::prompt_context::ContextSlot, String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1598,38 +1602,9 @@ fn append_prompt_context(prompt: &str, context: &str) -> String {
     )
 }
 
-const CLEARED_HARNESS_PROMPT_CONTEXT: &str = "## Continual harness state\nNo persistent harness state is currently configured. Ignore earlier harness state snapshots.";
-
-fn next_harness_prompt_context(
-    conversation: &[borg_provider::provider::ModelMessage],
-    current: String,
-) -> Option<String> {
-    let previous = conversation.iter().rev().find_map(|message| match message {
-        borg_provider::provider::ModelMessage::User { content, .. }
-            if content
-                .trim_start()
-                .starts_with("## Continual harness state") =>
-        {
-            Some(content.as_str())
-        }
-        _ => None,
-    });
-    if current.is_empty() {
-        return previous
-            .filter(|content| *content != CLEARED_HARNESS_PROMPT_CONTEXT)
-            .map(|_| CLEARED_HARNESS_PROMPT_CONTEXT.to_string());
-    }
-    (previous != Some(current.as_str())).then_some(current)
-}
-
 #[cfg(test)]
 mod prompt_context_tests {
-    use super::{
-        CLEARED_HARNESS_PROMPT_CONTEXT, CodingProvider, append_prompt_context,
-        lifecycle_model_material, next_harness_prompt_context,
-    };
-
-    use borg_provider::provider::ModelMessage;
+    use super::{CodingProvider, append_prompt_context, lifecycle_model_material};
 
     #[test]
     fn claude_model_and_effort_switch_in_place_so_they_do_not_split_the_pool() {
@@ -1655,22 +1630,6 @@ mod prompt_context_tests {
         assert!(result.starts_with(&format!("{prompt}\n")));
         assert!(result.ends_with("</borg-message>"));
         assert!(!result[..prompt.len()].contains("mutable harness snapshot"));
-    }
-
-    #[test]
-    fn unchanged_harness_context_is_not_replayed_into_the_warm_tail() {
-        let context = "\n\n## Continual harness state\nstate";
-        let conversation = vec![ModelMessage::user(context)];
-
-        assert!(next_harness_prompt_context(&conversation, context.to_string()).is_none());
-        assert_eq!(
-            next_harness_prompt_context(&conversation, "updated".to_string()).as_deref(),
-            Some("updated")
-        );
-        assert_eq!(
-            next_harness_prompt_context(&conversation, String::new()).as_deref(),
-            Some(CLEARED_HARNESS_PROMPT_CONTEXT)
-        );
     }
 }
 
@@ -1698,19 +1657,18 @@ async fn run_borg_provider_turn(
             turn.provider,
             CodingProvider::Codex | CodingProvider::Claude | CodingProvider::OpenCode
         ) {
-        next_harness_prompt_context(
-            &turn.conversation,
-            turn.agent_tools.harness_prompt_appendix().await?,
-        )
+        let slot = crate::prompt_context::ContextSlot::Harness;
+        let previous = turn.prompt_context_base.get(&slot).map(String::as_str);
+        slot.next(previous, turn.agent_tools.harness_prompt_appendix().await?)
     } else {
         None
     };
     if let Some(prompt_context) = prompt_context.as_ref() {
-        let context_message = borg_provider::provider::ModelMessage::user(prompt_context.clone());
-        crate::native_harness::record_native_prompt_context(
+        crate::prompt_context::record_prompt_context(
             &events,
             turn.provider,
-            &context_message,
+            crate::prompt_context::ContextSlot::Harness,
+            prompt_context,
         )
         .await?;
     }
@@ -2792,6 +2750,7 @@ mod tests {
             extension_api: Default::default(),
             system_prompt_appendix: "extension context".to_string(),
             declaration_base: None,
+            prompt_context_base: Default::default(),
             claude_native_subagents: false,
             volatile_system_prompt_appendix: "usage: 5-hour 65% left".to_string(),
         }

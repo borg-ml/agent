@@ -46,6 +46,59 @@ use crate::{CodingProvider, SessionEventKind};
 
 pub(crate) const DECLARATION_BASE_EVENT: &str = "native_declaration_base";
 pub(crate) const DECLARATION_DELTA_EVENT: &str = "native_declaration_delta";
+pub(crate) const PROMPT_CONTEXT_EVENT: &str = "native_prompt_context";
+
+/// Runtime context delivered as a user message after the turn's prompt.
+///
+/// It is conversation content: journaled and replayed where it was sent, so
+/// the next turn's request extends this one byte for byte and the provider
+/// prefix cache survives. Like Codex's reference context item, a slot is only
+/// appended again when its text changes; earlier snapshots stay in history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContextSlot {
+    /// Skills, unavailable MCP servers and the launch appendix.
+    Instructions,
+    /// Continual harness state and imported memory.
+    Harness,
+    /// Provider admission and usage status.
+    ProviderStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PromptContext {
+    pub(crate) slot: ContextSlot,
+    pub(crate) content: String,
+}
+
+const CLEARED_HARNESS_CONTEXT: &str = "## Continual harness state\nNo persistent harness state is currently configured. Ignore earlier harness state snapshots.";
+
+impl ContextSlot {
+    /// The text to append for this slot, or `None` when the model already
+    /// holds `current` because it is the slot's last recorded text.
+    pub(crate) fn next(self, previous: Option<&str>, current: String) -> Option<String> {
+        if current.trim().is_empty() {
+            // Removed harness state would otherwise stay in force from an
+            // earlier snapshot; the other slots only ever describe the turn.
+            let stale = previous.is_some_and(|previous| previous != CLEARED_HARNESS_CONTEXT);
+            return (self == Self::Harness && stale).then(|| CLEARED_HARNESS_CONTEXT.to_string());
+        }
+        (previous != Some(current.as_str())).then_some(current)
+    }
+}
+
+pub(crate) async fn record_prompt_context(
+    events: &mpsc::Sender<SessionEventKind>,
+    provider: CodingProvider,
+    slot: ContextSlot,
+    content: &str,
+) -> Result<()> {
+    let context = PromptContext {
+        slot,
+        content: content.to_string(),
+    };
+    record(events, provider, PROMPT_CONTEXT_EVENT, &context).await
+}
 
 /// The parts of the leading instructions that can change mid-conversation.
 ///
@@ -292,7 +345,7 @@ async fn record<T: Serialize>(
             payload,
         })
         .await
-        .map_err(|_| anyhow::anyhow!("session actor stopped while recording declarations"))
+        .map_err(|_| anyhow::anyhow!("session actor stopped while recording prompt context"))
 }
 
 #[cfg(test)]
