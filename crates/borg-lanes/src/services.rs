@@ -3941,7 +3941,9 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
                 .snapshot()
                 .unwrap()
                 .into_iter()
-                .find(|r| r.service_lease && matches!(r.state, crate::lanes::TicketState::Granted(_)))
+                .find(|r| {
+                    r.service_lease && matches!(r.state, crate::lanes::TicketState::Granted(_))
+                })
                 .map(|r| r.ticket.id)
         };
         let held = lease().expect("service lease");
@@ -4221,7 +4223,10 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
             .await
             .unwrap()
             .unwrap();
-            state(&manager, |s| s.reason.ends_with(&format!("held by ticket {}", ticket.id))).await;
+            state(&manager, |s| {
+                s.reason.ends_with(&format!("held by ticket {}", ticket.id))
+            })
+            .await;
             assert_eq!(launch_count(root.path()), 1, "{mode:?}");
             assert_eq!(
                 manager.read_status("fake").unwrap().backend_pid,
@@ -4229,7 +4234,8 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
             );
             lanes.release_lease(&lease).unwrap();
             state(&manager, |s| {
-                matches!(s.state, ServiceState::Healthy { .. }) && s.backend_pid != before.backend_pid
+                matches!(s.state, ServiceState::Healthy { .. })
+                    && s.backend_pid != before.backend_pid
             })
             .await;
             cleanup(&manager, task).await;
@@ -4264,7 +4270,8 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
         lanes.release_lease(&lease).unwrap();
         state(&manager, |s| {
             matches!(s.state, ServiceState::Healthy { .. })
-                && s.backend_pid.is_some_and(|pid| Some(pid) != before.backend_pid)
+                && s.backend_pid
+                    .is_some_and(|pid| Some(pid) != before.backend_pid)
         })
         .await;
         assert_eq!(launch_count(root.path()), 2);

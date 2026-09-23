@@ -131,10 +131,21 @@ All optional and serde-defaulted, so an existing definition keeps its behavior:
 - `restart.transient_exit_codes`: `[int]`. An active or candidate backend
   exiting with one of these is relaunched after `backoff_ms` without counting
   toward `max_restarts`; `restarts` still counts it.
-- `restart.defer_while`: `[ResourceKey]`. A backend launch or restart waits
-  while a lane ticket other than the service's own holds one of these keys
-  (for example a build of the project tree); the status reason names the key
-  and ticket.
+- `restart.defer_while`: `[ResourceKey]`, for example a build of the project
+  tree. Before a backend launch (a warm or cold restart, a relaunch after a
+  crash or failed replacement, or the first start) the supervisor takes a
+  *restart barrier*: an exclusive claim on all these keys, less the service's
+  own resources, in the same lane transaction that admits builds. While a
+  ticket holds, is queued for or quarantines one of them the launch waits,
+  and the status reason names the key and ticket (`restart deferred: build
+  (host) held by ticket <id>`, `queued for`, `quarantined by`; `launch
+  deferred: …` for a relaunch). A refused attempt journals nothing, so queued
+  builds keep their turn. From before a cold restart stops the old backend,
+  or a warm one starts the replacement, until the new backend is healthy
+  (warm: and the old one is stopped) or has failed, no ticket needing one of
+  the keys is admitted, not even a job that could make the service yield.
+  A barrier whose supervisor was lost is quarantined by `lane recover`, since
+  nothing proves its backend stopped. Keys must be unique.
 - `health.unhealthy_after_ms`: a running backend is declared hung only after
   its probes have failed continuously this long (default three
   `timeout_ms`). Each probe is still cut off at `timeout_ms`.
