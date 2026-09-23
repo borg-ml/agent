@@ -264,8 +264,9 @@ producer-aware watch. See `docs/watcher-yield.md` and runtime `watch.rs`.
   uses one canonical project resource R and one lane-store kernel lock. An
   exclusive request enters `Preparing` and blocks new shared grants on R,
   preserving FIFO. Before granting, lanes synchronously pre-yields **every**
-  service bound to R; each must acknowledge `Yielded` with its backend stopped,
-  front proxy returning 503, and a fencing token. Only after all acks may
+  service bound to R; each must acknowledge `Yielded` only after its backend
+  **and descendants** are stopped in a verified owned scope/cgroup, the front
+  proxy returns 503, and a fencing token is persisted. Only after all acks may
   the exclusive lease become Granted or its job begin. During the whole
   exclusive lease, services refuse every start, crash restart, TTL resume and
   trigger restart after checking the lease table **under the same lock**, not

@@ -111,8 +111,9 @@ argument `confirmed: true` is not a durable human approval for workspace GC.
 
 **Critical v0 release gate (parent decision):** lanes enters `Preparing` for
 exclusive project key R before grant; blocks new shared grants and synchronously
-pre-yields **every** service bound to R until backend PID is gone, proxy returns
-503, and a fencing token acknowledges `Yielded`. Only then grant the job.
+pre-yields **every** service bound to R until the owned backend scope/cgroup
+is verified empty (leader PID exit alone is not enough), proxy returns 503,
+and a fencing token acknowledges `Yielded`. Only then grant the job.
 Every service start/restart/TTL auto-resume checks exclusive leases under the
 **same kernel lock**, never a cached flag. Release runs post-hooks then service
 resume; stale client tokens are rejected. Lanes owns Preparing/hooks/fencing;
