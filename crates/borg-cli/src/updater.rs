@@ -281,7 +281,10 @@ fn extract_native_provider(archive: &[u8], destination: &Path) -> Result<()> {
             continue;
         };
         if relative.components().count() != 1
-            || !matches!(name, "claude" | "manifest.json" | "package.json")
+            || !matches!(
+                name,
+                "claude" | "manifest.json" | "package.json" | "LICENSE.md"
+            )
         {
             continue;
         }
@@ -330,11 +333,17 @@ fn extract_native_provider(archive: &[u8], destination: &Path) -> Result<()> {
     let mut zip = zip::ZipArchive::new(Cursor::new(archive)).context("invalid Borg release zip")?;
     fs::create_dir_all(destination)
         .context("failed to create native provider staging directory")?;
-    for name in ["claude.exe", "manifest.json", "package.json"] {
+    for name in ["claude.exe", "manifest.json", "package.json", "LICENSE.md"] {
         let archive_name = format!("providers/claude/{name}");
-        let mut entry = zip
-            .by_name(&archive_name)
-            .with_context(|| format!("Borg release zip does not contain `{archive_name}`"))?;
+        let mut entry = match zip.by_name(&archive_name) {
+            Ok(entry) => entry,
+            Err(zip::result::ZipError::FileNotFound) if name == "LICENSE.md" => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("Borg release zip does not contain `{archive_name}`")
+                });
+            }
+        };
         let output = destination.join(name);
         let mut file = fs::File::create(&output).with_context(|| {
             format!("failed to stage native provider file {}", output.display())
@@ -625,6 +634,10 @@ fn stage_native_provider(provider: &Path, target: &Path) -> Result<NativeProvide
     ] {
         fs::copy(provider.join(name), staged.join(name))
             .with_context(|| format!("failed to copy native provider `{name}`"))?;
+    }
+    if provider.join("LICENSE.md").is_file() {
+        fs::copy(provider.join("LICENSE.md"), staged.join("LICENSE.md"))
+            .context("failed to copy native provider `LICENSE.md`")?;
     }
     #[cfg(unix)]
     {
@@ -980,6 +993,7 @@ mod tests {
                 br#"{"sdkCompat":{"harnessSchema":1}}"#,
             ),
             ("providers/claude/package.json", br#"{"version":"1.0.0"}"#),
+            ("providers/claude/LICENSE.md", b"platform license"),
         ] {
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
@@ -998,6 +1012,71 @@ mod tests {
             fs::read(destination.join("claude")).unwrap(),
             b"claude-binary"
         );
+        assert_eq!(
+            fs::read(destination.join("LICENSE.md")).unwrap(),
+            b"platform license"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn older_native_provider_archives_without_a_license_still_install() {
+        let archive = release_archive(&[
+            ("providers/claude/claude", b"claude-binary"),
+            ("providers/claude/manifest.json", b"{}"),
+            ("providers/claude/package.json", b"{}"),
+        ]);
+        let directory = tempfile::tempdir().unwrap();
+        let staged = directory.path().join("staged");
+        extract_native_provider(&archive, &staged).unwrap();
+        let installed = directory.path().join("providers/claude");
+        install_native_provider_to(&staged, &installed).unwrap();
+        assert_eq!(
+            fs::read(installed.join("claude")).unwrap(),
+            b"claude-binary"
+        );
+        assert!(!installed.join("LICENSE.md").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_native_provider_archives_keep_an_optional_license() {
+        use zip::write::SimpleFileOptions;
+
+        for has_license in [false, true] {
+            let mut files: Vec<(&str, &[u8])> = vec![
+                ("providers/claude/claude.exe", b"claude-binary"),
+                ("providers/claude/manifest.json", b"{}"),
+                ("providers/claude/package.json", b"{}"),
+            ];
+            if has_license {
+                files.push(("providers/claude/LICENSE.md", b"platform license"));
+            }
+            let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            for (name, bytes) in files {
+                archive
+                    .start_file(name, SimpleFileOptions::default())
+                    .unwrap();
+                archive.write_all(bytes).unwrap();
+            }
+            let archive = archive.finish().unwrap().into_inner();
+            let directory = tempfile::tempdir().unwrap();
+            let staged = directory.path().join("staged");
+            extract_native_provider(&archive, &staged).unwrap();
+            let installed = directory.path().join("providers/claude");
+            install_native_provider_to(&staged, &installed).unwrap();
+            assert_eq!(
+                fs::read(installed.join("claude.exe")).unwrap(),
+                b"claude-binary"
+            );
+            assert_eq!(installed.join("LICENSE.md").exists(), has_license);
+            if has_license {
+                assert_eq!(
+                    fs::read(installed.join("LICENSE.md")).unwrap(),
+                    b"platform license"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -1023,11 +1102,16 @@ mod tests {
         fs::write(provider.join("claude"), b"new-claude").unwrap();
         fs::write(provider.join("manifest.json"), b"{}").unwrap();
         fs::write(provider.join("package.json"), b"{}").unwrap();
+        fs::write(provider.join("LICENSE.md"), b"platform license").unwrap();
         install_native_provider_to(&provider, &directory.path().join("providers/claude")).unwrap();
         let installed_provider = directory.path().join("providers/claude");
         assert_eq!(
             fs::read(installed_provider.join("claude")).unwrap(),
             b"new-claude"
+        );
+        assert_eq!(
+            fs::read(installed_provider.join("LICENSE.md")).unwrap(),
+            b"platform license"
         );
     }
 

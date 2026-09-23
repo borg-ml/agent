@@ -1,6 +1,7 @@
 # Changelog
 
-User-visible changes. Release pages on GitHub also list every merged change.
+User-visible changes. Release pages use these highlights and link to the full
+Git comparison.
 
 ## Unreleased (since 0.10.0)
 
@@ -36,6 +37,17 @@ User-visible changes. Release pages on GitHub also list every merged change.
 
 ### Agents and teams
 
+- **Provider switches and compaction keep Borg's context.** Switching between
+  Claude and Codex, reconnecting after a failed turn, and resuming an evicted
+  Claude process now rebuild from the durable session journal. A failed
+  compaction stops without replacing the source history with a degraded
+  summary; recovery also restores history behind older degraded boundaries.
+- **Claude process use is bounded across sessions.** Active turns stay live,
+  while the host retains at most four idle Claude processes for up to 15
+  minutes. An idle session rebuilds its context when needed again.
+- **Queued team updates recover and clear correctly.** Replayed sub-agent
+  messages keep their team role, appear in Pending Input, and leave the panel
+  when admitted into a turn. Older queued messages are corrected on recovery.
 - **`wait_agent` waits for real work.** One call blocks up to 30 minutes
   (default 10) and returns as soon as a child settles, reports, or human/team
   input arrives. It says what ended the wait and includes a status line per
@@ -51,6 +63,15 @@ User-visible changes. Release pages on GitHub also list every merged change.
   told its parent lifted the stop. Other agents can't lift it, and an
   interrupt or stop the human makes in the UI still holds, even after an
   agent's interrupt.
+
+### Terminal
+
+- Pending Input can be collapsed, and team messages there have accurate
+  controls. The composer and transcript scrollbar use less space, while the
+  completion chime plays more quietly.
+- The sub-agent roster now labels the current model separately from total
+  token use and marks estimated, subscription-equivalent, or mixed costs.
+- Codex's Ultra effort selection maps to an accepted provider value.
 
 ### Install and update
 
