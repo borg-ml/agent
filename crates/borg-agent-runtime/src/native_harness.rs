@@ -1337,8 +1337,8 @@ impl NativeHarness {
         // a provider switch. Render and fold bounded, provider-neutral chunks;
         // replaying historical tool protocol in a summarization request can
         // also make the target provider reject an otherwise valid transcript.
-        let input_chars = context_window_tokens.clamp(1, 1_024_000).saturating_div(2) as usize;
-        let summary_chars = (input_chars / 8).min(32 * 1024);
+        let input_chars = compaction_input_chars(context_window_tokens);
+        let summary_chars = compaction_summary_chars(context_window_tokens);
         let wrapper_chars = crate::session::COMPACTION_SUMMARY_PROMPT.chars().count() + 160;
         let chunk_chars = input_chars.saturating_sub(summary_chars + wrapper_chars);
         anyhow::ensure!(
@@ -1423,6 +1423,63 @@ impl NativeHarness {
         Ok(summary)
     }
 
+    /// Ask for the checkpoint on the request the provider last cached, with
+    /// the instruction appended, so the history is read from cache instead of
+    /// re-sent as text under a different head. `None` leaves the bounded text
+    /// fold to do the work.
+    #[allow(clippy::too_many_arguments)]
+    async fn compact_in_place(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+        effort: Option<&str>,
+        prefix: &ModelTurnRequest,
+        mut messages: Vec<ModelMessage>,
+        context_window_tokens: u64,
+        usage: &mut ProviderCallUsage,
+    ) -> Option<String> {
+        messages.push(ModelMessage::user(
+            crate::session::IN_PLACE_COMPACTION_PROMPT,
+        ));
+        canonicalize_native_messages(&mut messages);
+        repair_native_messages(&mut messages);
+        validate_native_messages(&messages).ok()?;
+        let request = ModelTurnRequest {
+            request_id: Some(format!("compact:{}", Uuid::new_v4())),
+            messages,
+            // A response schema would shape the checkpoint itself.
+            output_schema: None,
+            ..prefix.clone()
+        };
+        let result = match self
+            .model_client
+            .model_turn(provider, model, effort, request, None)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::warn!(%error, "in-place compaction failed; folding the history as text");
+                return None;
+            }
+        };
+        absorb_usage(usage, &result.usage);
+        let ModelMessage::Assistant {
+            content: Some(content),
+            tool_calls,
+            ..
+        } = result.message
+        else {
+            return None;
+        };
+        let complete = result.finish_reason != "length";
+        (complete && tool_calls.is_empty() && !content.trim().is_empty()).then(|| {
+            crate::session::truncate_compaction_context(
+                &content,
+                compaction_summary_chars(context_window_tokens),
+            )
+        })
+    }
+
     /// Compact `messages` in place when `budget` says the next request would
     /// exceed the window.
     ///
@@ -1443,6 +1500,7 @@ impl NativeHarness {
             warmer,
             events,
             earlier_tool_calls,
+            prefix,
             force,
         } = context;
         let compaction_budget =
@@ -1458,6 +1516,14 @@ impl NativeHarness {
         // rewrites history and invalidates the whole cached prefix, so it runs
         // only when trimming was not enough.
         let mut budget = budget;
+        // What the provider last cached, before trimming rewrites it, when it
+        // leaves room to write the checkpoint. A forced compaction follows a
+        // length refusal, which asking again would only repeat.
+        let fits = budget
+            .context_tokens
+            .saturating_add(IN_PLACE_COMPACTION_HEADROOM_TOKENS)
+            <= budget.context_window_tokens;
+        let sent = (!force && fits).then(|| messages.clone());
         if let Some(trim) = microcompact_native_messages(messages, earlier_tool_calls) {
             budget.context_tokens = budget.context_tokens.saturating_sub(trim.saved_tokens);
             let enough = !force && !budget.needs_auto_compaction(&compaction_budget);
@@ -1514,17 +1580,37 @@ impl NativeHarness {
         )
         .await;
         let mut compaction_usage = ProviderCallUsage::default();
-        let compacted = self
-            .compact_with_window(
-                turn.provider,
-                model,
-                turn.effort.as_deref(),
-                turn.fast.unwrap_or(false),
-                messages.clone(),
-                context_window_tokens,
-                &mut compaction_usage,
-            )
-            .await;
+        let in_place = match sent {
+            Some(sent) => {
+                self.compact_in_place(
+                    turn.provider,
+                    model,
+                    turn.effort.as_deref(),
+                    prefix,
+                    sent,
+                    context_window_tokens,
+                    &mut compaction_usage,
+                )
+                .await
+            }
+            None => None,
+        };
+        let in_place_used = in_place.is_some();
+        let compacted = match in_place {
+            Some(summary) => Ok(summary),
+            None => {
+                self.compact_with_window(
+                    turn.provider,
+                    model,
+                    turn.effort.as_deref(),
+                    turn.fast.unwrap_or(false),
+                    messages.clone(),
+                    context_window_tokens,
+                    &mut compaction_usage,
+                )
+                .await
+            }
+        };
         absorb_usage(usage, &compaction_usage);
         let (summary, retained) = match compacted {
             Ok(summary) => {
@@ -1552,7 +1638,9 @@ impl NativeHarness {
                             "budget_clamped_to_window": compaction_budget.clamped_to_window,
                             "retained_messages": retained.len(),
                             "provider_duration_ms": compaction_usage.duration_ms,
+                            "in_place": in_place_used,
                             "input_tokens": compaction_usage.input_tokens,
+                            "cached_input_tokens": compaction_usage.cached_input_tokens,
                             "output_tokens": compaction_usage.output_tokens,
                         }),
                     },
@@ -1632,6 +1720,20 @@ impl NativeHarness {
         )
         .await
     }
+}
+
+/// Room an in-place compaction needs beyond the history for its instruction,
+/// reasoning and checkpoint.
+const IN_PLACE_COMPACTION_HEADROOM_TOKENS: u64 = 16_384;
+
+/// Characters of history one text-fold compaction request may carry.
+fn compaction_input_chars(context_window_tokens: u64) -> usize {
+    context_window_tokens.clamp(1, 1_024_000).saturating_div(2) as usize
+}
+
+/// Longest checkpoint a compaction keeps.
+fn compaction_summary_chars(context_window_tokens: u64) -> usize {
+    (compaction_input_chars(context_window_tokens) / 8).min(32 * 1024)
 }
 
 struct NativeSteer {
@@ -6990,6 +7092,108 @@ mod tests {
             "the first model call read {} tokens for a {WINDOW}-token window",
             calls[0]
         );
+    }
+
+    /// A summary asked for under a different head re-reads the whole history
+    /// uncached; asked for on the request the provider just cached, only the
+    /// instruction is new.
+    #[tokio::test]
+    async fn compaction_extends_the_request_the_provider_cached() {
+        const WINDOW: u64 = 200_000;
+        #[derive(Default)]
+        struct Recording {
+            requests: Mutex<Vec<ModelTurnRequest>>,
+        }
+        #[async_trait]
+        impl NativeModelClient for Recording {
+            async fn model_turn(
+                &self,
+                _provider: crate::CodingProvider,
+                _model: &str,
+                _effort: Option<&str>,
+                request: ModelTurnRequest,
+                _progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                let id = request.request_id.clone().unwrap_or_default();
+                self.requests.lock().unwrap().push(request);
+                let (content, tool_calls) = if id.ends_with(":1") {
+                    let call = ModelToolCall::function(
+                        "read-once".into(),
+                        "read_file".into(),
+                        r#"{"path":"missing.txt"}"#.into(),
+                    );
+                    (None, vec![call])
+                } else if id.starts_with("compact:") {
+                    (Some("checkpoint".to_string()), Vec::new())
+                } else {
+                    (Some("done".to_string()), Vec::new())
+                };
+                let finish_reason = if tool_calls.is_empty() {
+                    "stop"
+                } else {
+                    "tool_calls"
+                };
+                Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(content, None, None, tool_calls),
+                    finish_reason: finish_reason.into(),
+                    usage: ProviderCallUsage {
+                        context_tokens: Some(WINDOW - 20_000),
+                        context_window_tokens: Some(WINDOW),
+                        ..Default::default()
+                    },
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+
+        let client = Arc::new(Recording::default());
+        let root = tempfile::tempdir().unwrap();
+        let (events, completed) = run_turn_events(
+            client.clone(),
+            root.path().to_path_buf(),
+            Uuid::new_v4(),
+            Vec::new(),
+            HashMap::new(),
+            "read",
+            "",
+            "",
+        )
+        .await;
+        assert!(completed);
+        let requests = client.requests.lock().unwrap();
+        let first = &requests[0];
+        let compaction = requests
+            .iter()
+            .find(|request| {
+                request
+                    .request_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("compact:"))
+            })
+            .expect("the turn compacted");
+        let json = |messages: &[ModelMessage]| serde_json::to_value(messages).unwrap();
+        assert_eq!(
+            json(&compaction.messages[..first.messages.len()]),
+            json(&first.messages)
+        );
+        assert!(matches!(compaction.messages.last(),
+            Some(ModelMessage::User { content, .. })
+                if content.ends_with(crate::session::IN_PLACE_COMPACTION_PROMPT)));
+        let names = |request: &ModelTurnRequest| {
+            request
+                .tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(compaction), names(first));
+        assert_eq!(compaction.prompt_cache_key, first.prompt_cache_key);
+        assert!(events.iter().any(|event| matches!(event,
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction"
+                    && payload["status"] == "completed"
+                    && payload["in_place"] == true)));
     }
 
     #[tokio::test]
