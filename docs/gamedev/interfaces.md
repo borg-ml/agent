@@ -10,9 +10,9 @@ prefer additive fields and explain wire compatibility.
 
 | Owner | Files | Responsibility |
 | --- | --- | --- |
-| gd_lanes_core | `crates/borg-lanes/src/lanes.rs`, own tests | FIFO, kernel-lock lease supervisor, job scheduler, durable job logs |
-| gd_services_core | `crates/borg-lanes/src/services.rs`, own tests | service supervisor, client leases, proxy |
-| gd_workspace_core | `crates/borg-lanes/src/workspace.rs`, own tests | worktree admission/GC/freeze |
+| gd_lanes_core | `crates/borg-lanes/src/lanes.rs`, own tests; `crates/borg-cli/src/lane_commands.rs` and minimal `cli.rs`/`main.rs` wiring | FIFO, lock supervisor, jobs, CLI entry |
+| gd_services_core | `crates/borg-lanes/src/services.rs`, own tests; `crates/borg-cli/src/lane_service_commands.rs` | service supervisor, client leases, proxy |
+| gd_workspace_core | `crates/borg-lanes/src/workspace.rs`, own tests; `crates/borg-cli/src/lane_workspace_commands.rs` | worktree admission/GC/freeze |
 | gd_unreal_adapter | Blu package in `extensions/unreal/` (coordinate location) | Unreal templates/skills/hooks/migration |
 | gd_native_adapter | Blu package in `extensions/native/` | cargo/CMake/ctest templates |
 | gd_contention_bench | own benchmark files | contention/recovery benchmarks |
@@ -213,3 +213,13 @@ producer-aware watch. See `docs/watcher-yield.md` and runtime `watch.rs`.
   mandatory indefinite MCP calls.
 - D4: Blu `api` v1 does not contain lane declarations; adapter data and
   validation are an explicit integration milestone, not silently assumed.
+
+- D5: gd_lanes_core owns CLI entry (`cli.rs`/`main.rs`) and lanes command
+  module; services/workspace may own isolated subcommand modules but route
+  integration through lanes owner. No direct agent-runtime MCP edits in v0;
+  Blu workflow-backed CLI is the initial agent bridge. MCP bindings above
+  remain follow-up work until end-to-end permissions and tests exist.
+- D6: service additions (health kind, idle/readiness controls, richer status)
+  are additive. Standalone borg-services crate rejected; keep cross-module
+  resource/yield types in borg-lanes. Detached supervisor must retain lock FD
+  and kernel-backed ownership across requesting process exit.
