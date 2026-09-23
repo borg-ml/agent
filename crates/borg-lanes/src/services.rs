@@ -1635,10 +1635,8 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
         }
         if status.yields.is_empty() && active.is_none() && candidate.is_none() && now >= next_launch
         {
-            // A relaunch (after a crash, or a cold restart whose replacement
-            // failed) is a restart too: never beside a build of the tree.
-            if let Some(deferred) = gate.reserve_launch()? {
-                let reason = format!("launch deferred: {deferred}");
+            if !gate.acquire()? {
+                let reason = gate.denial_reason()?;
                 if status.reason != reason {
                     transition(
                         &dir,
@@ -1655,9 +1653,12 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
-            if !gate.acquire()? {
-                gate.release_launch()?;
-                let reason = gate.denial_reason()?;
+            // A relaunch (after a crash, or a cold restart whose replacement
+            // failed) is a restart too: never beside a build of the tree.
+            // Claimed after the service lease, so neither refusal journals
+            // anything; a deferred launch keeps its lease, as while running.
+            if let Some(deferred) = gate.reserve_launch()? {
+                let reason = format!("launch deferred: {deferred}");
                 if status.reason != reason {
                     transition(
                         &dir,
@@ -4275,6 +4276,63 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
         })
         .await;
         assert_eq!(launch_count(root.path()), 2);
+        cleanup(&manager, task).await;
+    }
+
+    /// Failure mode: a relaunch refused lane admission for its own key taking
+    /// and dropping a restart barrier on every retry, flooding the journal
+    /// (and its retention) with barrier records.
+    #[tokio::test]
+    async fn a_launch_refused_admission_takes_no_barrier() {
+        let key = ResourceKey {
+            scope: ResourceScope::Host,
+            name: "build".into(),
+        };
+        let (root, manager, front, task) = setup_with(|spec| {
+            spec.restart.defer_while = vec![key.clone()];
+            // The relaunch comes 2 s after the crash.
+            spec.restart.backoff_ms = 1_000;
+        })
+        .await;
+        let own = ResourceKey {
+            scope: ResourceScope::Host,
+            name: "fake-exclusive".into(),
+        };
+        let lanes = LaneStore::new(root.path()).unwrap();
+        let _ = get(front, "/crash").await; // exits 11
+        state(&manager, |s| s.reason == "backend crashed").await;
+        let ticket = lanes.enqueue_lease(build_on(&[&own])).unwrap();
+        let lease = crate::lanes::LaneCoordinator::wait(&lanes, &ticket)
+            .await
+            .unwrap();
+        state(&manager, |s| s.reason.contains("fake-exclusive")).await;
+        // The first start's barrier is already in the journal, finished.
+        let barriers =
+            |rows: &[crate::lanes::LaneRecord]| rows.iter().filter(|r| r.restart_barrier).count();
+        let before = lanes.snapshot().unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let after = lanes.snapshot().unwrap();
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "refused launches grew the journal"
+        );
+        assert_eq!(
+            barriers(&after),
+            barriers(&before),
+            "a launch refused its lease took a restart barrier"
+        );
+        lanes.release_lease(&lease).unwrap();
+        state(&manager, |s| {
+            matches!(s.state, ServiceState::Healthy { .. })
+        })
+        .await;
+        // Once admitted, the relaunch still went through the barrier.
+        let admitted = lanes.snapshot().unwrap();
+        assert_eq!(barriers(&admitted), barriers(&before) + 1);
+        assert!(!admitted.iter().any(|r| {
+            r.restart_barrier && matches!(r.state, crate::lanes::TicketState::Granted(_))
+        }));
         cleanup(&manager, task).await;
     }
 
