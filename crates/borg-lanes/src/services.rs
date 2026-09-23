@@ -422,7 +422,10 @@ impl ServiceManager {
                 &format!("--working-directory={}", spec.cwd.display()),
                 "-p",
                 "KillMode=control-group",
+                "-p",
+                "Delegate=yes",
             ]);
+            command.arg(format!("--setenv=BORG_SERVICE_UNIT={unit}"));
             if let Some(bytes) = spec.memory_max_bytes {
                 command.args(["-p", &format!("MemoryMax={bytes}")]);
             }
@@ -706,50 +709,163 @@ async fn transition(
     }
     publish(dir, status)
 }
-async fn stop_child(child: &mut Child, spec: &ServiceSpec, port: Option<u16>) {
-    let pid = child.id();
-    if child.try_wait().ok().flatten().is_some() {
-        return;
+/// A per-generation subgroup is inside the supervisor's systemd-owned unit.
+/// Killing the supervisor kills its entire cgroup; stopping one generation
+/// kills just this subgroup, including descendants that used setsid().
+struct BackendCgroups {
+    base: Option<PathBuf>,
+}
+impl BackendCgroups {
+    fn new() -> Result<Self> {
+        if cfg!(test) {
+            return Ok(Self { base: None });
+        }
+        let unit = std::env::var("BORG_SERVICE_UNIT")
+            .context("service must run in a delegated systemd unit")?;
+        ensure!(
+            unit.starts_with("borg-service-") && unit.ends_with(".service"),
+            "invalid service unit"
+        );
+        let self_group = fs::read_to_string("/proc/self/cgroup")?
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .context("unified cgroup v2 required")?
+            .to_owned();
+        let output = std::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                &unit,
+                "-p",
+                "ControlGroup",
+                "-p",
+                "Delegate",
+            ])
+            .output()?;
+        ensure!(
+            output.status.success(),
+            "cannot verify supervisor systemd unit"
+        );
+        let properties = String::from_utf8(output.stdout)?;
+        ensure!(
+            properties
+                .lines()
+                .any(|l| l == format!("ControlGroup={self_group}")),
+            "supervisor not in its declared cgroup"
+        );
+        ensure!(
+            properties.lines().any(|l| l == "Delegate=yes"),
+            "supervisor unit lacks delegated cgroup"
+        );
+        let base = PathBuf::from("/sys/fs/cgroup").join(self_group.trim_start_matches('/'));
+        ensure!(
+            base.join("cgroup.kill").exists(),
+            "no cgroup.kill for supervisor scope"
+        );
+        Ok(Self { base: Some(base) })
     }
+    fn create(&self) -> Result<Option<PathBuf>> {
+        let Some(base) = &self.base else {
+            return Ok(None);
+        };
+        let scope = base.join(format!("backend-{}", Uuid::new_v4().simple()));
+        fs::create_dir(&scope).context("create backend cgroup")?;
+        ensure!(
+            scope.join("cgroup.kill").exists(),
+            "backend cgroup has no kill control"
+        );
+        Ok(Some(scope))
+    }
+}
+
+async fn stop_child(
+    child: &mut Child,
+    spec: &ServiceSpec,
+    port: Option<u16>,
+    scope: Option<&Path>,
+) -> Result<()> {
     if let Some(graceful) = &spec.graceful_stop {
         let _ = hook(graceful, spec, port, None).await;
     }
-    if tokio::time::timeout(Duration::from_secs(2), child.wait())
-        .await
-        .is_ok()
-    {
-        return;
-    }
-    if let Some(pid) = pid {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGTERM);
+    if let Some(scope) = scope {
+        // Even if the leader has exited, descendants in this cgroup must die.
+        fs::write(scope.join("cgroup.kill"), "1").context("kill backend cgroup")?;
+        let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let events = fs::read_to_string(scope.join("cgroup.events"))?;
+            if events.lines().any(|line| line == "populated 0") {
+                break;
+            }
+            ensure!(
+                tokio::time::Instant::now() < deadline,
+                "backend cgroup still populated"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-    }
-    if tokio::time::timeout(Duration::from_secs(3), child.wait())
-        .await
-        .is_ok()
-    {
-        return;
-    }
-    if let Some(pid) = pid {
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
+        fs::remove_dir(scope).context("remove empty backend cgroup")?;
+    } else {
+        // Direct supervisor invocations are test-only; production fails closed
+        // in BackendCgroups::new rather than relying on a process-group fallback.
+        ensure!(cfg!(test), "unscoped backend is forbidden");
+        if let Some(pid) = child.id() {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
         }
+        let _ = child.wait().await;
     }
-    let _ = child.wait().await;
+    Ok(())
 }
-fn spawn_backend(spec: &ServiceSpec, port: Option<u16>, log: &File) -> Result<Child> {
+fn spawn_backend(
+    spec: &ServiceSpec,
+    port: Option<u16>,
+    log: &File,
+    scopes: &BackendCgroups,
+) -> Result<(Child, Option<PathBuf>)> {
     use std::os::unix::process::CommandExt;
+    let scope = scopes.create()?;
     let mut cmd = command(&spec.argv, spec, port, None)?;
     cmd.stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log.try_clone()?);
-    cmd.as_std_mut().process_group(0); // Only the group's recorded PID can be signalled.
-    cmd.spawn().context("spawn service backend")
+    cmd.as_std_mut().process_group(0);
+    if let Some(ref scope_path) = scope {
+        use std::os::unix::ffi::OsStrExt;
+        let target =
+            std::ffi::CString::new(scope_path.join("cgroup.procs").as_os_str().as_bytes())?;
+        // pre_exec is child-only: libc calls without allocation/locking.
+        unsafe {
+            cmd.as_std_mut().pre_exec(move || {
+                let fd = libc::open(target.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let written = libc::write(fd, b"0".as_ptr().cast(), 1);
+                let error = std::io::Error::last_os_error();
+                libc::close(fd);
+                if written != 1 {
+                    return Err(error);
+                }
+                Ok(())
+            });
+        }
+    }
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(scope) = &scope {
+                let _ = fs::remove_dir(scope);
+            }
+            return Err(error).context("spawn scoped service backend");
+        }
+    };
+    Ok((child, scope))
 }
 
 struct Backend {
     child: Child,
+    scope: Option<PathBuf>,
     port: Option<u16>,
     started_ms: u64,
     last_probe_ms: u64,
@@ -834,6 +950,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
     ensure!(spec.id == id, "service spec identity mismatch");
     valid_spec(&spec)?;
     let mut gate = ServiceGate::new(root, &spec)?;
+    let scopes = BackendCgroups::new()?;
     use std::os::unix::fs::OpenOptionsExt;
     let log = OpenOptions::new()
         .create(true)
@@ -947,10 +1064,10 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             )
             .await?;
             if let Some(mut b) = candidate.take() {
-                stop_child(&mut b.child, &spec, b.port).await;
+                stop_child(&mut b.child, &spec, b.port, b.scope.as_deref()).await?;
             }
             if let Some(mut b) = active.take() {
-                stop_child(&mut b.child, &spec, b.port).await;
+                stop_child(&mut b.child, &spec, b.port, b.scope.as_deref()).await?;
             }
             status.backend_pid = None;
             gate.release()?;
@@ -1042,11 +1159,12 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             }
             let port = next_port_after(&spec, last_port);
             last_port = port;
-            match spawn_backend(&spec, port, &log) {
-                Ok(child) => {
+            match spawn_backend(&spec, port, &log, &scopes) {
+                Ok((child, scope)) => {
                     status.backend_pid = child.id();
                     candidate = Some(Backend {
                         child,
+                        scope,
                         port,
                         started_ms: now,
                         last_probe_ms: 0,
@@ -1083,7 +1201,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             let gone = b.child.try_wait()?.is_some();
             let overdue = now.saturating_sub(b.started_ms) >= spec.readiness_timeout_ms;
             if gone || overdue {
-                stop_child(&mut b.child, &spec, b.port).await;
+                stop_child(&mut b.child, &spec, b.port, b.scope.as_deref()).await?;
                 candidate = None;
                 failures += 1;
                 next_launch = now + backoff(&spec, failures);
@@ -1139,7 +1257,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                     last_activity = now;
                     idle = false;
                     if let Some(mut old) = old {
-                        stop_child(&mut old.child, &spec, old.port).await;
+                        stop_child(&mut old.child, &spec, old.port, old.scope.as_deref()).await?;
                         status.restarts += 1;
                     }
                 }
@@ -1203,7 +1321,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                         )
                         .await?;
                         let mut old = active.take().expect("active present");
-                        stop_child(&mut old.child, &spec, old.port).await;
+                        stop_child(&mut old.child, &spec, old.port, old.scope.as_deref()).await?;
                         status.backend_pid = None;
                         status.restarts += 1;
                         failures += 1;
@@ -1221,10 +1339,11 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
         {
             let port = next_port_after(&spec, last_port);
             last_port = port;
-            match spawn_backend(&spec, port, &log) {
-                Ok(child) => {
+            match spawn_backend(&spec, port, &log, &scopes) {
+                Ok((child, scope)) => {
                     candidate = Some(Backend {
                         child,
+                        scope,
                         port,
                         started_ms: now,
                         last_probe_ms: 0,
@@ -1283,10 +1402,10 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
     )
     .await?;
     if let Some(mut b) = candidate {
-        stop_child(&mut b.child, &spec, b.port).await;
+        stop_child(&mut b.child, &spec, b.port, b.scope.as_deref()).await?;
     }
     if let Some(mut b) = active {
-        stop_child(&mut b.child, &spec, b.port).await;
+        stop_child(&mut b.child, &spec, b.port, b.scope.as_deref()).await?;
     }
     gate.release()?;
     for lease in status.clients.clone() {
@@ -1333,10 +1452,10 @@ async fn handle_request(
             )
             .await?;
             if let Some(mut b) = candidate.take() {
-                stop_child(&mut b.child, spec, b.port).await;
+                stop_child(&mut b.child, spec, b.port, b.scope.as_deref()).await?;
             }
             if let Some(mut b) = active.take() {
-                stop_child(&mut b.child, spec, b.port).await;
+                stop_child(&mut b.child, spec, b.port, b.scope.as_deref()).await?;
             }
             status.backend_pid = None;
             gate.release()?;
@@ -1403,10 +1522,10 @@ async fn handle_request(
             )
             .await?;
             if let Some(mut b) = candidate.take() {
-                stop_child(&mut b.child, spec, b.port).await;
+                stop_child(&mut b.child, spec, b.port, b.scope.as_deref()).await?;
             }
             if let Some(mut b) = active.take() {
-                stop_child(&mut b.child, spec, b.port).await;
+                stop_child(&mut b.child, spec, b.port, b.scope.as_deref()).await?;
             }
             status.backend_pid = None;
             gate.release()?;
