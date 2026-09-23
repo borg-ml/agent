@@ -189,6 +189,14 @@ Log `/tmp/gd-service-budget-pass.log`, retained own isolated fixture
 `/tmp/borg-service-bench-p8e7c0sh` (test-owned units stopped). Do not mark
 the combined capacity gate green on the single volatile passing run.
 
+**Resume-readiness gate:** service owner found that a Resume control RPC can
+acknowledge `Starting` before the backend becomes `Healthy`. The existing
+lane path can clear `resume_pending` on that early ACK, concealing a later
+failed restart. Lanes owner is adding bounded Healthy observation and durable
+status/error/recover retry before marking resume complete. The older
+SHA `011c4ba9…` and earlier success-path probes do **not** prove this
+failure path. Rebuild and test explicit failed-resume/recovery after the fix.
+
 **D11 scoped evidence (2026-09-23):** a stale worktree executable
 that predated delegated backend cgroups let a detached child survive yield
 while an exclusive job started (`821d209b`, exited 1 on test assertion). This
