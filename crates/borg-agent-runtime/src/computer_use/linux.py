@@ -1154,6 +1154,9 @@ EVDEV_CODES = {
 }
 SCRUBBED_DISPLAY_ENV = ("DISPLAY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET", "NIRI_SOCKET", "SWAYSOCK",
                         "HYPRLAND_INSTANCE_SIGNATURE", "XAUTHORITY", "DESKTOP_STARTUP_ID", "XDG_ACTIVATION_TOKEN")
+DISPLAY_MISSING = ("the private display needs borg-display, which is not installed next to borg or on PATH; "
+                   "update or reinstall Borg (Linux release archives, `borg update` and `just cli` install it beside "
+                   "borg), or set BORG_DISPLAY_BIN to a borg-display binary")
 # Headless-capable compositors another backend could drive; detected and reported only.
 ALTERNATIVE_BACKENDS = ("sway", "cage", "labwc", "weston")
 
@@ -1221,8 +1224,7 @@ class BorgDisplay:
         import select
         binary, runtime = self.binary(), self.runtime_dir()
         if not binary:
-            raise ValueError("borg-display is not installed; build it with `cargo install --path crates/borg-display` "
-                             "or set BORG_DISPLAY_BIN")
+            raise ValueError(DISPLAY_MISSING)
         self.sweep(runtime)
         # display_id names both sockets so another session can attach_display to it.
         self.display_id, self.owned = uuid.uuid4().hex[:16], True
@@ -1792,7 +1794,7 @@ def private_capabilities():
                   "Detached apps are not killed at teardown but lose their display when it stops.",
               ]}
     if not binary:
-        status["reason"] = "borg-display is not installed next to borg or on PATH"
+        status["reason"] = DISPLAY_MISSING
     if private_running():
         status.update(display_status())
     return status

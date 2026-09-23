@@ -96,6 +96,9 @@ jobs:
           fi
           "$binary" --version
           "$binary" --help >/dev/null
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            "target/${{ matrix.target }}/release/borg-display" --version
+          fi
       - name: Install pinned native Claude payload
         shell: bash
         run: |
@@ -109,7 +112,9 @@ jobs:
           mkdir "$package_dir"
           cp "target/${{ matrix.target }}/release/borg" "$package_dir/"
           binaries=(borg)
-          if [[ -x "target/${{ matrix.target }}/release/borg-display" ]]; then
+          # Linux archives must carry the computer-use private display; the
+          # self-updater installs it beside borg.
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
             cp "target/${{ matrix.target }}/release/borg-display" "$package_dir/"
             binaries+=(borg-display)
           fi
