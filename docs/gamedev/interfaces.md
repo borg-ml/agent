@@ -223,3 +223,13 @@ producer-aware watch. See `docs/watcher-yield.md` and runtime `watch.rs`.
   are additive. Standalone borg-services crate rejected; keep cross-module
   resource/yield types in borg-lanes. Detached supervisor must retain lock FD
   and kernel-backed ownership across requesting process exit.
+
+- D7 (pending implementation): stale lease holders must be fenced after
+  supervisor recovery, expiry or exclusive yield. Attach a monotonic per-key
+  grant generation (or equivalent owner-validated token) to mutations,
+  validate it at the service proxy and release path, and reject stale clients;
+  a UUID and a log entry alone are not an authorization proof. gd_lanes_core
+  and gd_services_core will agree the additive Rust field before landing.
+- D8: VCS-native binary asset locks (P4, UVCS, Git LFS, etc.) remain
+  authoritative for edit checkout; host lane resources do not replace them.
+  Adapters must gate mutating asset actions against project VCS policy.
