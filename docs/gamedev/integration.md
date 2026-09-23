@@ -126,6 +126,23 @@ parent requires D11 atomic editor/exclusive handoff and real-CLI proof.
    at the MCP boundary (unless independently verified atomic foreign-client
    policy lands), then rerun every gate on the final integrated binary.
    Real UE runtime parity is migration acceptance, not a Borg v0 gate.
+10. MCP co-submit authorisation is **in memory only** (v0 limitation): the
+   `(participant, session, job)` set that `lane_job submit` records when a
+   submission coalesces onto another actor's ticket (`LaneTools::submitted`,
+   `crates/borg-agent-runtime/src/lane_tools.rs`) is not persisted. After a
+   runtime restart, a joiner that does not own the ticket's holder is denied
+   `status`/`wait` on that job through MCP (fails closed, never widens
+   access; joiners never get `cancel`, which stays owner-only); the trusted `borg lane job wait <id>` CLI still works, or
+   the agent resubmits. Persist it with the lane journal in v0.1 if restarts
+   mid-job turn out to matter.
+11. Coalescing requires an equal `LeaseRequest.queue_timeout_ms`. Only the
+   first submitter's supervisor enforces a queue timeout, so a joiner would
+   otherwise inherit that ticket's limit, and a 1 s joiner could wait
+   indefinitely on a ticket with none. With equal limits the shared ticket,
+   queued first, expires no later than the joiner's own deadline (within the
+   2 s wake granularity every ticket has). A differing limit, including
+   `None` against `Some`, gets its own ticket
+   (`coalescing_never_binds_a_joiner_to_a_longer_queue_timeout`).
 
 
 **Selected v0 model-exclusive fallback (committed bridge; final-binary checks pending):**
