@@ -563,6 +563,13 @@ impl LaneStore {
                         && spec.memory_max_bytes == other.memory_max_bytes
                         && spec.timeout_ms == other.timeout_ms
                         && spec.stall_timeout_ms == other.stall_timeout_ms
+                        // Only the existing ticket's supervisor enforces a
+                        // queue timeout, so a joiner is bound by that ticket's
+                        // limit, not its own. Join only an equal limit: the
+                        // ticket was queued first, so it expires no later than
+                        // the joiner's own deadline would. A differing limit
+                        // (including None against Some) gets its own ticket.
+                        && spec.lease.queue_timeout_ms == other.lease.queue_timeout_ms
                 })
             {
                 return Ok((existing.ticket.clone(), existing.job.clone()));
@@ -2632,19 +2639,16 @@ mod tests {
         store.finish(job.id, 125, "failed yield").unwrap();
         store.release_lease(&held).unwrap();
     }
-    #[test]
-    fn pending_coalesces_only_matching_workload_and_options() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LaneStore::new(dir.path()).unwrap();
-        let spec = JobSpec {
+    fn coalescing_spec(dir: &Path, queue_timeout_ms: Option<u64>) -> JobSpec {
+        JobSpec {
             fingerprint: JobFingerprint("source-r1".into()),
             lease: LeaseRequest {
                 resources: vec![resource("build", Access::Exclusive)],
                 holder: holder(),
-                queue_timeout_ms: None,
+                queue_timeout_ms,
             },
             argv: vec!["true".into()],
-            cwd: dir.path().to_path_buf(),
+            cwd: dir.to_path_buf(),
             env: vec![],
             memory_max_bytes: Some(2_000_000_000),
             admission: AdmissionBudget {
@@ -2652,14 +2656,21 @@ mod tests {
                 reserve_ram_bytes: 1,
                 min_free_disk_bytes: 0,
                 reserve_disk_bytes: 1,
-                disk_path: dir.path().into(),
+                disk_path: dir.into(),
             },
             pre_hook: None,
             post_hook: None,
             timeout_ms: 5000,
             stall_timeout_ms: None,
             coalesce: true,
-        };
+        }
+    }
+
+    #[test]
+    fn pending_coalesces_only_matching_workload_and_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let spec = coalescing_spec(dir.path(), None);
         store
             .locked(|state| {
                 let first = store
@@ -2680,6 +2691,37 @@ mod tests {
                         .0
                         .id
                 );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn coalescing_never_binds_a_joiner_to_a_longer_queue_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let unbounded = coalescing_spec(dir.path(), None);
+        let short = coalescing_spec(dir.path(), Some(1_000));
+        let long = coalescing_spec(dir.path(), Some(60_000));
+        store
+            .locked(|state| {
+                let mut submit = |spec: &JobSpec| {
+                    store
+                        .enqueue_record(state, spec.lease.clone(), Some(spec.clone()))
+                        .map(|(ticket, _)| ticket.id)
+                };
+                let open = submit(&unbounded)?;
+                // A 1 s joiner must not ride a ticket that never times out.
+                let bounded = submit(&short)?;
+                assert_ne!(open, bounded);
+                // Nor a 60 s ticket onto a 1 s one, or back.
+                let longer = submit(&long)?;
+                assert_ne!(longer, bounded);
+                assert_ne!(longer, open);
+                // Equal limits still coalesce, bounded and unbounded alike.
+                assert_eq!(submit(&short)?, bounded);
+                assert_eq!(submit(&long)?, longer);
+                assert_eq!(submit(&unbounded)?, open);
                 Ok(())
             })
             .unwrap();
