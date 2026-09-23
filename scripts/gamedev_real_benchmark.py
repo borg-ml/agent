@@ -6,6 +6,8 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import json
+import math
+import statistics
 import os
 from pathlib import Path
 import shutil
@@ -154,6 +156,7 @@ def run(binary: Path, agents: int, jobs: int, scale: float, seed: int) -> dict:
             raise RuntimeError(f"lane admitted {peak_slots} RAM slots, cap is 20")
         queue_ms = sorted(max(0, s["started_ms"] - s["created_ms"]) for s in statuses)
         waits = []
+        per_agent_wait = [0.0] * agents
         for record in records:
             match = next(s for s in statuses if s["ticket"]["id"] == record["id"])
             started = match.get("started_ms")
@@ -164,19 +167,27 @@ def run(binary: Path, agents: int, jobs: int, scale: float, seed: int) -> dict:
             if record["arrived"] > first_arrival:
                 # A join to an already-running build waits for its result, not
                 # for a second launch or a fictitious queue position.
-                waits.append(max(0, record["finished"] - record["arrived"]))
+                observed_wait = max(0, record["finished"] - record["arrived"])
+                waits.append(observed_wait)
+                per_agent_wait[record["agent"]] += observed_wait
             else:
-                waits.append(max(0, (started - created) / 1000))
+                observed_wait = max(0, (started - created) / 1000)
+                waits.append(observed_wait)
+                per_agent_wait[record["agent"]] += observed_wait
         per_agent = [sum(r["finished"] - r["arrived"] for r in records if r["agent"] == i)
                      for i in range(agents)]
         throughput = [sum(t.duration for t in tasks[i]) / max(0.001, per_agent[i])
                       for i in range(agents)]
         fairness = (sum(throughput) ** 2 / (agents * sum(t*t for t in throughput))) if sum(throughput) else 1.
         status_latency_ms.sort()
+        sorted_agent_wait = sorted(per_agent_wait)
         return {"mode": "real-cli", "agents": agents, "requests": len(records),
                 "launches": len(ids), "coalesced": len(records)-len(ids),
                 "makespan_seconds": round(end-origin, 3),
                 "agent_wait_hours": round(sum(waits)/3600, 5),
+                "per_agent_wait_seconds": [round(x, 3) for x in per_agent_wait],
+                "per_agent_wait_seconds_p50": round(statistics.median(per_agent_wait), 3),
+                "per_agent_wait_seconds_p95": round(sorted_agent_wait[math.ceil(.95*len(sorted_agent_wait))-1], 3),
                 "fairness_jain": round(fairness, 4), "oom": 0, "failures": 0,
                 "peak_reserved_gib": peak_slots,
                 "enqueue_to_start_ms_median": queue_ms[len(queue_ms)//2],
@@ -291,6 +302,86 @@ def probe_running_join(binary: Path) -> dict:
             raise
 
 
+
+def probe_burst_fairness(binary: Path, burst: int = 6, other_agents: int = 3) -> dict:
+    """One owner queues many same-key jobs ahead of other agents; report skew."""
+    binary = binary.resolve(strict=True)
+    with isolated_root() as root:
+        project = root / "project"
+        project.mkdir()
+        lane_root = root / "lanes"
+        key = {"scope": "Host", "name": "bench-burst-" + uuid.uuid4().hex}
+        marker = project / "blocker-started"
+        submitted: list[tuple[str, int]] = []
+
+        def enqueue(agent: int, index: int, blocker: bool = False) -> str:
+            if blocker:
+                payload = ("from pathlib import Path\nimport time\n"
+                           f"Path({str(marker)!r}).write_text('started')\n"
+                           "end = time.monotonic()+.7\n"
+                           "while time.monotonic()<end: sum(range(50))\n")
+                argv = [sys.executable, "-c", payload]
+            else:
+                argv = [sys.executable, str(Path(__file__).with_name("gamedev_benchmark.py")),
+                        "--worker", ".16", "1", ".25"]
+            spec = {"fingerprint": f"burst-{agent}-{index}", "lease": {
+                "resources": [{"key": key, "access": "Exclusive"}],
+                "holder": {"participant_id": str(uuid.uuid5(uuid.NAMESPACE_DNS, f"burst-{agent}")),
+                           "session_id": str(uuid.uuid4()), "host_pid": None, "purpose": "fairness burst"},
+                "queue_timeout_ms": 10000},
+                "argv": argv, "cwd": str(project), "env": [], "memory_max_bytes": 32 * 1024 * 1024,
+                "admission": {"min_available_ram_bytes": 0, "reserve_ram_bytes": 0,
+                              "min_free_disk_bytes": 0, "reserve_disk_bytes": 0,
+                              "disk_path": str(project)},
+                "pre_hook": None, "post_hook": None, "timeout_ms": 5000,
+                "stall_timeout_ms": None, "coalesce": False}
+            result = cli(binary, lane_root, "job", "submit", "--spec", "-", input_data=spec)
+            assert isinstance(result, dict)
+            job_id = result["job_id"]
+            submitted.append((job_id, agent))
+            return job_id
+
+        enqueue(0, -1, blocker=True)
+        try:
+            if not marker.exists():
+                subprocess.run(["inotifywait", "-q", "-t", "5", "-e", "create,moved_to", str(project)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=6)
+            if not marker.exists():
+                raise RuntimeError("burst blocker never started")
+            for index in range(burst):
+                enqueue(0, index)
+            for agent in range(1, other_agents+1):
+                enqueue(agent, 0)
+            rows = []
+            for job_id, agent in submitted:
+                cli(binary, lane_root, "job", "wait", job_id, timeout=20)
+                status = cli(binary, lane_root, "job", "status", job_id)
+                assert isinstance(status, dict)
+                rows.append((status["ticket"]["sequence"], agent,
+                             max(0, (status["started_ms"]-status["created_ms"])/1000)))
+            rows.sort()
+            per_agent = [sum(wait for _, owner, wait in rows if owner == a)
+                         for a in range(other_agents+1)]
+            per_request = [per_agent[0]/(burst+1)] + per_agent[1:]
+            ordered = sorted(per_agent)
+            return {"mode": "burst-fairness-cli", "burst_jobs": burst, "other_agents": other_agents,
+                    "per_agent_wait_seconds": [round(x, 3) for x in per_agent],
+                    "per_agent_wait_seconds_p50": round(statistics.median(per_agent), 3),
+                    "per_agent_wait_seconds_p95": round(ordered[math.ceil(.95*len(ordered))-1], 3),
+                    "per_request_mean_wait_seconds": [round(x, 3) for x in per_request],
+                    "max_to_min_mean_wait_ratio": round(max(per_request)/max(.001,min(per_request)), 3),
+                    "sequence_by_agent": [(seq, owner) for seq, owner, _ in rows],
+                    "fairness_gate": "informational; per-agent queue cap is not v0"}
+        except BaseException:
+            for job_id, _ in submitted:
+                try:
+                    cli(binary, lane_root, "job", "cancel", job_id)
+                    cli(binary, lane_root, "job", "wait", job_id, timeout=5)
+                except Exception:
+                    pass
+            raise
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--borg", required=True, type=Path, help="built Borg CLI binary with lane job subcommands")
@@ -299,12 +390,16 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=23)
     ap.add_argument("--scale", type=float, default=200)
     ap.add_argument("--check-budget", action="store_true", help="test impossible disk budget via CLI")
+    ap.add_argument("--burst-fairness", action="store_true",
+                    help="informational same-key burst from one agent vs peers")
     ap.add_argument("--check-running-join", action="store_true",
                     help="prove already-running identical job is not unsafely coalesced")
     args = ap.parse_args()
     if not (1 <= args.agents <= 8 and 1 <= args.jobs <= 20 and args.scale >= 1):
         ap.error("real mode requires agents=1..8, jobs=1..20, scale>=1")
-    if args.check_running_join:
+    if args.burst_fairness:
+        result = probe_burst_fairness(args.borg)
+    elif args.check_running_join:
         result = probe_running_join(args.borg)
     elif args.check_budget:
         result = probe_disk_budget(args.borg)

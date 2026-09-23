@@ -11,6 +11,8 @@ from collections import deque
 from dataclasses import dataclass, field
 import heapq
 import json
+import math
+import statistics
 import random
 import subprocess
 import sys
@@ -208,9 +210,13 @@ def simulate(tasks: list[list[Request]], policy: str, ram_limit: int = 20, cores
     throughput = [work / max(1e-9, end - (i % 3 * .2))
                   for i, (work, end) in enumerate(zip(solo, finished_at)) if work]
     fairness = sum(throughput) ** 2 / (len(throughput) * sum(x*x for x in throughput)) if throughput else 1.
+    sorted_wait = sorted(wait)
     return {"policy": policy, "agents": agents, "requests": sum(map(len, tasks)),
             "scale": scale, "agent_wait_hours": round(sum(wait) / 3600, 5),
             "unscaled_wait_hours": round(sum(wait) * scale / 3600, 5),
+            "per_agent_wait_seconds": [round(x, 3) for x in wait],
+            "per_agent_wait_seconds_p50": round(statistics.median(wait), 3) if wait else 0,
+            "per_agent_wait_seconds_p95": round(sorted_wait[math.ceil(.95*len(sorted_wait))-1], 3) if sorted_wait else 0,
             "makespan_seconds": round(makespan, 3),
             "cpu_utilization": round(busy_cpu_seconds / (max(finished_at, default=1) * cores), 4),
             "oom": oom, "failures": failures, "fairness_jain": round(fairness, 4),

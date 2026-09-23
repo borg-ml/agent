@@ -52,6 +52,14 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bench.simulate(tasks, "borg", ram_limit=5)
 
+    def test_per_agent_wait_distribution_matches_seeded_scenario(self):
+        result = bench.simulate(bench.workloads(6, 8, 23), "borg", scale=10)
+        self.assertEqual(len(result["per_agent_wait_seconds"]), 6)
+        self.assertEqual(result["per_agent_wait_seconds_p50"], 33.491)
+        self.assertEqual(result["per_agent_wait_seconds_p95"], 42.902)
+        self.assertAlmostEqual(sum(result["per_agent_wait_seconds"]) / 3600,
+                               result["agent_wait_hours"], places=4)
+
     def test_seed_reproducible(self):
         tasks = bench.workloads(8, 9, 23)
         self.assertEqual(bench.simulate(tasks, "borg"), bench.simulate(bench.workloads(8, 9, 23), "borg"))
