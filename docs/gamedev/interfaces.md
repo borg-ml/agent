@@ -260,16 +260,22 @@ producer-aware watch. See `docs/watcher-yield.md` and runtime `watch.rs`.
   bridge. A model-supplied `owner` or `confirmed` boolean cannot confer
   participant authority or human approval. Workspace destructive MCP GC is
   dry-run only until approval is bound to the exact deletion.
-- D11: editor service/exclusive-job mutual exclusion is a *shared lane
-  resource*, not merely a `yield` status flag. The service must stop its
-  backend and release its shared project lease before the exclusive request
-  becomes Granted; the exclusive holder releases before service resume can
-  reacquire. A pre-hook that runs *after* grant is too late to prove this
-  ordering. No editor+exclusive parity claim until both owners demonstrate
-  this handshake under crash/restart and identical canonical root/key. A
-  timed yield must not expire into a service restart while the exclusive
-  lease still exists; all service startup/resume paths recheck the gate
-  atomically, including after supervisor crash.
+- D11 (v0 release requirement): editor service/exclusive-job mutual exclusion
+  uses one canonical project resource R and one lane-store kernel lock. An
+  exclusive request enters `Preparing` and blocks new shared grants on R,
+  preserving FIFO. Before granting, lanes synchronously pre-yields **every**
+  service bound to R; each must acknowledge `Yielded` with its backend stopped,
+  front proxy returning 503, and a fencing token. Only after all acks may
+  the exclusive lease become Granted or its job begin. During the whole
+  exclusive lease, services refuse every start, crash restart, TTL resume and
+  trigger restart after checking the lease table **under the same lock**, not
+  a cached flag. On lease release, lane post-hooks permit service resume.
+  Reject stale leaseholders by token (D7). Lanes owns `Preparing`, hooks and
+  fencing; services owns yield ack, start refusal and resume. A real-CLI
+  cross-module regression must hold a client lease, acquire R exclusively,
+  show backend PID gone before job start, prevent restart during the job and
+  show resume afterward. Failing this gate blocks v0 release; a post-hook
+  after grant or a yield status flag alone is insufficient.
 - D12: on Linux production jobs need a verified systemd-owned scope/cgroup.
   An opt-in degraded/test-only process-group fallback may signal a group only
   while its recorded leader PID, start ticks and PGID match. If the leader

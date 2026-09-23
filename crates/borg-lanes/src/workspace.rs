@@ -1,6 +1,6 @@
 //! Worktree budgets and local freeze gates; shared-work claims stay in Borg's workspace log.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -58,8 +58,8 @@ pub struct Freeze {
 #[async_trait]
 pub trait WorkspaceCoordinator: Send + Sync {
     async fn create(&self, spec: WorktreeSpec) -> Result<WorktreeRecord>;
-    async fn list(&self, project: &PathBuf) -> Result<Vec<WorktreeRecord>>;
-    async fn gc(&self, project: &PathBuf, dry_run: bool) -> Result<Vec<PathBuf>>;
+    async fn list(&self, project: &Path) -> Result<Vec<WorktreeRecord>>;
+    async fn gc(&self, project: &Path, dry_run: bool) -> Result<Vec<PathBuf>>;
     async fn request_freeze(&self, request: FreezeRequest) -> Result<Freeze>;
     async fn acknowledge_freeze(&self, id: Uuid, participant: Uuid) -> Result<Freeze>;
     async fn release_freeze(&self, id: Uuid) -> Result<()>;
