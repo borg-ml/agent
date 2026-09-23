@@ -56,14 +56,6 @@ pub(crate) fn run(args: LimitsProtectArgs, json_output: bool) -> Result<()> {
     }
 }
 
-pub(crate) fn configured_service_names() -> Vec<String> {
-    configured_drop_ins()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(service, _)| service)
-        .collect()
-}
-
 fn add(service: &str, json_output: bool) -> Result<()> {
     ensure!(
         cfg!(target_os = "linux"),

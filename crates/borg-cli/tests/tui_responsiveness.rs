@@ -479,7 +479,6 @@ impl PtyChild {
             .env("HOME", cwd)
             .env("XDG_CONFIG_HOME", config_home)
             .env("BORG_HOME", borg_home)
-            .env("BORG_LIMITS", "0")
             .env("BORG_TUI", "1")
             .env("BORG_TUI_SCREEN", "alternate")
             .env("BORG_TUI_FPS", "165")

@@ -24,9 +24,6 @@ Inside a session: type a request, `/help` lists controls, Ctrl-C twice exits (th
 #[command(version)]
 #[command(after_help = QUICKSTART)]
 pub(crate) struct Cli {
-    /// Start this invocation without configured local resource limits.
-    #[arg(long, global = true)]
-    pub(crate) no_limits: bool,
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
 }
@@ -41,8 +38,7 @@ impl Cli {
         if args.len() <= 1 {
             return args;
         }
-        let command_index = 1 + usize::from(args.get(1).is_some_and(|arg| arg == "--no-limits"));
-        let Some(command) = args.get(command_index).and_then(|arg| arg.to_str()) else {
+        let Some(command) = args.get(1).and_then(|arg| arg.to_str()) else {
             return args;
         };
         let is_command = matches!(
@@ -80,7 +76,7 @@ impl Cli {
                 | "--version"
         );
         if !is_command {
-            args.insert(command_index, OsString::from("__agent"));
+            args.insert(1, OsString::from("__agent"));
         }
         args
     }
@@ -187,7 +183,7 @@ pub(crate) enum Command {
     },
     /// Collect a local-only diagnostic bundle to attach to a bug report.
     Bug(BugArgs),
-    /// Keep local agent workloads within a generous machine-wide budget.
+    /// Keep important user services restartable and favored under memory pressure.
     Limits(LimitsArgs),
     #[command(name = "__agent-mcp", hide = true)]
     AgentMcp,
@@ -249,7 +245,7 @@ pub(crate) struct BugArgs {
 #[derive(Debug, Args)]
 pub(crate) struct LimitsArgs {
     #[command(subcommand)]
-    pub(crate) command: Option<LimitsCommand>,
+    pub(crate) command: LimitsCommand,
     /// Emit machine-readable JSON output.
     #[arg(long, global = true)]
     pub(crate) json: bool,
@@ -257,12 +253,6 @@ pub(crate) struct LimitsArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum LimitsCommand {
-    /// Enable automatic limits for future local Borg sessions.
-    Enable,
-    /// Show configured limits and whether this machine can enforce them.
-    Status,
-    /// Disable limits for future sessions without stopping active ones.
-    Disable,
     /// Keep important user services restartable and favored under pressure.
     Protect(LimitsProtectArgs),
 }
@@ -766,12 +756,11 @@ mod tests {
     #[test]
     fn explicit_commands_stay_explicit_without_the_agent_subcommand() {
         let args = Cli::agent_default_args(
-            ["borg", "--no-limits", "capabilities", "--json"]
+            ["borg", "capabilities", "--json"]
                 .into_iter()
                 .map(OsString::from),
         );
         let cli = Cli::try_parse_from(args).expect("explicit command parses");
-        assert!(cli.no_limits);
         assert!(matches!(cli.command, Some(Command::Capabilities(_))));
 
         let session = "22222222-2222-2222-2222-222222222222";
@@ -849,35 +838,16 @@ mod tests {
     }
 
     #[test]
-    fn limits_are_one_command_to_enable_and_have_a_global_escape_hatch() {
-        let cli = Cli::try_parse_from(["borg", "limits", "enable", "--json"])
-            .expect("limits enable parses");
-        assert!(!cli.no_limits);
-        assert!(matches!(
-            cli.command,
-            Some(Command::Limits(LimitsArgs {
-                command: Some(LimitsCommand::Enable),
-                json: true,
-            }))
-        ));
-
-        let cli = Cli::try_parse_from(["borg", "resume", "--no-limits"])
-            .expect("one-run limits bypass parses");
-        assert!(cli.no_limits);
-        assert!(matches!(
-            cli.command,
-            Some(Command::Resume { session: None })
-        ));
-
+    fn protected_services_parse() {
         let command = Cli::try_parse_from(["borg", "limits", "protect", "add", "dms"])
             .expect("protected service parses")
             .command_or_agent();
         assert!(matches!(
             command,
             Command::Limits(LimitsArgs {
-                command: Some(LimitsCommand::Protect(LimitsProtectArgs {
+                command: LimitsCommand::Protect(LimitsProtectArgs {
                     command: Some(LimitsProtectCommand::Add { service }),
-                })),
+                }),
                 json: false,
             }) if service == "dms"
         ));
