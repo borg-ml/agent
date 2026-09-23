@@ -281,6 +281,87 @@ mod tests {
         scratch.discard().await;
     }
 
+    /// Failure mode: a revert continues the conversation on a fork, which
+    /// inherits no `SubagentActivity`, so every worker the parent started
+    /// vanished from the roster and could not be messaged or woken.
+    #[tokio::test]
+    async fn a_fork_takes_over_the_team_started_before_its_cut() {
+        let Some(url) = test_url() else {
+            eprintln!("skipping: BORG_TEST_SESSIONS_URL is not set");
+            return;
+        };
+        let (scratch, store, parent) = conversation(&url).await;
+        let child = |id: Uuid, task: &str, created_at: chrono::DateTime<Utc>| {
+            SessionEvent::new(
+                parent,
+                0,
+                SessionEventKind::SubagentActivity {
+                    activity: crate::SubagentActivityKind::Started,
+                    agent: crate::SubagentSnapshot {
+                        session_id: id,
+                        parent_session_id: parent,
+                        task_name: task.to_string(),
+                        status: crate::SubagentStatus::Running,
+                        provider: crate::CodingProvider::Claude,
+                        model: None,
+                        effort: None,
+                        cwd: std::path::PathBuf::from("/tmp"),
+                        created_at,
+                        updated_at: created_at,
+                        detail: None,
+                        final_text: None,
+                        usage: crate::SubagentUsage::default(),
+                        interrupted_by: None,
+                    },
+                    event: None,
+                },
+            )
+        };
+        let (kept, later) = (Uuid::new_v4(), Uuid::new_v4());
+        let before = Utc::now() - chrono::Duration::minutes(1);
+        store
+            .append(child(kept, "/root/kept", before))
+            .await
+            .unwrap();
+        let cut_at = store
+            .append(SessionEvent::new(
+                parent,
+                0,
+                SessionEventKind::Message {
+                    message_id: Uuid::new_v4(),
+                    actor: crate::EventActor::User,
+                    text: "reverted prompt".to_string(),
+                    attachments: Vec::new(),
+                    status: crate::MessageStatus::Complete,
+                    delivery: None,
+                },
+            ))
+            .await
+            .unwrap()
+            .sequence;
+        let after = Utc::now() + chrono::Duration::minutes(1);
+        store
+            .append(child(later, "/root/later", after))
+            .await
+            .unwrap();
+
+        let fork = Uuid::new_v4();
+        store.fork_before(parent, fork, cut_at).await.expect("fork");
+        let team = store.fork_team_events(fork).await.unwrap();
+        let agents: Vec<_> = team
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::SubagentActivity { agent, .. } => Some(agent),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(agents.len(), 1, "{agents:?}");
+        assert_eq!(agents[0].session_id, kept);
+        assert_eq!(agents[0].parent_session_id, fork);
+        assert!(store.fork_team_events(parent).await.unwrap().is_empty());
+        scratch.discard().await;
+    }
+
     #[tokio::test]
     async fn a_fork_and_its_parent_diverge_without_disturbing_each_other() {
         let Some(url) = test_url() else {

@@ -1483,6 +1483,16 @@ pub trait SessionStore: Send + Sync {
         session_id: Uuid,
         provider_session_id: &str,
     ) -> Result<Option<SessionRecovery>>;
+    /// The team a fork takes over from the session it was cut from.
+    ///
+    /// A fork does not inherit `SubagentActivity` rows, so without this a
+    /// revert (which continues the conversation on a fork) came up with an
+    /// empty roster: every worker the parent started was unreachable. Returns
+    /// the ancestors' latest activity for children created before the cut,
+    /// re-parented onto `session_id`, oldest ancestor first.
+    async fn fork_team_events(&self, _session_id: Uuid) -> Result<Vec<SessionEvent>> {
+        Ok(Vec::new())
+    }
     async fn live_events_after(
         &self,
         session_id: Uuid,

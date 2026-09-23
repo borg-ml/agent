@@ -1809,6 +1809,41 @@ impl SessionStore for PostgresSessionStore {
         self.fork_session_before(parent_session_id, session_id, sequence)
             .await
     }
+
+    async fn fork_team_events(&self, session_id: Uuid) -> Result<Vec<SessionEvent>> {
+        let session = self.session_row(session_id).await?;
+        let (Some(parent), Some(cut)) = (session.parent_session_id, session.parent_cut_sequence)
+        else {
+            return Ok(Vec::new());
+        };
+        // Children created after the cut belong to the parent's later
+        // history, not to this branch.
+        let cut_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "select created_at from session_events \
+             where session_id = $1 and sequence <= $2 order by sequence desc limit 1",
+        )
+        .bind(parent)
+        .bind(i64::try_from(cut).unwrap_or(i64::MAX))
+        .fetch_optional(self.pool())
+        .await?;
+        let Some(cut_at) = cut_at else {
+            return Ok(Vec::new());
+        };
+        let mut events = Box::pin(self.fork_team_events(parent)).await?;
+        events.extend(
+            self.recovery_projection(parent, crate::RecoveryParts::SUBAGENTS)
+                .await?
+                .subagent_events,
+        );
+        events.retain_mut(|event| match &mut event.kind {
+            crate::SessionEventKind::SubagentActivity { agent, .. } => {
+                agent.parent_session_id = session_id;
+                agent.created_at <= cut_at
+            }
+            _ => false,
+        });
+        Ok(events)
+    }
 }
 
 #[cfg(test)]
