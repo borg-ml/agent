@@ -47,9 +47,12 @@ def alive(obj):
 
 def windows():
     result = []
+    private_pids = {w["pid"] for w in private_windows(accessibility=False)}
     desktop = Atspi.get_desktop(0)
     for ai in range(min(desktop.get_child_count(), 256)):
         app = desktop.get_child_at_index(ai)
+        if private_pids and app_pid(app) in private_pids:
+            continue  # listed under display=private
         for wi in range(min(app.get_child_count(), 256)):
             win = app.get_child_at_index(wi)
             if alive(win):
@@ -59,7 +62,20 @@ def windows():
     return result
 
 
+def app_pid(app):
+    try:
+        return app.get_process_id()
+    except Exception:
+        return None
+
+
 def window(key):
+    if is_private(key):
+        accessible = private_accessible(private_window(key))
+        if accessible is None:
+            raise ValueError("this private-display window exposes no accessibility tree; use a private screenshot "
+                             "with pointer/key input instead")
+        return accessible
     if key not in {w["id"] for w in windows()}:
         raise ValueError("stale or unknown window_id; list_windows again")
     return objects[key]
@@ -143,7 +159,8 @@ def snapshot(args):
     if requested and (not previous or previous["observation_id"] != requested):
         raise ValueError("unknown diff baseline; observe without since")
     result = {"window_id": wid, "observation_id": token, "truncated": truncated,
-              "coordinate_space": "AT-SPI screen logical coordinates"}
+              "coordinate_space": ("window-relative AT-SPI coordinates; add the window bounds origin for "
+                                   "private display pixels") if is_private(wid) else "AT-SPI screen logical coordinates"}
     if requested:
         assert previous is not None
         old = previous["nodes"]
@@ -153,7 +170,10 @@ def snapshot(args):
         result["nodes"] = list(nodes.values())
     observations[wid] = {"observation_id": token, "nodes": nodes}
     if args.get("screenshot"):
-        result.update(screenshot(args.get("screenshot_scope")))
+        if is_private(wid):
+            result.update(private_screenshot({"scope": args.get("screenshot_scope") or "window", "window_id": wid}))
+        else:
+            result.update(screenshot(args.get("screenshot_scope")))
     return result
 
 
@@ -436,6 +456,8 @@ def inject(args):
     wid = args.get("window_id")
     if not isinstance(wid, str):
         raise ValueError("window_id is required")
+    if is_private(wid):
+        return private_inject(args)
     if op == "type_text":
         text = args.get("text")
         if not isinstance(text, str) or len(text) > 16384:
@@ -517,8 +539,592 @@ def inject(args):
     raise ValueError(f"unsupported operation: {op}")
 
 
+# ---- Agent-private display. Apps run on a Borg-owned headless compositor
+# whose owner control socket carries every input event and capture, so
+# nothing here touches the user's seat, pointer, focus or screen.
+
+PRIVATE_PREFIX = "pd:"
+PRIVATE = None  # the running private display backend
+PRIVATE_APPS = {}  # pid -> Popen for session-owned apps (killed at teardown)
+EVDEV_CODES = {
+    "BTN_LEFT": 272, "BTN_RIGHT": 273, "BTN_MIDDLE": 274, "KEY_ESC": 1, "KEY_MINUS": 12, "KEY_EQUAL": 13,
+    "KEY_BACKSPACE": 14, "KEY_TAB": 15, "KEY_LEFTBRACE": 26, "KEY_RIGHTBRACE": 27, "KEY_ENTER": 28,
+    "KEY_LEFTCTRL": 29, "KEY_SEMICOLON": 39, "KEY_APOSTROPHE": 40, "KEY_GRAVE": 41, "KEY_LEFTSHIFT": 42,
+    "KEY_BACKSLASH": 43, "KEY_COMMA": 51, "KEY_DOT": 52, "KEY_SLASH": 53, "KEY_LEFTALT": 56, "KEY_SPACE": 57,
+    "KEY_F11": 87, "KEY_F12": 88, "KEY_HOME": 102, "KEY_UP": 103, "KEY_PAGEUP": 104, "KEY_LEFT": 105,
+    "KEY_RIGHT": 106, "KEY_END": 107, "KEY_DOWN": 108, "KEY_PAGEDOWN": 109, "KEY_INSERT": 110,
+    "KEY_DELETE": 111, "KEY_LEFTMETA": 125,
+    **{f"KEY_{n}": 1 + n for n in range(1, 10)}, "KEY_0": 11,
+    **{f"KEY_F{n}": 58 + n for n in range(1, 11)},
+    **{f"KEY_{c}": code for row, first in (("QWERTYUIOP", 16), ("ASDFGHJKL", 30), ("ZXCVBNM", 44))
+       for code, c in enumerate(row, first)},
+}
+SCRUBBED_DISPLAY_ENV = ("DISPLAY", "WAYLAND_DISPLAY", "WAYLAND_SOCKET", "NIRI_SOCKET", "SWAYSOCK",
+                        "HYPRLAND_INSTANCE_SIGNATURE", "XAUTHORITY", "DESKTOP_STARTUP_ID", "XDG_ACTIVATION_TOKEN")
+# Headless-capable compositors another backend could drive; detected and reported only.
+ALTERNATIVE_BACKENDS = ("sway", "cage", "labwc", "weston")
+
+
+def is_private(window_id):
+    return isinstance(window_id, str) and window_id.startswith(PRIVATE_PREFIX)
+
+
+def die_with_helper():
+    """preexec_fn: deliver SIGTERM to the child when this helper dies, even by SIGKILL."""
+    import ctypes
+    import signal
+    ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
+
+
+def display_env():
+    return {k: v for k, v in os.environ.items() if k not in SCRUBBED_DISPLAY_ENV}
+
+
+def terminate_group(process, grace=3.0):
+    """SIGTERM the process group started for this child, then SIGKILL stragglers."""
+    import signal
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 2.0)):
+        try:
+            os.killpg(process.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            process.wait(timeout=wait)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)  # leftover group members
+            except (ProcessLookupError, PermissionError):
+                pass
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+class BorgDisplay:
+    """Private display backend on borg-display. Another headless compositor can
+    back the private display by providing the same methods: running, info,
+    windows, focus, pointer_move, pointer_relative, button, axis, key,
+    type_text, screenshot and stop, plus wayland_display and directory."""
+
+    name = "borg-display"
+
+    @staticmethod
+    def binary():
+        configured = os.environ.get("BORG_DISPLAY_BIN")
+        if configured and os.access(configured, os.X_OK):
+            return configured
+        return shutil.which("borg-display")
+
+    def __init__(self, width, height, render_node=None):
+        import select
+        import socket
+        import tempfile
+        binary, runtime = self.binary(), os.environ.get("XDG_RUNTIME_DIR")
+        if not binary:
+            raise ValueError("borg-display is not installed; build it with `cargo install --path crates/borg-display` "
+                             "or set BORG_DISPLAY_BIN")
+        if not runtime or not os.path.isdir(runtime):
+            raise ValueError("XDG_RUNTIME_DIR is required for the private display sockets")
+        self.directory = tempfile.mkdtemp(prefix="borg-display-", dir=runtime)
+        control = os.path.join(self.directory, "control")
+        command = [binary, "--socket", "borg-private-" + uuid.uuid4().hex[:12], "--control", control,
+                   "--size", f"{width}x{height}"]
+        if render_node:
+            command += ["--render-node", str(render_node)]
+        log_path = os.path.join(self.directory, "display.log")
+        with open(log_path, "wb") as log:
+            self.process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=log,
+                                            env=display_env(), preexec_fn=die_with_helper)
+        ready = None
+        if select.select([self.process.stdout], [], [], 15)[0]:
+            try:
+                ready = json.loads(self.process.stdout.readline() or "null")
+            except ValueError:
+                pass
+        if not isinstance(ready, dict) or not ready.get("ready"):
+            self.process.kill()
+            self.process.wait()
+            with open(log_path, errors="replace") as failure:
+                detail = failure.read()[-1024:].strip()
+            shutil.rmtree(self.directory, ignore_errors=True)
+            raise ValueError("borg-display failed to start: " + (detail or "no readiness report"))
+        self.wayland_display = ready["wayland_display"]
+        self.socket = socket.socket(socket.AF_UNIX)
+        self.socket.settimeout(20)
+        self.socket.connect(control)
+        self.reader = self.socket.makefile("rb")
+
+    def running(self):
+        return self.process.poll() is None
+
+    def call(self, request):
+        if not self.running():
+            raise ValueError("the private display exited; call start_display again")
+        try:
+            self.socket.sendall(json.dumps(request).encode() + b"\n")
+            line = self.reader.readline(8 * 1024 * 1024)
+        except OSError as error:
+            raise ValueError(f"private display control failed: {error}")
+        if not line:
+            raise ValueError("the private display exited; call start_display again")
+        response = json.loads(line)
+        if not response.get("ok"):
+            raise ValueError(response.get("error") or "private display request failed")
+        return response["result"]
+
+    def info(self):
+        return self.call({"op": "info"})
+
+    def windows(self):
+        return self.call({"op": "windows"})["windows"]
+
+    def focus(self, window):
+        self.call({"op": "focus", "window": window})
+
+    def pointer_move(self, x, y):
+        self.call({"op": "pointer_move", "x": x, "y": y})
+
+    def pointer_relative(self, dx, dy):
+        self.call({"op": "pointer_move", "dx": dx, "dy": dy})
+
+    def button(self, code, pressed):
+        self.call({"op": "button", "code": code, "pressed": pressed})
+
+    def axis(self, dx, dy):
+        self.call({"op": "axis", "dx": dx, "dy": dy})
+
+    def key(self, code, pressed):
+        self.call({"op": "key", "code": code, "pressed": pressed})
+
+    def type_text(self, text):
+        self.call({"op": "type", "text": text})
+
+    def screenshot(self, path, window=None):
+        return self.call({"op": "screenshot", "path": path, **({"window": window} if window is not None else {})})
+
+    def stop(self):
+        for closeable in (self.reader, self.socket):
+            try:
+                closeable.close()
+            except OSError:
+                pass
+        try:
+            self.process.wait(timeout=5)  # closing the owner socket makes it exit
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait()
+        shutil.rmtree(self.directory, ignore_errors=True)
+
+
+def private_running():
+    return PRIVATE is not None and PRIVATE.running()
+
+
+def require_private():
+    if not private_running():
+        raise ValueError("the private display is not running; call start_display or launch")
+    return PRIVATE
+
+
+def display_status(info=None):
+    if not private_running():
+        return {"display": "private", "running": False}
+    info = info or PRIVATE.info()
+    x11 = getattr(PRIVATE, "x11", None)
+    return {"display": "private", "running": True, "backend": PRIVATE.name,
+            "wayland_display": PRIVATE.wayland_display,
+            "x11_display": x11[1] if x11 and x11[0].poll() is None else None,
+            "width": info["width"], "height": info["height"], "gpu_accelerated": info["hardware"],
+            "gl_renderer": info["gl_renderer"], "render_node": info["render_node"], "dmabuf": info["dmabuf"],
+            "session_apps": sorted(pid for pid, app in PRIVATE_APPS.items() if app.poll() is None),
+            "coordinate_space": "private display pixels, top-left origin, scale 1"}
+
+
+def display_size(args):
+    size = []
+    for key, default in (("width", 1920), ("height", 1080)):
+        value = args.get(key, default)
+        if not isinstance(value, int) or isinstance(value, bool) or not 64 <= value <= 8192:
+            raise ValueError(f"{key} must be an integer between 64 and 8192")
+        size.append(value)
+    return tuple(size)
+
+
+def start_display(args):
+    global PRIVATE
+    width, height = display_size(args)
+    if private_running():
+        info = PRIVATE.info()
+        if ("width" in args or "height" in args) and (info["width"], info["height"]) != (width, height):
+            raise ValueError(f"the private display is already running at {info['width']}x{info['height']}; "
+                             "stop_display first to change its size")
+        return display_status(info)
+    if PRIVATE is not None:
+        stop_display()  # the compositor died: reap what it left behind
+    PRIVATE = BorgDisplay(width, height, args.get("render_node") or os.environ.get("BORG_DISPLAY_RENDER_NODE"))
+    PRIVATE.x11 = None
+    return display_status()
+
+
+def stop_display(_args=None):
+    global PRIVATE
+    terminated = []
+    for pid, app in list(PRIVATE_APPS.items()):
+        terminate_group(app)
+        terminated.append(pid)
+    PRIVATE_APPS.clear()
+    if PRIVATE is None:
+        return {"display": "private", "running": False, "stopped": False, "terminated_pids": terminated}
+    backend, PRIVATE = PRIVATE, None
+    if backend.x11 is not None:
+        stop_x11(backend.x11)
+    backend.stop()
+    return {"display": "private", "running": False, "stopped": True, "terminated_pids": terminated}
+
+
+def stop_x11(x11):
+    """Stop xwayland-satellite and remove the X socket and lock it leaves behind."""
+    terminate_group(x11[0], grace=1.0)
+    number = x11[1].lstrip(":")
+    for path in (f"/tmp/.X11-unix/X{number}", f"/tmp/.X{number}-lock"):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+
+def ensure_x11():
+    if PRIVATE.x11 is not None and PRIVATE.x11[0].poll() is None:
+        return PRIVATE.x11[1]
+    satellite = shutil.which("xwayland-satellite")
+    if not satellite:
+        raise ValueError("X11 apps on the private display need xwayland-satellite (package xwayland-satellite) "
+                         "and Xwayland; launch a Wayland-native app or install it")
+    number = next(n for n in range(100, 1000)
+                  if not os.path.exists(f"/tmp/.X11-unix/X{n}") and not os.path.exists(f"/tmp/.X{n}-lock"))
+    env = display_env()
+    env["WAYLAND_DISPLAY"] = PRIVATE.wayland_display
+    log_path = os.path.join(PRIVATE.directory, "xwayland.log")
+    with open(log_path, "wb") as log:
+        process = subprocess.Popen([satellite, f":{number}"], env=env, stdin=subprocess.DEVNULL, stdout=log,
+                                   stderr=subprocess.STDOUT, start_new_session=True, preexec_fn=die_with_helper)
+    deadline = time.monotonic() + 5
+    while not os.path.exists(f"/tmp/.X11-unix/X{number}"):
+        if process.poll() is not None or time.monotonic() > deadline:
+            stop_x11((process, f":{number}"))
+            raise ValueError("xwayland-satellite did not start; see " + log_path)
+        time.sleep(0.05)
+    PRIVATE.x11 = (process, f":{number}")
+    return PRIVATE.x11[1]
+
+
+def descends_from(pid, ancestor):
+    for _ in range(64):
+        if pid == ancestor:
+            return True
+        try:
+            with open(f"/proc/{pid}/stat") as stat:
+                pid = int(stat.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            return False
+        if pid <= 1:
+            return False
+    return False
+
+
+def launch(args):
+    argv = args.get("argv")
+    if not isinstance(argv, list) or not argv or len(argv) > 256 or not all(isinstance(a, str) for a in argv):
+        raise ValueError("argv must be a non-empty list of strings")
+    overrides = args.get("env") or {}
+    if not isinstance(overrides, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in overrides.items()):
+        raise ValueError("env must map strings to strings")
+    cwd = args.get("cwd")
+    if cwd is not None and (not isinstance(cwd, str) or not os.path.isdir(cwd)):
+        raise ValueError("cwd must be an existing directory")
+    wait = args.get("wait", 5)
+    if not isinstance(wait, (int, float)) or isinstance(wait, bool) or not 0 <= wait <= 10:
+        raise ValueError("wait must be between 0 and 10 seconds")
+    detached = args.get("detached") is True
+    start_display(args)
+    env = display_env()
+    env.update({"WAYLAND_DISPLAY": PRIVATE.wayland_display, "XDG_SESSION_TYPE": "wayland"})
+    if args.get("x11") is True:
+        env["DISPLAY"] = ensure_x11()
+    env.update(overrides)
+    log_path = os.path.join(PRIVATE.directory, f"app-{uuid.uuid4().hex[:8]}.log")
+    with open(log_path, "wb") as log:
+        try:
+            app = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=log,
+                                   stderr=subprocess.STDOUT, start_new_session=True,
+                                   preexec_fn=None if detached else die_with_helper)
+        except OSError as error:
+            raise ValueError(f"cannot launch {argv[0]}: {error}")
+    if not detached:
+        PRIVATE_APPS[app.pid] = app
+    result = {"pid": app.pid, "detached": detached, "log": log_path}
+    deadline = time.monotonic() + wait
+    while True:
+        found = [w for w in private_windows(accessibility=False)
+                 if w["pid"] and w["bounds"]["width"] > 0 and descends_from(w["pid"], app.pid)]
+        if found or app.poll() is not None or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    result.update({"windows": found, "display": display_status()})
+    if app.poll() is not None:
+        PRIVATE_APPS.pop(app.pid, None)
+        with open(log_path, errors="replace") as output:
+            result.update({"exited": app.returncode, "output_tail": output.read()[-2048:]})
+    return result
+
+
+def private_accessible(info):
+    """The AT-SPI window of a private-display app (same accessibility bus, matched by pid and title)."""
+    if not info["pid"]:
+        return None
+    candidates = []
+    desktop = Atspi.get_desktop(0)
+    for ai in range(min(desktop.get_child_count(), 256)):
+        app = desktop.get_child_at_index(ai)
+        if app_pid(app) != info["pid"]:
+            continue
+        for wi in range(min(app.get_child_count(), 256)):
+            win = app.get_child_at_index(wi)
+            if alive(win):
+                candidates.append(win)
+    titled = [w for w in candidates if (w.get_name() or "") == info["title"]]
+    chosen = titled or candidates
+    return chosen[0] if len(chosen) == 1 else None
+
+
+def x11_pids():
+    """Title -> _NET_WM_PID on the private X server; X11 windows otherwise report xwayland-satellite's pid."""
+    x11 = PRIVATE.x11
+    if not x11 or x11[0].poll() is not None or not shutil.which("xdotool"):
+        return {}
+    env = {**display_env(), "DISPLAY": x11[1]}
+    found = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", ""], env=env, capture_output=True,
+                           text=True, timeout=5)
+    pids = {}
+    for xid in found.stdout.split()[:256]:
+        name = subprocess.run(["xdotool", "getwindowname", xid], env=env, capture_output=True, text=True, timeout=5)
+        pid = subprocess.run(["xdotool", "getwindowpid", xid], env=env, capture_output=True, text=True, timeout=5)
+        title = name.stdout.rstrip("\n")
+        if pid.returncode == 0 and pid.stdout.strip().isdigit():
+            pids[title] = None if title in pids else int(pid.stdout)
+    return pids
+
+
+def private_windows(accessibility=True):
+    if not private_running():
+        return []
+    listed = []
+    satellite = PRIVATE.x11[0].pid if PRIVATE.x11 else None
+    windows_ = PRIVATE.windows()
+    x11 = x11_pids() if satellite and any(w["pid"] == satellite for w in windows_) else {}
+    for w in windows_:
+        if satellite and w["pid"] == satellite:
+            w = {**w, "pid": x11.get(w["title"]), "x11": True}
+        entry = {"id": f"{PRIVATE_PREFIX}{w['id']}", "title": w["title"], "application": w["app_id"],
+                 "app_id": w["app_id"], "pid": w["pid"], "bounds": w["bounds"], "active": w["focused"],
+                 "focused": w["focused"], "display": "private", "x11": w.get("x11", False),
+                 "compositor": {"backend": PRIVATE.name, "id": w["id"], "app_id": w["app_id"], "pid": w["pid"],
+                                "workspace": None, "output": "BORG-1", "focused": w["focused"], "visible": True,
+                                "geometry": w["bounds"]}}
+        if accessibility:
+            entry["accessible"] = private_accessible(w) is not None
+        listed.append(entry)
+    return listed
+
+
+def private_window(window_id):
+    require_private()
+    for w in private_windows(accessibility=False):
+        if w["id"] == window_id:
+            return {"id": w["compositor"]["id"], "title": w["title"], "pid": w["pid"], "bounds": w["bounds"]}
+    raise ValueError("stale or unknown private window_id; list_windows with display=private again")
+
+
+def private_screenshot(args):
+    backend = require_private()
+    window_id = args.get("window_id") if args.get("scope") == "window" else None
+    if window_id is not None and not is_private(window_id):
+        raise ValueError("window capture on the private display needs a pd: window_id")
+    path = os.path.join(backend.directory, f"shot-{uuid.uuid4().hex[:8]}.png")
+    shot = backend.screenshot(path, private_window(window_id)["id"] if window_id else None)
+    try:
+        with open(path, "rb") as image:
+            data = image.read()
+    finally:
+        os.unlink(path)
+    if len(data) > 4 * 1024 * 1024:
+        raise ValueError("screenshot exceeds 4 MiB; use a smaller private display or window capture")
+    result = {"scope": "window" if window_id else "desktop", "display": "private", "width": shot["width"],
+              "height": shot["height"],
+              "coordinate_space": ("window pixels; pass coordinate_space=window to pointer ops" if window_id
+                                   else "private display pixels; use these x,y for pointer ops on pd: windows"),
+              "borg_attachments": [{"media_type": "image/png", "data_base64": base64.b64encode(data).decode()}]}
+    if window_id:
+        result["window_id"] = window_id
+    return result
+
+
+def private_point(args, info, accessible, keys=("x", "y")):
+    """A private display pixel: an observed element's centre or x,y (display or window pixels)."""
+    if args.get("element_id") is not None and keys == ("x", "y"):
+        if accessible is None:
+            raise ValueError("this private window has no accessibility tree; use x,y from a private screenshot")
+        _, obj = target(args)
+        extents = obj.get_component_iface().get_extents(Atspi.CoordType.WINDOW)
+        if extents.width <= 0 or extents.height <= 0 or not states(obj).contains(Atspi.StateType.SHOWING):
+            raise ValueError("element has no on-screen bounds")
+        return (info["bounds"]["x"] + extents.x + extents.width / 2,
+                info["bounds"]["y"] + extents.y + extents.height / 2), False
+    x, y = number(args.get(keys[0])), number(args.get(keys[1]))
+    if x is None or y is None:
+        raise ValueError(f"pointer ops need element_id + observation_id or {keys[0]} + {keys[1]}")
+    space = args.get("coordinate_space", "desktop")
+    if space not in ("desktop", "window"):
+        raise ValueError('coordinate_space must be "desktop" or "window"')
+    if space == "window":
+        x, y = x + info["bounds"]["x"], y + info["bounds"]["y"]
+    return (x, y), True
+
+
+def private_inject(args):
+    op, wid = args["op"], args["window_id"]
+    backend = require_private()
+    info = private_window(wid)
+    accessible = private_accessible(info)
+    extra = {"display": "private"}
+    observations.pop(wid, None)
+    if op == "type_text":
+        text = args.get("text")
+        if not isinstance(text, str) or len(text) > 16384:
+            raise ValueError("text must be a string of at most 16384 characters")
+        backend.focus(info["id"])
+        backend.type_text(text)
+    elif op == "key":
+        modifiers, key = parse_keys(args.get("keys"))
+        hold = args.get("hold_ms", 0)
+        if not isinstance(hold, int) or isinstance(hold, bool) or not 0 <= hold <= 10000:
+            raise ValueError("hold_ms must be an integer between 0 and 10000")
+        backend.focus(info["id"])
+        codes = [EVDEV_CODES[name] for name in modifiers]
+        for code in codes:
+            backend.key(code, True)
+        backend.key(EVDEV_CODES[key], True)
+        time.sleep(hold / 1000)
+        backend.key(EVDEV_CODES[key], False)
+        for code in reversed(codes):
+            backend.key(code, False)
+        extra["keys"] = args["keys"]
+    elif op == "pointer_move":
+        dx, dy = number(args.get("dx", 0)), number(args.get("dy", 0))
+        steps = args.get("steps", 1)
+        duration = args.get("duration_ms", 0)
+        if dx is None or dy is None or abs(dx) > 10000 or abs(dy) > 10000:
+            raise ValueError("pointer_move dx/dy are limited to 10000 pixels")
+        if not isinstance(steps, int) or isinstance(steps, bool) or not 1 <= steps <= 1000:
+            raise ValueError("steps must be an integer between 1 and 1000")
+        if not isinstance(duration, int) or isinstance(duration, bool) or not 0 <= duration <= 10000:
+            raise ValueError("duration_ms must be an integer between 0 and 10000")
+        backend.focus(info["id"])
+        for _ in range(steps):
+            backend.pointer_relative(dx / steps, dy / steps)
+            time.sleep(duration / 1000 / steps)
+        extra.update({"relative": {"dx": dx, "dy": dy}, "steps": steps})
+    elif op in ("pointer_click", "scroll"):
+        (x, y), coordinate = private_point(args, info, accessible)
+        backend.focus(info["id"])
+        backend.pointer_move(x, y)
+        extra.update({"coordinate_click": coordinate, "point": {"x": x, "y": y}})
+        if op == "pointer_click":
+            count = args.get("count", 1)
+            if count not in (1, 2) or isinstance(count, bool):
+                raise ValueError("count must be 1 or 2")
+            code = EVDEV_CODES[button_code(args.get("button"))]
+            for _ in range(count):
+                backend.button(code, True)
+                backend.button(code, False)
+                time.sleep(0.03)
+        else:
+            dx, dy = number(args.get("dx", 0)), number(args.get("dy", 0))
+            if dx is None or dy is None or abs(dx) > 10000 or abs(dy) > 10000:
+                raise ValueError("scroll distance is limited to 10000 pixels")
+            backend.axis(notches(dx), notches(dy))  # positive dy scrolls content down
+            extra.update({"units": "wheel notches of about 120 pixels",
+                          "notches": {"dx": notches(dx), "dy": notches(dy)}})
+    elif op == "drag":
+        (fx, fy), _ = private_point(args, info, accessible, ("from_x", "from_y"))
+        (tx, ty), _ = private_point(args, info, accessible, ("to_x", "to_y"))
+        code = EVDEV_CODES[button_code(args.get("button"))]
+        backend.focus(info["id"])
+        backend.pointer_move(fx, fy)
+        backend.button(code, True)
+        for step in range(1, 13):
+            backend.pointer_move(fx + (tx - fx) * step / 12, fy + (ty - fy) * step / 12)
+            time.sleep(0.02)
+        backend.button(code, False)
+        extra.update({"from": {"x": fx, "y": fy}, "to": {"x": tx, "y": ty}})
+    else:
+        raise ValueError(f"unsupported operation: {op}")
+    time.sleep(0.1)
+    if not any(f"{PRIVATE_PREFIX}{w['id']}" == wid for w in backend.windows()):
+        return {"window_id": wid, "action": op, "dispatched": True, "window_closed": True, **extra,
+                "verification": "The window closed after the action; list_windows with display=private."}
+    if accessible is not None:
+        return settle_and_snapshot(accessible, wid, op, extra)
+    return {"window_id": wid, "action": op, "dispatched": True, "accessible": False, **extra,
+            "verification": "This window exposes no accessibility tree; take a private screenshot to verify."}
+
+
+def private_capabilities():
+    import glob
+    binary = BorgDisplay.binary()
+    status = {"available": bool(binary) and bool(os.environ.get("XDG_RUNTIME_DIR")),
+              "backend": "borg-display (Borg-owned headless Wayland compositor)", "binary": binary,
+              "render_nodes": sorted(glob.glob("/dev/dri/renderD*")),
+              "x11": "xwayland-satellite" if shutil.which("xwayland-satellite") else None,
+              "input_backend": "private seat through the display's control socket (never uinput or the user's focus)",
+              "operations": ["start_display", "stop_display", "launch", "list_windows", "observe", "screenshot",
+                             "click", "set_value", "type_text", "key", "pointer_click", "pointer_move", "scroll", "drag"],
+              "gpu_accelerated": None,
+              "gpu_note": "Measured when the display starts: true means hardware EGL on a render node plus dmabuf "
+                          "for Vulkan/GL clients; false means Mesa software rendering.",
+              "detected_alternative_compositors": [name for name in ALTERNATIVE_BACKENDS if shutil.which(name)],
+              "limitations": [
+                  "Private apps share the user's session D-Bus and accessibility bus; single-instance apps that are "
+                  "already running on the desktop (browsers, some terminals) may open their window there instead, so "
+                  "launch a separate instance or profile.",
+                  "type_text covers the characters of the default keyboard layout; use set_value for others.",
+                  "GTK4 reports element extents as 0,0; prefer semantic click/set_value or x,y from a private screenshot.",
+                  "Screenshots contain no cursor. X11 apps need launch x11=true and xwayland-satellite.",
+                  "Detached apps are not killed at teardown but lose their display when it stops.",
+              ]}
+    if not binary:
+        status["reason"] = "borg-display is not installed next to borg or on PATH"
+    if private_running():
+        status.update(display_status())
+    return status
+
+
 def dispatch(args):
     op = args["op"]
+    display = args.get("display", "desktop")
+    if display not in ("desktop", "private"):
+        raise ValueError('display must be "desktop" or "private"')
+    if op == "start_display":
+        return start_display(args)
+    if op == "stop_display":
+        return stop_display()
+    if op == "launch":
+        return launch(args)
+    if display == "private" and op == "list_windows":
+        return {"windows": private_windows(), "display": display_status()}
+    if op == "screenshot" and (display == "private" or is_private(args.get("window_id"))):
+        return private_screenshot(args)
+    if op == "pointer_move" and is_private(args.get("window_id")):
+        return private_inject(args)
     if op == "capabilities":
         missing = input_requirements()
         operations = ["capabilities", "list_windows", "observe", "screenshot", "click", "set_value"]
@@ -530,12 +1136,18 @@ def dispatch(args):
             limitations.append("Input injection requires the target window to be active (it is raised when the compositor allows); events reach the focused window.")
             if session_type() == "wayland":
                 limitations.append("On Wayland, element-targeted pointer_click/scroll are refused because AT-SPI extents are window-relative; use x,y from a desktop screenshot.")
+        private = private_capabilities()
+        if private["available"]:
+            operations += ["start_display", "stop_display", "launch"]
+            operations += [o for o in ("type_text", "key", "pointer_click", "scroll", "drag") if o not in operations]
+            limitations.append("Prefer the private display (launch, then display=private / pd: window ids) for app testing: "
+                               "its input and capture never touch the user's desktop. Desktop input goes to the user's focused window.")
         return {"platform": "linux", "backend": "AT-SPI2", "desktop_available": Atspi.get_desktop_count() > 0,
                 "session_type": session_type(), "operations": operations,
                 "capture_scopes": ["desktop"] if shutil.which("grim") and os.environ.get("WAYLAND_DISPLAY") else [],
                 "input_backend": None if missing else f"evdev uinput + {typing_tool()}",
                 "input_coordinate_space": "desktop screenshot pixels (top-left origin)",
-                "limitations": limitations}
+                "limitations": limitations, "private_display": private}
     if op == "list_windows":
         return {"windows": windows()}
     if op == "screenshot":
@@ -550,6 +1162,10 @@ def dispatch(args):
 
 
 if __name__ == "__main__":
+    import atexit
+    import signal
+    atexit.register(stop_display)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     for line in sys.stdin:
         try:
             request = json.loads(line)
