@@ -241,6 +241,104 @@ fn sigint_to_the_submitters_process_group_does_not_stop_the_job() {
     );
 }
 
+/// A process is gone once /proc has no live (non-zombie) entry for it.
+fn gone(pid: &str) -> bool {
+    std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).map_or(true, |stat| {
+        stat.rsplit(')')
+            .next()
+            .is_some_and(|rest| rest.trim_start().starts_with('Z'))
+    })
+}
+
+/// Failure mode: a running build that cannot be cancelled, or a cancel that
+/// leaves the workload running, loses the reason or skips the post hook.
+#[test]
+fn cancelling_a_running_job_kills_it_and_reports_the_reason() {
+    let lane = Lane::new();
+    let pid_file = lane.root.join("workload.pid");
+    let post = lane.root.join("post-phase");
+    let mut spec = lane.spec(
+        "long",
+        &format!("echo $$ > '{}'; exec sleep 30", pid_file.display()),
+    );
+    spec.timeout_ms = 60_000;
+    spec.post_hook = Some(Hook {
+        argv: vec![
+            "sh".into(),
+            "-c".into(),
+            format!("echo \"$BORG_LANE_PHASE\" > '{}'", post.display()),
+        ],
+        timeout_ms: 5_000,
+    });
+    let job = lane.submit(&spec);
+    let pid = lane.until(|| {
+        std::fs::read_to_string(&pid_file)
+            .ok()
+            .filter(|text| !text.trim().is_empty())
+    });
+    let cancelled: Value = lane.json(&["job", "cancel", &job]);
+    assert_eq!(cancelled["state"], "cancel_requested");
+    let out = lane.cli(&["job", "wait", &job], None);
+    assert_eq!(out.status.code(), Some(CANCELLED), "{}", describe(&out));
+    let waited: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        waited["state"]["Cancelled"]["reason"],
+        "cancelled by requester"
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("cancelled by requester"));
+    assert!(gone(&pid), "cancelled workload {pid} still running");
+    let evidence = lane.record(&job).unwrap().evidence.unwrap_or_default();
+    assert!(
+        evidence.contains("cancelled: cancelled by requester"),
+        "{evidence}"
+    );
+    if lane.degraded {
+        // Unbound post hooks run in their own scope, so degraded mode only
+        // records the attempt.
+        assert!(evidence.contains("post hook"), "{evidence}");
+    } else {
+        lane.until(|| {
+            std::fs::read_to_string(&post)
+                .ok()
+                .filter(|phase| phase.trim() == "post-exclusive")
+        });
+    }
+}
+
+/// Failure mode: a workload leader exits but a process it started (a
+/// compiler, say) keeps running while the next job already holds the key.
+#[test]
+fn processes_left_by_a_workload_die_before_the_next_holder_starts() {
+    let lane = Lane::new();
+    let child = lane.root.join("child.pid");
+    let overlap = lane.root.join("overlap");
+    let first = lane.submit(&lane.spec(
+        "leader",
+        &format!("sleep 30 & echo $! > '{}'; exit 0", child.display()),
+    ));
+    let second = lane.submit(&lane.spec(
+        "next",
+        &format!(
+            "kill -0 \"$(cat '{}')\" 2>/dev/null && echo alive > '{}'; exit 0",
+            child.display(),
+            overlap.display()
+        ),
+    ));
+    lane.wait(&first, 0);
+    lane.wait(&second, 0);
+    assert!(
+        !overlap.exists(),
+        "the next holder ran beside a leftover process"
+    );
+    let pid = std::fs::read_to_string(&child).unwrap();
+    assert!(gone(&pid), "leftover {pid} still running");
+    let evidence = lane.record(&first).unwrap().evidence.unwrap_or_default();
+    assert!(
+        evidence.contains(&format!("killed leftover pids [{}]", pid.trim())),
+        "{evidence}"
+    );
+}
+
 /// Several agents submit a mixed workload concurrently. Judged only from the
 /// CLI's own status records: jobs holding the same exclusive key never
 /// overlap, a shared host capacity is never over-admitted, and every job ends.

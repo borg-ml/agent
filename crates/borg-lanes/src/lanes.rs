@@ -262,6 +262,10 @@ pub struct LaneRecord {
     /// fresh outcome from an earlier error.
     #[serde(default)]
     pub resume_attempts: u64,
+    /// A cancel request for a job past Queued. Its supervisor kills the
+    /// workload and ends the record Cancelled with this reason.
+    #[serde(default)]
+    pub cancel_requested: Option<String>,
     pub evidence: Option<String>,
 }
 
@@ -723,6 +727,7 @@ impl LaneStore {
             resume_pending: vec![],
             resume_error: None,
             resume_attempts: 0,
+            cancel_requested: None,
             evidence: None,
         });
         Ok((ticket, job))
@@ -846,22 +851,47 @@ impl LaneStore {
     }
 
     pub fn finish(&self, id: Uuid, exit_code: i32, evidence: &str) -> Result<()> {
+        self.conclude(id, JobEnd::Exited(exit_code), evidence)
+    }
+
+    /// The one terminal transition of a job: Finished with its exit code or
+    /// Cancelled with a reason. An already terminal record is left as it is.
+    /// Yielded services are resumed either way.
+    fn conclude(&self, id: Uuid, end: JobEnd, evidence: &str) -> Result<()> {
         let services = self.locked(|state| {
             let record = state
                 .records
                 .iter_mut()
                 .find(|r| r.ticket.id == id)
                 .context("unknown job")?;
+            if matches!(
+                record.state,
+                TicketState::Finished | TicketState::Cancelled { .. }
+            ) {
+                return Ok(Vec::new());
+            }
             record.finished_ms = Some(milliseconds());
             let earlier = record.evidence.take();
             record.evidence =
                 Some(earlier.map_or_else(|| evidence.to_owned(), |e| format!("{e}; {evidence}")));
-            record.state = TicketState::Finished;
+            match end {
+                JobEnd::Exited(exit_code) => {
+                    record.state = TicketState::Finished;
+                    if let Some(job) = record.job.as_mut() {
+                        job.state = JobState::Finished { exit_code };
+                    }
+                }
+                JobEnd::Cancelled(reason) => {
+                    record.state = TicketState::Cancelled {
+                        reason: reason.clone(),
+                    };
+                    if let Some(job) = record.job.as_mut() {
+                        job.state = JobState::Cancelled { reason };
+                    }
+                }
+            }
             if !record.quarantined {
                 record.resume_pending = record.yield_services.clone();
-            }
-            if let Some(job) = record.job.as_mut() {
-                job.state = JobState::Finished { exit_code };
             }
             Ok(record.resume_pending.clone())
         })?;
@@ -1017,6 +1047,9 @@ impl LaneStore {
         Ok(serde_json::from_slice(&output.stdout)?)
     }
 
+    /// Cancel a queued ticket at once. A job past Queued (Preparing or
+    /// running) gets a cancel request that its supervisor carries out: it
+    /// kills the workload, runs the post hook and ends the job Cancelled.
     pub fn cancel_ticket(&self, id: Uuid, reason: &str) -> Result<()> {
         self.locked(|state| {
             let record = state
@@ -1024,22 +1057,34 @@ impl LaneStore {
                 .iter_mut()
                 .find(|r| r.ticket.id == id)
                 .context("unknown ticket")?;
-            ensure!(
-                matches!(record.state, TicketState::Queued),
-                "cannot cancel a running or completed ticket"
-            );
-            record.state = TicketState::Cancelled {
-                reason: reason.to_owned(),
-            };
-            if let Some(job) = record.job.as_mut() {
-                job.state = JobState::Cancelled {
-                    reason: reason.to_owned(),
-                };
+            match record.state {
+                TicketState::Queued => {
+                    record.state = TicketState::Cancelled {
+                        reason: reason.to_owned(),
+                    };
+                    if let Some(job) = record.job.as_mut() {
+                        job.state = JobState::Cancelled {
+                            reason: reason.to_owned(),
+                        };
+                    }
+                    record.finished_ms = Some(milliseconds());
+                }
+                TicketState::Preparing | TicketState::Granted(_) if record.job.is_some() => {
+                    record
+                        .cancel_requested
+                        .get_or_insert_with(|| reason.to_owned());
+                }
+                _ => bail!("cannot cancel a completed ticket or a service lease"),
             }
-            record.finished_ms = Some(milliseconds());
             Ok(())
         })
     }
+}
+
+/// How a supervised job ended.
+enum JobEnd {
+    Exited(i32),
+    Cancelled(String),
 }
 
 /// Where one finished job's service resume stands after `recover --wait`.
@@ -1265,6 +1310,49 @@ fn systemd_available() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// The cgroup of `pid` when it is the named systemd scope.
+fn process_scope(pid: u32, unit: &str) -> Option<String> {
+    let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    let path = text.lines().find_map(|line| line.strip_prefix("0::"))?;
+    path.ends_with(&format!("/{unit}")).then(|| path.to_owned())
+}
+
+/// Processes in a cgroup v2 group (empty once the group is gone).
+fn cgroup_pids(path: &str) -> Vec<u32> {
+    fs::read_to_string(
+        Path::new("/sys/fs/cgroup")
+            .join(path.trim_start_matches('/'))
+            .join("cgroup.procs"),
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter_map(|line| line.trim().parse().ok())
+    .collect()
+}
+
+/// Live processes whose process group is `group`.
+fn process_group_pids(group: u32) -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    // Fields after the parenthesised command: state ppid pgrp ...
+                    let mut fields = stat[stat.rfind(')')? + 2..].split_whitespace();
+                    let state = fields.next()?;
+                    let pgrp = fields.nth(1)?.parse::<u32>().ok()?;
+                    // A zombie is already dead; only its parent can reap it.
+                    (state != "Z").then_some(pgrp)
+                })
+                == Some(group)
+        })
+        .collect()
+}
+
 /// Workloads and supervisors run in systemd user scopes unless the caller
 /// opts out with `BORG_LANE_SCOPE=0` or no user manager exists.
 fn workload_scoped() -> bool {
@@ -1472,7 +1560,14 @@ impl LaneStore {
         let event = StateEvents::new(&self.root)?;
         loop {
             self.recover(false)?;
-            if !matches!(self.record(id)?.state, TicketState::Preparing)
+            let current = self.record(id)?;
+            if let Some(reason) = &current.cancel_requested {
+                bail!("cancel requested: {reason}");
+            }
+            if let TicketState::Cancelled { reason } = &current.state {
+                bail!("cancelled before grant: {reason}");
+            }
+            if !matches!(current.state, TicketState::Preparing)
                 && let Some(lease) = self.try_grant(id)?
             {
                 return Ok(lease);
@@ -1722,20 +1817,29 @@ impl LaneStore {
             Ok(())
         })?;
         let result = self.supervise_job(id);
-        let code = match &result {
-            Ok(code) => *code,
-            Err(_) => 125,
+        let requested = self.record(id)?.cancel_requested;
+        let (end, evidence) = match (result, requested) {
+            (Ok(JobEnd::Exited(code)), _) => (JobEnd::Exited(code), "finished".to_owned()),
+            (Ok(JobEnd::Cancelled(reason)), _) => {
+                let evidence = format!("cancelled: {reason}");
+                (JobEnd::Cancelled(reason), evidence)
+            }
+            (Err(error), Some(reason)) => (
+                JobEnd::Cancelled(reason),
+                format!("cancelled before start: {error:#}"),
+            ),
+            (Err(error), None) => (JobEnd::Exited(125), format!("supervisor: {error:#}")),
         };
-        let evidence = match result {
-            Ok(_) => "finished".to_owned(),
-            Err(error) => format!("supervisor: {error:#}"),
+        let code = match end {
+            JobEnd::Exited(code) => code,
+            JobEnd::Cancelled(_) => 125,
         };
-        self.finish(id, code, &evidence)?;
+        self.conclude(id, end, &evidence)?;
         drop(lock);
         Ok(code)
     }
 
-    fn supervise_job(&self, id: Uuid) -> Result<i32> {
+    fn supervise_job(&self, id: Uuid) -> Result<JobEnd> {
         let scoped = workload_scoped();
         ensure!(
             scoped || std::env::var("BORG_LANE_DEGRADED").as_deref() == Ok("1"),
@@ -1753,6 +1857,10 @@ impl LaneStore {
         {
             // Exclusive hooks already ran before the grant as a FIFO barrier.
             self.run_hook(pre, &spec, id, "pre", true)?;
+        }
+        if let Some(reason) = self.record(id)?.cancel_requested {
+            self.run_post_for_job(&spec, id, exclusive)?;
+            return Ok(JobEnd::Cancelled(reason));
         }
         let log = OpenOptions::new()
             .create(true)
@@ -1797,19 +1905,21 @@ impl LaneStore {
         let mut child = command
             .spawn()
             .with_context(|| format!("starting job {id}"))?;
-        let mut group = if scoped {
-            scope_control_group(&unit)
-        } else {
-            None
-        };
+        // `systemd-run` joins the scope before it execs the workload, so the
+        // workload's own /proc entry names the scope without a manager call.
+        let mut group = None;
         if scoped {
-            for _ in 0..20 {
-                if group.is_some() || child.try_wait()?.is_some() {
-                    break;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while group.is_none()
+                && child.try_wait()?.is_none()
+                && std::time::Instant::now() < deadline
+            {
+                group = process_scope(child.id(), &unit);
+                if group.is_none() {
+                    std::thread::sleep(Duration::from_millis(10));
                 }
-                std::thread::sleep(Duration::from_millis(25));
-                group = scope_control_group(&unit);
             }
+            group = group.or_else(|| scope_control_group(&unit));
         }
         self.locked(|state| {
             let record = state
@@ -1833,18 +1943,19 @@ impl LaneStore {
         let mut last_progress = started;
         let mut last_size = 0;
         let mut last_cpu = 0.0;
-        let code = loop {
+        let leader = child.id();
+        let end = loop {
             if let Some(status) = child.try_wait()? {
-                break status.code().unwrap_or(128 + status.signal().unwrap_or(9));
+                break JobEnd::Exited(status.code().unwrap_or(128 + status.signal().unwrap_or(9)));
             }
             let size = fs::metadata(self.job_dir(id).join("output.log")).map_or(0, |m| m.len());
-            let cpu = proc_cpu(child.id()).unwrap_or(0.0);
+            let cpu = proc_cpu(leader).unwrap_or(0.0);
             if size != last_size || cpu > last_cpu + 0.05 {
                 last_progress = std::time::Instant::now();
             }
             last_size = size;
             last_cpu = cpu;
-            self.locked(|state| {
+            let cancel = self.locked(|state| {
                 let record = state
                     .records
                     .iter_mut()
@@ -1852,43 +1963,107 @@ impl LaneStore {
                     .context("job vanished")?;
                 record.progress = Some(format!("{} bytes", size));
                 record.cpu_seconds = Some(cpu);
-                Ok(())
+                Ok(record.cancel_requested.clone())
             })?;
-            if started.elapsed() > Duration::from_millis(spec.timeout_ms)
-                || spec
-                    .stall_timeout_ms
-                    .is_some_and(|ms| last_progress.elapsed() > Duration::from_millis(ms))
-            {
-                let reason = if started.elapsed() > Duration::from_millis(spec.timeout_ms) {
-                    "timeout"
-                } else {
-                    "stall: no CPU or log growth"
+            let timed_out = started.elapsed() > Duration::from_millis(spec.timeout_ms);
+            let stalled = spec
+                .stall_timeout_ms
+                .is_some_and(|ms| last_progress.elapsed() > Duration::from_millis(ms));
+            if cancel.is_some() || timed_out || stalled {
+                let reason = match &cancel {
+                    Some(reason) => format!("cancelled: {reason}"),
+                    None if timed_out => "timeout".to_owned(),
+                    None => "stall: no CPU or log growth".to_owned(),
                 };
-                self.log_recovery(id, reason)?;
-                if matches!(self.job_status(id)?.state, JobState::Running { ref scope } if scope == &unit)
-                {
-                    let _ = Command::new("systemctl")
-                        .args(["--user", "kill", "--signal=SIGKILL", &unit])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                }
-                // Degraded mode may signal only its own verified live process group.
-                if !scoped && self.record(id)?.workload_start_ticks == proc_start_ticks(child.id())
-                {
-                    unsafe {
-                        libc::kill(-(child.id() as i32), libc::SIGKILL);
-                    }
-                }
+                self.log_recovery(id, &reason)?;
+                self.kill_workload(id, &unit, scoped, leader, "killed pids")?;
                 let _ = child.kill();
                 let _ = child.wait();
-                break if reason == "timeout" { 124 } else { 125 };
+                break match cancel {
+                    Some(reason) => JobEnd::Cancelled(reason),
+                    None if timed_out => JobEnd::Exited(124),
+                    None => JobEnd::Exited(125),
+                };
             }
             std::thread::sleep(Duration::from_millis(100));
         };
+        // The leader is gone; no process of this workload may outlive it into
+        // the next holder's lease (a compiler it started, for example).
+        self.kill_workload(id, &unit, scoped, leader, "killed leftover pids")?;
         self.run_post_for_job(&spec, id, exclusive)?;
         let _ = lease;
-        Ok(code)
+        Ok(end)
+    }
+
+    /// SIGKILL every process left in the job's scope (degraded: its own
+    /// process group, whose ID the kernel will not reuse while a member
+    /// lives) and wait until none remain. The PIDs go to the evidence and
+    /// recovery log; a group that will not empty quarantines the resource
+    /// rather than release it to the next job.
+    fn kill_workload(
+        &self,
+        id: Uuid,
+        unit: &str,
+        scoped: bool,
+        group: u32,
+        label: &str,
+    ) -> Result<Vec<u32>> {
+        let cgroup = scoped
+            .then(|| {
+                self.record(id)
+                    .ok()
+                    .and_then(|r| r.scope_cgroup)
+                    .or_else(|| scope_control_group(unit))
+            })
+            .flatten();
+        let members = || match &cgroup {
+            Some(path) => cgroup_pids(path),
+            None if scoped => Vec::new(),
+            None => process_group_pids(group),
+        };
+        let killed = members();
+        if killed.is_empty() {
+            return Ok(killed);
+        }
+        if scoped {
+            let _ = Command::new("systemctl")
+                .args(["--user", "kill", "--signal=SIGKILL", unit])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        } else {
+            unsafe {
+                libc::kill(-(group as i32), libc::SIGKILL);
+            }
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut left = members();
+        while !left.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            left = members();
+        }
+        let note = if left.is_empty() {
+            format!("{label} {killed:?}")
+        } else {
+            format!("{label} {killed:?}; still running {left:?}, resource quarantined")
+        };
+        self.locked(|state| {
+            let row = state
+                .records
+                .iter_mut()
+                .find(|r| r.ticket.id == id)
+                .context("job vanished")?;
+            row.evidence = Some(match row.evidence.take() {
+                Some(earlier) => format!("{earlier}; {note}"),
+                None => note.clone(),
+            });
+            if !left.is_empty() {
+                row.quarantined = true;
+            }
+            Ok(())
+        })?;
+        self.log_killed(id, &note, &killed)?;
+        Ok(killed)
     }
 
     fn run_post_for_job(&self, spec: &JobSpec, id: Uuid, exclusive: bool) -> Result<()> {
@@ -1917,6 +2092,17 @@ impl LaneStore {
                 })?;
             }
         }
+        Ok(())
+    }
+
+    fn log_killed(&self, id: Uuid, reason: &str, killed: &[u32]) -> Result<()> {
+        let record = serde_json::json!({"time_ms": milliseconds(), "job": id, "reason": reason,
+            "killed_pids": killed});
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(self.root.join("recovery.jsonl"))?;
+        writeln!(file, "{record}")?;
         Ok(())
     }
 
@@ -2301,6 +2487,7 @@ mod tests {
             resume_pending: vec![],
             resume_error: None,
             resume_attempts: 0,
+            cancel_requested: None,
             evidence: None,
         }
     }
@@ -3571,6 +3758,55 @@ mod tests {
             stall_timeout_ms: None,
             coalesce: true,
         }
+    }
+
+    /// Failure mode: a running job that cannot be cancelled, or a late
+    /// supervisor exit rewriting a cancelled job as Finished.
+    #[test]
+    fn cancels_reach_jobs_past_queued_and_terminal_records_stay_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LaneStore::new(dir.path()).unwrap();
+        let spec = coalescing_spec(dir.path(), None);
+        let (queued, running) = store
+            .locked(|state| {
+                let mut job = |argv: &str| {
+                    let spec = JobSpec {
+                        argv: vec![argv.into()],
+                        ..spec.clone()
+                    };
+                    store
+                        .enqueue_record(state, spec.lease.clone(), Some(spec))
+                        .map(|(_, job)| job.unwrap().id)
+                };
+                let (running, queued) = (job("first")?, job("second")?);
+                grant_entry(
+                    state
+                        .records
+                        .iter_mut()
+                        .find(|r| r.ticket.id == running)
+                        .unwrap(),
+                );
+                Ok((queued, running))
+            })
+            .unwrap();
+        store.cancel_ticket(queued, "stop").unwrap();
+        store.finish(queued, 125, "supervisor exit").unwrap();
+        assert!(matches!(
+            store.job_status(queued).unwrap().state,
+            JobState::Cancelled { .. }
+        ));
+        store.cancel_ticket(running, "stop").unwrap();
+        let row = store.record(running).unwrap();
+        assert!(matches!(row.state, TicketState::Granted(_)));
+        assert_eq!(row.cancel_requested.as_deref(), Some("stop"));
+        store
+            .conclude(running, JobEnd::Cancelled("stop".into()), "cancelled: stop")
+            .unwrap();
+        assert!(matches!(
+            store.job_status(running).unwrap().state,
+            JobState::Cancelled { ref reason } if reason == "stop"
+        ));
+        assert!(store.cancel_ticket(running, "again").is_err());
     }
 
     #[test]
