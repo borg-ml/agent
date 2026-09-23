@@ -89,13 +89,22 @@ not advertise editor MCP mutations as working. CLI `--owner` is a local operator
 authorization. Service `start` accepts arbitrary argv from a local file and
 must never be exposed as a model tool without a pre-registered validated spec.
 
-The planned model-facing `lane_service` wrapper accepts only
-`{op:"status|lease|release|restart|yield|resume|stop", id, ttl_ms?}` for a
-pre-registered service: its trusted dispatcher derives the owner from the
-actual session, checks workspace access and lease generation, and never accepts
-caller-supplied owner, spec, argv, or `confirmed`. Until the parent integrator
-reviews and wires those checks, **there is no registered MCP tool**. `borg lane
-service` remains a host-local CLI for operators and approved Blu workflows.
+The integrated model-facing `lane_service` wrapper accepts only
+`status`, `lease`, `release` and audited exact-path `read` for a
+pre-registered service. Its trusted dispatcher derives the holder from the
+calling actor session, refuses caller-supplied owner/fence/approval fields,
+and checks the session on lease release; the read tool requires a current
+lease, uses only loopback GET without redirects and caps streamed responses.
+Service start/stop/yield/resume, forced and ordinary restart and arbitrary
+raw editor MCP mutations are **not** model-facing: restart lacks an atomic
+actor fence in the supervisor, and no raw editor MCP proxy guarantees
+per-owner enforcement on every mutating call. `borg lane service` remains
+a host-local CLI for operators and approved Blu workflows. The MCP bridge
+rejects all model-facing exclusive job templates until atomic foreign-client
+preemption is proved; trusted CLI `borg lane job submit --spec <file>`
+requires coordinating with the editor lease holder. This is not a same-UID
+security sandbox.
+
 
 **Exclusive lane gate (fake services verified):** the supervisor holds a
 `LaneStore` shared lease during the backend lifetime. A lane job requesting

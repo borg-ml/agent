@@ -18,6 +18,7 @@ mod generation_activity;
 mod harness;
 mod host_paths;
 mod imported_memory;
+mod lane_tools;
 mod local_control;
 mod lsp;
 mod native_context;
