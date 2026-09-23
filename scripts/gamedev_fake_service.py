@@ -7,6 +7,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import time
 import uuid
 
 
@@ -97,4 +98,8 @@ if __name__ == "__main__":
     else:
         if os.environ.get("BENCH_CHILD_MARKER_DIR"):
             start_detached_child(Path(os.environ["BENCH_CHILD_MARKER_DIR"]))
+        delay = os.environ.get("BENCH_START_DELAY_FILE")
+        if delay and Path(delay).exists():
+            # Like an editor still loading: the port is not listening yet.
+            time.sleep(float(Path(delay).read_text() or 0))
         ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler).serve_forever()

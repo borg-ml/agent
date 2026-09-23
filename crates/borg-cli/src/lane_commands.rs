@@ -30,6 +30,8 @@ pub(crate) enum LaneCommand {
     },
     /// Supervised shared services bound to lane resources.
     Service(crate::lane_service_commands::ServiceArgs),
+    /// Same as `job recover`.
+    Recover(RecoverArgs),
     #[command(name = "__supervise", hide = true)]
     Supervise { id: Uuid },
     #[command(name = "__resume_services", hide = true)]
@@ -59,10 +61,19 @@ pub(crate) enum JobCommand {
     Cancel {
         id: Uuid,
     },
-    Recover {
-        #[arg(long)]
-        dry_run: bool,
-    },
+    Recover(RecoverArgs),
+}
+
+/// Recover lost jobs and restart pending service resumes.
+#[derive(Debug, clap::Args)]
+pub(crate) struct RecoverArgs {
+    /// Report what recovery would do without doing it.
+    #[arg(long, conflicts_with = "wait")]
+    dry_run: bool,
+    /// Block up to SECONDS until each started service resume clears or
+    /// fails; exits nonzero unless every one resumed.
+    #[arg(long, value_name = "SECONDS")]
+    wait: Option<u64>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -90,6 +101,48 @@ fn print_job(job: &JobHandle, json: bool) -> Result<()> {
     } else {
         println!("{} {:?} {}", job.id, job.state, job.log_path.display());
     }
+    Ok(())
+}
+
+fn recover(store: &LaneStore, args: RecoverArgs, json: bool) -> Result<()> {
+    let Some(seconds) = args.wait else {
+        let actions = store.recover(args.dry_run)?;
+        if json {
+            println!("{}", serde_json::to_string(&actions)?);
+        } else {
+            for action in actions {
+                println!("{action}");
+            }
+        }
+        return Ok(());
+    };
+    let (actions, resumes) = store.recover_wait(std::time::Duration::from_secs(seconds))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"actions": actions, "resumes": resumes})
+        );
+    } else {
+        for action in &actions {
+            println!("{action}");
+        }
+        for resume in &resumes {
+            match resume.outcome {
+                "resumed" => println!("job {}: resumed", resume.job_id),
+                outcome => println!(
+                    "job {}: {outcome} ({}): {}",
+                    resume.job_id,
+                    resume.pending.join(", "),
+                    resume.error.as_deref().unwrap_or("no attempt finished yet")
+                ),
+            }
+        }
+    }
+    let unresolved = resumes.iter().filter(|r| r.outcome != "resumed").count();
+    ensure!(
+        unresolved == 0,
+        "{unresolved} service resume(s) failed or still pending"
+    );
     Ok(())
 }
 
@@ -189,17 +242,9 @@ pub(crate) async fn run(args: LaneArgs) -> Result<()> {
                     println!("{}", serde_json::json!({"job_id":id,"state":"cancelled"}));
                 }
             }
-            JobCommand::Recover { dry_run } => {
-                let actions = store.recover(dry_run)?;
-                if json {
-                    println!("{}", serde_json::to_string(&actions)?);
-                } else {
-                    for action in actions {
-                        println!("{action}");
-                    }
-                }
-            }
+            JobCommand::Recover(args) => recover(&store, args, json)?,
         },
+        LaneCommand::Recover(args) => recover(&store, args, json)?,
         LaneCommand::Resource { command } => match command {
             ResourceCommand::List | ResourceCommand::Status => {
                 let records = store.snapshot()?;

@@ -105,6 +105,41 @@ pub struct ServiceSpec {
 fn default_ready_timeout_ms() -> u64 {
     120_000
 }
+
+/// The Degraded reason when a launched backend missed its readiness window.
+pub(crate) const READINESS_FAILED: &str = "backend failed readiness";
+
+/// How long a resumed service may take to report Healthy: its own
+/// `readiness_timeout_ms` plus one health interval and probe timeout, and 2 s
+/// for the supervisor to launch the backend. Without a readable spec, the
+/// default readiness window applies.
+pub(crate) fn resume_budget(services: &Path, id: &str) -> Duration {
+    #[derive(Deserialize)]
+    struct Health {
+        interval_ms: u64,
+        timeout_ms: u64,
+    }
+    #[derive(Deserialize)]
+    struct Budget {
+        #[serde(default = "default_ready_timeout_ms")]
+        readiness_timeout_ms: u64,
+        health: Health,
+    }
+    let valid = !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    let window = valid
+        .then(|| fs::read(services.join(id).join("spec.json")).ok())
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<Budget>(&bytes).ok())
+        .map_or(default_ready_timeout_ms(), |spec| {
+            spec.readiness_timeout_ms
+                .saturating_add(spec.health.interval_ms)
+                .saturating_add(spec.health.timeout_ms)
+        });
+    Duration::from_millis(window.saturating_add(2_000))
+}
 fn default_idle_after_ms() -> u64 {
     60_000
 }
@@ -1502,9 +1537,9 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                         &mut status,
                         &front,
                         ServiceState::Degraded {
-                            reason: "backend failed readiness".into(),
+                            reason: READINESS_FAILED.into(),
                         },
-                        "backend failed readiness",
+                        READINESS_FAILED,
                         active.as_ref().and_then(|b| b.port),
                     )
                     .await?;

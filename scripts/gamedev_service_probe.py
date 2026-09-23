@@ -331,7 +331,8 @@ def run_atomic(binary: Path, descendant: bool = False, post_barrier: bool = Fals
                fail_health: bool = False, foreign_lease: bool = False,
                late_lease: bool = False, own_lease: bool = False,
                foreign_grace: bool = False, foreign_indefinite: bool = False,
-               fail_active_hook: bool = False, per_resource_grace: bool = False) -> dict:
+               fail_active_hook: bool = False, per_resource_grace: bool = False,
+               slow_resume: bool = False) -> dict:
     foreign_lease = foreign_lease or late_lease or foreign_grace or foreign_indefinite or per_resource_grace
     binary = binary.resolve(strict=True)
     backend = Path(__file__).with_name("gamedev_fake_service.py").resolve()
@@ -378,7 +379,9 @@ def run_atomic(binary: Path, descendant: bool = False, post_barrier: bool = Fals
                         "cwd": str(project),
                         "env": ([["BENCH_CHILD_MARKER_DIR", str(child_markers)]] if descendant else [])
                                + ([["BENCH_HEALTH_FAIL_FILE", str(root / "health-disabled")]]
-                                  if fail_health and i == 0 else []),
+                                  if fail_health and i == 0 else [])
+                               + ([["BENCH_START_DELAY_FILE", str(root / "slow-start")]]
+                                  if slow_resume and i == 0 else []),
                         "resources": [{"key": second_key, "access": {"Shared": {"slots": 1}}}]
                                      if per_resource_grace and i == 1 else [resource],
                         "adapter_enforces_leases": False, "read_only_paths": ["/", "/health"],
@@ -390,6 +393,10 @@ def run_atomic(binary: Path, descendant: bool = False, post_barrier: bool = Fals
                         "endpoint": {"listen": f"127.0.0.1:{ports[i]}",
                                      "backend_ports": ports[(1 if project_alias or canonical_project else 2)+i*2:
                                                              (3 if project_alias or canonical_project else 4)+i*2]}, "restore": None}
+                if i == 0 and (fail_health or slow_resume):
+                    # The resume budget is the service's own readiness window:
+                    # short for the never-ready backend, a minute for the slow one.
+                    spec["readiness_timeout_ms"] = 8000 if fail_health else 60000
                 if i == 1 and (late_lease or fail_active_hook):
                     spec["idle_after_ms"] = 100
                     spec["idle"] = {"argv": [sys.executable, str(Path(__file__).resolve()),
@@ -407,6 +414,9 @@ def run_atomic(binary: Path, descendant: bool = False, post_barrier: bool = Fals
                 if status.get("backend_pid") is None:
                     raise RuntimeError(f"{service_id} never became healthy")
                 before[service_id] = status["backend_pid"]
+            if slow_resume:
+                # Only the backend launched by the post-job Resume starts slowly.
+                (root / "slow-start").write_text("35")
             if late_lease or fail_active_hook:
                 wait_marker(idle_marker, root)
                 if active_marker.exists():
@@ -637,6 +647,34 @@ def run_atomic(binary: Path, descendant: bool = False, post_barrier: bool = Fals
             state = done.get("state", {})
             if not isinstance(state, dict) or state.get("Finished", {}).get("exit_code") != 0 or not marker.exists():
                 raise RuntimeError(f"D11 no-hook exclusive did not complete: {done!r}")
+            if slow_resume:
+                # The resumed backend needs 35 s, above the old 30 s resume
+                # check. The lane itself must clear pending, with no recover and
+                # no resume error journalled while inside the readiness window.
+                finished = time.monotonic()
+                while True:
+                    row = lane(binary, root, "job", "status", job_id)
+                    if row.get("resume_error"):
+                        raise RuntimeError(f"slow start journalled a resume error: {row!r}")
+                    if not row.get("resume_pending"):
+                        break
+                    if time.monotonic() >= finished + 60:
+                        raise RuntimeError(f"slow resume stayed pending: {row!r}")
+                    subprocess.run(["inotifywait", "-q", "-t", "2", "-e", "moved_to", str(root)],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+                slow_seconds = round(time.monotonic() - finished, 1)
+                if slow_seconds < 30:
+                    raise RuntimeError(f"resume took {slow_seconds}s; not past the old 30 s window")
+                recovered = lane(binary, root, "recover", "--wait", "5")
+                if recovered.get("resumes"):
+                    raise RuntimeError(f"recover --wait found resumes still pending: {recovered!r}")
+                after = {service_id: resumed(binary, root, service_id)["backend_pid"]
+                         for service_id in started}
+                for i in range(len(started)):
+                    health_at(ports[i])
+                return {"mode": "D11-slow-resume-cli", "job_id": job_id, "auto_resumed": True,
+                        "slow_resume_seconds": slow_seconds, "resume_error": None,
+                        "recover_wait": recovered, "backend_before": before, "backend_after": after}
             if foreign_grace:
                 waited = lane(binary, root, "job", "status", job_id)
                 if (waited.get("started_ms") or 0) - (waited.get("created_ms") or 0) < 3500:
@@ -693,7 +731,10 @@ def run_atomic(binary: Path, descendant: bool = False, post_barrier: bool = Fals
                     subprocess.run(["inotifywait", "-q", "-t", "1", "-e", "modify,close_write,moved_to",
                                     str(root / "services" / "bench-editor-a")],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
-                lane(binary, root, "job", "recover")
+                recovered = lane(binary, root, "job", "recover", "--wait", "20")
+                outcomes = {r["job_id"]: r["outcome"] for r in recovered.get("resumes", [])}
+                if outcomes.get(job_id) != "resumed":
+                    raise RuntimeError(f"recover --wait did not report the resume: {recovered!r}")
                 while True:
                     row = lane(binary, root, "job", "status", job_id)
                     if not row.get("resume_pending") and not row.get("resume_error"):
@@ -944,6 +985,8 @@ def main() -> None:
                     help="systemd-only refuse a late client while exclusive Preparing")
     ap.add_argument("--atomic-foreign-lease", action="store_true",
                     help="systemd-only wait on test-owned foreign service client then release")
+    ap.add_argument("--atomic-slow-resume", action="store_true",
+                    help="systemd-only resumed backend ready after 35 s clears pending unaided")
     ap.add_argument("--atomic-unhealthy-resume", action="store_true",
                     help="systemd-only resumed backend fails health; retry without duplicate Resume")
     ap.add_argument("--fail-owned-health", action="store_true")
@@ -972,7 +1015,7 @@ def main() -> None:
                       Path(child_dir) if child_dir != "-" else None, args.stop_owned_service,
                       args.fail_owned_health)
     else:
-        if args.atomic_descendant or args.atomic_post_hook or args.atomic_post_hook_fail or args.atomic_failed_resume or args.atomic_unhealthy_resume or args.atomic_foreign_lease or args.atomic_foreign_grace or args.atomic_foreign_indefinite or args.atomic_late_lease or args.atomic_active_hook_rollback or args.atomic_per_resource_grace or args.atomic_own_lease or args.atomic_project_alias or args.check_service_budget or args.check_service_disk_budget:
+        if args.atomic_descendant or args.atomic_post_hook or args.atomic_post_hook_fail or args.atomic_failed_resume or args.atomic_unhealthy_resume or args.atomic_foreign_lease or args.atomic_foreign_grace or args.atomic_foreign_indefinite or args.atomic_late_lease or args.atomic_active_hook_rollback or args.atomic_per_resource_grace or args.atomic_slow_resume or args.atomic_own_lease or args.atomic_project_alias or args.check_service_budget or args.check_service_disk_budget:
             manager = subprocess.run(["systemctl", "--user", "show-environment"],
                                      capture_output=True, timeout=3)
             if manager.returncode:
@@ -980,7 +1023,7 @@ def main() -> None:
             os.environ["BORG_BENCH_REQUIRE_SCOPE"] = "1"
         if args.check_service_budget or args.check_service_disk_budget:
             result = service_budget_gate(args.borg, disk=args.check_service_disk_budget)
-        elif args.atomic or args.atomic_descendant or args.atomic_post_hook or args.atomic_post_hook_fail or args.atomic_failed_resume or args.atomic_unhealthy_resume or args.atomic_foreign_lease or args.atomic_foreign_grace or args.atomic_foreign_indefinite or args.atomic_late_lease or args.atomic_active_hook_rollback or args.atomic_per_resource_grace or args.atomic_own_lease or args.atomic_project_alias:
+        elif args.atomic or args.atomic_descendant or args.atomic_post_hook or args.atomic_post_hook_fail or args.atomic_failed_resume or args.atomic_unhealthy_resume or args.atomic_foreign_lease or args.atomic_foreign_grace or args.atomic_foreign_indefinite or args.atomic_late_lease or args.atomic_active_hook_rollback or args.atomic_per_resource_grace or args.atomic_slow_resume or args.atomic_own_lease or args.atomic_project_alias:
             result = run_atomic(args.borg, descendant=args.atomic_descendant,
                                 post_barrier=args.atomic_post_hook or args.atomic_post_hook_fail,
                                 project_alias=args.atomic_project_alias,
@@ -993,7 +1036,8 @@ def main() -> None:
                                 foreign_grace=args.atomic_foreign_grace,
                                 foreign_indefinite=args.atomic_foreign_indefinite,
                                 fail_active_hook=args.atomic_active_hook_rollback,
-                                per_resource_grace=args.atomic_per_resource_grace)
+                                per_resource_grace=args.atomic_per_resource_grace,
+                                slow_resume=args.atomic_slow_resume)
             if args.atomic_project_alias and not result["alias_rejected"]:
                 result["canonical_handoff"] = run_atomic(args.borg, canonical_project=True)
         elif args.mcp_pretty_health:
