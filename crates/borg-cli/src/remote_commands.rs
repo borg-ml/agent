@@ -2153,25 +2153,44 @@ async fn run_local_agent_session(
     } else {
         args.provider().into()
     };
+    if !resuming
+        && args.provider.is_none()
+        && matches!(
+            requested_provider,
+            CodingProvider::Claude | CodingProvider::Codex
+        )
+    {
+        ensure!(
+            crate::cli::default_subscription_ready(args.provider()),
+            "automatic provider selection requires a Claude or Codex subscription login; \
+             sign in or pass --provider explicitly (no API-key billing was selected)"
+        );
+    }
+    let codex_backup = automatic_codex_backup_profile(requested_provider, args.provider.is_some());
     let requested_model = args
         .model
         .clone()
+        .or_else(|| codex_backup.map(|(model, _)| model.to_string()))
         .or_else(|| default_model_for_provider(requested_provider));
-    let requested_effort = args.effort.clone().or_else(|| match requested_provider {
-        CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
-        // OpenRouter spans reasoning and non-reasoning models. Only send its
-        // optional reasoning parameter after an explicit user selection.
-        CodingProvider::OpenRouter => None,
-        CodingProvider::OpenAiCompatible => None,
-        CodingProvider::Claude => Some(borg_provider::claude_default_effort().to_string()),
-        CodingProvider::OpenCode => None,
-        CodingProvider::Kimi | CodingProvider::Glm => {
-            Some(borg_provider::kimi_default_effort().to_string())
-        }
-        CodingProvider::Qwen => Some(borg_provider::qwen_default_effort().to_string()),
-        // Grok Build and Muse Code choose their own reasoning depth, and the
-        // Anthropic lane sends extended thinking only when asked for it.
-        CodingProvider::Anthropic | CodingProvider::Grok | CodingProvider::Muse => None,
+    let requested_effort = args.effort.clone().or_else(|| {
+        codex_backup
+            .map(|(_, effort)| effort.to_string())
+            .or_else(|| match requested_provider {
+                CodingProvider::Codex => Some(borg_provider::codex_default_effort().to_string()),
+                // OpenRouter spans reasoning and non-reasoning models. Only send its
+                // optional reasoning parameter after an explicit user selection.
+                CodingProvider::OpenRouter => None,
+                CodingProvider::OpenAiCompatible => None,
+                CodingProvider::Claude => Some(borg_provider::claude_default_effort().to_string()),
+                CodingProvider::OpenCode => None,
+                CodingProvider::Kimi | CodingProvider::Glm => {
+                    Some(borg_provider::kimi_default_effort().to_string())
+                }
+                CodingProvider::Qwen => Some(borg_provider::qwen_default_effort().to_string()),
+                // Grok Build and Muse Code choose their own reasoning depth, and the
+                // Anthropic lane sends extended thinking only when asked for it.
+                CodingProvider::Anthropic | CodingProvider::Grok | CodingProvider::Muse => None,
+            })
     });
     let (
         recorded_cwd,
@@ -8012,13 +8031,15 @@ fn session_has_resumable_activity(state: &borg_remote::SessionState) -> bool {
     state.has_resumable_activity()
 }
 
+fn automatic_codex_backup_profile(
+    provider: CodingProvider,
+    explicit_provider: bool,
+) -> Option<(&'static str, &'static str)> {
+    (provider == CodingProvider::Codex && !explicit_provider).then_some(("gpt-6-sol", "xhigh"))
+}
+
 /// The model a fresh session pins when the user did not pass `--model`.
-///
-/// Every provider that can be chosen by default must answer with something, or
-/// the session records an empty model: the status bar then shows no model at
-/// all and the user cannot tell what they are talking to. Only OpenCode is
-/// allowed to defer, because it resolves its model from the running OpenCode
-/// server rather than from a static catalog.
+/// Only OpenCode defers to its running server rather than a static catalog.
 fn default_model_for_provider(provider: CodingProvider) -> Option<String> {
     match provider {
         CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
