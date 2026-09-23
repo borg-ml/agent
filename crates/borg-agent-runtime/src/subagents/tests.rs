@@ -2048,16 +2048,20 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
         .await
         .unwrap_err();
     assert!(unauthorized.to_string().contains("only the director"));
-    assert!(coordinator
-        .configure_child("/root", Some(CodingProvider::Codex), None, None)
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("not a child agent"));
-    assert!(coordinator
-        .configure_child(target, None, None, Some("invalid".into()))
-        .await
-        .is_err());
+    assert!(
+        coordinator
+            .configure_child("/root", Some(CodingProvider::Codex), None, None)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not a child agent")
+    );
+    assert!(
+        coordinator
+            .configure_child(target, None, None, Some("invalid".into()))
+            .await
+            .is_err()
+    );
 
     let configured = coordinator
         .call_tool_as(
@@ -2067,7 +2071,10 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
         )
         .await
         .unwrap();
-    assert_eq!(configured["agent"]["session_id"], child.session_id.to_string());
+    assert_eq!(
+        configured["agent"]["session_id"],
+        child.session_id.to_string()
+    );
     assert_eq!(configured["agent"]["provider"], "codex");
     assert_eq!(configured["agent"]["model"], "gpt-6-sol");
     assert_eq!(configured["agent"]["effort"], "max");
@@ -2076,7 +2083,10 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
     assert_eq!(config.provider, CodingProvider::Codex);
     assert_eq!(config.model.as_deref(), Some("gpt-6-sol"));
     assert_eq!(config.effort.as_deref(), Some("max"));
-    assert_eq!(state.latest_prompt.as_deref(), Some("Remember this original prompt."));
+    assert_eq!(
+        state.latest_prompt.as_deref(),
+        Some("Remember this original prompt.")
+    );
 
     coordinator.stop(target).await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -2086,7 +2096,10 @@ async fn director_configures_live_child_and_reuses_its_new_lane_after_wake() {
     })
     .await
     .unwrap();
-    coordinator.ensure_child_actor(child.session_id).await.unwrap();
+    coordinator
+        .ensure_child_actor(child.session_id)
+        .await
+        .unwrap();
     let revived = coordinator.get(child.session_id).await.unwrap();
     assert_eq!(revived.session_id, child.session_id);
     assert_eq!(revived.provider, CodingProvider::Codex);
