@@ -7746,10 +7746,12 @@ impl BorgTerminal {
         };
         let mut restored_scroll_from_bottom = None;
         let cursor_visible = cursor_blink_visible(self.cursor_blink_started_at.elapsed());
-        // Ratatui flushes changed cells before it applies the frame's cursor
-        // state. Hide the hardware cursor first so animated transcript diffs
-        // cannot briefly drag a visible caret through action rows.
+        // Ratatui flushes changed cells, then shows the cursor where the last
+        // cell was written before moving it. Keep the cursor out of the frame
+        // and place it while hidden, so animated transcript diffs cannot flash
+        // a caret through action rows.
         self.terminal.hide_cursor()?;
+        let mut frame_cursor = None;
         self.terminal.draw(|frame| {
             let area = centered_content_area_with_margin(frame.area(), self.horizontal_margin);
             let chunks = terminal_vertical_chunks(
@@ -8479,7 +8481,7 @@ impl BorgTerminal {
                     is_launch_screen,
                 )
             {
-                frame.set_cursor_position(cursor);
+                frame_cursor = Some(cursor);
             }
             let status_highlight = self.status_hovered && status_is_interruptible;
             let status_duration = if session_is_active {
@@ -9377,6 +9379,10 @@ impl BorgTerminal {
                 );
             }
         })?;
+        if let Some(cursor) = frame_cursor {
+            self.terminal.set_cursor_position(cursor)?;
+            self.terminal.show_cursor()?;
+        }
         if !input_fast_path {
             self.last_committed_viewport_render = Some((
                 transcript_width,
