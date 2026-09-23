@@ -2647,6 +2647,39 @@ fn running_tool_shimmer_moves_across_text_without_touching_the_gutter() {
 }
 
 #[test]
+fn running_status_shimmer_leaves_spinner_and_elapsed_time_still() {
+    let phase_for = |offset: usize| {
+        (RUNNING_SHIMMER_PADDING + offset) as u128 * RUNNING_SHIMMER_CYCLE_MILLIS
+            / ("running".width() + RUNNING_SHIMMER_PADDING * 2) as u128
+    };
+    let mut first = status_control_spans("⠋", "running", RUNNING_STATUS_PEACH, false, Some("2m"));
+    let mut second = first.clone();
+
+    apply_running_status_shimmer(&mut first, phase_for(1));
+    apply_running_status_shimmer(&mut second, phase_for(6));
+
+    assert_eq!(first[0], second[0]);
+    assert_eq!(first.last(), second.last());
+    assert_eq!(first.last().unwrap().content, " 2m");
+    assert_eq!(first.last().unwrap().style.fg, Some(Color::Gray));
+    assert_eq!(Line::from(first.clone()).to_string(), " ⠋ running 2m");
+    assert_eq!(
+        Line::from(first.clone()).width(),
+        Line::from(second.clone()).width()
+    );
+    assert_ne!(
+        first[1..first.len() - 1]
+            .iter()
+            .map(|span| span.style)
+            .collect::<Vec<_>>(),
+        second[1..second.len() - 1]
+            .iter()
+            .map(|span| span.style)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn structured_user_message_lines_preserve_column_spacing() {
     let text = "NAME      VALUE\nalpha     10\nbeta      20";
     assert!(user_message_has_structured_whitespace(text));
