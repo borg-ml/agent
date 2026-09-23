@@ -35,6 +35,18 @@ pub struct HealthCheck {
     pub kind: HealthKind,
     pub interval_ms: u64,
     pub timeout_ms: u64,
+    /// A running backend is declared hung (and replaced) only after its
+    /// probes have failed continuously for this long; None means three
+    /// probe timeouts. Each probe is still cut off at `timeout_ms`.
+    #[serde(default)]
+    pub unhealthy_after_ms: Option<u64>,
+}
+
+impl HealthCheck {
+    fn unhealthy_after_ms(&self) -> u64 {
+        self.unhealthy_after_ms
+            .unwrap_or_else(|| self.timeout_ms.saturating_mul(3))
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1649,7 +1661,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                     b.unhealthy_since_ms = None;
                 } else {
                     let since = *b.unhealthy_since_ms.get_or_insert(now);
-                    if now.saturating_sub(since) >= spec.health.timeout_ms.saturating_mul(3) {
+                    if now.saturating_sub(since) >= spec.health.unhealthy_after_ms() {
                         transition(
                             &dir,
                             &mut status,
@@ -2215,6 +2227,7 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
                 kind: HealthKind::Http,
                 interval_ms: 50,
                 timeout_ms: 100,
+                unhealthy_after_ms: None,
             },
             restart: RestartPolicy {
                 max_restarts: 4,
@@ -3561,6 +3574,35 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
             manager.read_status("fake").unwrap().clients.is_empty(),
             "failing active hook left a ghost client lease"
         );
+        cleanup(&manager, task).await;
+    }
+
+    /// Failure mode: an editor replaced as hung during a long but finite
+    /// stall (a shader compile) shorter than its configured window.
+    #[tokio::test]
+    async fn backend_is_hung_only_after_its_unhealthy_window() {
+        let (root, manager, _front, task) =
+            setup_with(|spec| spec.health.unhealthy_after_ms = Some(1_500)).await;
+        let before = manager.read_status("fake").unwrap();
+        let hang = root.path().join("hang");
+        // Three probe timeouts (the default window) pass; this one does not.
+        fs::write(&hang, "1").unwrap();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        fs::remove_file(&hang).unwrap();
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let after = manager.read_status("fake").unwrap();
+        assert_eq!(after.restarts, before.restarts, "{after:?}");
+        assert_eq!(after.backend_pid, before.backend_pid);
+        // A longer hang is still declared, once the window has passed.
+        fs::write(&hang, "1").unwrap();
+        let hung_at = tokio::time::Instant::now();
+        state(&manager, |s| s.restarts > before.restarts).await;
+        assert!(hung_at.elapsed() >= Duration::from_millis(1_400));
+        fs::remove_file(&hang).unwrap();
+        state(&manager, |s| {
+            matches!(s.state, ServiceState::Healthy { .. })
+        })
+        .await;
         cleanup(&manager, task).await;
     }
 
