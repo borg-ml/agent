@@ -59,11 +59,27 @@ pub enum HealthKind {
     McpInitialize,
 }
 
+/// How a requested restart replaces a running backend.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RestartMode {
+    /// Start the replacement on the other port beside the running backend
+    /// and switch the front over once it is healthy.
+    #[default]
+    Warm,
+    /// Stop the running backend first (graceful stop hook, then its cgroup
+    /// is killed and verified empty); the front answers 503 until the
+    /// replacement is healthy. For backends too large to run twice.
+    Cold,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RestartPolicy {
     pub max_restarts: u32,
     pub backoff_ms: u64,
     pub debounce_ms: u64,
+    #[serde(default)]
+    pub mode: RestartMode,
     /// Exit codes an active or candidate backend may end with to be
     /// relaunched after `backoff_ms` without counting as a failure toward
     /// `max_restarts` (`restarts` still counts it).
@@ -1790,10 +1806,31 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                     .await?;
                 }
             } else {
+                let cold = spec.restart.mode == RestartMode::Cold;
+                if cold {
+                    // Never two backends at once: this one is gone before the
+                    // replacement starts, and the front answers 503 meanwhile.
+                    transition(
+                        &dir,
+                        &mut status,
+                        &front,
+                        ServiceState::Restarting,
+                        reason.clone(),
+                        None,
+                    )
+                    .await?;
+                    let mut old = active.take().expect("active present");
+                    stop_child(&mut old.child, &spec, old.port, old.scope.as_deref()).await?;
+                    status.backend_pid = None;
+                    status.restarts += 1;
+                }
                 let port = next_port_after(&spec, last_port);
                 last_port = port;
                 match spawn_backend(&spec, port, &log, &scopes) {
                     Ok((child, scope)) => {
+                        if cold {
+                            status.backend_pid = child.id();
+                        }
                         candidate = Some(Backend {
                             child,
                             scope,
@@ -1813,7 +1850,13 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                         .await?;
                     }
                     Err(error) => {
-                        next_launch = now + backoff(&spec, failures + 1);
+                        if cold {
+                            // Nothing runs now; the ordinary launch path retries.
+                            failures += 1;
+                            next_launch = now + backoff(&spec, failures);
+                        } else {
+                            next_launch = now + backoff(&spec, failures + 1);
+                        }
                         transition(
                             &dir,
                             &mut status,
@@ -2334,6 +2377,7 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
                 max_restarts: 4,
                 backoff_ms: 50,
                 debounce_ms: 200,
+                mode: RestartMode::Warm,
                 transient_exit_codes: vec![],
                 defer_while: vec![],
             },
@@ -3750,6 +3794,75 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
             .unwrap()
             .unwrap();
         assert_eq!(manager.read_status("fake").unwrap().restarts, 1);
+    }
+
+    /// Failure mode: a cold-restart service (an editor too big to run twice)
+    /// starting its replacement while the old backend still runs, or its
+    /// front forwarding to a stopped backend.
+    #[tokio::test]
+    async fn cold_restart_stops_the_backend_before_starting_its_replacement() {
+        let (root, manager, front, task) =
+            setup_with(|spec| spec.restart.mode = RestartMode::Cold).await;
+        let before = manager.read_status("fake").unwrap();
+        let old = before.backend_pid.unwrap();
+        // The service keeps its lane lease throughout: an exclusive job can
+        // take the resource only by having the service yield.
+        let lanes = LaneStore::new(root.path()).unwrap();
+        let lease = || {
+            lanes
+                .snapshot()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.service_lease && matches!(r.state, TicketState::Granted(_)))
+                .map(|r| r.ticket.id)
+        };
+        let held = lease().expect("service lease");
+        let launches = root.path().join("launches");
+        let launched = || fs::read_to_string(&launches).unwrap().lines().count();
+        let first_launches = launched();
+        manager
+            .send(
+                "fake",
+                ServiceRequest::Restart {
+                    reason: "rebuilt".into(),
+                    force: false,
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut unavailable = false;
+        while launched() == first_launches {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no replacement launched"
+            );
+            unavailable |= get(front, "/health")
+                .await
+                .is_ok_and(|reply| reply.contains("503 Service Unavailable"));
+            assert_eq!(lease(), Some(held), "service lease released mid-restart");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !Path::new(&format!("/proc/{old}")).exists(),
+            "the replacement started while backend {old} still ran"
+        );
+        let restarted = state(&manager, |s| {
+            matches!(s.state, ServiceState::Healthy { .. })
+                && s.backend_pid.is_some_and(|pid| pid != old)
+        })
+        .await;
+        assert_eq!(restarted.restarts, before.restarts + 1);
+        assert_eq!(lease(), Some(held));
+        assert!(unavailable, "the front never answered 503 between backends");
+        assert!(
+            get(front, "/health")
+                .await
+                .unwrap()
+                .starts_with("HTTP/1.0 200")
+        );
+        cleanup(&manager, task).await;
     }
 
     /// Failure mode: an editor restart landing in the middle of a build of
