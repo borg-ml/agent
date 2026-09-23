@@ -3577,6 +3577,16 @@ async fn run_agent_session_store_kernel_inner(
                         journal.retain_latest_turn_checkpoint();
                         retained_context = None;
                     }
+                    Some(HostCommand::ResumeFromInterrupt {
+                        session_id: command_session_id,
+                    }) if command_session_id == session_id => {
+                        // The interrupting parent's follow-up is next in this
+                        // queue; without this it would be settled as a
+                        // background notification behind the stop latch.
+                        set_user_stop(&mut journal, &events, session_id, &mut user_stop, false)
+                            .await?;
+                        stale_user_prompts.clear();
+                    }
                     Some(HostCommand::Stop {
                         session_id: command_session_id,
                     }) if command_session_id == session_id => {
@@ -6063,6 +6073,7 @@ async fn run_agent_session_store_kernel_inner(
                             return Ok(());
                         }
                         HostCommand::ReleaseRetainedContext { .. }
+                        | HostCommand::ResumeFromInterrupt { .. }
                         | HostCommand::Launch { .. }
                         | HostCommand::Approve { .. }
                         | HostCommand::RespondToProviderInteraction { .. }
