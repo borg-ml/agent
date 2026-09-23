@@ -26,17 +26,6 @@ matching managed binary on macOS, Linux, and Windows. An existing `ffmpeg` on
 `PATH` is preferred. A custom `BORG_CLI_DICTATION_RECORD_COMMAND` remains fully
 user-managed and skips this dependency installation.
 
-## Ghostty bottom padding
+## Ghostty
 
-Ghostty windows are not always an exact multiple of the terminal cell height.
-The remaining pixels appear below the final terminal row and are outside
-Borg's drawable grid. To make the final Borg row extend through that padding,
-add this to the Ghostty configuration:
-
-```ini
-window-padding-color = extend-always
-```
-
-Ghostty applies this setting to newly opened windows and tabs. Optionally,
-`window-padding-balance = true` distributes leftover pixels across opposite
-edges instead of placing all of them at the bottom and right.
+For Borg's edge-to-edge terminal settings, see [terminal setup](terminal-setup.md#ghostty).

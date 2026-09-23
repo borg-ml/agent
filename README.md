@@ -44,6 +44,8 @@ borg bug
 borg extensions list
 ```
 
+For an edge-to-edge TUI in Ghostty, see the [terminal setup](docs/terminal-setup.md#ghostty).
+
 Use `/login` (or `/connect`) to choose ChatGPT subscription access or OpenAI
 API billing on this machine. Borg keeps the saved API key when you switch back
 to ChatGPT. ChatGPT login and token recovery are handled natively by Borg.
