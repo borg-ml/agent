@@ -291,18 +291,23 @@ fn diff_contents(
     before: Option<&[u8]>,
     after: Option<&[u8]>,
 ) -> Option<String> {
-    let old_file = if let Some(bytes) = before {
-        let mut file = tempfile::NamedTempFile::new().ok()?;
-        file.write_all(bytes).ok()?;
-        Some(file)
+    if before.is_none() && after.is_none() {
+        return None;
+    }
+    let mut old_file = tempfile::NamedTempFile::new().ok()?;
+    if let Some(bytes) = before {
+        old_file.write_all(bytes).ok()?;
+        old_file.flush().ok()?;
+    }
+    let new_file = if after.is_none() {
+        Some(tempfile::NamedTempFile::new().ok()?)
     } else {
         None
     };
-    let old = old_file
-        .as_ref()
-        .map_or_else(|| Path::new("/dev/null"), |file| file.path());
     let new_path = root.join(path);
-    let new = after.map_or_else(|| Path::new("/dev/null"), |_| new_path.as_path());
+    let new = new_file
+        .as_ref()
+        .map_or(new_path.as_path(), |file| file.path());
     let output = command_output(
         Command::new("git")
             .arg("--no-optional-locks")
@@ -310,7 +315,7 @@ fn diff_contents(
             .arg("--no-index")
             .arg("--no-ext-diff")
             .arg("--")
-            .arg(old)
+            .arg(old_file.path())
             .arg(new),
     )?;
     if !matches!(output.status.code(), Some(0 | 1)) {
@@ -335,6 +340,15 @@ fn diff_contents(
             patch.push_str(line);
         }
         patch.push('\n');
+    }
+    if patch.is_empty() {
+        // Two empty temporary files are byte-identical, but creating or
+        // deleting an empty file still changes the workspace.
+        patch = format!(
+            "diff --git a/{path} b/{path}\n--- {}\n+++ {}\n",
+            before.map_or_else(|| "/dev/null".to_string(), |_| format!("a/{path}")),
+            after.map_or_else(|| "/dev/null".to_string(), |_| format!("b/{path}")),
+        );
     }
     Some(patch)
 }
@@ -399,4 +413,34 @@ fn truncate_patch(mut patch: String, limit: usize) -> String {
         patch.push_str(MARKER);
     }
     patch
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Git sees real temporary files on both sides; `/dev/null` is only a
+    /// displayed diff label, so add/delete capture also works on Windows.
+    #[test]
+    fn add_and_delete_diffs_do_not_require_a_platform_null_device() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::write(root.path().join("new.rs"), "added\n").expect("new file");
+        let added =
+            diff_contents(root.path(), "new.rs", None, Some(b"added\n")).expect("addition diff");
+        assert!(added.contains("--- /dev/null"), "{added}");
+        assert!(added.contains("+++ b/new.rs"), "{added}");
+        assert!(added.contains("+added"), "{added}");
+
+        let removed =
+            diff_contents(root.path(), "old.rs", Some(b"removed\n"), None).expect("deletion diff");
+        assert!(removed.contains("--- a/old.rs"), "{removed}");
+        assert!(removed.contains("+++ /dev/null"), "{removed}");
+        assert!(removed.contains("-removed"), "{removed}");
+
+        fs::write(root.path().join("empty.rs"), b"").expect("empty file");
+        let empty =
+            diff_contents(root.path(), "empty.rs", None, Some(b"")).expect("empty addition diff");
+        assert!(empty.contains("--- /dev/null"), "{empty}");
+        assert!(empty.contains("+++ b/empty.rs"), "{empty}");
+    }
 }
