@@ -52,13 +52,24 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bench.simulate(tasks, "borg", ram_limit=5)
 
-    def test_per_agent_wait_distribution_matches_seeded_scenario(self):
-        result = bench.simulate(bench.workloads(6, 8, 23), "borg", scale=10)
-        self.assertEqual(len(result["per_agent_wait_seconds"]), 6)
-        self.assertEqual(result["per_agent_wait_seconds_p50"], 33.491)
-        self.assertEqual(result["per_agent_wait_seconds_p95"], 42.902)
-        self.assertAlmostEqual(sum(result["per_agent_wait_seconds"]) / 3600,
-                               result["agent_wait_hours"], places=4)
+    def test_seeded_metrics_match_documented_scenario(self):
+        # Makespan is shown to one decimal in benchmark.md; wait quantiles
+        # use the exact precision emitted in the public JSON output.
+        expected = {
+            "naive": (177.7, 89.5, 162.0),
+            "fifo": (174.9, 137.235, 159.213),
+            "borg": (57.4, 33.491, 42.902),
+        }
+        tasks = bench.workloads(6, 8, 23)
+        for policy, (makespan, p50, p95) in expected.items():
+            with self.subTest(policy=policy):
+                result = bench.simulate(tasks, policy, scale=10)
+                self.assertEqual(round(result["makespan_seconds"], 1), makespan)
+                self.assertEqual(len(result["per_agent_wait_seconds"]), 6)
+                self.assertEqual(result["per_agent_wait_seconds_p50"], p50)
+                self.assertEqual(result["per_agent_wait_seconds_p95"], p95)
+                self.assertAlmostEqual(sum(result["per_agent_wait_seconds"]) / 3600,
+                                       result["agent_wait_hours"], places=4)
 
     def test_seed_reproducible(self):
         tasks = bench.workloads(8, 9, 23)
