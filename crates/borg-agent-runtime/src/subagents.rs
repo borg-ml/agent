@@ -3095,6 +3095,7 @@ pub struct SubagentCoordinator {
     root_message_dispatches: Arc<Mutex<HashMap<Uuid, Instant>>>,
     projected_root_messages: Arc<Mutex<HashSet<Uuid>>>,
     consultation_lock: Arc<Mutex<()>>,
+    configure_lock: Arc<Mutex<()>>,
     wait_cursors: Arc<Mutex<HashMap<Uuid, wait::WaitCursor>>>,
 }
 
@@ -3131,6 +3132,7 @@ impl SubagentCoordinator {
             root_message_dispatches: Arc::new(Mutex::new(HashMap::new())),
             projected_root_messages: Arc::new(Mutex::new(HashSet::new())),
             consultation_lock: Arc::new(Mutex::new(())),
+            configure_lock: Arc::new(Mutex::new(())),
             wait_cursors: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -5799,6 +5801,114 @@ impl SubagentCoordinator {
         })
     }
 
+    /// Apply the same live session commands as /model and /effort. Wait for
+    /// the child's durable configuration event before returning its snapshot;
+    /// accepting a command into its channel is not proof the switch worked.
+    pub async fn configure_child(
+        &self,
+        target: &str,
+        provider: Option<CodingProvider>,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Result<SubagentSnapshot> {
+        ensure!(
+            provider.is_some() || model.is_some() || effort.is_some(),
+            "specify at least one of provider, model, or effort"
+        );
+        let _guard = self.configure_lock.lock().await;
+        let current = self.resolve_snapshot(target).await?;
+        let selected = provider.unwrap_or(current.provider);
+        if selected != current.provider {
+            ensure_provider_can_spawn(&self.root_launch, selected)?;
+        }
+        let model = model.map(|model| model.trim().to_string());
+        ensure!(model.as_deref().is_none_or(|model| !model.is_empty()), "model cannot be empty");
+        let effort = effort.map(|effort| effort.trim().to_ascii_lowercase());
+        ensure!(effort.as_deref().is_none_or(|effort| !effort.is_empty()), "effort cannot be empty");
+        if let Some(effort) = effort.as_deref() {
+            ensure!(
+                matches!(effort, "none" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"),
+                "effort must be one of none, low, medium, high, xhigh, max, or ultra"
+            );
+            validate_subagent_overrides(selected, None, Some(effort))?;
+        }
+        let expected_model = if selected != current.provider {
+            model.clone().or_else(|| {
+                selected
+                    .model_catalog()
+                    .map(|catalog| catalog.default_model.to_string())
+            })
+        } else {
+            model.clone().or_else(|| current.model.clone())
+        };
+        ensure!(
+            !selected.uses_native_harness() || expected_model.is_some(),
+            "{} requires a model; pass model=<id>",
+            selected.label()
+        );
+        let mut events = self.subscribe();
+        let id = current.session_id;
+        let lane_change = if selected != current.provider {
+            Some(crate::SessionConfigAction::SetProvider { provider: selected, model })
+        } else {
+            model.map(|model| crate::SessionConfigAction::SetModel { model })
+        };
+        if let Some(action) = lane_change {
+            self.send_command(target, |session_id| HostCommand::Configure { session_id, action })
+                .await?;
+            self.wait_for_child_config(&mut events, id, selected, expected_model.as_deref(), None)
+                .await?;
+        }
+        if let Some(effort) = effort {
+            self.send_command(target, |session_id| HostCommand::Configure {
+                session_id,
+                action: crate::SessionConfigAction::SetEffort { effort: effort.clone() },
+            })
+            .await?;
+            self.wait_for_child_config(&mut events, id, selected, expected_model.as_deref(), Some(&effort))
+                .await?;
+        }
+        self.resolve_snapshot(target).await
+    }
+
+    async fn wait_for_child_config(
+        &self,
+        events: &mut broadcast::Receiver<SubagentActivity>,
+        session_id: Uuid,
+        provider: CodingProvider,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match events.recv().await {
+                    Ok(SubagentActivity::SessionEvent { event, .. })
+                        if event.session_id == session_id =>
+                    {
+                        if let SessionEventKind::SessionConfigured {
+                            provider: actual_provider,
+                            model: actual_model,
+                            effort: actual_effort,
+                            ..
+                        } = event.kind
+                            && actual_provider == provider
+                            && actual_model.as_deref() == model
+                            && effort.is_none_or(|expected| actual_effort.as_deref() == Some(expected))
+                        {
+                            return Ok(());
+                        }
+                    }
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => {
+                        bail!("child activity channel closed before configuration was confirmed")
+                    }
+                }
+            }
+        })
+        .await
+        .with_context(|| format!("child {session_id} did not confirm its configuration within 30 seconds"))?
+    }
+
     /// Interrupt as the human (the UI path). `interrupt_agent` records its
     /// caller afterwards; here any earlier agent interrupt is forgotten, so a
     /// later human stop is never lifted by that agent's follow-up.
@@ -5970,6 +6080,17 @@ impl SubagentCoordinator {
             "list_agents" => {
                 let args: ListAgentsArgs = serde_json::from_value(arguments)?;
                 Ok(json!({ "agents": self.list(args.path_prefix.as_deref()).await }))
+            }
+            "configure_agent" => {
+                ensure!(
+                    actor_session_id == self.root_session_id,
+                    "only the director may configure child agents"
+                );
+                let args: ConfigureAgentArgs = serde_json::from_value(arguments)?;
+                let agent = self
+                    .configure_child(&args.target, args.provider, args.model, args.effort)
+                    .await?;
+                Ok(json!({ "agent": agent }))
             }
             "list_workspace_participants" => {
                 let _: NoArgs = serde_json::from_value(arguments)?;
@@ -6515,6 +6636,21 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": { "path_prefix": { "type": "string" } },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "configure_agent",
+            "Change a child agent's live provider, model, or effort without rotating, replacing its session, or losing its conversation. Takes effect on the next turn when a turn is running; returns only after the child records its new configuration. Use a target from list_agents. The director alone may call this; get_provider_capabilities before switching providers.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "target": { "type": "string", "minLength": 1 },
+                    "provider": { "type": "string", "enum": provider_choices },
+                    "model": { "type": "string", "minLength": 1 },
+                    "effort": { "type": "string", "enum": ["none", "low", "medium", "high", "xhigh", "max", "ultra"] }
+                },
+                "required": ["target"],
                 "additionalProperties": false
             }),
         ),
@@ -7447,7 +7583,7 @@ pub fn agent_tool_specs_for_surface(
         specs.retain(|spec| {
             !matches!(
                 spec["name"].as_str(),
-                Some("watch" | "list_watchers" | "await_watchers" | "stop_watcher")
+                Some("watch" | "list_watchers" | "await_watchers" | "stop_watcher" | "configure_agent")
             )
         });
     }
@@ -8079,6 +8215,15 @@ struct SpawnAgentArgs {
 #[serde(deny_unknown_fields)]
 struct ListAgentsArgs {
     path_prefix: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigureAgentArgs {
+    target: String,
+    provider: Option<CodingProvider>,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 #[derive(Deserialize)]

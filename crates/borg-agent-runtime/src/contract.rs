@@ -1638,6 +1638,14 @@ pub enum SubagentAction {
         request_id: Uuid,
         target: String,
     },
+    /// Change a child's live lane without replacing its session or transcript.
+    Configure {
+        request_id: Uuid,
+        target: String,
+        provider: Option<CodingProvider>,
+        model: Option<String>,
+        effort: Option<String>,
+    },
     Interrupt {
         request_id: Uuid,
         target: String,
@@ -1665,6 +1673,7 @@ impl SubagentAction {
             | Self::RecallPrompt { request_id, .. }
             | Self::FlushPendingInput { request_id, .. }
             | Self::ClearContext { request_id, .. }
+            | Self::Configure { request_id, .. }
             | Self::Interrupt { request_id, .. }
             | Self::Stop { request_id, .. }
             | Self::Approve { request_id, .. } => *request_id,
