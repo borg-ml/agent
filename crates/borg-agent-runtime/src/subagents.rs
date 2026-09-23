@@ -2713,6 +2713,10 @@ struct SubagentEntry {
     /// action wakes them. This prevents resuming an idle root from silently
     /// starting providers in the background.
     dormant: bool,
+    /// The agent whose `interrupt_agent` stopped this child's last turn. Its
+    /// next follow-up resumes the child; a stop the human made is not
+    /// recorded here and still holds against agent wakes.
+    interrupted_by: Option<Uuid>,
 }
 
 struct SubagentTable {
@@ -2726,7 +2730,9 @@ impl SubagentTable {
     fn reserve(&mut self, task_name: &str, launch: &LaunchSession) -> Result<SubagentSnapshot> {
         let task_name = canonical_task_name(task_name)?;
         if self.task_names.contains_key(&task_name) {
-            bail!("subagent task name already exists: {task_name}");
+            bail!(
+                "subagent task name already exists: {task_name}; use followup_task to give it more work"
+            );
         }
         let active = self
             .entries
@@ -2761,6 +2767,7 @@ impl SubagentTable {
                 inbox: Vec::new(),
                 assignment_claimed: false,
                 dormant: false,
+                interrupted_by: None,
             },
         );
         Ok(snapshot)
@@ -3524,6 +3531,7 @@ impl SubagentCoordinator {
                         inbox: Vec::new(),
                         assignment_claimed: false,
                         dormant: !snapshot.status.is_terminal() && !recovery_failed,
+                        interrupted_by: None,
                     },
                 );
             }
@@ -3713,7 +3721,7 @@ impl SubagentCoordinator {
             let mut table = self.table.lock().await;
             anyhow::ensure!(
                 !table.task_names.contains_key(&assignment_name),
-                "subagent task name already exists: {assignment_name}"
+                "subagent task name already exists: {assignment_name}; use followup_task to give it more work"
             );
             // Claim and rename under one lock. The name is what the roster,
             // `resolve`, and child-report attribution all key on, so a reused
@@ -5366,6 +5374,15 @@ impl SubagentCoordinator {
         }
         let mut messages = std::mem::take(&mut entry.inbox);
         messages.push(inbox_message);
+        if entry.interrupted_by == Some(actor_session_id)
+            && let Some(commands) = &entry.commands
+        {
+            commands
+                .send(HostCommand::ResumeFromInterrupt { session_id: id })
+                .await
+                .map_err(|_| anyhow::anyhow!("subagent command channel closed"))?;
+            entry.interrupted_by = None;
+        }
         for message in messages {
             send_prompt(entry, id, message).await?;
         }
@@ -5950,6 +5967,10 @@ impl SubagentCoordinator {
             "interrupt_agent" => {
                 let args: TargetArgs = serde_json::from_value(arguments)?;
                 self.interrupt(&args.target).await?;
+                let id = self.table.lock().await.resolve(&args.target)?;
+                if let Some(entry) = self.table.lock().await.entries.get_mut(&id) {
+                    entry.interrupted_by = Some(actor_session_id);
+                }
                 Ok(json!({ "accepted": true }))
             }
             "wait_agent" => {
@@ -6199,7 +6220,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "interrupt_agent",
-            "Interrupt a child agent's current turn.",
+            "Interrupt a child agent's current turn. The child then stays idle and ignores ordinary wakes until you give it more work: your next followup_task (or send_message with wake:true) to it resumes it.",
             target_schema(),
         ),
         tool(
@@ -8381,6 +8402,10 @@ async fn update_from_session_event(
         }
         SessionEventKind::StatusChanged { status, detail } => {
             entry.assignment_claimed = false;
+            if *status == SessionStatus::Running {
+                // Running again by any route: that interrupt is over.
+                entry.interrupted_by = None;
+            }
             entry.snapshot.status = match status {
                 SessionStatus::Starting => SubagentStatus::Starting,
                 SessionStatus::Running => SubagentStatus::Running,

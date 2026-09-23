@@ -6165,3 +6165,67 @@ async fn wait_agent_times_out_with_a_status_line_per_child_and_accepts_long_wait
     assert_eq!(args.timeout(), Duration::from_secs(600));
     scratch.discard().await;
 }
+
+#[tokio::test]
+async fn only_the_interrupting_agent_resumes_an_interrupted_child() {
+    let (_directory, scratch, coordinator, root, worker) = waiting_team().await;
+    let (commands, mut received) = mpsc::channel(8);
+    coordinator
+        .table
+        .lock()
+        .await
+        .entries
+        .get_mut(&worker)
+        .unwrap()
+        .commands = Some(commands);
+    let followup = |message: &'static str| {
+        let coordinator = coordinator.clone();
+        async move {
+            coordinator
+                .call_tool_as(
+                    root,
+                    "followup_task",
+                    json!({"target": "worker", "message": message}),
+                )
+                .await
+                .unwrap();
+        }
+    };
+
+    // A human stop (the UI path) is not released by an agent's follow-up.
+    coordinator.interrupt("worker").await.unwrap();
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::Interrupt { .. })
+    ));
+    followup("keep going").await;
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::TeamPrompt { .. })
+    ));
+
+    coordinator
+        .call_tool_as(root, "interrupt_agent", json!({"target": "worker"}))
+        .await
+        .unwrap();
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::Interrupt { .. })
+    ));
+    followup("resume with the smaller fix").await;
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::ResumeFromInterrupt { session_id }) if session_id == worker
+    ));
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::TeamPrompt { .. })
+    ));
+    followup("one more thing").await;
+    assert!(matches!(
+        received.recv().await,
+        Some(HostCommand::TeamPrompt { .. })
+    ));
+    assert!(received.try_recv().is_err());
+    scratch.discard().await;
+}
