@@ -7,7 +7,7 @@ description: "Build and test Cargo worktrees with bounded RAM, private targets a
 
 Run from the worktree root, not the canonical dirty checkout. The adapter is
 `extensions/native/native.py` (source) or `.borg/extensions/native/native.py` (installed) and uses `cargo check|build|test`
-with `-j` (at most 6, from MemAvailable with an 8 GiB reserve). It sets
+with `-j` (at most 6, from MemAvailable with an 8 GiB reserve plus 2 GiB fixed job overhead). It sets
 `CARGO_TARGET_DIR` to this worktree's `target/` and does not use `--release`.
 Pass additional Cargo args **after** `--` to avoid mixing adapter flags with
 Cargo flags:

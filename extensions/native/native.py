@@ -24,7 +24,9 @@ def available_ram() -> int:
 
 
 def jobs(bytes_per_job: int) -> int:
-    ram = max(0, available_ram() - 8 * GIB)
+    # The JobSpec also reserves a fixed 2 GiB for linker/test overhead; leave
+    # that outside the parallel-action budget so admission can grant the job.
+    ram = max(0, available_ram() - 10 * GIB)
     if ram < bytes_per_job:
         raise RuntimeError('insufficient available RAM for one native job')
     return min(6, os.cpu_count() or 1, ram // bytes_per_job)

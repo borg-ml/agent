@@ -19,7 +19,7 @@ def spec(data: Path, port: int) -> dict:
         'cwd': str(root.parent), 'env': [], 'resources': [],
         'memory_max_bytes': GIB,
         'admission': {'min_available_ram_bytes': 8 * GIB, 'reserve_ram_bytes': GIB,
-                      'min_free_disk_bytes': 60 * GIB, 'reserve_disk_bytes': GIB,
+                      'min_free_disk_bytes': 2 * GIB, 'reserve_disk_bytes': GIB,
                       'disk_path': str(root)},
         'health': {'argv': ['pg_isready', '-h', str(root.parent), '-p', str(port)],
                    'kind': 'command', 'interval_ms': 1000, 'timeout_ms': 3000},
@@ -46,6 +46,11 @@ def main() -> None:
             data.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             subprocess.run(['initdb', '-D', str(data), '--auth-local=peer',
                             '--auth-host=reject', '--no-instructions'], check=True)
+        cli = os.environ.get('BORG_NATIVE_BORG', 'borg')
+        existing = subprocess.run([cli, 'lane', 'service', 'status', 'test-postgres', '--json'],
+                                  capture_output=True, text=True)
+        if existing.returncode == 0 and json.loads(existing.stdout).get('state') != 'Stopped':
+            parser.error('test-postgres already running: inspect its endpoint/owner instead of replacing it')
         file.write_text(json.dumps(definition, indent=2) + '\n')
         file.chmod(0o600)
         subprocess.run([os.environ.get('BORG_NATIVE_BORG', 'borg'), 'lane', 'service', 'start', 'test-postgres',

@@ -18,7 +18,7 @@ python3 .borg/extensions/native/native.py ctest test # full gate
 ```
 
 The adapter selects a worktree-private `build/`, Release (for native C++), and
-`-j` from RAM (8 GiB reserve, 6-process cap). Override `--build-dir` only with
+`-j` from RAM (8 GiB reserve plus 2 GiB fixed overhead, 6-process cap). Override `--build-dir` only with
 a path **inside** that worktree. Pass raw CMake/ctest flags after `--`.
 `cmake_configure`, `cmake_build`, `ctest_fast`, `ctest_all` workflows are also
 registered as `/ext:native:<command>` in a project with the Blu

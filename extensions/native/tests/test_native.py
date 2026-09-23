@@ -21,7 +21,7 @@ spec.loader.exec_module(native)
 class NativePlannerTest(unittest.TestCase):
     def test_sizing_preserves_ram_and_caps_jobs(self):
         with patch.object(native, 'available_ram', return_value=14 * native.GIB):
-            self.assertEqual(native.jobs(2 * native.GIB), 3)
+            self.assertEqual(native.jobs(2 * native.GIB), 2)
         with patch.object(native, 'available_ram', return_value=8 * native.GIB):
             with self.assertRaisesRegex(RuntimeError, 'insufficient available RAM'):
                 native.jobs(native.GIB)
@@ -38,6 +38,10 @@ class NativePlannerTest(unittest.TestCase):
         self.assertEqual(pg.client_url('postgresql://me@localhost:55451/postgres', 'borg_native_123'),
                          'postgresql://me@localhost:55451/borg_native_123')
 
+    def test_database_credentials_never_enter_job_specs(self):
+        with self.assertRaisesRegex(ValueError, 'do not embed passwords'):
+            pg.client_url('postgresql://me:secret@localhost/postgres', 'client')
+
     def test_untracked_source_disables_coalescing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -47,6 +51,25 @@ class NativePlannerTest(unittest.TestCase):
             with patch.object(native, 'fingerprint', return_value='fingerprint'):
                 value = native.job_spec(root, 'cmake-build', ['cmake', '--build', str(root), '-j', '2'], {})
             self.assertFalse(value['coalesce'])
+
+    def test_failed_submit_keeps_database_and_lease(self):
+        import json
+        import subprocess
+        from contextlib import redirect_stderr
+        from io import StringIO
+        from uuid import NAMESPACE_OID, uuid5
+        owner = 'borg_native_' + '0' * 32
+        status = {'clients': [{'id': '11111111-1111-4111-8111-111111111111',
+                    'owner': {'participant_id': str(uuid5(NAMESPACE_OID, owner))}}]}
+        with patch.dict('os.environ', {'BORG_TEST_POSTGRES_ADMIN_URL': 'postgresql://me@localhost/postgres'}), \
+             patch.object(pg.sys, 'argv', ['postgres.py', '--', 'python3', 'native.py', 'cargo', 'test']), \
+             patch.object(pg, 'uuid4', return_value=type('Id', (), {'hex': '0' * 32})()), \
+             patch.object(pg, 'sql') as sql, \
+             patch.object(pg.subprocess, 'check_output', return_value=json.dumps(status)), \
+             patch.object(pg.subprocess, 'run', return_value=subprocess.CompletedProcess([], 3, '', '')), \
+             redirect_stderr(StringIO()):
+            self.assertEqual(pg.main(), 3)
+        sql.assert_called_once()  # CREATE; neither DROP nor release while submission is uncertain
 
     def test_database_cleanup_only_after_terminal_job(self):
         self.assertFalse(pg.terminal_job({'job': {'state': 'Queued'}}))
