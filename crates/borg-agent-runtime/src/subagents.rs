@@ -6784,7 +6784,7 @@ pub fn agent_tool_specs_for_surface(
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 128,
-                        "description": "Provider alias or model id, optionally with @EFFORT; examples: claude, gpt, claude-opus-5-5@high, or gpt-5.6-sol@xhigh."
+                        "description": "Provider alias or model id, optionally with @EFFORT; examples: claude, gpt, claude-opus-5-5@high, or gpt-6-sol@xhigh."
                     },
                     "prompt": {
                         "type": "string",
@@ -6936,7 +6936,7 @@ pub fn agent_tool_specs_for_surface(
                         "profile": {
                             "type": "string",
                             "maxLength": 128,
-                            "description": "Optional persistent peer profile such as claude, gpt, claude-opus-5-5@high, or gpt-5.6-sol@xhigh. Omit to choose the opposite provider automatically."
+                            "description": "Optional persistent peer profile such as claude, gpt, claude-opus-5-5@high, or gpt-6-sol@xhigh. Omit to choose the opposite provider automatically."
                         }
                     },
                     "required": ["prompt"],
@@ -6955,7 +6955,7 @@ pub fn agent_tool_specs_for_surface(
                         "profile": {
                             "type": "string",
                             "maxLength": 128,
-                            "description": "Optional target peer profile such as claude-opus-5-5@max or gpt-5.6-luna@max. Omit to use the opposite provider default."
+                            "description": "Optional target peer profile such as claude-opus-5-5@max or gpt-6-luna@max. Omit to use the opposite provider default."
                         },
                         "handoff": {
                             "type": "string",

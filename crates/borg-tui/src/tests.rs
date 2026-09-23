@@ -1504,7 +1504,7 @@ fn model_and_effort_pickers_use_the_provider_catalog() {
         effort_picker_options(Some(CodingProvider::Codex)),
         catalog.effort_levels
     );
-    assert!(values.contains(&"gpt-5.6-luna"));
+    assert!(values.contains(&"gpt-6-luna"));
     for (model, _) in borg_provider::CLAUDE_SELECTABLE_MODELS {
         assert!(values.contains(&model), "{model} missing from picker");
     }
@@ -1620,7 +1620,7 @@ fn model_picker_none_yields_no_open_ended_placeholder() {
     let options = model_picker_options(None::<CodingProvider>, None);
     // With None and no current, the dynamic arm returns empty; only catalogs render.
     // We still check that catalog providers remain selectable.
-    assert!(options.iter().any(|o| o.value == "gpt-5.6-luna"));
+    assert!(options.iter().any(|o| o.value == "gpt-6-luna"));
     assert!(options.iter().any(|o| o.value == "claude-fable-5-1"));
     assert!(!options.iter().any(|o| o.value == "claude-opus-5"));
 }
@@ -14439,7 +14439,7 @@ fn commit_message_model_spec_parses_with_default_effort() {
     assert_eq!(
         CommitMessageModel::parse(""),
         CommitMessageModel {
-            model: "gpt-5.6-luna".to_string(),
+            model: "gpt-6-luna".to_string(),
             effort: "low".to_string(),
         }
     );
