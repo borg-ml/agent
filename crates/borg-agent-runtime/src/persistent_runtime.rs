@@ -1002,8 +1002,8 @@ class RlmHandle:
     def send(self, message):
         return self.borg.tool("send_message", {"target": self.task_name or self.session_id, "message": message})
 
-    def wait(self, timeout_ms=30000):
-        return self.borg.tool("wait_agent", {"timeout_ms": timeout_ms})
+    def wait(self, timeout_ms=None):
+        return self.borg.tool("wait_agent", {} if timeout_ms is None else {"timeout_ms": timeout_ms})
 
 
 class Rlm:
@@ -1340,7 +1340,8 @@ const rlm = async (message, options = {}) => {
     followup: message_ => borg.tool("followup_task", {target, message: message_}),
     send: message_ => borg.tool("send_message", {target, message: message_}),
     interrupt: () => borg.tool("interrupt_agent", {target}),
-    wait: (timeout_ms = 30000) => borg.tool("wait_agent", {timeout_ms}),
+    wait: (timeout_ms = undefined) =>
+      borg.tool("wait_agent", timeout_ms === undefined ? {} : {timeout_ms}),
   };
 };
 rlm.list = async (pathPrefix = undefined) => (await borg.tool("list_agents", pathPrefix === undefined ? {} : {path_prefix: pathPrefix})).agents || [];
