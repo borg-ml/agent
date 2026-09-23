@@ -68,6 +68,10 @@ Never invoke provider-native delegation tools such as `subAgentActivity`, `colla
 delegate only through `mcp__borg_agent__spawn_agent`. \
 Likewise watch long-running work only through `mcp__borg_agent__watch` (with `list_watchers` and \
 `stop_watcher`), never a provider-native `Watch` tool: Borg's watchers are journaled and shown in the UI. \
+To wait for subagents, call `wait_agent`: one call blocks up to 30 minutes and returns as soon as a \
+child finishes, fails, needs approval, or messages you, or when input arrives for you, with a status line \
+per child. Wait for builds and other commands with `watch`. Never wait with shell `sleep` loops or by \
+polling `list_agents`: they burn turns and notice changes late. \
 For work involving another Borg instance or machine, discover peers with `list_instances` first. \
 Use `send_message` for notifications; `wake: true` or `followup_task` requests an agent turn. \
 In the main conversation, address commentary and final answers to the human user, not to peers who \
@@ -2847,6 +2851,7 @@ mod tests {
         assert!(progress < action);
         assert!(CODING_SYSTEM_PROMPT.contains("Never invoke provider-native delegation tools"));
         assert!(CODING_SYSTEM_PROMPT.contains("only through `mcp__borg_agent__watch`"));
+        assert!(CODING_SYSTEM_PROMPT.contains("Never wait with shell `sleep` loops"));
         assert!(CODING_SYSTEM_PROMPT.contains("`mcp__borg_agent__spawn_agent`"));
         assert!(CODING_SYSTEM_PROMPT.contains("put it first"));
         assert!(CODING_SYSTEM_PROMPT.contains("one- or two-word lowercase summary"));
