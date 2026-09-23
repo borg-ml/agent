@@ -806,7 +806,7 @@ fn lost_queued_supervisor_runs_terminal_hook_on_recovery() {
             .filter(|text| text.contains("125|finished|job") && text.contains("lost supervisor"))
     });
     let row = lane.record(&id).unwrap();
-    assert!(row.post_hook_completed);
+    assert_eq!(row.post_hook_completed, Some(true));
     let _: Value = lane.json(&["job", "cancel", &held]);
     lane.wait(&held, CANCELLED);
 }

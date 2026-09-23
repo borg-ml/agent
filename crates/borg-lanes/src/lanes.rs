@@ -279,8 +279,9 @@ pub struct LaneRecord {
     /// Fenced under the journal lock: a recovery/supervisor race never launches two hooks.
     #[serde(default)]
     pub post_hook_started: bool,
+    /// None is a pre-C5 record: old terminal rows already completed under the old supervisor.
     #[serde(default)]
-    pub post_hook_completed: bool,
+    pub post_hook_completed: Option<bool>,
     pub evidence: Option<String>,
 }
 
@@ -297,6 +298,15 @@ struct Journal {
 // Keep a bounded history in the admission snapshot. Quarantines, pending
 // service resumes, and terminal hooks still needing delivery must not be pruned.
 const TERMINAL_HISTORY_LIMIT: usize = 2048;
+fn post_hook_delivered(row: &LaneRecord) -> bool {
+    row.post_hook_completed.unwrap_or(
+        matches!(
+            row.state,
+            TicketState::Finished | TicketState::Cancelled { .. }
+        ) && !row.post_hook_started,
+    )
+}
+
 fn prunable(row: &LaneRecord) -> bool {
     matches!(
         row.state,
@@ -307,7 +317,7 @@ fn prunable(row: &LaneRecord) -> bool {
             .spec
             .as_ref()
             .is_none_or(|spec| spec.post_hook.is_none())
-            || row.post_hook_completed)
+            || post_hook_delivered(row))
 }
 impl Journal {
     fn prune_terminal(&mut self) {
@@ -844,7 +854,7 @@ impl LaneStore {
             resume_attempts: 0,
             cancel_requested: None,
             post_hook_started: false,
-            post_hook_completed: false,
+            post_hook_completed: Some(false),
             evidence: None,
         });
         Ok((ticket, job))
@@ -1017,7 +1027,7 @@ impl LaneStore {
             .spec
             .as_ref()
             .is_none_or(|spec| spec.post_hook.is_none())
-            || row.post_hook_completed)
+            || post_hook_delivered(&row))
         {
             return row.job.context("job record missing handle");
         }
@@ -1045,7 +1055,7 @@ impl LaneStore {
                 .iter_mut()
                 .find(|r| r.ticket.id == id)
                 .context("unknown job")?;
-            if record.post_hook_completed
+            if post_hook_delivered(record)
                 || record
                     .spec
                     .as_ref()
@@ -1077,7 +1087,7 @@ impl LaneStore {
                     .iter_mut()
                     .find(|r| r.ticket.id == id)
                     .context("job vanished after post hook")?
-                    .post_hook_completed = true;
+                    .post_hook_completed = Some(true);
                 Ok(())
             })?;
         }
@@ -2574,7 +2584,7 @@ impl LaneStore {
                 .spec
                 .as_ref()
                 .is_some_and(|spec| spec.post_hook.is_some())
-                && !record.post_hook_completed;
+                && !post_hook_delivered(&record);
             if (!matches!(
                 record.state,
                 TicketState::Granted(_) | TicketState::Queued | TicketState::Preparing
@@ -2921,7 +2931,7 @@ mod tests {
             resume_attempts: 0,
             cancel_requested: None,
             post_hook_started: false,
-            post_hook_completed: false,
+            post_hook_completed: Some(false),
             evidence: None,
         }
     }
