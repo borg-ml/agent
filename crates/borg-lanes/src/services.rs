@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::lanes::{
-    Access, AdmissionBudget, Holder, Hook, LaneStore, Lease, LeaseRequest, ResourceRequest,
+    Access, AdmissionBudget, Holder, Hook, LaneStore, Lease, LeaseRequest, ResourceKey,
+    ResourceRequest, ResourceScope, TicketState,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,6 +69,11 @@ pub struct RestartPolicy {
     /// `max_restarts` (`restarts` still counts it).
     #[serde(default)]
     pub transient_exit_codes: Vec<i32>,
+    /// A pending restart (warm or cold) waits while any Granted or
+    /// Preparing lane ticket other than this service's own lease holds one
+    /// of these keys, so it never lands during, say, a build of the tree.
+    #[serde(default)]
+    pub defer_while: Vec<ResourceKey>,
 }
 
 impl RestartPolicy {
@@ -338,6 +344,9 @@ fn valid_spec(spec: &ServiceSpec) -> Result<()> {
     );
     for resource in &spec.resources {
         resource.key.validate_canonical()?;
+    }
+    for key in &spec.restart.defer_while {
+        key.validate_canonical()?;
     }
     if let ClientMode::Shared { max_clients } = spec.client_mode {
         ensure!(
@@ -1296,12 +1305,48 @@ impl ServiceGate {
             .and_then(|r| r.wait_reason.clone())
             .unwrap_or_else(|| "waiting for lane resource admission".into()))
     }
+    /// Why a pending restart must wait: the first Granted or Preparing
+    /// ticket, other than this service's own lease, holding one of `keys`.
+    fn restart_deferral(&self, keys: &[ResourceKey]) -> Result<Option<String>> {
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        let own = self.request.holder.participant_id;
+        Ok(self.store.snapshot()?.iter().find_map(|record| {
+            let holds = matches!(
+                record.state,
+                TicketState::Granted(_) | TicketState::Preparing
+            );
+            let ours = record.service_lease && record.request.holder.participant_id == own;
+            let key = record
+                .request
+                .resources
+                .iter()
+                .find(|held| keys.contains(&held.key))?;
+            (holds && !ours).then(|| {
+                format!(
+                    "restart deferred: {} held by ticket {}",
+                    key_label(&key.key),
+                    record.ticket.id
+                )
+            })
+        }))
+    }
     fn release(&mut self) -> Result<()> {
         if let Some(lease) = &self.lease {
             self.store.release_lease(lease)?;
             self.lease = None;
         }
         Ok(())
+    }
+}
+
+/// A resource key for status reasons: its name and scope.
+fn key_label(key: &ResourceKey) -> String {
+    match &key.scope {
+        ResourceScope::Host => format!("{} (host)", key.name),
+        ResourceScope::Project(path) => format!("{} (project {})", key.name, path.display()),
+        ResourceScope::Worktree(path) => format!("{} (worktree {})", key.name, path.display()),
     }
 }
 
@@ -1641,6 +1686,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                     if let Some(mut old) = old {
                         stop_child(&mut old.child, &spec, old.port, old.scope.as_deref()).await?;
                         status.restarts += 1;
+                        publish(&dir, &status)?;
                     }
                 }
             }
@@ -1731,41 +1777,55 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
             && now.saturating_sub(*requested) >= spec.restart.debounce_ms
             && now >= next_launch
         {
-            let port = next_port_after(&spec, last_port);
-            last_port = port;
-            match spawn_backend(&spec, port, &log, &scopes) {
-                Ok((child, scope)) => {
-                    candidate = Some(Backend {
-                        child,
-                        scope,
-                        port,
-                        started_ms: now,
-                        last_probe_ms: 0,
-                        unhealthy_since_ms: None,
-                    });
+            if let Some(deferred) = gate.restart_deferral(&spec.restart.defer_while)? {
+                if status.reason != deferred {
                     transition(
                         &dir,
                         &mut status,
                         &front,
-                        ServiceState::Restarting,
-                        reason.clone(),
+                        ServiceState::RestartPending,
+                        deferred,
                         active.as_ref().and_then(|b| b.port),
                     )
                     .await?;
                 }
-                Err(error) => {
-                    next_launch = now + backoff(&spec, failures + 1);
-                    transition(
-                        &dir,
-                        &mut status,
-                        &front,
-                        ServiceState::Degraded {
-                            reason: error.to_string(),
-                        },
-                        format!("restart launch failed: {error}"),
-                        active.as_ref().and_then(|b| b.port),
-                    )
-                    .await?;
+            } else {
+                let port = next_port_after(&spec, last_port);
+                last_port = port;
+                match spawn_backend(&spec, port, &log, &scopes) {
+                    Ok((child, scope)) => {
+                        candidate = Some(Backend {
+                            child,
+                            scope,
+                            port,
+                            started_ms: now,
+                            last_probe_ms: 0,
+                            unhealthy_since_ms: None,
+                        });
+                        transition(
+                            &dir,
+                            &mut status,
+                            &front,
+                            ServiceState::Restarting,
+                            reason.clone(),
+                            active.as_ref().and_then(|b| b.port),
+                        )
+                        .await?;
+                    }
+                    Err(error) => {
+                        next_launch = now + backoff(&spec, failures + 1);
+                        transition(
+                            &dir,
+                            &mut status,
+                            &front,
+                            ServiceState::Degraded {
+                                reason: error.to_string(),
+                            },
+                            format!("restart launch failed: {error}"),
+                            active.as_ref().and_then(|b| b.port),
+                        )
+                        .await?;
+                    }
                 }
             }
         }
@@ -2275,6 +2335,7 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
                 backoff_ms: 50,
                 debounce_ms: 200,
                 transient_exit_codes: vec![],
+                defer_while: vec![],
             },
             endpoint: Some(Endpoint {
                 listen: format!("127.0.0.1:{front}"),
@@ -3689,6 +3750,65 @@ with open(sys.argv[4], 'a') as out: out.write(owner+chr(10))",
             .unwrap()
             .unwrap();
         assert_eq!(manager.read_status("fake").unwrap().restarts, 1);
+    }
+
+    /// Failure mode: an editor restart landing in the middle of a build of
+    /// its tree, or a status that does not say what it waits for.
+    #[tokio::test]
+    async fn a_pending_restart_waits_while_a_deferring_key_is_held() {
+        let build = ResourceKey {
+            scope: ResourceScope::Host,
+            name: "build".into(),
+        };
+        // The service's own lease on its bound key never defers it.
+        let (root, manager, _front, task) = setup_with(|spec| {
+            spec.restart.defer_while = vec![build.clone(), spec.resources[0].key.clone()]
+        })
+        .await;
+        let lanes = LaneStore::new(root.path()).unwrap();
+        let ticket = lanes
+            .enqueue_lease(LeaseRequest {
+                resources: vec![ResourceRequest {
+                    key: build.clone(),
+                    access: Access::Exclusive,
+                }],
+                holder: owner(),
+                queue_timeout_ms: None,
+            })
+            .unwrap();
+        let lease = crate::lanes::LaneCoordinator::wait(&lanes, &ticket)
+            .await
+            .unwrap();
+        let before = manager.read_status("fake").unwrap();
+        manager
+            .send(
+                "fake",
+                ServiceRequest::Restart {
+                    reason: "rebuilt".into(),
+                    force: false,
+                },
+                Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        // Well past the 200 ms debounce, it still waits and says why.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let deferred = manager.read_status("fake").unwrap();
+        assert!(
+            matches!(deferred.state, ServiceState::RestartPending)
+                && deferred
+                    .reason
+                    .contains(&format!("build (host) held by ticket {}", ticket.id)),
+            "{deferred:?}"
+        );
+        assert_eq!(deferred.backend_pid, before.backend_pid);
+        lanes.release_lease(&lease).unwrap();
+        let restarted = state(&manager, |s| {
+            s.restarts > before.restarts && matches!(s.state, ServiceState::Healthy { .. })
+        })
+        .await;
+        assert_ne!(restarted.backend_pid, before.backend_pid);
+        cleanup(&manager, task).await;
     }
 
     /// Failure mode: a replacement that exits with a transient code before it
