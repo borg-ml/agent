@@ -108,6 +108,7 @@ pub(crate) enum Ineligible {
     /// The route bills a subscription. A refresh consumes quota, and the
     /// API prices Borg knows are not what the user pays, so the saving a
     /// decision would be justified by is not a real number here.
+    #[cfg(feature = "subscription-adapters")]
     SubscriptionQuota,
     /// Extended thinking is enabled on this route with a thinking budget the
     /// provider keys the cached prefix on. A refresh replays the request under
@@ -132,6 +133,7 @@ impl Ineligible {
                 "no price or reported cost for this model, so a refresh cannot be justified"
                     .to_string()
             }
+            #[cfg(feature = "subscription-adapters")]
             Self::SubscriptionQuota => {
                 "this route spends subscription quota, which Borg cannot price against a cache miss"
                     .to_string()

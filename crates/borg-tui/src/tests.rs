@@ -4502,7 +4502,8 @@ fn incremental_transcript_render_matches_a_full_render_through_a_live_session() 
             matches!(entry, TranscriptEntry::Tool { code_view: Some((language, _)), .. } if language == "reasoning")
         })
         .unwrap();
-    let interactions: [(&str, Box<dyn Fn(&mut Transcript)>); 5] = [
+    type Interaction<'a> = (&'static str, Box<dyn Fn(&mut Transcript) + 'a>);
+    let interactions: [Interaction<'_>; 5] = [
         (
             "expand first run",
             Box::new(|transcript| {
