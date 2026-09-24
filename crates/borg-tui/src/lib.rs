@@ -1589,6 +1589,7 @@ pub struct BorgTerminal {
     git_commit_hovered: bool,
     status: SessionStatus,
     interrupt_requested: bool,
+    interrupt_requested_at: Option<Instant>,
     connection_retry_at: Option<DateTime<Utc>>,
     /// Which attempt of the bounded resend chain the countdown belongs to, as
     /// the runtime reported it. Shown in the status line so a session waiting on
@@ -2831,6 +2832,7 @@ impl BorgTerminal {
             git_commit_hovered: false,
             status: SessionStatus::Starting,
             interrupt_requested: false,
+            interrupt_requested_at: None,
             connection_retry_at: None,
             connection_retry_attempt: None,
             usage_retry_at: None,
@@ -4470,9 +4472,21 @@ impl BorgTerminal {
         } else {
             status
         };
+        // A repeated Esc resends the interrupt: an earlier request may have
+        // raced a turn boundary, and Esc must never look dead.
+        if self.interrupt_requested
+            && status_control_is_actionable(interrupt_status)
+            && self
+                .interrupt_requested_at
+                .is_some_and(|at| at.elapsed() >= INTERRUPT_RESEND_AFTER)
+        {
+            self.interrupt_requested_at = Some(Instant::now());
+            return true;
+        }
         if !claim_interrupt(&mut self.interrupt_requested, interrupt_status) {
             return false;
         }
+        self.interrupt_requested_at = Some(Instant::now());
         if status == SessionStatus::Running {
             self.transcript.order.push(TranscriptEntry::Activity {
                 text: USER_INTERRUPT_ACTIVITY.to_string(),
@@ -4484,6 +4498,12 @@ impl BorgTerminal {
             self.event_redraw_needed = true;
         }
         true
+    }
+
+    /// Esc stops an active turn even with input queued: the runtime sends
+    /// that input as the next turn, so stopping never waits behind it.
+    fn escape_interrupts_turn(&self) -> bool {
+        status_control_is_actionable(self.active_status())
     }
 
     fn has_pending_input_for_escape(&self) -> bool {
@@ -9867,7 +9887,7 @@ impl BorgTerminal {
         }
         if let Some(target) = focused_child_interrupt_target(&self.keymap, &key, self.focused_child)
         {
-            if !ctrl_c && self.has_pending_input_for_escape() {
+            if !ctrl_c && self.has_pending_input_for_escape() && !self.escape_interrupts_turn() {
                 return Ok(self.flush_pending_input());
             }
             return Ok(if self.begin_user_interrupt() {
@@ -9900,6 +9920,7 @@ impl BorgTerminal {
         if !ctrl_c
             && self.keymap.matches(KeyAction::Interrupt, &key)
             && self.has_pending_input_for_escape()
+            && !self.escape_interrupts_turn()
         {
             return Ok(self.flush_pending_input());
         }
@@ -15696,6 +15717,8 @@ fn status_control_is_actionable(status: SessionStatus) -> bool {
         SessionStatus::Starting | SessionStatus::Running | SessionStatus::WaitingForApproval
     )
 }
+
+const INTERRUPT_RESEND_AFTER: Duration = Duration::from_millis(500);
 
 fn claim_interrupt(requested: &mut bool, status: SessionStatus) -> bool {
     if *requested || !status_control_is_actionable(status) {

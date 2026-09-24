@@ -5243,227 +5243,8 @@ async fn run_agent_session_store_kernel_inner(
                     }
                     break;
                 }
-                // The actor owns the journal; an append from another task
-                // would leave the live context behind and change replay.
-                activity = child_activity_rx.recv(), if child_activity_open => {
-                    let Some(activity) = activity else {
-                        // The forwarder is gone, so nothing can arrive on this
-                        // channel again.
-                        child_activity_open = false;
-                        continue;
-                    };
-                    record_subagent_activity(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        subagents.as_ref().expect("child activity requires coordinator"),
-                        &watches,
-                        activity,
-                    ).await?;
-                }
-                message = root_message_rx.recv(), if owns_team => {
-                    match message {
-                        Ok(message) => {
-                            team_message_ids.insert(message.message_id);
-                            deferred_commands.push_front(HostCommand::TeamPrompt {
-                                session_id,
-                                message_id: message.message_id,
-                                text: message.text,
-                                attachments: message.attachments,
-                                output_schema: None,
-                                delivery: message.delivery,
-                            });
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => {}
-                    }
-                }
-                _ = root_inbox_tick.tick(), if owns_team => {
-                    refresh_durable_root_inbox(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        subagents.as_ref().expect("team inbox requires coordinator"),
-                        &watches,
-                    ).await?;
-                }
-                // Suspended while a human owns the turn: an operator may sit on
-                // an approval or a provider question indefinitely without the
-                // worker being stalled.
-                _ = watchdog_poll.tick(), if pending_approval.is_none()
-                    && pending_provider_interaction.is_none() => {
-                    let error = match watchdog.verdict() {
-                        WatchdogVerdict::Healthy => continue,
-                        WatchdogVerdict::Stalling(detail) => {
-                            // Visible, non-terminal: the user learns the worker
-                            // went quiet long before we give up on it.
-                            record(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                SessionEventKind::StatusChanged {
-                                    status: SessionStatus::Running,
-                                    detail: Some(detail),
-                                },
-                            ).await?;
-                            continue;
-                        }
-                        WatchdogVerdict::Expired(error) => error,
-                    };
-                    subscription_context_reusable = false;
-                    running.0.abort();
-                    let _ = (&mut running.0).await;
-                    // Cleanup failure is part of the user-visible story: it is
-                    // why processes may still be alive after the turn ends.
-                    let error = match stop_session_bounded(&executor, session_id, TURN_WATCHDOG_STOP_TIMEOUT).await {
-                        Some(cleanup) => format!("{error}; {cleanup}"),
-                        None => error,
-                    };
-                    deny_pending_approval(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        &mut pending_approval,
-                    ).await?;
-                    cancel_pending_provider_interaction(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        &mut pending_provider_interaction,
-                    ).await?;
-                    if autonomy_result_sender.is_some() {
-                        autonomy_result = Some(Err(anyhow::anyhow!(
-                            "autonomy turn liveness timeout"
-                        )));
-                    }
-                    flush_awaiting_steers(
-                        &mut steers_awaiting_consumption,
-                        interrupted,
-                        &mut journal,
-                        &events,
-                        session_id,
-                    )
-                    .await?;
-                    promote_uncommitted_steers(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        &mut pending,
-                        &mut pending_steers,
-                        executor.uses_native_harness(launch.provider),
-                    )
-                    .await?;
-                    record(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        SessionEventKind::Error { message: error.clone() },
-                    ).await?;
-                    if prompt.visible {
-                        record_prompt_status(
-                            &mut journal,
-                            &events,
-                            session_id,
-                            &prompt,
-                            MessageStatus::Failed,
-                            prompt.delivery,
-                        )
-                        .await?;
-                    }
-                    record(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        SessionEventKind::TurnCompleted {
-                            message_id: prompt.message_id,
-                            provider_session_id: provider_session_id.clone(),
-                            final_text: String::new(),
-                            error: Some(error.clone()),
-                        },
-                    ).await?;
-                    next_ready_detail = Some(format!(
-                        "Turn failed; the session remains available: {error}"
-                    ));
-                    break;
-                }
-                _ = watches.changed.notified() => {
-                    let snapshot = watches.summaries().await;
-                    record(
-                        &mut journal,
-                        &events,
-                        session_id,
-                        SessionEventKind::WatchesChanged { watches: snapshot },
-                    )
-                    .await?;
-                }
-                steer_result = steer_results.recv(), if !pending_steers.is_empty() => {
-                    let Some((acknowledgement_id, acknowledgement)) = steer_result else {
-                        continue;
-                    };
-                    let Some(index) = pending_steers
-                        .iter()
-                        .position(|steer| steer.acknowledgement_id == acknowledgement_id)
-                    else {
-                        continue;
-                    };
-                    if pending_steers[index].admission.is_accepted() {
-                        // An admission receipt says the provider took the
-                        // text, not that the model was given it. Under the
-                        // native harness the steer stays pending until the
-                        // fold is journaled, so acceptance settles nothing
-                        // and there is deliberately nothing to do here --
-                        // `retry_pending_steers` skips an accepted admission,
-                        // so it is not re-dispatched while it waits. This has
-                        // to be its own arm: falling through to the rejection
-                        // branch would log an accepted steer as refused and
-                        // send it back round at the next boundary, handing
-                        // the model the same words twice.
-                        if !executor.uses_native_harness(launch.provider) {
-                            for steer in pending_steers.iter_mut().filter(|steer| steer.acknowledgement_id == acknowledgement_id) {
-                                steer.state = PendingSteerState::Accepted;
-                            }
-                            settle_accepted_steers(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                &mut pending_steers,
-                                provider_reports_steer_consumption(launch.provider),
-                                &mut steers_awaiting_consumption,
-                            )
-                            .await?;
-                        }
-                    } else {
-                        let error = acknowledgement.err().unwrap_or_else(|| {
-                            "provider acknowledged the steer without accepting admission"
-                                .to_string()
-                        });
-                        {
-                            tracing::warn!(
-                                %acknowledgement_id,
-                                %error,
-                                "provider rejected active-turn steer; retaining it for the next boundary"
-                            );
-                            // The rejection is transient and the steer retries
-                            // at the next boundary, so it keeps its steer
-                            // delivery. It is nonetheless unconsumed, which is
-                            // what makes it honestly recallable meanwhile.
-                            for steer in pending_steers.iter_mut().filter(|steer| steer.acknowledgement_id == acknowledgement_id) {
-                                steer.state = PendingSteerState::RetryAtBoundary { error: error.clone() };
-                            }
-                            let boundary_already_passed = pending_steers[index].attempt_boundary
-                                < steer_boundary_generation;
-                            if boundary_already_passed && !context_compaction_in_progress && !user_stop && !interrupted {
-                                retry_pending_steers(
-                                    &control_tx,
-                                    &steer_result_tx,
-                                    &mut pending_steers,
-                                    steer_boundary_generation, launch.capabilities.frames_steers_for(launch.provider, launch.model.as_deref()),
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                }
+                // Commands (interrupts, steers) outrank team and watchdog
+                // traffic: a busy team must not delay the person's Esc.
                 command = next_host_command(&mut deferred_commands, &mut commands) => {
                     let Some(command) = command else {
                         running.0.abort();
@@ -6248,6 +6029,227 @@ async fn run_agent_session_store_kernel_inner(
                         | HostCommand::CancelWorkspaceCommand { .. }
                         | HostCommand::ShellCommand { .. }
                         | HostCommand::OpenTerminal { .. } => {}
+                    }
+                }
+                // The actor owns the journal; an append from another task
+                // would leave the live context behind and change replay.
+                activity = child_activity_rx.recv(), if child_activity_open => {
+                    let Some(activity) = activity else {
+                        // The forwarder is gone, so nothing can arrive on this
+                        // channel again.
+                        child_activity_open = false;
+                        continue;
+                    };
+                    record_subagent_activity(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        subagents.as_ref().expect("child activity requires coordinator"),
+                        &watches,
+                        activity,
+                    ).await?;
+                }
+                message = root_message_rx.recv(), if owns_team => {
+                    match message {
+                        Ok(message) => {
+                            team_message_ids.insert(message.message_id);
+                            deferred_commands.push_front(HostCommand::TeamPrompt {
+                                session_id,
+                                message_id: message.message_id,
+                                text: message.text,
+                                attachments: message.attachments,
+                                output_schema: None,
+                                delivery: message.delivery,
+                            });
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => {}
+                    }
+                }
+                _ = root_inbox_tick.tick(), if owns_team => {
+                    refresh_durable_root_inbox(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        subagents.as_ref().expect("team inbox requires coordinator"),
+                        &watches,
+                    ).await?;
+                }
+                // Suspended while a human owns the turn: an operator may sit on
+                // an approval or a provider question indefinitely without the
+                // worker being stalled.
+                _ = watchdog_poll.tick(), if pending_approval.is_none()
+                    && pending_provider_interaction.is_none() => {
+                    let error = match watchdog.verdict() {
+                        WatchdogVerdict::Healthy => continue,
+                        WatchdogVerdict::Stalling(detail) => {
+                            // Visible, non-terminal: the user learns the worker
+                            // went quiet long before we give up on it.
+                            record(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                SessionEventKind::StatusChanged {
+                                    status: SessionStatus::Running,
+                                    detail: Some(detail),
+                                },
+                            ).await?;
+                            continue;
+                        }
+                        WatchdogVerdict::Expired(error) => error,
+                    };
+                    subscription_context_reusable = false;
+                    running.0.abort();
+                    let _ = (&mut running.0).await;
+                    // Cleanup failure is part of the user-visible story: it is
+                    // why processes may still be alive after the turn ends.
+                    let error = match stop_session_bounded(&executor, session_id, TURN_WATCHDOG_STOP_TIMEOUT).await {
+                        Some(cleanup) => format!("{error}; {cleanup}"),
+                        None => error,
+                    };
+                    deny_pending_approval(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        &mut pending_approval,
+                    ).await?;
+                    cancel_pending_provider_interaction(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        &mut pending_provider_interaction,
+                    ).await?;
+                    if autonomy_result_sender.is_some() {
+                        autonomy_result = Some(Err(anyhow::anyhow!(
+                            "autonomy turn liveness timeout"
+                        )));
+                    }
+                    flush_awaiting_steers(
+                        &mut steers_awaiting_consumption,
+                        interrupted,
+                        &mut journal,
+                        &events,
+                        session_id,
+                    )
+                    .await?;
+                    promote_uncommitted_steers(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        &mut pending,
+                        &mut pending_steers,
+                        executor.uses_native_harness(launch.provider),
+                    )
+                    .await?;
+                    record(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        SessionEventKind::Error { message: error.clone() },
+                    ).await?;
+                    if prompt.visible {
+                        record_prompt_status(
+                            &mut journal,
+                            &events,
+                            session_id,
+                            &prompt,
+                            MessageStatus::Failed,
+                            prompt.delivery,
+                        )
+                        .await?;
+                    }
+                    record(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        SessionEventKind::TurnCompleted {
+                            message_id: prompt.message_id,
+                            provider_session_id: provider_session_id.clone(),
+                            final_text: String::new(),
+                            error: Some(error.clone()),
+                        },
+                    ).await?;
+                    next_ready_detail = Some(format!(
+                        "Turn failed; the session remains available: {error}"
+                    ));
+                    break;
+                }
+                _ = watches.changed.notified() => {
+                    let snapshot = watches.summaries().await;
+                    record(
+                        &mut journal,
+                        &events,
+                        session_id,
+                        SessionEventKind::WatchesChanged { watches: snapshot },
+                    )
+                    .await?;
+                }
+                steer_result = steer_results.recv(), if !pending_steers.is_empty() => {
+                    let Some((acknowledgement_id, acknowledgement)) = steer_result else {
+                        continue;
+                    };
+                    let Some(index) = pending_steers
+                        .iter()
+                        .position(|steer| steer.acknowledgement_id == acknowledgement_id)
+                    else {
+                        continue;
+                    };
+                    if pending_steers[index].admission.is_accepted() {
+                        // An admission receipt says the provider took the
+                        // text, not that the model was given it. Under the
+                        // native harness the steer stays pending until the
+                        // fold is journaled, so acceptance settles nothing
+                        // and there is deliberately nothing to do here --
+                        // `retry_pending_steers` skips an accepted admission,
+                        // so it is not re-dispatched while it waits. This has
+                        // to be its own arm: falling through to the rejection
+                        // branch would log an accepted steer as refused and
+                        // send it back round at the next boundary, handing
+                        // the model the same words twice.
+                        if !executor.uses_native_harness(launch.provider) {
+                            for steer in pending_steers.iter_mut().filter(|steer| steer.acknowledgement_id == acknowledgement_id) {
+                                steer.state = PendingSteerState::Accepted;
+                            }
+                            settle_accepted_steers(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                &mut pending_steers,
+                                provider_reports_steer_consumption(launch.provider),
+                                &mut steers_awaiting_consumption,
+                            )
+                            .await?;
+                        }
+                    } else {
+                        let error = acknowledgement.err().unwrap_or_else(|| {
+                            "provider acknowledged the steer without accepting admission"
+                                .to_string()
+                        });
+                        {
+                            tracing::warn!(
+                                %acknowledgement_id,
+                                %error,
+                                "provider rejected active-turn steer; retaining it for the next boundary"
+                            );
+                            // The rejection is transient and the steer retries
+                            // at the next boundary, so it keeps its steer
+                            // delivery. It is nonetheless unconsumed, which is
+                            // what makes it honestly recallable meanwhile.
+                            for steer in pending_steers.iter_mut().filter(|steer| steer.acknowledgement_id == acknowledgement_id) {
+                                steer.state = PendingSteerState::RetryAtBoundary { error: error.clone() };
+                            }
+                            let boundary_already_passed = pending_steers[index].attempt_boundary
+                                < steer_boundary_generation;
+                            if boundary_already_passed && !context_compaction_in_progress && !user_stop && !interrupted {
+                                retry_pending_steers(
+                                    &control_tx,
+                                    &steer_result_tx,
+                                    &mut pending_steers,
+                                    steer_boundary_generation, launch.capabilities.frames_steers_for(launch.provider, launch.model.as_deref()),
+                                )
+                                .await;
+                            }
+                        }
                     }
                 }
                 request = goal_tool_rx.recv() => {
