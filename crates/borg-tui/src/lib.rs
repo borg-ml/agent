@@ -16030,9 +16030,14 @@ fn replace_tool_activity_glyph(line: &mut Line<'static>, glyph: &str) {
 const RUNNING_SHIMMER_PADDING: usize = 10;
 const RUNNING_SHIMMER_HALF_WIDTH: f32 = 5.0;
 const RUNNING_SHIMMER_CYCLE_MILLIS: u128 = 2_000;
+/// Tool rows sweep at the same speed but rest one pass between sweeps, so a
+/// sweep starts half as often.
+const RUNNING_TOOL_SHIMMER_INTERVAL_MILLIS: u128 = RUNNING_SHIMMER_CYCLE_MILLIS * 2;
 /// The status sweep keeps the same speed but rests between passes, so it
 /// crosses 25% less often than the tool-row sweep.
-const RUNNING_STATUS_SHIMMER_INTERVAL_MILLIS: u128 = RUNNING_SHIMMER_CYCLE_MILLIS * 4 / 3;
+/// One status pass takes a third longer than a tool-row pass: 25% slower.
+const RUNNING_STATUS_SHIMMER_PASS_MILLIS: u128 = RUNNING_SHIMMER_CYCLE_MILLIS * 4 / 3;
+const RUNNING_STATUS_SHIMMER_INTERVAL_MILLIS: u128 = RUNNING_STATUS_SHIMMER_PASS_MILLIS * 4 / 3;
 static RUNNING_SHIMMER_START: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Clone, Copy)]
@@ -16071,7 +16076,7 @@ fn running_shimmer_phase() -> u128 {
         .get_or_init(Instant::now)
         .elapsed()
         .as_millis()
-        % RUNNING_SHIMMER_CYCLE_MILLIS
+        % RUNNING_TOOL_SHIMMER_INTERVAL_MILLIS
 }
 
 fn running_status_shimmer_phase() -> u128 {
@@ -16108,7 +16113,7 @@ fn apply_running_status_shimmer(spans: &mut Vec<Span<'static>>, phase: u128) {
 
     let period = width.saturating_add(RUNNING_SHIMMER_PADDING * 2);
     // Past one cycle the crest is beyond the text: the rest between passes.
-    let center = (phase * period as u128 / RUNNING_SHIMMER_CYCLE_MILLIS) as usize;
+    let center = (phase * period as u128 / RUNNING_STATUS_SHIMMER_PASS_MILLIS) as usize;
     let mut offset = 0usize;
     let mut animated = Vec::with_capacity(cells.len());
     for (grapheme, style) in cells {
@@ -16168,7 +16173,8 @@ fn apply_running_activity_pulse_with_width(
     }
 
     let period = content_width.saturating_add(RUNNING_SHIMMER_PADDING * 2);
-    let shimmer_center = ((phase % RUNNING_SHIMMER_CYCLE_MILLIS) * period as u128
+    // Past one pass the crest is beyond the text: the rest between sweeps.
+    let shimmer_center = ((phase % RUNNING_TOOL_SHIMMER_INTERVAL_MILLIS) * period as u128
         / RUNNING_SHIMMER_CYCLE_MILLIS) as usize;
     let mut offset = 0usize;
     let mut spans = Vec::with_capacity(line.spans.len() + 2);

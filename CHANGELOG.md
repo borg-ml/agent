@@ -5,6 +5,19 @@ Git comparison.
 
 ## Unreleased (since 0.11.1)
 
+### Terminal
+
+- The Running status sweep moves 25% slower.
+- Tool-call sweeps keep their speed but start half as often, resting between
+  passes.
+
+### Agents and teams
+
+- **`wait_agent` no longer returns empty updates.** When a child resumed work
+  or its message was delivered as input during the brief coalescing window,
+  the wait returned `child_update` with nothing in it, which looked like a
+  dropped message. It now keeps waiting instead.
+
 ### Providers and models
 
 - **Large screenshots no longer fail Claude turns.** Images over 2000 px on a
