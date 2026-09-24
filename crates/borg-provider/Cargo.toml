@@ -20,6 +20,10 @@ subscription-adapters = ["codex", "claude"]
 name = "codex_model_probe"
 required-features = ["codex"]
 
+[[example]]
+name = "claude_model_probe"
+required-features = ["claude"]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

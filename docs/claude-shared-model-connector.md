@@ -1,7 +1,62 @@
 # Claude shared model connector: a working ownership boundary
 
-2026-09-24. Research result and proposed cutover contract. The live experiment
-ran outside Borg; production provider routing and implementation are unchanged.
+2026-09-24. Research result and complete cutover contract. A shared transport
+and Borg model provider are implemented and tested below; the production
+agent-harness routing has not yet been switched.
+
+## Implementation verification
+
+The [subscription model provider](../crates/borg-provider/src/provider/claude_model.rs)
+now uses a [host broker](../crates/borg-provider/src/provider/claude_connector.rs)
+and [model-only preload](../crates/borg-provider/src/provider/claude_connector.js).
+The broker validates the official **2.1.281** binary checksum, coordinates startup
+across Borg processes, and protects its local transport with a private random
+credential. The helper inherits the startup lock and publishes its own endpoint,
+so a launcher exit cannot release ownership during startup. It selects a persistent credential authority independently of the
+conversation, verifies the actual OAuth account, bounds requests and streams,
+and supports addressed cancellation and disconnect cleanup. The helper retires
+after five idle minutes and survives the Borg process that launched it.
+
+The provider uses native model capabilities, preserves account-bound content
+blocks, and publishes raw per-request usage snapshots with an explicit completion
+flag. Borg still constructs every message, tool schema, cache breakpoint and
+thinking/output setting. The helper invokes no agent loop or tool executor.
+
+Fresh live checks with the checked-in
+[probe](../crates/borg-provider/examples/claude_model_probe.rs), using the existing
+subscription and Sonnet 5:
+
+| Check | Measured result |
+| --- | --- |
+| Four independent Rust clients, eight model calls | One helper PID; first request windows overlapped; all tool continuations passed |
+| Cold input across four conversations | 79,892 cache-write tokens, 8 other input tokens, no cache reads |
+| Warm tool continuations | 79,892 cache reads, 245 writes, 8 other input tokens: **99.68%** cached |
+| Helper peak sampled memory | 122.96 MiB RSS, **119.39 MiB PSS**; excludes Rust clients |
+| Client process exit | Helper remained alive after all four clients exited |
+| Host lock after launcher exit | Still held by the helper; another process could not acquire it |
+| Rust future cancellation | Selected stream cancelled after text began; active peer completed; helper reported zero remaining requests |
+| Forced helper death and new-client recovery | New helper PID; signed thinking replay passed; 20,149 cache reads, 222 writes, 2 other input tokens |
+
+Recovery used a serialized Borg `ModelMessage` checkpoint and a 728-byte thinking
+signature. Its server cache was still warm; this does not test expiry. The
+concurrency run took 9.54 seconds including client startup/checksum validation.
+Memory was sampled every 40 ms. These small tests neither measure subscription
+allowance debits nor establish native-Claude memory parity at large contexts.
+
+The live probe found a valid empty tool-input delta that the initial decoder
+rejected. The decoder now retains the initial `{}` input, with a regression test.
+The cancellation probe also caught an absent tool list being serialized as null;
+that request-construction bug was corrected before repeating the successful test.
+Other stream tests cover signed/opaque state through serialization and rejection
+of truncated or corrupt responses; account-isolation tests reject continuation
+from a different or unknown subscription.
+
+**Activation gates remain:** full agent harness/UI/journal/approval integration,
+controller-supplied credential authorities, expired-token recovery verification,
+remaining model features, and other host platforms. The current runtime binding
+admits Linux x86-64 glibc only and fails explicitly elsewhere. It never falls back
+to API billing or a provider-owned agent loop. Evidence is retained locally in
+`~/.local/share/borg/assessments/2026-09-24-subscriptions/claude-connector-research/rust-provider-proof/`.
 
 ## Recommendation
 
@@ -214,11 +269,11 @@ of releases leaving pieces of agent ownership in Claude.
   must become a shared credential authority for Claude without collapsing
   different users/accounts together.
 - [Native model state](/home/shulgin/agent/crates/borg-core/src/model.rs:49)
-  currently has only the OpenAI Responses variant.
+  now also preserves Anthropic blocks and account provenance.
 - [Anthropic request encoding](/home/shulgin/agent/crates/borg-provider/src/provider/anthropic_messages.rs:224)
-  currently drops native thinking on replay, uses fixed output/thinking budgets,
-  and hoists system messages. Its request body also omits `stream: true` while
-  the response path expects SSE. It cannot simply be selected for subscriptions.
+  now preserves native thinking and requests streaming. The separate subscription
+  provider replaces its fixed API-lane budgets with native capabilities and
+  uses the shared subscription authority.
 - [Usage storage](/home/shulgin/agent/crates/borg-core/src/usage.rs:35)
   needs the additional breakdowns if the UI is to show them durably.
 - [Binary resolution](/home/shulgin/agent/crates/borg-provider/src/provider_bin.rs:189)
