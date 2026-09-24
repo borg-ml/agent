@@ -170,10 +170,34 @@ records final evidence after cleanup. Torch settings apply live; scene placement
 includes the pawn's streaming origin and aim. A Borg command watch can own the
 attached start command and observe its bounded completion.
 
-This is the project-level reference for a future generic capture workflow.
-The preview plugin's raw MCP ownership restrictions still apply; installing
-this package does not expose or automatically dispatch that project runner.
-Promote the shared batch protocol only after project-specific readiness and
-fixture contracts have comparable evidence. Cross-worker memory reservations
-and complete ignored/derived-asset manifests remain prerequisites for scaling
-private editor concurrency.
+The plugin now dispatches configured project adapters directly, with literal
+argv and an attached process owned by Borg's command/watch lifecycle:
+
+```toml
+# .borg-unreal.toml in the project
+[visual]
+adapter = "Scripts/visual_iteration.py"
+[assets]
+adapter = "Scripts/asset_closure.py"
+```
+
+Use `python3 /path/to/extensions/unreal/bin/unreal.py --project /path/to/Game.uproject
+visual start|wait|status|batch|stop ...` or `assets snapshot|stage ...`.
+The project adapter supplies fixture validation, scene readiness, camera/pawn
+placement and lease restoration. Scripts must resolve inside that project.
+Abundance ships both adapters and the configuration. Raw shared-editor MCP
+restrictions still apply; this dispatch does not bypass them.
+
+Borg now serializes RAM admission across independent lane journals on the host.
+A native Cargo lane and an Unreal lane therefore share reservations even with
+different state directories. Reservations cover future growth: private anonymous
+and shared-memory residency is credited once, while reclaimable file cache and
+unknown/overlapping cgroups receive no credit. The Abundance legacy bridge uses
+the same host admission lock; it is a migration adapter, not another job queue.
+All participating Borg processes must run the new core. Old binaries and direct
+unwrapped compiler invocations cannot reserve through this protocol.
+
+The default Unreal build reserves 12 GiB and caps compiler parallelism to fit
+that estimate (including 2 GiB of overhead); the editor reserves 8 GiB. These
+estimates are distinct from hard cgroup limits and should be calibrated from
+measured peaks. Keep the existing launch floors and containment.
