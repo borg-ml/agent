@@ -34,6 +34,8 @@ jobs:
           components: rustfmt, clippy
       - name: Install quality tools
         run: cargo install --locked just cargo-deny cargo-audit
+      - name: Install borg-display build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
       - uses: ./.github/actions/test-postgres
       - name: Run workspace verification
         run: just verify
