@@ -2674,6 +2674,20 @@ fn streamed_text_uses_120_hz_when_cheap_and_keeps_the_draw_cost_budget() {
 }
 
 #[test]
+fn a_new_stream_burst_wakes_the_paint_timer_once_after_an_idle_gap() {
+    let now = tokio::time::Instant::now();
+    assert!(should_wake_stream_burst(None, now));
+    assert!(!should_wake_stream_burst(
+        Some(now),
+        now + STREAM_BURST_IDLE_GAP - std::time::Duration::from_millis(1)
+    ));
+    assert!(should_wake_stream_burst(
+        Some(now),
+        now + STREAM_BURST_IDLE_GAP
+    ));
+}
+
+#[test]
 fn terminal_animation_ticks_separate_active_and_idle_rates() {
     assert_eq!(IDLE_FRAME_INTERVAL, std::time::Duration::from_millis(100));
     assert!(terminal_needs_activity_tick(SessionStatus::Starting));

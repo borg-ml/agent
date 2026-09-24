@@ -482,6 +482,7 @@ impl PtyChild {
             .env("BORG_TUI", "1")
             .env("BORG_TUI_SCREEN", "alternate")
             .env("BORG_TUI_FPS", "165")
+            .env("BORG_IMAGE_PROTOCOL", "off")
             .env("TERM", "xterm-256color")
             .env("BORG_OPENAI_COMPATIBLE_BASE_URL", endpoint)
             .env("BORG_OPENAI_COMPATIBLE_MODEL", "tui-stress-model")
