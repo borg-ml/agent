@@ -62,7 +62,7 @@ mod local_server;
 const MIN_TUI_FPS: u64 = 15;
 const MAX_TUI_FPS: u64 = 240;
 const STREAMING_TUI_FPS: u64 = 120;
-const STREAMING_DRAW_COST_MULTIPLIER: u32 = 6;
+const STREAMING_DRAW_COST_MULTIPLIER: u32 = 7;
 const STREAM_BURST_IDLE_GAP: std::time::Duration = std::time::Duration::from_millis(100);
 const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 const TOOL_STARTED_FRAME_MIN_DURATION: std::time::Duration = std::time::Duration::from_millis(150);
