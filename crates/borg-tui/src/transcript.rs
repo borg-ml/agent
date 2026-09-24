@@ -117,8 +117,102 @@ fn extend_tool_lifecycle_spans(
     }
 }
 
+/// Transcript rows. Every mutation records the lowest index it may have
+/// changed, so a render can keep the rows it already drew for the untouched
+/// prefix. There is deliberately no `DerefMut`.
+#[derive(Default)]
+struct TranscriptEntries {
+    entries: Vec<TranscriptEntry>,
+    changed_from: Cell<usize>,
+}
+
+impl TranscriptEntries {
+    fn mark_changed(&self, index: usize) {
+        self.changed_from.set(self.changed_from.get().min(index));
+    }
+
+    /// The lowest index changed since the previous call, or `usize::MAX`.
+    fn take_changed_from(&self) -> usize {
+        self.changed_from.replace(usize::MAX)
+    }
+
+    fn get_mut(&mut self, index: usize) -> Option<&mut TranscriptEntry> {
+        self.mark_changed(index);
+        self.entries.get_mut(index)
+    }
+
+    fn last_mut(&mut self) -> Option<&mut TranscriptEntry> {
+        self.mark_changed(self.entries.len().saturating_sub(1));
+        self.entries.last_mut()
+    }
+
+    fn iter_mut(&mut self) -> std::slice::IterMut<'_, TranscriptEntry> {
+        self.mark_changed(0);
+        self.entries.iter_mut()
+    }
+
+    fn push(&mut self, entry: TranscriptEntry) {
+        self.mark_changed(self.entries.len());
+        self.entries.push(entry);
+    }
+
+    fn pop(&mut self) -> Option<TranscriptEntry> {
+        self.mark_changed(self.entries.len().saturating_sub(1));
+        self.entries.pop()
+    }
+
+    fn insert(&mut self, index: usize, entry: TranscriptEntry) {
+        self.mark_changed(index);
+        self.entries.insert(index, entry);
+    }
+
+    fn remove(&mut self, index: usize) -> TranscriptEntry {
+        self.mark_changed(index);
+        self.entries.remove(index)
+    }
+
+    fn clear(&mut self) {
+        self.mark_changed(0);
+        self.entries.clear();
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        self.entries.reserve(additional);
+    }
+}
+
+impl std::ops::Deref for TranscriptEntries {
+    type Target = Vec<TranscriptEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl<I: std::slice::SliceIndex<[TranscriptEntry]>> std::ops::Index<I> for TranscriptEntries {
+    type Output = I::Output;
+
+    fn index(&self, index: I) -> &Self::Output {
+        &self.entries[index]
+    }
+}
+
+impl std::ops::IndexMut<usize> for TranscriptEntries {
+    fn index_mut(&mut self, index: usize) -> &mut TranscriptEntry {
+        self.mark_changed(index);
+        &mut self.entries[index]
+    }
+}
+
+impl Extend<TranscriptEntry> for TranscriptEntries {
+    fn extend<T: IntoIterator<Item = TranscriptEntry>>(&mut self, entries: T) {
+        self.mark_changed(self.entries.len());
+        self.entries.extend(entries);
+    }
+}
+
 struct Transcript {
-    order: Vec<TranscriptEntry>,
+    order: TranscriptEntries,
     messages: HashMap<Uuid, usize>,
     /// Whether this transcript projects a delegated child session, whose
     /// opening prompt came from the director agent rather than the operator.
@@ -189,6 +283,9 @@ struct Transcript {
     image_cell: Option<(u16, u16)>,
     message_markdown_cache: RefCell<MessageMarkdownCache>,
     tool_body_cache: RefCell<ToolBodyCache>,
+    /// The last cache-mode render at each width the draw uses: the full width
+    /// and, once a scrollbar appears, the width beside its gutter.
+    render_resumes: RefCell<Vec<RenderResume>>,
 }
 
 #[derive(Clone, Debug)]
@@ -247,7 +344,7 @@ const MAX_GRAPHICS_PREVIEW_ROWS: usize = 24;
 impl Default for Transcript {
     fn default() -> Self {
         Self {
-            order: Vec::new(),
+            order: TranscriptEntries::default(),
             messages: HashMap::new(),
             child_transcript: false,
             director_prompt: DirectorPrompt::Unknown,
@@ -306,15 +403,123 @@ impl Default for Transcript {
             image_cell: None,
             message_markdown_cache: RefCell::new(MessageMarkdownCache::default()),
             tool_body_cache: RefCell::new(ToolBodyCache::default()),
+            render_resumes: RefCell::new(Vec::new()),
         }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct ToolRunWindow {
     start: usize,
     end: usize,
     total: usize,
+}
+
+/// Output lengths of a `TranscriptRender`, in tuple order.
+type RenderLengths = [usize; 8];
+
+fn render_lengths(render: &TranscriptRender) -> RenderLengths {
+    [
+        render.0.len(),
+        render.1.len(),
+        render.2.len(),
+        render.3.len(),
+        render.4.len(),
+        render.5.len(),
+        render.6.len(),
+        render.7.len(),
+    ]
+}
+
+fn truncate_render(render: &mut TranscriptRender, lengths: RenderLengths) {
+    render.0.truncate(lengths[0]);
+    render.1.truncate(lengths[1]);
+    render.2.truncate(lengths[2]);
+    render.3.truncate(lengths[3]);
+    render.4.truncate(lengths[4]);
+    render.5.truncate(lengths[5]);
+    render.6.truncate(lengths[6]);
+    render.7.truncate(lengths[7]);
+}
+
+/// What a render pass recorded about the entries it drew.
+#[derive(Default)]
+struct RenderTrace {
+    /// Output lengths before each entry, then the final lengths.
+    checkpoints: Vec<RenderLengths>,
+    /// Entries whose rows show the render clock.
+    clock_rows: Vec<usize>,
+    /// Live assistant messages, whose rows depend on whether a tool runs.
+    running_tool_rows: Vec<usize>,
+}
+
+impl RenderTrace {
+    fn truncate(&mut self, start: usize) {
+        self.checkpoints.truncate(start);
+        self.clock_rows.retain(|row| *row < start);
+        self.running_tool_rows.retain(|row| *row < start);
+    }
+}
+
+/// Render inputs that, when changed, invalidate every row.
+#[derive(PartialEq)]
+struct RenderInputs {
+    width: usize,
+    tool_run_viewport_height: usize,
+    today: NaiveDate,
+    user_label: String,
+    assistant_label: String,
+    colors: [Color; 4],
+    image_cell: Option<(u16, u16)>,
+    tool_click_behavior: ToolClickBehavior,
+}
+
+/// A cache-mode render plus what the next render must compare to redraw only
+/// from the first entry whose rows can differ.
+struct RenderResume {
+    inputs: RenderInputs,
+    render_time: DateTime<Utc>,
+    changed_from: usize,
+    running_tool: bool,
+    director_prompt_row: Option<usize>,
+    tool_run_offsets: HashMap<usize, usize>,
+    expanded_tool_runs: HashSet<usize>,
+    windows: Vec<Option<ToolRunWindow>>,
+    trace: RenderTrace,
+    render: Arc<TranscriptRender>,
+    #[cfg(test)]
+    redrawn_from: usize,
+}
+
+/// The part of an entry's rows that follows the render clock.
+fn render_clock_key(entry: &TranscriptEntry, now: DateTime<Utc>) -> (Option<String>, i64) {
+    match entry {
+        TranscriptEntry::Tool {
+            started_at,
+            completed_at,
+            ..
+        } => (
+            format_tool_elapsed_at(*started_at, *completed_at, now),
+            completed_at.map_or(0, |completed_at| {
+                reasoning_summary_rotation_phase(completed_at, now)
+            }),
+        ),
+        TranscriptEntry::Goal { goal, .. } => {
+            (format_elapsed_duration(goal_live_seconds(goal, now)), 0)
+        }
+        _ => (None, 0),
+    }
+}
+
+fn goal_live_seconds(goal: &SessionGoal, now: DateTime<Utc>) -> u64 {
+    goal.time_used_seconds
+        .saturating_add(if goal.status.is_active() {
+            now.signed_duration_since(goal.updated_at)
+                .num_seconds()
+                .max(0) as u64
+        } else {
+            0
+        })
 }
 
 #[derive(Clone)]
@@ -3520,7 +3725,7 @@ impl Transcript {
         self.foreground_tool = None;
         self.preparing_tools.clear();
         self.unkeyed_preparing_tools.clear();
-        for entry in &mut self.order {
+        for entry in self.order.iter_mut() {
             if let TranscriptEntry::Tool {
                 complete,
                 user_interrupted,
@@ -3653,7 +3858,7 @@ impl Transcript {
 
     fn set_diff_expansion(&mut self, policy: DiffExpansionPolicy) {
         self.diff_expansion = policy;
-        for entry in &mut self.order {
+        for entry in self.order.iter_mut() {
             if let TranscriptEntry::Tool {
                 code_view: Some((language, _)),
                 expanded,
@@ -3676,7 +3881,7 @@ impl Transcript {
 
     fn set_auto_expand_tools(&mut self, enabled: bool) {
         self.auto_expand_tools = enabled;
-        for entry in &mut self.order {
+        for entry in self.order.iter_mut() {
             if let TranscriptEntry::Tool {
                 name,
                 code_view: Some((language, _)),
@@ -4226,16 +4431,71 @@ impl Transcript {
 
     #[cfg(test)]
     fn render_for_cache(&self, width: usize, tool_run_viewport_height: usize) -> TranscriptRender {
-        self.render_for_cache_at(width, tool_run_viewport_height, Utc::now())
+        Arc::unwrap_or_clone(self.render_for_cache_at(width, tool_run_viewport_height, Utc::now()))
     }
 
+    /// The draw's transcript layout. It equals a full cache-mode render, but
+    /// keeps the previous render's rows up to the first entry that can differ
+    /// and redraws only from there. The previous render is reused in place
+    /// when nothing else still holds it.
     fn render_for_cache_at(
         &self,
         width: usize,
         tool_run_viewport_height: usize,
         render_time: DateTime<Utc>,
-    ) -> TranscriptRender {
-        self.render_with_tool_run_viewport_mode(
+    ) -> Arc<TranscriptRender> {
+        let inputs = RenderInputs {
+            width,
+            tool_run_viewport_height,
+            today: Local::now().date_naive(),
+            user_label: self.user_label.clone(),
+            assistant_label: self.assistant_label.clone(),
+            colors: [
+                self.user_label_color,
+                self.user_message_color,
+                self.assistant_label_color,
+                self.assistant_message_color,
+            ],
+            image_cell: self.image_cell,
+            tool_click_behavior: self.tool_click_behavior,
+        };
+        let windows = self.tool_run_windows();
+        let running_tool = self.has_running_tool();
+        let director_prompt_row = self.director_prompt_row();
+        let mut resumes = self.render_resumes.borrow_mut();
+        let changed_from = self.order.take_changed_from();
+        for resume in resumes.iter_mut() {
+            resume.changed_from = resume.changed_from.min(changed_from);
+        }
+        let resume = resumes
+            .iter()
+            .position(|resume| resume.inputs == inputs)
+            .map(|position| resumes.remove(position));
+        let start = resume.as_ref().map_or(0, |resume| {
+            self.render_resume_start(
+                resume,
+                &windows,
+                running_tool,
+                director_prompt_row,
+                render_time,
+            )
+        });
+        let (mut render, mut trace) = match resume {
+            Some(resume) if start > 0 => {
+                let mut render = resume.render;
+                let mut trace = resume.trace;
+                truncate_render(Arc::make_mut(&mut render), trace.checkpoints[start]);
+                trace.truncate(start);
+                (render, trace)
+            }
+            _ => (Arc::default(), RenderTrace::default()),
+        };
+        self.render_rows(
+            Arc::make_mut(&mut render),
+            &mut trace,
+            start,
+            &windows,
+            inputs.today,
             width,
             tool_run_viewport_height,
             None,
@@ -4244,7 +4504,104 @@ impl Transcript {
             true,
             None,
             render_time,
-        )
+        );
+        if resumes.len() == 2 {
+            resumes.remove(0);
+        }
+        resumes.push(RenderResume {
+            inputs,
+            render_time,
+            changed_from: usize::MAX,
+            running_tool,
+            director_prompt_row,
+            tool_run_offsets: self.tool_run_offsets.clone(),
+            expanded_tool_runs: self.expanded_tool_runs.clone(),
+            windows,
+            trace,
+            render: Arc::clone(&render),
+            #[cfg(test)]
+            redrawn_from: start,
+        });
+        render
+    }
+
+    /// The first entry whose rows may differ from `resume`'s render.
+    fn render_resume_start(
+        &self,
+        resume: &RenderResume,
+        windows: &[Option<ToolRunWindow>],
+        running_tool: bool,
+        director_prompt_row: Option<usize>,
+        render_time: DateTime<Utc>,
+    ) -> usize {
+        let rendered_entries = resume.trace.checkpoints.len() - 1;
+        // A tool row reads the kind of the entry after it.
+        let mut start = resume
+            .changed_from
+            .saturating_sub(1)
+            .min(rendered_entries);
+        // Whether a run is boxed depends on entries after it: its length and
+        // any bridging agent rows.
+        if let Some(index) = windows
+            .iter()
+            .zip(&resume.windows)
+            .position(|(window, rendered)| window != rendered)
+        {
+            start = start.min(index);
+        }
+        if running_tool != resume.running_tool
+            && let Some(row) = resume.trace.running_tool_rows.first()
+        {
+            start = start.min(*row);
+        }
+        if director_prompt_row != resume.director_prompt_row
+            && let Some(row) = director_prompt_row
+                .into_iter()
+                .chain(resume.director_prompt_row)
+                .min()
+        {
+            start = start.min(row);
+        }
+        if let Some(run) = self
+            .tool_run_offsets
+            .keys()
+            .chain(resume.tool_run_offsets.keys())
+            .filter(|run| self.tool_run_offsets.get(run) != resume.tool_run_offsets.get(run))
+            .chain(
+                self.expanded_tool_runs
+                    .symmetric_difference(&resume.expanded_tool_runs),
+            )
+            .min()
+        {
+            start = start.min(*run);
+        }
+        // Running tools and cycling reasoning summaries can tick anywhere in
+        // history, not only in the changed tail.
+        if let Some(row) = resume
+            .trace
+            .clock_rows
+            .iter()
+            .copied()
+            .take_while(|row| *row < start)
+            .find(|row| {
+                render_clock_key(&self.order[*row], resume.render_time)
+                    != render_clock_key(&self.order[*row], render_time)
+            })
+        {
+            start = row;
+        }
+        // A tool run rewrites its rows once its last entry is drawn, so it is
+        // redrawn from its header.
+        while let Some(run_start) = [windows, resume.windows.as_slice()]
+            .into_iter()
+            .filter_map(|windows| windows.get(start).copied().flatten())
+            .map(|window| window.start)
+            .filter(|run_start| *run_start < start)
+            .min()
+        {
+            start = run_start;
+        }
+        start
     }
 
     #[cfg(test)]
@@ -4288,21 +4645,59 @@ impl Transcript {
         focused_tool: Option<usize>,
         render_time: DateTime<Utc>,
     ) -> TranscriptRender {
-        let today = Local::now().date_naive();
+        let mut render = TranscriptRender::default();
+        self.render_rows(
+            &mut render,
+            &mut RenderTrace::default(),
+            0,
+            &self.tool_run_windows(),
+            Local::now().date_naive(),
+            width,
+            tool_run_viewport_height,
+            hovered_tool,
+            hovered_message,
+            hovered_entry,
+            defer_completed_message_backgrounds,
+            focused_tool,
+            render_time,
+        );
+        render
+    }
+
+    /// Draws entries from `start` onward into `render`, which must hold exactly
+    /// the rows drawn before `start` (a checkpoint that is not inside a run).
+    #[allow(clippy::too_many_arguments)]
+    fn render_rows(
+        &self,
+        render: &mut TranscriptRender,
+        trace: &mut RenderTrace,
+        start: usize,
+        tool_run_windows: &[Option<ToolRunWindow>],
+        today: NaiveDate,
+        width: usize,
+        tool_run_viewport_height: usize,
+        hovered_tool: Option<usize>,
+        hovered_message: Option<usize>,
+        hovered_entry: Option<usize>,
+        defer_completed_message_backgrounds: bool,
+        focused_tool: Option<usize>,
+        render_time: DateTime<Utc>,
+    ) {
         let today_prefix = today.format("%Y-%m-%d ").to_string();
-        if focused_tool.is_none() {
+        if focused_tool.is_none() && start == 0 {
             self.prepare_message_markdown_cache(width);
         }
-        let mut lines = Vec::new();
-        let mut tool_rows = Vec::new();
-        let mut tool_run_rows = Vec::new();
-        let mut message_rows = Vec::new();
-        let mut entry_rows = Vec::new();
-        let mut link_rows = Vec::new();
-        let mut selection_rows: Vec<SelectionRowRange> = Vec::new();
-        let mut running_tool_elapsed = Vec::new();
+        let (
+            lines,
+            tool_rows,
+            tool_run_rows,
+            message_rows,
+            entry_rows,
+            link_rows,
+            selection_rows,
+            running_tool_elapsed,
+        ) = &mut *render;
         let mut tool_run_starts = HashMap::new();
-        let tool_run_windows = self.tool_run_windows();
         let running_tool = self.has_running_tool();
         if let Some(index) = focused_tool
             && let Some((name, complete)) = self.inspector_heading(index)
@@ -4326,7 +4721,17 @@ impl Transcript {
             lines.push(Line::default());
         }
         let director_prompt_row = self.director_prompt_row();
-        for (index, entry) in self.order.iter().enumerate() {
+        for (index, entry) in self.order.iter().enumerate().skip(start) {
+            trace.checkpoints.push([
+                lines.len(),
+                tool_rows.len(),
+                tool_run_rows.len(),
+                message_rows.len(),
+                entry_rows.len(),
+                link_rows.len(),
+                selection_rows.len(),
+                running_tool_elapsed.len(),
+            ]);
             if focused_tool.is_some_and(|focused| focused != index) {
                 continue;
             }
@@ -4623,6 +5028,9 @@ impl Transcript {
                             lines.push(line);
                         }
                     }
+                    if *actor == EventActor::Assistant && !complete {
+                        trace.running_tool_rows.push(index);
+                    }
                     if *actor == EventActor::Assistant && !complete && !running_tool {
                         lines.push(Line::from(Span::styled(
                             "    ◌ responding",
@@ -4885,16 +5293,10 @@ impl Transcript {
                 }
                 TranscriptEntry::Goal { goal, time } => {
                     let time = display_local_time(time, &today_prefix);
-                    let live_time =
-                        goal.time_used_seconds
-                            .saturating_add(if goal.status.is_active() {
-                                Utc::now()
-                                    .signed_duration_since(goal.updated_at)
-                                    .num_seconds()
-                                    .max(0) as u64
-                            } else {
-                                0
-                            });
+                    if goal.status.is_active() {
+                        trace.clock_rows.push(index);
+                    }
+                    let live_time = goal_live_seconds(goal, render_time);
                     lines.push(Line::from(vec![
                         Span::styled(
                             "▌ Goal",
@@ -5155,6 +5557,9 @@ impl Transcript {
                     }
                     let prefix = if tool_window.is_some() { "│ " } else { "  " };
                     let elapsed = format_tool_elapsed_at(*started_at, *completed_at, render_time);
+                    if completed_at.is_none() || rotating_detail.is_some() {
+                        trace.clock_rows.push(index);
+                    }
                     if !*complete {
                         running_tool_elapsed.push((index, elapsed.clone()));
                     }
@@ -5493,16 +5898,7 @@ impl Transcript {
                 }
             }
         }
-        (
-            lines,
-            tool_rows,
-            tool_run_rows,
-            message_rows,
-            entry_rows,
-            link_rows,
-            selection_rows,
-            running_tool_elapsed,
-        )
+        trace.checkpoints.push(render_lengths(render));
     }
 
     fn prepare_message_markdown_cache(&self, width: usize) {

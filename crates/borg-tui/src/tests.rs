@@ -2453,7 +2453,7 @@ fn tool_hover_hint_names_the_copy_target() {
         code_view,
         output_view,
         ..
-    }) = transcript.order.first_mut()
+    }) = transcript.order.get_mut(0)
     {
         *code_view = Some(("diff:rs".to_string(), "@@ -1 +1 @@\n-old\n+new".to_string()));
         *output_view = None;
@@ -4214,6 +4214,347 @@ fn live_tail_updates_reuse_completed_tool_bodies() {
     );
 }
 
+/// Renders the transcript both ways at one clock reading and returns how many
+/// draws kept an unchanged prefix instead of starting over.
+fn assert_incremental_render_matches_full(
+    transcript: &Transcript,
+    render_time: DateTime<Utc>,
+    step: &str,
+) -> usize {
+    let mut resumed = 0;
+    // The draw lays out at the full width and beside the scrollbar gutter.
+    for width in [100, 98] {
+        let incremental =
+            transcript.render_for_cache_at(width, DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT, render_time);
+        if transcript
+            .render_resumes
+            .borrow()
+            .last()
+            .is_some_and(|resume| resume.redrawn_from > 0)
+        {
+            resumed += 1;
+        }
+        let full = transcript.render_with_tool_run_viewport_mode(
+            width,
+            DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT,
+            None,
+            None,
+            None,
+            true,
+            None,
+            render_time,
+        );
+        assert!(
+            *incremental == full,
+            "{step} at width {width}: incremental render differs from a full render \
+             ({} vs {} lines, first different line {:?})",
+            incremental.0.len(),
+            full.0.len(),
+            incremental.0.iter().zip(&full.0).position(|(a, b)| a != b),
+        );
+    }
+    resumed
+}
+
+/// The draw redraws only from the first entry whose rows can differ. A missed
+/// dependency there (the next row, a tool run growing at its tail, a running
+/// tool or cycling reasoning summary further up) leaves stale rows on screen,
+/// so every step of a live session must match a from-scratch render.
+#[test]
+fn incremental_transcript_render_matches_a_full_render_through_a_live_session() {
+    let started = Utc::now();
+    let turn = Uuid::new_v4();
+    let second_turn = Uuid::new_v4();
+    let reply = Uuid::new_v4();
+    let second_reply = Uuid::new_v4();
+    let retracted_reply = Uuid::new_v4();
+    let steer = Uuid::new_v4();
+    let message = |message_id, actor, text: &str, status| SessionEventKind::Message {
+        message_id,
+        actor,
+        text: text.to_string(),
+        attachments: Vec::new(),
+        status,
+        delivery: None,
+    };
+    let tool_started = |id: &str, query: &str| SessionEventKind::ToolStarted {
+        tool_call_id: id.to_string(),
+        name: "Search".to_string(),
+        input: serde_json::json!({ "query": query }),
+        input_ref: None,
+    };
+    let tool_completed = |id: &str| SessionEventKind::ToolCompleted {
+        tool_call_id: id.to_string(),
+        output: format!("{id}: 3 matches"),
+        output_ref: None,
+        is_error: false,
+        input: None,
+        input_ref: None,
+    };
+    let plan_ids: [Uuid; 3] = std::array::from_fn(|_| Uuid::new_v4());
+    let plan = |statuses: [PlanItemStatus; 3]| SessionEventKind::PlanUpdated {
+        items: [
+            "Track changed entries",
+            "Resume the render",
+            "Compare every step",
+        ]
+        .into_iter()
+        .zip(plan_ids)
+        .zip(statuses)
+        .map(|((content, id), status)| PlanItem {
+            id,
+            content: content.to_string(),
+            status,
+        })
+        .collect(),
+    };
+    let turn_started = |message_id| SessionEventKind::TurnStarted {
+        message_id,
+        provider: CodingProvider::Codex,
+        model: Some("gpt-5".to_string()),
+        effort: Some("high".to_string()),
+        fast: false,
+    };
+    let turn_completed = |message_id| SessionEventKind::TurnCompleted {
+        message_id,
+        provider_session_id: None,
+        final_text: String::new(),
+        error: None,
+    };
+
+    let mut events = vec![
+        turn_started(turn),
+        message(
+            Uuid::new_v4(),
+            EventActor::User,
+            "Make the transcript render incremental.",
+            MessageStatus::Complete,
+        ),
+        SessionEventKind::GoalUpdated {
+            goal: SessionGoal {
+                status: GoalStatus::Active,
+                updated_at: started - chrono::Duration::seconds(55),
+                ..SessionGoal::new("Stream long sessions smoothly".to_string(), None)
+            },
+        },
+        SessionEventKind::ReasoningDelta {
+            text: "**Reading the renderer.**".to_string(),
+        },
+        SessionEventKind::ReasoningDelta {
+            text: "**Reading the renderer.**\n**Tracing cache invalidation.**".to_string(),
+        },
+        SessionEventKind::ReasoningCompleted,
+        message(
+            reply,
+            EventActor::Assistant,
+            "I'll start",
+            MessageStatus::InProgress,
+        ),
+        SessionEventKind::MessageDelta {
+            message_id: reply,
+            delta: " by reading".to_string(),
+        },
+        SessionEventKind::MessageDelta {
+            message_id: reply,
+            delta: " the **draw loop**.".to_string(),
+        },
+    ];
+    // A run longer than the box threshold, with parallel calls finishing out
+    // of order in its middle.
+    for tool in 0..10 {
+        let id = format!("search-{tool}");
+        events.push(tool_started(&id, &format!("term {tool}")));
+        if tool == 5 {
+            events.push(tool_started("search-parallel", "parallel term"));
+        } else {
+            events.push(tool_completed(&id));
+        }
+        if tool == 7 {
+            events.push(tool_completed("search-5"));
+            events.push(tool_completed("search-parallel"));
+        }
+    }
+    events.extend([
+        message(
+            reply,
+            EventActor::Assistant,
+            "I'll start by reading the **draw loop**.\n\n- checkpoints\n- tracked mutations",
+            MessageStatus::Complete,
+        ),
+        plan([
+            PlanItemStatus::InProgress,
+            PlanItemStatus::Pending,
+            PlanItemStatus::Pending,
+        ]),
+        message(
+            steer,
+            EventActor::User,
+            "Also cover tool runs.",
+            MessageStatus::Queued,
+        ),
+        turn_completed(turn),
+        SessionEventKind::PromptRecalled {
+            message_id: steer,
+            text: "Also cover tool runs.".to_string(),
+            attachments: Vec::new(),
+        },
+        turn_started(second_turn),
+        message(
+            Uuid::new_v4(),
+            EventActor::User,
+            "Now check the reasoning rows.",
+            MessageStatus::Complete,
+        ),
+        SessionEventKind::ReasoningDelta {
+            text: "**Checking tool runs.**\n**Planning the test.**\n**Checking tool runs.**"
+                .to_string(),
+        },
+        SessionEventKind::ReasoningCompleted,
+        message(
+            second_reply,
+            EventActor::Assistant,
+            "Running the searches",
+            MessageStatus::InProgress,
+        ),
+        // Two running tools after a live reply: the reply's "responding" row
+        // returns only once the last of them finishes.
+        tool_started("late-a", "late a"),
+        tool_started("late-b", "late b"),
+        tool_completed("late-a"),
+        tool_completed("late-b"),
+    ]);
+    // The second run grows past the box threshold one call at a time.
+    for tool in 0..9 {
+        let id = format!("grow-{tool}");
+        events.push(tool_started(&id, &format!("grow {tool}")));
+        events.push(tool_completed(&id));
+    }
+    events.extend([
+        plan([
+            PlanItemStatus::Completed,
+            PlanItemStatus::InProgress,
+            PlanItemStatus::Pending,
+        ]),
+        message(
+            second_reply,
+            EventActor::Assistant,
+            "Running the searches finished.",
+            MessageStatus::Complete,
+        ),
+        // Unboxed tools with no live reply above them: the earlier row drops
+        // its trailing gap once another tool follows it.
+        tool_started("check-a", "check a"),
+        tool_completed("check-a"),
+        tool_started("check-b", "check b"),
+        tool_completed("check-b"),
+        message(
+            retracted_reply,
+            EventActor::Assistant,
+            "draft",
+            MessageStatus::InProgress,
+        ),
+        message(
+            retracted_reply,
+            EventActor::Assistant,
+            "",
+            MessageStatus::InProgress,
+        ),
+        tool_started("background", "still running"),
+        message(
+            Uuid::new_v4(),
+            EventActor::Assistant,
+            "Waiting on the search.",
+            MessageStatus::Complete,
+        ),
+    ]);
+
+    let mut transcript = Transcript::default();
+    let mut render_time = started;
+    let mut checks = 0;
+    let mut resumed = 0;
+    // Events arrive faster than the reasoning summaries cycle, so most steps
+    // redraw from the entry the event changed rather than from a summary row.
+    for (index, kind) in events.into_iter().enumerate() {
+        render_time += chrono::Duration::milliseconds(100);
+        let mut event = SessionEvent::new(Uuid::nil(), index as u64 + 1, kind);
+        event.created_at = render_time;
+        transcript.apply(&event);
+        checks += 2;
+        resumed += assert_incremental_render_matches_full(
+            &transcript,
+            render_time,
+            &format!("event {index}"),
+        );
+    }
+
+    let runs = transcript
+        .tool_run_windows()
+        .into_iter()
+        .flatten()
+        .map(|window| window.start)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(runs.len(), 2, "both action runs are boxed");
+    let first_run = *runs.first().unwrap();
+    let thinking = transcript
+        .order
+        .iter()
+        .position(|entry| {
+            matches!(entry, TranscriptEntry::Tool { code_view: Some((language, _)), .. } if language == "reasoning")
+        })
+        .unwrap();
+    let interactions: [(&str, Box<dyn Fn(&mut Transcript)>); 5] = [
+        (
+            "expand first run",
+            Box::new(|transcript| {
+                transcript.toggle_tool_run_expansion(first_run);
+            }),
+        ),
+        (
+            "collapse first run",
+            Box::new(|transcript| {
+                transcript.toggle_tool_run_expansion(first_run);
+            }),
+        ),
+        (
+            "scroll first run",
+            Box::new(|transcript| {
+                transcript.scroll_tool_run(first_run, 20, -2);
+            }),
+        ),
+        (
+            "expand thinking",
+            Box::new(|transcript| {
+                transcript.toggle_tool(thinking);
+            }),
+        ),
+        (
+            "relabel user",
+            Box::new(|transcript| transcript.user_label = "you".to_string()),
+        ),
+    ];
+    for (step, interact) in interactions {
+        interact(&mut transcript);
+        render_time += chrono::Duration::milliseconds(100);
+        checks += 2;
+        resumed += assert_incremental_render_matches_full(&transcript, render_time, step);
+    }
+    // Nothing changes but the clock: the running tool and the collapsed
+    // reasoning summaries far above the tail still tick.
+    for tick in 0..8 {
+        render_time += chrono::Duration::milliseconds(700);
+        checks += 2;
+        resumed += assert_incremental_render_matches_full(
+            &transcript,
+            render_time,
+            &format!("clock tick {tick}"),
+        );
+    }
+    assert!(
+        resumed * 2 > checks,
+        "only {resumed} of {checks} renders kept an unchanged prefix"
+    );
+}
+
 #[test]
 #[ignore = "explicit large-transcript TUI render p95 performance gate"]
 fn large_transcript_live_tail_render_p95_gate() {
@@ -4310,7 +4651,7 @@ fn large_transcript_live_tail_render_p95_gate() {
             },
         ));
     }
-    let _ = transcript.render(120, None, None, None);
+    let _ = transcript.render_for_cache_at(120, DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT, Utc::now());
 
     let mut samples = Vec::with_capacity(SAMPLES);
     for sample in 0..SAMPLES {
@@ -4330,7 +4671,8 @@ fn large_transcript_live_tail_render_p95_gate() {
             },
         ));
         let started = Instant::now();
-        let render = transcript.render(120, None, None, None);
+        let render =
+            transcript.render_for_cache_at(120, DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT, Utc::now());
         assert!(!render.0.is_empty());
         samples.push(started.elapsed());
     }
@@ -4345,8 +4687,10 @@ fn large_transcript_live_tail_render_p95_gate() {
             .messages
             .clear();
         transcript.tool_body_cache.borrow_mut().lines.clear();
+        transcript.render_resumes.borrow_mut().clear();
         let started = Instant::now();
-        let render = transcript.render(120, None, None, None);
+        let render =
+            transcript.render_for_cache_at(120, DEFAULT_TOOL_RUN_VIEWPORT_HEIGHT, Utc::now());
         assert!(!render.0.is_empty());
         uncached_samples.push(started.elapsed());
     }
@@ -14672,7 +15016,7 @@ fn exec_poll_completion_renders_command_and_readable_output() {
             output_view,
             expanded,
             ..
-        }) = transcript.order.first_mut()
+        }) = transcript.order.get_mut(0)
         else {
             panic!("poll remains a tool card");
         };
