@@ -21,6 +21,8 @@ const ATTACHED_SESSION_REFRESH_INTERVAL: std::time::Duration = std::time::Durati
 const ATTACHED_STORE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const LOCAL_LIVE_EVENT_BUFFER: usize = 128;
 const LOCAL_LIVE_FRAME_MAX_BYTES: usize = 1024 * 1024;
+const LOCAL_LIVE_DELTA_BATCH_DELAY: std::time::Duration = std::time::Duration::from_millis(8);
+const LOCAL_LIVE_DELTA_BATCH_MAX_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -44,6 +46,24 @@ struct LocalLivePublisher {
     message_bytes: HashMap<(Uuid, Uuid), usize>,
     reasoning_snapshots: HashMap<Uuid, SessionEvent>,
     message_snapshots: HashMap<(Uuid, Uuid), SessionEvent>,
+    pending_delta: Option<PendingLiveDelta>,
+    pending_generation: u64,
+    last_delta_sent_at: Option<tokio::time::Instant>,
+    last_delta_key: Option<LiveDeltaKey>,
+}
+
+#[derive(PartialEq, Eq)]
+enum LiveDeltaKey {
+    Reasoning(Uuid),
+    Message(Uuid, Uuid),
+}
+
+struct PendingLiveDelta {
+    key: LiveDeltaKey,
+    event: SessionEvent,
+    text_start: usize,
+    durable_watermark: u64,
+    generation: u64,
 }
 
 #[derive(Clone)]
@@ -53,7 +73,7 @@ struct LocalLiveWire {
 }
 
 impl LocalLivePublisher {
-    fn publish(&mut self, event: &SessionEvent) {
+    fn publish(&mut self, event: &SessionEvent) -> Option<(u64, tokio::time::Instant)> {
         self.latest_sequence = self.latest_sequence.max(event.sequence);
         let (session_id, kind) = preview_event_kind(event);
         let text_start = match kind {
@@ -118,28 +138,101 @@ impl LocalLivePublisher {
             }
             _ => None,
         };
-        if self.events.receiver_count() > 0 {
-            let frame = LocalLiveFrame::Event {
-                event: event.clone(),
-                text_start,
-                durable_watermark: self.latest_sequence,
-            };
-            let wire = encode_live_frame(&frame)
-                .ok()
-                .filter(|bytes| bytes.len() <= LOCAL_LIVE_FRAME_MAX_BYTES)
-                .map(|bytes| LocalLiveWire {
-                    bytes: Arc::from(bytes),
-                    lagged: false,
-                })
-                .unwrap_or_else(|| LocalLiveWire {
-                    bytes: Arc::from(
-                        encode_live_frame(&LocalLiveFrame::Lagged)
-                            .expect("static lag marker is serializable"),
-                    ),
-                    lagged: true,
-                });
-            let _ = self.events.send(wire);
+        if self.events.receiver_count() == 0 {
+            self.pending_delta = None;
+            self.last_delta_sent_at = None;
+            self.last_delta_key = None;
+            return None;
         }
+        let key = live_delta_key(event);
+        if let (Some(key), Some(_), Some(pending)) =
+            (key.as_ref(), text_start, self.pending_delta.as_mut())
+            && pending.key == *key
+            && live_delta_len(&pending.event).saturating_add(live_delta_len(event))
+                <= LOCAL_LIVE_DELTA_BATCH_MAX_BYTES
+            && append_live_delta(&mut pending.event, event)
+        {
+            return None;
+        }
+        if self.pending_delta.is_some() {
+            self.flush_pending_delta();
+            self.last_delta_sent_at = None;
+            self.last_delta_key = None;
+        }
+        if let (Some(key), Some(start)) = (key, text_start) {
+            let now = tokio::time::Instant::now();
+            if self
+                .last_delta_sent_at
+                .is_some_and(|last| now.duration_since(last) < LOCAL_LIVE_DELTA_BATCH_DELAY)
+                && self.last_delta_key.as_ref() == Some(&key)
+                && live_delta_len(event) <= LOCAL_LIVE_DELTA_BATCH_MAX_BYTES
+            {
+                self.pending_generation = self.pending_generation.wrapping_add(1);
+                let generation = self.pending_generation;
+                let deadline = now + LOCAL_LIVE_DELTA_BATCH_DELAY;
+                self.pending_delta = Some(PendingLiveDelta {
+                    key,
+                    event: event.clone(),
+                    text_start: start,
+                    durable_watermark: self.latest_sequence,
+                    generation,
+                });
+                return Some((generation, deadline));
+            }
+            self.send_event(event.clone(), Some(start), self.latest_sequence);
+            self.last_delta_sent_at = Some(now);
+            self.last_delta_key = Some(key);
+        } else {
+            self.send_event(event.clone(), text_start, self.latest_sequence);
+            self.last_delta_sent_at = None;
+            self.last_delta_key = None;
+        }
+        None
+    }
+
+    fn flush_pending_delta(&mut self) {
+        if let Some(pending) = self.pending_delta.take() {
+            self.last_delta_key = Some(pending.key);
+            self.send_event(
+                pending.event,
+                Some(pending.text_start),
+                pending.durable_watermark,
+            );
+            self.last_delta_sent_at = Some(tokio::time::Instant::now());
+        }
+    }
+
+    fn flush_pending_generation(&mut self, generation: u64) {
+        if self
+            .pending_delta
+            .as_ref()
+            .is_some_and(|pending| pending.generation == generation)
+        {
+            self.flush_pending_delta();
+        }
+    }
+
+    fn send_event(&self, event: SessionEvent, text_start: Option<usize>, durable_watermark: u64) {
+        let frame = LocalLiveFrame::Event {
+            event,
+            text_start,
+            durable_watermark,
+        };
+        let wire = encode_live_frame(&frame)
+            .ok()
+            .filter(|bytes| bytes.len() <= LOCAL_LIVE_FRAME_MAX_BYTES)
+            .map(|bytes| LocalLiveWire {
+                bytes: Arc::from(bytes),
+                lagged: false,
+            })
+            .unwrap_or_else(|| LocalLiveWire {
+                bytes: Arc::from(
+                    encode_live_frame(&LocalLiveFrame::Lagged)
+                        .expect("static lag marker is serializable"),
+                ),
+                lagged: true,
+            });
+        let _ = self.events.send(wire);
     }
 
     fn snapshots(&self) -> Vec<SessionEvent> {
@@ -151,6 +244,46 @@ impl LocalLivePublisher {
             .collect::<Vec<_>>();
         snapshots.sort_by_key(|event| (event.created_at, event.id));
         snapshots
+    }
+}
+
+fn live_delta_key(event: &SessionEvent) -> Option<LiveDeltaKey> {
+    if event.sequence != 0 {
+        return None;
+    }
+    match &event.kind {
+        SessionEventKind::ReasoningTextDelta { .. } => {
+            Some(LiveDeltaKey::Reasoning(event.session_id))
+        }
+        SessionEventKind::MessageDelta { message_id, .. } => {
+            Some(LiveDeltaKey::Message(event.session_id, *message_id))
+        }
+        _ => None,
+    }
+}
+
+fn live_delta_len(event: &SessionEvent) -> usize {
+    match &event.kind {
+        SessionEventKind::ReasoningTextDelta { delta }
+        | SessionEventKind::MessageDelta { delta, .. } => delta.len(),
+        _ => 0,
+    }
+}
+
+fn append_live_delta(pending: &mut SessionEvent, event: &SessionEvent) -> bool {
+    match (&mut pending.kind, &event.kind) {
+        (
+            SessionEventKind::ReasoningTextDelta { delta: text },
+            SessionEventKind::ReasoningTextDelta { delta },
+        )
+        | (
+            SessionEventKind::MessageDelta { delta: text, .. },
+            SessionEventKind::MessageDelta { delta, .. },
+        ) => {
+            text.push_str(delta);
+            true
+        }
+        _ => false,
     }
 }
 
@@ -719,6 +852,10 @@ impl LocalSessionControlServer {
             message_bytes: HashMap::new(),
             reasoning_snapshots: HashMap::new(),
             message_snapshots: HashMap::new(),
+            pending_delta: None,
+            pending_generation: 0,
+            last_delta_sent_at: None,
+            last_delta_key: None,
         }));
         let task_live = Arc::clone(&live);
         let (shutdown, _) = watch::channel(false);
@@ -774,7 +911,8 @@ impl LocalSessionControlServer {
                                     };
                                     if opted_in {
                                         let (latest_sequence, snapshots, mut live_events) = {
-                                            let live = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                            let mut live = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                            live.flush_pending_delta();
                                             (live.latest_sequence, live.snapshots(), live.events.subscribe())
                                         };
                                         let hello = LocalLiveFrame::Hello { latest_sequence, snapshots };
@@ -852,10 +990,20 @@ impl LocalSessionControlServer {
     }
 
     pub fn publish_live_event(&self, event: &SessionEvent) {
-        self.live
+        let pending = self
+            .live
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .publish(event);
+        if let Some((generation, deadline)) = pending {
+            let live = Arc::clone(&self.live);
+            tokio::spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                live.lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .flush_pending_generation(generation);
+            });
+        }
     }
 
     pub fn seed_durable_watermark(&self, sequence: u64) {
@@ -2091,6 +2239,121 @@ mod tests {
         .expect("viewer presence should be released when the attachment closes");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn live_delta_batches_keep_text_offsets_and_event_order() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let lock_path = root.path().join("session.lock");
+        let writer = SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .unwrap();
+        let (commands, _rx) = mpsc::channel(1);
+        let server = LocalSessionControlServer::start(
+            session_control_socket_path(root.path(), session_id),
+            session_id,
+            &writer,
+            commands,
+        )
+        .unwrap();
+        let mut frames = server.live.lock().unwrap().events.subscribe();
+        let mut preview = AttachedPreviewCursor::default();
+        let turn = SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::TurnStarted {
+                message_id,
+                provider: crate::CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+        );
+        server.publish_live_event(&turn);
+        let first = frames.recv().await.unwrap();
+        let LocalLiveFrame::Event { event, .. } =
+            serde_json::from_slice::<LocalLiveFrame>(&first.bytes).unwrap()
+        else {
+            panic!("turn should arrive first");
+        };
+        preview.accept(event, None).unwrap();
+
+        for delta in ["a", "b", "c"] {
+            server.publish_live_event(&SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::ReasoningTextDelta {
+                    delta: delta.into(),
+                },
+            ));
+        }
+        let first = frames.recv().await.unwrap();
+        let LocalLiveFrame::Event {
+            event,
+            text_start: Some(0),
+            ..
+        } = serde_json::from_slice::<LocalLiveFrame>(&first.bytes).unwrap()
+        else {
+            panic!("first reasoning fragment should arrive immediately");
+        };
+        assert!(
+            matches!(event.kind, SessionEventKind::ReasoningTextDelta { ref delta } if delta == "a")
+        );
+        preview.accept(event, Some(0)).unwrap();
+        assert!(frames.try_recv().is_err(), "the next fragments are batched");
+        tokio::time::advance(LOCAL_LIVE_DELTA_BATCH_DELAY).await;
+        let merged = frames.recv().await.unwrap();
+        let LocalLiveFrame::Event {
+            event,
+            text_start: Some(1),
+            ..
+        } = serde_json::from_slice::<LocalLiveFrame>(&merged.bytes).unwrap()
+        else {
+            panic!("merged reasoning fragments should retain their first offset");
+        };
+        assert!(
+            matches!(event.kind, SessionEventKind::ReasoningTextDelta { ref delta } if delta == "bc")
+        );
+        preview.accept(event, Some(1)).unwrap();
+
+        for delta in ["x", "y", "z"] {
+            server.publish_live_event(&SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::MessageDelta {
+                    message_id,
+                    delta: delta.into(),
+                },
+            ));
+        }
+        server.publish_live_event(&SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningDelta { text: "abc".into() },
+        ));
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let frame = frames.recv().await.unwrap();
+            let LocalLiveFrame::Event {
+                event, text_start, ..
+            } = serde_json::from_slice::<LocalLiveFrame>(&frame.bytes).unwrap()
+            else {
+                panic!("expected a live event");
+            };
+            seen.push(event.kind.clone());
+            preview.accept(event, text_start).unwrap();
+        }
+        assert!(
+            matches!(seen[0], SessionEventKind::MessageDelta { ref delta, .. } if delta == "x")
+        );
+        assert!(
+            matches!(seen[1], SessionEventKind::MessageDelta { ref delta, .. } if delta == "yz")
+        );
+        assert!(matches!(seen[2], SessionEventKind::ReasoningDelta { ref text } if text == "abc"));
+        assert_eq!(preview.reasoning[&session_id].text, "abc");
+        assert_eq!(preview.messages[&(session_id, message_id)], "xyz");
+    }
+
     #[tokio::test]
     async fn attached_viewer_receives_raw_text_before_the_next_store_snapshot() {
         let root = short_socket_tempdir();
@@ -2168,8 +2431,23 @@ mod tests {
             session_id,
             0,
             SessionEventKind::ReasoningTextDelta {
-                delta: "thinking".into(),
+                delta: "think".into(),
             },
+        ));
+        let first_reasoning =
+            tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("first fragment should arrive without waiting for the batch")
+                .unwrap();
+        server.publish_live_event(&SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningTextDelta { delta: "in".into() },
+        ));
+        server.publish_live_event(&SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningTextDelta { delta: "g".into() },
         ));
         server.publish_live_event(&SessionEvent::new(
             session_id,
@@ -2179,17 +2457,23 @@ mod tests {
                 delta: "answer".into(),
             },
         ));
-        let reasoning = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let message = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            matches!(reasoning.kind, SessionEventKind::ReasoningTextDelta { ref delta } if delta == "thinking")
-        );
+        let mut reasoning = String::new();
+        let SessionEventKind::ReasoningTextDelta { delta } = first_reasoning.kind else {
+            panic!("first fragment should be reasoning");
+        };
+        reasoning.push_str(&delta);
+        let message = loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            match &event.kind {
+                SessionEventKind::ReasoningTextDelta { delta } => reasoning.push_str(delta),
+                SessionEventKind::MessageDelta { .. } => break event,
+                _ => panic!("reasoning should arrive before the message"),
+            }
+        };
+        assert_eq!(reasoning, "thinking");
         assert!(
             matches!(message.kind, SessionEventKind::MessageDelta { ref delta, .. } if delta == "answer")
         );
