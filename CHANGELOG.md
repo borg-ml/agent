@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.11.1)
 
+### Providers and models
+
+- **Large screenshots no longer fail Claude turns.** Images over 2000 px on a
+  side, such as full 2560x1440 screenshots, are downscaled before they are
+  sent, so a conversation with many images is no longer rejected with "image
+  dimensions exceed max allowed size for many-image requests".
+
 ## 0.11.1 (2026-09-24)
 
 ### Agents and teams
