@@ -3668,6 +3668,7 @@ fn tool_catalog_exposes_one_complete_lifecycle() {
         [
             "spawn_agent",
             "list_agents",
+            "configure_agent",
             "list_workspace_participants",
             "list_instances",
             "send_message",
@@ -6499,6 +6500,7 @@ fn a_child_surface_is_the_director_surface_minus_the_documented_exceptions() {
         "consult_peer",
         "rotate_peer",
         "update_agent_settings",
+        "configure_agent",
         "watch",
         "list_watchers",
         "await_watchers",

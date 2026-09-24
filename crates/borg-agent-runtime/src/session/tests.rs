@@ -8184,8 +8184,10 @@ async fn initial_mixed_provider_peer_starts_with_isolated_provider_configuration
             && subscription_prompt_ends_with(prompt, "root topic")
     }));
     assert!(turns.iter().any(|(provider, model, effort, prompt)| {
+        // Borg runs Claude itself, so the peer resolves Claude's own
+        // defaults rather than inheriting the Codex root's model and effort.
         *provider == CodingProvider::Claude
-            && model.is_none()
+            && model.as_deref() == Some(borg_provider::claude_product_model())
             && effort.as_deref() == Some(borg_provider::claude_default_effort())
             && subscription_prompt_ends_with(prompt, "peer topic")
     }));
