@@ -279,6 +279,9 @@ impl SessionEventKind {
                 EventPersistence::Coalesced
             }
             Self::ProviderEvent { .. } => EventPersistence::Ephemeral,
+            Self::MessageDelta { .. } | Self::ReasoningTextDelta { .. } => {
+                EventPersistence::Ephemeral
+            }
             Self::Message {
                 actor: crate::EventActor::User | crate::EventActor::System,
                 status: MessageStatus::InProgress,
@@ -391,6 +394,8 @@ impl SessionEventKind {
                     status: MessageStatus::Queued | MessageStatus::InProgress,
                     ..
                 }
+                | Self::MessageDelta { .. }
+                | Self::ReasoningTextDelta { .. }
         )
     }
 

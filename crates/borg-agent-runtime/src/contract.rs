@@ -2405,6 +2405,16 @@ pub enum SessionEventKind {
         status: MessageStatus,
         delivery: Option<PromptDelivery>,
     },
+    /// Append-only assistant text for the live observer. Cumulative Message
+    /// snapshots remain authoritative for recovery and completion.
+    MessageDelta {
+        message_id: Uuid,
+        delta: String,
+    },
+    /// Append-only reasoning text for the live observer.
+    ReasoningTextDelta {
+        delta: String,
+    },
     ReasoningDelta {
         text: String,
     },
