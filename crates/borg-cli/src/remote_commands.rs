@@ -2575,6 +2575,9 @@ async fn run_local_agent_session(
             )?,
         )
     };
+    if let Some(server) = control_server.as_ref() {
+        server.seed_durable_watermark(session_state.latest_sequence);
+    }
     let actor = if session_access.is_attached() {
         tokio::spawn(run_attached_session(
             Arc::clone(&store),
@@ -3668,7 +3671,9 @@ async fn run_local_agent_session(
                 }
                 terminal_dirty = terminal.has_pending_scroll_frame();
             }
-            _ = activity_tick.tick(), if !streaming_frame_pending && terminal.as_ref().is_some_and(|terminal| {
+            _ = activity_tick.tick(), if !streaming_frame_pending
+                && last_stream_text_at.is_none_or(|at| at.elapsed() >= STREAM_BURST_IDLE_GAP)
+                && terminal.as_ref().is_some_and(|terminal| {
                 terminal_needs_activity_tick(status)
                     || terminal.has_running_tool()
                     || terminal.has_active_subagents()
@@ -3960,6 +3965,9 @@ async fn run_local_agent_session(
                                 ..
                             }
                         ));
+                if let Some(server) = control_server.as_ref() {
+                    server.publish_live_event(&event);
+                }
                 delivered_projection.observe(&event)?;
                 if let Some(message_id) = committed_prompt_id(&event.kind) {
                     pending_prompt_ids.remove(&message_id);
