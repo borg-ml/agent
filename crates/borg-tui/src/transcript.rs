@@ -523,19 +523,35 @@ fn compaction_has_expandable_detail(summary: &str) -> bool {
     )
 }
 
-/// The collapsed row's one-line summary of a reasoning block: its first line,
-/// without the bold markers some providers wrap a summary title in. Claude
-/// returns thinking as a short summary, so this is often the whole of it.
+/// Keep the collapsed Thinking row current without laying out an unbounded
+/// reasoning line on every streamed fragment. The full text stays in code_view.
 fn reasoning_preview(source: &str) -> String {
-    let line = source
-        .lines()
+    const MAX_CHARS: usize = 160;
+    let mut start = source.len().saturating_sub(MAX_CHARS * 4);
+    while !source.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &source[start..];
+    let line = tail
+        .rsplit('\n')
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or_default();
-    line.strip_prefix("**")
+    let line = line
+        .strip_prefix("**")
         .and_then(|line| line.strip_suffix("**"))
-        .unwrap_or(line)
-        .to_string()
+        .unwrap_or(line);
+    let preview_start = line
+        .char_indices()
+        .rev()
+        .nth(MAX_CHARS - 1)
+        .map_or(0, |(index, _)| index);
+    let preview = &line[preview_start..];
+    if start > 0 || preview_start > 0 {
+        format!("…{preview}")
+    } else {
+        preview.to_string()
+    }
 }
 
 fn tool_has_expandable_body(
@@ -5629,6 +5645,39 @@ impl Transcript {
 #[cfg(test)]
 mod parallel_preparation_tests {
     use super::*;
+
+    #[test]
+    fn streamed_thinking_keeps_a_bounded_live_summary_and_full_expandable_text() {
+        let session_id = Uuid::new_v4();
+        let mut transcript = Transcript::default();
+        let initial = "a".repeat(100_000);
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningTextDelta {
+                delta: initial.clone(),
+            },
+        ));
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningTextDelta {
+                delta: "recent thinking".to_string(),
+            },
+        ));
+
+        let Some(TranscriptEntry::Tool {
+            detail,
+            code_view: Some((_, source)),
+            ..
+        }) = transcript.order.first()
+        else {
+            panic!("expected Thinking row");
+        };
+        assert!(detail.len() <= 164);
+        assert!(detail.ends_with("recent thinking"));
+        assert_eq!(source, &format!("{initial}recent thinking"));
+    }
 
     #[test]
     fn parallel_action_preparations_promote_without_orphan_rows() {
