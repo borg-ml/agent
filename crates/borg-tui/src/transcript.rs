@@ -1,6 +1,7 @@
 const USER_INTERRUPT_ACTIVITY: &str = "agent interrupted by user";
 const TOOL_ELAPSED_REFRESH_MILLIS: i64 = 100;
 const LONG_TOOL_ELAPSED_REFRESH_MILLIS: i64 = 1_000;
+const REASONING_SUMMARY_ROTATION_MILLIS: i64 = 2_000;
 const LONG_TOOL_ELAPSED_THRESHOLD_MILLIS: i64 = 60_000;
 
 fn assistant_message_is_retired_action_leak(text: &str) -> bool {
@@ -552,6 +553,31 @@ fn reasoning_preview(source: &str) -> String {
     } else {
         preview.to_string()
     }
+}
+
+fn rotating_reasoning_summary_lines(source: &str) -> Option<Vec<&str>> {
+    let mut lines = Vec::new();
+    for line in source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let line = line.strip_prefix("**")?.strip_suffix("**")?.trim();
+        if line.is_empty() {
+            return None;
+        }
+        if lines.last().copied() != Some(line) {
+            lines.push(line);
+        }
+    }
+    (lines.len() > 1).then_some(lines)
+}
+
+fn reasoning_summary_rotation_phase(completed_at: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
+    now.signed_duration_since(completed_at)
+        .num_milliseconds()
+        .max(0)
+        .div_euclid(REASONING_SUMMARY_ROTATION_MILLIS)
 }
 
 fn tool_has_expandable_body(
@@ -4052,6 +4078,27 @@ impl Transcript {
         })
     }
 
+    pub(crate) fn reasoning_summary_rotation_phase_at(
+        &self,
+        index: usize,
+        now: DateTime<Utc>,
+    ) -> Option<i64> {
+        let Some(TranscriptEntry::Tool {
+            code_view: Some((language, source)),
+            completed_at: Some(completed_at),
+            complete: true,
+            expanded: false,
+            ..
+        }) = self.order.get(index)
+        else {
+            return None;
+        };
+        (language == "reasoning")
+            .then(|| rotating_reasoning_summary_lines(source))
+            .flatten()
+            .map(|_| reasoning_summary_rotation_phase(*completed_at, now))
+    }
+
     fn running_tool_timer_tick_at(&self, now: DateTime<Utc>) -> Option<i64> {
         let mut indices = self.tools.values().copied().collect::<Vec<_>>();
         indices.extend(self.active_reasoning);
@@ -5081,10 +5128,27 @@ impl Transcript {
                         || code_view
                             .as_ref()
                             .is_some_and(|(language, _)| is_diff_language(language));
-                    let mut summary = if detail.is_empty() || focused_tool == Some(index) {
+                    let rotating_detail = (is_reasoning
+                        && *complete
+                        && !*expanded
+                        && focused_tool.is_none())
+                    .then(|| {
+                        code_view.as_ref().and_then(|(_, source)| {
+                            rotating_reasoning_summary_lines(source).and_then(|lines| {
+                                completed_at.map(|completed_at| {
+                                    let phase =
+                                        reasoning_summary_rotation_phase(completed_at, render_time);
+                                    reasoning_preview(lines[phase as usize % lines.len()])
+                                })
+                            })
+                        })
+                    })
+                    .flatten();
+                    let display_detail = rotating_detail.as_deref().unwrap_or(detail);
+                    let mut summary = if display_detail.is_empty() || focused_tool == Some(index) {
                         format!("{time}  {glyph} {display_name}")
                     } else {
-                        format!("{time}  {glyph} {display_name}  {detail}")
+                        format!("{time}  {glyph} {display_name}  {display_detail}")
                     };
                     if let Some(lifecycle) = lifecycle {
                         summary.push_str(&format!(" · {lifecycle}"));
@@ -5655,6 +5719,61 @@ impl Transcript {
 #[cfg(test)]
 mod parallel_preparation_tests {
     use super::*;
+
+    #[test]
+    fn completed_reasoning_cycles_distinct_summary_lines_without_changing_expanded_source() {
+        let session_id = Uuid::new_v4();
+        let completed_at = Utc::now();
+        let source = "**Waiting on external session.**\n**Awaiting session expiry.**\n**Awaiting session expiry.**\n**Running candidate tests.**";
+        let mut transcript = Transcript::default();
+        transcript.apply(&SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::ReasoningDelta {
+                text: source.to_string(),
+            },
+        ));
+        let mut completed = SessionEvent::new(session_id, 2, SessionEventKind::ReasoningCompleted);
+        completed.created_at = completed_at;
+        transcript.apply(&completed);
+
+        for (seconds, expected) in [
+            (0, "Waiting on external session."),
+            (2, "Awaiting session expiry."),
+            (4, "Running candidate tests."),
+            (6, "Waiting on external session."),
+        ] {
+            let rendered = transcript
+                .render_for_cache_at(100, 30, completed_at + chrono::Duration::seconds(seconds))
+                .0
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rendered.contains(expected), "{rendered}");
+            assert_eq!(
+                rendered.matches("Awaiting session expiry.").count(),
+                usize::from(seconds == 2)
+            );
+        }
+
+        transcript.toggle_tool(0);
+        let expanded = transcript
+            .render_for_cache_at(100, 30, completed_at + chrono::Duration::seconds(8))
+            .0
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(expanded.matches("Awaiting session expiry.").count(), 2);
+        assert!(matches!(
+            &transcript.order[0],
+            TranscriptEntry::Tool {
+                code_view: Some((_, body)),
+                ..
+            } if body == source
+        ));
+    }
 
     #[test]
     fn streamed_thinking_keeps_a_bounded_live_summary_and_full_expandable_text() {
