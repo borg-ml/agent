@@ -1,8 +1,9 @@
 # Claude shared model connector: a working ownership boundary
 
-2026-09-24. Research result and complete cutover contract. A shared transport
-and Borg model provider are implemented and tested below; the production
-agent-harness routing has not yet been switched.
+2026-09-24. Implemented and activated in the local agent executor. Claude turns
+and children now use Borg's native harness through one shared subscription model
+helper per persistent credential authority. No Claude agent loop runs on this
+path. The historical prototype measurements below are labeled separately.
 
 ## Implementation verification
 
@@ -51,12 +52,60 @@ Other stream tests cover signed/opaque state through serialization and rejection
 of truncated or corrupt responses; account-isolation tests reject continuation
 from a different or unknown subscription.
 
-**Activation gates remain:** full agent harness/UI/journal/approval integration,
-controller-supplied credential authorities, expired-token recovery verification,
-remaining model features, and other host platforms. The current runtime binding
-admits Linux x86-64 glibc only and fails explicitly elsewhere. It never falls back
-to API billing or a provider-owned agent loop. Evidence is retained locally in
+The current runtime binding admits Linux x86-64 glibc only and fails explicitly
+elsewhere. It never falls back to API billing or a provider-owned agent loop.
+Evidence for these provider checks is retained locally in
 `~/.local/share/borg/assessments/2026-09-24-subscriptions/claude-connector-research/rust-provider-proof/`.
+
+### Full Borg runtime verification
+
+The checked-in [session probe](../crates/borg-remote/examples/codex_native_probe.rs)
+ran against an isolated PostgreSQL journal using the existing subscription:
+
+- A real Borg `exec` call passed manual approval, then Borg-owned compaction,
+  durable session restart, and an isolated consultation. Native content was
+  journaled; no Claude-owned session ID was created.
+- The same sequence passed with automatic approval, including Claude's
+  structured JSON review. Approval and consultation requests also retain raw
+  request/usage audit events.
+- Two Borg children streamed concurrently through one helper. Steering the
+  first and interrupting the second acted independently. Both recovered their
+  own private marker on follow-up, including the interrupted child. Each child
+  had its own journal, usage, request identity and actual parent identity.
+  Their parent received the normal `SubagentActivity` events used by Borg's UI;
+  this check did not render a UI.
+- Sampled combined peak memory for the two-child test was **166.44 MiB PSS**:
+  Borg separately peaked at 62.64 MiB and the helper at 103.82 MiB. These
+  separate peaks need not coincide. Sampling was every 50 ms; the workload
+  took 16.99 seconds. PostgreSQL, a rendered UI and unrelated host services are
+  excluded. This is a small-context measurement, not a memory scaling limit.
+
+The live tool check found Claude rejects top-level `oneOf` in tool schemas.
+The exec declaration now states the exclusive choice directly; Borg's existing
+runtime validation still requires exactly one of `cmd` and `session_id`.
+
+The control probe passed immediate durable queuing while a command is running,
+delivery at the tool boundary, and interruption that reaps the command. Its
+earlier expectation of a completed steer before the command ended was obsolete:
+completion now means the steer was durably folded into model input.
+
+Evidence: `claude-connector-research/runtime-cutover-proof/` under the same
+assessment directory. Logs include unsuccessful trials as well as final passes.
+
+### Persistent login authorities
+
+Local use continues to read the normal Claude Code login directory. Embedding
+controllers must initialize and retain a private directory per selected login,
+then supply `ChatProviderAuth.claude_config_dir` (or `codex_home` for Codex).
+Turns never restore an old bundle over rotating credentials. Missing directories,
+provider mismatches and cloud-channel substitutions fail explicitly. A controller
+using only the old bundle field must adopt this persistent-directory contract.
+
+Normal turns, approvals, compaction and consultations bind the selected account.
+Replayed native state is checked against that account before sending it. Native
+refresh uses the runtime's own credential invalidation, refresh lock and 401
+recovery. Credential-boundary tests cover persistence, isolation, stale-bundle
+avoidance and redacted diagnostics. A real expired-token race was not forced.
 
 ## Recommendation
 
@@ -66,7 +115,7 @@ addressed inference calls. Borg owns children, messages, the loop, context and
 cache policy, tools, permissions, journal, UI, steering, cancellation decisions,
 and recovery from the first release of this path.
 
-**This boundary now has a working live prototype.** Four overlapping, isolated
+**The original prototype established the boundary.** Four overlapping, isolated
 conversations ran through one unmodified Claude Code binary without starting
 Claude's agent loop. The helper peaked at 148.47 MiB PSS. Warm follow-ups reused
 99.60% of input tokens from cache. A new helper process recovered a conversation
@@ -78,9 +127,9 @@ as an architectural conclusion. An internal model-call boundary provides another
 route. It does not require Claude's native Agent tool, native child sessions,
 or a presentation layer over Claude-managed children.
 
-This establishes feasibility on the tested binary. It does not establish a
-supported public interface, complete Borg integration, or the absolute minimum
-possible transport footprint.
+The subsequent implementation and full-runtime checks above establish Borg
+integration. They do not establish a supported public interface or the absolute
+minimum possible transport footprint.
 
 ## What was inspected
 
@@ -109,7 +158,7 @@ Their wrappers restrict input/output or tool use; those wrappers are insufficien
 for a general Borg model transport. The lower client boundary is sufficient for
 the tested workload.
 
-## How the prototype works
+## How the original prototype worked
 
 The unmodified 2.1.278 binary honors a process-local `BUN_OPTIONS=--preload=...`.
 The research preload imports three embedded modules, initializes the existing
@@ -163,7 +212,7 @@ of that probe is not complete attribution conformance. The production connector
 must preserve the selected runtime's attribution behavior, model capabilities,
 and effective request settings explicitly.
 
-## Measured results
+## Original prototype measurements (2.1.278)
 
 Linux x86-64, unmodified Claude Code 2.1.278, `claude-sonnet-5`, existing Max
 subscription OAuth. A unique synthetic system prefix made the first group cold
@@ -229,10 +278,9 @@ The wrapper now checks the abort signal before emitting its terminal event;
 the repeated cancellation check passed. Usage received before abort remains
 partial and must not be presented as a final billed total.
 
-## The complete first cutover
+## Implemented ownership boundary
 
-These requirements belong in the same reviewed cutover. They are not a sequence
-of releases leaving pieces of agent ownership in Claude.
+These responsibilities move together in the native execution path:
 
 1. **Host-owned shared helper.** Broker calls by account/credential authority,
    not by Borg child, worktree, or temporary auth-home path. Coordinate across
@@ -261,38 +309,28 @@ of releases leaving pieces of agent ownership in Claude.
    Recovery replays Borg state and never silently chooses API-key billing or
    restarts a provider-owned agent loop.
 
-### Concrete Borg integration points
+### Source locations
 
-- [Claude native-harness routing](/home/shulgin/agent/crates/borg-agent-runtime/src/contract.rs:330)
-  and [provider dispatch](/home/shulgin/agent/crates/borg-agent-runtime/src/native_harness.rs:1905).
-- [Per-session credential restoration](/home/shulgin/agent/crates/borg-agent-runtime/src/agent.rs:1244)
-  must become a shared credential authority for Claude without collapsing
-  different users/accounts together.
-- [Native model state](/home/shulgin/agent/crates/borg-core/src/model.rs:49)
-  now also preserves Anthropic blocks and account provenance.
-- [Anthropic request encoding](/home/shulgin/agent/crates/borg-provider/src/provider/anthropic_messages.rs:224)
-  now preserves native thinking and requests streaming. The separate subscription
-  provider replaces its fixed API-lane budgets with native capabilities and
-  uses the shared subscription authority.
-- [Usage storage](/home/shulgin/agent/crates/borg-core/src/usage.rs:35)
-  needs the additional breakdowns if the UI is to show them durably.
-- [Binary resolution](/home/shulgin/agent/crates/borg-provider/src/provider_bin.rs:189)
-  must validate connector compatibility beyond `claude --version`.
+- [Executor routing](../crates/borg-agent-runtime/src/agent.rs):
+  `LocalAgentTurnExecutor::uses_native_harness` and `execute`.
+- [Account binding, model dispatch and compaction](../crates/borg-agent-runtime/src/native_harness.rs):
+  `with_provider_context`, `with_model_access_for`, `ProviderModelClient`, `compact`.
+- [Durable replay](../crates/borg-agent-runtime/src/session.rs):
+  `native_conversation_with_images` and `native_request_prefix`.
+- [Lossless model state](../crates/borg-core/src/model.rs): `ModelProviderState`.
+- [Native content codec](../crates/borg-provider/src/provider/anthropic_messages.rs).
+- [Pinned binary and shared helper](../crates/borg-provider/src/provider/claude_connector.rs).
 
-## What remains unproven before activation
+## Remaining evidence limits
 
-The experiment did not integrate Borg's UI, native harness or journal, exercise
-expired-token refresh/401 recovery, restore controller-supplied accounts, test
-cross-process helper sharing, exhaust the quota, validate fast mode or all
-selectable models, test images/structured output, or exercise production-sized
-contexts and compaction. The restart was orderly; killing a helper mid-stream
-still needs an integration check that preserves partial usage and durable state.
-
-Small acceptance tests should cover those concrete product contracts: a Borg
-child with a real approval and tool continuation; a steer affecting only that
-child; simultaneous clients sharing one PID; forced helper death and journal
-replay; refresh/account isolation; and a capability matrix for the pinned
-release. A compiler check cannot establish those cross-process/model contracts.
+The full runtime probes used Sonnet 5 at low effort. Provider probes separately
+covered signed thinking replay and helper replacement; codec tests cover images
+and opaque blocks. We did not force real OAuth expiry, exhaust quota, run every
+selectable model/fast-mode combination, visually inspect the UI, or establish
+production-sized memory scaling. Mid-stream interruption retained partial usage;
+the forced-helper-death recovery probe killed the helper between requests.
+Other platforms require their own validated binary bindings before they can use
+this route. These are explicit limits, not fallback routes.
 
 The observed credential lane was subscription OAuth and no API key was used.
 We did not measure an isolated change in the account's subscription allowance.
@@ -325,6 +363,5 @@ The tested binary is `/home/shulgin/.local/share/claude/versions/2.1.278`, SHA-2
 The extraction and installed binaries were not modified. Probe artifacts contain
 synthetic conversations and model output; credentials were never recorded.
 
-The remaining work is a complete production cutover against this boundary.
-There is now evidence to pursue full Borg ownership immediately, with a shared
-subscription transport and a fixed runtime footprint.
+Production execution now uses this boundary. The helper has a shared runtime
+cost; live request buffers and Borg histories still grow with concurrent work.

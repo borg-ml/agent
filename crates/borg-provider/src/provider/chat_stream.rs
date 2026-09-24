@@ -663,11 +663,25 @@ pub enum LocalAgentPermission {
     Manual,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ChatProviderAuth {
     pub provider: ProviderAuthProvider,
     pub bundle: ProviderAuthBundle,
+    /// Persistent login authority. Native turns never copy rotating tokens.
     pub codex_home: Option<PathBuf>,
+    pub claude_config_dir: Option<PathBuf>,
+}
+
+impl fmt::Debug for ChatProviderAuth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChatProviderAuth")
+            .field("provider", &self.provider)
+            .field("bundle", &"<redacted>")
+            .field("codex_home", &self.codex_home)
+            .field("claude_config_dir", &self.claude_config_dir)
+            .finish()
+    }
 }
 
 #[derive(Clone)]

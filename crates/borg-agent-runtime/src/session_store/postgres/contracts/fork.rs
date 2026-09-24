@@ -95,6 +95,107 @@ async fn request_usage_survives_reload_without_double_counting_or_fork_inheritan
 }
 
 #[tokio::test]
+async fn cache_projection_survives_reload_and_fork_without_erasing_the_transcript() {
+    use borg_provider::provider::{ModelMessage, ModelToolCall};
+    let (scratch, store) = super::support::store().await;
+    let parent = Uuid::new_v4();
+    store.create_session(parent).await.unwrap();
+    let prefix = crate::NativeRequestPrefix {
+        provider: CodingProvider::Claude,
+        model: "test-model".into(),
+        system_prompt: "stable system".into(),
+        tools: vec![],
+        prompt_cache_key: "parent-key".into(),
+    };
+    let original = "complete tool evidence".repeat(500);
+    for message in [
+        ModelMessage::user("inspect"),
+        ModelMessage::assistant(
+            None,
+            None,
+            None,
+            vec![ModelToolCall::function(
+                "call-1".into(),
+                "read".into(),
+                "{}".into(),
+            )],
+        ),
+        ModelMessage::tool("call-1", &original),
+    ] {
+        store
+            .append(SessionEvent::new(
+                parent,
+                0,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Claude,
+                    kind: "native_model_message".into(),
+                    payload: serde_json::to_value(message).unwrap(),
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    for (kind, payload) in [
+        ("native_tool_round_completed", serde_json::json!({})),
+        (
+            "native_request_prefix",
+            serde_json::to_value(&prefix).unwrap(),
+        ),
+        (
+            "context_microcompaction",
+            serde_json::json!({"status":"completed","cleared_tool_call_ids":["call-1"]}),
+        ),
+    ] {
+        store
+            .append(SessionEvent::new(
+                parent,
+                0,
+                SessionEventKind::ProviderEvent {
+                    provider: CodingProvider::Claude,
+                    kind: kind.into(),
+                    payload,
+                },
+            ))
+            .await
+            .unwrap();
+    }
+    drop(store);
+    let store = crate::PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+        .await
+        .unwrap();
+    let child = Uuid::new_v4();
+    store.fork_before(parent, child, 7).await.unwrap();
+    for session in [parent, child] {
+        let context = store.recovery(session).await.unwrap().context_events;
+        assert_eq!(
+            crate::session::native_request_prefix(&context),
+            Some(prefix.clone())
+        );
+        let messages =
+            crate::session::native_conversation(&context, CodingProvider::Claude).unwrap();
+        assert!(messages.iter().any(
+            |message| matches!(message, ModelMessage::Tool { content, .. }
+            if content == crate::native_harness::MICROCOMPACT_CLEARED_TOOL_RESULT)
+        ));
+        assert!(store.read(session).await.unwrap().iter().any(|event| matches!(&event.kind,
+            SessionEventKind::ProviderEvent { kind, payload, .. } if kind == "native_model_message" && payload["content"] == original)));
+    }
+    store
+        .append(SessionEvent::new(
+            child,
+            0,
+            SessionEventKind::ContextCleared,
+        ))
+        .await
+        .unwrap();
+    assert!(
+        crate::session::native_request_prefix(&store.recovery(child).await.unwrap().context_events)
+            .is_none()
+    );
+    scratch.discard().await;
+}
+
+#[tokio::test]
 async fn fork_records_lineage_without_copying_events() {
     let (scratch, store) = super::support::store().await;
     let parent_id = Uuid::new_v4();
