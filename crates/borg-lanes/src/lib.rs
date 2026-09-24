@@ -4,6 +4,7 @@
 #![cfg(unix)]
 
 pub mod adapter;
+mod host_admission;
 pub mod lanes;
 pub mod services;
 pub mod workspace;

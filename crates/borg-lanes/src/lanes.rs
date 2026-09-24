@@ -393,6 +393,7 @@ impl LaneStore {
     }
 
     fn locked<T>(&self, f: impl FnOnce(&mut Journal) -> Result<T>) -> Result<T> {
+        let _host = crate::host_admission::lock(&self.root)?;
         let guard = stable_file(&self.root.join("state.lock"))?;
         guard.lock()?;
         let state = self.root.join("state.json");
@@ -550,7 +551,7 @@ impl LaneStore {
                 let reason = if reason.is_some() {
                     reason
                 } else {
-                    budget_reason(state, budget).unwrap_or_else(|error| {
+                    budget_reason(&self.root, state, budget).unwrap_or_else(|error| {
                         Some(format!("budget inspection unavailable: {error:#}"))
                     })
                 };
@@ -565,8 +566,11 @@ impl LaneStore {
             let lock = stable_file(&self.ticket_path(ticket.id))?;
             lock.lock()?;
             held = Some(lock);
-            let reason = dispatch_reason(state, ticket.id)?.or(budget_reason(state, budget)
-                .unwrap_or_else(|error| Some(format!("budget inspection unavailable: {error:#}"))));
+            let reason =
+                dispatch_reason(state, ticket.id)?.or(budget_reason(&self.root, state, budget)
+                    .unwrap_or_else(|error| {
+                        Some(format!("budget inspection unavailable: {error:#}"))
+                    }));
             let entry = state
                 .records
                 .iter_mut()
@@ -1968,7 +1972,17 @@ fn same_filesystem(left: &Path, right: &Path) -> Result<bool> {
     }
 }
 
-fn budget_reason(state: &Journal, budget: &AdmissionBudget) -> Result<Option<String>> {
+fn budget_reason(root: &Path, state: &Journal, budget: &AdmissionBudget) -> Result<Option<String>> {
+    let mut combined = state.clone();
+    let own = root.canonicalize()?.join("state.json");
+    for path in crate::host_admission::journals(root)? {
+        if path == own || !path.exists() {
+            continue;
+        }
+        let foreign: Journal = serde_json::from_slice(&fs::read(&path)?)?;
+        combined.records.extend(foreign.records);
+    }
+    let state = &combined;
     let active: Vec<_> = state
         .records
         .iter()
@@ -1981,7 +1995,7 @@ fn budget_reason(state: &Journal, budget: &AdmissionBudget) -> Result<Option<Str
                 .map(|b| (r, b))
         })
         .collect();
-    let reserved_ram = active
+    let mut reserved_ram = active
         .iter()
         .map(|(row, b)| {
             // MemAvailable already excludes resident memory. Reserve only future
@@ -2024,6 +2038,11 @@ fn budget_reason(state: &Journal, budget: &AdmissionBudget) -> Result<Option<Str
             b.reserve_ram_bytes.saturating_sub(resident)
         })
         .fold(0_u64, u64::saturating_add);
+    // Bridge scopes may overlap a Borg job; adapters skip their bridge claim
+    // when Borg already owns this workload. Unknown scopes get no RSS credit.
+    for (bytes, _) in crate::host_admission::bridge_reservations(root)? {
+        reserved_ram = reserved_ram.saturating_add(bytes);
+    }
     let reserved_disk: u64 = state
         .records
         .iter()
@@ -2196,9 +2215,11 @@ impl LaneStore {
                     .find(|r| r.ticket.id == id)
                     .and_then(|r| r.spec.as_ref())
                 {
-                    Some(spec) => budget_reason(state, &spec.admission).unwrap_or_else(|error| {
-                        Some(format!("budget inspection unavailable: {error:#}"))
-                    }),
+                    Some(spec) => {
+                        budget_reason(&self.root, state, &spec.admission).unwrap_or_else(|error| {
+                            Some(format!("budget inspection unavailable: {error:#}"))
+                        })
+                    }
                     None => None,
                 }
             };
@@ -4286,7 +4307,7 @@ mod tests {
         store.release_lease(&admitted[0]).unwrap();
         assert!(
             store
-                .reading(|s| budget_reason(s, &budget))
+                .reading(|s| budget_reason(store.root(), s, &budget))
                 .unwrap()
                 .is_none()
         );
@@ -4327,7 +4348,7 @@ mod tests {
             ..test_budget(&b_path)
         };
         let job_reason = store
-            .reading(|state| budget_reason(state, &job_budget))
+            .reading(|state| budget_reason(store.root(), state, &job_budget))
             .unwrap()
             .unwrap();
         assert!(job_reason.contains("disk"), "{job_reason}");
@@ -4372,7 +4393,7 @@ mod tests {
         store.release_lease(&second).unwrap();
         assert!(
             store
-                .reading(|state| budget_reason(state, &job_budget))
+                .reading(|state| budget_reason(store.root(), state, &job_budget))
                 .unwrap()
                 .is_none()
         );
@@ -4402,7 +4423,7 @@ mod tests {
             .unwrap();
         fs::remove_dir(&active).unwrap();
         let error = store
-            .reading(|state| budget_reason(state, &test_budget(&other)))
+            .reading(|state| budget_reason(store.root(), state, &test_budget(&other)))
             .unwrap_err()
             .to_string();
         assert!(error.contains("reserved disk"), "{error}");
