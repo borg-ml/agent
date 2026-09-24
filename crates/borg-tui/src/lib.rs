@@ -98,6 +98,7 @@ const PARALLEL_MARKDOWN_RENDER_MIN_MESSAGES: usize = 512;
 const MAX_PARALLEL_MARKDOWN_RENDER_WORKERS: usize = 16;
 const COMMAND_PANEL_BG: Color = Color::Rgb(31, 24, 27);
 const COMPOSER_BG: Color = Color::Rgb(42, 32, 37);
+const COMPOSER_INPUT_BG: Color = Color::Rgb(31, 24, 27);
 /// Divider between status-line segments. It is its own span so a hovered
 /// segment underlines its own text only.
 const STATUS_SEPARATOR: &str = " · ";
@@ -8475,7 +8476,7 @@ impl BorgTerminal {
                 .style(Style::default().bg(if is_launch_screen {
                     Color::Reset
                 } else {
-                    COMPOSER_BG
+                    COMPOSER_INPUT_BG
                 }))
                 .borders(if is_launch_screen {
                     Borders::LEFT
@@ -8500,7 +8501,7 @@ impl BorgTerminal {
             let composer_content_style = Style::default().bg(if is_launch_screen {
                 Color::Reset
             } else {
-                COMPOSER_BG
+                COMPOSER_INPUT_BG
             });
             if let Some(lines) = picker_lines.clone() {
                 frame.render_widget(
@@ -8793,7 +8794,7 @@ impl BorgTerminal {
                             .bg(if is_launch_screen {
                                 Color::Reset
                             } else {
-                                COMMAND_PANEL_BG
+                                COMPOSER_BG
                             }),
                     )
                     .alignment(if is_launch_screen {
@@ -16029,8 +16030,11 @@ fn apply_running_status_shimmer(spans: &mut Vec<Span<'static>>, phase: u128) {
     let period = label_width.saturating_add(RUNNING_SHIMMER_PADDING * 2);
     let center = ((phase % RUNNING_SHIMMER_CYCLE_MILLIS) * period as u128
         / RUNNING_SHIMMER_CYCLE_MILLIS) as usize;
-    let Color::Rgb(background_red, background_green, background_blue) = COMMAND_PANEL_BG else {
-        unreachable!("command panel background is RGB")
+    let Color::Rgb(background_red, background_green, background_blue) = COMPOSER_BG else {
+        unreachable!("composer background is RGB")
+    };
+    let Color::Rgb(base_red, base_green, base_blue) = RUNNING_STATUS_PEACH else {
+        unreachable!("running status colour is RGB")
     };
     let mut offset = 0usize;
     let mut animated = Vec::with_capacity(label.content.graphemes(true).count());
@@ -16052,9 +16056,9 @@ fn apply_running_status_shimmer(spans: &mut Vec<Span<'static>>, phase: u128) {
             label
                 .style
                 .fg(Color::Rgb(
-                    channel(202, background_red),
-                    channel(193, background_green),
-                    channel(196, background_blue),
+                    channel(base_red, background_red),
+                    channel(base_green, background_green),
+                    channel(base_blue, background_blue),
                 ))
                 .add_modifier(Modifier::BOLD),
         ));

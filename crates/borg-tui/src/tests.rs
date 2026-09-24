@@ -2679,15 +2679,18 @@ fn running_status_shimmer_leaves_spinner_and_elapsed_time_still() {
             .collect::<Vec<_>>()
     );
 
-    let Color::Rgb(background_red, background_green, background_blue) = COMMAND_PANEL_BG else {
+    let Color::Rgb(background_red, background_green, background_blue) = COMPOSER_BG else {
         unreachable!()
     };
     let Color::Rgb(red, green, blue) = first[2].style.fg.unwrap() else {
         panic!("the status shimmer uses RGB colors")
     };
-    assert!(red.abs_diff(background_red) < 20);
-    assert!(green.abs_diff(background_green) < 20);
-    assert!(blue.abs_diff(background_blue) < 20);
+    let Color::Rgb(base_red, base_green, base_blue) = RUNNING_STATUS_PEACH else {
+        unreachable!()
+    };
+    assert!(red.abs_diff(background_red) < red.abs_diff(base_red));
+    assert!(green.abs_diff(background_green) < green.abs_diff(base_green));
+    assert!(blue.abs_diff(background_blue) < blue.abs_diff(base_blue));
 
     let mut without_duration =
         status_control_spans("⠋", "running", RUNNING_STATUS_PEACH, false, None);
