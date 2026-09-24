@@ -11755,12 +11755,15 @@ fn is_safe_automatic_retry_error(error: &str) -> bool {
 /// 429 is a usage limit and handled separately.
 fn provider_error_is_transient_api_failure(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
-    if let Some(status) = error
-        .split("request failed with http ")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next())
-        .and_then(|status| status.trim_end_matches(':').parse::<u16>().ok())
-        && (500..600).contains(&status)
+    if [
+        "request failed with http ",
+        "codex subscription response did not complete. http ",
+    ]
+    .into_iter()
+    .filter_map(|prefix| error.split(prefix).nth(1))
+    .filter_map(|rest| rest.split_whitespace().next())
+    .filter_map(|status| status.trim_end_matches([':', '.']).parse::<u16>().ok())
+    .any(|status| (500..600).contains(&status))
     {
         return true;
     }
