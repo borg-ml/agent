@@ -55,6 +55,18 @@ class AdapterTests(unittest.TestCase):
         config.write_text('[editor]\nport = 49311\nbackend_ports = [49311,49313]\n')
         self.assertEqual(self.cli('editor', 'spec').returncode, 2)
 
+    def test_project_visual_adapter_preserves_arguments_and_refuses_escape(self):
+        adapter = self.project.parent / 'visual.py'
+        adapter.write_text('import json, sys; print(json.dumps(sys.argv[1:]))\n')
+        config = self.project.parent / '.borg-unreal.toml'
+        config.write_text('[visual]\nadapter = "visual.py"\n')
+        result = self.cli('visual', 'batch', 'session with spaces', '$(must-stay-literal)', 'out')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), ['batch', 'session with spaces', '$(must-stay-literal)', 'out'])
+        config.write_text('[visual]\nadapter = "../outside.py"\n')
+        (self.project.parent.parent / 'outside.py').write_text('raise SystemExit(0)')
+        self.assertNotEqual(self.cli('visual', 'start', 'session').returncode, 0)
+
     def test_build_project_alias_normalized_and_conflicts_rejected(self):
         # Pin -MaxParallelActions despite host MemAvailable changing mid-test.
         (self.project.parent / '.borg-unreal.toml').write_text(

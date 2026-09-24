@@ -86,7 +86,7 @@ def budget(project: Path, cfg: dict, section: str) -> dict:
     min_ram = sizes(cfg, section, 'min_available_ram_gb', 8)
     disk = sizes(cfg, section, 'min_free_disk_gb', 20)
     return {'min_available_ram_bytes': min_ram * GIB,
-            'reserve_ram_bytes': sizes(cfg, section, 'reserve_ram_gb', 4) * GIB,
+            'reserve_ram_bytes': sizes(cfg, section, 'reserve_ram_gb', 12 if section == 'build' else 8) * GIB,
             'min_free_disk_bytes': disk * GIB,
             'reserve_disk_bytes': sizes(cfg, section, 'reserve_disk_gb', 10) * GIB,
             'disk_path': str(project.parent)}
@@ -151,11 +151,12 @@ def build_spec(args: argparse.Namespace, project: Path, engine: Path, cfg: dict)
     script = engine / 'Engine/Build/BatchFiles' / PLATFORM / 'Build.sh'
     state = Path(os.environ.get('XDG_RUNTIME_DIR') or '/tmp') / 'borg' / 'unreal' / project_id(project)
     action_gb = float(cfg.get('build', {}).get('gb_per_action', 1.5))
-    reserve = sizes(cfg, 'build', 'reserve_ram_gb', 4)
+    reserve = sizes(cfg, 'build', 'reserve_ram_gb', 12)
     if action_gb <= 0:
         raise ValueError('build.gb_per_action must be positive')
     available = mem_available_bytes() // GIB
-    actions = max(1, min((os.cpu_count() or 2) // 2, int(max(1, available - reserve) / action_gb)))
+    actions = max(1, min((os.cpu_count() or 2) // 2,
+                        int(max(1, min(available - 8, reserve - 2)) / action_gb)))
     ubt_args = [a for a in positional if not a.lower().startswith(('-waitmutex', '-nomutex', '-log=', '-maxparallelactions='))]
     ubt_args += ['-NoMutex', f'-MaxParallelActions={actions}']
     have_syms = (PLATFORM == 'Linux' and
@@ -297,6 +298,9 @@ def main(argv: list[str]) -> int:
     editor.add_argument('service_args', nargs=argparse.REMAINDER)
     mcp = sub.add_parser('mcp')
     mcp.add_argument('mcp_args', nargs=argparse.REMAINDER)
+    for name in ('visual', 'assets'):
+        adapter = sub.add_parser(name, help='invoke the configured project fixture/visual adapter')
+        adapter.add_argument('adapter_args', nargs=argparse.REMAINDER)
     opts = ap.parse_args(argv)
     # argparse.REMAINDER preserves UBT/Python flags but also captures adapter
     # flags placed after the target/kind. Only consume flags before the explicit
@@ -315,6 +319,20 @@ def main(argv: list[str]) -> int:
     try:
         project = project_path(opts.project or os.environ.get('UE_UPROJECT'), Path.cwd())
         cfg = read_config(project, opts.config)
+        if opts.command in ('visual', 'assets'):
+            relative = cfg.get(opts.command, {}).get('adapter')
+            if not isinstance(relative, str) or Path(relative).is_absolute():
+                raise ValueError(f'{opts.command}.adapter must name a project-relative Python script')
+            adapter = (project.parent / relative).resolve(strict=True)
+            if not adapter.is_relative_to(project.parent) or adapter.suffix != '.py':
+                raise ValueError('project adapter must stay inside the project tree')
+            allowed = ('start', 'wait', 'status', 'batch', 'stop') if opts.command == 'visual' else ('snapshot', 'stage')
+            if not opts.adapter_args or opts.adapter_args[0] not in allowed:
+                raise ValueError(f'{opts.command} requires one of {allowed}')
+            # Keep the attached process visible to Borg cancellation/watch;
+            # the project adapter owns scene readiness, leases and restoration.
+            os.chdir(project.parent)
+            os.execv(sys.executable, [sys.executable, str(adapter), *opts.adapter_args])
         engine = engine_path(project, opts.engine_root or cfg.get('engine_root'))
         if opts.command == 'discover':
             front, back = ports(cfg)
