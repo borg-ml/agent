@@ -109,6 +109,7 @@ pub use profiling::{
     RuntimeProfileActiveTurn, RuntimeProfilePhase, RuntimeProfileSnapshot, RuntimeProfileTurn,
     read_runtime_profile, runtime_profile_path,
 };
+pub use prompt_context::NativeRequestPrefix;
 pub use runtime_protocol::{
     AGENT_RUNTIME_PROTOCOL, AGENT_RUNTIME_PROTOCOL_VERSION, AgentRuntimeCommandEnvelope,
     AgentRuntimeEventEnvelope, AgentRuntimeSnapshot,

@@ -12,7 +12,7 @@ discipline is the most explicit of the harnesses available to read.
 | Anthropic API | Explicit `cache_control` breakpoints, at most four per request | One on the system block, one on the last tool definition, and one on the newest text so the marker advances with the conversation |
 | Codex (ChatGPT subscription, Responses API) | Implicit prefix cache, keyed by `prompt_cache_key`, with turn-scoped sticky routing | Stable per-session key, deterministic `instructions`, `store: false`, reasoning items replayed through `provider_state`, and the `x-codex-turn-state` token from a turn's first response replayed on the rest of that turn |
 | OpenAI-compatible family: Go gateway, Kimi, GLM, Qwen, OpenRouter, configured endpoints | Implicit prefix cache, keyed by `prompt_cache_key` for vendors that honour it | Same stable key; some profiles also send the session id |
-| Claude subscription (Claude Code binary) | The binary owns its own breakpoints: a global-scope block before `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`, an org-scope block after it, and a rolling message marker with a one-hour TTL | Borg supplies the system prompt, the pooled process and the prompt text; a reused process appends only the new turn. An idle process is kept for the cache's hour, four at most across the host, and model or effort changes are applied to the live process |
+| Claude subscription (shared model connector) | Explicit Messages cache breakpoints with one-hour retention; the shared helper supplies native subscription authentication and required request attribution | Borg constructs stable instructions, sorted tools, breakpoint placement, lossless native history and thinking settings. All children on a credential authority share one helper; restart replays Borg's journal without a provider-owned session |
 
 ## Invariants
 
@@ -42,7 +42,10 @@ discipline is the most explicit of the harnesses available to read.
   counter or randomness reaches the prompt. Tool definitions are sorted before
   the request.
 - **Cheapest reduction first.** Micro-compaction clears old tool results in the
-  replayed view before any summary rewrites history.
+  replayed view before any summary rewrites history. Cleared tool IDs are durable
+  and fork-inheritable, so a new turn or process reconstructs the same view while
+  the original transcript remains available. Manual and between-turn compaction
+  likewise recover the previous system/tools/cache key from `native_request_prefix`.
 
 ## Measurement and token definitions (verified 2026-09-24)
 
@@ -63,6 +66,11 @@ terminal usage even when its output is rejected. An absent counter is unknown,
 not a measured zero. These audit events do not increment the existing
 `usage_updated` turn totals and are not inherited into a fork's request audit.
 The child's own journal holds its audit; its parent does not duplicate it.
+The bound native client also journals auxiliary approval, consultation and
+compaction requests. Optional title generation currently exposes its successful
+processed total through `SessionTitled`; standalone TUI commit-message drafts do
+not enter a conversation journal. Neither is included in the matched workload
+measurements below.
 
 Fresh matched adapter probes against Codex 0.156.1 did not establish a general
 Borg cache failure. The simple warm follow-ups cached 98.00% in Borg and 98.92%
@@ -113,26 +121,21 @@ in `/home/shulgin/.local/share/borg/assessments/2026-09-24-subscriptions/`.
 
 ## Gaps, in the order they are worth closing
 
-1. **Cold Claude processes after a restart or eviction.** The replacement
-   process gets the canonical projection, so its first request rewrites a
-   history the previous process still has cached. Beyond the four newest idle
-   processes this happens to any session left idle. Resuming Claude Code's own session record would
-   reuse it, at the cost of a provider-owned durable state Borg does not keep
-   today.
-2. **Volatile status in the Claude system prompt.** Provider usage percentages
-   sit in the system block every new Claude process shares, so a changed figure
-   rewrites that block for the next subagent or cold turn. Small today; it would
-   move to trailing context as on the native lanes.
-3. **Responses over WebSocket.** Codex CLI sends incremental input with
-   `previous_response_id` over a persistent socket. Borg stays on HTTP, which
-   the backend still caches by prefix; the socket mainly saves upload and
-   latency.
-4. **Codex intermittent warm misses.** Catalog-driven request conformance and
+1. **Codex intermittent warm misses.** Catalog-driven request conformance and
    infrastructure cookies are implemented. Some controlled warm calls still
    missed completely. The final effort-marker correction and transport effects
    have not been isolated as causes; byte-stable replay alone does not prove
    that the service will return a cache hit.
-5. **Warming where no lifetime is documented.** Warming fires wherever a
+2. **Responses over WebSocket.** Codex CLI sends incremental input with
+   `previous_response_id` over a persistent socket. Borg stays on HTTP, which
+   the backend still caches by prefix; the socket mainly saves upload and
+   latency.
+3. **Long-context Claude verification.** Shared-helper restart and signed-state
+   replay reused warm cache in bounded tests. Larger coding sessions and cache
+   expiry have not been matched against native Claude. The old process-per-child
+   and volatile-system-status gaps are removed by the native harness cutover.
+4. **Warming where no lifetime is documented.** Warming fires wherever a
    documented lifetime exists, which today is the direct Anthropic route. An
    operator who knows a vendor retention can declare `prompt_cache_ttl_seconds`
-   for a configured provider.
+   for a configured provider. Automatic warming is disabled for subscription
+   routes: an API-price saving does not establish a subscription-quota saving.

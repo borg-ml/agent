@@ -1,9 +1,10 @@
 # Claude native protocol (stream-json + control_request)
 
-For the model-only ownership boundary tested on Claude Code 2.1.278, see
-[the shared model connector research](claude-shared-model-connector.md). That
-prototype uses private runtime modules through a preload and does not enter the
-agent loop described here. It is not a new stream-json control capability.
+**Historical compatibility transport.** Normal Claude execution now uses
+[the shared model connector](claude-shared-model-connector.md), pinned to
+Claude Code 2.1.281. Borg owns the agent loop and calls private model modules
+through a shared helper. The stream-json controls described below remain a
+reference for the legacy adapter; they do not provide the new sharing boundary.
 
 Reference for the native Rust `claude-agents` runtime imported by Borg. The
 `packages/claude-native-runtime` npm package is only the pinned upstream binary

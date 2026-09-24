@@ -385,7 +385,7 @@ impl Connector {
         command
             .arg("--version")
             .current_dir(&directory)
-            .env("BUN_OPTIONS", format!("--preload={}", script.display()))
+            .env("BUN_OPTIONS", "--preload=./connector.js")
             .env("CLAUDE_CODE_ENTRYPOINT", "borg")
             .env("CLAUDE_AGENT_SDK_CLIENT_APP", "borg-model-connector")
             .stdin(Stdio::piped())

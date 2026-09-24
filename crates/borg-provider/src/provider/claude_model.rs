@@ -26,6 +26,14 @@ pub struct ClaudeModelProvider {
 }
 
 impl ClaudeModelProvider {
+    pub async fn account_identity(auth_directory: Option<&Path>) -> Result<String> {
+        Ok(Connector::connect(auth_directory)
+            .await?
+            .info(None)
+            .await?
+            .account_identity)
+    }
+
     pub async fn context_window(&self, auth_directory: Option<&Path>) -> Result<u64> {
         let connector = Connector::connect(auth_directory).await?;
         Ok(connector
@@ -45,6 +53,18 @@ impl ClaudeModelProvider {
         auth_directory: Option<&Path>,
         parent_agent_id: Option<&str>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        self.model_turn_for_account(request, progress, auth_directory, parent_agent_id, None)
+            .await
+    }
+
+    pub async fn model_turn_for_account(
+        &self,
+        request: ModelTurnRequest,
+        progress: Option<UnboundedSender<ProviderProgress>>,
+        auth_directory: Option<&Path>,
+        parent_agent_id: Option<&str>,
+        expected_account: Option<&str>,
+    ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
         let trace = ProviderAttemptTrace {
             invocation: ProviderInvocation {
                 provider_label: "claude-subscription".into(),
@@ -63,6 +83,7 @@ impl ClaudeModelProvider {
             progress,
             auth_directory,
             parent_agent_id,
+            expected_account,
             trace.clone(),
         )
         .await
@@ -97,11 +118,16 @@ impl ClaudeModelProvider {
         progress: Option<UnboundedSender<ProviderProgress>>,
         auth_directory: Option<&Path>,
         parent_agent_id: Option<&str>,
+        expected_account: Option<&str>,
         mut trace: ProviderAttemptTrace,
     ) -> Result<ModelTurnResult> {
         let started = Instant::now();
         let connector = Connector::connect(auth_directory).await?;
         let info = connector.info(Some(&self.model)).await?;
+        ensure!(
+            expected_account.is_none_or(|expected| expected == info.account_identity),
+            "Claude credentials changed during this turn; retry with the selected account"
+        );
         let capabilities = info.capabilities.context("missing Claude capabilities")?;
         validate_replay_account(&request.messages, &info.account_identity)?;
         let body = subscription_request_body(

@@ -3346,6 +3346,14 @@ async fn run_agent_session_store_kernel_inner(
                                         crate::ModelAccessContext {
                                             session_id,
                                             store: dispatcher.session_store(),
+                                            provider_context: launch
+                                                .capabilities
+                                                .runtime_provider_context
+                                                .clone(),
+                                            parent_session_id: dispatcher.parent_session_id().await,
+                                            request_prefix: native_request_prefix(
+                                                journal.context_events(),
+                                            ),
                                         },
                                         launch.provider,
                                         model,
@@ -3401,6 +3409,7 @@ async fn run_agent_session_store_kernel_inner(
                                             .clone()
                                             .unwrap_or_default(),
                                         declaration_base: None,
+                                        request_prefix_base: None,
                                         prompt_context_base: Default::default(),
                                         volatile_system_prompt_appendix:
                                             crate::provider_capabilities_prompt(
@@ -3923,6 +3932,9 @@ async fn run_agent_session_store_kernel_inner(
                         crate::ModelAccessContext {
                             session_id,
                             store: dispatcher.session_store(),
+                            provider_context: launch.capabilities.runtime_provider_context.clone(),
+                            parent_session_id: dispatcher.parent_session_id().await,
+                            request_prefix: native_request_prefix(journal.context_events()),
                         },
                         launch.provider,
                         launch
@@ -4595,6 +4607,7 @@ async fn run_agent_session_store_kernel_inner(
                 .system_prompt_appendix
                 .clone()
                 .unwrap_or_default(),
+            request_prefix_base: native_request_prefix(journal.context_events()),
             declaration_base: native_provider
                 .then(|| native_declarations(journal.context_events()))
                 .flatten(),
@@ -6293,7 +6306,12 @@ async fn run_agent_session_store_kernel_inner(
                         });
                         executor
                             .consult(ConsultationRequest {
-                                access: crate::ModelAccessContext { session_id, store: dispatcher.session_store() },
+                                access: crate::ModelAccessContext {
+                                    session_id, store: dispatcher.session_store(),
+                                    provider_context: launch.capabilities.runtime_provider_context.clone(),
+                                    parent_session_id: dispatcher.parent_session_id().await,
+                                    request_prefix: native_request_prefix(journal.context_events()),
+                                },
                                 message_id: Uuid::new_v4(),
                                 provider,
                                 model,
@@ -6662,6 +6680,9 @@ fn default_consultation_effort(provider: CodingProvider) -> Option<String> {
 /// empty list remains safe for legacy and resumed sessions.  A non-empty list
 /// is deliberately strict: missing roots are rejected rather than ignored.
 fn validate_launch_session(launch: &mut LaunchSession) -> Result<()> {
+    if launch.provider == CodingProvider::Claude && launch.model.is_none() {
+        launch.model = Some(borg_provider::claude_product_model().to_owned());
+    }
     if launch.provider == CodingProvider::Claude && launch.effort.is_none() {
         launch.effort = Some(borg_provider::claude_default_effort().to_string());
     }
@@ -6979,6 +7000,33 @@ fn native_conversation_with_images(
         .collect::<HashSet<_>>();
     for event in events {
         match &event.kind {
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "context_microcompaction" =>
+            {
+                if let Some(ids) = payload
+                    .get("cleared_tool_call_ids")
+                    .and_then(Value::as_array)
+                {
+                    let ids = ids.iter().filter_map(Value::as_str).collect::<HashSet<_>>();
+                    for message in conversation
+                        .iter_mut()
+                        .chain(&mut pending_native)
+                        .chain(&mut pending_generic)
+                    {
+                        if let borg_provider::provider::ModelMessage::Tool {
+                            tool_call_id,
+                            content,
+                            attachments,
+                        } = message
+                            && attachments.is_empty()
+                            && ids.contains(tool_call_id.as_str())
+                        {
+                            *content =
+                                crate::native_harness::MICROCOMPACT_CLEARED_TOOL_RESULT.to_string();
+                        }
+                    }
+                }
+            }
             SessionEventKind::ProviderEvent { kind, payload, .. }
                 if kind == "context_compaction"
                     && payload.get("degraded").and_then(Value::as_bool) == Some(true)
@@ -7421,6 +7469,26 @@ fn compaction_restarts_replay(payload: &Value) -> bool {
 /// carries no declarations and leaves none, so the next turn records a fresh
 /// base rather than inheriting one from a generation that has ended.
 const COMPACTION_RETAINED_DECLARATIONS_FIELD: &str = "retained_declarations";
+
+pub(crate) fn native_request_prefix(events: &[SessionEvent]) -> Option<crate::NativeRequestPrefix> {
+    for event in events.iter().rev() {
+        match &event.kind {
+            SessionEventKind::ContextCleared => return None,
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "context_compaction" && compaction_restarts_replay(payload) =>
+            {
+                return None;
+            }
+            SessionEventKind::ProviderEvent { kind, payload, .. }
+                if kind == "native_request_prefix" =>
+            {
+                return serde_json::from_value(payload.clone()).ok();
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
 /// Declarations in force at the end of the journal: the base for the current
 /// context generation, folded with every change recorded after it.
@@ -7981,6 +8049,7 @@ async fn run_retained_compaction(
             extension_api: crate::ExtensionApiSnapshot::default(),
             system_prompt_appendix: RETAINED_COMPACTION_SYSTEM_PROMPT.to_string(),
             declaration_base: None,
+            request_prefix_base: None,
             prompt_context_base: Default::default(),
             volatile_system_prompt_appendix: crate::provider_capabilities_prompt(
                 &launch.capabilities.provider_capabilities,

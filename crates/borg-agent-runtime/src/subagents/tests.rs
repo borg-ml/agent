@@ -2536,8 +2536,8 @@ async fn persistent_peer_empty_turn_fails_at_its_correlated_completion_boundary(
 #[test]
 fn cross_provider_peer_does_not_inherit_an_incompatible_model_or_effort() {
     assert_eq!(
-        default_model_for_cross_provider_peer(CodingProvider::Claude),
-        None
+        default_model_for_cross_provider_peer(CodingProvider::Claude).as_deref(),
+        Some(borg_provider::claude_product_model())
     );
     assert_eq!(
         default_effort_for_cross_provider_peer(CodingProvider::Claude).as_deref(),
@@ -6146,6 +6146,7 @@ async fn forwarded_image_reaches_the_recipient_model_as_pixels() {
         extension_api: Default::default(),
         system_prompt_appendix: String::new(),
         declaration_base: None,
+        request_prefix_base: None,
         prompt_context_base: Default::default(),
         volatile_system_prompt_appendix: String::new(),
     };

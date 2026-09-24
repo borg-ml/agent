@@ -220,6 +220,7 @@ pub struct AgentTurn {
     /// and a rebuilt base would silently differ from the one the model was
     /// shown.
     pub(crate) declaration_base: Option<crate::prompt_context::Declarations>,
+    pub(crate) request_prefix_base: Option<crate::NativeRequestPrefix>,
     /// Each prompt-context slot's last recorded text in this context
     /// generation, so the turn appends a slot only when it changed.
     pub(crate) prompt_context_base:
@@ -260,6 +261,9 @@ pub struct ConsultationRequest {
 pub struct ModelAccessContext {
     pub session_id: Uuid,
     pub store: Option<std::sync::Arc<dyn crate::SessionStore>>,
+    pub provider_context: Option<crate::RuntimeProviderContext>,
+    pub parent_session_id: Option<Uuid>,
+    pub request_prefix: Option<crate::NativeRequestPrefix>,
 }
 
 impl std::fmt::Debug for ModelAccessContext {
@@ -567,31 +571,6 @@ impl SubscriptionPoolRegistry {
             host_registry: Some(Arc::new(HostClaudePoolRegistry::for_host())),
             ..Self::default()
         }
-    }
-
-    async fn has_context(&self, session_id: Uuid) -> bool {
-        let mut slots = self.slots.lock().await;
-        let Some(slot) = slots.get(&session_id).filter(|slot| slot.healthy) else {
-            return false;
-        };
-        let token = slot.host_lease.as_ref().map(|lease| lease.token);
-        let Some(registry) = self.host_registry.as_ref() else {
-            return true;
-        };
-        let allowed = match registry.allowed_tokens() {
-            Ok(allowed) => allowed,
-            Err(error) => {
-                tracing::warn!(%session_id, %error, "Claude idle lease check failed; replaying journal");
-                Default::default()
-            }
-        };
-        if token.is_some_and(|token| allowed.contains(&token)) {
-            return true;
-        }
-        let evicted = slots.remove(&session_id);
-        drop(slots);
-        drop(evicted);
-        false
     }
 
     async fn prepare(
@@ -1078,18 +1057,7 @@ impl LocalAgentTurnExecutor {
             .extend(runtime_extensions.skill_roots);
         turn.extension_workflows
             .extend(runtime_extensions.workflows);
-        if turn.provider == CodingProvider::Claude {
-            // Claude Code's own AGENTS.md, skill and plugin discovery is off, so
-            // Borg supplies the project guidance and skill catalog its native
-            // harness gives every other model.
-            let context = crate::native_context::NativeContext::load(
-                turn.cwd.clone(),
-                turn.extension_skill_roots.clone(),
-            )
-            .await?;
-            turn.system_prompt_appendix
-                .push_str(&context.path_catalog_appendix());
-        } else if !turn.extension_skill_roots.is_empty() {
+        if !turn.extension_skill_roots.is_empty() {
             turn.system_prompt_appendix.push_str(
                 &crate::native_context::extension_skill_prompt_appendix(
                     turn.extension_skill_roots.clone(),
@@ -1132,11 +1100,9 @@ fn completed_hook_arguments(turn: &AgentTurn, result: &Result<AgentTurnResult>) 
 }
 
 /// Providers whose local CLI turn can summarize a durable transcript for the
-/// retained-context fold. Claude has its pooled/local CLI turn and OpenCode a
-/// local CLI turn; every other provider is expected to compact through
-/// `compact_native` on its own harness.
+/// retained-context fold. Native providers compact through `compact_native`.
 fn supports_retained_context_compaction(provider: CodingProvider) -> bool {
-    matches!(provider, CodingProvider::Claude | CodingProvider::OpenCode)
+    provider == CodingProvider::OpenCode
 }
 
 #[async_trait::async_trait]
@@ -1163,7 +1129,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
 
     fn uses_native_harness(&self, provider: CodingProvider) -> bool {
         provider.uses_native_harness()
-            || provider == CodingProvider::Codex
+            || matches!(provider, CodingProvider::Codex | CodingProvider::Claude)
             || (self.opencode_session_native && provider == CodingProvider::OpenCode)
     }
 
@@ -1171,15 +1137,12 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         self.web_search.clone()
     }
 
-    fn supports_subscription_context_reuse(&self, provider: CodingProvider) -> bool {
-        provider == CodingProvider::Claude
+    fn supports_subscription_context_reuse(&self, _provider: CodingProvider) -> bool {
+        false
     }
 
-    async fn has_provider_context(&self, session_id: Uuid, provider: CodingProvider) -> bool {
-        if provider != CodingProvider::Claude {
-            return true;
-        }
-        self.subscription_pools.has_context(session_id).await
+    async fn has_provider_context(&self, _session_id: Uuid, _provider: CodingProvider) -> bool {
+        true
     }
 
     fn extension_workflow_snapshot(
@@ -1211,6 +1174,9 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         events: mpsc::Sender<SessionEventKind>,
         controls: Option<mpsc::Receiver<AgentTurnControl>>,
     ) -> Result<AgentTurnResult> {
+        if turn.provider == CodingProvider::Claude && turn.model.is_none() {
+            turn.model = Some(borg_provider::claude_product_model().to_owned());
+        }
         #[cfg(feature = "profiling")]
         let profile_started = self
             .profiler
@@ -1232,9 +1198,6 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             .runtime_provider_context
             .clone()
             .unwrap_or_else(|| self.provider_context.clone());
-        // Holds a restored per-session ChatGPT auth home for the duration of
-        // the turn; dropping it removes the ephemeral credentials.
-        let mut _codex_auth_home: Option<tempfile::TempDir> = None;
         #[cfg(feature = "profiling")]
         let profile_provider = turn.provider;
         #[cfg(feature = "profiling")]
@@ -1246,27 +1209,9 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
             // native turns: a per-session ChatGPT subscription for Codex, and a
             // gateway for an enterprise policy route. Without one the
             // host-local harness configuration stands.
-            let mut harness = self.native_harness.clone();
-            if turn.provider == CodingProvider::Codex
-                && let Some(auth) = provider_context.provider_auth.as_ref()
-                && auth.provider == borg_provider::ProviderAuthProvider::Openai
-            {
-                let home =
-                    tempfile::TempDir::new().context("create per-session Codex auth home")?;
-                borg_provider::provider_auth::restore_bundle(
-                    auth.provider,
-                    &auth.bundle,
-                    home.path(),
-                )
-                .context("restore per-session ChatGPT subscription")?;
-                harness = harness.with_codex_auth_file(
-                    borg_provider::provider_auth::codex_credentials_path(home.path()),
-                );
-                _codex_auth_home = Some(home);
-            }
-            if let Some(gateway) = provider_context.model_gateway.clone() {
-                harness = harness.with_turn_gateway(gateway);
-            }
+            let harness = self
+                .native_harness
+                .with_provider_context(turn.provider, &provider_context)?;
             let result = harness.run(turn.clone(), events, controls).await;
             #[cfg(feature = "profiling")]
             if let Some((profiler, started)) = self.profiler.as_ref().zip(profile_started) {
@@ -1286,10 +1231,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         }
         let completed_hook_turn = turn.clone();
         let result = match turn.provider {
-            CodingProvider::Claude
-            | CodingProvider::OpenCode
-            | CodingProvider::Grok
-            | CodingProvider::Muse => {
+            CodingProvider::OpenCode | CodingProvider::Grok | CodingProvider::Muse => {
                 let request_template = (!provider_context.is_empty())
                     .then(|| provider_context_request_template(&turn, &provider_context));
                 run_borg_provider_turn(
@@ -1308,6 +1250,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 .await
             }
             CodingProvider::Codex
+            | CodingProvider::Claude
             | CodingProvider::Anthropic
             | CodingProvider::Kimi
             | CodingProvider::Glm
@@ -1340,6 +1283,14 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 .context("native consultation requires an explicit model")?;
             let (final_text, usage) = self
                 .native_harness
+                .with_provider_context(
+                    request.provider,
+                    request
+                        .access
+                        .provider_context
+                        .as_ref()
+                        .unwrap_or(&self.provider_context),
+                )?
                 .with_model_access_for(request.provider, Some(model), &request.access)
                 .await?
                 .consult(
@@ -1381,6 +1332,13 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
         );
         let (summary, usage) = self
             .native_harness
+            .with_provider_context(
+                provider,
+                access
+                    .provider_context
+                    .as_ref()
+                    .unwrap_or(&self.provider_context),
+            )?
             .with_model_access_for(provider, Some(model), &access)
             .await?
             .compact(
@@ -1389,6 +1347,7 @@ impl AgentTurnExecutor for LocalAgentTurnExecutor {
                 effort,
                 fast,
                 conversation,
+                access.request_prefix.as_ref(),
                 observed_context_window_tokens,
                 progress,
             )
@@ -2814,6 +2773,7 @@ mod tests {
             extension_api: Default::default(),
             system_prompt_appendix: "extension context".to_string(),
             declaration_base: None,
+            request_prefix_base: None,
             prompt_context_base: Default::default(),
             volatile_system_prompt_appendix: "usage: 5-hour 65% left".to_string(),
         }
@@ -2961,8 +2921,8 @@ mod tests {
             .unwrap();
         assert!(migrated.uses_native_harness(CodingProvider::Codex));
         assert!(!migrated.supports_subscription_context_reuse(CodingProvider::Codex));
-        assert!(!migrated.uses_native_harness(CodingProvider::Claude));
-        assert!(migrated.supports_subscription_context_reuse(CodingProvider::Claude));
+        assert!(migrated.uses_native_harness(CodingProvider::Claude));
+        assert!(!migrated.supports_subscription_context_reuse(CodingProvider::Claude));
         assert!(
             LocalAgentTurnExecutor::default()
                 .with_codex_model_only()
@@ -3012,13 +2972,11 @@ mod tests {
     #[test]
     fn retained_context_compaction_admits_the_local_cli_turns() {
         assert!(super::supports_retained_context_compaction(
-            CodingProvider::Claude
-        ));
-        assert!(super::supports_retained_context_compaction(
             CodingProvider::OpenCode
         ));
         for provider in [
             CodingProvider::Codex,
+            CodingProvider::Claude,
             CodingProvider::Kimi,
             CodingProvider::Glm,
             CodingProvider::OpenRouter,
@@ -3072,6 +3030,9 @@ mod tests {
         let access = ModelAccessContext {
             session_id: Uuid::new_v4(),
             store: None,
+            provider_context: None,
+            parent_session_id: None,
+            request_prefix: None,
         };
         let model = borg_provider::codex_product_model();
         let compact = executor

@@ -1203,6 +1203,16 @@ impl AgentToolDispatcher {
         self.journal.clone()
     }
 
+    pub(crate) async fn parent_session_id(&self) -> Option<Uuid> {
+        let parent = self
+            .subagents
+            .as_ref()?
+            .get(self.actor_session_id)
+            .await?
+            .parent_session_id;
+        (parent != self.actor_session_id).then_some(parent)
+    }
+
     /// Whether this session is currently parked on a watcher yield.
     ///
     /// Read by the native harness at a tool-round boundary to decide that the
@@ -6482,7 +6492,7 @@ impl SubagentCoordinator {
 fn default_model_for_cross_provider_peer(provider: CodingProvider) -> Option<String> {
     match provider {
         CodingProvider::Codex => Some(borg_provider::codex_product_model().to_string()),
-        CodingProvider::Claude => None,
+        CodingProvider::Claude => Some(borg_provider::claude_product_model().to_string()),
         CodingProvider::OpenCode => None,
         CodingProvider::Grok => Some(borg_provider::grok_product_model().to_string()),
         CodingProvider::Muse => Some(borg_provider::muse_product_model().to_string()),
@@ -8605,7 +8615,7 @@ fn workspace_effect(name: &str, arguments: &Value) -> Option<(&'static str, Stri
 pub(crate) fn exec_tool_spec() -> Value {
     tool(
         "exec",
-        "Run a shell command, or poll, interact with, or terminate a running process. Shell commands may invoke any installed language runtime. Use `borg tools` and `borg call NAME JSON` inside the shell for Borg and Blu capabilities.",
+        "Run a shell command, or poll, interact with, or terminate a running process. Supply exactly one of cmd (start) or session_id (interact). Shell commands may invoke any installed language runtime. Use `borg tools` and `borg call NAME JSON` inside the shell for Borg and Blu capabilities.",
         json!({
             "type": "object",
             "properties": {
@@ -8630,10 +8640,6 @@ pub(crate) fn exec_tool_spec() -> Value {
                     "maximum": RUNTIME_MAX_COMMAND_TIMEOUT_MS
                 }
             },
-            "oneOf": [
-                { "required": ["cmd"] },
-                { "required": ["session_id"] }
-            ],
             "additionalProperties": false
         }),
     )

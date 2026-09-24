@@ -48,6 +48,17 @@ pub(crate) const DECLARATION_BASE_EVENT: &str = "native_declaration_base";
 pub(crate) const DECLARATION_DELTA_EVENT: &str = "native_declaration_delta";
 pub(crate) const PROMPT_CONTEXT_EVENT: &str = "native_prompt_context";
 
+/// Exact declarations for a cache-preserving checkpoint request after restart.
+/// These definitions never authorize execution; compaction cannot run tools.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeRequestPrefix {
+    pub provider: CodingProvider,
+    pub model: String,
+    pub system_prompt: String,
+    pub tools: Vec<ModelToolDefinition>,
+    pub prompt_cache_key: String,
+}
+
 /// Runtime context delivered as a user message after the turn's prompt.
 ///
 /// It is conversation content: journaled and replayed where it was sent, so

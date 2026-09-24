@@ -80,8 +80,9 @@ pub(crate) struct NativeHarness {
     configured_model_aliases: std::collections::BTreeSet<String>,
     /// `[warming] mode`, unless `BORG_CACHE_WARMING` overrides it.
     warming: CacheWarmingMode,
-    /// Controller-restored per-session ChatGPT auth file for Codex turns.
+    /// Persistent controller-selected subscription authorities.
     codex_auth_file: Option<std::path::PathBuf>,
+    claude_config_dir: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for NativeHarness {
@@ -111,6 +112,7 @@ impl Default for NativeHarness {
             configured_model_aliases: std::collections::BTreeSet::new(),
             warming: CacheWarmingMode::default(),
             codex_auth_file: None,
+            claude_config_dir: None,
         }
     }
 }
@@ -196,6 +198,7 @@ impl NativeHarness {
                 codex_account: None,
                 #[cfg(feature = "subscription-adapters")]
                 codex_auth_file: None,
+                ..ProviderModelClient::default()
             }),
             reviewer_model: settings.approval_reviewer_model.clone(),
             reviewer_effort: settings.approval_reviewer_effort.clone(),
@@ -206,6 +209,7 @@ impl NativeHarness {
             configured_model_aliases: settings.configured_model_gateways.keys().cloned().collect(),
             warming: settings.warming,
             codex_auth_file: None,
+            claude_config_dir: None,
         }
     }
 
@@ -221,6 +225,7 @@ impl NativeHarness {
                 codex_account: None,
                 #[cfg(feature = "subscription-adapters")]
                 codex_auth_file: None,
+                ..ProviderModelClient::default()
             }),
             ..Self::with_settings(settings)
         }
@@ -243,23 +248,64 @@ impl NativeHarness {
             codex_account: None,
             #[cfg(feature = "subscription-adapters")]
             codex_auth_file: next.codex_auth_file.clone(),
+            #[cfg(feature = "subscription-adapters")]
+            claude_config_dir: next.claude_config_dir.clone(),
+            ..ProviderModelClient::default()
         });
         next
     }
 
-    /// Clone this harness with a controller-restored per-session Codex auth
-    /// file bound for the next turns. Used by an embedding product so a
-    /// managed Codex session reads the user's own subscription instead of the
-    /// host-local credential selection.
-    pub(crate) fn with_codex_auth_file(&self, auth_file: std::path::PathBuf) -> Self {
+    pub(crate) fn with_provider_context(
+        &self,
+        provider: crate::CodingProvider,
+        context: &crate::RuntimeProviderContext,
+    ) -> Result<Self> {
         let mut next = self.clone();
-        next.codex_auth_file = Some(auth_file.clone());
-        next.model_client = Arc::new(ProviderModelClient {
-            #[cfg(feature = "subscription-adapters")]
-            codex_auth_file: Some(auth_file),
-            ..ProviderModelClient::default()
-        });
-        next
+        if matches!(
+            provider,
+            crate::CodingProvider::Claude | crate::CodingProvider::Codex
+        ) {
+            anyhow::ensure!(
+                context
+                    .provider_channel
+                    .is_none_or(|channel| channel == borg_provider::ProviderChannel::Direct),
+                "the selected subscription route cannot use a cloud provider channel"
+            );
+            if let Some(auth) = &context.provider_auth {
+                let (expected, selected, file) = match provider {
+                    crate::CodingProvider::Claude => (
+                        borg_provider::ProviderAuthProvider::Claude,
+                        auth.claude_config_dir.as_ref(),
+                        ".credentials.json",
+                    ),
+                    _ => (
+                        borg_provider::ProviderAuthProvider::Openai,
+                        auth.codex_home.as_ref(),
+                        "auth.json",
+                    ),
+                };
+                anyhow::ensure!(
+                    auth.provider == expected,
+                    "controller credentials do not match the selected subscription provider"
+                );
+                let directory = selected.context(
+                    "controller subscription access requires its persistent login directory (claude_config_dir or codex_home); a copied bundle cannot preserve rotating credentials"
+                )?.canonicalize().context("open controller subscription login directory")?;
+                anyhow::ensure!(
+                    directory.join(file).is_file(),
+                    "controller subscription login directory has no credential file"
+                );
+                if provider == crate::CodingProvider::Claude {
+                    next.claude_config_dir = Some(directory);
+                } else {
+                    next.codex_auth_file = Some(directory.join(file));
+                }
+            }
+        }
+        if let Some(gateway) = &context.model_gateway {
+            next = next.with_turn_gateway(gateway.clone());
+        }
+        Ok(next)
     }
 
     pub(crate) async fn run(
@@ -271,6 +317,9 @@ impl NativeHarness {
         let access = crate::ModelAccessContext {
             session_id: turn.session_id,
             store: turn.agent_tools.session_store(),
+            provider_context: turn.runtime_provider_context.clone(),
+            parent_session_id: turn.agent_tools.parent_session_id().await,
+            request_prefix: turn.request_prefix_base.clone(),
         };
         let (bound, steers) = await_model_admission(
             self.with_model_access_for(turn.provider, turn.model.as_deref(), &access),
@@ -298,23 +347,36 @@ impl NativeHarness {
         #[cfg(not(feature = "subscription-adapters"))]
         let _ = (provider, access);
         #[cfg(feature = "subscription-adapters")]
-        if provider == crate::CodingProvider::Codex {
+        if matches!(
+            provider,
+            crate::CodingProvider::Codex | crate::CodingProvider::Claude
+        ) {
             let store = access
                 .store
                 .as_ref()
                 .context("subscription model access requires durable Borg session storage")?;
-            let identity = borg_provider::provider::CodexModelProvider::account_identity_from(
-                self.codex_auth_file.clone(),
-            )
-            .await?;
+            let identity = if provider == crate::CodingProvider::Claude {
+                borg_provider::provider::ClaudeModelProvider::account_identity(
+                    self.claude_config_dir.as_deref(),
+                )
+                .await?
+            } else {
+                borg_provider::provider::CodexModelProvider::account_identity_from(
+                    self.codex_auth_file.clone(),
+                )
+                .await?
+            };
             store
                 .record_model_access(access.session_id, provider, &identity)
                 .await?;
             let scoped = Self {
                 model_client: Arc::new(ProviderModelClient {
-                    codex_account: Some(identity),
-                    #[cfg(feature = "subscription-adapters")]
+                    codex_account: (provider == crate::CodingProvider::Codex)
+                        .then(|| identity.clone()),
                     codex_auth_file: self.codex_auth_file.clone(),
+                    claude_account: (provider == crate::CodingProvider::Claude).then_some(identity),
+                    claude_config_dir: self.claude_config_dir.clone(),
+                    access: Some(access.clone()),
                     ..ProviderModelClient::default()
                 }),
                 ..self.clone()
@@ -365,6 +427,7 @@ impl NativeHarness {
                 codex_account: None,
                 #[cfg(feature = "subscription-adapters")]
                 codex_auth_file: None,
+                ..ProviderModelClient::default()
             }),
             ..self.clone()
         })
@@ -547,7 +610,7 @@ impl NativeHarness {
             }
         }
         canonicalize_native_messages(&mut messages);
-        let provider_session_id = format!("borg-session:{}", turn.session_id);
+        let provider_session_id = native_model_session_id(turn.provider, turn.session_id);
         let prompt_cache_key = native_prompt_cache_key(
             turn.prompt_cache_session_id.unwrap_or(turn.session_id),
             turn.context_generation,
@@ -610,6 +673,22 @@ impl NativeHarness {
             tools: tools.clone(),
             output_schema: turn.output_schema.clone(),
         };
+        let prefix = crate::NativeRequestPrefix {
+            provider: turn.provider,
+            model: model.clone(),
+            system_prompt: match messages.first() {
+                Some(ModelMessage::System { content }) => content.clone(),
+                _ => String::new(),
+            },
+            tools: tools.clone(),
+            prompt_cache_key: prompt_cache_key.clone(),
+        };
+        if turn.request_prefix_base.as_ref() != Some(&prefix) {
+            events.send(SessionEventKind::ProviderEvent {
+                provider: turn.provider, kind: "native_request_prefix".into(),
+                payload: serde_json::to_value(&prefix)?,
+            }).await.context("record model request prefix")?;
+        }
         let mut assistant_message_id = Uuid::new_v4();
         let mut model_round = 0_usize;
         let mut tool_round = 0_usize;
@@ -1325,6 +1404,7 @@ impl NativeHarness {
         effort: Option<&str>,
         fast: bool,
         conversation: Vec<ModelMessage>,
+        prefix: Option<&crate::NativeRequestPrefix>,
         observed_context_window_tokens: Option<u64>,
         progress: Option<mpsc::UnboundedSender<NativeCompactionProgress>>,
     ) -> Result<(String, ProviderCallUsage)> {
@@ -1337,6 +1417,44 @@ impl NativeHarness {
                 .unwrap_or(NATIVE_ASSUMED_CONTEXT_WINDOW_TOKENS),
         };
         let mut usage = ProviderCallUsage::default();
+        if let Some(prefix) =
+            prefix.filter(|prefix| prefix.provider == provider && prefix.model == model)
+        {
+            let mut messages = vec![ModelMessage::System {
+                content: prefix.system_prompt.clone(),
+            }];
+            messages.extend(conversation.clone());
+            let fits = estimated_messages_tokens(&messages)
+                .saturating_add(IN_PLACE_COMPACTION_HEADROOM_TOKENS)
+                <= window;
+            if fits {
+                let request = ModelTurnRequest {
+                    fast,
+                    request_id: None,
+                    session_id: None,
+                    prompt_cache_key: Some(prefix.prompt_cache_key.clone()),
+                    turn_routing: Default::default(),
+                    messages: Vec::new(),
+                    tools: prefix.tools.clone(),
+                    output_schema: None,
+                };
+                if let Some(summary) = self
+                    .compact_in_place(
+                        provider, model, effort, &request, messages, window, &mut usage,
+                    )
+                    .await?
+                {
+                    if let Some(progress) = &progress {
+                        let _ = progress.send(NativeCompactionProgress {
+                            completed_passes: 1,
+                            total_passes: 1,
+                            pass_duration_ms: usage.duration_ms,
+                        });
+                    }
+                    return Ok((summary, usage));
+                }
+            }
+        }
         match self
             .compact_with_window(
                 provider,
@@ -1496,13 +1614,15 @@ impl NativeHarness {
         mut messages: Vec<ModelMessage>,
         context_window_tokens: u64,
         usage: &mut ProviderCallUsage,
-    ) -> Option<String> {
+    ) -> Result<Option<String>> {
         messages.push(ModelMessage::user(
             crate::session::IN_PLACE_COMPACTION_PROMPT,
         ));
         canonicalize_native_messages(&mut messages);
         repair_native_messages(&mut messages);
-        validate_native_messages(&messages).ok()?;
+        if validate_native_messages(&messages).is_err() {
+            return Ok(None);
+        }
         let request = ModelTurnRequest {
             request_id: Some(format!("compact:{}", Uuid::new_v4())),
             messages,
@@ -1516,10 +1636,13 @@ impl NativeHarness {
             .await
         {
             Ok(result) => result,
-            Err(error) => {
+            Err(error)
+                if error.kind == borg_provider::provider::ProviderErrorKind::ContextLength =>
+            {
                 tracing::warn!(%error, "in-place compaction failed; folding the history as text");
-                return None;
+                return Ok(None);
             }
+            Err(error) => return Err(error.into()),
         };
         absorb_usage(usage, &result.usage);
         let ModelMessage::Assistant {
@@ -1528,15 +1651,17 @@ impl NativeHarness {
             ..
         } = result.message
         else {
-            return None;
+            return Ok(None);
         };
         let complete = result.finish_reason == "stop";
-        (complete && tool_calls.is_empty() && !content.trim().is_empty()).then(|| {
-            crate::session::truncate_compaction_context(
-                &content,
-                compaction_summary_chars(context_window_tokens),
-            )
-        })
+        Ok(
+            (complete && tool_calls.is_empty() && !content.trim().is_empty()).then(|| {
+                crate::session::truncate_compaction_context(
+                    &content,
+                    compaction_summary_chars(context_window_tokens),
+                )
+            }),
+        )
     }
 
     /// Compact `messages` in place when `budget` says the next request would
@@ -1600,6 +1725,7 @@ impl NativeHarness {
                         "automatic": true,
                         "trigger": trigger,
                         "tool_results_cleared": trim.cleared,
+                        "cleared_tool_call_ids": trim.tool_call_ids,
                         "tokens_saved": trim.saved_tokens,
                         "context_tokens_after": budget.context_tokens,
                         "effective_context_window_tokens": budget.context_window_tokens,
@@ -1652,12 +1778,13 @@ impl NativeHarness {
                 )
                 .await
             }
-            None => None,
+            None => Ok(None),
         };
-        let in_place_used = in_place.is_some();
+        let in_place_used = matches!(in_place, Ok(Some(_)));
         let compacted = match in_place {
-            Some(summary) => Ok(summary),
-            None => {
+            Ok(Some(summary)) => Ok(summary),
+            Err(error) => Err(error),
+            Ok(None) => {
                 self.compact_with_window(
                     turn.provider,
                     model,
@@ -1874,6 +2001,11 @@ struct ProviderModelClient {
     /// host-local selection.
     #[cfg(feature = "subscription-adapters")]
     codex_auth_file: Option<std::path::PathBuf>,
+    #[cfg(feature = "subscription-adapters")]
+    claude_account: Option<String>,
+    #[cfg(feature = "subscription-adapters")]
+    claude_config_dir: Option<std::path::PathBuf>,
+    access: Option<crate::ModelAccessContext>,
 }
 
 /// The route one request takes to a provider.
@@ -1885,6 +2017,8 @@ struct ProviderModelClient {
 enum NativeRoute<'a> {
     #[cfg(feature = "subscription-adapters")]
     CodexAccount(&'a str),
+    #[cfg(feature = "subscription-adapters")]
+    ClaudeSubscription(&'a str),
     /// The Anthropic Messages API, reached with the API key the user stored for
     /// the Anthropic lane.
     AnthropicMessages,
@@ -1898,6 +2032,14 @@ enum NativeRoute<'a> {
 /// request of its own to send.
 struct NotNative;
 
+fn native_model_session_id(provider: crate::CodingProvider, session_id: Uuid) -> String {
+    if provider == crate::CodingProvider::Claude {
+        session_id.to_string()
+    } else {
+        format!("borg-session:{session_id}")
+    }
+}
+
 impl ProviderModelClient {
     /// Choose credentials and endpoint without touching the network.
     ///
@@ -1909,6 +2051,12 @@ impl ProviderModelClient {
         provider: crate::CodingProvider,
         model: &str,
     ) -> std::result::Result<NativeRoute<'_>, NotNative> {
+        #[cfg(feature = "subscription-adapters")]
+        if provider == crate::CodingProvider::Claude
+            && let Some(account) = self.claude_account.as_deref()
+        {
+            return Ok(NativeRoute::ClaudeSubscription(account));
+        }
         #[cfg(feature = "subscription-adapters")]
         if provider == crate::CodingProvider::Codex
             && let Some(account) = self.codex_account.as_deref()
@@ -1977,9 +2125,8 @@ fn not_native_error(
     }
 }
 
-#[async_trait]
-impl NativeModelClient for ProviderModelClient {
-    async fn model_turn(
+impl ProviderModelClient {
+    async fn infer(
         &self,
         provider: crate::CodingProvider,
         model: &str,
@@ -1991,6 +2138,26 @@ impl NativeModelClient for ProviderModelClient {
             .route(provider, model)
             .map_err(|NotNative| not_native_error(provider, model, effort))?;
         let (profile, gateway) = match route {
+            #[cfg(feature = "subscription-adapters")]
+            NativeRoute::ClaudeSubscription(account) => {
+                let parent = self
+                    .access
+                    .as_ref()
+                    .and_then(|access| access.parent_session_id)
+                    .map(|id| id.to_string());
+                return borg_provider::provider::ClaudeModelProvider {
+                    model: model.to_string(),
+                    effort: effort.map(str::to_owned),
+                }
+                .model_turn_for_account(
+                    request,
+                    progress,
+                    self.claude_config_dir.as_deref(),
+                    parent.as_deref(),
+                    Some(account),
+                )
+                .await;
+            }
             #[cfg(feature = "subscription-adapters")]
             NativeRoute::CodexAccount(account) => {
                 return borg_provider::provider::CodexModelProvider {
@@ -2051,6 +2218,76 @@ impl NativeModelClient for ProviderModelClient {
         .await
     }
 
+    async fn record_audit(
+        &self,
+        provider: crate::CodingProvider,
+        progress: ProviderProgress,
+    ) -> Result<()> {
+        if let ProviderProgress::ProviderEvent { kind, payload, .. } = progress
+            && matches!(kind.as_str(), "native_model_request" | "native_model_usage")
+            && let Some(access) = &self.access
+            && let Some(store) = &access.store
+        {
+            store
+                .append(crate::SessionEvent::new(
+                    access.session_id,
+                    0,
+                    SessionEventKind::ProviderEvent {
+                        provider,
+                        kind,
+                        payload,
+                    },
+                ))
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl NativeModelClient for ProviderModelClient {
+    async fn model_turn(
+        &self,
+        provider: crate::CodingProvider,
+        model: &str,
+        effort: Option<&str>,
+        mut request: ModelTurnRequest,
+        progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+    ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        if request.session_id.is_none() {
+            request.session_id = self
+                .access
+                .as_ref()
+                .map(|access| native_model_session_id(provider, access.session_id));
+        }
+        if progress.is_some() || self.access.is_none() {
+            return self.infer(provider, model, effort, request, progress).await;
+        }
+        // Auxiliary calls have no UI stream, but must retain request and usage
+        // evidence even if the model fails or the call is cancelled.
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let call = self.infer(provider, model, effort, request, Some(sender));
+        tokio::pin!(call);
+        let audit_error = |error: anyhow::Error| ProviderCallError {
+            message: format!("persist model request audit: {error:#}"),
+            trace: Box::default(),
+            session_id: None,
+            kind: borg_provider::provider::ProviderErrorKind::Fatal,
+        };
+        loop {
+            tokio::select! {
+                biased;
+                Some(update) = receiver.recv() => self.record_audit(provider, update).await.map_err(audit_error)?,
+                result = &mut call => {
+                    while let Ok(update) = receiver.try_recv() {
+                        self.record_audit(provider, update).await.map_err(audit_error)?;
+                    }
+                    return result;
+                }
+            }
+        }
+    }
+
     /// This client does reach a real provider, so it can replay a request.
     fn prompt_cache_refresh(self: Arc<Self>) -> Option<Arc<dyn PromptCacheRefreshClient>> {
         Some(self)
@@ -2069,7 +2306,9 @@ impl NativeModelClient for ProviderModelClient {
             // `instructions` field regardless of position, so a change there
             // rewrites the head no matter where it is placed.
             #[cfg(feature = "subscription-adapters")]
-            Ok(NativeRoute::CodexAccount(_)) => DeclarationTransport::Collapsed,
+            Ok(NativeRoute::CodexAccount(_) | NativeRoute::ClaudeSubscription(_)) => {
+                DeclarationTransport::Collapsed
+            }
             // The Messages API collects `System` into one top-level field, so a
             // change there rewrites the head wherever it was placed.
             Ok(NativeRoute::AnthropicMessages) => DeclarationTransport::Collapsed,
@@ -2080,6 +2319,16 @@ impl NativeModelClient for ProviderModelClient {
     async fn context_window(&self, provider: crate::CodingProvider, model: &str) -> Option<u64> {
         let gateway = match self.route(provider, model) {
             Ok(NativeRoute::ChatCompletions { gateway, .. }) => gateway,
+            #[cfg(feature = "subscription-adapters")]
+            Ok(NativeRoute::ClaudeSubscription(_)) => {
+                return borg_provider::provider::ClaudeModelProvider {
+                    model: model.to_owned(),
+                    effort: None,
+                }
+                .context_window(self.claude_config_dir.as_deref())
+                .await
+                .ok();
+            }
             #[cfg(feature = "subscription-adapters")]
             Ok(NativeRoute::CodexAccount(account)) => {
                 return borg_provider::provider::CodexModelProvider {
@@ -2153,7 +2402,9 @@ impl PromptCacheRefreshClient for ProviderModelClient {
             // catalog below would price a refresh in money this user never
             // pays, so the threshold it is compared against would be fiction.
             #[cfg(feature = "subscription-adapters")]
-            NativeRoute::CodexAccount(_) => return Err(Ineligible::SubscriptionQuota),
+            NativeRoute::CodexAccount(_) | NativeRoute::ClaudeSubscription(_) => {
+                return Err(Ineligible::SubscriptionQuota);
+            }
             // A real turn writes a cache entry through the system marker, so a
             // refresh has something to keep alive. Whether one is worth sending
             // is still decided below, from a documented lifetime and a real
@@ -2240,6 +2491,13 @@ impl PromptCacheRefreshClient for ProviderModelClient {
             .route(provider, model)
             .map_err(|NotNative| not_native_error(provider, model, effort))?
         {
+            #[cfg(feature = "subscription-adapters")]
+            NativeRoute::ClaudeSubscription(_) => Err(ProviderCallError {
+                message: "Claude subscription quota is not spent on automatic cache warming".into(),
+                trace: Box::default(),
+                session_id: None,
+                kind: borg_provider::provider::ProviderErrorKind::Fatal,
+            }),
             #[cfg(feature = "subscription-adapters")]
             NativeRoute::CodexAccount(account) => {
                 borg_provider::provider::CodexModelProvider {
@@ -3938,7 +4196,7 @@ const MICROCOMPACT_MIN_SAVED_TOKENS: u64 = 256;
 /// What a cleared tool result says instead of its output. The transcript keeps
 /// the original, so the note says how to get it back rather than pretending the
 /// result was never produced.
-const MICROCOMPACT_CLEARED_TOOL_RESULT: &str = "This tool result was cleared to free context. Its output is kept in the session transcript: re-run the tool, or use `query_history`, if it is needed.";
+pub(crate) const MICROCOMPACT_CLEARED_TOOL_RESULT: &str = "This tool result was cleared to free context. Its output is kept in the session transcript: re-run the tool, or use `query_history`, if it is needed.";
 
 /// The tool calls a message list answers for.
 fn tool_call_ids(messages: &[ModelMessage]) -> HashSet<String> {
@@ -3952,18 +4210,19 @@ fn tool_call_ids(messages: &[ModelMessage]) -> HashSet<String> {
 }
 
 /// What one micro-compaction pass cleared.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Microcompaction {
     cleared: usize,
     saved_tokens: u64,
+    tool_call_ids: Vec<String>,
 }
 
 /// Clear the contents of the oldest tool results in `messages`.
 ///
 /// `messages` is the request view of the conversation, never the transcript:
 /// the durable journal keeps every byte, the tool call ids and the message
-/// count are untouched, and the next turn rebuilds the view from the journal
-/// and decides again. Only results the transcript already held when the turn
+/// count are untouched. The journal records which results were cleared so the
+/// next turn replays the same view. Only results held when the turn
 /// started are eligible, so nothing the live turn produced is dropped, and a
 /// result carrying an image is left alone because the model cannot ask for it
 /// again by name.
@@ -4020,14 +4279,22 @@ fn microcompact_native_messages(
     if saved_tokens < MICROCOMPACT_MIN_SAVED_TOKENS {
         return None;
     }
+    let mut tool_call_ids = Vec::with_capacity(candidates.len());
     for index in &candidates {
-        if let ModelMessage::Tool { content, .. } = &mut messages[*index] {
+        if let ModelMessage::Tool {
+            content,
+            tool_call_id,
+            ..
+        } = &mut messages[*index]
+        {
             *content = MICROCOMPACT_CLEARED_TOOL_RESULT.to_string();
+            tool_call_ids.push(tool_call_id.clone());
         }
     }
     Some(Microcompaction {
         cleared: candidates.len(),
         saved_tokens,
+        tool_call_ids,
     })
 }
 
@@ -4395,6 +4662,177 @@ mod tests {
     use crate::SessionEvent;
 
     #[test]
+    fn controller_subscription_authorities_are_persistent_and_never_restored_from_stale_bundles() {
+        for (provider, auth_provider, file) in [
+            (
+                crate::CodingProvider::Claude,
+                borg_provider::ProviderAuthProvider::Claude,
+                ".credentials.json",
+            ),
+            (
+                crate::CodingProvider::Codex,
+                borg_provider::ProviderAuthProvider::Openai,
+                "auth.json",
+            ),
+        ] {
+            let first = tempfile::tempdir().unwrap();
+            let second = tempfile::tempdir().unwrap();
+            for directory in [first.path(), second.path()] {
+                std::fs::write(directory.join(file), "refreshed credential").unwrap();
+            }
+            let mut context = crate::RuntimeProviderContext {
+                provider_auth: Some(borg_provider::provider::ChatProviderAuth {
+                    provider: auth_provider,
+                    bundle: borg_provider::ProviderAuthBundle {
+                        files: vec![borg_provider::ProviderAuthFile {
+                            path: "stale".into(),
+                            contents_b64: "stale secret".into(),
+                        }],
+                    },
+                    codex_home: Some(first.path().to_owned()),
+                    claude_config_dir: Some(first.path().to_owned()),
+                }),
+                ..Default::default()
+            };
+            assert!(!format!("{context:?}").contains("stale secret"));
+            for directory in [first.path(), first.path(), second.path()] {
+                let auth = context.provider_auth.as_mut().unwrap();
+                auth.codex_home = Some(directory.to_owned());
+                auth.claude_config_dir = Some(directory.to_owned());
+                let selected = NativeHarness::default()
+                    .with_provider_context(provider, &context)
+                    .unwrap();
+                if provider == crate::CodingProvider::Claude {
+                    assert_eq!(
+                        selected.claude_config_dir.unwrap(),
+                        directory.canonicalize().unwrap()
+                    );
+                } else {
+                    assert_eq!(
+                        selected.codex_auth_file.unwrap(),
+                        directory.canonicalize().unwrap().join(file)
+                    );
+                }
+                assert_eq!(
+                    std::fs::read_to_string(directory.join(file)).unwrap(),
+                    "refreshed credential"
+                );
+            }
+            let auth = context.provider_auth.as_mut().unwrap();
+            auth.codex_home = None;
+            auth.claude_config_dir = None;
+            assert!(
+                NativeHarness::default()
+                    .with_provider_context(provider, &context)
+                    .is_err()
+            );
+            let auth = context.provider_auth.as_mut().unwrap();
+            auth.provider = if auth_provider == borg_provider::ProviderAuthProvider::Claude {
+                borg_provider::ProviderAuthProvider::Openai
+            } else {
+                borg_provider::ProviderAuthProvider::Claude
+            };
+            assert!(
+                NativeHarness::default()
+                    .with_provider_context(provider, &context)
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_reuses_the_durable_request_prefix_and_does_not_retry_auth_or_transport_errors()
+     {
+        struct Client {
+            error: Option<borg_provider::provider::ProviderErrorKind>,
+        }
+        #[async_trait]
+        impl NativeModelClient for Client {
+            async fn model_turn(
+                &self,
+                _: crate::CodingProvider,
+                _: &str,
+                effort: Option<&str>,
+                request: ModelTurnRequest,
+                _: Option<mpsc::UnboundedSender<ProviderProgress>>,
+            ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+                assert_eq!(effort, Some("high"));
+                assert_eq!(request.prompt_cache_key.as_deref(), Some("lineage-key"));
+                assert_eq!(request.tools.len(), 1);
+                assert_eq!(
+                    request.messages[0],
+                    ModelMessage::System {
+                        content: "original instructions".into()
+                    }
+                );
+                assert!(
+                    matches!(&request.messages[1], ModelMessage::User { content, .. } if content.starts_with("prior user"))
+                );
+                if let Some(kind) = self.error {
+                    return Err(ProviderCallError {
+                        message: "stop here".into(),
+                        trace: Box::default(),
+                        session_id: None,
+                        kind,
+                    });
+                }
+                Ok(ModelTurnResult {
+                    message: ModelMessage::assistant(Some("checkpoint".into()), None, None, vec![]),
+                    finish_reason: "stop".into(),
+                    usage: ProviderCallUsage {
+                        input_tokens: 3,
+                        cached_input_tokens: 90,
+                        total_tokens: 95,
+                        output_tokens: 2,
+                        ..Default::default()
+                    },
+                    raw_response: Value::Null,
+                    trace: ProviderAttemptTrace::default(),
+                })
+            }
+        }
+        let prefix = crate::NativeRequestPrefix {
+            provider: crate::CodingProvider::Codex,
+            model: "test-model".into(),
+            system_prompt: "original instructions".into(),
+            tools: vec![
+                ModelToolDefinition::new("read", "read", json!({"type":"object"})).unwrap(),
+            ],
+            prompt_cache_key: "lineage-key".into(),
+        };
+        let restored = serde_json::from_slice(&serde_json::to_vec(&prefix).unwrap()).unwrap();
+        for error in [
+            None,
+            Some(borg_provider::provider::ProviderErrorKind::Fatal),
+            Some(borg_provider::provider::ProviderErrorKind::ConnectionLost),
+        ] {
+            let harness = NativeHarness {
+                model_client: Arc::new(Client { error }),
+                ..NativeHarness::default()
+            };
+            let result = harness
+                .compact(
+                    crate::CodingProvider::Codex,
+                    "test-model",
+                    Some("high"),
+                    false,
+                    vec![ModelMessage::user("prior user")],
+                    Some(&restored),
+                    Some(100_000),
+                    None,
+                )
+                .await;
+            if error.is_some() {
+                assert_eq!(result.unwrap_err().to_string(), "stop here");
+            } else {
+                let (summary, usage) = result.unwrap();
+                assert_eq!(summary, "checkpoint");
+                assert_eq!(usage.cached_input_tokens, 90);
+            }
+        }
+    }
+
+    #[test]
     fn mutating_builtins_are_gated_read_only_builtins_are_not() {
         let write = mutating_builtin_approval(
             "write_file",
@@ -4506,6 +4944,7 @@ mod tests {
                 ],
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -4555,6 +4994,7 @@ mod tests {
                 Some("high"),
                 false,
                 vec![ModelMessage::user("important history")],
+                None,
                 Some(20_000),
                 None,
             )
@@ -4713,6 +5153,7 @@ mod tests {
                 Some("max"),
                 false,
                 conversation,
+                None,
                 Some(20_000),
                 Some(progress_tx),
             )
@@ -4845,6 +5286,7 @@ mod tests {
                 None,
                 false,
                 conversation.clone(),
+                None,
                 None,
                 None,
             )
@@ -5384,6 +5826,7 @@ mod tests {
                 extension_api: Default::default(),
                 system_prompt_appendix: String::new(),
                 declaration_base: None,
+                request_prefix_base: None,
                 prompt_context_base: Default::default(),
                 volatile_system_prompt_appendix: String::new(),
             };
@@ -6169,8 +6612,8 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            definition.input_schema["oneOf"].as_array().unwrap().len(),
-            2
+            definition.input_schema["properties"]["session_id"]["type"],
+            "string"
         );
     }
 
@@ -7043,6 +7486,7 @@ mod tests {
             extension_api: Default::default(),
             system_prompt_appendix: system_prompt_appendix.to_string(),
             declaration_base: None,
+            request_prefix_base: None,
             prompt_context_base,
             volatile_system_prompt_appendix: volatile.to_string(),
         };
@@ -8047,6 +8491,7 @@ mod tests {
                 extension_api: Default::default(),
                 system_prompt_appendix: String::new(),
                 declaration_base: None,
+                request_prefix_base: None,
                 prompt_context_base: Default::default(),
                 volatile_system_prompt_appendix: String::new(),
             };
@@ -8284,6 +8729,7 @@ mod tests {
                 extension_api: Default::default(),
                 system_prompt_appendix: String::new(),
                 declaration_base: None,
+                request_prefix_base: None,
                 prompt_context_base: Default::default(),
                 volatile_system_prompt_appendix: String::new(),
             };
@@ -8742,6 +9188,7 @@ mod tests {
                 extension_api: Default::default(),
                 system_prompt_appendix: String::new(),
                 declaration_base: None,
+                request_prefix_base: None,
                 prompt_context_base: Default::default(),
                 volatile_system_prompt_appendix: String::new(),
             };
