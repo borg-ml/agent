@@ -53,6 +53,9 @@ fn main() -> Result<()> {
     configure_allocator();
     spawn_allocator_trim();
     tokio::runtime::Builder::new_multi_thread()
+        // The session/store/SQLx poll chain can exceed Tokio's default 2 MiB
+        // worker stack while admitting a prompt (observed on SessionConfigured).
+        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .context("could not start the Borg async runtime")?
