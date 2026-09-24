@@ -6764,9 +6764,9 @@ async fn wait_agent_returns_on_a_child_report_and_on_waiting_input() {
         .await
         .unwrap();
     assert_eq!(again["reason"], "timeout");
-    input.send(false).unwrap();
+    input.send_replace(false);
     reported.store(false, std::sync::atomic::Ordering::Release);
-    input.send(true).unwrap();
+    input.send_replace(true);
     let next = coordinator
         .wait_for(
             root,
