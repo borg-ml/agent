@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -8,7 +8,7 @@ use std::sync::{
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use crate::{
@@ -19,6 +19,149 @@ use crate::{
 const MAX_CONTROL_COMMAND_BYTES: u64 = 1024 * 1024;
 const ATTACHED_SESSION_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 const ATTACHED_STORE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+const LOCAL_LIVE_EVENT_BUFFER: usize = 128;
+const LOCAL_LIVE_FRAME_MAX_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum LocalLiveFrame {
+    Hello {
+        latest_sequence: u64,
+        snapshots: Vec<SessionEvent>,
+    },
+    Event {
+        event: SessionEvent,
+        text_start: Option<usize>,
+        durable_watermark: u64,
+    },
+    Lagged,
+}
+
+struct LocalLivePublisher {
+    events: broadcast::Sender<LocalLiveWire>,
+    latest_sequence: u64,
+    reasoning_bytes: HashMap<Uuid, usize>,
+    message_bytes: HashMap<(Uuid, Uuid), usize>,
+    reasoning_snapshots: HashMap<Uuid, SessionEvent>,
+    message_snapshots: HashMap<(Uuid, Uuid), SessionEvent>,
+}
+
+#[derive(Clone)]
+struct LocalLiveWire {
+    bytes: Arc<[u8]>,
+    lagged: bool,
+}
+
+impl LocalLivePublisher {
+    fn publish(&mut self, event: &SessionEvent) {
+        self.latest_sequence = self.latest_sequence.max(event.sequence);
+        let (session_id, kind) = preview_event_kind(event);
+        let text_start = match kind {
+            SessionEventKind::ReasoningTextDelta { delta } => {
+                let start = self.reasoning_bytes.entry(session_id).or_default();
+                let previous = *start;
+                *start += delta.len();
+                Some(previous)
+            }
+            SessionEventKind::MessageDelta { message_id, delta } => {
+                let start = self
+                    .message_bytes
+                    .entry((session_id, *message_id))
+                    .or_default();
+                let previous = *start;
+                *start += delta.len();
+                Some(previous)
+            }
+            SessionEventKind::ReasoningDelta { text } => {
+                self.reasoning_bytes.insert(session_id, text.len());
+                self.reasoning_snapshots.insert(session_id, event.clone());
+                None
+            }
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::Assistant,
+                text,
+                status,
+                ..
+            } => {
+                if *status == MessageStatus::InProgress {
+                    self.message_bytes
+                        .insert((session_id, *message_id), text.len());
+                    self.message_snapshots
+                        .insert((session_id, *message_id), event.clone());
+                } else {
+                    self.message_bytes.remove(&(session_id, *message_id));
+                    self.message_snapshots.remove(&(session_id, *message_id));
+                }
+                self.reasoning_bytes.remove(&session_id);
+                self.reasoning_snapshots.remove(&session_id);
+                None
+            }
+            SessionEventKind::ReasoningCompleted
+            | SessionEventKind::ToolStarted { .. }
+            | SessionEventKind::ToolUpdated { .. }
+            | SessionEventKind::ToolCompleted { .. } => {
+                self.reasoning_bytes.remove(&session_id);
+                self.reasoning_snapshots.remove(&session_id);
+                None
+            }
+            SessionEventKind::TurnStarted { .. }
+            | SessionEventKind::TurnCompleted { .. }
+            | SessionEventKind::ContextCleared => {
+                self.reasoning_bytes.remove(&session_id);
+                self.message_bytes
+                    .retain(|(owner, _), _| *owner != session_id);
+                self.reasoning_snapshots.remove(&session_id);
+                self.message_snapshots
+                    .retain(|(owner, _), _| *owner != session_id);
+                None
+            }
+            _ => None,
+        };
+        if self.events.receiver_count() > 0 {
+            let frame = LocalLiveFrame::Event {
+                event: event.clone(),
+                text_start,
+                durable_watermark: self.latest_sequence,
+            };
+            let wire = encode_live_frame(&frame)
+                .ok()
+                .filter(|bytes| bytes.len() <= LOCAL_LIVE_FRAME_MAX_BYTES)
+                .map(|bytes| LocalLiveWire {
+                    bytes: Arc::from(bytes),
+                    lagged: false,
+                })
+                .unwrap_or_else(|| LocalLiveWire {
+                    bytes: Arc::from(
+                        encode_live_frame(&LocalLiveFrame::Lagged)
+                            .expect("static lag marker is serializable"),
+                    ),
+                    lagged: true,
+                });
+            let _ = self.events.send(wire);
+        }
+    }
+
+    fn snapshots(&self) -> Vec<SessionEvent> {
+        let mut snapshots = self
+            .reasoning_snapshots
+            .values()
+            .chain(self.message_snapshots.values())
+            .cloned()
+            .collect::<Vec<_>>();
+        snapshots.sort_by_key(|event| (event.created_at, event.id));
+        snapshots
+    }
+}
+
+fn preview_event_kind(event: &SessionEvent) -> (Uuid, &SessionEventKind) {
+    match &event.kind {
+        SessionEventKind::SubagentActivity {
+            event: Some(child), ..
+        } => (child.session_id, &child.kind),
+        kind => (event.session_id, kind),
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LocalSessionOwnerMetadata {
@@ -444,6 +587,7 @@ pub async fn send_local_session_command(
 pub struct LocalSessionControlServer {
     task: tokio::task::JoinHandle<()>,
     attached_viewers: Arc<AtomicUsize>,
+    live: Arc<Mutex<LocalLivePublisher>>,
 }
 
 #[cfg(not(unix))]
@@ -484,6 +628,10 @@ impl LocalSessionControlServer {
     pub fn has_attached_viewers(&self) -> bool {
         false
     }
+
+    pub fn publish_live_event(&self, _event: &SessionEvent) {}
+
+    pub fn seed_durable_watermark(&self, _sequence: u64) {}
 }
 
 #[cfg(unix)]
@@ -532,7 +680,6 @@ impl LocalSessionControlServer {
         store: Option<Arc<dyn SessionStore>>,
     ) -> Result<Self> {
         use std::os::unix::fs::PermissionsExt;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixListener;
 
         if socket_path.exists() {
@@ -563,6 +710,16 @@ impl LocalSessionControlServer {
         let task_socket_path = socket_path.clone();
         let attached_viewers = Arc::new(AtomicUsize::new(0));
         let task_attached_viewers = Arc::clone(&attached_viewers);
+        let (live_events, _) = broadcast::channel(LOCAL_LIVE_EVENT_BUFFER);
+        let live = Arc::new(Mutex::new(LocalLivePublisher {
+            events: live_events,
+            latest_sequence: 0,
+            reasoning_bytes: HashMap::new(),
+            message_bytes: HashMap::new(),
+            reasoning_snapshots: HashMap::new(),
+            message_snapshots: HashMap::new(),
+        }));
+        let task_live = Arc::clone(&live);
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -592,19 +749,54 @@ impl LocalSessionControlServer {
                     }
                     result = presence_listener.accept() => {
                         match result {
-                            Ok((mut stream, _)) => {
+                            Ok((stream, _)) => {
                                 let attached_viewers = Arc::clone(&task_attached_viewers);
+                                let live = Arc::clone(&task_live);
                                 tokio::spawn(async move {
+                                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
                                     attached_viewers.fetch_add(1, Ordering::AcqRel);
                                     // The acknowledgement makes the attachment
                                     // visible before its session loop proceeds.
-                                    let _ = stream.write_all(&[1]).await;
+                                    let (mut reader, mut writer) = stream.into_split();
+                                    if writer.write_all(&[2]).await.is_err() {
+                                        attached_viewers.fetch_sub(1, Ordering::AcqRel);
+                                        return;
+                                    }
                                     let mut byte = [0_u8; 1];
-                                    loop {
-                                        match stream.read(&mut byte).await {
-                                            Ok(0) | Err(_) => break,
-                                            Ok(_) => {}
+                                    if reader.read_exact(&mut byte).await.is_ok() && byte == [2] {
+                                        let (latest_sequence, snapshots, mut live_events) = {
+                                            let live = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                                            (live.latest_sequence, live.snapshots(), live.events.subscribe())
+                                        };
+                                        if write_live_frame(&mut writer, &LocalLiveFrame::Hello { latest_sequence, snapshots }).await.is_ok() {
+                                            loop {
+                                                tokio::select! {
+                                                    read = reader.read(&mut byte) => {
+                                                        if !matches!(read, Ok(1..)) {
+                                                            break;
+                                                        }
+                                                    }
+                                                    received = live_events.recv() => {
+                                                        let frame = match received {
+                                                            Ok(frame) => frame,
+                                                            Err(broadcast::error::RecvError::Lagged(_)) => LocalLiveWire {
+                                                                bytes: Arc::from(encode_live_frame(&LocalLiveFrame::Lagged).expect("static lag marker is serializable")),
+                                                                lagged: true,
+                                                            },
+                                                            Err(broadcast::error::RecvError::Closed) => break,
+                                                        };
+                                                        if writer.write_all(&frame.bytes).await.is_err() || frame.lagged {
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
+                                    } else {
+                                        // Older attached terminals keep this socket open only
+                                        // for presence. They never subscribe to event traffic.
+                                        while matches!(reader.read(&mut byte).await, Ok(1..)) {}
                                     }
                                     attached_viewers.fetch_sub(1, Ordering::AcqRel);
                                 });
@@ -625,12 +817,50 @@ impl LocalSessionControlServer {
         Ok(Self {
             task,
             attached_viewers,
+            live,
         })
     }
 
     pub fn has_attached_viewers(&self) -> bool {
         self.attached_viewers.load(Ordering::Acquire) > 0
     }
+
+    pub fn publish_live_event(&self, event: &SessionEvent) {
+        self.live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .publish(event);
+    }
+
+    pub fn seed_durable_watermark(&self, sequence: u64) {
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        live.latest_sequence = live.latest_sequence.max(sequence);
+    }
+}
+
+#[cfg(unix)]
+async fn write_live_frame<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &LocalLiveFrame,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let bytes = encode_live_frame(frame)?;
+    anyhow::ensure!(
+        bytes.len() <= LOCAL_LIVE_FRAME_MAX_BYTES,
+        "local live event is too large"
+    );
+    writer.write_all(&bytes).await?;
+    Ok(())
+}
+
+fn encode_live_frame(frame: &LocalLiveFrame) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(frame)?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 #[cfg(unix)]
@@ -779,55 +1009,16 @@ pub async fn run_attached_session(
     mut commands: mpsc::Receiver<HostCommand>,
     events: mpsc::Sender<SessionEvent>,
 ) -> Result<()> {
-    use tokio::io::AsyncReadExt;
-    use tokio::net::UnixStream;
-
     let presence_socket_path = session_control_presence_socket_path(
         socket_path.parent().unwrap_or_else(|| Path::new(".")),
         session_id,
     );
-    let mut _presence = match UnixStream::connect(&presence_socket_path).await {
-        Ok(mut stream) => {
-            let mut acknowledgement = [0_u8; 1];
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                stream.read_exact(&mut acknowledgement),
-            )
-            .await
-            {
-                Ok(Ok(_)) => Some(stream),
-                Ok(Err(error)) => {
-                    tracing::debug!(
-                        %error,
-                        socket_path = %presence_socket_path.display(),
-                        "local session presence handshake failed"
-                    );
-                    None
-                }
-                Err(_) => {
-                    tracing::debug!(
-                        socket_path = %presence_socket_path.display(),
-                        "local session presence handshake timed out"
-                    );
-                    None
-                }
-            }
-        }
-        Err(error) => {
-            tracing::debug!(
-                %error,
-                socket_path = %presence_socket_path.display(),
-                "local session owner does not expose a viewer presence channel"
-            );
-            None
-        }
-    };
-
     let command_events = events.clone();
     let mut event_forwarder = tokio::spawn(forward_attached_events(
         Arc::clone(&store),
         session_id,
         lock_path.clone(),
+        presence_socket_path,
         last_sequence,
         events,
     ));
@@ -924,6 +1115,251 @@ async fn forward_attached_command(
     Ok(false)
 }
 
+#[cfg(unix)]
+struct LocalLiveConnection {
+    reader: tokio::io::BufReader<tokio::net::UnixStream>,
+    latest_sequence: u64,
+    snapshots: Vec<SessionEvent>,
+}
+
+#[cfg(unix)]
+enum LocalLiveConnect {
+    Connected(LocalLiveConnection),
+    Unsupported(tokio::net::UnixStream),
+    Unavailable,
+}
+
+#[cfg(unix)]
+async fn connect_local_live_stream(path: &Path) -> LocalLiveConnect {
+    use tokio::io::AsyncReadExt;
+
+    let stream = match tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        tokio::net::UnixStream::connect(path),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        _ => return LocalLiveConnect::Unavailable,
+    };
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut acknowledgement = [0_u8; 1];
+    if !matches!(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader.read_exact(&mut acknowledgement),
+        )
+        .await,
+        Ok(Ok(_))
+    ) {
+        return LocalLiveConnect::Unavailable;
+    }
+    if acknowledgement != [2] {
+        return LocalLiveConnect::Unsupported(reader.into_inner());
+    }
+    use tokio::io::AsyncWriteExt;
+    if reader.get_mut().write_all(&[2]).await.is_err() {
+        return LocalLiveConnect::Unavailable;
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        read_live_frame(&mut reader),
+    )
+    .await
+    {
+        Ok(Ok(Some(LocalLiveFrame::Hello {
+            latest_sequence,
+            snapshots,
+        }))) => LocalLiveConnect::Connected(LocalLiveConnection {
+            reader,
+            latest_sequence,
+            snapshots,
+        }),
+        _ => LocalLiveConnect::Unavailable,
+    }
+}
+
+#[cfg(unix)]
+async fn read_live_frame(
+    reader: &mut tokio::io::BufReader<tokio::net::UnixStream>,
+) -> Result<Option<LocalLiveFrame>> {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            anyhow::ensure!(bytes.is_empty(), "truncated local live event");
+            return Ok(None);
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |index| index + 1);
+        anyhow::ensure!(
+            bytes.len().saturating_add(consumed) <= LOCAL_LIVE_FRAME_MAX_BYTES,
+            "local live event exceeds frame limit"
+        );
+        bytes.extend_from_slice(&available[..consumed]);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(Some(serde_json::from_slice(&bytes)?));
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReasoningPreviewCursor {
+    text: String,
+    known: bool,
+    raw_sent: bool,
+}
+
+#[derive(Default)]
+struct AttachedPreviewCursor {
+    reasoning: HashMap<Uuid, ReasoningPreviewCursor>,
+    messages: HashMap<(Uuid, Uuid), String>,
+    fresh_turns: HashSet<Uuid>,
+}
+
+impl AttachedPreviewCursor {
+    fn require_snapshot_for_existing_streams(&mut self) {
+        for reasoning in self.reasoning.values_mut() {
+            reasoning.known = false;
+        }
+        self.messages.clear();
+        self.fresh_turns.clear();
+    }
+
+    fn accept_store_snapshot(&mut self, event: SessionEvent) -> Option<SessionEvent> {
+        let (session_id, kind) = preview_event_kind(&event);
+        let result = if let SessionEventKind::ReasoningDelta { .. } = kind {
+            let cursor = self.reasoning.entry(session_id).or_default();
+            if cursor.raw_sent {
+                Some(event.clone())
+            } else {
+                reasoning_delta_from_snapshot(event.clone(), &mut cursor.text)
+            }
+        } else {
+            Some(event.clone())
+        };
+        self.accept(event, None)?;
+        result
+    }
+
+    fn accept(
+        &mut self,
+        mut event: SessionEvent,
+        text_start: Option<usize>,
+    ) -> Option<SessionEvent> {
+        let (session_id, kind) = preview_event_kind_mut(&mut event);
+        match kind {
+            SessionEventKind::ReasoningTextDelta { delta } => {
+                let cursor = self.reasoning.entry(session_id).or_default();
+                if !cursor.known {
+                    return None;
+                }
+                let start = text_start?;
+                let skip = cursor.text.len().checked_sub(start)?;
+                let suffix = delta.get(skip..)?.to_string();
+                if suffix.is_empty() {
+                    return None;
+                }
+                cursor.text.push_str(&suffix);
+                cursor.raw_sent = true;
+                *delta = suffix;
+            }
+            SessionEventKind::MessageDelta { message_id, delta } => {
+                let key = (session_id, *message_id);
+                if !self.messages.contains_key(&key) && !self.fresh_turns.contains(&session_id) {
+                    return None;
+                }
+                let text = self.messages.entry(key).or_default();
+                let start = text_start?;
+                let skip = text.len().checked_sub(start)?;
+                let suffix = delta.get(skip..)?.to_string();
+                if suffix.is_empty() {
+                    return None;
+                }
+                text.push_str(&suffix);
+                *delta = suffix;
+            }
+            SessionEventKind::ReasoningDelta { text } => {
+                let cursor = self.reasoning.entry(session_id).or_default();
+                if !cursor.text.starts_with(text.as_str()) {
+                    cursor.text.clone_from(text);
+                }
+                cursor.known = true;
+            }
+            SessionEventKind::Message {
+                actor: EventActor::Assistant,
+                message_id,
+                text,
+                status,
+                ..
+            } => {
+                let key = (session_id, *message_id);
+                if *status == MessageStatus::InProgress {
+                    let current = self.messages.entry(key).or_default();
+                    if !current.starts_with(text.as_str()) {
+                        current.clone_from(text);
+                    }
+                } else {
+                    self.messages.remove(&key);
+                }
+                self.reasoning.insert(
+                    session_id,
+                    ReasoningPreviewCursor {
+                        known: true,
+                        ..Default::default()
+                    },
+                );
+            }
+            SessionEventKind::ReasoningCompleted
+            | SessionEventKind::ToolStarted { .. }
+            | SessionEventKind::ToolUpdated { .. }
+            | SessionEventKind::ToolCompleted { .. } => {
+                self.reasoning.insert(
+                    session_id,
+                    ReasoningPreviewCursor {
+                        known: true,
+                        ..Default::default()
+                    },
+                );
+            }
+            SessionEventKind::TurnStarted { .. } => {
+                self.clear_session(session_id);
+                self.fresh_turns.insert(session_id);
+                self.reasoning.insert(
+                    session_id,
+                    ReasoningPreviewCursor {
+                        known: true,
+                        ..Default::default()
+                    },
+                );
+            }
+            SessionEventKind::TurnCompleted { .. } | SessionEventKind::ContextCleared => {
+                self.clear_session(session_id);
+            }
+            _ => {}
+        }
+        Some(event)
+    }
+
+    fn clear_session(&mut self, session_id: Uuid) {
+        self.reasoning.remove(&session_id);
+        self.messages.retain(|(owner, _), _| *owner != session_id);
+        self.fresh_turns.remove(&session_id);
+    }
+}
+
+fn preview_event_kind_mut(event: &mut SessionEvent) -> (Uuid, &mut SessionEventKind) {
+    match &mut event.kind {
+        SessionEventKind::SubagentActivity {
+            event: Some(child), ..
+        } => (child.session_id, &mut child.kind),
+        kind => (event.session_id, kind),
+    }
+}
+
 /// Forward the canonical event stream independently from the command path.
 ///
 /// The event channel is deliberately backpressured: dropping a durable event
@@ -935,13 +1371,177 @@ async fn forward_attached_events(
     store: Arc<dyn SessionStore>,
     session_id: Uuid,
     lock_path: PathBuf,
+    presence_socket_path: PathBuf,
     mut last_sequence: u64,
     events: mpsc::Sender<SessionEvent>,
 ) -> Result<()> {
     let mut refresh = tokio::time::interval(ATTACHED_SESSION_REFRESH_INTERVAL);
     let mut live_revision = 0_u64;
-    let mut reasoning_snapshot = String::new();
+    let mut preview = AttachedPreviewCursor::default();
+    let mut reconnect_at = tokio::time::Instant::now();
+    let mut live_protocol_supported = true;
+    let mut _legacy_presence = None;
     loop {
+        let connection = if live_protocol_supported && tokio::time::Instant::now() >= reconnect_at {
+            match connect_local_live_stream(&presence_socket_path).await {
+                LocalLiveConnect::Connected(connection)
+                    if connection.latest_sequence < last_sequence =>
+                {
+                    reconnect_at = tokio::time::Instant::now() + ATTACHED_STORE_RETRY_DELAY;
+                    None
+                }
+                LocalLiveConnect::Connected(connection) => Some(connection),
+                LocalLiveConnect::Unsupported(presence) => {
+                    _legacy_presence = Some(presence);
+                    live_protocol_supported = false;
+                    None
+                }
+                LocalLiveConnect::Unavailable => {
+                    reconnect_at = tokio::time::Instant::now() + ATTACHED_STORE_RETRY_DELAY;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(mut connection) = connection {
+            // Subscription and watermark are captured together by the owner.
+            // Store replay fills only the durable prefix preceding that point;
+            // the socket then supplies all later events in the owner's order.
+            while last_sequence < connection.latest_sequence {
+                let historical = match store.events_after(session_id, last_sequence, 1_000).await {
+                    Ok(events) => events,
+                    Err(error) if attached_store_error_is_retryable(&error) => {
+                        tracing::debug!(%error, %session_id, "attached durable catch-up is busy; retrying");
+                        tokio::time::sleep(ATTACHED_STORE_RETRY_DELAY).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                anyhow::ensure!(
+                    !historical.is_empty(),
+                    "attached session cannot fill durable gap through {}",
+                    connection.latest_sequence
+                );
+                let before = last_sequence;
+                for event in historical {
+                    if event.sequence > connection.latest_sequence {
+                        break;
+                    }
+                    let stopped = matches!(
+                        event.kind,
+                        SessionEventKind::StatusChanged {
+                            status: SessionStatus::Stopped,
+                            ..
+                        }
+                    );
+                    last_sequence = event.sequence;
+                    if let Some(event) = preview.accept(event, None)
+                        && events.send(event).await.is_err()
+                    {
+                        return Ok(());
+                    }
+                    if stopped {
+                        return Ok(());
+                    }
+                }
+                anyhow::ensure!(
+                    last_sequence > before,
+                    "attached session cannot advance durable gap through {}",
+                    connection.latest_sequence
+                );
+            }
+            preview.require_snapshot_for_existing_streams();
+            if connection.latest_sequence >= last_sequence {
+                for snapshot in connection.snapshots.drain(..) {
+                    if let Some(snapshot) = preview.accept(snapshot, None)
+                        && events.send(snapshot).await.is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            loop {
+                let frame = match read_live_frame(&mut connection.reader).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::debug!(%error, %session_id, "local live stream ended; using store fallback");
+                        break;
+                    }
+                };
+                let LocalLiveFrame::Event {
+                    event,
+                    text_start,
+                    durable_watermark,
+                } = frame
+                else {
+                    break;
+                };
+                if event.sequence == 0 && durable_watermark < last_sequence {
+                    continue;
+                }
+                if event.sequence > 0 {
+                    if event.sequence <= last_sequence {
+                        continue;
+                    }
+                    while event.sequence > last_sequence.saturating_add(1) {
+                        let historical = match store
+                            .events_after(session_id, last_sequence, 1_000)
+                            .await
+                        {
+                            Ok(events) => events,
+                            Err(error) if attached_store_error_is_retryable(&error) => {
+                                tracing::debug!(%error, %session_id, "attached durable gap repair is busy; retrying");
+                                tokio::time::sleep(ATTACHED_STORE_RETRY_DELAY).await;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        anyhow::ensure!(
+                            !historical.is_empty(),
+                            "attached session cannot repair durable gap before {}",
+                            event.sequence
+                        );
+                        let before = last_sequence;
+                        for missed in historical {
+                            if missed.sequence >= event.sequence {
+                                break;
+                            }
+                            last_sequence = missed.sequence;
+                            if let Some(missed) = preview.accept(missed, None)
+                                && events.send(missed).await.is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                        anyhow::ensure!(
+                            last_sequence > before,
+                            "attached session cannot advance durable gap before {}",
+                            event.sequence
+                        );
+                    }
+                    last_sequence = event.sequence;
+                }
+                let stopped = matches!(
+                    event.kind,
+                    SessionEventKind::StatusChanged {
+                        status: SessionStatus::Stopped,
+                        ..
+                    }
+                );
+                if let Some(event) = preview.accept(event, text_start)
+                    && events.send(event).await.is_err()
+                {
+                    return Ok(());
+                }
+                if stopped {
+                    return Ok(());
+                }
+            }
+            reconnect_at = tokio::time::Instant::now() + ATTACHED_STORE_RETRY_DELAY;
+        }
+
         refresh.tick().await;
         let historical = match store.events_after(session_id, last_sequence, 1_000).await {
             Ok(events) => events,
@@ -953,15 +1553,6 @@ async fn forward_attached_events(
             Err(error) => return Err(error),
         };
         for event in historical {
-            if event.kind.clears_live_turn_state()
-                || event
-                    .kind
-                    .cleared_live_state_keys()
-                    .iter()
-                    .any(|key| key == "reasoning")
-            {
-                reasoning_snapshot.clear();
-            }
             let stopped = matches!(
                 event.kind,
                 SessionEventKind::StatusChanged {
@@ -970,7 +1561,9 @@ async fn forward_attached_events(
                 }
             );
             let sequence = event.sequence;
-            if events.send(event).await.is_err() {
+            if let Some(event) = preview.accept(event, None)
+                && events.send(event).await.is_err()
+            {
                 return Ok(());
             }
             last_sequence = sequence;
@@ -989,7 +1582,7 @@ async fn forward_attached_events(
         };
         for live in live_events {
             live_revision = live_revision.max(live.revision);
-            if let Some(event) = reasoning_delta_from_snapshot(live.event, &mut reasoning_snapshot)
+            if let Some(event) = preview.accept_store_snapshot(live.event)
                 && events.send(event).await.is_err()
             {
                 return Ok(());
@@ -1469,6 +2062,307 @@ mod tests {
         })
         .await
         .expect("viewer presence should be released when the attachment closes");
+    }
+
+    #[tokio::test]
+    async fn attached_viewer_receives_raw_text_before_the_next_store_snapshot() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let lock_path = root.path().join(format!("{session_id}.lock"));
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let writer = SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .unwrap();
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let postgres = Arc::new(postgres);
+        postgres.create_session(session_id).await.unwrap();
+        let started = postgres
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        let store: Arc<dyn SessionStore> = postgres.clone();
+        let (owner_tx, _owner_rx) = mpsc::channel(1);
+        let server =
+            LocalSessionControlServer::start(socket_path.clone(), session_id, &writer, owner_tx)
+                .unwrap();
+        server.seed_durable_watermark(started.sequence);
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let attachment = tokio::spawn(run_attached_session(
+            store,
+            session_id,
+            lock_path,
+            socket_path,
+            started.sequence,
+            command_rx,
+            event_tx,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if server.live.lock().unwrap().events.receiver_count() > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("attached viewer should subscribe to the owner event stream");
+
+        let message_id = Uuid::new_v4();
+        let turn = postgres
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::TurnStarted {
+                    message_id,
+                    provider: crate::CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: false,
+                },
+            ))
+            .await
+            .unwrap();
+        server.publish_live_event(&turn);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .kind,
+            SessionEventKind::TurnStarted { .. }
+        ));
+
+        server.publish_live_event(&SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningTextDelta {
+                delta: "thinking".into(),
+            },
+        ));
+        server.publish_live_event(&SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::MessageDelta {
+                message_id,
+                delta: "answer".into(),
+            },
+        ));
+        let reasoning = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let message = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(reasoning.kind, SessionEventKind::ReasoningTextDelta { ref delta } if delta == "thinking")
+        );
+        assert!(
+            matches!(message.kind, SessionEventKind::MessageDelta { ref delta, .. } if delta == "answer")
+        );
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        attachment.await.unwrap().unwrap();
+        scratch.discard().await;
+    }
+
+    #[test]
+    fn reconnect_store_snapshot_keeps_reasoning_cumulative_after_raw_preview() {
+        let session_id = Uuid::new_v4();
+        let mut preview = AttachedPreviewCursor::default();
+        let turn = SessionEvent::new(
+            session_id,
+            1,
+            SessionEventKind::TurnStarted {
+                message_id: Uuid::new_v4(),
+                provider: crate::CodingProvider::Codex,
+                model: None,
+                effort: None,
+                fast: false,
+            },
+        );
+        preview.accept(turn, None).unwrap();
+        let raw = SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningTextDelta {
+                delta: "thinking".into(),
+            },
+        );
+        assert!(
+            matches!(preview.accept(raw, Some(0)).unwrap().kind, SessionEventKind::ReasoningTextDelta { ref delta } if delta == "thinking")
+        );
+        preview.require_snapshot_for_existing_streams();
+        let snapshot = SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningDelta {
+                text: "thinking again".into(),
+            },
+        );
+        assert!(
+            matches!(preview.accept_store_snapshot(snapshot).unwrap().kind, SessionEventKind::ReasoningDelta { ref text } if text == "thinking again")
+        );
+        let resumed = SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningTextDelta {
+                delta: " more".into(),
+            },
+        );
+        assert!(
+            matches!(preview.accept(resumed, Some("thinking again".len())).unwrap().kind, SessionEventKind::ReasoningTextDelta { ref delta } if delta == " more")
+        );
+        assert_eq!(preview.reasoning[&session_id].text, "thinking again more");
+    }
+
+    #[tokio::test]
+    async fn attached_viewer_rejects_snapshots_from_an_owner_behind_the_store() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let lock_path = root.path().join(format!("{session_id}.lock"));
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let writer = SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .unwrap();
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let postgres = Arc::new(postgres);
+        postgres.create_session(session_id).await.unwrap();
+        let started = postgres
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::SessionStarted,
+            ))
+            .await
+            .unwrap();
+        let message_id = Uuid::new_v4();
+        let in_progress = postgres
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::Assistant,
+                    text: "stale draft".into(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::InProgress,
+                    delivery: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let complete = postgres
+            .append(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id,
+                    actor: EventActor::Assistant,
+                    text: "finished".into(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Complete,
+                    delivery: None,
+                },
+            ))
+            .await
+            .unwrap();
+        let store: Arc<dyn SessionStore> = postgres;
+        let (owner_tx, _owner_rx) = mpsc::channel(1);
+        let server =
+            LocalSessionControlServer::start(socket_path.clone(), session_id, &writer, owner_tx)
+                .unwrap();
+        server.seed_durable_watermark(started.sequence);
+        server.publish_live_event(&in_progress);
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let attachment = tokio::spawn(run_attached_session(
+            store,
+            session_id,
+            lock_path,
+            socket_path,
+            complete.sequence,
+            command_rx,
+            event_tx,
+        ));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), event_rx.recv())
+                .await
+                .is_err(),
+            "a stale owner snapshot must not resurrect a completed message"
+        );
+        server.publish_live_event(&complete);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), event_rx.recv())
+                .await
+                .is_err(),
+            "catching up the owner must not replay its stale snapshot"
+        );
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        attachment.await.unwrap().unwrap();
+        scratch.discard().await;
+    }
+
+    #[tokio::test]
+    async fn attached_viewer_keeps_presence_with_an_older_owner() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let lock_path = root.path().join(format!("{session_id}.lock"));
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let presence_path = session_control_presence_socket_path(root.path(), session_id);
+        let listener = tokio::net::UnixListener::bind(presence_path).unwrap();
+        let _writer = SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .unwrap();
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let postgres = Arc::new(postgres);
+        postgres.create_session(session_id).await.unwrap();
+        let store: Arc<dyn SessionStore> = postgres;
+        let (command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let attachment = tokio::spawn(run_attached_session(
+            store,
+            session_id,
+            lock_path,
+            socket_path,
+            0,
+            command_rx,
+            event_tx,
+        ));
+        let (mut old_owner, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        old_owner.write_all(&[1]).await.unwrap();
+        let mut byte = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                old_owner.read(&mut byte)
+            )
+            .await
+            .is_err(),
+            "an older owner must keep counting the attached viewer"
+        );
+        command_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        attachment.await.unwrap().unwrap();
+        assert_eq!(old_owner.read(&mut byte).await.unwrap(), 0);
+        scratch.discard().await;
     }
 
     #[tokio::test]
