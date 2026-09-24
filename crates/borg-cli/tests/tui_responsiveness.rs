@@ -329,7 +329,7 @@ fn spawn_streaming_provider() -> (String, mpsc::Receiver<()>, thread::JoinHandle
         read_http_request(&mut socket).expect("read provider request");
         started_tx.send(()).expect("publish provider start");
 
-        const DELTAS: usize = 3_000;
+        const DELTAS: usize = 5_000;
         let mut frames = Vec::with_capacity(DELTAS + 2);
         for index in 0..DELTAS {
             frames.push(format!(
