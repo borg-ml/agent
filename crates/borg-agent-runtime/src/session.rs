@@ -2103,6 +2103,9 @@ async fn run_agent_session_store_kernel_inner(
     let mut network_retry_attempts = 0_usize;
     let mut network_retry_message_id = None;
     let mut usage_limit_continuation_id = None;
+    // Human prompts already queued when the usage wait began. Any other human
+    // prompt is new input and ends the wait: the limit may already be lifted.
+    let mut usage_wait_prompts: Option<HashSet<Uuid>> = None;
     if let Some(retry) = state.usage_limit_retry {
         if retry.continuation {
             // The process may have died after the atomic retry checkpoint but
@@ -2470,8 +2473,20 @@ async fn run_agent_session_store_kernel_inner(
             )
             .await?;
         }
-        let usage_limit_retry_waiting =
+        let mut usage_limit_retry_waiting =
             retry_not_before.is_some_and(|deadline| deadline > Instant::now());
+        if usage_limit_retry_waiting {
+            let waiting = usage_wait_prompts.get_or_insert_with(|| human_prompt_ids(&pending));
+            if pending.iter().any(|prompt| {
+                prompt.actor == EventActor::User && !waiting.contains(&prompt.message_id)
+            }) {
+                retry_not_before = None;
+                usage_limit_retry_waiting = false;
+            }
+        }
+        if !usage_limit_retry_waiting {
+            usage_wait_prompts = None;
+        }
         // Before admitting, fold any queued team notifications into one prompt.
         // This runs ahead of `pop_next_pending_prompt`, which still prefers a
         // human prompt, so batching can never take a turn from a person.
@@ -2929,6 +2944,11 @@ async fn run_agent_session_store_kernel_inner(
                             continue;
                         }
                         if retry_not_before.is_some_and(|deadline| deadline > Instant::now()) {
+                            // The actor was decided above; keep a team report
+                            // marked as one so it never lands in Pending Input.
+                            if actor == EventActor::System {
+                                team_message_ids.insert(message_id);
+                            }
                             queue_pending_prompt(
                                 &mut journal,
                                 &events,
@@ -2941,6 +2961,13 @@ async fn run_agent_session_store_kernel_inner(
                                 output_schema,
                             )
                             .await?;
+                            if actor == EventActor::User {
+                                // A person's message is a fresh attempt: the limit
+                                // may be lifted already. If it is not, the turn
+                                // fails back into the same usage wait.
+                                retry_not_before = None;
+                                break pop_next_pending_prompt(&mut pending, true);
+                            }
                             continue;
                         }
                         break Some(QueuedPrompt {
@@ -5233,6 +5260,9 @@ async fn run_agent_session_store_kernel_inner(
                                     usage_limit_continuation_id = Some(retry_prompt.message_id);
                                 }
                                 pending.push_front(retry_prompt);
+                            }
+                            if usage_limit_retry {
+                                usage_wait_prompts = Some(human_prompt_ids(&pending));
                             }
                             next_ready_detail = Some(ready_detail);
                         }
@@ -9580,6 +9610,14 @@ fn coalesce_pending_team_notifications(
     combined.delivery = PromptDelivery::Queue;
     combined.interrupt_batch = false;
     pending.insert(first, combined);
+}
+
+fn human_prompt_ids(pending: &VecDeque<QueuedPrompt>) -> HashSet<Uuid> {
+    pending
+        .iter()
+        .filter(|prompt| prompt.actor == EventActor::User)
+        .map(|prompt| prompt.message_id)
+        .collect()
 }
 
 fn pop_next_pending_prompt(

@@ -2098,6 +2098,31 @@ impl AgentTurnExecutor for UsageLimitThenSuccessExecutor {
     }
 }
 
+/// Hits a usage limit whose reset is an hour away, then succeeds.
+struct LongUsageLimitExecutor {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl AgentTurnExecutor for LongUsageLimitExecutor {
+    async fn execute(
+        &self,
+        _turn: AgentTurn,
+        _events: mpsc::Sender<SessionEventKind>,
+        _controls: Option<mpsc::Receiver<AgentTurnControl>>,
+    ) -> Result<AgentTurnResult> {
+        if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+            return Err(anyhow::anyhow!(
+                "You've hit your usage limit. Provider-reported retry delay: 3600 seconds."
+            ));
+        }
+        Ok(AgentTurnResult {
+            provider_session_id: Some("provider-session".to_string()),
+            final_text: "ran after the top-up".to_string(),
+        })
+    }
+}
+
 struct HungProviderExecutor;
 
 struct NarrationThenDelayedCompletionExecutor;
@@ -2849,6 +2874,96 @@ async fn usage_limited_prompt_resumes_automatically_after_the_retry_delay() {
             .state,
         crate::SessionActionState::Completed
     );
+    scratch.discard().await;
+}
+
+async fn next_turn_completion(event_rx: &mut mpsc::Receiver<SessionEvent>, what: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let event = tokio::time::timeout_at(deadline, event_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{what}"))
+            .expect("session remains attached");
+        if matches!(event.kind, SessionEventKind::TurnCompleted { .. }) {
+            return;
+        }
+    }
+}
+
+/// Failure mode: after a usage limit, a person's new message sat queued
+/// behind the automatic retry timer (up to hours) even though the account
+/// had been topped up, leaving the session stuck on "starting".
+#[tokio::test]
+async fn a_human_message_ends_a_usage_limit_wait_immediately() {
+    let root = tempdir().unwrap();
+    let session_id = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store: Arc<dyn SessionStore> = Arc::new(store);
+    store.create_session(session_id).await.unwrap();
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let (event_tx, mut event_rx) = mpsc::channel(128);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor = Arc::new(LongUsageLimitExecutor {
+        calls: Arc::clone(&calls),
+    });
+    let actor = tokio::spawn({
+        let journal_path = root.path().join("session.lock");
+        let cwd = root.path().to_path_buf();
+        let store = Arc::clone(&store);
+        async move {
+            run_session_actor(
+                &journal_path,
+                session_id,
+                LaunchSession {
+                    request_id: Uuid::new_v4(),
+                    cwd,
+                    provider: CodingProvider::Codex,
+                    model: None,
+                    effort: None,
+                    fast: Some(false),
+                    response_language: crate::ResponseLanguage::Auto,
+                    permission_mode: PermissionMode::Manual,
+                    name: None,
+                    initial_prompt: Some("finish this task".to_string()),
+                    capabilities: Default::default(),
+                    subagent_concurrency_limit: None,
+                    extension_skill_roots: Vec::new(),
+                    team_policy: None,
+                },
+                command_rx,
+                event_tx,
+                executor,
+                store,
+            )
+            .await
+        }
+    });
+    next_turn_completion(&mut event_rx, "the first turn hits the usage limit").await;
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+
+    command_tx
+        .send(HostCommand::Prompt {
+            session_id,
+            message_id: Uuid::new_v4(),
+            text: "I topped up, carry on".to_string(),
+            attachments: Vec::new(),
+            output_schema: None,
+            delivery: PromptDelivery::Queue,
+        })
+        .await
+        .unwrap();
+    next_turn_completion(
+        &mut event_rx,
+        "the human message runs without waiting an hour",
+    )
+    .await;
+    assert_eq!(calls.load(Ordering::Acquire), 2);
+
+    command_tx
+        .send(HostCommand::Stop { session_id })
+        .await
+        .unwrap();
+    actor.await.unwrap().unwrap();
     scratch.discard().await;
 }
 
