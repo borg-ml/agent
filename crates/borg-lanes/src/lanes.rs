@@ -1986,7 +1986,9 @@ fn budget_reason(root: &Path, state: &Journal, budget: &AdmissionBudget) -> Resu
     let active: Vec<_> = state
         .records
         .iter()
-        .filter(|r| r.quarantined || matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
+        .filter(|r| {
+            r.quarantined || matches!(r.state, TicketState::Granted(_) | TicketState::Preparing)
+        })
         .filter_map(|r| {
             r.spec
                 .as_ref()
@@ -2046,7 +2048,9 @@ fn budget_reason(root: &Path, state: &Journal, budget: &AdmissionBudget) -> Resu
     let reserved_disk: u64 = state
         .records
         .iter()
-        .filter(|r| r.quarantined || matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
+        .filter(|r| {
+            r.quarantined || matches!(r.state, TicketState::Granted(_) | TicketState::Preparing)
+        })
         .filter_map(|r| {
             r.spec
                 .as_ref()
