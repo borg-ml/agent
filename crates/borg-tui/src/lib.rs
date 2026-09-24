@@ -16138,10 +16138,9 @@ const RUNNING_SHIMMER_CYCLE_MILLIS: u128 = 2_000;
 /// Tool rows sweep at the same speed but rest one pass between sweeps, so a
 /// sweep starts half as often.
 const RUNNING_TOOL_SHIMMER_INTERVAL_MILLIS: u128 = RUNNING_SHIMMER_CYCLE_MILLIS * 2;
-/// The status sweep keeps the same speed but rests between passes, so it
-/// crosses 25% less often than the tool-row sweep.
-/// One status pass takes a third longer than a tool-row pass: 25% slower.
-const RUNNING_STATUS_SHIMMER_PASS_MILLIS: u128 = RUNNING_SHIMMER_CYCLE_MILLIS * 4 / 3;
+/// Slow the status sweep by 25% without changing tool-row sweeps.
+const RUNNING_STATUS_SHIMMER_PASS_MILLIS: u128 = RUNNING_SHIMMER_CYCLE_MILLIS * 16 / 9;
+const RUNNING_STATUS_SHIMMER_HALF_WIDTH: f32 = RUNNING_SHIMMER_HALF_WIDTH * 0.75;
 const RUNNING_STATUS_SHIMMER_INTERVAL_MILLIS: u128 = RUNNING_STATUS_SHIMMER_PASS_MILLIS * 4 / 3;
 static RUNNING_SHIMMER_START: OnceLock<Instant> = OnceLock::new();
 
@@ -16225,8 +16224,8 @@ fn apply_running_status_shimmer(spans: &mut Vec<Span<'static>>, phase: u128) {
         let distance = offset
             .saturating_add(RUNNING_SHIMMER_PADDING)
             .abs_diff(center) as f32;
-        let intensity = if distance <= RUNNING_SHIMMER_HALF_WIDTH {
-            0.5 * (1.0 + (std::f32::consts::PI * distance / RUNNING_SHIMMER_HALF_WIDTH).cos())
+        let intensity = if distance <= RUNNING_STATUS_SHIMMER_HALF_WIDTH {
+            0.5 * (1.0 + (std::f32::consts::PI * distance / RUNNING_STATUS_SHIMMER_HALF_WIDTH).cos())
         } else {
             0.0
         };
