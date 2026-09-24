@@ -32,7 +32,7 @@ enum LocalLiveFrame {
         snapshots: Vec<SessionEvent>,
     },
     Event {
-        event: SessionEvent,
+        event: Box<SessionEvent>,
         text_start: Option<usize>,
         durable_watermark: u64,
     },
@@ -214,7 +214,7 @@ impl LocalLivePublisher {
 
     fn send_event(&self, event: SessionEvent, text_start: Option<usize>, durable_watermark: u64) {
         let frame = LocalLiveFrame::Event {
-            event,
+            event: Box::new(event),
             text_start,
             durable_watermark,
         };
@@ -1653,6 +1653,7 @@ async fn forward_attached_events(
                 else {
                     break;
                 };
+                let event = *event;
                 if event.sequence == 0 && durable_watermark < last_sequence {
                     continue;
                 }
@@ -2276,7 +2277,7 @@ mod tests {
         else {
             panic!("turn should arrive first");
         };
-        preview.accept(event, None).unwrap();
+        preview.accept(*event, None).unwrap();
 
         for delta in ["a", "b", "c"] {
             server.publish_live_event(&SessionEvent::new(
@@ -2299,7 +2300,7 @@ mod tests {
         assert!(
             matches!(event.kind, SessionEventKind::ReasoningTextDelta { ref delta } if delta == "a")
         );
-        preview.accept(event, Some(0)).unwrap();
+        preview.accept(*event, Some(0)).unwrap();
         assert!(frames.try_recv().is_err(), "the next fragments are batched");
         tokio::time::advance(LOCAL_LIVE_DELTA_BATCH_DELAY).await;
         let merged = frames.recv().await.unwrap();
@@ -2314,7 +2315,7 @@ mod tests {
         assert!(
             matches!(event.kind, SessionEventKind::ReasoningTextDelta { ref delta } if delta == "bc")
         );
-        preview.accept(event, Some(1)).unwrap();
+        preview.accept(*event, Some(1)).unwrap();
 
         for delta in ["x", "y", "z"] {
             server.publish_live_event(&SessionEvent::new(
@@ -2341,7 +2342,7 @@ mod tests {
                 panic!("expected a live event");
             };
             seen.push(event.kind.clone());
-            preview.accept(event, text_start).unwrap();
+            preview.accept(*event, text_start).unwrap();
         }
         assert!(
             matches!(seen[0], SessionEventKind::MessageDelta { ref delta, .. } if delta == "x")
