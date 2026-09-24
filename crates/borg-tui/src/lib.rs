@@ -16225,7 +16225,8 @@ fn apply_running_status_shimmer(spans: &mut Vec<Span<'static>>, phase: u128) {
             .saturating_add(RUNNING_SHIMMER_PADDING)
             .abs_diff(center) as f32;
         let intensity = if distance <= RUNNING_STATUS_SHIMMER_HALF_WIDTH {
-            0.5 * (1.0 + (std::f32::consts::PI * distance / RUNNING_STATUS_SHIMMER_HALF_WIDTH).cos())
+            0.5 * (1.0
+                + (std::f32::consts::PI * distance / RUNNING_STATUS_SHIMMER_HALF_WIDTH).cos())
         } else {
             0.0
         };
