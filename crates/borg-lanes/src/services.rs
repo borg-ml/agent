@@ -1788,6 +1788,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                     let old = active.replace(new);
                     status.backend_pid = active.as_ref().and_then(|b| b.child.id());
                     let port = active.as_ref().and_then(|b| b.port);
+                    write_json(&dir.join("last-backend-port.json"), &port)?;
                     transition(
                         &dir,
                         &mut status,
@@ -1931,7 +1932,13 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                     status.backend_pid = None;
                     status.restarts += 1;
                 }
-                let port = reserve_backend_port(&dir, &spec)?;
+                let port = match &active {
+                    // A warm replacement is recorded only once it serves: a
+                    // supervisor lost mid-restart then relaunches on this
+                    // idle port, not on the one its clients just left.
+                    Some(serving) => next_port_after(&spec, serving.port),
+                    None => reserve_backend_port(&dir, &spec)?,
+                };
                 match spawn_backend(&spec, port, &log, &scopes) {
                     Ok((child, scope)) => {
                         if cold {
