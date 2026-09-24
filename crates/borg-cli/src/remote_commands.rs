@@ -62,6 +62,7 @@ mod local_server;
 const MIN_TUI_FPS: u64 = 15;
 const MAX_TUI_FPS: u64 = 240;
 const STREAMING_TUI_FPS: u64 = 120;
+const STREAM_BURST_IDLE_GAP: std::time::Duration = std::time::Duration::from_millis(100);
 const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 const TOOL_STARTED_FRAME_MIN_DURATION: std::time::Duration = std::time::Duration::from_millis(150);
 const IDLE_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -2895,6 +2896,7 @@ async fn run_local_agent_session(
     let mut transcript_rebuild_pending = false;
     let mut interaction_dirty = false;
     let mut streaming_frame_pending = false;
+    let mut last_stream_text_at: Option<tokio::time::Instant> = None;
     let mut tool_started_frame_hold_until = None;
     let mut tui_fps = tui_refresh_rate(u64::from(editor_preferences.presentation.refresh_rate_fps));
     let mut prevent_sleep = editor_preferences.interaction.prevent_sleep;
@@ -4094,11 +4096,22 @@ async fn run_local_agent_session(
                 if schema_rejected && stale_local_owner {
                     tracing::info!(%session_id, "recovering obsolete owner after schema rejection");
                 } else if let Some(terminal) = terminal.as_mut() {
-                    if session_event_contains_stream_text(&event.kind) {
+                    let stream_text = session_event_contains_stream_text(&event.kind);
+                    let stream_burst_started = stream_text && {
+                        let now = tokio::time::Instant::now();
+                        let started = should_wake_stream_burst(last_stream_text_at, now);
+                        last_stream_text_at = Some(now);
+                        started
+                    };
+                    if stream_text {
                         tool_started_frame_hold_until = None;
                         streaming_frame_pending = true;
                     }
                     terminal_dirty |= terminal.apply_session_event(&event);
+                    if stream_burst_started && terminal_dirty {
+                        render_frame_interval = tui_frame_interval(tui_fps.max(STREAMING_TUI_FPS));
+                        render_tick = tui_render_interval(render_frame_interval);
+                    }
                     if event.sequence == 0 && coalesced_transcript_event(&event.kind) {
                         transcript_live_tail = true;
                     }
@@ -8972,6 +8985,13 @@ fn responsive_tui_frame_interval(
         last_draw.saturating_mul(3)
     })
     .min(MAX_RENDER_BACKOFF_INTERVAL)
+}
+
+fn should_wake_stream_burst(
+    previous_text_at: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> bool {
+    previous_text_at.is_none_or(|previous| now.duration_since(previous) >= STREAM_BURST_IDLE_GAP)
 }
 
 /// `/sleep lid|idle|off`, plus `on`/`off` for backwards compatibility where
