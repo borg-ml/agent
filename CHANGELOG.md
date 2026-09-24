@@ -126,6 +126,13 @@ Git comparison.
   white tool text so its moving highlight stays visible, and also sweeps
   across the Running spinner, resting between passes. Jump to bottom and
   Back to actions share one right edge and style, side by side when both show.
+- **Scrolling and streaming stay responsive on long sessions.** Wheel motion
+  catches up by elapsed time, so a slow frame never leaves scrolling that keeps
+  draining after the wheel stops, and streamed text is no longer throttled to
+  a few frames per second when drawing gets expensive. The transcript also
+  fills the row that used to sit empty above the status line.
+- Edited rows that span several files show each later file as a path row;
+  Git's `diff --git` and `index` headers no longer appear as numbered code.
 - Ghostty setup ships with the release archives. Completion notifications
   only fire when work actually stops, and new threads receive durable titles.
 

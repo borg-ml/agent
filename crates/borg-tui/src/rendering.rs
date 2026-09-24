@@ -375,7 +375,28 @@ fn unified_diff_lines(
         .and_then(|language| syntax_for_language(syntaxes, language))
         .map(|syntax| HighlightLines::new(syntax, theme));
     let show_line_numbers = source.lines().any(|line| hunk_starts(line).is_some());
+    let mut in_git_header = false;
     for raw in source.lines() {
+        if let Some(path) = git_diff_header_path(raw) {
+            // A later file starts: its numbering is its own, and its path
+            // separates it from the previous file's hunks.
+            in_git_header = true;
+            (old_line, new_line) = (None, None);
+            if !output.is_empty() {
+                if wrap {
+                    output.extend(plain_lines(path, width));
+                } else {
+                    output.push(Line::from(Span::styled(
+                        pad_cells(path, width),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+            continue;
+        }
+        if in_git_header && (is_git_extended_header(raw) || raw.starts_with("--- ")) {
+            continue;
+        }
         if let Some(path) = diff_file_path(raw) {
             if wrap {
                 output.extend(plain_lines(path, width));
@@ -390,6 +411,7 @@ fn unified_diff_lines(
             continue;
         }
         if let Some((old, new)) = hunk_starts(raw) {
+            in_git_header = false;
             old_line = Some(old);
             new_line = Some(new);
             continue;
@@ -550,6 +572,32 @@ fn diff_file_path(line: &str) -> Option<&str> {
     (path != "/dev/null").then_some(path)
 }
 
+/// The new path named by a `diff --git a/X b/Y` file header.
+fn git_diff_header_path(line: &str) -> Option<&str> {
+    let paths = line.strip_prefix("diff --git ")?;
+    Some(paths.rsplit_once(" b/").map_or(paths, |(_, path)| path))
+}
+
+/// Git's extended header lines between `diff --git` and the first hunk.
+fn is_git_extended_header(line: &str) -> bool {
+    [
+        "index ",
+        "old mode ",
+        "new mode ",
+        "deleted file mode ",
+        "new file mode ",
+        "similarity index ",
+        "dissimilarity index ",
+        "rename from ",
+        "rename to ",
+        "copy from ",
+        "copy to ",
+        "Binary files ",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
+}
+
 fn is_apply_patch_control_line(line: &str) -> bool {
     matches!(
         line,
@@ -572,11 +620,39 @@ fn split_diff_lines(
     let (mut old_line, mut new_line) = (None, None);
     let mut syntax = SplitDiffSyntax::new(source_language);
 
+    let mut in_git_header = false;
     for raw in source.lines() {
-        if raw.starts_with("---") || raw.starts_with("+++") || diff_file_path(raw).is_some() {
+        if let Some(path) = git_diff_header_path(raw) {
+            for (number, before) in pending_removed.drain(..) {
+                output.push(split_diff_row(
+                    number,
+                    before,
+                    None,
+                    "",
+                    pane,
+                    number_width,
+                    &mut syntax,
+                ));
+            }
+            in_git_header = true;
+            (old_line, new_line) = (None, None);
+            if !output.is_empty() {
+                output.push(Line::from(Span::styled(
+                    pad_cells(path, width),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            continue;
+        }
+        if raw.starts_with("---")
+            || raw.starts_with("+++")
+            || diff_file_path(raw).is_some()
+            || (in_git_header && is_git_extended_header(raw))
+        {
             continue;
         }
         if let Some((old, new)) = hunk_starts(raw) {
+            in_git_header = false;
             for (number, before) in pending_removed.drain(..) {
                 output.push(split_diff_row(
                     number,
@@ -1041,6 +1117,28 @@ mod tests {
             "a removals-only diff has no meaningful after pane: {lines:?}"
         );
         assert!(lines.iter().any(|line| line.to_string().contains("− one")));
+    }
+
+    #[test]
+    fn later_git_file_headers_become_a_path_row_not_numbered_context() {
+        let diff = "@@ -68,2 +70,2 @@\n const A: u8 = 1;\n-const B: u8 = 2;\n+const B: u8 = 3;\ndiff --git a/src/tests.rs b/src/tests.rs\nindex f06d636e..7762b49a 100644\n--- a/src/tests.rs\n+++ b/src/tests.rs\n@@ -2656,2 +2656,2 @@\n );\n-old();\n+new();";
+        for width in [100, 200] {
+            let rendered = diff_lines(diff, width, Some("rs"))
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            assert!(
+                rendered.iter().all(|line| !line.contains("diff --git")
+                    && !line.contains("index ")
+                    && !line.contains("--- a/")),
+                "{rendered:?}"
+            );
+            let heading = rendered
+                .iter()
+                .position(|line| line.trim() == "src/tests.rs")
+                .expect("the second file is named");
+            assert!(rendered[heading + 1].contains("2656"), "{rendered:?}");
+        }
     }
 
     #[test]

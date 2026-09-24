@@ -11880,6 +11880,19 @@ fn wheel_distance_advances_in_bounded_frames_and_stops_at_boundaries() {
 }
 
 #[test]
+fn late_frames_catch_up_wheel_motion_instead_of_leaving_a_backlog() {
+    let start = Instant::now();
+    let mut motion = ScrollMotion::default();
+    motion.push(MAX_PENDING_WHEEL_SCROLL_LINES);
+    let scroll = motion.advance_at(0, 500, start);
+    assert_eq!(scroll, MAX_WHEEL_SCROLL_LINES_PER_FRAME as usize);
+    // One slow draw later the whole gesture has landed.
+    let scroll = motion.advance_at(scroll, 500, start + Duration::from_millis(1_000));
+    assert_eq!(scroll, MAX_PENDING_WHEEL_SCROLL_LINES as usize);
+    assert!(!motion.is_active());
+}
+
+#[test]
 fn nested_wheel_motion_applies_a_coalesced_gesture_in_one_render_frame() {
     let mut scroll = 0;
     let mut motion = ScrollMotion::default();

@@ -2656,11 +2656,11 @@ fn streamed_text_uses_120_hz_when_cheap_and_keeps_the_draw_cost_budget() {
     );
     assert_eq!(
         responsive_tui_frame_interval(60, std::time::Duration::from_millis(10), false, true),
-        std::time::Duration::from_millis(70)
+        std::time::Duration::from_millis(20)
     );
     assert_eq!(
         responsive_tui_frame_interval(60, std::time::Duration::from_millis(3), false, true),
-        std::time::Duration::from_millis(21)
+        tui_frame_interval(STREAMING_TUI_FPS)
     );
     assert_eq!(
         responsive_tui_frame_interval(165, std::time::Duration::ZERO, false, true),
