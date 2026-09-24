@@ -118,7 +118,8 @@ Git comparison.
   terminal on every delta. The composer status and footer rows are black
   with blank spacing but no separator borders around the dark input stripe.
   The Ready status uses an open-circle icon. The running sweep now darkens
-  white tool text so its moving highlight stays visible.
+  white tool text so its moving highlight stays visible, and also sweeps
+  across the Running spinner.
 - Ghostty setup ships with the release archives. Completion notifications
   only fire when work actually stops, and new threads receive durable titles.
 

@@ -2651,26 +2651,26 @@ fn running_tool_shimmer_moves_across_text_without_touching_the_gutter() {
 }
 
 #[test]
-fn running_status_shimmer_sweeps_label_and_timer_but_not_spinner() {
+fn running_status_shimmer_sweeps_spinner_label_and_timer() {
     let phase_for = |offset: usize| {
         (RUNNING_SHIMMER_PADDING + offset) as u128 * RUNNING_SHIMMER_CYCLE_MILLIS
-            / (" running 2m".width() + RUNNING_SHIMMER_PADDING * 2) as u128
+            / (" ⠋ running 2m".width() + RUNNING_SHIMMER_PADDING * 2) as u128
             + 1
     };
     let base = status_control_spans("⠋", "running", RUNNING_STATUS_PEACH, false, Some("2m"));
     let mut label_crest = base.clone();
     let mut timer_crest = base.clone();
     apply_running_status_shimmer(&mut label_crest, phase_for(1));
-    apply_running_status_shimmer(&mut timer_crest, phase_for(8));
+    apply_running_status_shimmer(&mut timer_crest, phase_for(11));
 
-    assert_eq!(label_crest[0], base[0]);
     assert_eq!(Line::from(label_crest.clone()).to_string(), " ⠋ running 2m");
     let green = |span: &Span<'_>| match span.style.fg {
         Some(Color::Rgb(_, green, _)) => green,
         _ => panic!("the running sweep uses RGB colors"),
     };
-    assert!(green(&label_crest[2]) > 200, "label crest is gold");
-    assert!(green(&timer_crest[9]) > 200, "timer crest is gold");
+    assert!(green(&label_crest[1]) > 200, "spinner crest is gold");
+    assert!(green(&label_crest[3]) > 180, "sweep reaches the label");
+    assert!(green(&timer_crest[11]) > 200, "timer crest is gold");
     assert_eq!(
         label_crest.last().unwrap().style.fg,
         Some(RUNNING_STATUS_PEACH)

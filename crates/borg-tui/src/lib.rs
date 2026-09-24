@@ -16031,7 +16031,6 @@ fn apply_running_activity_pulse(line: &mut Line<'static>, phase: u128) {
 fn apply_running_status_shimmer(spans: &mut Vec<Span<'static>>, phase: u128) {
     let cells = spans
         .iter()
-        .skip(1)
         .flat_map(|span| {
             span.content
                 .graphemes(true)
@@ -16069,7 +16068,7 @@ fn apply_running_status_shimmer(spans: &mut Vec<Span<'static>>, phase: u128) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    spans.truncate(1);
+    spans.clear();
     spans.extend(animated);
 }
 
