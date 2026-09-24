@@ -6,12 +6,15 @@
 //! unmodified Claude Code binary. Subscription credentials are never replayed
 //! here, and this key is never used to stand in for them.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::UnboundedSender;
+
+use borg_core::ModelProviderState;
 
 use crate::runtime::ProviderCallUsage;
 use crate::runtime::elapsed_millis_u64;
@@ -163,11 +166,15 @@ impl AnthropicMessagesProvider {
 
         let mut state = AnthropicStreamState::default();
         let mut buffer: Vec<u8> = Vec::new();
+        let mut received_bytes: usize = 0;
         let mut stream = response.bytes_stream();
         let mut stream_failure: Option<(String, ProviderErrorKind)> = None;
         while let Some(chunk) = stream.next().await {
             match chunk {
-                Ok(bytes) => buffer.extend_from_slice(&bytes),
+                Ok(bytes) => {
+                    received_bytes = received_bytes.saturating_add(bytes.len());
+                    buffer.extend_from_slice(&bytes);
+                }
                 Err(error) => {
                     stream_failure = Some((
                         format!("{ANTHROPIC_LABEL} streaming response failed: {error}"),
@@ -176,14 +183,20 @@ impl AnthropicMessagesProvider {
                     break;
                 }
             }
-            while let Some(frame) = take_sse_frame(&mut buffer) {
-                apply_sse_frame(&mut state, &frame, progress.as_ref());
-            }
-            if buffer.len() > STREAM_MAX_BYTES {
+            if received_bytes > STREAM_MAX_BYTES {
                 stream_failure = Some((
                     format!("{ANTHROPIC_LABEL} stream exceeded {STREAM_MAX_BYTES} bytes"),
                     ProviderErrorKind::ConnectionLost,
                 ));
+                break;
+            }
+            while let Some(frame) = take_sse_frame(&mut buffer) {
+                match frame {
+                    Ok(frame) => apply_sse_frame(&mut state, &frame, progress.as_ref()),
+                    Err(_) => state.protocol_error("invalid UTF-8 in event"),
+                }
+            }
+            if state.provider_error.is_some() {
                 break;
             }
         }
@@ -195,12 +208,20 @@ impl AnthropicMessagesProvider {
                 kind,
             });
         }
-        if let Some((message, kind)) = state.provider_error.take() {
+        if let Some((message, kind)) = state.take_error() {
             return Err(ProviderCallError {
                 message,
                 trace: Box::new(trace),
                 session_id: None,
                 kind,
+            });
+        }
+        if let Err(message) = state.validate_complete() {
+            return Err(ProviderCallError {
+                message,
+                trace: Box::new(trace),
+                session_id: None,
+                kind: ProviderErrorKind::ConnectionLost,
             });
         }
         let usage = state.usage(elapsed_millis_u64(started_at));
@@ -219,9 +240,8 @@ impl AnthropicMessagesProvider {
 ///
 /// The API hoists every `System` message into one top-level field and requires
 /// `max_tokens`, so this is not a field-for-field rename of the portable
-/// conversation: tool results become user content blocks, and assistant
-/// thinking is not replayed because the API only accepts it back with the
-/// signature it issued.
+/// conversation: tool results become user content blocks. Native assistant
+/// blocks carry the signatures needed to replay thinking across tool rounds.
 pub(crate) fn messages_request_body(
     model: &str,
     effort: Option<&str>,
@@ -247,8 +267,14 @@ pub(crate) fn messages_request_body(
             ModelMessage::Assistant {
                 content,
                 tool_calls,
+                provider_state,
                 ..
             } => {
+                if let Some(ModelProviderState::AnthropicMessages { content, .. }) = provider_state
+                {
+                    push_turn(&mut messages, "assistant", content.clone());
+                    continue;
+                }
                 let mut blocks: Vec<Value> = Vec::new();
                 if let Some(text) = content.as_deref().filter(|text| !text.trim().is_empty()) {
                     blocks.push(json!({ "type": "text", "text": text }));
@@ -268,15 +294,18 @@ pub(crate) fn messages_request_body(
                 content,
                 attachments,
             } => {
-                let mut blocks = vec![json!({
+                let result = if attachments.is_empty() {
+                    json!(content)
+                } else {
+                    let mut blocks = text_blocks(content);
+                    blocks.extend(image_blocks(attachments));
+                    json!(blocks)
+                };
+                let blocks = vec![json!({
                     "type": "tool_result",
                     "tool_use_id": tool_call_id,
-                    "content": content,
+                    "content": result,
                 })];
-                // The API cannot attach images to a tool result, so they ride
-                // along as later blocks of the same turn rather than being
-                // dropped or split into a second turn.
-                blocks.extend(image_blocks(attachments));
                 push_turn(&mut messages, "user", blocks);
             }
         }
@@ -289,6 +318,7 @@ pub(crate) fn messages_request_body(
         "model": model,
         "max_tokens": max_output_tokens(effort),
         "messages": messages,
+        "stream": true,
     });
     if !system_parts.is_empty() {
         // Sent as a block rather than a bare string so it can carry the cache
@@ -466,75 +496,107 @@ pub(crate) fn anthropic_error_kind(status: u16, body: &str) -> ProviderErrorKind
     ProviderErrorKind::Unknown
 }
 
-#[derive(Debug, Clone)]
-struct AnthropicToolCall {
-    id: String,
-    name: String,
-    arguments: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AnthropicBlock {
-    Text,
-    Thinking,
-    ToolUse(usize),
-    Other,
-}
-
-/// Everything one streamed turn has produced so far.
+/// One model response, including opaque blocks required for continuation.
 #[derive(Debug, Default)]
 pub(crate) struct AnthropicStreamState {
-    text: String,
-    thinking: String,
-    tool_calls: Vec<AnthropicToolCall>,
-    blocks: Vec<AnthropicBlock>,
-    input_tokens: u64,
-    cache_creation_input_tokens: u64,
-    cache_read_input_tokens: u64,
-    output_tokens: u64,
+    message: Value,
+    blocks: Vec<Value>,
+    input_json: HashMap<usize, String>,
+    open_blocks: HashSet<usize>,
+    started: bool,
+    finished: bool,
     stop_reason: Option<String>,
-    model: Option<String>,
     provider_error: Option<(String, ProviderErrorKind)>,
 }
 
 impl AnthropicStreamState {
-    fn usage(&self, duration_ms: u64) -> ProviderCallUsage {
+    pub(crate) fn usage(&self, duration_ms: u64) -> ProviderCallUsage {
+        let tokens = |name: &str| {
+            self.message
+                .get("usage")
+                .and_then(|usage| usage.get(name))
+                .and_then(Value::as_u64)
+                .unwrap_or_default()
+        };
+        let input = tokens("input_tokens");
+        let cached = tokens("cache_read_input_tokens");
+        let written = tokens("cache_creation_input_tokens");
+        let output = tokens("output_tokens");
+        let all_input = input.saturating_add(cached).saturating_add(written);
         ProviderCallUsage {
             duration_ms,
-            input_tokens: self.input_tokens,
-            cached_input_tokens: self.cache_read_input_tokens,
-            cache_creation_input_tokens: self.cache_creation_input_tokens,
-            output_tokens: self.output_tokens,
-            total_tokens: self.input_tokens
-                + self.cache_creation_input_tokens
-                + self.cache_read_input_tokens
-                + self.output_tokens,
-            context_tokens: Some(
-                self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens,
-            ),
+            input_tokens: input,
+            cached_input_tokens: cached,
+            cache_creation_input_tokens: written,
+            output_tokens: output,
+            total_tokens: all_input.saturating_add(output),
+            context_tokens: Some(all_input),
             ..Default::default()
         }
     }
 
-    fn assistant_message(&self) -> ModelMessage {
-        let tool_calls = self
-            .tool_calls
+    pub(crate) fn assistant_message(&self) -> ModelMessage {
+        let text = self
+            .blocks
             .iter()
-            .filter(|call| !call.id.is_empty() && !call.name.is_empty())
-            .map(|call| {
-                ModelToolCall::function(call.id.clone(), call.name.clone(), call.arguments.clone())
+            .filter_map(|block| {
+                (block["type"] == "text")
+                    .then(|| block["text"].as_str())
+                    .flatten()
             })
-            .collect::<Vec<_>>();
-        ModelMessage::assistant(
-            (!self.text.trim().is_empty()).then(|| self.text.clone()),
-            (!self.thinking.trim().is_empty()).then(|| self.thinking.clone()),
-            None,
+            .collect::<String>();
+        let thinking = self
+            .blocks
+            .iter()
+            .filter_map(|block| {
+                (block["type"] == "thinking")
+                    .then(|| block["thinking"].as_str())
+                    .flatten()
+            })
+            .collect::<String>();
+        let tool_calls = self
+            .blocks
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .filter_map(|block| {
+                Some(ModelToolCall::function(
+                    block["id"].as_str()?.to_string(),
+                    block["name"].as_str()?.to_string(),
+                    block.get("input")?.to_string(),
+                ))
+            })
+            .collect();
+        ModelMessage::Assistant {
+            content: (!text.is_empty()).then_some(text),
+            reasoning_content: (!thinking.is_empty()).then_some(thinking),
+            reasoning_details: None,
+            provider_state: Some(ModelProviderState::AnthropicMessages {
+                content: self.blocks.clone(),
+                account_identity: None,
+            }),
             tool_calls,
-        )
+        }
     }
 
-    /// The portable finish reason for the reported stop reason.
-    fn finish_reason(&self) -> String {
+    pub(crate) fn validate_complete(&self) -> Result<(), String> {
+        if let Some((message, _)) = &self.provider_error {
+            return Err(message.clone());
+        }
+        if !self.started
+            || !self.finished
+            || self.stop_reason.is_none()
+            || !self.open_blocks.is_empty()
+        {
+            return Err("Anthropic stream ended before a complete model response".to_string());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take_error(&mut self) -> Option<(String, ProviderErrorKind)> {
+        self.provider_error.take()
+    }
+
+    pub(crate) fn finish_reason(&self) -> String {
         match self.stop_reason.as_deref() {
             Some("tool_use") => "tool_calls".to_string(),
             Some("max_tokens") => "length".to_string(),
@@ -543,23 +605,25 @@ impl AnthropicStreamState {
         }
     }
 
-    fn raw_response(&self) -> Value {
-        json!({
-            "stop_reason": self.stop_reason,
-            "model": self.model,
-            "usage": {
-                "input_tokens": self.input_tokens,
-                "cache_creation_input_tokens": self.cache_creation_input_tokens,
-                "cache_read_input_tokens": self.cache_read_input_tokens,
-                "output_tokens": self.output_tokens,
-            },
-            "blocks": self.blocks.len(),
-        })
+    pub(crate) fn raw_response(&self) -> Value {
+        let mut response = self.message.clone();
+        response["content"] = json!(self.blocks);
+        response["stop_reason"] = json!(self.stop_reason);
+        response
+    }
+
+    fn protocol_error(&mut self, message: &str) {
+        self.provider_error.get_or_insert_with(|| {
+            (
+                format!("Anthropic stream protocol error: {message}"),
+                ProviderErrorKind::ConnectionLost,
+            )
+        });
     }
 }
 
 /// Split one complete server-sent event off the front of the buffer.
-fn take_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
+fn take_sse_frame(buffer: &mut Vec<u8>) -> Option<Result<String, std::string::FromUtf8Error>> {
     let (index, width) = buffer
         .windows(2)
         .position(|window| window == b"\n\n")
@@ -570,14 +634,12 @@ fn take_sse_frame(buffer: &mut Vec<u8>) -> Option<String> {
                 .position(|window| window == b"\r\n\r\n")
                 .map(|index| (index, 4))
         })?;
-    let frame = String::from_utf8_lossy(&buffer[..index]).to_string();
+    let frame = String::from_utf8(buffer[..index].to_vec());
     buffer.drain(..index + width);
     Some(frame)
 }
 
-/// Apply one server-sent event. Framing problems are ignored rather than
-/// failing the turn: a malformed frame the adapter cannot read is not evidence
-/// that the model refused, and a real failure arrives as its own error event.
+/// A malformed event makes continuation unsafe, even if later events arrive.
 fn apply_sse_frame(
     state: &mut AnthropicStreamState,
     frame: &str,
@@ -600,6 +662,7 @@ fn apply_sse_frame(
         return;
     }
     let Ok(payload) = serde_json::from_str::<Value>(&data) else {
+        state.protocol_error("invalid JSON in event");
         return;
     };
     let kind = event_name.unwrap_or_else(|| {
@@ -612,136 +675,188 @@ fn apply_sse_frame(
     apply_stream_event(state, &kind, &payload, progress);
 }
 
-fn apply_stream_event(
+pub(crate) fn apply_stream_event(
     state: &mut AnthropicStreamState,
     kind: &str,
     payload: &Value,
     progress: Option<&UnboundedSender<ProviderProgress>>,
 ) {
+    if state.provider_error.is_some() {
+        return;
+    }
+    if state.finished && kind != "ping" {
+        state.protocol_error("event after message_stop");
+        return;
+    }
     match kind {
         "message_start" => {
-            state.model = payload
-                .pointer("/message/model")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            if let Some(usage) = payload.pointer("/message/usage") {
-                absorb_usage(state, usage);
+            if state.started || !payload["message"].is_object() {
+                state.protocol_error("invalid or duplicate message_start");
+                return;
             }
+            state.started = true;
+            state.message = payload["message"].clone();
+            state.blocks = payload["message"]["content"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
         }
         "content_block_start" => {
-            let index = block_index(payload);
-            let block = payload.get("content_block").cloned().unwrap_or(Value::Null);
-            let block_kind = match block.get("type").and_then(Value::as_str) {
-                Some("text") => {
-                    if let Some(text) = block.get("text").and_then(Value::as_str) {
-                        state.text.push_str(text);
-                        send_text(progress, text);
-                    }
-                    AnthropicBlock::Text
+            let Some(index) = block_index(payload) else {
+                state.protocol_error("missing content block index");
+                return;
+            };
+            if !state.started
+                || index != state.blocks.len()
+                || index >= 16_384
+                || !payload["content_block"].is_object()
+            {
+                state.protocol_error("invalid content block start");
+                return;
+            }
+            let block = &payload["content_block"];
+            match block["type"].as_str() {
+                Some("text") => send_text(progress, block["text"].as_str().unwrap_or_default()),
+                Some("thinking") => {
+                    send_reasoning(progress, block["thinking"].as_str().unwrap_or_default())
                 }
-                Some("thinking") | Some("redacted_thinking") => AnthropicBlock::Thinking,
                 Some("tool_use") => {
-                    let id = block
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let name = block
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    state.tool_calls.push(AnthropicToolCall {
-                        id: id.clone(),
-                        name,
-                        arguments: String::new(),
-                    });
                     if let Some(sender) = progress {
                         let _ = sender.send(ProviderProgress::ToolCallGenerating {
-                            id: (!id.is_empty()).then_some(id),
+                            id: block["id"].as_str().map(str::to_string),
                         });
-                    }
-                    AnthropicBlock::ToolUse(state.tool_calls.len() - 1)
-                }
-                _ => AnthropicBlock::Other,
-            };
-            set_block(state, index, block_kind);
-        }
-        "content_block_delta" => {
-            let index = block_index(payload);
-            let delta = payload.get("delta").cloned().unwrap_or(Value::Null);
-            match delta.get("type").and_then(Value::as_str) {
-                Some("text_delta") => {
-                    if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                        state.text.push_str(text);
-                        send_text(progress, text);
-                    }
-                }
-                Some("thinking_delta") => {
-                    if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
-                        state.thinking.push_str(text);
-                        send_reasoning(progress, text);
-                    }
-                }
-                Some("input_json_delta") => {
-                    let partial = delta
-                        .get("partial_json")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if partial.is_empty() {
-                        return;
-                    }
-                    let Some(AnthropicBlock::ToolUse(call)) = state.blocks.get(index).copied()
-                    else {
-                        return;
-                    };
-                    if let Some(call) = state.tool_calls.get_mut(call) {
-                        call.arguments.push_str(partial);
-                        let id = call.id.clone();
-                        if let Some(sender) = progress {
-                            let _ = sender.send(ProviderProgress::ToolCallInputDelta {
-                                id: (!id.is_empty()).then_some(id),
-                            });
-                        }
                     }
                 }
                 _ => {}
             }
+            state.blocks.push(block.clone());
+            state.open_blocks.insert(index);
+        }
+        "content_block_delta" => {
+            let Some(index) =
+                block_index(payload).filter(|index| state.open_blocks.contains(index))
+            else {
+                state.protocol_error("delta for an unopened content block");
+                return;
+            };
+            let delta = &payload["delta"];
+            let block = &mut state.blocks[index];
+            match delta["type"].as_str() {
+                Some("text_delta" | "thinking_delta" | "signature_delta") => {
+                    let field = match delta["type"].as_str() {
+                        Some("text_delta") => "text",
+                        Some("thinking_delta") => "thinking",
+                        _ => "signature",
+                    };
+                    let Some(text) = delta[field].as_str() else {
+                        state.protocol_error("non-string content delta");
+                        return;
+                    };
+                    let mut value = block[field].as_str().unwrap_or_default().to_string();
+                    value.push_str(text);
+                    block[field] = json!(value);
+                    match field {
+                        "text" => send_text(progress, text),
+                        "thinking" => send_reasoning(progress, text),
+                        _ => {}
+                    }
+                }
+                Some("input_json_delta") => {
+                    if block["type"] != "tool_use" {
+                        state.protocol_error("tool input delta for a non-tool block");
+                        return;
+                    }
+                    let Some(partial) = delta["partial_json"].as_str() else {
+                        state.protocol_error("non-string tool input delta");
+                        return;
+                    };
+                    state.input_json.entry(index).or_default().push_str(partial);
+                    if let Some(sender) = progress {
+                        let _ = sender.send(ProviderProgress::ToolCallInputDelta {
+                            id: block["id"].as_str().map(str::to_string),
+                        });
+                    }
+                }
+                Some("citations_delta") => {
+                    let citation = &delta["citation"];
+                    if !citation.is_object() {
+                        state.protocol_error("invalid citation delta");
+                        return;
+                    }
+                    if block.get("citations").is_none() {
+                        block["citations"] = json!([]);
+                    }
+                    if let Some(citations) = block["citations"].as_array_mut() {
+                        citations.push(citation.clone());
+                    } else {
+                        state.protocol_error("invalid citations block");
+                    }
+                }
+                _ => state.protocol_error("unsupported content delta"),
+            }
         }
         "content_block_stop" => {
-            let index = block_index(payload);
-            let Some(AnthropicBlock::ToolUse(call)) = state.blocks.get(index).copied() else {
+            let Some(index) = block_index(payload).filter(|index| state.open_blocks.remove(index))
+            else {
+                state.protocol_error("stop for an unopened content block");
                 return;
             };
-            let Some(call) = state.tool_calls.get(call) else {
-                return;
-            };
-            if let Some(sender) = progress {
-                let _ = sender.send(ProviderProgress::ToolCallStarted {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    input: parse_tool_arguments(&call.arguments),
-                });
+            let block = &mut state.blocks[index];
+            if let Some(partial) = state.input_json.remove(&index) {
+                let Ok(input) = serde_json::from_str::<Value>(&partial) else {
+                    state.protocol_error("incomplete tool input JSON");
+                    return;
+                };
+                block["input"] = input;
+            }
+            if block["type"] == "tool_use" {
+                let (Some(id), Some(name)) = (block["id"].as_str(), block["name"].as_str()) else {
+                    state.protocol_error("tool call omitted identity or name");
+                    return;
+                };
+                if !block["input"].is_object() {
+                    state.protocol_error("tool call input is not an object");
+                    return;
+                }
+                if let Some(sender) = progress {
+                    let _ = sender.send(ProviderProgress::ToolCallStarted {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        input: block["input"].clone(),
+                    });
+                }
             }
         }
         "message_delta" => {
-            if let Some(reason) = payload
-                .pointer("/delta/stop_reason")
-                .and_then(Value::as_str)
-            {
-                state.stop_reason = Some(reason.to_string());
+            if !state.started {
+                state.protocol_error("message delta before message_start");
+                return;
+            }
+            if let Some(delta) = payload["delta"].as_object() {
+                state
+                    .message
+                    .as_object_mut()
+                    .expect("message_start validated object")
+                    .extend(delta.clone());
+                if let Some(reason) = delta.get("stop_reason").and_then(Value::as_str) {
+                    state.stop_reason = Some(reason.to_string());
+                }
             }
             if let Some(usage) = payload.get("usage") {
                 absorb_usage(state, usage);
             }
+            if let Some(context) = payload.get("context_management") {
+                state.message["context_management"] = context.clone();
+            }
         }
+        "message_stop" => state.finished = true,
         "error" => {
             let message = payload
                 .pointer("/error/message")
                 .and_then(Value::as_str)
                 .unwrap_or("stream failed");
             state.provider_error = Some((
-                format!("{ANTHROPIC_LABEL} stream error: {message}"),
+                format!("Anthropic stream error: {message}"),
                 anthropic_error_kind(200, &payload.to_string()),
             ));
         }
@@ -749,35 +864,33 @@ fn apply_stream_event(
     }
 }
 
-fn block_index(payload: &Value) -> usize {
+fn block_index(payload: &Value) -> Option<usize> {
     payload
         .get("index")
         .and_then(Value::as_u64)
-        .unwrap_or_default() as usize
-}
-
-fn set_block(state: &mut AnthropicStreamState, index: usize, kind: AnthropicBlock) {
-    if state.blocks.len() <= index {
-        state.blocks.resize(index + 1, AnthropicBlock::Other);
-    }
-    state.blocks[index] = kind;
+        .and_then(|index| usize::try_from(index).ok())
 }
 
 fn absorb_usage(state: &mut AnthropicStreamState, usage: &Value) {
-    let field = |name: &str| usage.get(name).and_then(Value::as_u64);
-    // Anthropic reports running totals, so the latest value replaces the
-    // earlier one rather than adding to it.
-    if let Some(value) = field("input_tokens") {
-        state.input_tokens = value;
+    let Some(fields) = usage.as_object() else {
+        return;
+    };
+    if !state.message["usage"].is_object() {
+        state.message["usage"] = json!({});
     }
-    if let Some(value) = field("cache_creation_input_tokens") {
-        state.cache_creation_input_tokens = value;
-    }
-    if let Some(value) = field("cache_read_input_tokens") {
-        state.cache_read_input_tokens = value;
-    }
-    if let Some(value) = field("output_tokens") {
-        state.output_tokens = value;
+    let target = state.message["usage"]
+        .as_object_mut()
+        .expect("usage object");
+    // Deltas report running totals and can omit earlier breakdowns.
+    for (key, value) in fields {
+        if let (Some(existing), Some(incoming)) = (
+            target.get_mut(key).and_then(Value::as_object_mut),
+            value.as_object(),
+        ) {
+            existing.extend(incoming.clone());
+        } else {
+            target.insert(key.clone(), value.clone());
+        }
     }
 }
 
@@ -898,11 +1011,11 @@ mod tests {
             .iter()
             .map(|block| block["type"].as_str().unwrap_or_default().to_string())
             .collect::<Vec<_>>();
-        // Tool results first, then the image the second one carried, then text.
-        assert_eq!(kinds, vec!["tool_result", "tool_result", "image", "text"]);
+        assert_eq!(kinds, vec!["tool_result", "tool_result", "text"]);
         assert_eq!(blocks[0]["tool_use_id"], json!("toolu_1"));
         assert_eq!(blocks[1]["tool_use_id"], json!("toolu_2"));
-        assert_eq!(blocks[3]["text"], json!("and now this"));
+        assert_eq!(blocks[1]["content"][1]["type"], "image");
+        assert_eq!(blocks[2]["text"], json!("and now this"));
     }
 
     #[test]
@@ -951,8 +1064,7 @@ mod tests {
         );
         assert_eq!(body["messages"][0]["role"], json!("user"));
         assert_eq!(body["messages"][0]["content"][0]["type"], json!("text"));
-        // Thinking is not replayed, so the assistant turn is text plus the
-        // tool call and nothing else.
+        // Portable reasoning without a native signature cannot be replayed.
         assert_eq!(body["messages"][1]["content"][0]["type"], json!("text"));
         assert_eq!(body["messages"][1]["content"][1]["type"], json!("tool_use"));
         assert_eq!(
@@ -1149,6 +1261,7 @@ mod tests {
                         "usage": {
                             "input_tokens": 10,
                             "cache_creation_input_tokens": 30,
+                            "cache_creation": { "ephemeral_1h_input_tokens": 30 },
                             "cache_read_input_tokens": 1200,
                             "output_tokens": 1
                         }
@@ -1164,6 +1277,11 @@ mod tests {
                 json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "thinking_delta", "thinking": "weighing" } }),
             ),
             frame(
+                "content_block_delta",
+                json!({ "index": 0, "delta": { "type": "signature_delta", "signature": "opaque-signed-state" } }),
+            ),
+            frame("content_block_stop", json!({ "index": 0 })),
+            frame(
                 "content_block_start",
                 json!({ "type": "content_block_start", "index": 1, "content_block": { "type": "text" } }),
             ),
@@ -1171,6 +1289,11 @@ mod tests {
                 "content_block_delta",
                 json!({ "type": "content_block_delta", "index": 1, "delta": { "type": "text_delta", "text": "hello" } }),
             ),
+            frame(
+                "content_block_delta",
+                json!({ "index": 1, "delta": { "type": "citations_delta", "citation": { "type": "char_location", "cited_text": "source", "document_index": 0, "start_char_index": 0, "end_char_index": 6 } } }),
+            ),
+            frame("content_block_stop", json!({ "index": 1 })),
             frame(
                 "content_block_start",
                 json!({
@@ -1200,6 +1323,11 @@ mod tests {
                 json!({ "type": "content_block_stop", "index": 2 }),
             ),
             frame(
+                "content_block_start",
+                json!({ "index": 3, "content_block": { "type": "redacted_thinking", "data": "opaque-redacted-state" } }),
+            ),
+            frame("content_block_stop", json!({ "index": 3 })),
+            frame(
                 "message_delta",
                 json!({
                     "type": "message_delta",
@@ -1207,11 +1335,43 @@ mod tests {
                     "usage": { "output_tokens": 5 }
                 }),
             ),
+            frame("message_stop", json!({ "type": "message_stop" })),
         ];
         for event in frames {
             apply_sse_frame(&mut state, &event, Some(&sender));
         }
         drop(sender);
+        state.validate_complete().expect("complete response");
+        let persisted = serde_json::to_vec(&state.assistant_message()).expect("persist");
+        let restored = serde_json::from_slice(&persisted).expect("restore");
+        let replay = messages_request_body(
+            "claude-sonnet-4-5",
+            Some("high"),
+            &request(
+                vec![
+                    ModelMessage::user("read a"),
+                    restored,
+                    ModelMessage::tool("toolu_1", "file body"),
+                ],
+                Vec::new(),
+            ),
+        );
+        assert_eq!(
+            replay["messages"][1]["content"],
+            state.raw_response()["content"]
+        );
+        assert_eq!(
+            replay["messages"][1]["content"][0]["signature"],
+            "opaque-signed-state"
+        );
+        assert_eq!(
+            replay["messages"][1]["content"][3]["data"],
+            "opaque-redacted-state"
+        );
+        assert_eq!(
+            state.raw_response()["usage"]["cache_creation"]["ephemeral_1h_input_tokens"],
+            30
+        );
 
         let mut streamed_text = String::new();
         let mut streamed_reasoning = String::new();
@@ -1270,7 +1430,9 @@ mod tests {
         buffer.extend_from_slice(head.as_bytes());
         assert!(take_sse_frame(&mut buffer).is_none());
         buffer.extend_from_slice(tail.as_bytes());
-        let first = take_sse_frame(&mut buffer).expect("first frame");
+        let first = take_sse_frame(&mut buffer)
+            .expect("first frame")
+            .expect("UTF-8");
         assert!(first.contains("ping"));
         assert!(take_sse_frame(&mut buffer).is_none());
 
@@ -1279,9 +1441,58 @@ mod tests {
             frame("message_stop", json!({ "type": "message_stop" }))
         );
         buffer.extend_from_slice(stop.as_bytes());
-        let second = take_sse_frame(&mut buffer).expect("second frame");
+        let second = take_sse_frame(&mut buffer)
+            .expect("second frame")
+            .expect("UTF-8");
         assert!(second.contains("message_stop"));
         assert!(take_sse_frame(&mut buffer).is_none());
+    }
+
+    #[test]
+    fn incomplete_or_corrupt_streams_cannot_commit_an_assistant_message() {
+        for corruption in ["missing_stop", "open_block", "bad_json", "bad_tool_input"] {
+            let mut state = AnthropicStreamState::default();
+            apply_stream_event(
+                &mut state,
+                "message_start",
+                &json!({"message": {"content": []}}),
+                None,
+            );
+            apply_stream_event(
+                &mut state,
+                "content_block_start",
+                &json!({"index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {}}}),
+                None,
+            );
+            if corruption == "bad_json" {
+                apply_sse_frame(
+                    &mut state,
+                    "event: content_block_delta\ndata: {broken",
+                    None,
+                );
+            }
+            if corruption == "bad_tool_input" {
+                apply_stream_event(
+                    &mut state,
+                    "content_block_delta",
+                    &json!({"index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"path\":"}}),
+                    None,
+                );
+            }
+            if corruption != "open_block" {
+                apply_stream_event(&mut state, "content_block_stop", &json!({"index": 0}), None);
+            }
+            apply_stream_event(
+                &mut state,
+                "message_delta",
+                &json!({"delta": {"stop_reason": "tool_use"}}),
+                None,
+            );
+            if corruption != "missing_stop" {
+                apply_stream_event(&mut state, "message_stop", &json!({}), None);
+            }
+            assert!(state.validate_complete().is_err(), "{corruption}");
+        }
     }
 
     #[test]
