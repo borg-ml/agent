@@ -7268,6 +7268,13 @@ impl BorgTerminal {
                 .as_ref()
                 .map(|(width, ..)| *width),
         );
+        if !input_fast_path {
+            // This draw replaces both snapshots. Releasing them first leaves the
+            // transcript sole owner of its last render, so it can redraw only
+            // the changed tail in place instead of copying every row.
+            self.active_transcript_render = None;
+            self.last_committed_viewport_render = None;
+        }
         let goal_tick = self.transcript.active_goal_cache_tick();
         let tool_elapsed_tick = self.transcript.tool_elapsed_cache_tick();
         let render_time = Utc::now();
@@ -14601,11 +14608,11 @@ fn cached_transcript_render(
         )
         .map(|(_, _, _, _, _, render)| Arc::clone(render))
         .unwrap_or_else(|| {
-            let render = Arc::new(transcript.render_for_cache_at(
-                width,
-                tool_run_viewport_height,
-                render_time,
-            ));
+            // Release the stale render first so the transcript can redraw
+            // only its changed tail in place.
+            cache.take();
+            let render =
+                transcript.render_for_cache_at(width, tool_run_viewport_height, render_time);
             let tool_elapsed_tick = transcript.tool_elapsed_cache_tick();
             *cache = Some((
                 width,
