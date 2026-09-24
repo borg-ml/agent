@@ -802,7 +802,9 @@ pub(crate) fn apply_stream_event(
                 return;
             };
             let block = &mut state.blocks[index];
-            if let Some(partial) = state.input_json.remove(&index) {
+            if let Some(partial) = state.input_json.remove(&index)
+                && !partial.is_empty()
+            {
                 let Ok(input) = serde_json::from_str::<Value>(&partial) else {
                     state.protocol_error("incomplete tool input JSON");
                     return;
@@ -1493,6 +1495,34 @@ mod tests {
             }
             assert!(state.validate_complete().is_err(), "{corruption}");
         }
+    }
+
+    #[test]
+    fn empty_tool_delta_preserves_the_initial_input_object() {
+        let mut state = AnthropicStreamState::default();
+        for (kind, payload) in [
+            ("message_start", json!({"message": {"content": []}})),
+            (
+                "content_block_start",
+                json!({"index": 0, "content_block": {"type": "tool_use", "id": "toolu_1", "name": "probe", "input": {}}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"index": 0, "delta": {"type": "input_json_delta", "partial_json": ""}}),
+            ),
+            ("content_block_stop", json!({"index": 0})),
+            (
+                "message_delta",
+                json!({"delta": {"stop_reason": "tool_use"}}),
+            ),
+            ("message_stop", json!({})),
+        ] {
+            apply_stream_event(&mut state, kind, &payload, None);
+        }
+        state
+            .validate_complete()
+            .expect("complete zero-argument tool call");
+        assert_eq!(state.raw_response()["content"][0]["input"], json!({}));
     }
 
     #[test]

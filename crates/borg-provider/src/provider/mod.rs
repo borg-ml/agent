@@ -1,5 +1,9 @@
 mod anthropic_messages;
 pub mod chat_stream;
+#[cfg(feature = "claude")]
+mod claude_connector;
+#[cfg(feature = "claude")]
+mod claude_model;
 #[cfg(feature = "codex")]
 mod codex_model;
 mod model_turn;
@@ -12,6 +16,8 @@ pub mod opencode_model;
 pub use anthropic_messages::{
     ANTHROPIC_LABEL, AnthropicMessagesProvider, context_window_tokens, messages_endpoint,
 };
+#[cfg(feature = "claude")]
+pub use claude_model::ClaudeModelProvider;
 #[cfg(feature = "codex")]
 pub use codex_model::CodexModelProvider;
 
