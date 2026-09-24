@@ -5,6 +5,16 @@ Git comparison.
 
 ## Unreleased (since 0.11.0)
 
+### Agents and teams
+
+- **Messages you send during a usage-limit wait run immediately.** Borg no
+  longer holds them until the automatic retry, which could be hours away after
+  you had already topped up or switched account. If the limit still applies,
+  the turn returns to the same wait.
+- **Team reports stay out of Pending Input during a usage-limit wait.** A
+  subagent report that arrived while the session waited on a usage limit was
+  queued as if you had typed it; it is now kept as a team update.
+
 ## 0.11.0 (2026-09-24)
 
 ### Development lanes and engine integration
