@@ -66,6 +66,9 @@ fn live_tui_input_latency_under_storage_pressure() {
     terminal
         .wait_for_pattern(b"live-", Duration::from_secs(10))
         .expect("wait for the active streaming screen");
+    terminal
+        .wait_for_screen_text("full access", Duration::from_secs(10))
+        .expect("wait for the status line before pointer probes");
 
     let hover_latency = terminal
         .hover_and_measure(

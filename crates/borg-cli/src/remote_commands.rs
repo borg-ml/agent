@@ -62,6 +62,7 @@ mod local_server;
 const MIN_TUI_FPS: u64 = 15;
 const MAX_TUI_FPS: u64 = 240;
 const STREAMING_TUI_FPS: u64 = 120;
+const STREAMING_DRAW_COST_MULTIPLIER: u32 = 6;
 const STREAM_BURST_IDLE_GAP: std::time::Duration = std::time::Duration::from_millis(100);
 const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 const TOOL_STARTED_FRAME_MIN_DURATION: std::time::Duration = std::time::Duration::from_millis(150);
@@ -3688,14 +3689,18 @@ async fn run_local_agent_session(
                 terminal.draw_for_activity()?;
                 interaction_dirty = false;
             }
-            _ = tool_timer_tick.tick(), if terminal.as_ref().is_some_and(BorgTerminal::has_running_tool) => {
+            _ = tool_timer_tick.tick(), if !streaming_frame_pending
+                && last_stream_text_at.is_none_or(|at| at.elapsed() >= STREAM_BURST_IDLE_GAP)
+                && terminal.as_ref().is_some_and(BorgTerminal::has_running_tool) => {
                 let terminal = terminal.as_mut().expect("terminal");
                 if terminal.running_tool_timer_refresh_due() {
                     terminal.draw_for_activity()?;
                     interaction_dirty = false;
                 }
             }
-            _ = idle_tick.tick(), if terminal.as_ref().is_some_and(|terminal| {
+            _ = idle_tick.tick(), if !streaming_frame_pending
+                && last_stream_text_at.is_none_or(|at| at.elapsed() >= STREAM_BURST_IDLE_GAP)
+                && terminal.as_ref().is_some_and(|terminal| {
                 terminal_needs_idle_tick(
                     terminal.has_expiring_notice(),
                     terminal.has_blinking_cursor(),
@@ -8992,7 +8997,11 @@ fn responsive_tui_frame_interval(
     base.max(if interaction_frame {
         last_draw
     } else {
-        last_draw.saturating_mul(3)
+        last_draw.saturating_mul(if streaming_frame {
+            STREAMING_DRAW_COST_MULTIPLIER
+        } else {
+            3
+        })
     })
     .min(MAX_RENDER_BACKOFF_INTERVAL)
 }
