@@ -2686,6 +2686,9 @@ async fn call_model_streaming(
         // deadline instead of letting it wait for an unrelated boundary event.
         let pending_text_flush = (text.len() != emitted_text_len)
             .then(|| crate::agent::live_output_interval().saturating_sub(last_text_emit.elapsed()));
+        let pending_reasoning_flush = (!pending_reasoning.is_empty()).then(|| {
+            crate::agent::live_output_interval().saturating_sub(last_reasoning_emit.elapsed())
+        });
         tokio::select! {
             result = &mut call, if completed.is_none() => {
                 completed = Some(result
@@ -2699,6 +2702,18 @@ async fn call_model_streaming(
                 send_live_assistant_text(context.events, context.assistant_message_id, &text).await;
                 emitted_text_len = text.len();
                 last_text_emit = Instant::now();
+            }
+            () = tokio::time::sleep(pending_reasoning_flush.unwrap_or_default()),
+                if pending_reasoning_flush.is_some() =>
+            {
+                send(
+                    context.events,
+                    SessionEventKind::ReasoningDelta {
+                        text: std::mem::take(&mut pending_reasoning),
+                    },
+                )
+                .await;
+                last_reasoning_emit = Instant::now();
             }
             progress = progress_rx.recv(), if progress_open => {
                 // The model wrote this text before whatever comes next, so it
@@ -2731,7 +2746,16 @@ async fn call_model_streaming(
                         .await;
                         last_reasoning_emit = Instant::now();
                     }
-                    text.push_str(&String::from_utf8_lossy(&chunk));
+                    let delta = String::from_utf8_lossy(&chunk);
+                    text.push_str(&delta);
+                    send(
+                        context.events,
+                        SessionEventKind::MessageDelta {
+                            message_id: context.assistant_message_id,
+                            delta: delta.into_owned(),
+                        },
+                    )
+                    .await;
                     if last_text_emit.elapsed() >= crate::agent::live_output_interval()
                         || chunk.ends_with(b"\n")
                     {
@@ -2752,6 +2776,11 @@ async fn call_model_streaming(
                         if let Some(delta) = normalize_reasoning_delta(&mut reasoning_accumulated, &text)
                         {
                             pending_reasoning.push_str(&delta);
+                            send(
+                                context.events,
+                                SessionEventKind::ReasoningTextDelta { delta },
+                            )
+                            .await;
                         }
                         if !pending_reasoning.is_empty()
                             && last_reasoning_emit.elapsed()
@@ -5538,7 +5567,14 @@ mod tests {
             );
             tokio::pin!(call);
             let observe = async {
-                for expected in ["The", "The commentary is complete."] {
+                for (delta, expected) in [
+                    ("The", "The"),
+                    (" commentary is complete.", "The commentary is complete."),
+                ] {
+                    assert!(matches!(events_rx.recv().await,
+                        Some(SessionEventKind::MessageDelta {
+                            message_id: id, delta: part,
+                        }) if id == message_id && part == delta));
                     assert!(matches!(events_rx.recv().await,
                         Some(SessionEventKind::Message {
                             message_id: id, text, status: MessageStatus::InProgress, ..
@@ -5615,14 +5651,17 @@ mod tests {
         events: &mut mpsc::Receiver<SessionEventKind>,
         message_id: Uuid,
     ) -> String {
-        match events.recv().await {
-            Some(SessionEventKind::Message {
-                message_id: id,
-                text,
-                status: MessageStatus::InProgress,
-                ..
-            }) if id == message_id => text,
-            other => panic!("expected a live commentary snapshot, got {other:?}"),
+        loop {
+            match events.recv().await {
+                Some(SessionEventKind::MessageDelta { .. }) => continue,
+                Some(SessionEventKind::Message {
+                    message_id: id,
+                    text,
+                    status: MessageStatus::InProgress,
+                    ..
+                }) if id == message_id => return text,
+                other => panic!("expected a live commentary snapshot, got {other:?}"),
+            }
         }
     }
 
@@ -5753,6 +5792,11 @@ mod tests {
                 );
                 assert!(matches!(
                     events.recv().await,
+                    Some(SessionEventKind::ReasoningTextDelta { delta })
+                        if delta == "weighing the next step"
+                ));
+                assert!(matches!(
+                    events.recv().await,
                     Some(SessionEventKind::ReasoningDelta { text })
                         if text == "weighing the next step"
                 ));
@@ -5836,13 +5880,26 @@ mod tests {
         let observe = async {
             assert!(matches!(
                 events_rx.recv().await,
+                Some(SessionEventKind::ReasoningTextDelta { delta }) if delta == "weighing "
+            ));
+            assert!(matches!(
+                events_rx.recv().await,
                 Some(SessionEventKind::ReasoningDelta { text }) if text == "weighing "
+            ));
+            assert!(matches!(
+                events_rx.recv().await,
+                Some(SessionEventKind::ReasoningTextDelta { delta }) if delta == "the next step"
             ));
             // The model reasons before it writes, so the throttled tail must
             // reach the reader before the prose it produced.
             assert!(matches!(
                 events_rx.recv().await,
                 Some(SessionEventKind::ReasoningDelta { text }) if text == "the next step"
+            ));
+            assert!(matches!(
+                events_rx.recv().await,
+                Some(SessionEventKind::MessageDelta { message_id: id, delta })
+                    if id == message_id && delta == "The lifecycle regression passed."
             ));
             assert!(matches!(
                 events_rx.recv().await,
@@ -5858,6 +5915,74 @@ mod tests {
             _ = &mut call => panic!("model must remain unfinished while generating"),
             result = tokio::time::timeout(Duration::from_secs(1), observe) => {
                 result.expect("reasoning must reach the stream before the prose");
+            }
+        }
+    }
+
+    struct ReasoningTailClient;
+
+    #[async_trait]
+    impl NativeModelClient for ReasoningTailClient {
+        async fn model_turn(
+            &self,
+            _provider: crate::CodingProvider,
+            _model: &str,
+            _effort: Option<&str>,
+            _request: ModelTurnRequest,
+            progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
+        ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+            let progress = progress.unwrap();
+            for text in ["weighing ", "the next step"] {
+                progress.send(reasoning_progress(text)).unwrap();
+            }
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn quiet_reasoning_tail_reaches_live_state_before_model_finishes() {
+        let client = ReasoningTailClient;
+        let (events_tx, mut events_rx) = mpsc::channel(16);
+        let mut controls = None;
+        let mut queued_steer = Vec::new();
+        let call = call_model_streaming(
+            &client,
+            crate::CodingProvider::Codex,
+            "test-model",
+            None,
+            ModelTurnRequest {
+                fast: false,
+                request_id: None,
+                session_id: None,
+                prompt_cache_key: None,
+                turn_routing: Default::default(),
+                messages: vec![ModelMessage::user("hello")],
+                tools: Vec::new(),
+                output_schema: None,
+            },
+            ModelStreamContext {
+                coding_provider: crate::CodingProvider::Codex,
+                assistant_message_id: Uuid::new_v4(),
+                events: &events_tx,
+                controls: &mut controls,
+                queued_steer: &mut queued_steer,
+            },
+        );
+        tokio::pin!(call);
+        let observe = async {
+            assert!(matches!(events_rx.recv().await,
+                Some(SessionEventKind::ReasoningTextDelta { delta }) if delta == "weighing "));
+            assert!(matches!(events_rx.recv().await,
+                Some(SessionEventKind::ReasoningDelta { text }) if text == "weighing "));
+            assert!(matches!(events_rx.recv().await,
+                Some(SessionEventKind::ReasoningTextDelta { delta }) if delta == "the next step"));
+            assert!(matches!(events_rx.recv().await,
+                Some(SessionEventKind::ReasoningDelta { text }) if text == "the next step"));
+        };
+        tokio::select! {
+            _ = &mut call => panic!("model must remain unfinished during the quiet tail"),
+            result = tokio::time::timeout(Duration::from_secs(1), observe) => {
+                result.expect("quiet reasoning tail must flush without a later provider event");
             }
         }
     }

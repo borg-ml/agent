@@ -1839,6 +1839,7 @@ async fn run_borg_provider_turn(
     }
     let mut assistant_message_id = Uuid::new_v4();
     let mut text = String::new();
+    let mut emitted_text_len = 0;
     let mut final_output = String::new();
     let mut completed_segment = false;
     let mut last_text_emit = Instant::now() - Duration::from_millis(50);
@@ -1849,7 +1850,28 @@ async fn run_borg_provider_turn(
     let mut pending_reasoning = String::new();
     let mut last_reasoning_emit = Instant::now() - Duration::from_millis(50);
     let mut last_completed_reasoning = None;
-    while let Some(event) = stream.recv().await {
+    loop {
+        let pending_text_flush = (text.len() != emitted_text_len)
+            .then(|| live_output_interval().saturating_sub(last_text_emit.elapsed()));
+        let pending_reasoning_flush = (!pending_reasoning.is_empty())
+            .then(|| live_output_interval().saturating_sub(last_reasoning_emit.elapsed()));
+        let event = tokio::select! {
+            event = stream.recv() => event,
+            () = tokio::time::sleep(pending_text_flush.unwrap_or_default()),
+                if pending_text_flush.is_some() => {
+                send_live_assistant_text(&events, assistant_message_id, &text).await;
+                emitted_text_len = text.len();
+                last_text_emit = Instant::now();
+                continue;
+            }
+            () = tokio::time::sleep(pending_reasoning_flush.unwrap_or_default()),
+                if pending_reasoning_flush.is_some() => {
+                flush_pending_reasoning(&events, &mut pending_reasoning).await;
+                last_reasoning_emit = Instant::now();
+                continue;
+            }
+        };
+        let Some(event) = event else { break };
         match event {
             ChatStreamEvent::ProviderEvent { kind, payload, .. } => {
                 if let Some(usage) = live_context_usage(&kind, &payload) {
@@ -1894,6 +1916,10 @@ async fn run_borg_provider_turn(
                 .await;
             }
             ChatStreamEvent::Delta(delta) => {
+                if !pending_reasoning.is_empty() {
+                    flush_pending_reasoning(&events, &mut pending_reasoning).await;
+                    last_reasoning_emit = Instant::now();
+                }
                 if first_model_output {
                     first_model_output = false;
                     #[cfg(feature = "profiling")]
@@ -1910,20 +1936,19 @@ async fn run_borg_provider_turn(
                         "Borg provider stage"
                     );
                 }
+                let ends_line = delta.ends_with('\n');
                 text.push_str(&delta);
-                if last_text_emit.elapsed() >= live_output_interval() || delta.ends_with('\n') {
-                    send(
-                        &events,
-                        SessionEventKind::Message {
-                            message_id: assistant_message_id,
-                            actor: EventActor::Assistant,
-                            text: text.clone(),
-                            attachments: Vec::new(),
-                            status: MessageStatus::InProgress,
-                            delivery: None,
-                        },
-                    )
-                    .await;
+                send(
+                    &events,
+                    SessionEventKind::MessageDelta {
+                        message_id: assistant_message_id,
+                        delta,
+                    },
+                )
+                .await;
+                if last_text_emit.elapsed() >= live_output_interval() || ends_line {
+                    send_live_assistant_text(&events, assistant_message_id, &text).await;
+                    emitted_text_len = text.len();
                     last_text_emit = Instant::now();
                 }
             }
@@ -1952,6 +1977,7 @@ async fn run_borg_provider_turn(
                     );
                 }
                 pending_reasoning.push_str(&delta);
+                send(&events, SessionEventKind::ReasoningTextDelta { delta }).await;
                 if last_reasoning_emit.elapsed() >= live_output_interval()
                     || pending_reasoning.ends_with('\n')
                 {
@@ -1997,6 +2023,7 @@ async fn run_borg_provider_turn(
                 completed_segment = true;
                 assistant_message_id = Uuid::new_v4();
                 text.clear();
+                emitted_text_len = 0;
                 last_text_emit = Instant::now() - Duration::from_millis(50);
             }
             ChatStreamEvent::Phase { name, input } => {
@@ -2110,6 +2137,7 @@ async fn run_borg_provider_turn(
                     completed_segment = true;
                     assistant_message_id = Uuid::new_v4();
                     text.clear();
+                    emitted_text_len = 0;
                     last_text_emit = Instant::now() - Duration::from_millis(50);
                 }
                 if first_model_output {
@@ -2326,9 +2354,13 @@ async fn run_borg_provider_turn(
                     )
                     .await;
                 }
+                emitted_text_len = text.len();
             }
             ChatStreamEvent::Failed { error, kind } => {
                 flush_pending_reasoning(&events, &mut pending_reasoning).await;
+                if text.len() != emitted_text_len {
+                    send_live_assistant_text(&events, assistant_message_id, &text).await;
+                }
                 if let Some((registry, _)) = pool_invocation.as_ref() {
                     registry.mark(turn.session_id, turn.provider, false).await;
                 }
@@ -2350,6 +2382,10 @@ async fn run_borg_provider_turn(
                 }));
             }
         }
+    }
+    flush_pending_reasoning(&events, &mut pending_reasoning).await;
+    if !terminal_seen && text.len() != emitted_text_len {
+        send_live_assistant_text(&events, assistant_message_id, &text).await;
     }
     if let Err(error) = require_provider_stream_terminal(terminal_seen) {
         if let Some((registry, _)) = pool_invocation.as_ref() {
@@ -2393,6 +2429,25 @@ async fn run_borg_provider_turn(
 
 pub(crate) fn live_output_interval() -> Duration {
     Duration::from_millis(40)
+}
+
+async fn send_live_assistant_text(
+    events: &mpsc::Sender<SessionEventKind>,
+    message_id: Uuid,
+    text: &str,
+) {
+    send(
+        events,
+        SessionEventKind::Message {
+            message_id,
+            actor: EventActor::Assistant,
+            text: text.to_string(),
+            attachments: Vec::new(),
+            status: MessageStatus::InProgress,
+            delivery: None,
+        },
+    )
+    .await;
 }
 
 async fn flush_pending_reasoning(events: &mpsc::Sender<SessionEventKind>, pending: &mut String) {
