@@ -1224,7 +1224,9 @@ impl Transcript {
             SessionEventKind::Message {
                 actor: EventActor::Assistant,
                 ..
-            } | SessionEventKind::ReasoningDelta { .. }
+            } | SessionEventKind::MessageDelta { .. }
+                | SessionEventKind::ReasoningDelta { .. }
+                | SessionEventKind::ReasoningTextDelta { .. }
                 | SessionEventKind::ReasoningCompleted
                 | SessionEventKind::ToolStarted { .. }
         ) || matches!(
@@ -1603,7 +1605,13 @@ impl Transcript {
                     } = &mut self.order[index]
                     {
                         *stored_actor = *actor;
-                        *stored_text = text.clone();
+                        if !(*actor == EventActor::Assistant
+                            && *status == MessageStatus::InProgress
+                            && *stored_status == MessageStatus::InProgress
+                            && stored_text.starts_with(text))
+                        {
+                            *stored_text = text.clone();
+                        }
                         *stored_status = *status;
                         *complete =
                             matches!(*status, MessageStatus::Complete | MessageStatus::Failed);
@@ -1685,8 +1693,14 @@ impl Transcript {
                     );
                 }
             }
+            SessionEventKind::MessageDelta { message_id, delta } => {
+                self.append_assistant_message_delta(*message_id, delta, event);
+            }
             SessionEventKind::ReasoningDelta { text } => {
                 self.append_reasoning(text, event.created_at, local_event_time(event));
+            }
+            SessionEventKind::ReasoningTextDelta { delta } => {
+                self.append_reasoning_text_delta(delta, event.created_at, local_event_time(event));
             }
             SessionEventKind::ReasoningCompleted => {
                 self.finish_reasoning(event.created_at);
@@ -2747,6 +2761,96 @@ impl Transcript {
             .active_reasoning
             .map(|reasoning| reasoning + usize::from(reasoning >= index));
         self.last_edit = self.last_edit.map(|edit| edit + usize::from(edit >= index));
+    }
+
+    fn append_assistant_message_delta(
+        &mut self,
+        message_id: Uuid,
+        delta: &str,
+        event: &SessionEvent,
+    ) {
+        if self.live_turn_closed || delta.is_empty() {
+            return;
+        }
+        if let Some(index) = self.messages.get(&message_id).copied() {
+            if !matches!(
+                self.order.get(index),
+                Some(TranscriptEntry::Message {
+                    actor: EventActor::Assistant,
+                    status: MessageStatus::InProgress,
+                    ..
+                })
+            ) {
+                return;
+            }
+            self.finish_reasoning(event.created_at);
+            if let Some(TranscriptEntry::Message {
+                actor: EventActor::Assistant,
+                text,
+                status: MessageStatus::InProgress,
+                ..
+            }) = self.order.get_mut(index)
+            {
+                text.push_str(delta);
+                self.message_markdown_cache
+                    .get_mut()
+                    .messages
+                    .retain(|(entry_index, _), _| *entry_index != index);
+            }
+            return;
+        }
+        self.finish_reasoning(event.created_at);
+        self.collapse_previous_edit();
+        let (model, effort) = self
+            .active_turn
+            .as_ref()
+            .map(|turn| (turn.model.clone(), turn.effort.clone()))
+            .or_else(|| {
+                self.config
+                    .as_ref()
+                    .map(|config| (config.model.clone(), config.effort.clone()))
+            })
+            .unwrap_or_default();
+        let time = self.message_event_time(event);
+        self.messages.insert(message_id, self.order.len());
+        self.order.push(TranscriptEntry::Message {
+            actor: EventActor::Assistant,
+            text: delta.to_string(),
+            attachments: Vec::new(),
+            model,
+            effort,
+            time,
+            status: MessageStatus::InProgress,
+            complete: false,
+            user_interrupted: false,
+            redirected: false,
+        });
+    }
+
+    fn append_reasoning_text_delta(
+        &mut self,
+        delta: &str,
+        started_at: DateTime<Utc>,
+        time: String,
+    ) {
+        if self.live_turn_closed || delta.is_empty() {
+            return;
+        }
+        if self.active_reasoning.is_none() {
+            self.start_reasoning(started_at, time);
+        }
+        if let Some(index) = self.active_reasoning
+            && let Some(TranscriptEntry::Tool {
+                code_view: Some((language, source)),
+                detail,
+                complete: false,
+                ..
+            }) = self.order.get_mut(index)
+            && language == "reasoning"
+        {
+            source.push_str(delta);
+            *detail = reasoning_preview(source);
+        }
     }
 
     fn append_reasoning(&mut self, text: &str, started_at: DateTime<Utc>, time: String) {
