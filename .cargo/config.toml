@@ -1,0 +1,6 @@
+[env]
+# The session actor's async frames are sized for the 8 MiB worker stacks the
+# CLI runtime configures (crates/borg-cli/src/main.rs). Give Cargo-run tests
+# and binaries the same minimum so unoptimized builds do not overflow the
+# default 2 MiB thread stack.
+RUST_MIN_STACK = "8388608"
