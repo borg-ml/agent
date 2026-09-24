@@ -5,6 +5,24 @@ Git comparison.
 
 ## Unreleased (since 0.11.2)
 
+### Terminal
+
+- **Image previews render once, at native size.** Resumed and child
+  transcripts forgot the terminal's graphics support, so a preview drew a
+  blocky text fallback under a stretched copy of the image and was captioned
+  "text unreadable here". Every transcript now uses the graphics protocol.
+- Message backgrounds and diff highlight bars reach both edges of the screen;
+  the scrollbar is drawn over them.
+- The footer's `↓N` behind-count shows a "git pull" tooltip on hover, like the
+  `↑N` push count, so it is clear that clicking it pulls.
+
+### Agents and teams
+
+- **Messages sent while a steer is in flight are delivered together.** A
+  second message was held until the next model call, which could be a long
+  tool call away. Held messages now go to the model, each separately, as soon
+  as the earlier one is accepted.
+
 ## 0.11.2 (2026-09-24)
 
 ### Terminal

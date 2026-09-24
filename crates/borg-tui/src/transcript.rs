@@ -812,6 +812,10 @@ impl Transcript {
         self.image_cell = cell;
     }
 
+    fn image_cell(&self) -> Option<(u16, u16)> {
+        self.image_cell
+    }
+
     /// The line under a preview tile. On a terminal without graphics the reader
     /// is told the tile cannot show the text rather than left to squint at it.
     fn preview_caption(&self, number: usize, path: &std::path::Path) -> String {
