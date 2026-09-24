@@ -5243,6 +5243,76 @@ async fn run_agent_session_store_kernel_inner(
                     }
                     break;
                 }
+                // Settle steer admissions first: an interrupt must observe a
+                // steer the provider already accepted.
+                steer_result = steer_results.recv(), if !pending_steers.is_empty() => {
+                    let Some((acknowledgement_id, acknowledgement)) = steer_result else {
+                        continue;
+                    };
+                    let Some(index) = pending_steers
+                        .iter()
+                        .position(|steer| steer.acknowledgement_id == acknowledgement_id)
+                    else {
+                        continue;
+                    };
+                    if pending_steers[index].admission.is_accepted() {
+                        // An admission receipt says the provider took the
+                        // text, not that the model was given it. Under the
+                        // native harness the steer stays pending until the
+                        // fold is journaled, so acceptance settles nothing
+                        // and there is deliberately nothing to do here --
+                        // `retry_pending_steers` skips an accepted admission,
+                        // so it is not re-dispatched while it waits. This has
+                        // to be its own arm: falling through to the rejection
+                        // branch would log an accepted steer as refused and
+                        // send it back round at the next boundary, handing
+                        // the model the same words twice.
+                        if !executor.uses_native_harness(launch.provider) {
+                            for steer in pending_steers.iter_mut().filter(|steer| steer.acknowledgement_id == acknowledgement_id) {
+                                steer.state = PendingSteerState::Accepted;
+                            }
+                            settle_accepted_steers(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                &mut pending_steers,
+                                provider_reports_steer_consumption(launch.provider),
+                                &mut steers_awaiting_consumption,
+                            )
+                            .await?;
+                        }
+                    } else {
+                        let error = acknowledgement.err().unwrap_or_else(|| {
+                            "provider acknowledged the steer without accepting admission"
+                                .to_string()
+                        });
+                        {
+                            tracing::warn!(
+                                %acknowledgement_id,
+                                %error,
+                                "provider rejected active-turn steer; retaining it for the next boundary"
+                            );
+                            // The rejection is transient and the steer retries
+                            // at the next boundary, so it keeps its steer
+                            // delivery. It is nonetheless unconsumed, which is
+                            // what makes it honestly recallable meanwhile.
+                            for steer in pending_steers.iter_mut().filter(|steer| steer.acknowledgement_id == acknowledgement_id) {
+                                steer.state = PendingSteerState::RetryAtBoundary { error: error.clone() };
+                            }
+                            let boundary_already_passed = pending_steers[index].attempt_boundary
+                                < steer_boundary_generation;
+                            if boundary_already_passed && !context_compaction_in_progress && !user_stop && !interrupted {
+                                retry_pending_steers(
+                                    &control_tx,
+                                    &steer_result_tx,
+                                    &mut pending_steers,
+                                    steer_boundary_generation, launch.capabilities.frames_steers_for(launch.provider, launch.model.as_deref()),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
                 // Commands (interrupts, steers) outrank team and watchdog
                 // traffic: a busy team must not delay the person's Esc.
                 command = next_host_command(&mut deferred_commands, &mut commands) => {
@@ -6183,74 +6253,6 @@ async fn run_agent_session_store_kernel_inner(
                         SessionEventKind::WatchesChanged { watches: snapshot },
                     )
                     .await?;
-                }
-                steer_result = steer_results.recv(), if !pending_steers.is_empty() => {
-                    let Some((acknowledgement_id, acknowledgement)) = steer_result else {
-                        continue;
-                    };
-                    let Some(index) = pending_steers
-                        .iter()
-                        .position(|steer| steer.acknowledgement_id == acknowledgement_id)
-                    else {
-                        continue;
-                    };
-                    if pending_steers[index].admission.is_accepted() {
-                        // An admission receipt says the provider took the
-                        // text, not that the model was given it. Under the
-                        // native harness the steer stays pending until the
-                        // fold is journaled, so acceptance settles nothing
-                        // and there is deliberately nothing to do here --
-                        // `retry_pending_steers` skips an accepted admission,
-                        // so it is not re-dispatched while it waits. This has
-                        // to be its own arm: falling through to the rejection
-                        // branch would log an accepted steer as refused and
-                        // send it back round at the next boundary, handing
-                        // the model the same words twice.
-                        if !executor.uses_native_harness(launch.provider) {
-                            for steer in pending_steers.iter_mut().filter(|steer| steer.acknowledgement_id == acknowledgement_id) {
-                                steer.state = PendingSteerState::Accepted;
-                            }
-                            settle_accepted_steers(
-                                &mut journal,
-                                &events,
-                                session_id,
-                                &mut pending_steers,
-                                provider_reports_steer_consumption(launch.provider),
-                                &mut steers_awaiting_consumption,
-                            )
-                            .await?;
-                        }
-                    } else {
-                        let error = acknowledgement.err().unwrap_or_else(|| {
-                            "provider acknowledged the steer without accepting admission"
-                                .to_string()
-                        });
-                        {
-                            tracing::warn!(
-                                %acknowledgement_id,
-                                %error,
-                                "provider rejected active-turn steer; retaining it for the next boundary"
-                            );
-                            // The rejection is transient and the steer retries
-                            // at the next boundary, so it keeps its steer
-                            // delivery. It is nonetheless unconsumed, which is
-                            // what makes it honestly recallable meanwhile.
-                            for steer in pending_steers.iter_mut().filter(|steer| steer.acknowledgement_id == acknowledgement_id) {
-                                steer.state = PendingSteerState::RetryAtBoundary { error: error.clone() };
-                            }
-                            let boundary_already_passed = pending_steers[index].attempt_boundary
-                                < steer_boundary_generation;
-                            if boundary_already_passed && !context_compaction_in_progress && !user_stop && !interrupted {
-                                retry_pending_steers(
-                                    &control_tx,
-                                    &steer_result_tx,
-                                    &mut pending_steers,
-                                    steer_boundary_generation, launch.capabilities.frames_steers_for(launch.provider, launch.model.as_deref()),
-                                )
-                                .await;
-                            }
-                        }
-                    }
                 }
                 request = goal_tool_rx.recv() => {
                     let Some(request) = request else {
