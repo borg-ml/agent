@@ -3509,7 +3509,8 @@ fn usage_screen_keeps_account_limits_and_session_usage_distinct() {
         input_tokens: 12_345,
         output_tokens: 678,
         cached_input_tokens: 1_234,
-        total_tokens: 13_023,
+        cache_creation_input_tokens: 56,
+        total_tokens: 14_313,
         ..SessionUsage::default()
     };
     let limits = CodexAccountRateLimits {
@@ -3528,8 +3529,10 @@ fn usage_screen_keeps_account_limits_and_session_usage_distinct() {
     assert!(summary.contains("Weekly"));
     assert!(summary.contains("[██████████░░░░░░░░░░] 52% left"));
     assert!(summary.contains("Session\n"));
-    assert!(summary.contains("Input tokens     12,345"));
-    assert!(summary.contains("Total tokens     13,023"));
+    assert!(summary.contains("Uncached input   12,345"));
+    assert!(summary.contains("Cache writes     56"));
+    assert!(summary.contains("Processed tokens 14,313"));
+    assert!(summary.contains("Account allowance is reported separately"));
     assert!(!summary.contains("Session ·"));
 
     let generic = format_usage_summary(CodingProvider::OpenRouter, &SessionUsage::default(), None);

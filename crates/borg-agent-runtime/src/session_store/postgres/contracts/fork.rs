@@ -19,6 +19,82 @@ use crate::{
 };
 
 #[tokio::test]
+async fn request_usage_survives_reload_without_double_counting_or_fork_inheritance() {
+    let (scratch, store) = super::support::store().await;
+    let parent = Uuid::new_v4();
+    store.create_session(parent).await.unwrap();
+    let raw = serde_json::json!({
+        "input_tokens": 12, "input_tokens_details": {"cached_tokens": 4, "cache_write_tokens": 2},
+        "output_tokens": 3, "output_tokens_details": {"reasoning_tokens": 2},
+    });
+    for kind in [
+        SessionEventKind::SessionStarted,
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "native_model_request".into(),
+            payload: serde_json::json!({"request_id":"request-1"}),
+        },
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "native_model_usage".into(),
+            payload: serde_json::json!({"request_id":"request-1","complete":false,"usage":{"input_tokens":12}}),
+        },
+        SessionEventKind::ProviderEvent {
+            provider: CodingProvider::Codex,
+            kind: "native_model_usage".into(),
+            payload: serde_json::json!({"request_id":"request-1","complete":true,"usage":raw}),
+        },
+        SessionEventKind::UsageUpdated {
+            provider_duration_ms: 1,
+            turn_id: None,
+            provider_context_reused: None,
+            input_tokens: 6,
+            output_tokens: 3,
+            cached_input_tokens: 4,
+            cache_creation_input_tokens: 2,
+            total_tokens: 15,
+            cost_microusd: None,
+            cost_basis: "subscription_equivalent".into(),
+            cost_usd: None,
+            context_tokens: Some(12),
+            context_window_tokens: None,
+        },
+    ] {
+        store
+            .append(SessionEvent::new(parent, 0, kind))
+            .await
+            .unwrap();
+    }
+    drop(store);
+    let store = crate::PostgresSessionStore::connect_with_pool_size(&scratch.url, 2)
+        .await
+        .unwrap();
+    let events = store.read(parent).await.unwrap();
+    assert_eq!(events.len(), 5);
+    assert!(
+        matches!(&events[3].kind, SessionEventKind::ProviderEvent { payload, .. }
+        if payload["complete"] == true && payload["usage"] == raw)
+    );
+    let usage = store.state(parent).await.unwrap().usage;
+    assert_eq!(
+        (
+            usage.calls,
+            usage.input_tokens,
+            usage.cached_input_tokens,
+            usage.cache_creation_input_tokens,
+            usage.output_tokens,
+            usage.total_tokens
+        ),
+        (1, 6, 4, 2, 3, 15)
+    );
+    let child = Uuid::new_v4();
+    store.fork_before(parent, child, 6).await.unwrap();
+    assert!(store.read(child).await.unwrap().iter().all(|event| !matches!(&event.kind,
+        SessionEventKind::ProviderEvent { kind, .. } if matches!(kind.as_str(), "native_model_request" | "native_model_usage"))));
+    scratch.discard().await;
+}
+
+#[tokio::test]
 async fn fork_records_lineage_without_copying_events() {
     let (scratch, store) = super::support::store().await;
     let parent_id = Uuid::new_v4();

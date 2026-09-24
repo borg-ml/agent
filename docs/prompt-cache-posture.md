@@ -44,23 +44,51 @@ discipline is the most explicit of the harnesses available to read.
 - **Cheapest reduction first.** Micro-compaction clears old tool results in the
   replayed view before any summary rewrites history.
 
-## Measurement
+## Measurement and token definitions (verified 2026-09-24)
 
-Journal usage is per turn: `usage_updated` carries uncached, cached and cache
-creation tokens. Codex CLI rollouts in `~/.codex/sessions` carry per-request
-`token_count` events.
+Borg's `input_tokens` means input that was neither read from nor written to the
+cache. Cached reads and cache writes are separate counters. `total_tokens` is
+all three input categories plus output. Reasoning is a subset of output, not an
+additional charge to add to this total. These are processed tokens, not a
+measurement of subscription allowance consumed. Codex CLI also presents a
+blended total that subtracts cached input; comparing that display directly with
+Borg's processed total exaggerates the difference.
 
-Before the fixes above (30 days to 2026-09-23), Borg's Codex lane cached 93.0% of
-input against Codex CLI's 95.6%. Short follow-up turns cached only 80.7%, because
-each turn dropped the previous turn's prompt context and re-read that turn
-uncached, and 134 compactions re-read 16.1M tokens as text under a different
-head. After them, a no-tool follow-up to a turn that read a 13k-token file cached
-14,848 of 14,993 input tokens.
+`native_model_usage` now journals raw provider usage per request, including
+reasoning and cache-write breakdowns where supplied. Records sharing a request
+ID are cumulative snapshots: use the latest, and check `complete`. Interrupted
+Claude streams can retain partial counters. A failed Codex response can retain
+terminal usage even when its output is rejected. An absent counter is unknown,
+not a measured zero. These audit events do not increment the existing
+`usage_updated` turn totals and are not inherited into a fork's request audit.
+The child's own journal holds its audit; its parent does not duplicate it.
 
-The Claude subscription lane cached 99.1% of reads; cache writes were 0.9% of
-input. A cold process replays the whole history as one message, which cannot
-match the previous process's cached layout; the avoidable cold turns clustered
-at Borg restarts and cost about 5M write tokens over the period.
+Fresh matched adapter probes against Codex 0.156.1 did not establish a general
+Borg cache failure. The simple warm follow-ups cached 98.00% in Borg and 98.92%
+in Codex; the absolute uncached difference across those two follow-ups was 18
+tokens. A controlled restart preserved warm caching in both. Earlier cold
+Codex results were confounded by changed workspace context. Cache writes were
+zero in these small matched samples; a nonzero-write SSE regression fixture
+checks their normalization separately. These probes do not cover long coding
+sessions, compaction, production tool catalogs, or subscription allowance.
+
+The unmatched historical cohort (2026-08-25 through 2026-09-23 UTC) cached
+93.231% of Borg Codex input and 97.536% of local Codex input. The local records
+were predominantly VS Code sessions and used different workloads and models;
+this is not a causal CLI comparison. The prior 95.6% baseline and 80.7%
+short-follow-up figure could not be reproduced with an explicit matching
+cohort. The 134 legacy compactions did reread 16,072,256 noncached input tokens.
+One recorded compaction using the cached request instead read 220,032 cached
+and 1,121 noncached tokens. The earlier follow-up with 14,848 cached of 14,993
+input tokens was also reproduced from the journal.
+
+Claude's unmatched historical input was 99.101% cached. The prior attribution
+of roughly 5M writes to cold restarts was not independently established.
+The shared-connector measurements and activation status are recorded in
+[Claude shared model connector](claude-shared-model-connector.md).
+
+Raw measurements, source versions, cohort queries, and the full audit are kept
+in `/home/shulgin/.local/share/borg/assessments/2026-09-24-subscriptions/`.
 
 ## Gaps, in the order they are worth closing
 
@@ -78,9 +106,9 @@ at Borg restarts and cost about 5M write tokens over the period.
    `previous_response_id` over a persistent socket. Borg stays on HTTP, which
    the backend still caches by prefix; the socket mainly saves upload and
    latency.
-4. **Per-request usage in the journal.** Usage is folded per turn, so a miss on
-   one request is only visible as a lower turn ratio. Recording the provider's
-   cached count per request would locate misses directly.
+4. **Codex request conformance.** The model catalog's Responses Lite,
+   reasoning summary, verbosity, and effort-update behavior need to match the
+   reference client. Their effect on cache hit rate is not yet measured.
 5. **Warming where no lifetime is documented.** Warming fires wherever a
    documented lifetime exists, which today is the direct Anthropic route. An
    operator who knows a vendor retention can declare `prompt_cache_ttl_seconds`
