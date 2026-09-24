@@ -376,6 +376,7 @@ fn publish_usage(
         "native_model_usage",
         json!({
             "request_id": id, "protocol": "anthropic_messages", "complete": complete,
+            "response_id": state.raw_response().get("id"),
             "usage": state.raw_response().get("usage"),
         }),
     );

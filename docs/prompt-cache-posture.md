@@ -56,7 +56,8 @@ Borg's processed total exaggerates the difference.
 
 `native_model_usage` now journals raw provider usage per request, including
 reasoning and cache-write breakdowns where supplied. Records sharing a request
-ID are cumulative snapshots: use the latest, and check `complete`. Interrupted
+and provider response ID are cumulative snapshots: use the latest for that
+pair, and check `complete`. A retry with a new response ID is a separate call. Interrupted
 Claude streams can retain partial counters. A failed Codex response can retain
 terminal usage even when its output is rejected. An absent counter is unknown,
 not a measured zero. These audit events do not increment the existing
@@ -71,6 +72,26 @@ Codex results were confounded by changed workspace context. Cache writes were
 zero in these small matched samples; a nonzero-write SSE regression fixture
 checks their normalization separately. These probes do not cover long coding
 sessions, compaction, production tool catalogs, or subscription allowance.
+
+The current Codex subscription adapter also follows the model catalog for
+Responses Lite, reasoning summaries, verbosity, and supported effort updates.
+Lite instructions and tool declarations have deterministic IDs. Borg persists
+the original request effort and places trusted effort updates at their original
+conversation positions, including the initial selection. Account-scoped HTTP
+clients retain only allowlisted infrastructure cookies; they never retain
+authentication cookies or send routing cookies to the API-key endpoint.
+
+Three subsequent seven-request probes exercised a larger prefix, a tool
+continuation, warm turns, an effort change, process recovery, and a fork. With
+Codex's effort-update feature enabled, Borg reported 59,293 input tokens,
+41,600 cached input, and 58 output; Codex reported 102,525 input, 72,576 cached,
+and 61 output. Both reported zero cache writes. Their prompt overhead differed
+by about 6,000 tokens per request, so raw totals are not an allowance comparison.
+Borg had one unexplained warm cache miss; Codex missed on the fork. Earlier
+runs used Codex's default-disabled effort-update feature and are not a clean
+comparison for that behavior. These probes preceded the final initial-effort
+marker correction, which has replay/serialization test coverage. They establish
+successful continuation and recovery, not cache parity or an allowance saving.
 
 The unmatched historical cohort (2026-08-25 through 2026-09-23 UTC) cached
 93.231% of Borg Codex input and 97.536% of local Codex input. The local records
@@ -106,9 +127,11 @@ in `/home/shulgin/.local/share/borg/assessments/2026-09-24-subscriptions/`.
    `previous_response_id` over a persistent socket. Borg stays on HTTP, which
    the backend still caches by prefix; the socket mainly saves upload and
    latency.
-4. **Codex request conformance.** The model catalog's Responses Lite,
-   reasoning summary, verbosity, and effort-update behavior need to match the
-   reference client. Their effect on cache hit rate is not yet measured.
+4. **Codex intermittent warm misses.** Catalog-driven request conformance and
+   infrastructure cookies are implemented. Some controlled warm calls still
+   missed completely. The final effort-marker correction and transport effects
+   have not been isolated as causes; byte-stable replay alone does not prove
+   that the service will return a cache hit.
 5. **Warming where no lifetime is documented.** Warming fires wherever a
    documented lifetime exists, which today is the direct Anthropic route. An
    operator who knows a vendor retention can declare `prompt_cache_ttl_seconds`

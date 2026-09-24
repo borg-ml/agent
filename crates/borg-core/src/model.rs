@@ -50,6 +50,14 @@ pub enum ModelProviderState {
         output: Vec<Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account_identity: Option<String>,
+        /// Borg-authored settings retain the original request effort while
+        /// supported effort updates are replayed at their conversation positions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effective_effort: Option<String>,
     },
     AnthropicMessages {
         content: Vec<Value>,
