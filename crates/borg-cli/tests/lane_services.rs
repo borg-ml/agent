@@ -40,6 +40,7 @@ const HEALTH_FAIL_FILE: &str = "FAKE_HEALTH_FAIL_FILE";
 const MCP_SESSION_LOG: &str = "FAKE_MCP_SESSION_LOG";
 const CHILD_MARKER_DIR: &str = "FAKE_CHILD_MARKER_DIR";
 const START_DELAY_FILE: &str = "FAKE_START_DELAY_FILE";
+const REUSED_PORT_FILE: &str = "FAKE_REUSED_PORT_FILE";
 
 // ---------------------------------------------------------------------------
 // Re-executed roles: this test binary doubles as the fake backend, its
@@ -82,6 +83,15 @@ fn fake_backend() {
     {
         // Like an editor still loading: the port is not listening yet.
         std::thread::sleep(Duration::from_secs(seconds.trim().parse().unwrap_or(0)));
+    }
+    if let Some(marker) = std::env::var_os(REUSED_PORT_FILE) {
+        let marker = Path::new(&marker);
+        if std::fs::read_to_string(marker).is_ok_and(|used| used.trim() == port.to_string()) {
+            // A recently used editor port can remain in TCP TIME_WAIT after
+            // the old supervisor is killed. Make that window deterministic.
+            std::thread::sleep(Duration::from_secs(60));
+        }
+        std::fs::write(marker, port.to_string()).unwrap();
     }
     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
     for stream in listener.incoming().flatten() {
@@ -728,13 +738,18 @@ fn kill_supervisor_mid_restart(
     f.resumed(id);
     std::fs::write(&slow, "60").unwrap();
     f.run(&["restart", id]);
-    let barrier = until(Duration::from_secs(20), || {
-        f.lane
-            .records()
-            .into_iter()
-            .find(|r| r.restart_barrier && matches!(r.state, TicketState::Granted(_)))
-            .map(|r| r.ticket.id.to_string())
+    // Restarting is published only once the replacement is spawned, so its
+    // port is chosen and the first launch's barrier already released.
+    until(Duration::from_secs(20), || {
+        matches!(f.status(id).state, ServiceState::Restarting).then_some(())
     });
+    let barrier = f
+        .lane
+        .records()
+        .into_iter()
+        .find(|r| r.restart_barrier && matches!(r.state, TicketState::Granted(_)))
+        .map(|r| r.ticket.id.to_string())
+        .expect("a restarting service holds its restart barrier");
     // This test started exactly this supervisor.
     let supervisor = f.status(id).supervisor_pid.unwrap().to_string();
     assert!(
@@ -802,6 +817,35 @@ fn a_restarted_supervisor_frees_what_its_killed_predecessor_held() {
     let job = f.submit(&build, &[]);
     let waited = f.lane.cli(&["job", "wait", &job, "--timeout", "60"], None);
     f.assert_job_succeeded(&job, &waited);
+}
+
+/// Failure mode (F2): a supervisor killed mid-restart has recorded its
+/// still-loading replacement's port, so the next start reuses the port the
+/// serving backend's clients just left. The editor then waits out TCP
+/// TIME_WAIT (here, the fake backend's 60 s) although the other port is idle.
+#[test]
+fn a_killed_restart_uses_the_other_backend_port_before_the_first_is_quiet() {
+    let f = Fixture::scoped();
+    let defer = f.lane.spec("port-after-kill", "true").lease.resources[0]
+        .key
+        .clone();
+    let (mut spec, slow, barrier) = kill_supervisor_mid_restart(&f, "port-editor", &defer);
+    let [previous, alternate] = spec.endpoint.as_ref().unwrap().backend_ports;
+    let recently_used = f.root().join("recently-used-backend-port");
+    std::fs::write(&recently_used, previous.to_string()).unwrap();
+    spec.env
+        .push((REUSED_PORT_FILE.into(), recently_used.display().to_string()));
+    std::fs::write(&slow, "0").unwrap();
+
+    // No `lane recover`: the next supervisor releases the old claims and,
+    // within `resumed`'s 10 s, serves from the port no client just left.
+    f.start(&spec, &[]);
+    let ready = f.resumed("port-editor");
+    assert!(
+        matches!(ready.state, ServiceState::Healthy { backend: Some(port) } if port == alternate),
+        "expected alternate port {alternate}, got {ready:?}"
+    );
+    assert_barrier_released(&f, &barrier);
 }
 
 /// Failure mode: a cold restart (an editor too big to run twice) starting
