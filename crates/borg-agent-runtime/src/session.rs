@@ -1303,7 +1303,9 @@ fn provider_event_is_progress(event: &SessionEventKind) -> bool {
     match event {
         // Model output.
         SessionEventKind::Message { .. }
+        | SessionEventKind::MessageDelta { .. }
         | SessionEventKind::ReasoningDelta { .. }
+        | SessionEventKind::ReasoningTextDelta { .. }
         | SessionEventKind::ReasoningCompleted
         // Tool calls.
         | SessionEventKind::ToolStarted { .. }
@@ -10353,6 +10355,21 @@ async fn record_provider_event(
     events: &mpsc::Sender<SessionEvent>,
     session_id: Uuid,
 ) -> Result<()> {
+    // The provider's cumulative snapshots are the recovery record. Deliver
+    // these fragments only to the live observer, without touching the store.
+    if matches!(
+        kind,
+        SessionEventKind::MessageDelta { .. } | SessionEventKind::ReasoningTextDelta { .. }
+    ) {
+        deliver_recorded_event(
+            events,
+            session_id,
+            SessionEvent::new(session_id, 0, kind),
+            crate::EventPersistence::Ephemeral,
+        )
+        .await;
+        return Ok(());
+    }
     complete_consumed_steers(&kind, awaiting, journal, events, session_id).await?;
     let applied = native_steer_applied_to(&kind);
     record(journal, events, session_id, kind).await?;
@@ -11727,6 +11744,8 @@ fn provider_event_has_side_effect(kind: &SessionEventKind) -> bool {
     matches!(
         kind,
         SessionEventKind::ReasoningDelta { .. }
+            | SessionEventKind::ReasoningTextDelta { .. }
+            | SessionEventKind::MessageDelta { .. }
             | SessionEventKind::Message {
                 actor: EventActor::Assistant | EventActor::Tool,
                 ..
