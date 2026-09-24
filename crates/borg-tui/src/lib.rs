@@ -6286,9 +6286,11 @@ impl BorgTerminal {
     pub fn advance_scroll_frame(&mut self) {
         self.advance_nested_scroll_frame();
         let scroll_was_active = self.scroll_motion.is_active();
-        self.scroll_from_bottom = self
-            .scroll_motion
-            .advance(self.scroll_from_bottom, self.transcript_scroll_max);
+        self.scroll_from_bottom = self.scroll_motion.advance_at(
+            self.scroll_from_bottom,
+            self.transcript_scroll_max,
+            Instant::now(),
+        );
         if scroll_was_active {
             self.transcript.follow_tail = self.scroll_from_bottom == 0;
         }
@@ -7732,7 +7734,7 @@ impl BorgTerminal {
                 footer_height,
                 is_launch_screen,
             );
-            usize::from(chunks[0].height.saturating_sub(1))
+            usize::from(chunks[0].height)
         };
         let transcript_width = transcript_width_for_viewport(
             content_width,
@@ -7913,15 +7915,7 @@ impl BorgTerminal {
                     Rect::default(),
                 )
             } else {
-                (
-                    chunks[2],
-                    Rect {
-                        height: chunks[0].height.saturating_sub(1),
-                        ..chunks[0]
-                    },
-                    chunks[3],
-                    chunks[4],
-                )
+                (chunks[2], chunks[0], chunks[3], chunks[4])
             };
             next_composer_text_area = Some(Rect {
                 x: composer_area
@@ -7976,16 +7970,6 @@ impl BorgTerminal {
                 next_shell_status_area = place(shell_status.as_deref());
                 next_watch_status_area = place(watch_status.as_deref());
                 next_todo_status_area = place(todo_status.as_deref());
-            }
-            if !is_launch_screen {
-                frame.render_widget(
-                    Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0))),
-                    Rect {
-                        y: chunks[0].bottom().saturating_sub(1),
-                        height: chunks[0].height.min(1),
-                        ..chunks[0]
-                    },
-                );
             }
             if !transcript_area.is_empty() {
                 let visible_height = transcript_area.height as usize;
@@ -11950,7 +11934,13 @@ fn is_context_compaction(kind: &str) -> bool {
 #[derive(Default)]
 struct ScrollMotion {
     remaining_lines: isize,
+    last_advance: Option<Instant>,
 }
+
+/// The frame the wheel easing is tuned for. A late frame applies every
+/// nominal frame it missed, so slow draws make scrolling coarser rather than
+/// leaving a backlog that keeps moving after the wheel stops.
+const SCROLL_MOTION_FRAME: Duration = Duration::from_millis(16);
 
 impl ScrollMotion {
     fn push(&mut self, lines: isize) {
@@ -11970,6 +11960,7 @@ impl ScrollMotion {
 
     fn cancel(&mut self) {
         self.remaining_lines = 0;
+        self.last_advance = None;
     }
 
     fn is_active(&self) -> bool {
@@ -11983,6 +11974,23 @@ impl ScrollMotion {
             1,
             MAX_WHEEL_SCROLL_LINES_PER_FRAME as usize,
         )
+    }
+
+    /// Advance by the nominal frames elapsed since the previous advance.
+    fn advance_at(&mut self, scroll_from_bottom: usize, scroll_max: usize, now: Instant) -> usize {
+        let frames = self.last_advance.map_or(1, |last| {
+            (now.saturating_duration_since(last).as_millis() / SCROLL_MOTION_FRAME.as_millis())
+                .clamp(1, 64) as usize
+        });
+        let mut scroll = scroll_from_bottom;
+        for _ in 0..frames {
+            if !self.is_active() {
+                break;
+            }
+            scroll = self.advance(scroll, scroll_max);
+        }
+        self.last_advance = self.is_active().then_some(now);
+        scroll
     }
 
     fn take_pending(&mut self) -> isize {
