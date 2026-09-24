@@ -8,7 +8,7 @@ use std::sync::{
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use uuid::Uuid;
 
 use crate::{
@@ -588,6 +588,7 @@ pub struct LocalSessionControlServer {
     task: tokio::task::JoinHandle<()>,
     attached_viewers: Arc<AtomicUsize>,
     live: Arc<Mutex<LocalLivePublisher>>,
+    shutdown: watch::Sender<bool>,
 }
 
 #[cfg(not(unix))]
@@ -720,6 +721,8 @@ impl LocalSessionControlServer {
             message_snapshots: HashMap::new(),
         }));
         let task_live = Arc::clone(&live);
+        let (shutdown, _) = watch::channel(false);
+        let task_shutdown = shutdown.clone();
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -752,6 +755,7 @@ impl LocalSessionControlServer {
                             Ok((stream, _)) => {
                                 let attached_viewers = Arc::clone(&task_attached_viewers);
                                 let live = Arc::clone(&task_live);
+                                let mut shutdown = task_shutdown.subscribe();
                                 tokio::spawn(async move {
                                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -764,14 +768,24 @@ impl LocalSessionControlServer {
                                         return;
                                     }
                                     let mut byte = [0_u8; 1];
-                                    if reader.read_exact(&mut byte).await.is_ok() && byte == [2] {
+                                    let opted_in = tokio::select! {
+                                        read = reader.read_exact(&mut byte) => read.is_ok() && byte == [2],
+                                        _ = shutdown.changed() => false,
+                                    };
+                                    if opted_in {
                                         let (latest_sequence, snapshots, mut live_events) = {
                                             let live = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                                             (live.latest_sequence, live.snapshots(), live.events.subscribe())
                                         };
-                                        if write_live_frame(&mut writer, &LocalLiveFrame::Hello { latest_sequence, snapshots }).await.is_ok() {
+                                        let hello = LocalLiveFrame::Hello { latest_sequence, snapshots };
+                                        let hello_sent = tokio::select! {
+                                            sent = write_live_frame(&mut writer, &hello) => sent.is_ok(),
+                                            _ = shutdown.changed() => false,
+                                        };
+                                        if hello_sent {
                                             loop {
                                                 tokio::select! {
+                                                    _ = shutdown.changed() => break,
                                                     read = reader.read(&mut byte) => {
                                                         if !matches!(read, Ok(1..)) {
                                                             break;
@@ -786,17 +800,28 @@ impl LocalSessionControlServer {
                                                             },
                                                             Err(broadcast::error::RecvError::Closed) => break,
                                                         };
-                                                        if writer.write_all(&frame.bytes).await.is_err() || frame.lagged {
+                                                        let sent = tokio::select! {
+                                                            sent = writer.write_all(&frame.bytes) => sent.is_ok(),
+                                                            _ = shutdown.changed() => false,
+                                                        };
+                                                        if !sent || frame.lagged {
                                                             break;
                                                         }
                                                     }
                                                 }
                                             }
                                         }
-                                    } else {
+                                    } else if !*shutdown.borrow() {
                                         // Older attached terminals keep this socket open only
                                         // for presence. They never subscribe to event traffic.
-                                        while matches!(reader.read(&mut byte).await, Ok(1..)) {}
+                                        loop {
+                                            tokio::select! {
+                                                _ = shutdown.changed() => break,
+                                                read = reader.read(&mut byte) => {
+                                                    if !matches!(read, Ok(1..)) { break; }
+                                                }
+                                            }
+                                        }
                                     }
                                     attached_viewers.fetch_sub(1, Ordering::AcqRel);
                                 });
@@ -818,6 +843,7 @@ impl LocalSessionControlServer {
             task,
             attached_viewers,
             live,
+            shutdown,
         })
     }
 
@@ -988,6 +1014,7 @@ async fn handle_control_connection(
 #[cfg(unix)]
 impl Drop for LocalSessionControlServer {
     fn drop(&mut self) {
+        self.shutdown.send_replace(true);
         self.task.abort();
         // Leave the path in place. The next journal owner safely reclaims a
         // refused socket; unlinking here could remove a successor's endpoint
@@ -2396,6 +2423,54 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), attachment)
             .await
             .expect("attachment should notice released ownership")
+            .expect("attachment task should not panic")
+            .expect("owner loss is a clean detach");
+        scratch.discard().await;
+    }
+
+    #[tokio::test]
+    async fn connected_attachment_ends_when_owner_drops_without_a_stop_event() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let lock_path = root.path().join(format!("{session_id}.lock"));
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let writer = SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .unwrap();
+        let (scratch, postgres) = crate::session_store::postgres::testing::session_store().await;
+        let postgres = Arc::new(postgres);
+        postgres.create_session(session_id).await.unwrap();
+        let store: Arc<dyn SessionStore> = postgres;
+        let (owner_tx, _owner_rx) = mpsc::channel(1);
+        let server =
+            LocalSessionControlServer::start(socket_path.clone(), session_id, &writer, owner_tx)
+                .unwrap();
+        let (_command_tx, command_rx) = mpsc::channel(1);
+        let (event_tx, _event_rx) = mpsc::channel(1);
+        let attachment = tokio::spawn(run_attached_session(
+            store,
+            session_id,
+            lock_path,
+            socket_path,
+            0,
+            command_rx,
+            event_tx,
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if server.live.lock().unwrap().events.receiver_count() > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("attached viewer should establish the live socket");
+        drop(writer);
+        drop(server);
+        tokio::time::timeout(std::time::Duration::from_secs(1), attachment)
+            .await
+            .expect("attached viewer should leave a silent closed owner")
             .expect("attachment task should not panic")
             .expect("owner loss is a clean detach");
         scratch.discard().await;
