@@ -2671,6 +2671,14 @@ fn running_status_shimmer_sweeps_spinner_label_and_timer() {
     assert!(green(&label_crest[1]) > 200, "spinner crest is gold");
     assert!(green(&label_crest[3]) > 180, "sweep reaches the label");
     assert!(green(&timer_crest[11]) > 200, "timer crest is gold");
+    let mut resting = base.clone();
+    apply_running_status_shimmer(&mut resting, RUNNING_SHIMMER_CYCLE_MILLIS + 1);
+    assert!(
+        resting
+            .iter()
+            .all(|span| span.style.fg == Some(RUNNING_STATUS_PEACH)),
+        "the status sweep rests between passes"
+    );
     assert_eq!(
         label_crest.last().unwrap().style.fg,
         Some(RUNNING_STATUS_PEACH)

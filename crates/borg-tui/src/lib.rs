@@ -8398,33 +8398,8 @@ impl BorgTerminal {
                     });
                 }
             }
-            if !is_launch_screen && self.scroll_from_bottom > 0 {
-                let label = format!(" ↓ {} ", ui_text(ui_language, "Jump to bottom"));
-                let button_width = label.width() as u16;
-                let button = Rect {
-                    x: chunks[2].right().saturating_sub(button_width + 1),
-                    y: chunks[0].bottom().saturating_sub(1),
-                    width: button_width,
-                    height: 1,
-                };
-                frame.render_widget(
-                    Paragraph::new(label).style(
-                        Style::default()
-                            .fg(if self.jump_to_bottom_hovered {
-                                Color::White
-                            } else {
-                                Color::Gray
-                            })
-                            .bg(if self.jump_to_bottom_hovered {
-                                MESSAGE_HOVER_BG
-                            } else {
-                                Color::Black
-                            }),
-                    ),
-                    button,
-                );
-                next_jump_to_bottom_area = Some(button);
-            }
+            let jump_to_bottom_label = (!is_launch_screen && self.scroll_from_bottom > 0)
+                .then(|| format!(" ↓ {} ", ui_text(ui_language, "Jump to bottom")));
             if !queued_prompts.is_empty() {
                 next_pending_input_header_area = Some(Rect {
                     height: chunks[1].height.min(1),
@@ -8608,7 +8583,7 @@ impl BorgTerminal {
                 status_duration.as_deref(),
             );
             if session_is_active && self.running_sweeps && !status_highlight {
-                apply_running_status_shimmer(&mut status_spans, running_shimmer_phase());
+                apply_running_status_shimmer(&mut status_spans, running_status_shimmer_phase());
             }
             let status_width = status_spans.iter().map(|span| span.width()).sum::<usize>();
             let agents_status = agents_status_label(active_subagents);
@@ -8878,7 +8853,7 @@ impl BorgTerminal {
                     (" ↩ Return ", SUBAGENT_PINK)
                 };
                 let button = Rect {
-                    x: status_area.right().saturating_sub(label.width() as u16),
+                    x: chunks[2].right().saturating_sub(label.width() as u16 + 1),
                     y: status_area.y,
                     width: label.width() as u16,
                     height: 1,
@@ -8901,6 +8876,42 @@ impl BorgTerminal {
                     button,
                 );
                 next_back_to_director_area = Some(button);
+            }
+            if let Some(label) = jump_to_bottom_label {
+                // Share the right edge and style of the return button; when
+                // both are shown they sit side by side on the status row.
+                let width = label.width() as u16;
+                let button = match next_back_to_director_area {
+                    Some(back) => Rect {
+                        x: back.x.saturating_sub(width + 1),
+                        y: back.y,
+                        width,
+                        height: 1,
+                    },
+                    None => Rect {
+                        x: chunks[2].right().saturating_sub(width + 1),
+                        y: chunks[0].bottom().saturating_sub(1),
+                        width,
+                        height: 1,
+                    },
+                };
+                frame.render_widget(
+                    Paragraph::new(label).style(
+                        Style::default()
+                            .fg(if self.jump_to_bottom_hovered {
+                                Color::White
+                            } else {
+                                Color::Gray
+                            })
+                            .bg(if self.jump_to_bottom_hovered {
+                                MESSAGE_HOVER_BG
+                            } else {
+                                COMMAND_PANEL_BG
+                            }),
+                    ),
+                    button,
+                );
+                next_jump_to_bottom_area = Some(button);
             }
             if self.goal_status_hovered
                 && let Some(goal) = active_goal.as_ref()
@@ -15981,6 +15992,9 @@ fn replace_tool_activity_glyph(line: &mut Line<'static>, glyph: &str) {
 const RUNNING_SHIMMER_PADDING: usize = 10;
 const RUNNING_SHIMMER_HALF_WIDTH: f32 = 5.0;
 const RUNNING_SHIMMER_CYCLE_MILLIS: u128 = 2_000;
+/// The status sweep keeps the same speed but rests between passes, so it
+/// crosses 25% less often than the tool-row sweep.
+const RUNNING_STATUS_SHIMMER_INTERVAL_MILLIS: u128 = RUNNING_SHIMMER_CYCLE_MILLIS * 4 / 3;
 static RUNNING_SHIMMER_START: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Clone, Copy)]
@@ -16022,6 +16036,14 @@ fn running_shimmer_phase() -> u128 {
         % RUNNING_SHIMMER_CYCLE_MILLIS
 }
 
+fn running_status_shimmer_phase() -> u128 {
+    RUNNING_SHIMMER_START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        % RUNNING_STATUS_SHIMMER_INTERVAL_MILLIS
+}
+
 #[cfg(test)]
 fn apply_running_activity_pulse(line: &mut Line<'static>, phase: u128) {
     let content_width = running_activity_content_width(line);
@@ -16047,8 +16069,8 @@ fn apply_running_status_shimmer(spans: &mut Vec<Span<'static>>, phase: u128) {
     }
 
     let period = width.saturating_add(RUNNING_SHIMMER_PADDING * 2);
-    let center = ((phase % RUNNING_SHIMMER_CYCLE_MILLIS) * period as u128
-        / RUNNING_SHIMMER_CYCLE_MILLIS) as usize;
+    // Past one cycle the crest is beyond the text: the rest between passes.
+    let center = (phase * period as u128 / RUNNING_SHIMMER_CYCLE_MILLIS) as usize;
     let mut offset = 0usize;
     let mut animated = Vec::with_capacity(cells.len());
     for (grapheme, style) in cells {
