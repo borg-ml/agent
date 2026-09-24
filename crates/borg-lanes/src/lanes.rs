@@ -1986,7 +1986,7 @@ fn budget_reason(root: &Path, state: &Journal, budget: &AdmissionBudget) -> Resu
     let active: Vec<_> = state
         .records
         .iter()
-        .filter(|r| matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
+        .filter(|r| r.quarantined || matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
         .filter_map(|r| {
             r.spec
                 .as_ref()
@@ -2046,7 +2046,7 @@ fn budget_reason(root: &Path, state: &Journal, budget: &AdmissionBudget) -> Resu
     let reserved_disk: u64 = state
         .records
         .iter()
-        .filter(|r| matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
+        .filter(|r| r.quarantined || matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
         .filter_map(|r| {
             r.spec
                 .as_ref()
@@ -4304,6 +4304,20 @@ mod tests {
             1,
             "independent resource keys still share host RAM"
         );
+        store
+            .reading(|state| {
+                let mut quarantined = state.clone();
+                let row = quarantined
+                    .records
+                    .iter_mut()
+                    .find(|row| row.ticket.id == admitted[0].ticket.id)
+                    .unwrap();
+                row.state = TicketState::Finished;
+                row.quarantined = true;
+                assert!(budget_reason(store.root(), &quarantined, &budget)?.is_some());
+                Ok(())
+            })
+            .unwrap();
         store.release_lease(&admitted[0]).unwrap();
         assert!(
             store
