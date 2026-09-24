@@ -313,12 +313,14 @@ fn subscription_request_body(
         !disabled || !capabilities.thinking_required,
         "the selected Claude model requires thinking"
     );
+    // Newer models omit thinking text unless a display is requested; the
+    // summaries are what the transcript shows as Reasoned rows.
     if disabled || !capabilities.thinking {
         body["thinking"] = json!({"type": "disabled"});
     } else if capabilities.adaptive_thinking {
-        body["thinking"] = json!({"type": "adaptive"});
+        body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
     } else {
-        body["thinking"] = json!({"type": "enabled", "budget_tokens": 4096.min(capabilities.default_output_tokens.saturating_sub(1))});
+        body["thinking"] = json!({"type": "enabled", "budget_tokens": 4096.min(capabilities.default_output_tokens.saturating_sub(1)), "display": "summarized"});
     }
     if !disabled && !capabilities.efforts.is_empty() {
         ensure!(

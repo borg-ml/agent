@@ -77,7 +77,8 @@ Git comparison.
   catalog. Claude Code's own tools, claude.ai connectors, plugins, skills,
   settings files, memory and "the user hasn't heard from you" reminder are
   off. That reminder often pushed Claude to write its progress updates
-  inside thinking.
+  inside thinking. Borg requests summarized thinking, so Claude's reasoning
+  still streams as Reasoned rows.
 - **Reasoned rows show their summary.** A collapsed Reasoned row now shows
   the first line of the thinking summary.
 - **Provider switches and compaction keep Borg's context.** Switching between
