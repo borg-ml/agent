@@ -9,6 +9,59 @@ launches. The subsequent authorized implementation has its own
 [private visual pilot and measured evidence](../../../abundance/docs/VISUAL_ITERATION.md);
 the architectural recommendations below include work beyond that pilot.
 
+**Implementation delivered, 24 September:** the authorized reliability follow-up
+is on Abundance main through `fbc5fb1e`. It adds host RAM reservations and a
+compiler-action cap, portable ignored/generated asset manifests with safe
+reflink staging, bounded automation with conclusive final results, default
+zero-test preflight, and atomic candidate/result/review/activation checks. The
+private visual runner now pins its tool code as well as runtime inputs and
+suppresses the one-shot capture timer that previously ended warm sessions.
+The pre-existing item-purpose audit failure was fixed by scanning nested
+runtime sources. Details, commands and complete evidence are in
+[VISUAL_ITERATION.md](../../../abundance/docs/VISUAL_ITERATION.md).
+
+Borg core commits `f2fb4c59`, `8d4b40a3` and `9c58e0e2` coordinate admission
+across independent journals, account for remaining growth without crediting
+reclaimable file cache, preserve quarantined workloads' reservations, and rotate
+backend ports durably across supervisor crashes. Plugin commit `7b7d72c4`
+exposes project-configured visual/asset adapters. Existing Borg job/service
+ownership remains authoritative; the Abundance bridge uses the same host lock
+and claim protocol. Old runtimes and raw heavy commands do not automatically
+participate, so production adoption still requires the coordinated runtime
+upgrade. This implementation did not select a backend or restart the shared
+editor, and did not repeat real-Unreal crash recovery on the new Borg binary.
+
+The final matched torch experiment produced three frames at 1600 × 900 with
+8-second stable settle per arm. **Measured:** 31.26 s private-editor startup;
+60.37 s first batch including 18.14 s PIE setup; 28.57 s repeat batch in the same
+editor/PIE. Thus reuse saved 63.06 s versus editor startup plus first batch
+(91.63 s), excluding build, queue and fixture checks. These are single paired
+observations, not percentiles or standalone-game screenshot parity. Identical
+camera/pawn/settings readbacks and visually consistent off/normal/overexposed
+arms establish that the live light controls changed the rendered scene.
+All 1,263 hashed source/tool inputs match the committed implementation.
+
+Cached verification of all 23,089 Content files (50.8 GiB) took 1.32 s to
+snapshot and 4.54 s to verify/stage an already complete tree. A deliberately
+missing mannequin/foliage fixture staged two files (15.8 MB) in 0.036 s using
+reflinks with independent inodes. These measured warm operations do not include
+the unmeasured first full content-hashing cost.
+
+Acceptance evidence: Borg unit contracts 66/66 and separate cross-process host
+admission tests 2/2; plugin nine passes/two opt-in skips; Abundance release-switch
+46/46, asset/watchdog/release contracts 6/6 and visual contracts 7/7. The full
+339-case native run had 335 passes, three fixture skips and one fake scope test
+whose RAM request made it depend on live contention. Its corrected fixture and
+the reliability test both passed on rerun. Recovery-port rotation was verified
+against an occupied TCP port using a fake backend; its expected avoidance of
+the reported ~61-second recovery penalty is still an estimate for real UE.
+
+The remaining architectural ideas below (a reusable workspace pool, broader
+gameplay scenarios, input replay, remote workers and product packaging) are
+future proposals, not claims of delivered capability. The implemented changes
+target normal visual iteration and prevent invalid work first; rare recovery
+speed remains a separate acceptance gate.
+
 **Recommendation:** optimize time from an edit to a trustworthy decision about
 the running game. Build a reproducible experiment runner on the existing lanes,
 make frequently tuned presentation values changeable in a running scene, and
