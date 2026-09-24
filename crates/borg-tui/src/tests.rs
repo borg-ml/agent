@@ -8474,6 +8474,55 @@ fn invalidated_activity_redraw_recomputes_scrollbar_safe_width() {
     assert!(!reuse_current_transcript_width(false, true));
 }
 
+#[tokio::test]
+#[ignore = "requires a PTY; verifies visible completed reasoning rotates on an activity redraw"]
+async fn visible_completed_reasoning_rotates_without_a_session_event() {
+    let session_id = Uuid::new_v4();
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        session_id,
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    terminal.apply_session_event(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ReasoningDelta {
+            text: "**First summary.**\n**Second summary.**".into(),
+        },
+    ));
+    let mut completed = SessionEvent::new(session_id, 2, SessionEventKind::ReasoningCompleted);
+    completed.created_at = Utc::now() + chrono::Duration::seconds(10);
+    terminal.apply_session_event(&completed);
+    terminal.draw().unwrap();
+    terminal.draw_for_activity().unwrap();
+    let first = Arc::clone(&terminal.last_committed_viewport_render.as_ref().unwrap().5);
+    assert!(
+        first
+            .0
+            .iter()
+            .any(|line| line.to_string().contains("First summary."))
+    );
+
+    if let TranscriptEntry::Tool { completed_at, .. } = &mut terminal.transcript.order[0] {
+        *completed_at = Some(Utc::now() - chrono::Duration::seconds(3));
+    } else {
+        panic!("expected reasoning row");
+    }
+    terminal.draw_for_activity().unwrap();
+    let second = &terminal.last_committed_viewport_render.as_ref().unwrap().5;
+    assert!(!Arc::ptr_eq(&first, second));
+    assert!(
+        second
+            .0
+            .iter()
+            .any(|line| line.to_string().contains("Second summary."))
+    );
+    terminal.shutdown().await;
+}
+
 #[test]
 fn low_frequency_settings_do_not_clutter_slash_suggestions() {
     for command in [
