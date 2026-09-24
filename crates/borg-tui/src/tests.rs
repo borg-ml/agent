@@ -2712,9 +2712,11 @@ fn running_status_shimmer_sweeps_spinner_label_and_timer() {
             + 1
     };
     let base = status_control_spans("⠋", "running", RUNNING_STATUS_PEACH, false, Some("2m"));
+    let mut spinner_crest = base.clone();
     let mut label_crest = base.clone();
     let mut timer_crest = base.clone();
-    apply_running_status_shimmer(&mut label_crest, phase_for(1));
+    apply_running_status_shimmer(&mut spinner_crest, phase_for(1));
+    apply_running_status_shimmer(&mut label_crest, phase_for(3));
     apply_running_status_shimmer(&mut timer_crest, phase_for(11));
 
     assert_eq!(Line::from(label_crest.clone()).to_string(), " ⠋ running 2m");
@@ -2722,8 +2724,8 @@ fn running_status_shimmer_sweeps_spinner_label_and_timer() {
         Some(Color::Rgb(_, green, _)) => green,
         _ => panic!("the running sweep uses RGB colors"),
     };
-    assert!(green(&label_crest[1]) > 200, "spinner crest is gold");
-    assert!(green(&label_crest[3]) > 180, "sweep reaches the label");
+    assert!(green(&spinner_crest[1]) > 200, "spinner crest is gold");
+    assert!(green(&label_crest[3]) > 200, "sweep reaches the label");
     assert!(green(&timer_crest[11]) > 200, "timer crest is gold");
     let mut resting = base.clone();
     apply_running_status_shimmer(&mut resting, RUNNING_STATUS_SHIMMER_PASS_MILLIS + 1);
