@@ -461,7 +461,12 @@ impl NativeHarness {
             root: turn.cwd.clone(),
             permission: turn.permission_mode,
             agent_tools: turn.agent_tools.clone(),
-            external_mcp_servers: turn.external_mcp_servers.clone(),
+            // The Borg harness exposes external MCP only through `borg call`,
+            // which starts servers lazily, so a turn never waits on them.
+            external_mcp_servers: match self.harness {
+                HarnessMode::Borg => Vec::new(),
+                HarnessMode::Native => turn.external_mcp_servers.clone(),
+            },
             extension_skill_roots: turn.extension_skill_roots.clone(),
             execution_provider: turn.agent_tools.execution_provider(),
             session_store,
