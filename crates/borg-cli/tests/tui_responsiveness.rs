@@ -97,6 +97,10 @@ fn live_tui_input_latency_under_storage_pressure() {
         .write_all_retry(&mouse_wheel_sequence(65, 32, 1, 10))
         .expect("restore live-tail scroll");
 
+    assert!(
+        !server.is_finished(),
+        "mock stream ended before the active CPU sample"
+    );
     let cpu_before = terminal.cpu_time().expect("read initial Borg CPU time");
     let cpu_sample_started = Instant::now();
     while cpu_sample_started.elapsed() < ACTIVE_CPU_SAMPLE {
@@ -111,6 +115,10 @@ fn live_tui_input_latency_under_storage_pressure() {
         .saturating_sub(cpu_before)
         .as_secs_f64()
         / cpu_sample_started.elapsed().as_secs_f64();
+    assert!(
+        !server.is_finished(),
+        "mock stream ended during the active CPU sample"
+    );
 
     let stop_pressure = Arc::new(AtomicBool::new(false));
     let pressure_bytes = Arc::new(AtomicU64::new(0));
@@ -321,7 +329,7 @@ fn spawn_streaming_provider() -> (String, mpsc::Receiver<()>, thread::JoinHandle
         read_http_request(&mut socket).expect("read provider request");
         started_tx.send(()).expect("publish provider start");
 
-        const DELTAS: usize = 1_500;
+        const DELTAS: usize = 3_000;
         let mut frames = Vec::with_capacity(DELTAS + 2);
         for index in 0..DELTAS {
             frames.push(format!(
