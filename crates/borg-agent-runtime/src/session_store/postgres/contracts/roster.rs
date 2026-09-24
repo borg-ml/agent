@@ -79,6 +79,8 @@ async fn mirrored_child_provider_audit_events_are_live_only() {
     // Durable in the child, but provider audit records the parent never reads.
     for kind in [
         "native_model_message",
+        "native_model_request",
+        "native_model_usage",
         "native_tool_round_completed",
         "context_compaction",
     ] {

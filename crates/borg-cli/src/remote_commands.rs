@@ -4071,6 +4071,7 @@ async fn run_local_agent_session(
                         input_tokens,
                         output_tokens,
                         cached_input_tokens,
+                        cache_creation_input_tokens,
                         total_tokens,
                         cost_usd,
                         ..
@@ -4078,6 +4079,7 @@ async fn run_local_agent_session(
                         *input_tokens,
                         *output_tokens,
                         *cached_input_tokens,
+                        *cache_creation_input_tokens,
                         *total_tokens,
                         *cost_usd,
                     ),
@@ -9669,6 +9671,7 @@ struct SessionUsage {
     input_tokens: u64,
     output_tokens: u64,
     cached_input_tokens: u64,
+    cache_creation_input_tokens: u64,
     total_tokens: u64,
     cost_usd: Option<f64>,
 }
@@ -9680,16 +9683,26 @@ impl SessionUsage {
             input_tokens: projected.input_tokens,
             output_tokens: projected.output_tokens,
             cached_input_tokens: projected.cached_input_tokens,
+            cache_creation_input_tokens: projected.cache_creation_input_tokens,
             total_tokens: projected.total_tokens,
             cost_usd: projected.cost_usd,
         }
     }
 
-    fn add(&mut self, input: u64, output: u64, cached: u64, total: u64, cost: Option<f64>) {
+    fn add(
+        &mut self,
+        input: u64,
+        output: u64,
+        cached: u64,
+        written: u64,
+        total: u64,
+        cost: Option<f64>,
+    ) {
         self.calls += 1;
         self.input_tokens += input;
         self.output_tokens += output;
         self.cached_input_tokens += cached;
+        self.cache_creation_input_tokens += written;
         self.total_tokens += total;
         if let Some(cost) = cost {
             self.cost_usd = Some(self.cost_usd.unwrap_or_default() + cost);
@@ -9800,7 +9813,7 @@ fn format_usage_summary(
         format!("  {:<16} {}", "Calls", format_count(session.calls)),
         format!(
             "  {:<16} {}",
-            "Input tokens",
+            "Uncached input",
             format_count(session.input_tokens)
         ),
         format!(
@@ -9810,15 +9823,23 @@ fn format_usage_summary(
         ),
         format!(
             "  {:<16} {}",
+            "Cache writes",
+            format_count(session.cache_creation_input_tokens)
+        ),
+        format!(
+            "  {:<16} {}",
             "Output tokens",
             format_count(session.output_tokens)
         ),
         format!(
             "  {:<16} {}",
-            "Total tokens",
+            "Processed tokens",
             format_count(session.total_tokens)
         ),
     ]);
+    if matches!(provider, CodingProvider::Codex | CodingProvider::Claude) {
+        lines.push("  Processed tokens include cache reads and writes; output includes reasoning. Account allowance is reported separately above.".to_string());
+    }
     if let Some(cost) = session.cost_usd {
         lines.push(format!("  {:<16} ${cost:.4}", "Estimated cost"));
     }

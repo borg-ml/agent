@@ -696,6 +696,8 @@ impl Transcript {
         }
         self.session_usage = borg_remote::SubagentUsage {
             input_tokens: state.usage.input_tokens,
+            cached_input_tokens: state.usage.cached_input_tokens,
+            cache_creation_input_tokens: state.usage.cache_creation_input_tokens,
             output_tokens: state.usage.output_tokens,
             total_tokens: state.usage.total_tokens,
             context_tokens: state.usage.context_tokens,
@@ -1428,6 +1430,14 @@ impl Transcript {
                     .session_usage
                     .output_tokens
                     .saturating_add(*output_tokens);
+                self.session_usage.cached_input_tokens = self
+                    .session_usage
+                    .cached_input_tokens
+                    .saturating_add(*cached_input_tokens);
+                self.session_usage.cache_creation_input_tokens = self
+                    .session_usage
+                    .cache_creation_input_tokens
+                    .saturating_add(*cache_creation_input_tokens);
                 self.session_usage.total_tokens = self
                     .session_usage
                     .total_tokens

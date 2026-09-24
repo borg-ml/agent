@@ -106,6 +106,8 @@ impl SubagentStatus {
 #[ts(export)]
 pub struct SubagentUsage {
     pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub context_tokens: Option<u64>,
@@ -9175,6 +9177,16 @@ async fn update_from_session_event(
                 .usage
                 .input_tokens
                 .saturating_add(*input_tokens);
+            entry.snapshot.usage.cached_input_tokens = entry
+                .snapshot
+                .usage
+                .cached_input_tokens
+                .saturating_add(*cached_input_tokens);
+            entry.snapshot.usage.cache_creation_input_tokens = entry
+                .snapshot
+                .usage
+                .cache_creation_input_tokens
+                .saturating_add(*cache_creation_input_tokens);
             entry.snapshot.usage.output_tokens = entry
                 .snapshot
                 .usage
@@ -9233,6 +9245,8 @@ fn project_child_state(snapshot: &mut SubagentSnapshot, state: &crate::SessionSt
     snapshot.final_text = state.latest_response.clone();
     snapshot.usage = SubagentUsage {
         input_tokens: state.usage.input_tokens,
+        cached_input_tokens: state.usage.cached_input_tokens,
+        cache_creation_input_tokens: state.usage.cache_creation_input_tokens,
         output_tokens: state.usage.output_tokens,
         total_tokens: state.usage.total_tokens,
         context_tokens: state.usage.context_tokens,

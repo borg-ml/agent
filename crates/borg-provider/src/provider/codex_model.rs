@@ -358,6 +358,9 @@ impl CodexModelProvider {
         refresh: Option<PromptCacheRefresh>,
         auth_file: Option<std::path::PathBuf>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        request
+            .request_id
+            .get_or_insert_with(|| uuid::Uuid::new_v4().to_string());
         // See the same guard in `openai_compatible`: a refresh gets its own
         // client request id so an upstream cannot deduplicate it against the
         // real turn and return without refreshing anything.
@@ -407,6 +410,17 @@ impl CodexModelProvider {
                 body["max_output_tokens"] = json!(refresh.max_output_tokens);
             }
             let endpoint = access.endpoint();
+            publish_model_audit(progress.as_ref(), "native_model_request", json!({
+                "request_id": request.request_id,
+                "session_id": request.session_id,
+                "protocol": "openai_responses",
+                "model": self.model, "effort": self.effort, "fast": request.fast,
+                "prompt_cache_key": request.prompt_cache_key,
+                "instructions_sha256": hex::encode(Sha256::digest(serde_json::to_vec(&body["instructions"])?)),
+                "tools_sha256": hex::encode(Sha256::digest(serde_json::to_vec(&body["tools"])?)),
+                "auth": if access.is_api_key() { "api_key" } else { "subscription_oauth" },
+                "agent_loop": "borg",
+            }));
             let response = self
                 .send(
                     &client,
@@ -417,7 +431,7 @@ impl CodexModelProvider {
                     &body,
                 )
                 .await?;
-            let (mut message, response) = self.read_stream(response, progress.as_ref()).await?;
+            let (mut message, response) = self.read_stream(response, progress.as_ref(), request.request_id.as_deref()).await?;
             if let ModelMessage::Assistant { provider_state: Some(ModelProviderState::OpenAiResponses { account_identity, .. }), .. } = &mut message {
                 *account_identity = Some(expected_account.to_string());
             }
@@ -427,19 +441,6 @@ impl CodexModelProvider {
         match result {
             Ok((message, raw_response, context_window, api_key)) => {
                 trace.exit_status = Some(0);
-                let input = raw_response
-                    .pointer("/usage/input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let cached = raw_response
-                    .pointer("/usage/input_tokens_details/cached_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    .min(input);
-                let output = raw_response
-                    .pointer("/usage/output_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
                 let has_tools = matches!(&message, ModelMessage::Assistant { tool_calls, .. } if !tool_calls.is_empty());
                 let finish_reason = if response_hit_output_limit(&raw_response) {
                     "length"
@@ -453,18 +454,13 @@ impl CodexModelProvider {
                     finish_reason: finish_reason.into(),
                     usage: ProviderCallUsage {
                         duration_ms: crate::runtime::elapsed_millis_u64(started),
-                        input_tokens: input - cached,
-                        cached_input_tokens: cached,
-                        output_tokens: output,
-                        total_tokens: input.saturating_add(output),
-                        context_tokens: Some(input),
                         context_window_tokens: context_window,
                         cost_basis: if api_key {
                             CostBasis::Unavailable
                         } else {
                             CostBasis::SubscriptionEquivalent
                         },
-                        ..Default::default()
+                        ..response_usage(&raw_response)
                     },
                     raw_response,
                     trace,
@@ -666,6 +662,7 @@ impl CodexModelProvider {
         &self,
         response: reqwest::Response,
         progress: Option<&UnboundedSender<ProviderProgress>>,
+        request_id: Option<&str>,
     ) -> Result<(ModelMessage, Value)> {
         let response = check_subscription_response(response).await?;
         let mut stream = response.bytes_stream();
@@ -690,6 +687,22 @@ impl CodexModelProvider {
                         let event: Value = serde_json::from_str(&data)
                             .context("invalid Codex model event JSON")?;
                         data.clear();
+                        if let Some(usage) =
+                            event.pointer("/response/usage").filter(|v| v.is_object())
+                        {
+                            publish_model_audit(
+                                progress,
+                                "native_model_usage",
+                                json!({
+                                    "request_id": request_id,
+                                    "response_id": event.pointer("/response/id"),
+                                    "protocol": "openai_responses",
+                                    "complete": matches!(event["type"].as_str(), Some("response.completed" | "response.incomplete" | "response.failed")),
+                                    "status": event.pointer("/response/status"),
+                                    "usage": usage,
+                                }),
+                            );
+                        }
                         if let Some(response) =
                             state.event(&event, progress, &self.model, &self.effort)?
                         {
@@ -711,6 +724,52 @@ impl CodexModelProvider {
             );
         }
         bail!("Codex model stream ended before response.completed; no tools were executed")
+    }
+}
+
+fn response_usage(response: &Value) -> ProviderCallUsage {
+    let usage = &response["usage"];
+    let input = usage["input_tokens"].as_u64().unwrap_or(0);
+    let cached = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(input);
+    let written = usage
+        .pointer("/input_tokens_details/cache_write_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(input - cached);
+    let output = usage["output_tokens"].as_u64().unwrap_or(0);
+    ProviderCallUsage {
+        input_tokens: input - cached - written,
+        cached_input_tokens: cached,
+        cache_creation_input_tokens: written,
+        output_tokens: output,
+        total_tokens: input.saturating_add(output),
+        context_tokens: Some(input),
+        ..Default::default()
+    }
+}
+
+fn publish_model_audit(
+    progress: Option<&UnboundedSender<ProviderProgress>>,
+    kind: &str,
+    payload: Value,
+) {
+    if let Some(progress) = progress {
+        let _ = progress.send(ProviderProgress::ProviderEvent {
+            kind: kind.into(),
+            payload,
+            raw_payload: Box::new(None),
+            stream_channel: None,
+            content_text: None,
+            provider_item_id: None,
+            tool_use_id: None,
+            tool_name: None,
+            model: None,
+            effort: None,
+        });
     }
 }
 
@@ -1464,7 +1523,7 @@ mod tests {
             effort: "low".into(),
         };
         let error = provider
-            .read_stream(response, Some(&progress))
+            .read_stream(response, Some(&progress), Some("test-request"))
             .await
             .unwrap_err()
             .to_string();
@@ -1836,7 +1895,7 @@ mod tests {
                     socket.write_all(format!("data: {event}\n\n").as_bytes()).await.unwrap();
                 }
                 let end = json!({"type":"response.completed","response":{"status":"completed","output":[],
-                    "usage":{"input_tokens":12,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}}});
+                    "usage":{"input_tokens":12,"output_tokens":3,"input_tokens_details":{"cached_tokens":4,"cache_write_tokens":2},"output_tokens_details":{"reasoning_tokens":2}}}});
                 // Split the SSE frame across transport chunks as well.
                 let frame = format!("data: {end}\n\n");
                 socket.write_all(&frame.as_bytes()[..7]).await.unwrap();
@@ -1853,15 +1912,24 @@ mod tests {
                 &mut access, &account,
                 &request, &provider.request_body(&request).unwrap()).await.unwrap();
             let (tx, mut rx) = mpsc::unbounded_channel();
-            let read = tokio::spawn(async move { provider.read_stream(response, Some(&tx)).await });
+            let read = tokio::spawn(async move { provider.read_stream(response, Some(&tx), Some("test-request")).await });
             assert!(matches!(rx.recv().await.unwrap(), ProviderProgress::ProviderEvent { kind, .. } if kind == "reasoning_delta"));
             assert!(rx.try_recv().is_err());
             first_tx.send(()).unwrap();
             assert!(matches!(rx.recv().await.unwrap(), ProviderProgress::ToolCallGenerating { id: Some(id) } if id == "call"));
             assert!(!read.is_finished(), "complete arguments must still be withheld");
             finish_tx.send(()).unwrap();
-            let (message, _) = read.await.unwrap().unwrap();
+            let (message, raw) = read.await.unwrap().unwrap();
             server.await.unwrap();
+            let usage = response_usage(&raw);
+            assert_eq!((usage.input_tokens, usage.cached_input_tokens, usage.cache_creation_input_tokens, usage.output_tokens, usage.total_tokens), (6, 4, 2, 3, 15));
+            let audit = std::iter::from_fn(|| rx.try_recv().ok()).find_map(|event| match event {
+                ProviderProgress::ProviderEvent { kind, payload, .. } if kind == "native_model_usage" => Some(payload),
+                _ => None,
+            }).expect("per-request usage survives the SSE decoder");
+            assert_eq!(audit["request_id"], "test-request");
+            assert_eq!(audit["complete"], true);
+            assert_eq!(audit["usage"], raw["usage"]);
             // Simulate Borg's durable serialization before the next tool round.
             request.messages.push(serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap());
             request.messages.push(ModelMessage::Tool { tool_call_id: "call".into(), content: "ok".into(), attachments: Vec::new() });

@@ -35,14 +35,18 @@ impl fmt::Display for CostBasis {
 pub struct ProviderCallUsage {
     #[serde(default)]
     pub duration_ms: u64,
+    /// Input that was neither read from nor written to the prompt cache.
     #[serde(default)]
     pub input_tokens: u64,
     #[serde(default)]
     pub cached_input_tokens: u64,
     #[serde(default)]
     pub cache_creation_input_tokens: u64,
+    /// Includes reasoning tokens when the provider counts them as output.
     #[serde(default)]
     pub output_tokens: u64,
+    /// All processed input (including cache reads/writes) plus output. This is
+    /// not a subscription allowance debit or a provider's blended UI counter.
     #[serde(default)]
     pub total_tokens: u64,
     #[serde(default)]

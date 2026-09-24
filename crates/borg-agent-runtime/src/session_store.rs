@@ -232,6 +232,8 @@ impl SessionEventKind {
                 if matches!(
                     kind.as_str(),
                     "native_model_message"
+                        | "native_model_request"
+                        | "native_model_usage"
                         | "native_prompt_context"
                         | "native_tool_round_completed"
                         | "network_retry"
@@ -357,7 +359,7 @@ impl SessionEventKind {
 
     pub fn is_fork_inheritable(&self) -> bool {
         if matches!(self, Self::ProviderEvent { kind, .. }
-            if matches!(kind.as_str(), "network_retry" | "usage_limit_retry" | "usage_limit_retry_cancelled" | "usage_limit_retry_released"))
+            if matches!(kind.as_str(), "native_model_request" | "native_model_usage" | "network_retry" | "usage_limit_retry" | "usage_limit_retry_cancelled" | "usage_limit_retry_released"))
         {
             return false;
         }
