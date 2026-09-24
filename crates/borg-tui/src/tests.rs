@@ -2671,7 +2671,10 @@ fn running_status_shimmer_sweeps_label_and_timer_but_not_spinner() {
     };
     assert!(green(&label_crest[2]) > 200, "label crest is gold");
     assert!(green(&timer_crest[9]) > 200, "timer crest is gold");
-    assert_eq!(label_crest.last().unwrap().style.fg, Some(RUNNING_STATUS_PEACH));
+    assert_eq!(
+        label_crest.last().unwrap().style.fg,
+        Some(RUNNING_STATUS_PEACH)
+    );
 }
 
 #[test]
