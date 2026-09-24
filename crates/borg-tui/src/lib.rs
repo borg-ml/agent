@@ -7406,6 +7406,8 @@ impl BorgTerminal {
             && matches!(status, SessionStatus::Starting | SessionStatus::Running)
         {
             "borging"
+        } else if status == SessionStatus::Ready && self.transcript.watch_status().is_some() {
+            "waiting"
         } else {
             self.transcript.status_label(status)
         };
@@ -8587,7 +8589,7 @@ impl BorgTerminal {
                 frame_cursor = Some(cursor);
             }
             let status_highlight = self.status_hovered && status_is_interruptible;
-            let status_duration = if session_is_active {
+            let status_duration = if session_is_active && reconnect_label.is_none() {
                 format_elapsed_duration(active_status_started_at.map_or(0, |started| {
                     Utc::now()
                         .signed_duration_since(started)
@@ -16018,27 +16020,30 @@ fn apply_running_activity_pulse(line: &mut Line<'static>, phase: u128) {
 }
 
 fn apply_running_status_shimmer(spans: &mut Vec<Span<'static>>, phase: u128) {
-    let has_duration = spans.len() > 2;
-    let Some(label) = spans.get(1).cloned() else {
-        return;
-    };
-    let label_width = UnicodeWidthStr::width(label.content.as_ref());
-    if label_width == 0 {
+    let cells = spans
+        .iter()
+        .skip(1)
+        .flat_map(|span| {
+            span.content
+                .graphemes(true)
+                .map(|grapheme| (grapheme.to_string(), span.style))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let width = cells
+        .iter()
+        .map(|(grapheme, _)| UnicodeWidthStr::width(grapheme.as_str()))
+        .sum::<usize>();
+    if width == 0 {
         return;
     }
 
-    let period = label_width.saturating_add(RUNNING_SHIMMER_PADDING * 2);
+    let period = width.saturating_add(RUNNING_SHIMMER_PADDING * 2);
     let center = ((phase % RUNNING_SHIMMER_CYCLE_MILLIS) * period as u128
         / RUNNING_SHIMMER_CYCLE_MILLIS) as usize;
-    let Color::Rgb(background_red, background_green, background_blue) = COMPOSER_BG else {
-        unreachable!("composer background is RGB")
-    };
-    let Color::Rgb(base_red, base_green, base_blue) = RUNNING_STATUS_PEACH else {
-        unreachable!("running status colour is RGB")
-    };
     let mut offset = 0usize;
-    let mut animated = Vec::with_capacity(label.content.graphemes(true).count());
-    for grapheme in label.content.graphemes(true) {
+    let mut animated = Vec::with_capacity(cells.len());
+    for (grapheme, style) in cells {
         let distance = offset
             .saturating_add(RUNNING_SHIMMER_PADDING)
             .abs_diff(center) as f32;
@@ -16047,27 +16052,31 @@ fn apply_running_status_shimmer(spans: &mut Vec<Span<'static>>, phase: u128) {
         } else {
             0.0
         };
-        let fade = intensity * 0.9;
-        let channel = |base: u8, background: u8| {
-            (f32::from(base) * (1.0 - fade) + f32::from(background) * fade) as u8
-        };
+        offset = offset.saturating_add(UnicodeWidthStr::width(grapheme.as_str()));
         animated.push(Span::styled(
-            grapheme.to_string(),
-            label
-                .style
-                .fg(Color::Rgb(
-                    channel(base_red, background_red),
-                    channel(base_green, background_green),
-                    channel(base_blue, background_blue),
-                ))
+            grapheme,
+            style
+                .fg(sunburst_color(intensity))
                 .add_modifier(Modifier::BOLD),
         ));
-        offset = offset.saturating_add(UnicodeWidthStr::width(grapheme));
     }
-    spans.splice(1..2, animated);
-    if has_duration && let Some(duration) = spans.last_mut() {
-        duration.style = duration.style.fg(Color::Gray);
-    }
+    spans.truncate(1);
+    spans.extend(animated);
+}
+
+/// Salmon at rest, sweeping through orange to gold at the crest.
+fn sunburst_color(intensity: f32) -> Color {
+    const STOPS: [(f32, f32, f32); 3] = [
+        (255.0, 132.0, 112.0),
+        (255.0, 168.0, 64.0),
+        (255.0, 222.0, 120.0),
+    ];
+    let position = intensity.clamp(0.0, 1.0) * (STOPS.len() - 1) as f32;
+    let index = (position as usize).min(STOPS.len() - 2);
+    let t = position - index as f32;
+    let (from, to) = (STOPS[index], STOPS[index + 1]);
+    let mix = |a: f32, b: f32| (a + (b - a) * t).round() as u8;
+    Color::Rgb(mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
 }
 
 fn running_activity_content_width(line: &Line<'static>) -> usize {

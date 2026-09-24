@@ -2647,58 +2647,27 @@ fn running_tool_shimmer_moves_across_text_without_touching_the_gutter() {
 }
 
 #[test]
-fn running_status_shimmer_leaves_spinner_and_elapsed_time_still() {
+fn running_status_shimmer_sweeps_label_and_timer_but_not_spinner() {
     let phase_for = |offset: usize| {
         (RUNNING_SHIMMER_PADDING + offset) as u128 * RUNNING_SHIMMER_CYCLE_MILLIS
-            / ("running".width() + RUNNING_SHIMMER_PADDING * 2) as u128
+            / (" running 2m".width() + RUNNING_SHIMMER_PADDING * 2) as u128
             + 1
     };
-    let mut first = status_control_spans("⠋", "running", RUNNING_STATUS_PEACH, false, Some("2m"));
-    let mut second = first.clone();
+    let base = status_control_spans("⠋", "running", RUNNING_STATUS_PEACH, false, Some("2m"));
+    let mut label_crest = base.clone();
+    let mut timer_crest = base.clone();
+    apply_running_status_shimmer(&mut label_crest, phase_for(1));
+    apply_running_status_shimmer(&mut timer_crest, phase_for(8));
 
-    apply_running_status_shimmer(&mut first, phase_for(1));
-    apply_running_status_shimmer(&mut second, phase_for(6));
-
-    assert_eq!(first[0], second[0]);
-    assert_eq!(first.last(), second.last());
-    assert_eq!(first.last().unwrap().content, " 2m");
-    assert_eq!(first.last().unwrap().style.fg, Some(Color::Gray));
-    assert_eq!(Line::from(first.clone()).to_string(), " ⠋ running 2m");
-    assert_eq!(
-        Line::from(first.clone()).width(),
-        Line::from(second.clone()).width()
-    );
-    assert_ne!(
-        first[1..first.len() - 1]
-            .iter()
-            .map(|span| span.style)
-            .collect::<Vec<_>>(),
-        second[1..second.len() - 1]
-            .iter()
-            .map(|span| span.style)
-            .collect::<Vec<_>>()
-    );
-
-    let Color::Rgb(background_red, background_green, background_blue) = COMPOSER_BG else {
-        unreachable!()
+    assert_eq!(label_crest[0], base[0]);
+    assert_eq!(Line::from(label_crest.clone()).to_string(), " ⠋ running 2m");
+    let green = |span: &Span<'_>| match span.style.fg {
+        Some(Color::Rgb(_, green, _)) => green,
+        _ => panic!("the running sweep uses RGB colors"),
     };
-    let Color::Rgb(red, green, blue) = first[2].style.fg.unwrap() else {
-        panic!("the status shimmer uses RGB colors")
-    };
-    let Color::Rgb(base_red, base_green, base_blue) = RUNNING_STATUS_PEACH else {
-        unreachable!()
-    };
-    assert!(red.abs_diff(background_red) < red.abs_diff(base_red));
-    assert!(green.abs_diff(background_green) < green.abs_diff(base_green));
-    assert!(blue.abs_diff(background_blue) < blue.abs_diff(base_blue));
-
-    let mut without_duration =
-        status_control_spans("⠋", "running", RUNNING_STATUS_PEACH, false, None);
-    let mut with_duration =
-        status_control_spans("⠋", "running", RUNNING_STATUS_PEACH, false, Some("2m"));
-    apply_running_status_shimmer(&mut without_duration, phase_for(3));
-    apply_running_status_shimmer(&mut with_duration, phase_for(3));
-    assert_eq!(without_duration, with_duration[..with_duration.len() - 1]);
+    assert!(green(&label_crest[2]) > 200, "label crest is gold");
+    assert!(green(&timer_crest[9]) > 200, "timer crest is gold");
+    assert_eq!(label_crest.last().unwrap().style.fg, Some(RUNNING_STATUS_PEACH));
 }
 
 #[test]
