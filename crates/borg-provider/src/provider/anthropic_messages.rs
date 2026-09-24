@@ -423,16 +423,96 @@ fn image_blocks(attachments: &[super::ModelInputAttachment]) -> Vec<Value> {
     attachments
         .iter()
         .map(|attachment| {
+            let (media_type, data) = fitted_image(attachment);
             json!({
                 "type": "image",
                 "source": {
                     "type": "base64",
-                    "media_type": attachment.media_type,
-                    "data": attachment.data_base64,
+                    "media_type": media_type,
+                    "data": data,
                 },
             })
         })
         .collect()
+}
+
+/// Anthropic rejects a request when any image exceeds this edge once the
+/// request carries many images, which every long screenshot session does.
+const MAX_IMAGE_EDGE: u32 = 2000;
+
+/// The attachment, downscaled to fit `MAX_IMAGE_EDGE` when it is larger.
+/// History replays every image on every turn, so resized copies are cached.
+fn fitted_image(attachment: &super::ModelInputAttachment) -> (String, String) {
+    use base64::Engine as _;
+    use std::hash::{Hash, Hasher};
+    let original = || {
+        (
+            attachment.media_type.clone(),
+            attachment.data_base64.clone(),
+        )
+    };
+    let engine = base64::engine::general_purpose::STANDARD;
+    // Image headers sit at the start; decode a prefix to read the size cheaply.
+    let prefix = &attachment.data_base64[..attachment.data_base64.len().min(64 * 1024) / 4 * 4];
+    let dimensions = |bytes: &[u8]| {
+        image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?
+            .into_dimensions()
+            .ok()
+    };
+    let size = engine
+        .decode(prefix)
+        .ok()
+        .and_then(|bytes| dimensions(&bytes))
+        .or_else(|| dimensions(&engine.decode(&attachment.data_base64).ok()?));
+    if size.is_none_or(|(width, height)| width.max(height) <= MAX_IMAGE_EDGE) {
+        return original();
+    }
+
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<u64, (String, String)>>> = OnceLock::new();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    attachment.data_base64.hash(&mut hasher);
+    let key = hasher.finish();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return hit.clone();
+    }
+    let Some(image) = engine
+        .decode(&attachment.data_base64)
+        .ok()
+        .and_then(|bytes| image::load_from_memory(&bytes).ok())
+    else {
+        return original();
+    };
+    let resized = image.resize(
+        MAX_IMAGE_EDGE,
+        MAX_IMAGE_EDGE,
+        image::imageops::FilterType::Triangle,
+    );
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    let (media_type, written) = if attachment.media_type == "image/jpeg" {
+        let rgb = image::DynamicImage::ImageRgb8(resized.to_rgb8());
+        (
+            "image/jpeg",
+            rgb.write_to(&mut encoded, image::ImageFormat::Jpeg),
+        )
+    } else {
+        (
+            "image/png",
+            resized.write_to(&mut encoded, image::ImageFormat::Png),
+        )
+    };
+    if written.is_err() {
+        return original();
+    }
+    let fitted = (media_type.to_string(), engine.encode(encoded.into_inner()));
+    let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(key, fitted.clone());
+    fitted
 }
 
 /// Whether extended thinking is requested, and the budget it may spend.
@@ -1222,6 +1302,33 @@ mod tests {
             body["messages"][0]["content"][1]["source"]["data"],
             json!("AAAA")
         );
+    }
+
+    #[test]
+    fn a_screenshot_larger_than_the_many_image_limit_is_downscaled() {
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let encode = |width, height| {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(width, height)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            super::super::ModelInputAttachment {
+                media_type: "image/png".to_string(),
+                data_base64: engine.encode(png.into_inner()),
+                filename: None,
+            }
+        };
+        let size = |block: &Value| {
+            let bytes = engine
+                .decode(block["source"]["data"].as_str().unwrap())
+                .unwrap();
+            image::load_from_memory(&bytes).unwrap().dimensions()
+        };
+        use image::GenericImageView as _;
+        let blocks = image_blocks(&[encode(2560, 1440), encode(800, 600)]);
+        assert_eq!(size(&blocks[0]), (2000, 1125));
+        assert_eq!(size(&blocks[1]), (800, 600));
     }
 
     #[test]
