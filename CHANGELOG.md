@@ -3,7 +3,9 @@
 User-visible changes. Release pages use these highlights and link to the full
 Git comparison.
 
-## Unreleased (since 0.11.0)
+## Unreleased (since 0.11.1)
+
+## 0.11.1 (2026-09-24)
 
 ### Agents and teams
 
