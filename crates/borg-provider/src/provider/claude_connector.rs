@@ -282,9 +282,9 @@ impl Connector {
 
     async fn existing(endpoint_path: &Path, revision: &str) -> Result<Option<Self>> {
         if endpoint_path.exists() {
-            let file = File::open(&endpoint_path)?;
+            let file = File::open(endpoint_path)?;
             let bytes = crate::bounded_io::read_open_file_bytes_with_limit(
-                &endpoint_path,
+                endpoint_path,
                 "Claude connector endpoint",
                 file,
                 4096,
