@@ -108,7 +108,10 @@ pub(super) fn graphics_preview_rows(
     let cell_width = f64::from(cell.0.max(1));
     let cell_height = f64::from(cell.1.max(1));
     let scale = (width as f64 * cell_width / f64::from(image_width)).min(1.0);
-    let rows = (f64::from(image_height) * scale / cell_height).ceil();
+    // Keep the fitted image inside whole terminal rows. Rounding up reserves a
+    // mostly-empty last row, which can look like a separate stripe below a
+    // screenshot when the terminal composites the image over that row.
+    let rows = (f64::from(image_height) * scale / cell_height).floor();
     Some((rows.max(1.0) as usize).min(max_rows))
 }
 

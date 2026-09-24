@@ -5,6 +5,25 @@ Git comparison.
 
 ## Unreleased (since 0.10.0)
 
+### Development lanes and engine integration
+
+- **Host-local build lanes and supervised services.** `borg lane` and the
+  model-facing lane tools queue resource-bounded jobs across independent Borg
+  processes, recover detached jobs, and track their results. Shared services
+  have health checks, client leases, restart policies, scoped process cleanup,
+  and safe handoff to exclusive build jobs. Reservations cover memory, CPU,
+  filesystem space and service dependencies; fairness, coalescing and retry
+  behavior are observable rather than hidden.
+- **Workspace budgets and safe cleanup.** `borg worktree` reports owned
+  worktrees and build targets, enforces per-agent and disk budgets, and previews
+  eligible cleanup. Garbage collection requires human confirmation and never
+  treats unknown ownership as permission to delete.
+- **Native build and Unreal adapters.** The native lane extension sizes Cargo
+  jobs and leases a disposable PostgreSQL database for tests; the guarded
+  Unreal adapter coordinates UBT builds with editor start/stop and shared
+  services. Both expose their verified workflows without commandeering the
+  user's active workspace. See `docs/gamedev/`.
+
 ### Computer use
 
 - **Private display for testing apps and games (Linux).** `computer_use`
@@ -36,6 +55,13 @@ Git comparison.
   `attach_display` to, such as the parent's. The user's desktop is refused.
 
 ### Agents and teams
+
+- **Long waits no longer re-wake on one pending steer.** A queued follow-up
+  interrupts `wait_agent` once; further waits block until another event or the
+  timeout even if the provider has not folded that follow-up into its input yet.
+- **Team configuration and recovery.** Child agents can be reconfigured live;
+  forked teams retain their identity, ownership and transcript order after
+  restart. Team membership and queued updates survive replay and retry.
 
 - **Claude sessions run on Borg's tools and context.** Claude Code now only
   provides the subscription model and its loop. Borg runs every command and
@@ -84,6 +110,16 @@ Git comparison.
 
 ### Terminal
 
+- Image previews are bounded to the transcript, use filtered downscaling and
+  fit within complete terminal rows to avoid an extra stripe below a thumbnail.
+  In-flight messages remain selectable and attached terminals receive live
+  streaming output. Command edits have durable Edit rows; reasoning and live
+  text previews update without flooding the transcript or repainting the
+  terminal on every delta. The running sweep now darkens white tool text so
+  its moving highlight stays visible.
+- Ghostty setup ships with the release archives. Completion notifications
+  only fire when work actually stops, and new threads receive durable titles.
+
 - Pending Input can be collapsed and shows only queued human prompts. The
   composer has a lighter text stripe between divider lines, the transcript
   scrollbar uses less space, and the completion chime plays more quietly.
@@ -93,6 +129,10 @@ Git comparison.
 - Codex's Ultra effort selection maps to an accepted provider value.
 
 ### Install and update
+
+- Draft releases use curated changelog notes and packaged notices. Linux
+  computer use is implemented by the bundled native display helper rather
+  than an external Python worker; the native lane extension also runs in Blu.
 
 - `borg update`, Linux release archives and `just cli` install `borg-display`
   beside `borg`. Updates verify its version and install it atomically with

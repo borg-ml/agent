@@ -9,6 +9,7 @@
 //! earlier does not end every later wait immediately.
 
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::watch;
 
 pub(crate) const DEFAULT_WAIT: Duration = Duration::from_secs(10 * 60);
@@ -41,6 +42,8 @@ pub(crate) struct WaitSignals {
     pub cancel: Option<CancellationToken>,
     /// True while human or team input is queued for the waiting session.
     pub input_pending: Option<watch::Receiver<bool>>,
+    /// One pending input should interrupt at most one wait until it clears.
+    pub input_reported: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Default)]
@@ -133,6 +136,7 @@ impl SubagentCoordinator {
         let deadline = started + timeout.clamp(MIN_WAIT, MAX_WAIT);
         let cancel = signals.cancel.unwrap_or_default();
         let mut input = signals.input_pending;
+        let reported = signals.input_reported.unwrap_or_default();
         // Subscribe before the first look so nothing lands in between.
         let mut activity = self.subscribe();
         let mut wakes = self.subscribe_root_messages();
@@ -143,7 +147,7 @@ impl SubagentCoordinator {
         if !unseen.is_empty() {
             return self.report(actor, "child_update", unseen, started).await;
         }
-        if input_waiting(&input) {
+        if input_waiting(&input) && !reported.swap(true, Ordering::AcqRel) {
             return self.report(actor, "input_pending", unseen, started).await;
         }
         let idle_at_start = !self.children(actor).await.iter().any(working);
@@ -160,11 +164,11 @@ impl SubagentCoordinator {
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    let reason = if input_waiting(&input) { "input_pending" } else { "cancelled" };
+                    let reason = if input_waiting(&input) && !reported.swap(true, Ordering::AcqRel) { "input_pending" } else { "cancelled" };
                     let unseen = self.unseen(actor, &woken).await;
                     return self.report(actor, reason, unseen, started).await;
                 }
-                () = input_arrives(&mut input) => {
+                () = input_arrives(&mut input, &reported) => {
                     let unseen = self.unseen(actor, &woken).await;
                     return self.report(actor, "input_pending", unseen, started).await;
                 }
@@ -385,11 +389,16 @@ fn input_waiting(input: &Option<watch::Receiver<bool>>) -> bool {
 
 /// Resolves when input is waiting. A dropped sender can never signal again,
 /// so that case pends instead of spinning.
-async fn input_arrives(input: &mut Option<watch::Receiver<bool>>) {
-    if let Some(input) = input
-        && input.wait_for(|pending| *pending).await.is_ok()
-    {
-        return;
+async fn input_arrives(input: &mut Option<watch::Receiver<bool>>, reported: &AtomicBool) {
+    if let Some(input) = input {
+        while input.wait_for(|pending| !*pending).await.is_ok() {
+            if input.wait_for(|pending| *pending).await.is_err() {
+                break;
+            }
+            if !reported.swap(true, Ordering::AcqRel) {
+                return;
+            }
+        }
     }
     std::future::pending().await
 }

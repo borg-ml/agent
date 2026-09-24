@@ -2594,12 +2594,16 @@ fn running_tool_shimmer_moves_across_text_without_touching_the_gutter() {
         Span::styled("white action", Style::default().fg(Color::White)),
     ]);
     apply_running_activity_pulse(&mut white, phase_for("white action".width(), 3));
+    assert!(white.spans.iter().skip(1).any(|span| matches!(
+        span.style.fg,
+        Some(Color::Rgb(shade, _, _)) if shade < 220
+    )));
     assert!(
-        !white
+        white
             .spans
             .iter()
             .skip(1)
-            .any(|span| span.style.fg != Some(Color::White))
+            .any(|span| span.style.fg == Some(Color::White))
     );
     assert!(
         white
@@ -15885,6 +15889,21 @@ fn graphics_preview_is_scaled_down_to_a_bounded_tile() {
             .iter()
             .any(|line| line.to_string().contains("not readable")),
         "a graphics terminal must not fall back to the glyph caption"
+    );
+}
+
+#[test]
+fn graphics_preview_does_not_add_a_partial_row_below_screenshot() {
+    // At 480 px wide this 16:9 image is 270 px high: fit it into 13
+    // complete 20 px rows rather than drawing a stray fourteenth row.
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("shot.png");
+    image::RgbImage::from_pixel(2560, 1440, image::Rgb([10, 20, 30]))
+        .save(&path)
+        .unwrap();
+    assert_eq!(
+        attachments::graphics_preview_rows(&path, 60, (8, 20), 24),
+        Some(13)
     );
 }
 

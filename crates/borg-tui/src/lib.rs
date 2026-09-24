@@ -16150,7 +16150,10 @@ fn shimmer_style(style: Style, intensity: f32) -> Style {
         Color::Rgb(red, green, blue) => lift(red, green, blue),
         Color::DarkGray => lift(100, 100, 100),
         Color::Gray => lift(170, 170, 170),
-        Color::White => Color::White,
+        Color::White => {
+            let shade = (255.0 - 95.0 * intensity).round() as u8;
+            Color::Rgb(shade, shade, shade)
+        }
         other => brighten_color(other, if intensity >= 0.6 { 2 } else { 1 }),
     };
     let style = style.fg(color);

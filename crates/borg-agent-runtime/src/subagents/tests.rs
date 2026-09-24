@@ -6719,7 +6719,9 @@ async fn wait_agent_returns_on_a_child_report_and_on_waiting_input() {
     );
 
     let (input, input_pending) = tokio::sync::watch::channel(false);
+    let reported = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let waiting = {
+        let reported = Arc::clone(&reported);
         let coordinator = coordinator.clone();
         tokio::spawn(async move {
             coordinator
@@ -6729,6 +6731,7 @@ async fn wait_agent_returns_on_a_child_report_and_on_waiting_input() {
                     WaitSignals {
                         cancel: None,
                         input_pending: Some(input_pending),
+                        input_reported: Some(reported),
                     },
                 )
                 .await
@@ -6746,6 +6749,37 @@ async fn wait_agent_returns_on_a_child_report_and_on_waiting_input() {
         .unwrap()
         .unwrap();
     assert_eq!(result["reason"], "input_pending");
+    // The steer is still pending until the provider folds it. It must not
+    // end each subsequent wait immediately just because the flag is still true.
+    let again = coordinator
+        .wait_for(
+            root,
+            Duration::from_millis(250),
+            WaitSignals {
+                cancel: None,
+                input_pending: Some(input.subscribe()),
+                input_reported: Some(Arc::clone(&reported)),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(again["reason"], "timeout");
+    input.send(false).unwrap();
+    reported.store(false, std::sync::atomic::Ordering::Release);
+    input.send(true).unwrap();
+    let next = coordinator
+        .wait_for(
+            root,
+            Duration::from_millis(250),
+            WaitSignals {
+                cancel: None,
+                input_pending: Some(input.subscribe()),
+                input_reported: Some(reported),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(next["reason"], "input_pending");
     scratch.discard().await;
 }
 
