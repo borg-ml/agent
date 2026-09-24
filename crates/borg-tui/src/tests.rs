@@ -4998,7 +4998,7 @@ fn deferred_edit_output_rehydrates_as_a_copyable_diff() {
 }
 
 #[test]
-fn collapsed_composer_never_places_the_hardware_cursor_on_the_statusline() {
+fn composer_blank_rows_never_hold_the_hardware_cursor() {
     assert_eq!(
         composer_frame_cursor(Rect::new(0, 6, 80, 0), (0, 0), 0, false),
         None
@@ -5009,8 +5009,7 @@ fn collapsed_composer_never_places_the_hardware_cursor_on_the_statusline() {
     );
     assert_eq!(
         composer_frame_cursor(Rect::new(0, 6, 80, 2), (0, 0), 0, false),
-        None,
-        "the hardware cursor must not appear on the lower separator"
+        None
     );
     assert_eq!(
         composer_frame_cursor(Rect::new(0, 6, 3, 3), (0, 0), 0, false),
@@ -5018,7 +5017,7 @@ fn collapsed_composer_never_places_the_hardware_cursor_on_the_statusline() {
     );
     assert_eq!(
         composer_frame_cursor(Rect::new(0, 6, 80, 3), (0, 0), 0, false),
-        Some(Position { x: 3, y: 7 })
+        Some(Position { x: 3, y: 7 }),
     );
 }
 
@@ -11810,8 +11809,8 @@ fn status_hover_underlines_the_label_but_not_the_activity_glyph() {
 }
 
 #[test]
-fn ready_status_uses_a_diamond_activity_glyph() {
-    assert_eq!(activity_glyph(SessionStatus::Ready), "◇");
+fn ready_status_uses_an_open_circle_activity_glyph() {
+    assert_eq!(activity_glyph(SessionStatus::Ready), "○");
 }
 
 #[test]

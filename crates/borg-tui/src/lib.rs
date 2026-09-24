@@ -8473,8 +8473,12 @@ impl BorgTerminal {
                         height: footer_area.bottom().saturating_sub(composer_area.y),
                     },
                 );
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(Color::Black)),
+                    footer_area,
+                );
             }
-            let mut composer_block = Block::default()
+            let composer_block = Block::default()
                 .style(Style::default().bg(if is_launch_screen {
                     Color::Reset
                 } else {
@@ -8483,22 +8487,22 @@ impl BorgTerminal {
                 .borders(if is_launch_screen {
                     Borders::LEFT
                 } else {
-                    Borders::TOP | Borders::BOTTOM
+                    Borders::NONE
                 })
                 .border_style(Style::default().fg(if is_launch_screen {
                     BORG_ORANGE
                 } else {
                     Color::DarkGray
                 }));
-            if let Some(name) = focused_agent_name.as_deref() {
-                composer_block = composer_block.title(Span::styled(
-                    format!(" TO {name} "),
-                    Style::default()
-                        .fg(SUBAGENT_PINK)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            let composer_content_area = composer_block.inner(composer_area);
+            let composer_content_area = if is_launch_screen {
+                composer_block.inner(composer_area)
+            } else {
+                Rect {
+                    y: composer_area.y.saturating_add(1),
+                    height: composer_area.height.saturating_sub(2),
+                    ..composer_area
+                }
+            };
             frame.render_widget(composer_block, composer_area);
             let composer_content_style = Style::default().bg(if is_launch_screen {
                 Color::Reset
@@ -8565,10 +8569,7 @@ impl BorgTerminal {
                     };
                     let row = Rect {
                         x: composer_area.x.saturating_add(1),
-                        y: composer_area
-                            .y
-                            .saturating_add(u16::from(!is_launch_screen))
-                            .saturating_add(line as u16),
+                        y: composer_content_area.y.saturating_add(line as u16),
                         width: picker_hit_width,
                         height: 1,
                     };
@@ -8739,6 +8740,14 @@ impl BorgTerminal {
                     },
                 );
             }
+            if let Some(name) = focused_agent_name.as_deref() {
+                status_spans.push(Span::styled(
+                    format!("{STATUS_SEPARATOR}to {name}"),
+                    Style::default()
+                        .fg(SUBAGENT_PINK)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
             let status_line = Line::from(status_spans);
             let alignment_offset = if is_launch_screen {
                 status_area.width.saturating_sub(status_line.width() as u16) / 2
@@ -8796,7 +8805,7 @@ impl BorgTerminal {
                             .bg(if is_launch_screen {
                                 Color::Reset
                             } else {
-                                COMPOSER_BG
+                                Color::Black
                             }),
                     )
                     .alignment(if is_launch_screen {
@@ -9219,7 +9228,7 @@ impl BorgTerminal {
                 };
                 frame.render_widget(
                     Paragraph::new(controls)
-                        .style(Style::default().fg(Color::DarkGray).bg(COMPOSER_BG)),
+                        .style(Style::default().fg(Color::DarkGray).bg(Color::Black)),
                     controls_area,
                 );
                 if footer_metadata.is_some() && metadata_width > 0 {
@@ -9250,7 +9259,7 @@ impl BorgTerminal {
                     frame.render_widget(
                         Paragraph::new(metadata_line)
                             .alignment(Alignment::Right)
-                            .style(Style::default().bg(COMPOSER_BG)),
+                            .style(Style::default().bg(Color::Black)),
                         metadata_rect,
                     );
                     self.git_status_area = footer_git_status
@@ -9477,7 +9486,7 @@ impl BorgTerminal {
                 frame.render_widget(Clear, copy_area);
                 frame.render_widget(
                     Paragraph::new(copy_notice_line(notice.to_string()))
-                        .style(Style::default().bg(COMPOSER_BG)),
+                        .style(Style::default().bg(Color::Black)),
                     copy_area,
                 );
             }
@@ -15392,7 +15401,7 @@ fn composer_frame_cursor(
         .saturating_add(composer_cursor_x_offset(is_launch_screen));
     let y = area.y.saturating_add(u16::from(!is_launch_screen));
     let content_bottom = area.bottom().saturating_sub(u16::from(!is_launch_screen));
-    // A collapsed composer has no text cell between its borders.
+    // A collapsed composer has no text cell between its blank rows.
     if x >= area.right() || y >= content_bottom {
         return None;
     }
@@ -15942,7 +15951,7 @@ fn format_elapsed_duration(total_seconds: u64) -> Option<String> {
 
 fn activity_glyph(status: SessionStatus) -> &'static str {
     if status == SessionStatus::Ready {
-        return "◇";
+        return "○";
     }
     if !matches!(status, SessionStatus::Starting | SessionStatus::Running) {
         return "●";
