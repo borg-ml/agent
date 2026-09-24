@@ -10340,7 +10340,7 @@ fn recovered_idle_session_stops_orphaned_tool_spinner() {
 
 #[tokio::test]
 #[ignore = "requires a PTY; exercises Esc and Up with a queued prompt and a typed draft"]
-async fn escape_flushes_only_pending_queue_and_keeps_the_composer_draft() {
+async fn escape_interrupts_with_pending_queue_and_keeps_the_composer_draft() {
     let session_id = Uuid::new_v4();
     let directory = tempfile::tempdir().unwrap();
     let mut terminal = BorgTerminal::enter(
@@ -10359,15 +10359,18 @@ async fn escape_flushes_only_pending_queue_and_keeps_the_composer_draft() {
     });
     terminal.composer.insert("unsent draft");
 
+    // Esc stops the turn at once; the runtime sends the queued input next.
     assert!(matches!(
         terminal
             .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap(),
-        UiAction::FlushPendingInput { target: None }
+        UiAction::Interrupt { target: None }
     ));
     assert_eq!(terminal.composer.text, "unsent draft");
+    assert_eq!(terminal.queued_prompts.len(), 1);
 
     terminal.status = SessionStatus::Ready;
+    terminal.interrupt_requested = false;
     assert!(matches!(
         terminal
             .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))

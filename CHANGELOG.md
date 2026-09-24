@@ -131,6 +131,10 @@ Git comparison.
   draining after the wheel stops, and streamed text is no longer throttled to
   a few frames per second when drawing gets expensive. The transcript also
   fills the row that used to sit empty above the status line.
+- **Esc stops a turn on the first press.** Queued follow-ups no longer turn
+  the first Esc into "send pending input"; the turn stops and the queued
+  input runs next. Interrupts also outrank busy team traffic in the session
+  actor, and pressing Esc again resends a stop that has not landed yet.
 - Edited rows that span several files show each later file as a path row;
   Git's `diff --git` and `index` headers no longer appear as numbered code.
 - Ghostty setup ships with the release archives. Completion notifications
