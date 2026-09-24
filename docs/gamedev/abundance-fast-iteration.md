@@ -3,10 +3,11 @@
 Investigation: 24 September 2026. Borg source inspected through
 f25d7aa96b8609227e7a4aa146728909ec322e2f; Abundance through
 9cca68d575cae88d36e72b5c4d77db204cf79f3a. Both repositories were active.
-This is a design and prioritization report, not an implementation or benchmark
-of the proposed system. Inspection used source, existing evidence, read-only
-lane status, and aggregate journal queries. No builds, game launches, lane
-switches, configuration changes, or cleanup were performed.
+The initial investigation used source, existing evidence, read-only lane
+status and aggregate journal queries. That phase performed no builds or
+launches. The subsequent authorized implementation has its own
+[private visual pilot and measured evidence](../../../abundance/docs/VISUAL_ITERATION.md);
+the architectural recommendations below include work beyond that pilot.
 
 **Recommendation:** optimize time from an edit to a trustworthy decision about
 the running game. Build a reproducible experiment runner on the existing lanes,

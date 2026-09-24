@@ -159,3 +159,21 @@ changes at copy time, so this is adapter compatibility evidence, **not** a
 final-source release or integrated-binary gate.
 Consult `docs/gamedev/interfaces.md` for core contracts and rollout
 prerequisites.
+
+## Abundance visual-iteration pilot
+
+Abundance's [private batch runner](../../../abundance/docs/VISUAL_ITERATION.md)
+exercises the reusable-scene workflow through its existing `ab_build.sh` lane
+adapter. It builds a linked worktree once, validates source/modules/fixtures,
+keeps one private PIE scene, captures bounded pose/cvar combinations, and
+records final evidence after cleanup. Torch settings apply live; scene placement
+includes the pawn's streaming origin and aim. A Borg command watch can own the
+attached start command and observe its bounded completion.
+
+This is the project-level reference for a future generic capture workflow.
+The preview plugin's raw MCP ownership restrictions still apply; installing
+this package does not expose or automatically dispatch that project runner.
+Promote the shared batch protocol only after project-specific readiness and
+fixture contracts have comparable evidence. Cross-worker memory reservations
+and complete ignored/derived-asset manifests remain prerequisites for scaling
+private editor concurrency.
