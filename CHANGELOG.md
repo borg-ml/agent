@@ -129,8 +129,10 @@ Git comparison.
 - **Scrolling and streaming stay responsive on long sessions.** Wheel motion
   catches up by elapsed time, so a slow frame never leaves scrolling that keeps
   draining after the wheel stops, and streamed text is no longer throttled to
-  a few frames per second when drawing gets expensive. The transcript also
-  fills the row that used to sit empty above the status line.
+  a few frames per second when drawing gets expensive. Live updates redraw
+  only the changed tail of the transcript, so streaming cost no longer grows
+  with the length of the session. The transcript also fills the row that
+  used to sit empty above the status line.
 - **Esc stops a turn on the first press.** Queued follow-ups no longer turn
   the first Esc into "send pending input"; the turn stops and the queued
   input runs next. Interrupts also outrank busy team traffic in the session
