@@ -2653,7 +2653,7 @@ fn running_tool_shimmer_moves_across_text_without_touching_the_gutter() {
 #[test]
 fn running_status_shimmer_sweeps_spinner_label_and_timer() {
     let phase_for = |offset: usize| {
-        (RUNNING_SHIMMER_PADDING + offset) as u128 * RUNNING_SHIMMER_CYCLE_MILLIS
+        (RUNNING_SHIMMER_PADDING + offset) as u128 * RUNNING_STATUS_SHIMMER_PASS_MILLIS
             / (" ⠋ running 2m".width() + RUNNING_SHIMMER_PADDING * 2) as u128
             + 1
     };
@@ -2672,7 +2672,7 @@ fn running_status_shimmer_sweeps_spinner_label_and_timer() {
     assert!(green(&label_crest[3]) > 180, "sweep reaches the label");
     assert!(green(&timer_crest[11]) > 200, "timer crest is gold");
     let mut resting = base.clone();
-    apply_running_status_shimmer(&mut resting, RUNNING_SHIMMER_CYCLE_MILLIS + 1);
+    apply_running_status_shimmer(&mut resting, RUNNING_STATUS_SHIMMER_PASS_MILLIS + 1);
     assert!(
         resting
             .iter()

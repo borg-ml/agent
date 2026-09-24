@@ -189,9 +189,15 @@ impl SubagentCoordinator {
                 },
                 _ = recheck.tick() => check = true,
                 () = tokio::time::sleep_until(wake_at) => {
-                    if settle_at.is_some() {
+                    if settle_at.take().is_some() {
+                        // The change can vanish while coalescing: the child
+                        // resumed work, or its message was delivered as input.
+                        // An empty result reads as a dropped message.
                         let unseen = self.unseen(actor, &woken).await;
-                        return self.report(actor, "child_update", unseen, started).await;
+                        if !unseen.is_empty() {
+                            return self.report(actor, "child_update", unseen, started).await;
+                        }
+                        continue;
                     }
                     if until < deadline && self.children(actor).await.iter().any(working) {
                         until = deadline;
