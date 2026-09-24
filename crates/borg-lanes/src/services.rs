@@ -1261,6 +1261,14 @@ fn next_port_after(spec: &ServiceSpec, last: Option<u16>) -> Option<u16> {
             .unwrap_or(endpoint.backend_ports[0])
     })
 }
+
+fn reserve_backend_port(dir: &Path, spec: &ServiceSpec) -> Result<Option<u16>> {
+    let last = read_json::<Option<u16>>(&dir.join("last-backend-port.json")).unwrap_or(None);
+    let port = next_port_after(spec, last);
+    // Persist before spawn: even a supervisor killed during startup must rotate.
+    write_json(&dir.join("last-backend-port.json"), &port)?;
+    Ok(port)
+}
 async fn restore_client(spec: &ServiceSpec, lease: &ClientLease, port: Option<u16>) -> Result<()> {
     if let Some(restore) = &spec.restore {
         hook(
@@ -1507,7 +1515,6 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
     let mut active: Option<Backend> = None;
     let mut candidate: Option<Backend> = None;
     let mut pending: Option<(u64, String)> = None;
-    let mut last_port: Option<u16> = None;
     let mut last_activity = unix_ms();
     let mut idle = false;
     let mut failures = 0u32;
@@ -1675,8 +1682,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
-            let port = next_port_after(&spec, last_port);
-            last_port = port;
+            let port = reserve_backend_port(&dir, &spec)?;
             match spawn_backend(&spec, port, &log, &scopes) {
                 Ok((child, scope)) => {
                     status.backend_pid = child.id();
@@ -1925,8 +1931,7 @@ pub async fn supervise(root: &Path, id: &str) -> Result<()> {
                     status.backend_pid = None;
                     status.restarts += 1;
                 }
-                let port = next_port_after(&spec, last_port);
-                last_port = port;
+                let port = reserve_backend_port(&dir, &spec)?;
                 match spawn_backend(&spec, port, &log, &scopes) {
                     Ok((child, scope)) => {
                         if cold {
@@ -2544,6 +2549,27 @@ http.server.ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()
         tokio::task::JoinHandle<Result<()>>,
     ) {
         setup_with(|_| {}).await
+    }
+
+    #[tokio::test]
+    async fn supervisor_restart_rotates_away_from_persisted_busy_port() {
+        let old = StdTcpListener::bind(("127.0.0.1", port())).unwrap();
+        let old_port = old.local_addr().unwrap().port();
+        let (_root, manager, _, task) = setup_with(|spec| {
+            spec.endpoint.as_mut().unwrap().backend_ports[0] = old_port;
+            let dir = service_dir(&spec.cwd.join("services"), &spec.id).unwrap();
+            write_json(&dir.join("last-backend-port.json"), &Some(old_port)).unwrap();
+        })
+        .await;
+        let ready = manager.status("fake").await.unwrap();
+        assert!(
+            matches!(ready.state, ServiceState::Healthy { backend: Some(port) } if port != old_port)
+        );
+        assert_eq!(
+            ready.restarts, 0,
+            "recovery must not wait for the old TCP port"
+        );
+        cleanup(&manager, task).await;
     }
     pub(crate) async fn setup_with(
         configure: impl FnOnce(&mut ServiceSpec),

@@ -1969,7 +1969,7 @@ fn same_filesystem(left: &Path, right: &Path) -> Result<bool> {
 }
 
 fn budget_reason(state: &Journal, budget: &AdmissionBudget) -> Result<Option<String>> {
-    let reserved_ram: u64 = state
+    let active: Vec<_> = state
         .records
         .iter()
         .filter(|r| matches!(r.state, TicketState::Granted(_) | TicketState::Preparing))
@@ -1978,8 +1978,51 @@ fn budget_reason(state: &Journal, budget: &AdmissionBudget) -> Result<Option<Str
                 .as_ref()
                 .map(|s| &s.admission)
                 .or(r.service_admission.as_ref())
+                .map(|b| (r, b))
         })
-        .map(|b| b.reserve_ram_bytes)
+        .collect();
+    let reserved_ram = active
+        .iter()
+        .map(|(row, b)| {
+            // MemAvailable already excludes resident memory. Reserve only future
+            // growth, and never credit a shared/ancestor cgroup to two owners.
+            let scope = row.scope_cgroup.as_ref().or(row.owner_cgroup.as_ref());
+            let exclusive = scope.filter(|scope| {
+                !active.iter().any(|(other, _)| {
+                    other.ticket.id != row.ticket.id
+                        && other
+                            .scope_cgroup
+                            .as_ref()
+                            .or(other.owner_cgroup.as_ref())
+                            .is_some_and(|s| {
+                                s == *scope
+                                    || s.starts_with(&format!("{scope}/"))
+                                    || scope.starts_with(&format!("{s}/"))
+                            })
+                })
+            });
+            let resident = exclusive
+                .and_then(|scope| {
+                    fs::read_to_string(
+                        Path::new("/sys/fs/cgroup")
+                            .join(scope.trim_start_matches('/'))
+                            .join("memory.stat"),
+                    )
+                    .ok()?
+                    .lines()
+                    // Reclaimable file cache can still be in MemAvailable;
+                    // crediting memory.current would count those bytes twice.
+                    .filter_map(|line| {
+                        let (name, bytes) = line.split_once(' ')?;
+                        matches!(name, "anon" | "shmem")
+                            .then(|| bytes.parse::<u64>().ok())
+                            .flatten()
+                    })
+                    .reduce(u64::saturating_add)
+                })
+                .unwrap_or(0);
+            b.reserve_ram_bytes.saturating_sub(resident)
+        })
         .fold(0_u64, u64::saturating_add);
     let reserved_disk: u64 = state
         .records
@@ -4192,6 +4235,60 @@ mod tests {
                 .error
                 .as_deref()
                 .is_some_and(|error| error.contains("not healthy after resume"))
+        );
+    }
+
+    #[test]
+    fn concurrent_workers_cannot_reserve_the_same_ram() {
+        let dir = tempfile::tempdir().unwrap();
+        let reserve = crate::workspace::hygiene::ram_available().unwrap() * 3 / 4;
+        let budget = AdmissionBudget {
+            reserve_ram_bytes: reserve,
+            ..test_budget(dir.path())
+        };
+        let store = LaneStore::new(dir.path().join("state")).unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let admitted = std::thread::scope(|scope| {
+            let workers: Vec<_> = ["unreal", "cargo"]
+                .into_iter()
+                .map(|id| {
+                    let store = &store;
+                    let budget = &budget;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        store
+                            .try_acquire_service(
+                                LeaseRequest {
+                                    resources: vec![resource(id, Access::Shared { slots: 1 })],
+                                    holder: Holder {
+                                        purpose: format!("service:{id}"),
+                                        ..holder()
+                                    },
+                                    queue_timeout_ms: None,
+                                },
+                                budget,
+                            )
+                            .unwrap()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .filter_map(|w| w.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(
+            admitted.len(),
+            1,
+            "independent resource keys still share host RAM"
+        );
+        store.release_lease(&admitted[0]).unwrap();
+        assert!(
+            store
+                .reading(|s| budget_reason(s, &budget))
+                .unwrap()
+                .is_none()
         );
     }
 
