@@ -244,6 +244,7 @@ pub struct AgentToolDispatcher {
     /// Whether human or team input is queued behind the running turn. A
     /// blocking `wait_agent` returns on it so the parent answers promptly.
     input_pending: Arc<tokio::sync::watch::Sender<bool>>,
+    input_reported: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Default)]
@@ -834,6 +835,7 @@ impl AgentToolDispatcher {
             harness_lock: Arc::new(Mutex::new(())),
             web_search,
             input_pending: Arc::new(tokio::sync::watch::Sender::new(false)),
+            input_reported: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -879,6 +881,9 @@ impl AgentToolDispatcher {
 
     /// Published by the session loop while input waits for the running turn.
     pub(crate) fn set_input_pending(&self, pending: bool) {
+        if !pending {
+            self.input_reported.store(false, Ordering::Release);
+        }
         self.input_pending.send_if_modified(|current| {
             let changed = *current != pending;
             *current = pending;
@@ -2211,6 +2216,7 @@ impl AgentToolDispatcher {
                             WaitSignals {
                                 cancel: workflow_cancel,
                                 input_pending: Some(self.input_pending.subscribe()),
+                                input_reported: Some(Arc::clone(&self.input_reported)),
                             },
                         )
                         .await;
