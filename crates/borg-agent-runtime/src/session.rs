@@ -5311,6 +5311,26 @@ async fn run_agent_session_store_kernel_inner(
                             )
                             .await?;
                         }
+                        // Steers typed while this one was in flight were held
+                        // only to keep their order. It is in, so send them all
+                        // now rather than at the next provider boundary.
+                        let earlier_in_flight = pending_steers.iter().any(|steer| {
+                            !steer.admission.is_accepted()
+                                && matches!(steer.state, PendingSteerState::AwaitingAcknowledgement)
+                        });
+                        let held = pending_steers.iter().any(|steer| {
+                            !steer.admission.is_accepted()
+                                && matches!(steer.state, PendingSteerState::RetryAtBoundary { .. })
+                        });
+                        if held && !earlier_in_flight && !context_compaction_in_progress && !user_stop && !interrupted {
+                            retry_pending_steers(
+                                &control_tx,
+                                &steer_result_tx,
+                                &mut pending_steers,
+                                steer_boundary_generation, launch.capabilities.frames_steers_for(launch.provider, launch.model.as_deref()),
+                            )
+                            .await;
+                        }
                     } else {
                         let error = acknowledgement.err().unwrap_or_else(|| {
                             "provider acknowledged the steer without accepting admission"

@@ -1587,6 +1587,7 @@ pub struct BorgTerminal {
     git_pull_area: Option<Rect>,
     git_commit_area: Option<Rect>,
     git_commit_hovered: bool,
+    git_pull_hovered: bool,
     status: SessionStatus,
     interrupt_requested: bool,
     interrupt_requested_at: Option<Instant>,
@@ -2830,6 +2831,7 @@ impl BorgTerminal {
             git_pull_area: None,
             git_commit_area: None,
             git_commit_hovered: false,
+            git_pull_hovered: false,
             status: SessionStatus::Starting,
             interrupt_requested: false,
             interrupt_requested_at: None,
@@ -2986,6 +2988,8 @@ impl BorgTerminal {
         self.attachment_store = AttachmentStore::for_session(sessions_dir, session_id)?;
         self.keymap = KeyMap::from_config(keybindings)?;
         self.transcript = root_transcript_from_environment();
+        self.transcript
+            .set_image_cell(image_preview_cell(self.image_picker.as_ref()));
         self.director_transcript = None;
         self.child_transcripts.clear();
         self.child_unhydrated_events.clear();
@@ -3017,6 +3021,7 @@ impl BorgTerminal {
         self.git_pull_area = None;
         self.git_commit_area = None;
         self.git_commit_hovered = false;
+        self.git_pull_hovered = false;
         self.status = SessionStatus::Starting;
         self.interrupt_requested = false;
         self.session_state_sequence = 0;
@@ -4450,6 +4455,7 @@ impl BorgTerminal {
         self.permission_status_hovered = false;
         self.git_status_hovered = false;
         self.git_commit_hovered = false;
+        self.git_pull_hovered = false;
         self.back_to_director_hovered = false;
         self.scrollbar_hovered = false;
         self.jump_to_bottom_hovered = false;
@@ -5690,6 +5696,9 @@ impl BorgTerminal {
                     .is_some_and(|area| area.contains(pointer));
                 self.git_commit_hovered = self
                     .git_commit_area
+                    .is_some_and(|area| area.contains(pointer));
+                self.git_pull_hovered = self
+                    .git_pull_area
                     .is_some_and(|area| area.contains(pointer));
                 self.back_to_director_hovered = self
                     .back_to_director_area
@@ -7213,6 +7222,14 @@ impl BorgTerminal {
             self.transcript.tool_click_behavior = self.tool_click_behavior;
             self.invalidate_transcript_render_cache();
         }
+        // Child and resumed transcripts are built fresh; whichever one is shown
+        // must size previews for the graphics protocol that will draw them, or
+        // it falls back to glyph tiles under a stretched graphics image.
+        let image_cell = image_preview_cell(self.image_picker.as_ref());
+        if self.transcript.image_cell() != image_cell {
+            self.transcript.set_image_cell(image_cell);
+            self.invalidate_transcript_render_cache();
+        }
         self.drain_git_push_results();
         if self
             .copy_notice_expires_at
@@ -8229,6 +8246,37 @@ impl BorgTerminal {
                     );
                 }
                 frame.render_widget(Paragraph::new(visible_transcript), content_area);
+                // Message backgrounds and diff bars reach the screen edge: carry
+                // each row's trailing background through the scrollbar gutter,
+                // which the thin scrollbar is then drawn over.
+                if content_area.right() < transcript_area.right() {
+                    let buffer = frame.buffer_mut();
+                    for y in content_area.y..content_area.bottom() {
+                        let bg = buffer[(content_area.right() - 1, y)].bg;
+                        if bg == Color::Reset {
+                            continue;
+                        }
+                        for x in content_area.right()..transcript_area.right() {
+                            buffer[(x, y)].set_bg(bg);
+                        }
+                    }
+                }
+                // Diff bars also reach the left edge, under the detail rule.
+                {
+                    let buffer = frame.buffer_mut();
+                    for y in content_area.y..content_area.bottom() {
+                        let bg = buffer[(content_area.right() - 1, y)].bg;
+                        if !matches!(bg, rendering::DIFF_ADDED_BG | rendering::DIFF_REMOVED_BG) {
+                            continue;
+                        }
+                        for x in content_area.x..content_area.right() {
+                            if buffer[(x, y)].bg != Color::Reset {
+                                break;
+                            }
+                            buffer[(x, y)].set_bg(bg);
+                        }
+                    }
+                }
                 if let Some(picker) = self.image_picker.as_ref() {
                     for slot in image_preview_slots(link_rows) {
                         let first = slot.first_row.max(scroll_start);
@@ -8958,9 +9006,11 @@ impl BorgTerminal {
                     tooltip,
                 );
             }
-            if (self.git_status_hovered || self.git_commit_hovered)
+            if (self.git_status_hovered || self.git_commit_hovered || self.git_pull_hovered)
                 && let Some(git_area) = if self.git_commit_hovered {
                     self.git_commit_area
+                } else if self.git_pull_hovered {
+                    self.git_pull_area
                 } else {
                     self.git_status_area
                 }
@@ -8968,8 +9018,11 @@ impl BorgTerminal {
             {
                 let pushing = self.git_push.is_running(&active_cwd, GitRemoteAction::Push);
                 let committing = self.git_commit.is_committing(&active_cwd);
+                let pulling = self.git_push.is_running(&active_cwd, GitRemoteAction::Pull);
                 let tooltip_title = if self.git_commit_hovered {
                     " git commit "
+                } else if self.git_pull_hovered {
+                    " git pull "
                 } else {
                     " git push "
                 };
@@ -8981,6 +9034,15 @@ impl BorgTerminal {
                             "Commit all changes on {} — message by {} — then push — click",
                             git_status.branch,
                             commit_model_from_environment().label()
+                        )
+                    }
+                } else if self.git_pull_hovered {
+                    if pulling {
+                        format!("Pulling {} from upstream…", git_status.branch)
+                    } else {
+                        format!(
+                            "Pull ↓{} into {} — click",
+                            git_status.behind, git_status.branch
                         )
                     }
                 } else if pushing {
@@ -10513,6 +10575,7 @@ impl BorgTerminal {
 
 fn fresh_transcript_like(previous: &Transcript) -> Transcript {
     Transcript {
+        image_cell: previous.image_cell,
         diff_expansion: previous.diff_expansion,
         auto_expand_tools: previous.auto_expand_tools,
         auto_expand_thinking: previous.auto_expand_thinking,

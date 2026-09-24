@@ -11,8 +11,8 @@ use unicode_width::UnicodeWidthStr;
 const SPLIT_DIFF_MIN_WIDTH: usize = 160;
 const CODE_GUTTER_WIDTH: usize = 5;
 const DIFF_NUMBER_WIDTH: usize = 4;
-const DIFF_ADDED_BG: Color = Color::Rgb(25, 57, 39);
-const DIFF_REMOVED_BG: Color = Color::Rgb(67, 31, 34);
+pub(crate) const DIFF_ADDED_BG: Color = Color::Rgb(25, 57, 39);
+pub(crate) const DIFF_REMOVED_BG: Color = Color::Rgb(67, 31, 34);
 const TOML_SYNTAX: &str = r#"%YAML 1.2
 ---
 name: TOML
