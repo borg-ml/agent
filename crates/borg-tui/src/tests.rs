@@ -15208,6 +15208,47 @@ fn live_reasoning_preview_appends_repeated_deltas_without_snapshot_duplication()
     assert_eq!(transcript.order.len(), 1);
 }
 
+#[test]
+fn reasoning_snapshot_repairs_a_dropped_live_preview() {
+    let session_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    let preview = |delta: &str| {
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningTextDelta {
+                delta: delta.into(),
+            },
+        )
+    };
+    let snapshot = |text: &str| {
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningDelta { text: text.into() },
+        )
+    };
+    fn reasoning_text(transcript: &Transcript) -> &str {
+        match &transcript.order[0] {
+            TranscriptEntry::Tool {
+                code_view: Some((_, source)),
+                ..
+            } => source,
+            _ => panic!("expected a reasoning row"),
+        }
+    }
+
+    // The observer missed "abc" while its channel was full.
+    transcript.apply(&preview("def"));
+    transcript.apply(&snapshot("abcdef"));
+    assert_eq!(reasoning_text(&transcript), "abcdef");
+    transcript.apply(&preview("ghi"));
+    transcript.apply(&snapshot("abc"));
+    assert_eq!(reasoning_text(&transcript), "abcdefghi");
+    transcript.apply(&snapshot("abcdefghi"));
+    assert_eq!(reasoning_text(&transcript), "abcdefghi");
+}
+
 #[tokio::test]
 #[ignore = "requires a PTY; verifies inspector identity across plan updates"]
 async fn action_inspector_stays_on_its_tool_when_plan_or_goal_moves() {
