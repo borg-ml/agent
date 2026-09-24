@@ -2623,29 +2623,54 @@ fn tui_frame_interval_preserves_supported_high_refresh_and_caps_extremes() {
 #[test]
 fn expensive_draws_leave_time_for_input_and_animation_events() {
     assert_eq!(
-        responsive_tui_frame_interval(165, std::time::Duration::from_millis(5), false),
+        responsive_tui_frame_interval(165, std::time::Duration::from_millis(5), false, false),
         std::time::Duration::from_millis(15)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), false),
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), false, false),
         std::time::Duration::from_millis(120)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::ZERO, false),
+        responsive_tui_frame_interval(60, std::time::Duration::ZERO, false, false),
         tui_frame_interval(60)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), true),
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(40), true, false),
         std::time::Duration::from_millis(40)
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false),
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false, false),
         MAX_RENDER_BACKOFF_INTERVAL
     );
     assert_eq!(
-        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false),
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(500), false, false),
         MAX_RENDER_BACKOFF_INTERVAL
     );
+}
+
+#[test]
+fn streamed_text_uses_120_hz_when_cheap_and_keeps_the_draw_cost_budget() {
+    assert_eq!(
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(1), false, true),
+        tui_frame_interval(STREAMING_TUI_FPS)
+    );
+    assert_eq!(
+        responsive_tui_frame_interval(60, std::time::Duration::from_millis(10), false, true),
+        std::time::Duration::from_millis(30)
+    );
+    assert_eq!(
+        responsive_tui_frame_interval(165, std::time::Duration::ZERO, false, true),
+        tui_frame_interval(165)
+    );
+    assert!(session_event_contains_stream_text(
+        &SessionEventKind::MessageDelta {
+            message_id: Uuid::new_v4(),
+            delta: "x".into(),
+        }
+    ));
+    assert!(session_event_contains_stream_text(
+        &SessionEventKind::ReasoningTextDelta { delta: "x".into() }
+    ));
 }
 
 #[test]

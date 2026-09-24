@@ -15081,6 +15081,133 @@ fn a_cleanly_completed_response_is_not_marked_interrupted() {
     assert!(!rendered.contains("user interrupted"), "{rendered}");
 }
 
+#[test]
+fn live_message_preview_reconciles_snapshots_and_stops_at_completion() {
+    let session_id = Uuid::new_v4();
+    let prompt_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&turn_started(session_id, 1, prompt_id));
+    let preview = |delta: &str| {
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::MessageDelta {
+                message_id,
+                delta: delta.into(),
+            },
+        )
+    };
+    let snapshot = |text: &str, status| {
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::Message {
+                message_id,
+                actor: EventActor::Assistant,
+                text: text.into(),
+                attachments: Vec::new(),
+                status,
+                delivery: None,
+            },
+        )
+    };
+    fn message_text(transcript: &Transcript) -> &str {
+        match transcript.order.first() {
+            Some(TranscriptEntry::Message { text, .. }) => text,
+            _ => panic!("expected one assistant message"),
+        }
+    }
+
+    transcript.apply(&preview("He"));
+    assert_eq!(message_text(&transcript), "He");
+    transcript.apply(&snapshot("H", MessageStatus::InProgress));
+    assert_eq!(
+        message_text(&transcript),
+        "He",
+        "older snapshot rolled back preview"
+    );
+    transcript.apply(&preview("l"));
+    assert_eq!(message_text(&transcript), "Hel");
+    transcript.apply(&snapshot("Hello", MessageStatus::InProgress));
+    assert_eq!(
+        message_text(&transcript),
+        "Hello",
+        "snapshot did not fill a lost delta"
+    );
+    transcript.apply(&preview("!"));
+    transcript.apply(&snapshot("Hello.", MessageStatus::Complete));
+    transcript.apply(&preview("?"));
+    assert_eq!(message_text(&transcript), "Hello.");
+    assert_eq!(transcript.order.len(), 1);
+
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::TurnCompleted {
+            message_id: prompt_id,
+            provider_session_id: None,
+            final_text: String::new(),
+            error: None,
+        },
+    ));
+    transcript.apply(&preview("late"));
+    assert_eq!(message_text(&transcript), "Hello.");
+}
+
+#[test]
+fn live_reasoning_preview_appends_repeated_deltas_without_snapshot_duplication() {
+    let session_id = Uuid::new_v4();
+    let prompt_id = Uuid::new_v4();
+    let mut transcript = Transcript::default();
+    transcript.apply(&turn_started(session_id, 1, prompt_id));
+    let preview = |delta: &str| {
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningTextDelta {
+                delta: delta.into(),
+            },
+        )
+    };
+    let snapshot = |text: &str| {
+        SessionEvent::new(
+            session_id,
+            0,
+            SessionEventKind::ReasoningDelta { text: text.into() },
+        )
+    };
+    fn reasoning_text(transcript: &Transcript) -> &str {
+        match transcript.order.first() {
+            Some(TranscriptEntry::Tool {
+                code_view: Some((_, source)),
+                ..
+            }) => source,
+            _ => panic!("expected one reasoning row"),
+        }
+    }
+
+    transcript.apply(&preview("a"));
+    transcript.apply(&snapshot("a"));
+    transcript.apply(&preview("a"));
+    assert_eq!(reasoning_text(&transcript), "aa");
+    transcript.apply(&snapshot("aa"));
+    assert_eq!(reasoning_text(&transcript), "aa");
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        2,
+        SessionEventKind::TurnCompleted {
+            message_id: prompt_id,
+            provider_session_id: None,
+            final_text: String::new(),
+            error: None,
+        },
+    ));
+    transcript.apply(&preview("late"));
+    assert_eq!(reasoning_text(&transcript), "aa");
+    assert_eq!(transcript.order.len(), 1);
+}
+
 #[tokio::test]
 #[ignore = "requires a PTY; verifies inspector identity across plan updates"]
 async fn action_inspector_stays_on_its_tool_when_plan_or_goal_moves() {

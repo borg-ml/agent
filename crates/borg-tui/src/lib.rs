@@ -3942,7 +3942,12 @@ impl BorgTerminal {
         let Some(child_event) = child_event else {
             return false;
         };
-        if !self.hydrated_children.contains(&child_id) {
+        if !self.hydrated_children.contains(&child_id)
+            && !matches!(
+                child_event.kind,
+                SessionEventKind::MessageDelta { .. } | SessionEventKind::ReasoningTextDelta { .. }
+            )
+        {
             self.child_unhydrated_events
                 .entry(child_id)
                 .or_default()
@@ -12083,7 +12088,9 @@ fn session_event_changes_transcript(kind: &SessionEventKind) -> bool {
         } => subagent_activity_summary(*activity, agent, event.as_deref()).is_some(),
         SessionEventKind::AgentMessageReceived { .. }
         | SessionEventKind::Message { .. }
+        | SessionEventKind::MessageDelta { .. }
         | SessionEventKind::ReasoningDelta { .. }
+        | SessionEventKind::ReasoningTextDelta { .. }
         | SessionEventKind::ReasoningCompleted
         | SessionEventKind::ToolStarted { .. }
         | SessionEventKind::ToolUpdated { .. }

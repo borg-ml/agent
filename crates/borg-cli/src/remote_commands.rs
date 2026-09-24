@@ -61,6 +61,7 @@ mod local_server;
 
 const MIN_TUI_FPS: u64 = 15;
 const MAX_TUI_FPS: u64 = 240;
+const STREAMING_TUI_FPS: u64 = 120;
 const ACTIVITY_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 const TOOL_STARTED_FRAME_MIN_DURATION: std::time::Duration = std::time::Duration::from_millis(150);
 const IDLE_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -2893,6 +2894,7 @@ async fn run_local_agent_session(
     let mut history_has_coalesced_events = history.iter().any(|event| event.sequence == 0);
     let mut transcript_rebuild_pending = false;
     let mut interaction_dirty = false;
+    let mut streaming_frame_pending = false;
     let mut tool_started_frame_hold_until = None;
     let mut tui_fps = tui_refresh_rate(u64::from(editor_preferences.presentation.refresh_rate_fps));
     let mut prevent_sleep = editor_preferences.interaction.prevent_sleep;
@@ -3655,14 +3657,16 @@ async fn run_local_agent_session(
                     tui_fps,
                     draw_started.elapsed(),
                     interaction_frame,
+                    streaming_frame_pending,
                 );
+                streaming_frame_pending = false;
                 if next_interval != render_frame_interval {
                     render_frame_interval = next_interval;
                     render_tick = tui_render_interval(render_frame_interval);
                 }
                 terminal_dirty = terminal.has_pending_scroll_frame();
             }
-            _ = activity_tick.tick(), if terminal.as_ref().is_some_and(|terminal| {
+            _ = activity_tick.tick(), if !streaming_frame_pending && terminal.as_ref().is_some_and(|terminal| {
                 terminal_needs_activity_tick(status)
                     || terminal.has_running_tool()
                     || terminal.has_active_subagents()
@@ -4090,6 +4094,10 @@ async fn run_local_agent_session(
                 if schema_rejected && stale_local_owner {
                     tracing::info!(%session_id, "recovering obsolete owner after schema rejection");
                 } else if let Some(terminal) = terminal.as_mut() {
+                    if session_event_contains_stream_text(&event.kind) {
+                        tool_started_frame_hold_until = None;
+                        streaming_frame_pending = true;
+                    }
                     terminal_dirty |= terminal.apply_session_event(&event);
                     if event.sequence == 0 && coalesced_transcript_event(&event.kind) {
                         transcript_live_tail = true;
@@ -4124,7 +4132,9 @@ async fn run_local_agent_session(
                                 tui_fps,
                                 draw_started.elapsed(),
                                 false,
+                                false,
                             );
+                            streaming_frame_pending = false;
                             if next_interval != render_frame_interval {
                                 render_frame_interval = next_interval;
                                 render_tick = tui_render_interval(render_frame_interval);
@@ -8436,7 +8446,9 @@ fn coalesced_transcript_event(kind: &SessionEventKind) -> bool {
             actor: EventActor::User | EventActor::Assistant,
             ..
         }
-        | SessionEventKind::ReasoningDelta { .. } => true,
+        | SessionEventKind::ReasoningDelta { .. }
+        | SessionEventKind::MessageDelta { .. }
+        | SessionEventKind::ReasoningTextDelta { .. } => true,
         SessionEventKind::ProviderEvent { kind, .. } => matches!(
             kind.as_str(),
             "action/preparing" | "action/generation_status" | "tool_call_started"
@@ -8947,14 +8959,19 @@ fn responsive_tui_frame_interval(
     fps: u64,
     last_draw: std::time::Duration,
     interaction_frame: bool,
+    streaming_frame: bool,
 ) -> std::time::Duration {
-    tui_frame_interval(fps)
-        .max(if interaction_frame {
-            last_draw
-        } else {
-            last_draw.saturating_mul(3)
-        })
-        .min(MAX_RENDER_BACKOFF_INTERVAL)
+    let base = if streaming_frame {
+        tui_frame_interval(fps.max(STREAMING_TUI_FPS))
+    } else {
+        tui_frame_interval(fps)
+    };
+    base.max(if interaction_frame {
+        last_draw
+    } else {
+        last_draw.saturating_mul(3)
+    })
+    .min(MAX_RENDER_BACKOFF_INTERVAL)
 }
 
 /// `/sleep lid|idle|off`, plus `on`/`off` for backwards compatibility where
@@ -9126,6 +9143,24 @@ fn terminal_needs_idle_tick(has_expiring_notice: bool, has_blinking_cursor: bool
 fn session_event_needs_immediate_frame(kind: &SessionEventKind) -> bool {
     matches!(kind, SessionEventKind::ToolStarted { .. })
         || matches!(kind, SessionEventKind::ProviderEvent { kind, .. } if kind == "tool_call_started" || kind == "action/preparing")
+}
+
+fn session_event_contains_stream_text(kind: &SessionEventKind) -> bool {
+    match kind {
+        SessionEventKind::Message {
+            actor: EventActor::Assistant,
+            status: MessageStatus::InProgress | MessageStatus::Complete,
+            ..
+        }
+        | SessionEventKind::MessageDelta { .. }
+        | SessionEventKind::ReasoningDelta { .. }
+        | SessionEventKind::ReasoningTextDelta { .. } => true,
+        SessionEventKind::SubagentActivity {
+            event: Some(child_event),
+            ..
+        } => session_event_contains_stream_text(&child_event.kind),
+        _ => false,
+    }
 }
 
 fn should_schedule_interaction_frame(
