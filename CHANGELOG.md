@@ -59,6 +59,10 @@ Git comparison.
 - **Long waits no longer re-wake on one pending steer.** A queued follow-up
   interrupts `wait_agent` once; further waits block until another event or the
   timeout even if the provider has not folded that follow-up into its input yet.
+- **Transient Codex 5xx responses retry without switching billing.** A
+  subscription HTTP 5xx error enters Borg's bounded same-subscription retry
+  path instead of blocking an active goal. Authentication, usage-limit and
+  other 4xx responses still surface without API-key fallback.
 - **Team configuration and recovery.** Child agents can be reconfigured live;
   forked teams retain their identity, ownership and transcript order after
   restart. Team membership and queued updates survive replay and retry.

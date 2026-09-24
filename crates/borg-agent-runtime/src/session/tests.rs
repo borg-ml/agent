@@ -929,6 +929,17 @@ fn structured_claude_result_terminations_classify_without_prose() {
         )));
     }
 
+    for status in [500, 502, 503, 504, 529] {
+        assert!(is_safe_automatic_retry_error(&format!(
+            "Codex subscription response did not complete. HTTP {status}. No billing fallback was attempted; no tools from this response were executed."
+        )));
+    }
+    for status in [400, 401, 403, 404, 429] {
+        assert!(!is_safe_automatic_retry_error(&format!(
+            "Codex subscription response did not complete. HTTP {status}. No billing fallback was attempted; no tools from this response were executed."
+        )));
+    }
+
     assert!(is_safe_automatic_retry_error(
         r#"claude SDK error_during_execution: upstream failed "terminal_reason":"api_error" "status":529"#
     ));
