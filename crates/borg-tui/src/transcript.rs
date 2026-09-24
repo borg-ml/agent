@@ -173,6 +173,7 @@ struct Transcript {
     tool_run_offsets: HashMap<usize, usize>,
     expanded_tool_runs: HashSet<usize>,
     active_reasoning: Option<usize>,
+    reasoning_has_preview: bool,
     last_edit: Option<usize>,
     /// Entry indices inserted ahead of existing rows since the owner last
     /// drained them. Removals are reported through the `apply` return value;
@@ -297,6 +298,7 @@ impl Default for Transcript {
             tool_run_offsets: HashMap::new(),
             expanded_tool_runs: HashSet::new(),
             active_reasoning: None,
+            reasoning_has_preview: false,
             last_edit: None,
             pending_entry_insertions: Vec::new(),
             next_image_number: 1,
@@ -723,6 +725,7 @@ impl Transcript {
         self.tool_run_offsets.clear();
         self.expanded_tool_runs.clear();
         self.active_reasoning = None;
+        self.reasoning_has_preview = false;
         self.last_edit = None;
         self.message_markdown_cache.get_mut().messages.clear();
         self.tool_body_cache.get_mut().lines.clear();
@@ -2624,6 +2627,9 @@ impl Transcript {
                 Some(reasoning - usize::from(reasoning > index))
             }
         });
+        if self.active_reasoning.is_none() {
+            self.reasoning_has_preview = false;
+        }
         self.last_edit = self.last_edit.and_then(|edit| {
             if edit == index {
                 None
@@ -2850,6 +2856,7 @@ impl Transcript {
         {
             source.push_str(delta);
             *detail = reasoning_preview(source);
+            self.reasoning_has_preview = true;
         }
     }
 
@@ -2864,7 +2871,15 @@ impl Transcript {
             && language == "reasoning"
             && !*complete
         {
-            Self::merge_reasoning_snapshot(source, text);
+            if self.reasoning_has_preview {
+                // The owner returns cumulative snapshots; replace any preview with a missing prefix.
+                if !source.starts_with(text) {
+                    source.clear();
+                    source.push_str(text);
+                }
+            } else {
+                Self::merge_reasoning_snapshot(source, text);
+            }
             *detail = reasoning_preview(source);
             return;
         }
@@ -2917,6 +2932,7 @@ impl Transcript {
             expanded: self.auto_expand_thinking,
         });
         self.active_reasoning = Some(index);
+        self.reasoning_has_preview = false;
     }
 
     fn merge_reasoning_snapshot(source: &mut String, incoming: &str) {
@@ -2941,6 +2957,7 @@ impl Transcript {
         let Some(index) = self.active_reasoning.take() else {
             return;
         };
+        self.reasoning_has_preview = false;
         if let Some(TranscriptEntry::Tool {
             name,
             complete,
