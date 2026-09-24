@@ -51,6 +51,11 @@ pub enum ModelProviderState {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         account_identity: Option<String>,
     },
+    AnthropicMessages {
+        content: Vec<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        account_identity: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
