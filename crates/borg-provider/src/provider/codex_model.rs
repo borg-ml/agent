@@ -2,12 +2,14 @@
 //! billing. Borg owns the conversation and tools in both modes.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use borg_core::{CostBasis, ModelProviderState, ProviderCallUsage};
 use futures::StreamExt;
+use reqwest::cookie::{CookieStore, Jar};
+use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -27,6 +29,73 @@ const MODELS_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/models";
 const MAX_STREAM_BYTES: usize = 128 * 1024 * 1024;
 const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
 
+#[derive(Default)]
+struct RoutingCookies(Jar);
+
+impl CookieStore for RoutingCookies {
+    fn set_cookies(&self, headers: &mut dyn Iterator<Item = &HeaderValue>, url: &reqwest::Url) {
+        if url.scheme() != "https" || url.host_str() != Some("chatgpt.com") {
+            return;
+        }
+        let mut allowed = headers.filter(|header| {
+            header.as_bytes().len() <= 4096
+                && header
+                    .to_str()
+                    .ok()
+                    .and_then(|value| value.split_once('='))
+                    .is_some_and(|(name, _)| {
+                        let name = name.trim();
+                        matches!(
+                            name,
+                            "__cf_bm"
+                                | "__cflb"
+                                | "__cfruid"
+                                | "__cfseq"
+                                | "__cfwaitingroom"
+                                | "__oailb"
+                                | "_cfuvid"
+                                | "cf_clearance"
+                                | "cf_ob_info"
+                                | "cf_use_ob"
+                        ) || (name.len() <= 128 && name.starts_with("cf_chl_"))
+                    })
+        });
+        self.0.set_cookies(&mut allowed, url);
+    }
+
+    fn cookies(&self, url: &reqwest::Url) -> Option<HeaderValue> {
+        if url.scheme() != "https" || url.host_str() != Some("chatgpt.com") {
+            return None;
+        }
+        let mut header = self.0.cookies(url)?;
+        header.set_sensitive(true);
+        Some(header)
+    }
+}
+
+fn model_http_client(account: &str) -> Result<reqwest::Client> {
+    // No bearer token is kept in client defaults. Each account gets its own
+    // connection pool and infrastructure-only cookies, including __oailb.
+    static CLIENTS: OnceLock<Mutex<Vec<(String, reqwest::Client)>>> = OnceLock::new();
+    let mut clients = CLIENTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Codex HTTP client cache unavailable"))?;
+    if let Some((_, client)) = clients.iter().find(|(identity, _)| identity == account) {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(30))
+        .cookie_provider(Arc::new(RoutingCookies::default()))
+        .build()?;
+    if clients.len() == 32 {
+        clients.remove(0);
+    }
+    clients.push((account.to_owned(), client.clone()));
+    Ok(client)
+}
+
 pub struct CodexModelProvider {
     pub model: String,
     pub effort: String,
@@ -36,6 +105,18 @@ pub struct CodexModelProvider {
 struct ModelCapabilities {
     slug: String,
     supported_reasoning_levels: Vec<ReasoningLevel>,
+    #[serde(default)]
+    use_responses_lite: bool,
+    #[serde(default = "default_true")]
+    supports_reasoning_summary_parameter: bool,
+    #[serde(default)]
+    default_reasoning_summary: Option<String>,
+    #[serde(default)]
+    support_verbosity: bool,
+    #[serde(default)]
+    default_verbosity: Option<String>,
+    #[serde(default)]
+    supports_reasoning_effort_updates: bool,
     #[serde(default)]
     service_tiers: Vec<ServiceTier>,
     #[serde(default)]
@@ -59,6 +140,10 @@ struct ServiceTier {
 // This is the wire protocol's default when the catalog omits the field.
 fn default_context_percent() -> u64 {
     95
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl ModelCapabilities {
@@ -194,7 +279,7 @@ impl SubscriptionAccess {
         }) {
             // The catalog gates model visibility on its client protocol version, not Borg releases.
             // Keep Borg identified by originator; no installed executable is needed.
-            let version = "0.155.1";
+            let version = "0.156.1";
             let rejected_token = self.token.clone();
             let auth_file = self.auth_file.clone();
             let response = self
@@ -291,7 +376,7 @@ impl CodexModelProvider {
             return Ok(None);
         }
         let capabilities = access
-            .model_capabilities(&reqwest::Client::new(), &self.model)
+            .model_capabilities(&model_http_client(expected_account)?, &self.model)
             .await?;
         Ok(Some(capabilities.usable_context_window()?))
     }
@@ -384,15 +469,12 @@ impl CodexModelProvider {
             stderr: String::new(),
         };
         let result = async {
-            let client = reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(30))
-                .build()?;
             let mut access = SubscriptionAccess::read_with(auth_file, None).await?;
             trace.invocation.executable = access.endpoint().into();
             ensure!(access.identity() == expected_account,
                 "OpenAI credentials changed during this turn; retry to use the currently selected account");
-            let context_window = if access.is_api_key() {
+            let client = model_http_client(expected_account)?;
+            let capabilities = if access.is_api_key() {
                 None
             } else {
                 let capabilities = access.model_capabilities(&client, &self.model).await?;
@@ -400,9 +482,10 @@ impl CodexModelProvider {
                     "selected effort is not supported by this Codex model");
                 ensure!(!request.fast || capabilities.supports_fast(),
                     "fast mode is not supported by this Codex model");
-                Some(capabilities.usable_context_window()?)
+                Some(capabilities)
             };
-            let mut body = self.request_body_for_account(&mut request, expected_account)?;
+            let context_window = capabilities.as_ref().map(ModelCapabilities::usable_context_window).transpose()?;
+            let mut body = self.request_body_for_account(&mut request, expected_account, capabilities.as_ref())?;
             // Reasoning tokens count against `max_output_tokens` on the
             // Responses API, so this cap bounds the whole refresh, not just
             // its visible text.
@@ -415,9 +498,13 @@ impl CodexModelProvider {
                 "session_id": request.session_id,
                 "protocol": "openai_responses",
                 "model": self.model, "effort": self.effort, "fast": request.fast,
+                "reasoning": body["reasoning"], "text": body.get("text"),
+                "responses_lite": capabilities.as_ref().is_some_and(|c| c.use_responses_lite),
                 "prompt_cache_key": request.prompt_cache_key,
-                "instructions_sha256": hex::encode(Sha256::digest(serde_json::to_vec(&body["instructions"])?)),
-                "tools_sha256": hex::encode(Sha256::digest(serde_json::to_vec(&body["tools"])?)),
+                "instructions_sha256": hex::encode(Sha256::digest(request.messages.iter().filter_map(|message| match message {
+                    ModelMessage::System { content } => Some(content.as_str()), _ => None,
+                }).collect::<Vec<_>>().join("\n\n").as_bytes())),
+                "tools_sha256": hex::encode(Sha256::digest(serde_json::to_vec(&request.tools)?)),
                 "auth": if access.is_api_key() { "api_key" } else { "subscription_oauth" },
                 "agent_loop": "borg",
             }));
@@ -432,8 +519,11 @@ impl CodexModelProvider {
                 )
                 .await?;
             let (mut message, response) = self.read_stream(response, progress.as_ref(), request.request_id.as_deref()).await?;
-            if let ModelMessage::Assistant { provider_state: Some(ModelProviderState::OpenAiResponses { account_identity, .. }), .. } = &mut message {
+            if let ModelMessage::Assistant { provider_state: Some(ModelProviderState::OpenAiResponses { account_identity, request_model, request_effort, effective_effort, .. }), .. } = &mut message {
                 *account_identity = Some(expected_account.to_string());
+                *request_model = Some(self.model.clone());
+                *request_effort = body["reasoning"]["effort"].as_str().map(str::to_owned);
+                *effective_effort = Some(self.wire_effort().to_owned());
             }
             Ok::<_, anyhow::Error>((message, response, context_window, access.is_api_key()))
         }
@@ -492,6 +582,7 @@ impl CodexModelProvider {
         &self,
         request: &mut ModelTurnRequest,
         expected_account: &str,
+        capabilities: Option<&ModelCapabilities>,
     ) -> Result<Value> {
         for message in &mut request.messages {
             if let ModelMessage::Assistant { provider_state, .. } = message
@@ -503,12 +594,51 @@ impl CodexModelProvider {
                 *provider_state = None;
             }
         }
-        self.request_body(request)
+        self.request_body_with_capabilities(request, capabilities)
     }
 
+    #[cfg(test)]
     fn request_body(&self, request: &ModelTurnRequest) -> Result<Value> {
+        self.request_body_with_capabilities(request, None)
+    }
+
+    fn wire_effort(&self) -> &str {
+        if self.effort == "ultra" {
+            "max"
+        } else {
+            &self.effort
+        }
+    }
+
+    fn request_body_with_capabilities(
+        &self,
+        request: &ModelTurnRequest,
+        capabilities: Option<&ModelCapabilities>,
+    ) -> Result<Value> {
         let mut input = Vec::new();
         let mut instructions = Vec::new();
+        let effort_updates = capabilities.is_some_and(|c| c.supports_reasoning_effort_updates);
+        let baseline = if effort_updates {
+            request
+                .messages
+                .iter()
+                .find_map(|message| match message {
+                    ModelMessage::Assistant {
+                        provider_state:
+                            Some(ModelProviderState::OpenAiResponses {
+                                request_model: Some(model),
+                                request_effort: Some(effort),
+                                ..
+                            }),
+                        ..
+                    } if model == &self.model => Some(effort.as_str()),
+                    _ => None,
+                })
+                .unwrap_or(self.wire_effort())
+        } else {
+            self.wire_effort()
+        };
+        let mut applied_effort = None;
         for message in &request.messages {
             match message {
                 ModelMessage::System { content } => instructions.push(content.as_str()),
@@ -530,10 +660,33 @@ impl CodexModelProvider {
                     input.push(json!({"role": "user", "content": blocks}));
                 }
                 ModelMessage::Assistant {
-                    provider_state: Some(ModelProviderState::OpenAiResponses { output, .. }),
+                    provider_state:
+                        Some(ModelProviderState::OpenAiResponses {
+                            output,
+                            request_model,
+                            effective_effort,
+                            ..
+                        }),
                     ..
                 } => {
-                    input.extend(output.iter().cloned());
+                    if effort_updates
+                        && request_model.as_deref() == Some(&self.model)
+                        && let Some(effort) = effective_effort.as_deref()
+                        && Some(effort) != applied_effort
+                    {
+                        input.push(
+                            json!({"type":"configuration_update","reasoning":{"effort":effort}}),
+                        );
+                        applied_effort = Some(effort);
+                    }
+                    // Configuration is authored from Borg's durable request
+                    // metadata, never from an assistant's output items.
+                    input.extend(
+                        output
+                            .iter()
+                            .filter(|item| item["type"] != "configuration_update")
+                            .cloned(),
+                    );
                 }
                 ModelMessage::Assistant {
                     content,
@@ -559,6 +712,11 @@ impl CodexModelProvider {
                 } => input.push(function_call_output(tool_call_id, content, attachments)?),
             }
         }
+        if effort_updates && applied_effort != Some(self.wire_effort()) {
+            input.push(
+                json!({"type":"configuration_update","reasoning":{"effort":self.wire_effort()}}),
+            );
+        }
         let tools: Vec<_> = request
             .tools
             .iter()
@@ -569,18 +727,53 @@ impl CodexModelProvider {
                 })
             })
             .collect();
-        // The catalog advertises `ultra`, but the Responses endpoint accepts
-        // `max` as its highest wire effort. Keep the Borg selection while
-        // sending the endpoint's accepted value.
-        let wire_effort = if self.effort == "ultra" {
-            "max"
-        } else {
-            &self.effort
-        };
-        let mut body = json!({"model": self.model, "instructions": instructions.join("\n\n"),
+        let instructions = instructions.join("\n\n");
+        if capabilities.is_some_and(|c| c.use_responses_lite) {
+            let namespace = uuid::Uuid::new_v5(
+                &uuid::Uuid::NAMESPACE_OID,
+                request
+                    .prompt_cache_key
+                    .as_deref()
+                    .or(request.session_id.as_deref())
+                    .unwrap_or("borg-unscoped")
+                    .as_bytes(),
+            );
+            let mut prefix = vec![
+                json!({"type":"additional_tools", "role":"developer", "tools":tools,
+                "id":format!("at_{}",uuid::Uuid::new_v5(&namespace,&serde_json::to_vec(&tools)?))}),
+            ];
+            if !instructions.is_empty() {
+                prefix.push(json!({"type":"message", "role":"developer",
+                    "id":format!("msg_{}",uuid::Uuid::new_v5(&namespace,instructions.as_bytes())),
+                    "content":[{"type":"input_text","text":instructions}]}));
+            }
+            input.splice(0..0, prefix);
+        }
+        let mut body = json!({"model": self.model, "instructions": instructions,
             "input": input, "tools": tools, "tool_choice": "auto", "parallel_tool_calls": true,
-            "reasoning": {"effort": wire_effort, "summary": "auto"},
+            "reasoning": {"effort": baseline, "summary": "auto"},
             "store": false, "stream": true, "include": ["reasoning.encrypted_content"]});
+        if let Some(capabilities) = capabilities {
+            if capabilities.use_responses_lite {
+                body["instructions"] = json!("");
+                body.as_object_mut().unwrap().remove("tools");
+                body["reasoning"]["context"] = json!("all_turns");
+            }
+            let summary = capabilities
+                .default_reasoning_summary
+                .as_deref()
+                .unwrap_or("auto");
+            if capabilities.supports_reasoning_summary_parameter && summary != "none" {
+                body["reasoning"]["summary"] = json!(summary);
+            } else {
+                body["reasoning"].as_object_mut().unwrap().remove("summary");
+            }
+            if capabilities.support_verbosity
+                && let Some(verbosity) = &capabilities.default_verbosity
+            {
+                body["text"] = json!({"verbosity":verbosity});
+            }
+        }
         if request.fast {
             body["service_tier"] = json!("priority");
         }
@@ -588,7 +781,10 @@ impl CodexModelProvider {
             body["prompt_cache_key"] = json!(key);
         }
         if let Some(schema) = &request.output_schema {
-            body["text"] = json!({"format": {"type": "json_schema", "name": "borg_response", "strict": true, "schema": schema}});
+            if body.get("text").is_none() {
+                body["text"] = json!({});
+            }
+            body["text"]["format"] = json!({"type": "json_schema", "name": "borg_response", "strict": true, "schema": schema});
         }
         Ok(body)
     }
@@ -1106,6 +1302,9 @@ impl ResponseState {
                 provider_state: Some(ModelProviderState::OpenAiResponses {
                     output,
                     account_identity: None,
+                    request_model: None,
+                    request_effort: None,
+                    effective_effort: None,
                 }),
                 tool_calls: calls,
             },
@@ -1272,6 +1471,159 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
 
     #[test]
+    fn routing_cookies_never_store_authentication_or_cross_endpoint_boundaries() {
+        let jar = RoutingCookies::default();
+        let url = reqwest::Url::parse(ENDPOINT).unwrap();
+        let headers = [
+            HeaderValue::from_static("__oailb=route; Secure; Path=/"),
+            HeaderValue::from_static("__cf_bm=infra; Secure; Path=/"),
+            HeaderValue::from_static("session=private; Secure; Path=/"),
+            HeaderValue::from_static("__Secure-next-auth.session-token=private; Secure; Path=/"),
+        ];
+        jar.set_cookies(&mut headers.iter(), &url);
+        let value = jar.cookies(&url).unwrap();
+        assert!(value.is_sensitive());
+        let text = value.to_str().unwrap();
+        assert!(text.contains("__oailb=route") && text.contains("__cf_bm=infra"));
+        assert!(!text.contains("private") && !text.contains("session"));
+        for endpoint in [
+            API_ENDPOINT,
+            "http://chatgpt.com/backend-api/codex/responses",
+            "https://other.chatgpt.com/",
+        ] {
+            let other = reqwest::Url::parse(endpoint).unwrap();
+            assert!(jar.cookies(&other).is_none());
+            let empty = RoutingCookies::default();
+            empty.set_cookies(&mut headers.iter(), &other);
+            assert!(empty.cookies(&url).is_none());
+        }
+    }
+
+    #[test]
+    fn lite_prefix_and_effort_updates_survive_restart_without_rewriting_history() {
+        let mut capabilities: ModelCapabilities = serde_json::from_value(json!({
+            "slug":"model", "supported_reasoning_levels":[], "use_responses_lite":true,
+            "supports_reasoning_effort_updates":true, "default_reasoning_summary":"none",
+            "support_verbosity":true, "default_verbosity":"low",
+        }))
+        .unwrap();
+        let mut provider = CodexModelProvider {
+            model: "model".into(),
+            effort: "low".into(),
+        };
+        let mut request = ModelTurnRequest {
+            messages: vec![
+                ModelMessage::System {
+                    content: "stable instructions".into(),
+                },
+                ModelMessage::user("first"),
+            ],
+            tools: vec![
+                super::super::ModelToolDefinition::new(
+                    "inspect",
+                    "Read a file",
+                    json!({"type":"object"}),
+                )
+                .unwrap(),
+            ],
+            request_id: Some("request".into()),
+            session_id: Some("session".into()),
+            prompt_cache_key: Some("cache".into()),
+            turn_routing: Default::default(),
+            fast: false,
+            output_schema: Some(json!({"type":"object"})),
+        };
+        let first = provider
+            .request_body_with_capabilities(&request, Some(&capabilities))
+            .unwrap();
+        assert_eq!(first["instructions"], "");
+        assert!(first.get("tools").is_none());
+        assert_eq!(first["input"][0]["type"], "additional_tools");
+        assert_eq!(first["input"][1]["role"], "developer");
+        assert_eq!(
+            first["input"][1]["content"][0]["text"],
+            "stable instructions"
+        );
+        assert_eq!(
+            first["reasoning"],
+            json!({"effort":"low", "context":"all_turns"})
+        );
+        assert_eq!(first["text"]["verbosity"], "low");
+        assert_eq!(first["text"]["format"]["type"], "json_schema");
+        let output = json!({"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]});
+        let reply = |effort: &str| ModelMessage::Assistant {
+            content: Some("done".into()),
+            reasoning_content: None,
+            reasoning_details: None,
+            tool_calls: vec![],
+            provider_state: Some(ModelProviderState::OpenAiResponses {
+                output: vec![output.clone()],
+                account_identity: Some("account".into()),
+                request_model: Some("model".into()),
+                request_effort: Some("low".into()),
+                effective_effort: Some(effort.into()),
+            }),
+        };
+        request.messages.push(reply("low"));
+        request.messages.push(ModelMessage::user("second"));
+        provider.effort = "high".into();
+        let changed = provider
+            .request_body_with_capabilities(&request, Some(&capabilities))
+            .unwrap();
+        let prefix = first["input"].as_array().unwrap();
+        assert_eq!(
+            &changed["input"].as_array().unwrap()[..prefix.len()],
+            prefix
+        );
+        assert_eq!(changed["reasoning"]["effort"], "low");
+        assert_eq!(
+            changed["input"].as_array().unwrap().last().unwrap(),
+            &json!({"type":"configuration_update","reasoning":{"effort":"high"}})
+        );
+        request.messages.push(reply("high"));
+        request.messages.push(ModelMessage::user("after restart"));
+        request.messages =
+            serde_json::from_slice(&serde_json::to_vec(&request.messages).unwrap()).unwrap();
+        let restarted = CodexModelProvider {
+            model: "model".into(),
+            effort: "high".into(),
+        }
+        .request_body_with_capabilities(&request, Some(&capabilities))
+        .unwrap();
+        let previous = changed["input"].as_array().unwrap();
+        assert_eq!(
+            &restarted["input"].as_array().unwrap()[..previous.len()],
+            previous
+        );
+        assert_eq!(restarted["reasoning"], changed["reasoning"]);
+        assert_eq!(restarted["input"][previous.len()], output);
+        request.session_id = Some("fork-session".into());
+        let forked = provider
+            .request_body_with_capabilities(&request, Some(&capabilities))
+            .unwrap();
+        assert_eq!(forked["input"], restarted["input"]);
+        capabilities.use_responses_lite = false;
+        capabilities.supports_reasoning_effort_updates = false;
+        capabilities.supports_reasoning_summary_parameter = false;
+        capabilities.default_reasoning_summary = Some("detailed".into());
+        let classic = provider
+            .request_body_with_capabilities(&request, Some(&capabilities))
+            .unwrap();
+        assert_eq!(classic["instructions"], "stable instructions");
+        assert_eq!(classic["reasoning"], json!({"effort":"high"}));
+        assert!(
+            classic["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["type"] != "configuration_update")
+        );
+        assert!(
+            matches!(&request.messages[4], ModelMessage::Assistant { provider_state: Some(ModelProviderState::OpenAiResponses { effective_effort: Some(effort), .. }), .. } if effort == "high")
+        );
+    }
+
+    #[test]
     fn account_switch_replays_borg_history_without_foreign_continuation() {
         let provider = CodexModelProvider {
             model: "test-model".into(),
@@ -1297,6 +1649,9 @@ mod tests {
                         provider_state: Some(ModelProviderState::OpenAiResponses {
                             output: output.clone(),
                             account_identity: origin.map(str::to_owned),
+                            request_model: None,
+                            request_effort: None,
+                            effective_effort: None,
                         }),
                         tool_calls: vec![ModelToolCall::function(
                             "call-1".into(),
@@ -1308,7 +1663,7 @@ mod tests {
                 ],
             };
             let body = provider
-                .request_body_for_account(&mut request, "account-b")
+                .request_body_for_account(&mut request, "account-b", None)
                 .unwrap();
             let input = body["input"].as_array().unwrap();
             assert_eq!(input[0]["content"][0]["text"], "keep the task");
