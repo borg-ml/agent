@@ -1517,26 +1517,80 @@ fn composer_line_navigation_stays_within_the_current_logical_line() {
 fn subagent_activity_timers_are_independent_and_stop_with_their_agent() {
     let first = Uuid::new_v4();
     let second = Uuid::new_v4();
-    let first_started = Utc::now() - chrono::Duration::seconds(9);
-    let second_started = Utc::now() - chrono::Duration::seconds(3);
-    let mut active_since = HashMap::new();
+    let started = Utc::now() - chrono::Duration::minutes(8);
+    let mut clocks = HashMap::new();
 
+    track_child_activity(&mut clocks, first, SessionStatus::Running, started);
     track_child_activity(
-        &mut active_since,
+        &mut clocks,
+        second,
+        SessionStatus::Running,
+        started + chrono::Duration::minutes(2),
+    );
+    track_child_activity(
+        &mut clocks,
+        first,
+        SessionStatus::Ready,
+        started + chrono::Duration::minutes(3),
+    );
+    track_child_activity(
+        &mut clocks,
         first,
         SessionStatus::Running,
-        first_started,
+        started + chrono::Duration::minutes(7),
     );
-    track_child_activity(
-        &mut active_since,
-        second,
-        SessionStatus::Starting,
-        second_started,
-    );
-    track_child_activity(&mut active_since, first, SessionStatus::Stopped, Utc::now());
 
-    assert!(!active_since.contains_key(&first));
-    assert_eq!(active_since.get(&second), Some(&second_started));
+    assert_eq!(
+        clocks[&first]
+            .status_duration(started + chrono::Duration::minutes(8))
+            .as_deref(),
+        Some("4m · run 1m")
+    );
+    assert_eq!(
+        clocks[&second]
+            .status_duration(started + chrono::Duration::minutes(8))
+            .as_deref(),
+        Some("6m")
+    );
+}
+
+#[test]
+fn running_status_retains_total_when_another_run_starts() {
+    let started = Utc::now() - chrono::Duration::minutes(8);
+    let mut clock = ActivityClock::default();
+    clock.observe(SessionStatus::Running, started);
+    clock.observe(
+        SessionStatus::Running,
+        started + chrono::Duration::minutes(1),
+    );
+    clock.observe(SessionStatus::Ready, started + chrono::Duration::minutes(3));
+    clock.observe(
+        SessionStatus::Running,
+        started + chrono::Duration::minutes(7),
+    );
+    assert_eq!(
+        clock
+            .status_duration(started + chrono::Duration::minutes(7))
+            .as_deref(),
+        Some("3m · run <1m")
+    );
+    assert_eq!(
+        clock
+            .status_duration(started + chrono::Duration::minutes(8))
+            .as_deref(),
+        Some("4m · run 1m")
+    );
+    clock.observe(
+        SessionStatus::Stopped,
+        started + chrono::Duration::minutes(8),
+    );
+    assert_eq!(clock.started_at, None);
+    assert_eq!(
+        clock
+            .status_duration(started + chrono::Duration::minutes(20))
+            .as_deref(),
+        Some("4m")
+    );
 }
 
 #[test]

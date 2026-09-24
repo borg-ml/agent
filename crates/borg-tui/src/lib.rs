@@ -1556,7 +1556,7 @@ pub struct BorgTerminal {
     child_queued_prompts: HashMap<Uuid, Vec<PendingPromptProjection>>,
     child_requeue_cursors: HashMap<Uuid, Option<usize>>,
     child_statuses: HashMap<Uuid, SessionStatus>,
-    child_active_since: HashMap<Uuid, DateTime<Utc>>,
+    child_activity_clocks: HashMap<Uuid, ActivityClock>,
     child_pending_approvals: HashSet<Uuid>,
     /// Startup recovery can publish child-state corrections after the root
     /// history has already been seeded. Keep those corrections in the roster
@@ -1696,7 +1696,7 @@ pub struct BorgTerminal {
     composer_selection: Option<ComposerSelection>,
     pending_transcript_click: Option<PendingTranscriptClick>,
     pending_tool_copy: Option<usize>,
-    active_since: Option<DateTime<Utc>>,
+    activity_clock: ActivityClock,
     notice: Option<String>,
     copy_notice_expires_at: Option<Instant>,
     last_ctrl_c: Option<Instant>,
@@ -2803,7 +2803,7 @@ impl BorgTerminal {
             child_queued_prompts: HashMap::new(),
             child_requeue_cursors: HashMap::new(),
             child_statuses: HashMap::new(),
-            child_active_since: HashMap::new(),
+            child_activity_clocks: HashMap::new(),
             child_pending_approvals: HashSet::new(),
             suppress_bootstrap_subagent_activity: true,
             focused_child: None,
@@ -2931,7 +2931,7 @@ impl BorgTerminal {
             composer_selection: None,
             pending_transcript_click: None,
             pending_tool_copy: None,
-            active_since: None,
+            activity_clock: ActivityClock::default(),
             notice: None,
             copy_notice_expires_at: None,
             last_ctrl_c: None,
@@ -2997,7 +2997,7 @@ impl BorgTerminal {
         self.child_history_hydration_complete = false;
         self.child_queued_prompts.clear();
         self.child_statuses.clear();
-        self.child_active_since.clear();
+        self.child_activity_clocks.clear();
         self.child_pending_approvals.clear();
         self.suppress_bootstrap_subagent_activity = true;
         self.focused_child = None;
@@ -3094,7 +3094,7 @@ impl BorgTerminal {
         self.text_selection = None;
         self.pending_transcript_click = None;
         self.pending_tool_copy = None;
-        self.active_since = None;
+        self.activity_clock = ActivityClock::default();
         self.notice = None;
         self.copy_notice_expires_at = None;
         self.last_ctrl_c = None;
@@ -3300,6 +3300,7 @@ impl BorgTerminal {
         root_transcript.reconcile_session_status(state);
         if let Some(status) = state.status {
             self.status = status;
+            self.activity_clock.observe(status, Utc::now());
             if !status_control_is_actionable(status) {
                 self.interrupt_requested = false;
             }
@@ -3466,7 +3467,8 @@ impl BorgTerminal {
         self.withheld_queued_prompt = None;
         self.status = SessionStatus::Starting;
         self.interrupt_requested = false;
-        self.active_since = Some(event.created_at);
+        self.activity_clock
+            .observe(SessionStatus::Starting, event.created_at);
         self.transcript.follow_tail = true;
         self.invalidate_transcript_render_cache();
     }
@@ -3498,7 +3500,8 @@ impl BorgTerminal {
             {
                 self.transcript.active_turn = None;
                 self.status = SessionStatus::Ready;
-                self.active_since = None;
+                self.activity_clock
+                    .observe(SessionStatus::Ready, Utc::now());
             }
         }
         self.optimistic_idle_prompt = None;
@@ -3768,11 +3771,7 @@ impl BorgTerminal {
             if !status_control_is_actionable(status) {
                 self.interrupt_requested = false;
             }
-            if matches!(status, SessionStatus::Starting | SessionStatus::Running) {
-                self.active_since.get_or_insert(event.created_at);
-            } else {
-                self.active_since = None;
-            }
+            self.activity_clock.observe(status, event.created_at);
         }
         if matches!(event.kind, SessionEventKind::TurnStarted { .. }) {
             self.interrupt_requested = false;
@@ -3954,11 +3953,16 @@ impl BorgTerminal {
             child_event.as_deref(),
         ));
         self.child_statuses.insert(child_id, status);
+        let observed_at = if self.child_activity_clocks.contains_key(&child_id) {
+            event.created_at
+        } else {
+            agent.created_at
+        };
         track_child_activity(
-            &mut self.child_active_since,
+            &mut self.child_activity_clocks,
             child_id,
             status,
-            agent.created_at,
+            observed_at,
         );
         if !self.hydrated_children.contains(&child_id) && self.child_history_hydration_complete {
             self.hydrated_children.insert(child_id);
@@ -4008,7 +4012,7 @@ impl BorgTerminal {
         if let SessionEventKind::StatusChanged { status, .. } = child_event.kind {
             self.child_statuses.insert(child_id, status);
             track_child_activity(
-                &mut self.child_active_since,
+                &mut self.child_activity_clocks,
                 child_id,
                 status,
                 child_event.created_at,
@@ -4180,7 +4184,7 @@ impl BorgTerminal {
                 let status = subagent_session_status(status);
                 self.child_statuses.insert(child_id, status);
                 track_child_activity(
-                    &mut self.child_active_since,
+                    &mut self.child_activity_clocks,
                     child_id,
                     status,
                     event.created_at,
@@ -4245,11 +4249,16 @@ impl BorgTerminal {
             transcript.upsert_subagent_snapshot(agent);
             let status = subagent_session_status(agent.status);
             self.child_statuses.insert(agent.session_id, status);
+            let observed_at = if self.child_activity_clocks.contains_key(&agent.session_id) {
+                agent.updated_at
+            } else {
+                agent.created_at
+            };
             track_child_activity(
-                &mut self.child_active_since,
+                &mut self.child_activity_clocks,
                 agent.session_id,
                 status,
-                agent.created_at,
+                observed_at,
             );
         }
     }
@@ -4260,10 +4269,14 @@ impl BorgTerminal {
             .unwrap_or(self.status)
     }
 
-    fn active_status_started_at(&self) -> Option<DateTime<Utc>> {
+    fn active_activity_clock(&self) -> ActivityClock {
         match self.focused_child() {
-            Some(child) => self.child_active_since.get(&child).copied(),
-            None => self.active_since,
+            Some(child) => self
+                .child_activity_clocks
+                .get(&child)
+                .copied()
+                .unwrap_or_default(),
+            None => self.activity_clock,
         }
     }
 
@@ -4602,7 +4615,8 @@ impl BorgTerminal {
             {
                 self.status = SessionStatus::Starting;
                 self.interrupt_requested = false;
-                self.active_since = Some(Utc::now());
+                self.activity_clock
+                    .observe(SessionStatus::Starting, Utc::now());
                 self.borging_this_run = borging_for_run(Uuid::new_v4());
             }
             self.invalidate_transcript_render_cache();
@@ -7500,7 +7514,7 @@ impl BorgTerminal {
         });
         let total_subagents = agent_roster_entries.len().saturating_sub(1);
         let session_is_active = matches!(status, SessionStatus::Starting | SessionStatus::Running);
-        let active_status_started_at = self.active_status_started_at();
+        let activity_clock = self.active_activity_clock();
         let active_goal = self.active_goal().cloned();
         let goal_status = self.transcript.goal_status();
         let shell_status = self.transcript.shell_status();
@@ -8625,12 +8639,7 @@ impl BorgTerminal {
             }
             let status_highlight = self.status_hovered && status_is_interruptible;
             let status_duration = if session_is_active && reconnect_label.is_none() {
-                format_elapsed_duration(active_status_started_at.map_or(0, |started| {
-                    Utc::now()
-                        .signed_duration_since(started)
-                        .num_seconds()
-                        .max(0) as u64
-                }))
+                activity_clock.status_duration(Utc::now())
             } else {
                 None
             };
@@ -10990,17 +10999,50 @@ fn focused_child_interrupt_target(
         .flatten()
 }
 
+#[derive(Clone, Copy, Default)]
+struct ActivityClock {
+    started_at: Option<DateTime<Utc>>,
+    elapsed: chrono::Duration,
+}
+
+impl ActivityClock {
+    fn observe(&mut self, status: SessionStatus, at: DateTime<Utc>) {
+        if matches!(status, SessionStatus::Starting | SessionStatus::Running) {
+            self.started_at.get_or_insert(at);
+        } else if let Some(started_at) = self.started_at.take() {
+            self.elapsed += at
+                .signed_duration_since(started_at)
+                .max(chrono::Duration::zero());
+        }
+    }
+
+    fn status_duration(&self, now: DateTime<Utc>) -> Option<String> {
+        let current = self
+            .started_at
+            .map_or(chrono::Duration::zero(), |started_at| {
+                now.signed_duration_since(started_at)
+                    .max(chrono::Duration::zero())
+            });
+        let total = format_elapsed_duration((self.elapsed + current).num_seconds().max(0) as u64)?;
+        if self.elapsed <= chrono::Duration::zero() || self.started_at.is_none() {
+            return Some(total);
+        }
+        let run = format_elapsed_duration(current.num_seconds().max(0) as u64)
+            .unwrap_or_else(|| "<1m".to_string());
+        Some(format!("{total} · run {run}"))
+    }
+}
+
 fn track_child_activity(
-    active_since: &mut HashMap<Uuid, DateTime<Utc>>,
+    clocks: &mut HashMap<Uuid, ActivityClock>,
     child_id: Uuid,
     status: SessionStatus,
     observed_at: DateTime<Utc>,
 ) {
-    if matches!(status, SessionStatus::Starting | SessionStatus::Running) {
-        active_since.entry(child_id).or_insert(observed_at);
-    } else {
-        active_since.remove(&child_id);
-    }
+    clocks
+        .entry(child_id)
+        .or_default()
+        .observe(status, observed_at);
 }
 
 fn display_agent_name(task_name: &str) -> String {
