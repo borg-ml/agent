@@ -8515,7 +8515,13 @@ impl BorgTerminal {
                                     self.pending_input_expanded,
                                     chunks[1].width,
                                 ),
-                                Style::default().fg(Color::Gray),
+                                Style::default()
+                                    .fg(if self.focused_child.is_some() {
+                                        SUBAGENT_PINK
+                                    } else {
+                                        BORG_ORANGE
+                                    })
+                                    .add_modifier(Modifier::BOLD),
                             )),
                     ),
                     chunks[1],
@@ -8533,7 +8539,7 @@ impl BorgTerminal {
                 );
                 for strip in [status_area, footer_area] {
                     frame.render_widget(
-                        Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0))),
+                        Block::default().style(Style::default().bg(Color::Reset)),
                         Rect {
                             x: 0,
                             width: terminal_size.width,
@@ -8858,15 +8864,7 @@ impl BorgTerminal {
                 .map(|width| status_hit_area(permission_status_start, width));
             frame.render_widget(
                 Paragraph::new(status_line)
-                    .style(
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .bg(if is_launch_screen {
-                                Color::Reset
-                            } else {
-                                Color::Black
-                            }),
-                    )
+                    .style(Style::default().fg(Color::DarkGray).bg(Color::Reset))
                     .alignment(if is_launch_screen {
                         Alignment::Center
                     } else {
@@ -9338,7 +9336,7 @@ impl BorgTerminal {
                 };
                 frame.render_widget(
                     Paragraph::new(controls)
-                        .style(Style::default().fg(Color::DarkGray).bg(Color::Black)),
+                        .style(Style::default().fg(Color::DarkGray).bg(Color::Reset)),
                     controls_area,
                 );
                 if footer_metadata.is_some() && metadata_width > 0 {
@@ -9369,7 +9367,7 @@ impl BorgTerminal {
                     frame.render_widget(
                         Paragraph::new(metadata_line)
                             .alignment(Alignment::Right)
-                            .style(Style::default().bg(Color::Black)),
+                            .style(Style::default().bg(Color::Reset)),
                         metadata_rect,
                     );
                     self.git_status_area = footer_git_status
@@ -9596,7 +9594,7 @@ impl BorgTerminal {
                 frame.render_widget(Clear, copy_area);
                 frame.render_widget(
                     Paragraph::new(copy_notice_line(notice.to_string()))
-                        .style(Style::default().bg(Color::Black)),
+                        .style(Style::default().bg(Color::Reset)),
                     copy_area,
                 );
             }
@@ -13060,7 +13058,7 @@ fn queued_prompt_panel_height(
     if !expanded {
         return 1;
     }
-    let queue_width = panel_width.saturating_sub(5).max(1) as usize;
+    let queue_width = panel_width.saturating_sub(11).max(1) as usize;
     let visible = queued_prompts.len().min(6);
     let text_lines = queued_prompts
         .iter()
@@ -13069,8 +13067,8 @@ fn queued_prompt_panel_height(
         .sum::<usize>();
     text_lines
         .saturating_add(usize::from(queued_prompts.len() > visible))
-        // One border/title row; shortcut help lives in the palette.
-        .saturating_add(1)
+        // One top-border/title row plus one contextual shortcut row.
+        .saturating_add(2)
         .min(u16::MAX as usize) as u16
 }
 
@@ -13080,8 +13078,15 @@ fn pending_input_title(
     expanded: bool,
     panel_width: u16,
 ) -> String {
-    let arrow = if expanded { "▾" } else { "▸" };
-    let full = format!(" {arrow} {} · {count} ", ui_text(language, "Pending Input"));
+    let (arrow, action) = if expanded {
+        ("▾", "collapse")
+    } else {
+        ("▸", "expand")
+    };
+    let full = format!(
+        " {arrow} {} · {count} · click to {action} ",
+        ui_text(language, "Pending Input")
+    );
     if full.width() < usize::from(panel_width) {
         return full;
     }
@@ -13109,14 +13114,18 @@ fn wrapped_pending_prompt_lines(text: &str, width: usize) -> Vec<String> {
 fn queued_prompt_lines(
     queued_prompts: &[PendingPromptProjection],
     panel_width: u16,
-    _subagent_accent: Option<Color>,
+    subagent_accent: Option<Color>,
 ) -> Vec<Line<'static>> {
     let visible = queued_prompts.len().min(6);
-    let queue_width = panel_width.saturating_sub(5).max(1) as usize;
+    let queue_width = panel_width.saturating_sub(11).max(1) as usize;
     let mut lines = queued_prompts
         .iter()
         .take(visible)
         .flat_map(|prompt| {
+            let label_color = subagent_accent.unwrap_or(match prompt.delivery {
+                PromptDelivery::Steer => BORG_ORANGE,
+                PromptDelivery::Queue => Color::Gray,
+            });
             wrapped_pending_prompt_lines(&prompt.text, queue_width)
                 .into_iter()
                 .enumerate()
@@ -13125,6 +13134,12 @@ fn queued_prompt_lines(
                         Span::styled(
                             if index == 0 { " ↳ " } else { "   " },
                             Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            if index == 0 { "Next  " } else { "      " },
+                            Style::default()
+                                .fg(label_color)
+                                .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(text, Style::default().fg(Color::Gray)),
                     ])
@@ -13137,6 +13152,10 @@ fn queued_prompt_lines(
             Style::default().fg(Color::DarkGray),
         )));
     }
+    lines.push(Line::from(Span::styled(
+        "   esc send input · keep running  ·  ↑ edit / recall input",
+        Style::default().fg(Color::DarkGray),
+    )));
     lines
 }
 
@@ -15421,40 +15440,39 @@ fn tool_summary_lines(
     prefix: &str,
     width: usize,
 ) -> Vec<String> {
-    let content_width = width.saturating_sub(UnicodeWidthStr::width(prefix));
-    let Some(elapsed) = elapsed else {
-        return wrap_display(summary, content_width.max(1));
-    };
-    // Keep action text at one stable width while the timer changes from
-    // tenths to seconds, minutes, hours, or days.
+    // One row per action: long details end in an ellipsis (the full text is
+    // one click away) and the timer keeps a fixed right-aligned column.
     const ELAPSED_COLUMN_WIDTH: usize = 8;
-    let elapsed_width = UnicodeWidthStr::width(elapsed);
-    let reserved_width = ELAPSED_COLUMN_WIDTH.saturating_add(2);
-    if content_width <= reserved_width {
-        return wrap_display(&format!("{summary} · {elapsed}"), content_width.max(1));
+    let content_width = width.saturating_sub(UnicodeWidthStr::width(prefix)).max(1);
+    let reserved_width = elapsed.map_or(0, |_| ELAPSED_COLUMN_WIDTH + 2);
+    let text_width = content_width.saturating_sub(reserved_width).max(1);
+    let summary = summary.replace(['\n', '\r', '\t'], " ");
+    let mut line = String::new();
+    if UnicodeWidthStr::width(summary.as_str()) <= text_width {
+        line = summary;
+    } else {
+        let mut used = 0;
+        for character in summary.chars() {
+            let character_width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+            if used + character_width + 1 > text_width {
+                break;
+            }
+            used += character_width;
+            line.push(character);
+        }
+        line.truncate(line.trim_end().len());
+        line.push('…');
     }
-
-    let first_width = content_width - reserved_width;
-    let Some((first_start, first_end)) = display_ranges(summary, first_width, false)
-        .into_iter()
-        .next()
-    else {
-        return vec![format!("{:>content_width$}", elapsed)];
-    };
-    let mut lines = vec![summary[first_start..first_end].to_string()];
-    let remaining = summary[first_end..].trim_start();
-    if !remaining.is_empty() {
-        lines.extend(wrap_display(remaining, content_width));
-    }
-    if let Some(first) = lines.first_mut() {
+    if let Some(elapsed) = elapsed
+        && content_width > reserved_width
+    {
         let padding = content_width
-            .saturating_sub(UnicodeWidthStr::width(first.as_str()))
-            .saturating_sub(ELAPSED_COLUMN_WIDTH)
-            .saturating_add(ELAPSED_COLUMN_WIDTH.saturating_sub(elapsed_width));
-        first.push_str(&" ".repeat(padding));
-        first.push_str(elapsed);
+            .saturating_sub(UnicodeWidthStr::width(line.as_str()))
+            .saturating_sub(UnicodeWidthStr::width(elapsed));
+        line.push_str(&" ".repeat(padding));
+        line.push_str(elapsed);
     }
-    lines
+    vec![line]
 }
 
 #[cfg(test)]

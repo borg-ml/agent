@@ -3562,7 +3562,7 @@ fn running_tool_timing_column_never_rewraps_action_text() {
     let short = tool_summary_lines(summary, Some("0.1s"), "  ", 88);
     let long = tool_summary_lines(summary, Some("1m 00s"), "  ", 88);
 
-    assert_eq!(short.len(), long.len());
+    assert_eq!((short.len(), long.len()), (1, 1));
     assert_eq!(
         &short[0][..short[0].len() - 8],
         &long[0][..long[0].len() - 8]
@@ -10571,9 +10571,9 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
     let six = (0..6).map(|_| prompts[0].clone()).collect::<Vec<_>>();
     let seven = (0..7).map(|_| prompts[0].clone()).collect::<Vec<_>>();
     assert_eq!(queued_prompt_panel_height(&[], 60, true), 0);
-    assert_eq!(queued_prompt_panel_height(&prompts, 60, true), 2);
-    assert_eq!(queued_prompt_panel_height(&six, 60, true), 7);
-    assert_eq!(queued_prompt_panel_height(&seven, 60, true), 8);
+    assert_eq!(queued_prompt_panel_height(&prompts, 60, true), 3);
+    assert_eq!(queued_prompt_panel_height(&six, 60, true), 8);
+    assert_eq!(queued_prompt_panel_height(&seven, 60, true), 9);
 
     let area = Rect::new(0, 0, 60, queued_prompt_panel_height(&prompts, 60, true));
     let mut buffer = ratatui::buffer::Buffer::empty(area);
@@ -10587,8 +10587,12 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
     let content = (0..area.width)
         .map(|x| buffer[(x, 1)].symbol())
         .collect::<String>();
-    assert!(!content.contains("Next"));
+    let hint = (0..area.width)
+        .map(|x| buffer[(x, 2)].symbol())
+        .collect::<String>();
+    assert!(content.contains("Next"));
     assert!(content.contains("visible follow-up"));
+    assert!(hint.contains("↑ edit / recall input"));
 }
 
 #[test]
@@ -10620,7 +10624,7 @@ fn collapsed_pending_input_keeps_the_queue_count_and_reclaims_transcript_rows() 
     let header = (0..area.width)
         .map(|x| buffer[(x, 0)].symbol())
         .collect::<String>();
-    assert!(header.contains("Pending Input · 23"));
+    assert!(header.contains("Pending Input · 23 · click to expand"));
     assert!(!header.contains("long pending input"));
     for (width, expected) in [(20, "23 pending"), (8, "▸ 23")] {
         let narrow = Rect::new(0, 0, width, 1);
@@ -10709,7 +10713,7 @@ fn pending_input_wraps_the_entire_prompt_instead_of_compacting_it() {
 }
 
 #[test]
-fn pending_steer_ui_shows_the_queued_message_without_shortcut_clutter() {
+fn pending_steer_ui_uses_the_shared_next_label_and_live_flush_action() {
     let prompts = [PendingPromptProjection {
         message_id: Uuid::new_v4(),
         text: "focus on the failing test".to_string(),
@@ -10722,11 +10726,12 @@ fn pending_steer_ui_shows_the_queued_message_without_shortcut_clutter() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(!rendered.contains("Next"));
+    assert!(rendered.contains("Next"));
     assert!(!rendered.contains("NEXT TOOL"));
     assert!(!rendered.contains("NEXT TURN"));
     assert!(rendered.contains("focus on the failing test"));
-    assert!(!rendered.contains("esc send input"));
+    assert!(rendered.contains("esc send input · keep running"));
+    assert!(rendered.contains("recall input"));
 }
 
 #[test]
