@@ -3148,6 +3148,23 @@ async fn run_agent_session_store_kernel_inner(
                             retry_not_before = None;
                         }
                     }
+                    Some(HostCommand::RecoverPendingInput { prompts, .. }) => {
+                        for recovered in prompts {
+                            queue_pending_prompt(
+                                &mut journal,
+                                &events,
+                                session_id,
+                                &mut pending,
+                                &mut team_message_ids,
+                                recovered.message_id,
+                                recovered.text,
+                                recovered.attachments,
+                                recovered.output_schema,
+                            )
+                            .await?;
+                        }
+                        coalesce_queued_prompts(&mut pending);
+                    }
                     Some(HostCommand::FlushPendingInput { .. }) => {}
                     Some(HostCommand::ExtensionCommand {
                         session_id: command_session_id,
@@ -5858,6 +5875,20 @@ async fn run_agent_session_store_kernel_inner(
                             batch_pending_after_interrupt = true;
                             interrupted = true;
                             break;
+                        }
+                        HostCommand::RecoverPendingInput { prompts, .. } => {
+                            for recovered in prompts {
+                                if pending_steers.iter().any(|steer| {
+                                    steer.prompt.batch_entries().iter().any(|entry| entry.message_id == recovered.message_id)
+                                }) {
+                                    continue;
+                                }
+                                queue_pending_prompt(
+                                    &mut journal, &events, session_id, &mut pending,
+                                    &mut team_message_ids, recovered.message_id, recovered.text,
+                                    recovered.attachments, recovered.output_schema,
+                                ).await?;
+                            }
                         }
                         HostCommand::FlushPendingInput { .. } => {
                             flush_pending_input_into_active_turn(
@@ -10117,6 +10148,25 @@ async fn collect_input_at_turn_boundary(
             } if command_session_id == session_id => {
                 for recalled in recall_visible_queued_prompts(pending, message_id) {
                     record_recalled_prompt(journal, events, session_id, &recalled).await?;
+                }
+            }
+            HostCommand::RecoverPendingInput {
+                session_id: command_session_id,
+                prompts,
+            } if command_session_id == session_id => {
+                for recovered in prompts {
+                    queue_pending_prompt(
+                        journal,
+                        events,
+                        session_id,
+                        pending,
+                        team_message_ids,
+                        recovered.message_id,
+                        recovered.text,
+                        recovered.attachments,
+                        recovered.output_schema,
+                    )
+                    .await?;
                 }
             }
             HostCommand::FlushPendingInput {

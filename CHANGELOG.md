@@ -7,6 +7,8 @@ Git comparison.
 
 ### Terminal
 
+- Pending Input is quieter and gives queued text more room. In the tool
+  inspector, Back to actions no longer overlaps the compaction status row.
 - The Running timer now keeps cumulative active time across action handoffs,
   including for subagents, without adding a second `run` timer.
 - The Running status highlight sweeps more slowly and narrowly, without
@@ -20,8 +22,10 @@ Git comparison.
   `capabilities.watcher_yield = false` to disable it.
 - Queued human follow-ups are batched into one turn at the boundary, even
   without an interrupt; each message keeps its own durable identity.
-- Esc on an owned local session bypasses the general command backlog so a
-  busy actor can stop the active turn promptly.
+- Esc on owned and attached local sessions bypasses the general command
+  backlog so a busy actor can stop the active turn promptly.
+- Flushing Pending Input from an attached viewer delivers recovered messages
+  together before the flush, preserving the same batch as the session owner.
 
 ### Providers and dictation
 

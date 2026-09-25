@@ -2567,16 +2567,15 @@ async fn run_local_agent_session(
     let control_server = if session_access.is_attached() {
         None
     } else {
-        Some(
-            LocalSessionControlServer::start_with_durable_prompt_admissions(
-                control_socket_path.clone(),
-                session_id,
-                writer.as_ref().expect("session owner holds writer lease"),
-                session_command_tx.clone(),
-                Some(Arc::clone(&local_prompt_admissions)),
-                Arc::clone(&store),
-            )?,
-        )
+        Some(LocalSessionControlServer::start_with_priority_commands(
+            control_socket_path.clone(),
+            session_id,
+            writer.as_ref().expect("session owner holds writer lease"),
+            session_command_tx.clone(),
+            interrupt_tx.clone(),
+            Some(Arc::clone(&local_prompt_admissions)),
+            Arc::clone(&store),
+        )?)
     };
     if let Some(server) = control_server.as_ref() {
         server.seed_durable_watermark(session_state.latest_sequence);
@@ -5721,14 +5720,24 @@ async fn run_local_agent_session(
                                 | SessionStatus::Running
                                 | SessionStatus::WaitingForApproval
                         ) {
-                            dispatch_host_command_without_blocking(
-                                if session_access.is_attached() {
-                                    &session_command_tx
-                                } else {
-                                    &interrupt_tx
-                                },
-                                HostCommand::Interrupt { session_id },
-                            )
+                            if session_access.is_attached() {
+                                let socket = control_socket_path.clone();
+                                let fallback = session_command_tx.clone();
+                                tokio::spawn(async move {
+                                    if let Err(error) = send_local_session_command(
+                                        &socket, session_id, HostCommand::Interrupt { session_id },
+                                    ).await {
+                                        tracing::warn!(%error, "direct viewer interrupt failed; retrying through attached actor");
+                                        let _ = fallback.send(HostCommand::Interrupt { session_id }).await;
+                                    }
+                                });
+                                true
+                            } else {
+                                dispatch_host_command_without_blocking(
+                                    &interrupt_tx,
+                                    HostCommand::Interrupt { session_id },
+                                )
+                            }
                         } else {
                             true
                         };
@@ -10305,6 +10314,7 @@ fn remote_command_name(command: &HostCommand) -> &'static str {
         HostCommand::Broadcast { .. } => "team broadcast",
         HostCommand::BroadcastInstances { .. } => "instance broadcast",
         HostCommand::FlushPendingInput { .. } => "flush pending input",
+        HostCommand::RecoverPendingInput { .. } => "recover pending input",
         HostCommand::Configure { .. } => "configure",
         HostCommand::Approve { .. } => "approval",
         HostCommand::RespondToProviderInteraction { .. } => "provider interaction response",
