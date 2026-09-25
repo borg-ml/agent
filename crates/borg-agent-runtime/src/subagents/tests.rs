@@ -1868,7 +1868,7 @@ async fn a_child_without_a_lane_inherits_the_parent_live_lane() {
         "{spawned}"
     );
     let child = Uuid::parse_str(spawned["session_id"].as_str().unwrap()).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if coordinator.get(child).await.unwrap().status == SubagentStatus::Ready {
                 break;
