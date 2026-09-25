@@ -4592,11 +4592,12 @@ fn authorize_workspace_command(
     if matches!(
         command,
         HostCommand::TeamPrompt { .. }
+            | HostCommand::RecoverPendingInput { .. }
             | HostCommand::Broadcast { .. }
             | HostCommand::BroadcastInstances { .. }
             | HostCommand::ResumeFromInterrupt { .. }
     ) {
-        bail!("team prompts are host-local and cannot be remotely authorized");
+        bail!("host-local commands cannot be remotely authorized");
     }
     let Some(authority) = &attachment.command_authority else {
         return Ok(());
@@ -4604,6 +4605,7 @@ fn authorize_workspace_command(
     let kind = match command {
         HostCommand::Prompt { .. } => crate::ParticipantCommandKind::Prompt,
         HostCommand::TeamPrompt { .. }
+        | HostCommand::RecoverPendingInput { .. }
         | HostCommand::Broadcast { .. }
         | HostCommand::BroadcastInstances { .. }
         | HostCommand::ResumeFromInterrupt { .. } => {
@@ -8534,6 +8536,17 @@ mod tests {
                 },
             )
             .is_ok()
+        );
+        assert!(
+            authorize_workspace_command(
+                &attachment,
+                &HostCommand::RecoverPendingInput {
+                    session_id,
+                    prompts: Vec::new(),
+                },
+            )
+            .is_err(),
+            "Prompt permission must not authorize internal recovery batches"
         );
         assert!(
             authorize_workspace_command(&attachment, &HostCommand::Stop { session_id }).is_err()

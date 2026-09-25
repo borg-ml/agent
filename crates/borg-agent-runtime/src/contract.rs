@@ -1370,6 +1370,15 @@ pub struct RemoteSession {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct RecoveredPendingPrompt {
+    pub message_id: Uuid,
+    pub text: String,
+    pub attachments: Vec<PathBuf>,
+    pub output_schema: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[ts(export)]
 pub enum HostCommand {
@@ -1421,6 +1430,12 @@ pub enum HostCommand {
     /// Unlike `Interrupt`, this never cancels the turn.
     FlushPendingInput {
         session_id: Uuid,
+    },
+    /// Internal atomic handoff of already-admitted pending input. Never accept
+    /// this command from a remote participant or a client control socket.
+    RecoverPendingInput {
+        session_id: Uuid,
+        prompts: Vec<RecoveredPendingPrompt>,
     },
     Configure {
         session_id: Uuid,
@@ -1517,6 +1532,7 @@ impl HostCommand {
             | Self::BroadcastInstances { session_id, .. }
             | Self::RecallQueuedPrompt { session_id, .. }
             | Self::FlushPendingInput { session_id }
+            | Self::RecoverPendingInput { session_id, .. }
             | Self::Configure { session_id, .. }
             | Self::Approve { session_id, .. }
             | Self::RespondToProviderInteraction { session_id, .. }

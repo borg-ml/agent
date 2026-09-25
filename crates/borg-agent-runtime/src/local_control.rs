@@ -759,6 +759,26 @@ impl LocalSessionControlServer {
         Self::start(socket_path, session_id, _writer, commands)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_priority_commands(
+        socket_path: PathBuf,
+        session_id: Uuid,
+        writer: &SessionWriterLease,
+        commands: mpsc::Sender<HostCommand>,
+        _priority: mpsc::Sender<HostCommand>,
+        prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
+        store: Arc<dyn SessionStore>,
+    ) -> Result<Self> {
+        Self::start_with_durable_prompt_admissions(
+            socket_path,
+            session_id,
+            writer,
+            commands,
+            prompt_admissions,
+            store,
+        )
+    }
+
     pub fn has_attached_viewers(&self) -> bool {
         false
     }
@@ -786,7 +806,34 @@ impl LocalSessionControlServer {
         commands: mpsc::Sender<HostCommand>,
         prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
     ) -> Result<Self> {
-        Self::start_control_server(socket_path, session_id, commands, prompt_admissions, None)
+        Self::start_control_server(
+            socket_path,
+            session_id,
+            commands,
+            prompt_admissions,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_priority_commands(
+        socket_path: PathBuf,
+        session_id: Uuid,
+        _writer: &SessionWriterLease,
+        commands: mpsc::Sender<HostCommand>,
+        priority: mpsc::Sender<HostCommand>,
+        prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
+        store: Arc<dyn SessionStore>,
+    ) -> Result<Self> {
+        Self::start_control_server(
+            socket_path,
+            session_id,
+            commands,
+            prompt_admissions,
+            Some(store),
+            Some(priority),
+        )
     }
 
     pub fn start_with_durable_prompt_admissions(
@@ -803,6 +850,7 @@ impl LocalSessionControlServer {
             commands,
             prompt_admissions,
             Some(store),
+            None,
         )
     }
 
@@ -812,6 +860,7 @@ impl LocalSessionControlServer {
         commands: mpsc::Sender<HostCommand>,
         prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
         store: Option<Arc<dyn SessionStore>>,
+        priority: Option<mpsc::Sender<HostCommand>>,
     ) -> Result<Self> {
         use std::os::unix::fs::PermissionsExt;
         use tokio::net::UnixListener;
@@ -867,12 +916,14 @@ impl LocalSessionControlServer {
                         match result {
                             Ok((stream, _)) => {
                                 let commands = commands.clone();
+                                let priority = priority.clone();
                                 let prompt_admissions = prompt_admissions.clone();
                                 let store = store.clone();
                                 tokio::spawn(handle_control_connection(
                                     stream,
                                     session_id,
                                     commands,
+                                    priority,
                                     prompt_admissions,
                                     store,
                                 ));
@@ -1042,6 +1093,7 @@ async fn handle_control_connection(
     mut stream: tokio::net::UnixStream,
     session_id: Uuid,
     commands: mpsc::Sender<HostCommand>,
+    priority: Option<mpsc::Sender<HostCommand>>,
     prompt_admissions: Option<Arc<Mutex<HashSet<Uuid>>>>,
     store: Option<Arc<dyn SessionStore>>,
 ) {
@@ -1061,6 +1113,10 @@ async fn handle_control_connection(
         if command.session_id() != Some(session_id) {
             bail!("command targets a different session");
         }
+        anyhow::ensure!(
+            !matches!(command, HostCommand::RecoverPendingInput { .. }),
+            "recovered input is internal to the session owner"
+        );
         if let HostCommand::Prompt {
             message_id,
             text,
@@ -1106,6 +1162,7 @@ async fn handle_control_connection(
             // Admission can succeed before the original control handoff fails.
             // Re-send those identities before flushing; the actor deduplicates
             // prompts already present in its queue or active turn.
+            let mut recovered = Vec::new();
             for action in store.pending_actions(session_id, usize::MAX).await? {
                 if !matches!(
                     action.kind,
@@ -1131,20 +1188,29 @@ async fn handle_control_connection(
                         .cloned()
                         .context("pending prompt is missing its attachments")?,
                 )?;
+                recovered.push(crate::RecoveredPendingPrompt {
+                    message_id: action.action_id,
+                    text,
+                    attachments,
+                    output_schema: action.payload.get("output_schema").cloned(),
+                });
+            }
+            if !recovered.is_empty() {
                 commands
-                    .send(HostCommand::Prompt {
+                    .send(HostCommand::RecoverPendingInput {
                         session_id,
-                        message_id: action.action_id,
-                        text,
-                        attachments,
-                        output_schema: action.payload.get("output_schema").cloned(),
-                        delivery: crate::PromptDelivery::Steer,
+                        prompts: recovered,
                     })
                     .await
                     .map_err(|_| anyhow::anyhow!("session owner stopped"))?;
             }
         }
-        commands
+        let sender = if matches!(command, HostCommand::Interrupt { .. }) {
+            priority.as_ref().unwrap_or(&commands)
+        } else {
+            &commands
+        };
+        sender
             .send(command)
             .await
             .map_err(|_| anyhow::anyhow!("session owner stopped"))?;
@@ -1819,6 +1885,7 @@ pub async fn run_attached_session(
 mod tests {
     use super::*;
     use crate::PromptDelivery;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const MAX_UNIX_SOCKET_TEMP_ROOT_LENGTH: usize = 32;
@@ -2115,10 +2182,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attached_interrupt_bypasses_a_full_owner_command_queue() {
+        let root = short_socket_tempdir();
+        let session_id = Uuid::new_v4();
+        let lock_path = root.path().join("session.lock");
+        let socket_path = session_control_socket_path(root.path(), session_id);
+        let writer = SessionWriterLease::try_acquire(&lock_path)
+            .unwrap()
+            .unwrap();
+        let (_scratch, store) = crate::session_store::postgres::testing::session_store().await;
+        let store: Arc<dyn SessionStore> = Arc::new(store);
+        let (normal_tx, mut normal_rx) = mpsc::channel(1);
+        normal_tx
+            .send(HostCommand::Stop { session_id })
+            .await
+            .unwrap();
+        let (urgent_tx, mut urgent_rx) = mpsc::channel(1);
+        let _server = LocalSessionControlServer::start_with_priority_commands(
+            socket_path.clone(),
+            session_id,
+            &writer,
+            normal_tx,
+            urgent_tx,
+            None,
+            store,
+        )
+        .unwrap();
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            forward_attached_command(
+                &lock_path,
+                &socket_path,
+                HostCommand::Interrupt { session_id },
+            ),
+        )
+        .await
+        .expect("interrupt blocked on full command queue")
+        .unwrap();
+        assert!(matches!(
+            urgent_rx.recv().await,
+            Some(HostCommand::Interrupt { .. })
+        ));
+        assert!(matches!(
+            normal_rx.recv().await,
+            Some(HostCommand::Stop { .. })
+        ));
+    }
+
+    #[tokio::test]
     async fn flush_recovers_admitted_prompt_with_attachments_before_flushing_owner() {
         let root = short_socket_tempdir();
         let session_id = Uuid::new_v4();
         let message_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
         let lock_path = root.path().join("session.lock");
         let socket_path = session_control_socket_path(root.path(), session_id);
         let writer = SessionWriterLease::try_acquire(&lock_path)
@@ -2167,6 +2283,21 @@ mod tests {
             ))
             .await
             .unwrap();
+        store
+            .admit_prompt(SessionEvent::new(
+                session_id,
+                0,
+                SessionEventKind::Message {
+                    message_id: second_id,
+                    actor: EventActor::User,
+                    text: "second message".into(),
+                    attachments: Vec::new(),
+                    status: MessageStatus::Queued,
+                    delivery: Some(PromptDelivery::Queue),
+                },
+            ))
+            .await
+            .unwrap();
         let (owner_tx, mut owner_rx) = mpsc::channel(4);
         let _server = LocalSessionControlServer::start_with_durable_prompt_admissions(
             socket_path.clone(),
@@ -2187,19 +2318,15 @@ mod tests {
             .unwrap()
         );
         match owner_rx.recv().await.unwrap() {
-            HostCommand::Prompt {
-                message_id: actual,
-                text,
-                attachments: actual_files,
-                delivery,
-                ..
-            } => {
-                assert_eq!(actual, message_id);
-                assert_eq!(text, "use this image");
-                assert_eq!(actual_files, attachments);
-                assert_eq!(delivery, PromptDelivery::Steer);
+            HostCommand::RecoverPendingInput { prompts, .. } => {
+                assert_eq!(prompts.len(), 2);
+                assert_eq!(prompts[0].message_id, message_id);
+                assert_eq!(prompts[0].text, "use this image");
+                assert_eq!(prompts[0].attachments, attachments);
+                assert_eq!(prompts[1].message_id, second_id);
+                assert_eq!(prompts[1].text, "second message");
             }
-            command => panic!("expected recovered prompt, got {command:?}"),
+            command => panic!("expected one recovered batch, got {command:?}"),
         }
         assert!(matches!(
             owner_rx.recv().await.unwrap(),

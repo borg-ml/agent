@@ -10545,9 +10545,9 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
     let six = (0..6).map(|_| prompts[0].clone()).collect::<Vec<_>>();
     let seven = (0..7).map(|_| prompts[0].clone()).collect::<Vec<_>>();
     assert_eq!(queued_prompt_panel_height(&[], 60, true), 0);
-    assert_eq!(queued_prompt_panel_height(&prompts, 60, true), 3);
-    assert_eq!(queued_prompt_panel_height(&six, 60, true), 8);
-    assert_eq!(queued_prompt_panel_height(&seven, 60, true), 9);
+    assert_eq!(queued_prompt_panel_height(&prompts, 60, true), 2);
+    assert_eq!(queued_prompt_panel_height(&six, 60, true), 7);
+    assert_eq!(queued_prompt_panel_height(&seven, 60, true), 8);
 
     let area = Rect::new(0, 0, 60, queued_prompt_panel_height(&prompts, 60, true));
     let mut buffer = ratatui::buffer::Buffer::empty(area);
@@ -10561,12 +10561,8 @@ fn one_queued_prompt_allocates_a_content_row_below_its_border() {
     let content = (0..area.width)
         .map(|x| buffer[(x, 1)].symbol())
         .collect::<String>();
-    let hint = (0..area.width)
-        .map(|x| buffer[(x, 2)].symbol())
-        .collect::<String>();
-    assert!(content.contains("Next"));
+    assert!(!content.contains("Next"));
     assert!(content.contains("visible follow-up"));
-    assert!(hint.contains("↑ edit / recall input"));
 }
 
 #[test]
@@ -10598,7 +10594,7 @@ fn collapsed_pending_input_keeps_the_queue_count_and_reclaims_transcript_rows() 
     let header = (0..area.width)
         .map(|x| buffer[(x, 0)].symbol())
         .collect::<String>();
-    assert!(header.contains("Pending Input · 23 · click to expand"));
+    assert!(header.contains("Pending Input · 23"));
     assert!(!header.contains("long pending input"));
     for (width, expected) in [(20, "23 pending"), (8, "▸ 23")] {
         let narrow = Rect::new(0, 0, width, 1);
@@ -10687,7 +10683,7 @@ fn pending_input_wraps_the_entire_prompt_instead_of_compacting_it() {
 }
 
 #[test]
-fn pending_steer_ui_uses_the_shared_next_label_and_live_flush_action() {
+fn pending_steer_ui_shows_the_queued_message_without_shortcut_clutter() {
     let prompts = [PendingPromptProjection {
         message_id: Uuid::new_v4(),
         text: "focus on the failing test".to_string(),
@@ -10700,14 +10696,11 @@ fn pending_steer_ui_uses_the_shared_next_label_and_live_flush_action() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    assert!(rendered.contains("Next"));
+    assert!(!rendered.contains("Next"));
     assert!(!rendered.contains("NEXT TOOL"));
     assert!(!rendered.contains("NEXT TURN"));
     assert!(rendered.contains("focus on the failing test"));
-    assert!(rendered.contains("esc send input · keep running"));
-    // ↑ asks the session to recall the steer; it decides whether the provider
-    // has acknowledged it yet.
-    assert!(rendered.contains("recall input"));
+    assert!(!rendered.contains("esc send input"));
 }
 
 #[test]
@@ -15743,6 +15736,46 @@ async fn action_inspector_stays_on_its_tool_when_plan_or_goal_moves() {
         ));
         terminal.shutdown().await;
     }
+}
+
+#[tokio::test]
+#[ignore = "requires a PTY to render the action inspector"]
+async fn back_to_actions_never_covers_compaction_status() {
+    let session_id = Uuid::new_v4();
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        session_id,
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    terminal.apply_session_event(&SessionEvent::new(
+        session_id,
+        1,
+        SessionEventKind::ToolStarted {
+            tool_call_id: "selected-tool".into(),
+            name: "exec".into(),
+            input: serde_json::json!({"cmd": "cargo check"}),
+            input_ref: None,
+        },
+    ));
+    terminal.open_tool_inspector(terminal.transcript.tools["selected-tool"]);
+    terminal.transcript.context_known = true;
+    terminal.transcript.context_remaining_percent = 20;
+    terminal.draw().unwrap();
+    let button = terminal
+        .back_to_director_area
+        .expect("return button visible");
+    let status = terminal.status_area.expect("status row visible");
+    assert!(
+        button.bottom() <= status.y,
+        "button {button:?} overlaps status {status:?}"
+    );
+    if let Some(compaction) = terminal.context_status_area {
+        assert!(!button.intersects(compaction));
+    }
+    terminal.shutdown().await;
 }
 
 #[tokio::test]

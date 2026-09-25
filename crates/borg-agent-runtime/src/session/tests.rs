@@ -9762,6 +9762,65 @@ async fn inactive_wake_report_is_retained_for_the_root_provider_turn() {
 }
 
 #[tokio::test]
+async fn recovered_pending_batch_is_admitted_before_flush_at_turn_boundary() {
+    let session_id = Uuid::new_v4();
+    let (scratch, _store, mut journal) = runtime_store(session_id).await;
+    let (event_tx, _event_rx) = mpsc::channel(8);
+    let (command_tx, command_rx) = mpsc::channel(8);
+    let ids = [Uuid::new_v4(), Uuid::new_v4()];
+    command_tx
+        .send(HostCommand::RecoverPendingInput {
+            session_id,
+            prompts: ids
+                .iter()
+                .enumerate()
+                .map(|(index, message_id)| crate::RecoveredPendingPrompt {
+                    message_id: *message_id,
+                    text: format!("follow-up {index}"),
+                    attachments: Vec::new(),
+                    output_schema: None,
+                })
+                .collect(),
+        })
+        .await
+        .unwrap();
+    command_tx
+        .send(HostCommand::FlushPendingInput { session_id })
+        .await
+        .unwrap();
+    let mut commands = HostCommandInbox::new(command_rx, None);
+    let mut pending = VecDeque::new();
+    let mut deferred = VecDeque::new();
+    let mut team_ids = HashSet::new();
+    let mut stale = HashSet::new();
+    collect_input_at_turn_boundary(
+        &mut journal,
+        &event_tx,
+        session_id,
+        &mut pending,
+        &mut commands,
+        &mut deferred,
+        &mut team_ids,
+        &mut stale,
+    )
+    .await
+    .unwrap();
+    coalesce_queued_prompts(&mut pending);
+    assert!(deferred.is_empty());
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].text, "follow-up 0\n\nfollow-up 1");
+    assert_eq!(
+        pending[0]
+            .batch_entries()
+            .iter()
+            .map(|entry| entry.message_id)
+            .collect::<Vec<_>>(),
+        ids
+    );
+    scratch.discard().await;
+}
+
+#[tokio::test]
 async fn turn_boundary_waits_for_a_late_sibling_of_pending_input() {
     let session_id = Uuid::new_v4();
     let (scratch, _store, mut journal) = runtime_store(session_id).await;

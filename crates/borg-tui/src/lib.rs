@@ -7918,7 +7918,8 @@ impl BorgTerminal {
                 is_launch_screen,
             );
             let status_color = focused_subagent_status_color(status, self.focused_child.is_some());
-            let (status_area, transcript_area, composer_area, footer_area) = if is_launch_screen {
+            let (status_area, mut transcript_area, composer_area, footer_area) = if is_launch_screen
+            {
                 let launch_width = composer_area_width.min(chunks[0].width);
                 let launch_height = composer_height
                     .saturating_add(7)
@@ -7974,6 +7975,21 @@ impl BorgTerminal {
                 )
             } else {
                 (chunks[2], chunks[0], chunks[3], chunks[4])
+            };
+            let back_to_actions_row = if self.focused_tool.is_some() && transcript_area.height > 1 {
+                let row = Rect {
+                    height: 1,
+                    ..transcript_area
+                };
+                transcript_area.y += 1;
+                transcript_area.height -= 1;
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(Color::Black)),
+                    row,
+                );
+                Some(row)
+            } else {
+                None
             };
             next_composer_text_area = Some(Rect {
                 x: composer_area
@@ -8499,13 +8515,7 @@ impl BorgTerminal {
                                     self.pending_input_expanded,
                                     chunks[1].width,
                                 ),
-                                Style::default()
-                                    .fg(if self.focused_child.is_some() {
-                                        SUBAGENT_PINK
-                                    } else {
-                                        BORG_ORANGE
-                                    })
-                                    .add_modifier(Modifier::BOLD),
+                                Style::default().fg(Color::Gray),
                             )),
                     ),
                     chunks[1],
@@ -8926,9 +8936,10 @@ impl BorgTerminal {
                 } else {
                     (" ↩ Return ", SUBAGENT_PINK)
                 };
+                let button_row = back_to_actions_row.unwrap_or(status_area);
                 let button = Rect {
-                    x: chunks[2].right().saturating_sub(label.width() as u16 + 1),
-                    y: status_area.y,
+                    x: button_row.right().saturating_sub(label.width() as u16 + 1),
+                    y: button_row.y,
                     width: label.width() as u16,
                     height: 1,
                 };
@@ -13049,7 +13060,7 @@ fn queued_prompt_panel_height(
     if !expanded {
         return 1;
     }
-    let queue_width = panel_width.saturating_sub(26).max(1) as usize;
+    let queue_width = panel_width.saturating_sub(5).max(1) as usize;
     let visible = queued_prompts.len().min(6);
     let text_lines = queued_prompts
         .iter()
@@ -13058,8 +13069,8 @@ fn queued_prompt_panel_height(
         .sum::<usize>();
     text_lines
         .saturating_add(usize::from(queued_prompts.len() > visible))
-        // One top-border/title row plus one contextual shortcut row.
-        .saturating_add(2)
+        // One border/title row; shortcut help lives in the palette.
+        .saturating_add(1)
         .min(u16::MAX as usize) as u16
 }
 
@@ -13069,15 +13080,8 @@ fn pending_input_title(
     expanded: bool,
     panel_width: u16,
 ) -> String {
-    let (arrow, action) = if expanded {
-        ("▾", "collapse")
-    } else {
-        ("▸", "expand")
-    };
-    let full = format!(
-        " {arrow} {} · {count} · click to {action} ",
-        ui_text(language, "Pending Input")
-    );
+    let arrow = if expanded { "▾" } else { "▸" };
+    let full = format!(" {arrow} {} · {count} ", ui_text(language, "Pending Input"));
     if full.width() < usize::from(panel_width) {
         return full;
     }
@@ -13105,18 +13109,14 @@ fn wrapped_pending_prompt_lines(text: &str, width: usize) -> Vec<String> {
 fn queued_prompt_lines(
     queued_prompts: &[PendingPromptProjection],
     panel_width: u16,
-    subagent_accent: Option<Color>,
+    _subagent_accent: Option<Color>,
 ) -> Vec<Line<'static>> {
     let visible = queued_prompts.len().min(6);
-    let queue_width = panel_width.saturating_sub(26).max(1) as usize;
+    let queue_width = panel_width.saturating_sub(5).max(1) as usize;
     let mut lines = queued_prompts
         .iter()
         .take(visible)
         .flat_map(|prompt| {
-            let label_color = subagent_accent.unwrap_or(match prompt.delivery {
-                PromptDelivery::Steer => BORG_ORANGE,
-                PromptDelivery::Queue => Color::Gray,
-            });
             wrapped_pending_prompt_lines(&prompt.text, queue_width)
                 .into_iter()
                 .enumerate()
@@ -13125,12 +13125,6 @@ fn queued_prompt_lines(
                         Span::styled(
                             if index == 0 { " ↳ " } else { "   " },
                             Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(
-                            if index == 0 { "Next  " } else { "      " },
-                            Style::default()
-                                .fg(label_color)
-                                .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(text, Style::default().fg(Color::Gray)),
                     ])
@@ -13143,10 +13137,6 @@ fn queued_prompt_lines(
             Style::default().fg(Color::DarkGray),
         )));
     }
-    lines.push(Line::from(Span::styled(
-        "   esc send input · keep running  ·  ↑ edit / recall input",
-        Style::default().fg(Color::DarkGray),
-    )));
     lines
 }
 
