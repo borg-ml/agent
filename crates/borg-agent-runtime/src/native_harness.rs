@@ -591,6 +591,7 @@ impl NativeHarness {
         let history = std::mem::take(&mut turn.conversation);
         let earlier_tool_calls = tool_call_ids(&history);
         messages.extend(history);
+        let new_message_start = messages.len();
         let user_message = native_user_message(&turn.cwd, &turn.prompt, &turn.attachments).await?;
         record_native_message(&events, turn.provider, &user_message).await?;
         messages.push(user_message);
@@ -624,6 +625,7 @@ impl NativeHarness {
                 messages.push(ModelMessage::user(content));
             }
         }
+        let new_message_tokens = estimated_messages_tokens(&messages[new_message_start..]);
         canonicalize_native_messages(&mut messages);
         let provider_session_id = native_model_session_id(turn.provider, turn.session_id);
         let prompt_cache_key = native_prompt_cache_key(
@@ -719,13 +721,12 @@ impl NativeHarness {
             if model_round == 1
                 && let Some(window) = route_window_tokens
             {
-                let budget = native_context_budget(
-                    &ProviderCallUsage {
-                        context_window_tokens: Some(window),
-                        ..Default::default()
-                    },
+                let budget = turn_start_context_budget(
                     &messages,
-                    0,
+                    window,
+                    turn.prior_native_context_tokens,
+                    turn.request_prefix_base.as_ref() == Some(&prefix),
+                    new_message_tokens,
                 );
                 self.compact_context_if_needed(
                     &turn,
@@ -1291,7 +1292,12 @@ impl NativeHarness {
                     // without an assistant message: the model wrote no answer
                     // and inventing one would put words in its mouth. Any text
                     // it did emit before parking is preserved in
-                    // `truncated_text`.
+                    // `truncated_text`. The pending tool results have not been
+                    // sent back to the model yet; include them in the usage
+                    // anchor that the next same-prefix turn may reuse.
+                    usage.context_tokens = usage
+                        .context_tokens
+                        .map(|tokens| tokens.saturating_add(trailing_context_tokens));
                     send_usage(&events, &usage, Some(turn.message_id)).await;
                     send(
                         &events,
@@ -4112,6 +4118,31 @@ impl NativeContextBudget {
 /// Context accounting for the next model round. Provider-reported usage is
 /// preferred, but a provider that reports nothing (or zero, as local servers
 /// do) must not disable compaction and let the transcript grow unbounded.
+fn turn_start_context_budget(
+    messages: &[ModelMessage],
+    window: u64,
+    prior_context_tokens: Option<u64>,
+    same_prefix: bool,
+    new_message_tokens: u64,
+) -> NativeContextBudget {
+    // Serialized JSON is a conservative fallback for cold or changed requests;
+    // it can greatly exceed the provider's actual token count on a cached replay.
+    // For an unchanged prefix, use the last server measurement plus this turn's
+    // new messages, just as post-round checks use server tokens plus tool output.
+    let context_tokens = prior_context_tokens
+        .filter(|_| same_prefix)
+        .map(|tokens| tokens.saturating_add(new_message_tokens));
+    native_context_budget(
+        &ProviderCallUsage {
+            context_tokens,
+            context_window_tokens: Some(window),
+            ..ProviderCallUsage::default()
+        },
+        messages,
+        0,
+    )
+}
+
 fn native_context_budget(
     usage: &ProviderCallUsage,
     messages: &[ModelMessage],
@@ -5962,6 +5993,7 @@ mod tests {
                 prompt_cache_session_id: Some(cache_root),
                 message_id: Uuid::new_v4(),
                 context_generation: 0,
+                prior_native_context_tokens: None,
                 provider: crate::CodingProvider::OpenRouter,
                 provider_session_id: None,
                 provider_fork_turn_id: None,
@@ -7146,6 +7178,26 @@ mod tests {
     }
 
     #[test]
+    fn turn_start_prefers_valid_provider_usage_over_inflated_replay_estimate() {
+        // A serialized replay can greatly exceed the server's count. A short
+        // follow-up must not compact at 63% free solely because of that estimate.
+        let messages = vec![ModelMessage::user("x".repeat(900_000))];
+        let threshold = EffectiveCompactionBudget::defaults_for_window(258_400);
+        let measured = turn_start_context_budget(&messages, 258_400, Some(95_035), true, 500);
+        assert_eq!(measured.context_tokens, 95_535);
+        assert!(!measured.needs_auto_compaction(&threshold));
+
+        let nearly_full = turn_start_context_budget(&messages, 258_400, Some(219_000), true, 1_000);
+        assert!(nearly_full.needs_auto_compaction(&threshold));
+
+        for (prior, same_prefix) in [(None, true), (Some(95_035), false)] {
+            let cold = turn_start_context_budget(&messages, 258_400, prior, same_prefix, 500);
+            assert_eq!(cold.context_source, "estimated");
+            assert!(cold.needs_auto_compaction(&threshold));
+        }
+    }
+
+    #[test]
     fn tool_round_auto_compaction_keeps_fifteen_percent_headroom() {
         let usage = |context_tokens, context_window_tokens| ProviderCallUsage {
             context_tokens: Some(context_tokens),
@@ -7627,6 +7679,7 @@ mod tests {
             prompt_cache_session_id: None,
             message_id: Uuid::new_v4(),
             context_generation: 0,
+            prior_native_context_tokens: None,
             provider: crate::CodingProvider::OpenRouter,
             provider_session_id: None,
             provider_fork_turn_id: None,
@@ -8631,6 +8684,7 @@ mod tests {
                 prompt_cache_session_id: Some(Uuid::new_v4()),
                 message_id: Uuid::new_v4(),
                 context_generation: 0,
+                prior_native_context_tokens: None,
                 provider: crate::CodingProvider::OpenRouter,
                 provider_session_id: None,
                 provider_fork_turn_id: None,
@@ -8869,6 +8923,7 @@ mod tests {
                 prompt_cache_session_id: Some(Uuid::new_v4()),
                 message_id: Uuid::new_v4(),
                 context_generation: 0,
+                prior_native_context_tokens: None,
                 provider: crate::CodingProvider::OpenRouter,
                 provider_session_id: None,
                 provider_fork_turn_id: None,
@@ -9329,6 +9384,7 @@ mod tests {
                 prompt_cache_session_id: Some(Uuid::new_v4()),
                 message_id: Uuid::new_v4(),
                 context_generation: 0,
+                prior_native_context_tokens: None,
                 provider: crate::CodingProvider::OpenRouter,
                 provider_session_id: None,
                 provider_fork_turn_id: None,
