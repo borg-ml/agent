@@ -47,6 +47,8 @@ const MAX_TOOL_RESULT_ATTACHMENT_BASE64_BYTES: usize = 6 * 1024 * 1024;
 /// estimate keeps a screenshot from being counted as a megabyte of text.
 const ESTIMATED_TOKENS_PER_IMAGE: u64 = 1_600;
 const COMPACTION_IMAGE_RESERVATION_CHARS: usize = ESTIMATED_TOKENS_PER_IMAGE as usize * 2;
+/// Stay below the provider's per-request image limit, counting overview/tiles.
+const MAX_REPLAY_IMAGE_BLOCKS: usize = 60;
 pub(crate) const MAX_APPROVAL_DETAIL_BYTES: usize = 8 * 1024;
 /// Continuations granted when the model hits its completion-token limit
 /// before finishing a reply. Each one keeps the truncated prefix as its own
@@ -2249,6 +2251,60 @@ impl ProviderModelClient {
     }
 }
 
+/// Trim only the outgoing replay. Durable history keeps the image so a
+/// subsequent compaction or an explicit revisit can still refer to it.
+fn limit_request_images(request: &mut ModelTurnRequest) {
+    let mut remaining = MAX_REPLAY_IMAGE_BLOCKS;
+    for message in request.messages.iter_mut().rev() {
+        let (content, attachments) = match message {
+            ModelMessage::User {
+                content,
+                attachments,
+            }
+            | ModelMessage::Tool {
+                content,
+                attachments,
+                ..
+            } => (content, attachments),
+            _ => continue,
+        };
+        let mut kept = Vec::new();
+        let mut omitted = Vec::new();
+        for attachment in std::mem::take(attachments).into_iter().rev() {
+            let blocks = if remaining == 0 {
+                1
+            } else {
+                base64::engine::general_purpose::STANDARD
+                    .decode(&attachment.data_base64)
+                    .map(|bytes| borg_provider::image_tiles::piece_count(&bytes))
+                    .unwrap_or(1)
+            };
+            if blocks <= remaining {
+                remaining -= blocks;
+                kept.push(attachment);
+            } else {
+                let path = attachment
+                    .filename
+                    .as_deref()
+                    .filter(|path| !path.is_empty() && !content.contains(path));
+                omitted.push(match path {
+                    Some(path) => format!("[image omitted from history: {path}]"),
+                    None => "[image omitted from history]".to_string(),
+                });
+            }
+        }
+        kept.reverse();
+        *attachments = kept;
+        omitted.reverse();
+        for marker in omitted {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&marker);
+        }
+    }
+}
+
 #[async_trait]
 impl NativeModelClient for ProviderModelClient {
     async fn model_turn(
@@ -2259,6 +2315,7 @@ impl NativeModelClient for ProviderModelClient {
         mut request: ModelTurnRequest,
         progress: Option<mpsc::UnboundedSender<ProviderProgress>>,
     ) -> std::result::Result<ModelTurnResult, ProviderCallError> {
+        limit_request_images(&mut request);
         if request.session_id.is_none() {
             request.session_id = self
                 .access
@@ -2486,9 +2543,10 @@ impl PromptCacheRefreshClient for ProviderModelClient {
         provider: crate::CodingProvider,
         model: &str,
         effort: Option<&str>,
-        request: ModelTurnRequest,
+        mut request: ModelTurnRequest,
         support: &RefreshSupport,
     ) -> std::result::Result<ProviderCallUsage, ProviderCallError> {
+        limit_request_images(&mut request);
         let refresh = PromptCacheRefresh {
             max_output_tokens: support.max_output_tokens,
         };
@@ -4502,12 +4560,7 @@ pub(crate) async fn native_user_message(
         encoded.push(ModelInputAttachment {
             media_type: media_type.to_string(),
             data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-            filename: path
-                .strip_prefix(cwd)
-                .unwrap_or(path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_string),
+            filename: Some(path.strip_prefix(cwd).unwrap_or(path).display().to_string()),
         });
     }
     Ok(ModelMessage::user_with_attachments(prompt, encoded))
@@ -4660,6 +4713,108 @@ struct ReadSkillArgs {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn request_image_budget_counts_tiled_screenshots() {
+        let mut image = Vec::new();
+        image::DynamicImage::new_rgb8(3840, 2160)
+            .write_to(
+                &mut std::io::Cursor::new(&mut image),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let attachment = ModelInputAttachment {
+            media_type: "image/png".to_string(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode(image),
+            filename: None,
+        };
+        let mut request = ModelTurnRequest {
+            fast: false,
+            request_id: None,
+            session_id: None,
+            prompt_cache_key: None,
+            turn_routing: Default::default(),
+            messages: (0..7)
+                .map(|index| ModelMessage::User {
+                    content: format!("screenshot {index}"),
+                    attachments: vec![attachment.clone()],
+                })
+                .collect(),
+            tools: Vec::new(),
+            output_schema: None,
+        };
+        limit_request_images(&mut request);
+        assert!(
+            matches!(&request.messages[0], ModelMessage::User { content, attachments }
+            if attachments.is_empty() && content.ends_with("[image omitted from history]"))
+        );
+        assert_eq!(
+            request
+                .messages
+                .iter()
+                .filter(|message| matches!(message,
+            ModelMessage::User { attachments, .. } if !attachments.is_empty()))
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    fn request_image_budget_keeps_recent_images_and_identifies_older_ones() {
+        let mut request = ModelTurnRequest {
+            fast: false,
+            request_id: None,
+            session_id: None,
+            prompt_cache_key: None,
+            turn_routing: Default::default(),
+            messages: (0..70)
+                .map(|index| ModelMessage::User {
+                    content: if index == 0 {
+                        "See old/0.png".to_string()
+                    } else {
+                        "screenshot".to_string()
+                    },
+                    attachments: vec![ModelInputAttachment {
+                        media_type: "image/png".to_string(),
+                        data_base64: base64::engine::general_purpose::STANDARD
+                            .encode(b"not an image"),
+                        filename: Some(format!("old/{index}.png")),
+                    }],
+                })
+                .collect(),
+            tools: Vec::new(),
+            output_schema: None,
+        };
+        let durable = request.messages.clone();
+        limit_request_images(&mut request);
+        assert_eq!(durable.len(), 70);
+        assert!(
+            matches!(&durable[0], ModelMessage::User { attachments, .. } if attachments.len() == 1)
+        );
+        assert!(
+            matches!(&request.messages[0], ModelMessage::User { content, attachments }
+            if attachments.is_empty() && content == "See old/0.png\n[image omitted from history]")
+        );
+        assert!(
+            matches!(&request.messages[1], ModelMessage::User { content, attachments }
+            if attachments.is_empty() && content == "screenshot\n[image omitted from history: old/1.png]")
+        );
+        assert!(
+            matches!(&request.messages[10], ModelMessage::User { attachments, .. } if attachments.len() == 1)
+        );
+        assert!(
+            matches!(&request.messages[69], ModelMessage::User { attachments, .. } if attachments.len() == 1)
+        );
+        assert_eq!(
+            request
+                .messages
+                .iter()
+                .filter(|message| matches!(message,
+            ModelMessage::User { attachments, .. } if !attachments.is_empty()))
+                .count(),
+            MAX_REPLAY_IMAGE_BLOCKS
+        );
+    }
+
     use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
 

@@ -26,9 +26,15 @@ Git comparison.
   backlog so a busy actor can stop the active turn promptly.
 - Flushing Pending Input from an attached viewer delivers recovered messages
   together before the flush, preserving the same batch as the session owner.
+- Messaging an idle child now reports `queued_idle` and explains how to wake it,
+  rather than implying the message was already read.
 
 ### Providers and dictation
 
+- Large images arrive as a scaled overview plus full-resolution tiles. Long
+  sessions keep at most 60 image blocks per request (counting tiles), retaining
+  the newest images and identifying older omissions by path when needed;
+  durable conversation history is unchanged.
 - The shared Claude subscription connector selects the pinned, checksummed
   runtime for macOS, Linux ARM, and Windows, not just Linux x86-64.
 - Managed dictation retries a recording on an isolated default-accelerator
