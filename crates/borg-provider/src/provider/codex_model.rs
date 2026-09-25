@@ -1013,6 +1013,12 @@ fn subscription_failure_message(
         "Codex subscription usage or rate limit reached.".to_string()
     } else if codes.contains(&Some("context_length_exceeded")) {
         "Codex context limit reached; compact the conversation before trying again.".to_string()
+    } else if status == Some(reqwest::StatusCode::UNAUTHORIZED)
+        && codes.contains(&Some("invalid_api_key"))
+    {
+        // ChatGPT accepted the refreshed login but its backend rejected its
+        // own upstream key; reconnecting cannot fix a provider-side outage.
+        "Codex backend rejected its own upstream credentials after your ChatGPT login was refreshed; this is an OpenAI outage, retry later.".to_string()
     } else if status == Some(reqwest::StatusCode::UNAUTHORIZED) {
         "Codex subscription authentication was rejected after recovery; reconnect Codex."
             .to_string()
@@ -1357,7 +1363,8 @@ const KNOWN_INCOMPLETE_REASONS: [&str; 2] = ["max_output_tokens", "content_filte
 /// counted as `other`, which still shows that an unsupported item arrived
 /// without repeating whatever the backend called it.
 const KNOWN_ITEM_TYPES: [&str; 3] = ["message", "function_call", "reasoning"];
-const KNOWN_ERROR_CODES: [&str; 8] = [
+const KNOWN_ERROR_CODES: [&str; 9] = [
+    "invalid_api_key",
     "invalid_value",
     "invalid_type",
     "invalid_request_error",
