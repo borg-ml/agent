@@ -314,14 +314,22 @@ pub async fn ensure_backend(config: LocalDictationConfig) -> Result<LocalDictati
     )
     .await
     .context("timed out installing the local Parakeet dictation backend")??;
-    let managed_config = config.for_managed_backend();
+    start_managed_backend(config.for_managed_backend(), installed, 5092).await
+}
+
+async fn start_managed_backend(
+    mut config: LocalDictationConfig,
+    installed: InstalledDictation,
+    port: u16,
+) -> Result<LocalDictationBackend> {
+    config.base_url = format!("http://127.0.0.1:{port}");
     let mut child = Command::new(&installed.server_bin)
         .arg("--model")
         .arg(&installed.model_path)
         .arg("--host")
         .arg("127.0.0.1")
         .arg("--port")
-        .arg("5092")
+        .arg(port.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -334,14 +342,14 @@ pub async fn ensure_backend(config: LocalDictationConfig) -> Result<LocalDictati
             )
         })?;
 
-    if let Err(error) = wait_for_endpoint(&managed_config.base_url, &mut child).await {
+    if let Err(error) = wait_for_endpoint(&config.base_url, &mut child).await {
         child.kill().await.ok();
         child.wait().await.ok();
         return Err(error);
     }
 
     Ok(LocalDictationBackend {
-        config: managed_config,
+        config,
         _service: Some(LocalDictationService { _child: child }),
     })
 }
@@ -1242,7 +1250,32 @@ impl LocalDictationRecorder {
         if !status.success() {
             bail!("{}", recorder_failure_message(status, &stderr));
         }
-        transcribe(&config, self.audio_path.as_ref()).await
+        match transcribe(&config, self.audio_path.as_ref()).await {
+            Err(error)
+                if config.requires_setup()
+                    && error
+                        .downcast_ref::<DictationServerError>()
+                        .is_some_and(|failure| failure.status.is_server_error()) =>
+            {
+                let port = std::net::TcpListener::bind("127.0.0.1:0")
+                    .context("reserve dictation recovery port")?
+                    .local_addr()?
+                    .port();
+                let installed = ensure_installed(
+                    config.managed_model_path.as_deref(),
+                    config.model_choice,
+                    DictationAccelerator::Auto,
+                    false,
+                )
+                .await?;
+                let fallback =
+                    start_managed_backend(config.for_managed_backend(), installed, port).await?;
+                transcribe(&fallback.config, self.audio_path.as_ref())
+                    .await
+                    .context("dictation recovery after local server error")
+            }
+            result => result,
+        }
     }
 }
 
@@ -1344,6 +1377,24 @@ fn recorder_command(config: &LocalDictationConfig, output: &std::path::Path) -> 
     Ok(command)
 }
 
+#[derive(Debug)]
+struct DictationServerError {
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl std::fmt::Display for DictationServerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "local dictation model returned {}: {}",
+            self.status, self.body
+        )
+    }
+}
+
+impl std::error::Error for DictationServerError {}
+
 async fn transcribe(config: &LocalDictationConfig, path: &std::path::Path) -> Result<String> {
     let metadata = tokio::fs::metadata(path)
         .await
@@ -1391,11 +1442,13 @@ async fn transcribe(config: &LocalDictationConfig, path: &std::path::Path) -> Re
         "local dictation response is too large"
     );
     let body = String::from_utf8_lossy(&body);
-    anyhow::ensure!(
-        status.is_success(),
-        "local dictation model returned {status}: {}",
-        body.trim()
-    );
+    if !status.is_success() {
+        return Err(DictationServerError {
+            status,
+            body: body.trim().to_string(),
+        }
+        .into());
+    }
     Ok(transcription_response_text(&body))
 }
 

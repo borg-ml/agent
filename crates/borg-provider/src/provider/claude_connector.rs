@@ -175,7 +175,35 @@ fn platform_release() -> Result<(&'static str, &'static str)> {
             "linux-x64",
             "56fe3da88458465fb27d7e9299dddb3fead55750fb9c2de795f233b5eea6dce1",
         )),
-        _ => bail!("the Claude shared model connector has no validated runtime for this platform"),
+        ("linux", "aarch64", false) => Ok((
+            "linux-arm64",
+            "dd27b36438a4fed1670cd29bad2fda6a73b628b6da55443e5c2f647fe6ed328f",
+        )),
+        ("linux", "x86_64", true) => Ok((
+            "linux-x64-musl",
+            "30220a5cf0628634599e0ede13a5cc8144b2c40e35abf762f0598a33636f7bca",
+        )),
+        ("linux", "aarch64", true) => Ok((
+            "linux-arm64-musl",
+            "4f72ebbb08706651e7a2204303793700698f4046bc31f3e7e65b381063b7c210",
+        )),
+        ("macos", "aarch64", _) => Ok((
+            "darwin-arm64",
+            "a922981f6f3b55a251ef9f9dbaa0621a5f99cbcb5ca67f8a797476ccfc83f626",
+        )),
+        ("macos", "x86_64", _) => Ok((
+            "darwin-x64",
+            "a9355cbb0d291ce948efcf61a6ef397401672f64fa5e5e67bca092fed6cd9088",
+        )),
+        ("windows", "x86_64", _) => Ok((
+            "win32-x64",
+            "39be063c2512b43347fe7b0ab18c46f1596141701c9c5fc895ddfca9a051067c",
+        )),
+        ("windows", "aarch64", _) => Ok((
+            "win32-arm64",
+            "103730182fe4dd36b8ff7791a408ac6144b2c40e35ab7b56b3561ce1d385ecbb",
+        )),
+        _ => bail!("the Claude shared model connector has no pinned runtime for this platform"),
     }
 }
 
@@ -193,7 +221,8 @@ async fn executable(root: &Path) -> Result<PathBuf> {
         let directory = root.join(VERSION).join(platform);
         private_directory(&directory)?;
         let _lock = lock(&directory.join("install.lock")).await?;
-        let path = directory.join("claude");
+        let binary_name = if cfg!(windows) { "claude.exe" } else { "claude" };
+        let path = directory.join(binary_name);
         if path.exists() {
             let checking = path.clone();
             ensure!(tokio::task::spawn_blocking(move || checksum(&checking)).await?? == expected,
@@ -204,7 +233,7 @@ async fn executable(root: &Path) -> Result<PathBuf> {
             "Claude {VERSION} is required for the shared connector; automatic installation is disabled");
         let mut file = tempfile::NamedTempFile::new_in(&directory)?;
         let response = reqwest::Client::builder().connect_timeout(Duration::from_secs(30)).build()?
-            .get(format!("{RELEASE_ROOT}/{VERSION}/{platform}/claude"))
+            .get(format!("{RELEASE_ROOT}/{VERSION}/{platform}/{binary_name}"))
             .timeout(Duration::from_secs(180)).send().await?.error_for_status()?;
         let mut stream = response.bytes_stream();
         let mut count = 0usize;
