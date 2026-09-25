@@ -4281,6 +4281,7 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
                 model: None,
                 effort: None,
             },
+            false,
         )
         .await
         .expect("a default-profile assignment must not fail on a stale reuse candidate");
@@ -4308,6 +4309,67 @@ async fn an_ordinary_assignment_repairs_a_reuse_candidate_that_lost_its_membersh
         recorded[1].contains("describe the material set"),
         "the executed turn must carry the assigned task: {recorded:?}"
     );
+
+    coordinator.stop_all().await;
+    scratch.discard().await;
+}
+
+/// An orchestrator keeps finished workers idle to follow up with them later
+/// (land this once the gate passes). A reuse renames such a worker and drops
+/// its last answer, so fresh:true must spawn and leave it untouched.
+#[tokio::test]
+async fn a_fresh_assignment_spawns_and_leaves_an_idle_worker_to_its_task() {
+    let directory = tempdir().unwrap();
+    let root = Uuid::new_v4();
+    let (scratch, store) = crate::session_store::postgres::testing::session_store().await;
+    let store = Arc::new(store);
+    store.create_session(root).await.unwrap();
+    let mut root_launch = launch();
+    root_launch.cwd = directory.path().to_path_buf();
+    let session_store: Arc<dyn SessionStore> = store.clone();
+    let coordinator = SubagentCoordinator::new_with_store_and_executor(
+        directory.path(),
+        root,
+        root_launch,
+        2,
+        Arc::new(RecordingPeerExecutor {
+            prompts: Arc::new(StdMutex::new(Vec::new())),
+        }),
+        session_store,
+    )
+    .unwrap();
+    let first = coordinator
+        .call_tool(
+            "spawn_agent",
+            json!({ "task_name": "rivers", "message": "Fix the rivers, then wait for landing." }),
+        )
+        .await
+        .unwrap();
+    let idle = Uuid::parse_str(first["session_id"].as_str().unwrap()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while coordinator.get(idle).await.unwrap().status != SubagentStatus::Ready {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first worker settles idle");
+
+    let second = coordinator
+        .call_tool(
+            "spawn_agent",
+            json!({ "task_name": "landing", "message": "Land the branches.", "fresh": true }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second["reused"], json!(false));
+    assert_ne!(second["session_id"], first["session_id"]);
+    let kept = coordinator.get(idle).await.unwrap();
+    assert!(
+        kept.task_name.ends_with("rivers"),
+        "renamed to {}",
+        kept.task_name
+    );
+    assert_eq!(kept.status, SubagentStatus::Ready);
 
     coordinator.stop_all().await;
     scratch.discard().await;
