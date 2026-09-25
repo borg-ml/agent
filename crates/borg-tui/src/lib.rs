@@ -3473,8 +3473,7 @@ impl BorgTerminal {
         self.withheld_queued_prompt = None;
         self.status = SessionStatus::Starting;
         self.interrupt_requested = false;
-        self.activity_clock
-            .observe(SessionStatus::Starting, event.created_at);
+        self.activity_clock.restart(event.created_at);
         self.transcript.follow_tail = true;
         self.invalidate_transcript_render_cache();
     }
@@ -3781,6 +3780,7 @@ impl BorgTerminal {
         }
         if matches!(event.kind, SessionEventKind::TurnStarted { .. }) {
             self.interrupt_requested = false;
+            self.activity_clock.restart(event.created_at);
         }
         if event.sequence > 0 {
             self.session_state_sequence = self.session_state_sequence.max(event.sequence);
@@ -11101,6 +11101,13 @@ struct ActivityClock {
 }
 
 impl ActivityClock {
+    /// A new turn times from zero. Time already running since its prompt was
+    /// sent still counts, but earlier turns, and waits between them, do not.
+    fn restart(&mut self, at: DateTime<Utc>) {
+        self.elapsed = chrono::Duration::zero();
+        self.started_at.get_or_insert(at);
+    }
+
     fn observe(&mut self, status: SessionStatus, at: DateTime<Utc>) {
         if matches!(status, SessionStatus::Starting | SessionStatus::Running) {
             self.started_at.get_or_insert(at);

@@ -26,6 +26,8 @@ Git comparison.
 
 ### Terminal
 
+- The running timer starts from zero for each new turn, including one a
+  message starts after the session was waiting, instead of adding to the last.
 - Replies stream a finished paragraph at a time by default: a paragraph once a
   blank line ends it, lists item by item, code blocks once their fence closes,
   and titles together with the text under them. `/streaming token` (or

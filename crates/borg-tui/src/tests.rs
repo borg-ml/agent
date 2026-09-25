@@ -1582,6 +1582,24 @@ fn subagent_activity_timers_are_independent_and_stop_with_their_agent() {
 }
 
 #[test]
+fn a_new_turn_times_from_zero_after_waiting() {
+    let started = Utc::now() - chrono::Duration::minutes(20);
+    let mut clock = ActivityClock::default();
+    clock.observe(SessionStatus::Running, started);
+    // The turn ended and the session waited on a watcher for ten minutes.
+    clock.observe(SessionStatus::Ready, started + chrono::Duration::minutes(5));
+    let woken = started + chrono::Duration::minutes(15);
+    clock.restart(woken);
+    clock.observe(SessionStatus::Running, woken);
+    assert_eq!(
+        clock
+            .status_duration(woken + chrono::Duration::minutes(2))
+            .as_deref(),
+        Some("2m")
+    );
+}
+
+#[test]
 fn running_status_retains_total_when_another_run_starts() {
     let started = Utc::now() - chrono::Duration::minutes(8);
     let mut clock = ActivityClock::default();
