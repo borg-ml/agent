@@ -5,6 +5,23 @@ Git comparison.
 
 ## Unreleased (since 0.11.5)
 
+### Models
+
+- Ordered model fallback chains: set `[models].fallback` (for example
+  `["claude-opus-5-5@max", "gpt-6-sol@xhigh", "opencode-go/deepseek-v4.1"]`)
+  and a usage limit moves the same turn to the next model with quota, then back
+  once the limit resets. Named chains compose with `chain:<name>`, and a route
+  never spends API credit unless it opts in. See docs/model-fallback.md.
+
+### Terminal
+
+- Footer hover hints say click and right-click, with the action in white and
+  what it does in grey.
+
+### History
+
+- Filtering history by actor works without search text.
+
 ## 0.11.5 (2026-09-25)
 
 ### Terminal
