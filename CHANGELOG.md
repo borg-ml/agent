@@ -5,6 +5,12 @@ Git comparison.
 
 ## Unreleased (since 0.11.6)
 
+### Models
+
+- New sessions start on the model you last used, and a session that fell back
+  after a usage limit stays on its new model instead of switching back at a
+  turn boundary.
+
 ### Terminal
 
 - Watch and other action rows sit in the action list with no extra spacing,

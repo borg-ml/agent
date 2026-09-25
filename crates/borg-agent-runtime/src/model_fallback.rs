@@ -3,8 +3,8 @@
 //! A session configured with a chain of [`ModelRoute`]s runs on the first
 //! route that has quota. When that route reaches a usage limit the session
 //! records when it resets and continues the same turn on the next available
-//! route; at later turn boundaries it returns to the earliest route whose limit
-//! has cleared. Only when every route is limited does it wait, and then for the
+//! route, where it stays until the user changes the model or that route is
+//! limited too. Only when every route is limited does it wait, and then for the
 //! route that resets first.
 
 use std::collections::HashMap;
