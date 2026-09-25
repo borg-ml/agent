@@ -39,8 +39,9 @@ Git comparison.
 ### Terminal
 
 - The action list is regrouped: every batch of actions sits under one header
-  with its start time, working directory and a summary (`read 4 · searched 2 ·
-  7 actions · 1 failed`); finished batches fold to that header until clicked.
+  with its start time, action count and working directory (`17:41 · 7 actions ·
+  ~/project`, plus `1 failed` in red when something failed); finished batches
+  fold to that header until clicked.
   Rows drop their clock time and leading `cd …`, name what a command did
   (`Read src/main.rs:1-40`, `Search “pattern”`, `Write build.py`, `Run Python`),
   show its result beside the duration (`6 matches`, `exit 1`, `12 passed`,

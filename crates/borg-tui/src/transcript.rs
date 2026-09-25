@@ -746,18 +746,15 @@ fn compaction_has_expandable_detail(summary: &str) -> bool {
 
 /// Keep the collapsed Thinking row current without laying out an unbounded
 /// reasoning line on every streamed fragment. The full text stays in code_view.
-/// A group's header: when it started, where its commands ran, and what it
-/// did, e.g. `17:41 · ~/abundance-wt/ore-cues · read 4 · searched 2 · 7 actions`.
+/// A group's header: when it started, how many actions, and where its
+/// commands ran, e.g. `17:41 · 7 actions · ~/abundance-wt/ore-cues`.
 fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: &str) -> String {
     let mut time = None;
     let mut cwd = None;
     // A folded group must not hide that something in it went wrong.
     let mut failed = 0;
-    let mut counts: Vec<(&str, usize)> = Vec::new();
     for entry in entries {
         let TranscriptEntry::Tool {
-            name,
-            code_view,
             time: row_time,
             cwd: row_cwd,
             error,
@@ -774,25 +771,12 @@ fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: 
         if row_cwd.is_some() {
             cwd = row_cwd.as_deref();
         }
-        let reasoning = matches!(code_view, Some((language, _)) if language == "reasoning");
-        let kind = match tool_kind_marker(name, reasoning) {
-            "∴" => continue,
-            "≡" => "read",
-            "⌕" => "searched",
-            "✎" => "edited",
-            "▶" => "ran",
-            "◆" => "agents",
-            _ => continue,
-        };
-        match counts.iter_mut().find(|(existing, _)| *existing == kind) {
-            Some((_, count)) => *count += 1,
-            None => counts.push((kind, 1)),
-        }
     }
     let mut parts: Vec<String> = Vec::new();
     if let Some(time) = time {
         parts.push(display_local_time(time, today_prefix).to_string());
     }
+    parts.push(format!("{total} action{}", if total == 1 { "" } else { "s" }));
     if let Some(cwd) = cwd {
         let home = std::env::var("HOME").unwrap_or_default();
         parts.push(match cwd.strip_prefix(&home) {
@@ -800,8 +784,6 @@ fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: 
             _ => cwd.to_string(),
         });
     }
-    parts.extend(counts.into_iter().map(|(kind, count)| format!("{kind} {count}")));
-    parts.push(format!("{total} action{}", if total == 1 { "" } else { "s" }));
     if failed > 0 {
         parts.push(format!("{failed} failed"));
     }

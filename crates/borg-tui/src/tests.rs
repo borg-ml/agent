@@ -12660,9 +12660,7 @@ fn a_finished_action_group_folds_to_its_summary_until_clicked() {
 
     let folded = render(&transcript);
     assert!(
-        folded.contains(
-            "▸ 12:00 · /srv/ore-cues · read 2 · searched 2 · 4 actions · click to expand"
-        ),
+        folded.contains("▸ 12:00 · 4 actions · /srv/ore-cues · click to expand"),
         "{folded}"
     );
     assert!(!folded.contains("first-read"), "{folded}");
