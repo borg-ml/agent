@@ -10965,6 +10965,74 @@ async fn escape_interrupts_with_pending_queue_and_keeps_the_composer_draft() {
     terminal.shutdown().await;
 }
 
+#[tokio::test]
+#[ignore = "requires a PTY; drives status-line menus with the keyboard only"]
+async fn keyboard_reaches_status_line_menus_without_a_mouse() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut terminal = BorgTerminal::enter(
+        directory.path(),
+        Uuid::new_v4(),
+        directory.path().to_path_buf(),
+        &KeybindingConfig::default(),
+    )
+    .unwrap();
+    terminal.transcript.config = Some(SessionDisplayConfig {
+        cwd: directory.path().to_path_buf(),
+        provider: CodingProvider::Codex,
+        model: Some("gpt-5".to_string()),
+        effort: Some("high".to_string()),
+        response_language: ResponseLanguage::default(),
+        fast: false,
+        permission_mode: PermissionMode::FullAccess,
+    });
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    terminal.draw().unwrap();
+    let targets = terminal
+        .status_focus_targets()
+        .into_iter()
+        .map(|(focus, _)| focus)
+        .collect::<Vec<_>>();
+    assert!(
+        [
+            StatusFocus::Model,
+            StatusFocus::Effort,
+            StatusFocus::Permission
+        ]
+        .iter()
+        .all(|focus| targets.contains(focus)),
+        "{targets:?}"
+    );
+
+    // Down from the empty composer focuses the first status control, and
+    // Right visits every control before wrapping.
+    terminal.handle_key(key(KeyCode::Down)).unwrap();
+    for expected in targets.iter().chain(targets.first()) {
+        assert_eq!(terminal.status_focus, Some(*expected));
+        terminal.draw().unwrap();
+        terminal.handle_key(key(KeyCode::Right)).unwrap();
+    }
+    // Typing returns to the composer without losing the keystroke.
+    terminal.handle_key(key(KeyCode::Char('x'))).unwrap();
+    assert_eq!(terminal.status_focus, None);
+    assert_eq!(terminal.composer.text, "x");
+    terminal.composer.clear();
+
+    // Enter activates the focused control exactly like a click.
+    terminal.handle_key(key(KeyCode::Down)).unwrap();
+    while terminal.status_focus != Some(StatusFocus::Permission) {
+        terminal.handle_key(key(KeyCode::Right)).unwrap();
+    }
+    terminal.draw().unwrap();
+    assert!(terminal.permission_status_hovered);
+    terminal.handle_key(key(KeyCode::Enter)).unwrap();
+    assert!(matches!(
+        terminal.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::Permission)
+    ));
+    assert_eq!(terminal.status_focus, None);
+    terminal.shutdown().await;
+}
+
 #[test]
 fn up_recall_targets_all_queued_prompts_only_for_an_empty_composer() {
     let queued = PendingPromptProjection {

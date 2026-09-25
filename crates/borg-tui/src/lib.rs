@@ -471,6 +471,24 @@ impl ComposerSelection {
     }
 }
 
+/// Status-line control that owns keyboard focus. Terminals without mouse
+/// reporting reach every status menu through this path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusFocus {
+    Agents,
+    Goal,
+    Model,
+    Effort,
+    Fast,
+    Permission,
+    Context,
+    Shell,
+    Watch,
+    Todo,
+}
+
+const STATUS_FOCUS_HINT: &str = "←/→ status menus · ↑/↓ items · Enter open · Esc back";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ComposerNavigation {
     WordLeft,
@@ -1700,6 +1718,8 @@ pub struct BorgTerminal {
     fast_status_hovered: bool,
     permission_status_area: Option<Rect>,
     permission_status_hovered: bool,
+    status_focus: Option<StatusFocus>,
+    status_focus_row: Option<usize>,
     nested_scroll_motion: Option<NestedScrollMotion>,
     text_selection: Option<TextSelection>,
     composer_selection: Option<ComposerSelection>,
@@ -2941,6 +2961,8 @@ impl BorgTerminal {
             fast_status_hovered: false,
             permission_status_area: None,
             permission_status_hovered: false,
+            status_focus: None,
+            status_focus_row: None,
             nested_scroll_motion: None,
             text_selection: None,
             composer_selection: None,
@@ -4491,6 +4513,164 @@ impl BorgTerminal {
         self.dictation_button_hovered = false;
     }
 
+    /// Focusable status-line controls in reading order, from the last frame.
+    fn status_focus_targets(&self) -> Vec<(StatusFocus, Rect)> {
+        let mut targets = [
+            (StatusFocus::Agents, self.agents_status_area),
+            (StatusFocus::Goal, self.goal_status_area),
+            (StatusFocus::Model, self.model_status_area),
+            (StatusFocus::Effort, self.effort_status_area),
+            (StatusFocus::Fast, self.fast_status_area),
+            (StatusFocus::Permission, self.permission_status_area),
+            (StatusFocus::Context, self.context_status_area),
+            (StatusFocus::Shell, self.shell_status_area),
+            (StatusFocus::Watch, self.watch_status_area),
+            (StatusFocus::Todo, self.todo_status_area),
+        ]
+        .into_iter()
+        .filter_map(|(focus, area)| Some((focus, area?)))
+        .collect::<Vec<_>>();
+        targets.sort_by_key(|(_, area)| (area.y, area.x));
+        targets
+    }
+
+    fn status_focus_rows(&self, focus: StatusFocus) -> Vec<Rect> {
+        match focus {
+            StatusFocus::Agents => self.team_roster_hit_areas.iter().map(|(a, _)| *a).collect(),
+            StatusFocus::Shell => self.shell_row_hit_areas.iter().map(|(a, _)| *a).collect(),
+            StatusFocus::Watch => self.watch_row_hit_areas.iter().map(|(a, _)| *a).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Mirror keyboard focus into the hover state, so a focused control and
+    /// its menu render exactly like the hovered ones (bold, underlined).
+    fn show_status_focus(&mut self, visible: bool) {
+        let Some(focus) = self.status_focus else {
+            return;
+        };
+        let row = self.status_focus_row.filter(|_| visible);
+        match focus {
+            StatusFocus::Agents => {
+                self.agents_status_hovered = visible;
+                self.hovered_team_roster = row;
+            }
+            StatusFocus::Goal => self.goal_status_hovered = visible,
+            StatusFocus::Model => self.model_status_hovered = visible,
+            StatusFocus::Effort => self.effort_status_hovered = visible,
+            StatusFocus::Fast => self.fast_status_hovered = visible,
+            StatusFocus::Permission => self.permission_status_hovered = visible,
+            StatusFocus::Context => self.context_status_hovered = visible,
+            StatusFocus::Shell => {
+                self.shell_status_hovered = visible;
+                self.hovered_shell_row = row;
+            }
+            StatusFocus::Watch => {
+                self.watch_status_hovered = visible;
+                self.hovered_watch_row = row;
+            }
+            StatusFocus::Todo => self.todo_status_hovered = visible,
+        }
+    }
+
+    fn set_status_focus(&mut self, focus: Option<StatusFocus>, row: Option<usize>) {
+        self.show_status_focus(false);
+        self.status_focus = focus;
+        self.status_focus_row = row;
+        self.show_status_focus(true);
+    }
+
+    fn leave_status_focus(&mut self) {
+        self.set_status_focus(None, None);
+        if self.notice.as_deref() == Some(STATUS_FOCUS_HINT) {
+            self.notice = None;
+        }
+    }
+
+    fn close_status_menus(&mut self) {
+        self.team_switcher_open = false;
+        self.shell_menu_open = false;
+        self.watch_menu_open = false;
+    }
+
+    /// Keyboard navigation while a status-line control has focus. Returns
+    /// `None` for keys that leave focus and continue to the composer.
+    fn handle_status_focus_key(&mut self, key: &KeyEvent) -> Result<Option<UiAction>> {
+        let Some(focus) = self.status_focus else {
+            return Ok(None);
+        };
+        let targets = self.status_focus_targets();
+        let Some(position) = targets.iter().position(|(target, _)| *target == focus) else {
+            self.leave_status_focus();
+            return Ok(None);
+        };
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            self.leave_status_focus();
+            return Ok(None);
+        }
+        let rows = self.status_focus_rows(focus).len();
+        let row = self.status_focus_row.filter(|row| *row < rows);
+        match key.code {
+            KeyCode::Left | KeyCode::BackTab | KeyCode::Right | KeyCode::Tab => {
+                let step = if matches!(key.code, KeyCode::Left | KeyCode::BackTab) {
+                    targets.len() - 1
+                } else {
+                    1
+                };
+                self.close_status_menus();
+                self.set_status_focus(Some(targets[(position + step) % targets.len()].0), None);
+            }
+            // Menus open upward from the status line, so Up enters them.
+            KeyCode::Up if rows > 0 => {
+                let row = row.map_or(rows - 1, |row| row.saturating_sub(1));
+                self.set_status_focus(Some(focus), Some(row));
+            }
+            KeyCode::Down => {
+                let row = row.map(|row| row + 1).filter(|row| *row < rows);
+                self.set_status_focus(Some(focus), row);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let area = match row {
+                    Some(row) => self.status_focus_rows(focus).get(row).copied(),
+                    None => Some(targets[position].1),
+                };
+                let Some(area) = area else {
+                    return Ok(Some(UiAction::None));
+                };
+                // Activation is a click on the focused control, so keyboard
+                // and mouse share one behavior for every status menu.
+                let action = self.handle_event(TerminalInputEvent {
+                    event: Event::Mouse(MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: area.x,
+                        row: area.y,
+                        modifiers: KeyModifiers::NONE,
+                    }),
+                    scroll_repetitions: 1,
+                })?;
+                if self.picker.is_none() {
+                    self.set_status_focus(Some(focus), None);
+                }
+                return Ok(Some(action));
+            }
+            KeyCode::Esc
+                if self.team_switcher_open || self.shell_menu_open || self.watch_menu_open =>
+            {
+                self.close_status_menus();
+                self.set_status_focus(Some(focus), None);
+            }
+            KeyCode::Up | KeyCode::Esc => self.leave_status_focus(),
+            _ => {
+                self.leave_status_focus();
+                return Ok(None);
+            }
+        }
+        Ok(Some(UiAction::None))
+    }
+
     pub fn set_notice(&mut self, notice: impl Into<String>) {
         self.notice = Some(notice.into());
     }
@@ -5714,6 +5894,8 @@ impl BorgTerminal {
                 )))
             }
             Event::Mouse(mouse) => {
+                self.status_focus = None;
+                self.status_focus_row = None;
                 let previous_hover = self.hover_state();
                 let pointer = Position::new(mouse.column, mouse.row);
                 let pointer_moved =
@@ -7372,6 +7554,7 @@ impl BorgTerminal {
             self.copy_notice_expires_at = None;
         }
         let picker_open = self.picker.is_some();
+        self.show_status_focus(true);
         let background_hover_suppressed = overlay_suppresses_background_hover(
             picker_open,
             self.team_switcher_open,
@@ -8760,6 +8943,7 @@ impl BorgTerminal {
                 }
             }
             if self.picker.is_none()
+                && self.status_focus.is_none()
                 && cursor_visible
                 && let Some(cursor) = composer_frame_cursor(
                     composer_area,
@@ -9896,6 +10080,11 @@ impl BorgTerminal {
             self.last_ctrl_c = None;
             self.ctrl_c_count = 0;
         }
+        if self.picker.is_none()
+            && let Some(action) = self.handle_status_focus_key(&key)?
+        {
+            return Ok(action);
+        }
         if matches!(
             self.picker.as_ref().map(|picker| picker.kind),
             Some(PickerKind::Commands | PickerKind::Model)
@@ -10462,6 +10651,11 @@ impl BorgTerminal {
                 } else if !self.composer.text.is_empty() {
                     let width = terminal_content_width(self.terminal.size()?.width).max(1) as usize;
                     self.composer.move_vertical(1, width);
+                } else if let Some((focus, _)) = self.status_focus_targets().first().copied() {
+                    // The status line sits below the composer; Down enters it.
+                    self.set_status_focus(Some(focus), None);
+                    self.notice = Some(STATUS_FOCUS_HINT.to_string());
+                    return Ok(UiAction::None);
                 }
                 self.update_slash_notice();
                 Ok(UiAction::None)
