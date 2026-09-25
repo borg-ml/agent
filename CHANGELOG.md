@@ -81,10 +81,9 @@ Git comparison.
   start, instead of a fragment cut at both ends.
 - The running timer starts from zero for each new turn, including one a
   message starts after the session was waiting, instead of adding to the last.
-- Replies stream a finished paragraph at a time by default: a paragraph once a
-  blank line ends it, lists item by item, code blocks once their fence closes,
-  and titles together with the text under them. `/streaming token` (or
-  Settings → Response streaming) shows every token as it arrives instead.
+- Replies stream token by token by default. `/streaming paragraph` (or
+  Settings → Response streaming) holds unfinished paragraphs, list items,
+  and code blocks until they are ready.
 - Settings menu choices after "Auto-expand tools" opened the setting below
   them; each now opens its own.
 - Watch and other action rows sit in the action list with no extra spacing,

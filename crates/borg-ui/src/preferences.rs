@@ -115,8 +115,8 @@ pub enum DiffExpansionPolicy {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseStreaming {
-    #[default]
     Paragraph,
+    #[default]
     Token,
 }
 
@@ -213,7 +213,7 @@ impl Default for PresentationPreferences {
             auto_expand_tools: false,
             auto_expand_thinking: false,
             tool_click_behavior: ToolClickBehavior::Fullscreen,
-            response_streaming: ResponseStreaming::Paragraph,
+            response_streaming: ResponseStreaming::Token,
             action_descriptors: true,
             running_sweeps: true,
             composer_cursor_style: ComposerCursorStyle::Underline,
@@ -511,6 +511,20 @@ fn validate_label(kind: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_editor_streams_partial_replies_by_default() {
+        assert_eq!(ResponseStreaming::default(), ResponseStreaming::Token);
+        assert_eq!(
+            EditorPreferences::default().presentation.response_streaming,
+            ResponseStreaming::Token
+        );
+        let empty: EditorPreferences = toml::from_str("").unwrap();
+        assert_eq!(
+            empty.presentation.response_streaming,
+            ResponseStreaming::Token
+        );
+    }
 
     #[test]
     fn stale_sessions_preserve_dictation_and_newer_build_settings() {
