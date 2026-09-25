@@ -3385,6 +3385,10 @@ pub struct SubagentCoordinator {
     root_message_tx: broadcast::Sender<TeamInboxMessage>,
     root_message_dispatches: Arc<Mutex<HashMap<Uuid, Instant>>>,
     projected_root_messages: Arc<Mutex<HashSet<Uuid>>>,
+    /// Sessions that sent a followup_task and have not heard back since. The
+    /// next team message to reach one while it is idle starts a turn, so a
+    /// reply is acted on instead of filed as a queued report.
+    awaiting_reply: Arc<std::sync::Mutex<HashSet<Uuid>>>,
     consultation_lock: Arc<Mutex<()>>,
     configure_lock: Arc<Mutex<()>>,
     wait_cursors: Arc<Mutex<HashMap<Uuid, wait::WaitCursor>>>,
@@ -3424,6 +3428,7 @@ impl SubagentCoordinator {
             root_message_tx,
             root_message_dispatches: Arc::new(Mutex::new(HashMap::new())),
             projected_root_messages: Arc::new(Mutex::new(HashSet::new())),
+            awaiting_reply: Arc::new(std::sync::Mutex::new(HashSet::new())),
             consultation_lock: Arc::new(Mutex::new(())),
             configure_lock: Arc::new(Mutex::new(())),
             wait_cursors: Arc::new(Mutex::new(HashMap::new())),
@@ -5830,6 +5835,15 @@ impl SubagentCoordinator {
             .map(|_| ())
     }
 
+    /// Whether `session_id` sent a followup_task it has not had an answer to;
+    /// taking it clears the wait, so one reply wakes the session once.
+    pub(crate) fn take_awaiting_reply(&self, session_id: Uuid) -> bool {
+        self.awaiting_reply
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&session_id)
+    }
+
     async fn route_followup_task_with_options_as(
         &self,
         actor_session_id: Uuid,
@@ -5838,6 +5852,10 @@ impl SubagentCoordinator {
         options: TeamMessageOptions,
     ) -> Result<RoutedTeamMessage> {
         let message = required_message(message)?;
+        self.awaiting_reply
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(actor_session_id);
         let (actor, local_id, root_session_id, status) = {
             let table = self.table.lock().await;
             let actor = table.task_name(actor_session_id)?;
@@ -7100,7 +7118,7 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
         ),
         tool(
             "wait_agent",
-            "Block until your child agents give you something to act on, then report it. This is how to wait for children: one call covers a whole assignment, so never poll with shell sleeps or repeated list_agents. Returns early when a child finishes, fails, stops or needs approval, when a child or teammate messages you, or when human or team input is waiting for you (answer that first); otherwise at timeout_ms. Each change is reported once, so a child that finished earlier does not end later waits. With no child working it returns after a few seconds instead of blocking. The result gives the reason (child_settled, child_message, child_update for both, input_pending, no_active_children, timeout), the changes with each finished child's final text, messages, and a compact status line for every child.",
+            "Block until your child agents give you something to act on, then report it. This is how to wait for children: one call covers a whole assignment, so never poll with shell sleeps or repeated list_agents. Returns early when a child finishes, fails, stops or needs approval, when a child or teammate messages you, or when human or team input is waiting for you (answer that first); otherwise at timeout_ms. Each change is reported once, so a child that finished earlier does not end later waits. With no child working it returns after a few seconds instead of blocking, unless you sent a followup_task that is still unanswered: then it blocks until that reply arrives, so this is how to wait for a peer. Do not poll the inbox from a watcher. The result gives the reason (child_settled, child_message, child_update for both, input_pending, no_active_children, timeout), the changes with each finished child's final text, messages, and a compact status line for every child.",
             json!({
                 "type": "object",
                 "properties": {

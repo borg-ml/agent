@@ -3016,10 +3016,18 @@ async fn run_agent_session_store_kernel_inner(
                         } else {
                             EventActor::User
                         };
+                        // A team message answering a followup_task this session
+                        // sent is acted on, not filed as a queued report.
+                        let answers_followup = actor == EventActor::System
+                            && !is_autonomy
+                            && subagents
+                                .as_ref()
+                                .is_some_and(|team| team.take_awaiting_reply(session_id));
                         if actor == EventActor::System
                             && !is_autonomy
                             && (user_stop
                                 || (delivery == PromptDelivery::Queue
+                                    && !answers_followup
                                     && (watches.yielded().is_some()
                                         || !goal.as_ref().is_some_and(|goal| {
                                             goal.status == GoalStatus::Active
