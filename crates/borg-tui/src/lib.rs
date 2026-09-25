@@ -11023,13 +11023,7 @@ impl ActivityClock {
                 now.signed_duration_since(started_at)
                     .max(chrono::Duration::zero())
             });
-        let total = format_elapsed_duration((self.elapsed + current).num_seconds().max(0) as u64)?;
-        if self.elapsed <= chrono::Duration::zero() || self.started_at.is_none() {
-            return Some(total);
-        }
-        let run = format_elapsed_duration(current.num_seconds().max(0) as u64)
-            .unwrap_or_else(|| "<1m".to_string());
-        Some(format!("{total} · run {run}"))
+        format_elapsed_duration((self.elapsed + current).num_seconds().max(0) as u64)
     }
 }
 
