@@ -17,6 +17,9 @@ Git comparison.
 
 - Footer hover hints say click and right-click, with the action in white and
   what it does in grey.
+- Stopped and failed subagents stay on the team roster, after the working ones,
+  marked "click to resume"; the status line shows "N stopped" when none are
+  working so the roster stays reachable.
 
 ### History
 

@@ -4039,12 +4039,21 @@ impl Transcript {
                 child_id: None,
             });
         }
+        // Working children first, then any that stopped or failed: a child that
+        // died with a restart must stay visible so it can be resumed. Idle
+        // ready workers finished normally and stay out of the way.
         let mut agents = self
             .subagent_snapshots
             .values()
-            .filter(|agent| subagent_is_working(agent.status))
+            .filter(|agent| {
+                subagent_is_working(agent.status)
+                    || matches!(agent.status, SubagentStatus::Stopped | SubagentStatus::Failed)
+            })
             .collect::<Vec<_>>();
-        agents.sort_by(|left, right| left.task_name.cmp(&right.task_name));
+        agents.sort_by(|left, right| {
+            (!subagent_is_working(left.status), &left.task_name)
+                .cmp(&(!subagent_is_working(right.status), &right.task_name))
+        });
         rows.extend(agents.into_iter().map(|agent| {
             let name = display_agent_name(&agent.task_name);
             let model = display_subagent_model(agent);
@@ -4058,7 +4067,13 @@ impl Transcript {
                 name,
                 model,
                 effort: effort.to_string(),
-                state: subagent_status_label(agent.status).to_string(),
+                state: match agent.status {
+                    // Clicking the row focuses the child; a message there wakes it.
+                    SubagentStatus::Stopped | SubagentStatus::Failed => {
+                        format!("{} · click to resume", subagent_status_label(agent.status))
+                    }
+                    status => subagent_status_label(status).to_string(),
+                },
                 usage: usage.to_string(),
                 child_id: Some(agent.session_id),
             }

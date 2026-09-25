@@ -7734,6 +7734,14 @@ fn persistent_peers_follow_ordinary_agent_visibility() {
     assert_eq!(transcript.agent_roster_entries()[0].effort, "—");
     assert_eq!(running_rows[1].state, "running");
     assert_eq!(transcript.active_subagent_count(), 1);
+    // A stopped child stays on the roster so it can be resumed.
+    let mut stopped = peer.clone();
+    stopped.status = SubagentStatus::Stopped;
+    transcript.upsert_subagent_snapshot(&stopped);
+    let stopped_rows = transcript.agent_roster_entries();
+    assert_eq!(stopped_rows.len(), 2);
+    assert_eq!(stopped_rows[1].state, "stopped · click to resume");
+    transcript.upsert_subagent_snapshot(&peer);
     assert_eq!(
         agents_status_label(transcript.active_subagent_count()).as_deref(),
         Some("1 subagent")
@@ -7741,7 +7749,7 @@ fn persistent_peers_follow_ordinary_agent_visibility() {
 }
 
 #[test]
-fn agent_roster_contains_only_currently_working_children() {
+fn agent_roster_lists_working_children_then_resumable_stopped_ones() {
     let parent_id = Uuid::new_v4();
     let now = chrono::Utc::now();
     let snapshot = |name: &str, status, age_minutes| SubagentSnapshot {
@@ -7777,13 +7785,17 @@ fn agent_roster_contains_only_currently_working_children() {
 
     let rows = transcript.agent_roster_entries();
 
-    assert_eq!(rows.len(), 4);
+    // Working children first; stopped and failed ones stay listed so they can
+    // be resumed; idle ready workers are left out.
+    assert_eq!(rows.len(), 6);
     assert_eq!(rows[1].name, "a_starting");
     assert_eq!(rows[2].name, "b_waiting");
     assert_eq!(rows[3].name, "z_live");
+    assert_eq!(rows[4].name, "older");
+    assert_eq!(rows[4].state, "stopped · click to resume");
+    assert_eq!(rows[5].name, "oldest");
+    assert_eq!(rows[5].state, "failed · click to resume");
     assert!(!rows.iter().any(|row| row.name == "idle"));
-    assert!(!rows.iter().any(|row| row.name == "oldest"));
-    assert!(!rows.iter().any(|row| row.name == "older"));
 }
 
 #[test]

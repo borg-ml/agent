@@ -7532,6 +7532,18 @@ impl BorgTerminal {
             .as_deref()
             .unwrap_or(&self.transcript);
         let active_subagents = team_transcript.active_subagent_count();
+        // Children that stopped or failed keep the team label up, so the roster
+        // that resumes them stays one hover away.
+        let stopped_subagents = team_transcript
+            .subagent_snapshots
+            .values()
+            .filter(|agent| {
+                matches!(
+                    agent.status,
+                    SubagentStatus::Stopped | SubagentStatus::Failed
+                )
+            })
+            .count();
         let agent_roster_entries = team_transcript.agent_roster_entries();
         let focused_agent_name = self.focused_child.and_then(|child| {
             team_transcript
@@ -8695,7 +8707,9 @@ impl BorgTerminal {
                 apply_running_status_shimmer(&mut status_spans, running_status_shimmer_phase());
             }
             let status_width = status_spans.iter().map(|span| span.width()).sum::<usize>();
-            let agents_status = agents_status_label(active_subagents);
+            let agents_status = agents_status_label(active_subagents).or_else(|| {
+                (stopped_subagents > 0).then(|| format!("{stopped_subagents} stopped"))
+            });
             let agents_status_width = agents_status
                 .as_ref()
                 .map(|status| activity_glyph(SessionStatus::Running).width() + 1 + status.width());
@@ -8709,7 +8723,14 @@ impl BorgTerminal {
             if let Some(agents_status) = agents_status {
                 let hovered = self.agents_status_hovered || self.team_switcher_open;
                 status_spans.push(Span::styled(
-                    format!("{} ", activity_glyph(SessionStatus::Running)),
+                    format!(
+                        "{} ",
+                        activity_glyph(if active_subagents > 0 {
+                            SessionStatus::Running
+                        } else {
+                            SessionStatus::Stopped
+                        })
+                    ),
                     agents_status_spinner_style(hovered),
                 ));
                 status_spans.push(Span::styled(
