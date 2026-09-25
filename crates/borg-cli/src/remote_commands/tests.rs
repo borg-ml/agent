@@ -551,6 +551,7 @@ fn tool_start_gets_a_visible_frame_even_when_completion_is_already_queued() {
         name: "command_execution".to_string(),
         input: serde_json::json!({"command": "true"}),
         input_ref: None,
+        parent_tool_call_id: None,
     };
 
     assert!(session_event_needs_immediate_frame(&tool_started));

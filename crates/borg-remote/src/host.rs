@@ -7669,6 +7669,7 @@ mod tests {
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         );
 
@@ -7698,6 +7699,7 @@ mod tests {
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         );
         let child_event_id = child_event.id;
@@ -7769,6 +7771,7 @@ mod tests {
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         );
         let stored_child = store.append(child_event.clone()).await.unwrap();
@@ -7875,6 +7878,7 @@ mod tests {
                     is_error: false,
                     input: None,
                     input_ref: None,
+                    parent_tool_call_id: None,
                 },
             ))
             .await
@@ -8063,6 +8067,7 @@ mod tests {
                         is_error: false,
                         input: None,
                         input_ref: None,
+                        parent_tool_call_id: None,
                     },
                 ))
                 .await

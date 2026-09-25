@@ -885,6 +885,7 @@ fn child_history_merge_uses_journal_order_when_timestamps_invert() {
             name: "exec_command".to_string(),
             input: serde_json::json!({"cmd": "cargo test"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     );
     tool.created_at = now;
@@ -2113,6 +2114,7 @@ fn completed_file_creation_replaces_null_diff_placeholder() {
             name: "Edit".to_string(),
             input: input.clone(),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -2126,6 +2128,7 @@ fn completed_file_creation_replaces_null_diff_placeholder() {
             is_error: false,
             input: Some(input),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -2154,6 +2157,7 @@ fn completed_tool_keeps_output_in_the_expandable_body_and_summarizes_the_header(
             name: "functions.exec_command".to_string(),
             input: serde_json::json!({"cmd": "git status --short"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -2166,6 +2170,7 @@ fn completed_tool_keeps_output_in_the_expandable_body_and_summarizes_the_header(
             is_error: false,
             input: Some(serde_json::json!({"cmd": "git status --short"})),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -2197,6 +2202,7 @@ fn command_changes_become_a_separate_replay_stable_edit_action() {
             name: "exec_command".to_string(),
             input: serde_json::json!({"cmd": "python3 rewrite.py"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     );
     let later = SessionEvent::new(
@@ -2207,6 +2213,7 @@ fn command_changes_become_a_separate_replay_stable_edit_action() {
             name: "exec_command".to_string(),
             input: serde_json::json!({"cmd": "cargo check"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     );
     let completed = SessionEvent::new(
@@ -2231,6 +2238,7 @@ fn command_changes_become_a_separate_replay_stable_edit_action() {
             is_error: false,
             input: Some(serde_json::json!({"cmd": "python3 rewrite.py"})),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     );
     let mut transcript = Transcript::default();
@@ -2318,6 +2326,7 @@ fn deferred_command_change_hydrates_its_edit_action() {
             name: "exec_command".to_string(),
             input: serde_json::json!({"cmd": "python3 rewrite.py"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -2337,6 +2346,7 @@ fn deferred_command_change_hydrates_its_edit_action() {
             is_error: false,
             input: None,
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     assert!(matches!(
@@ -2384,6 +2394,7 @@ fn background_process_change_and_terminal_poll_share_one_edit_action() {
             name: "exec_command".to_string(),
             input: serde_json::json!({"cmd": "python3 rewrite.py"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -2406,6 +2417,7 @@ fn background_process_change_and_terminal_poll_share_one_edit_action() {
             is_error: false,
             input: None,
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -2440,6 +2452,7 @@ fn background_process_change_and_terminal_poll_share_one_edit_action() {
             name: "write_stdin".to_string(),
             input: serde_json::json!({"session_id": process_id}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -2459,6 +2472,7 @@ fn background_process_change_and_terminal_poll_share_one_edit_action() {
             is_error: false,
             input: Some(serde_json::json!({"session_id": process_id})),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     assert_eq!(transcript.order.len(), 3);
@@ -2561,6 +2575,7 @@ fn native_edit_file_keeps_the_replacement_diff_after_its_mutation_receipt() {
             name: "edit_file".to_string(),
             input: input.clone(),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -2575,6 +2590,7 @@ fn native_edit_file_keeps_the_replacement_diff_after_its_mutation_receipt() {
             is_error: false,
             input: Some(input),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -2602,6 +2618,7 @@ fn running_tool_uses_a_stable_marker_without_invalidating_transcript_cache() {
             name: "command_execution".to_string(),
             input: serde_json::json!({"command": "cargo check"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -2791,6 +2808,7 @@ fn instant_tools_keep_a_diamond_without_animation() {
             name: "get_plan".to_string(),
             input: serde_json::json!({}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -2821,6 +2839,7 @@ fn instant_tools_keep_a_diamond_without_animation() {
             is_error: false,
             input: Some(serde_json::json!({})),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     let completed = transcript
@@ -2898,6 +2917,7 @@ fn edit_preparation_waits_for_the_first_diff_before_promotion() {
             name: "Edit".to_string(),
             input: serde_json::json!({"path": "src/main.rs"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     let editing = transcript
@@ -2973,6 +2993,7 @@ fn hiding_action_descriptions_keeps_generation_feedback_visible() {
             name: "Edit".to_string(),
             input: serde_json::json!({"path": "src/main.rs", "diff": "@@ -1 +1 @@\n-old\n+new"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     let rendered = transcript
@@ -3061,6 +3082,7 @@ fn action_preparation_completes_when_the_start_event_is_missing() {
             is_error: false,
             input: None,
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -3091,6 +3113,7 @@ fn late_completion_does_not_consume_new_action_preparation() {
             name: "exec_command".to_string(),
             input: serde_json::json!({"cmd": "cargo test"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -3121,6 +3144,7 @@ fn late_completion_does_not_consume_new_action_preparation() {
             is_error: false,
             input: Some(serde_json::json!({"cmd": "cargo test"})),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -3359,6 +3383,7 @@ fn provider_progress_keeps_an_unbacked_tool_in_the_foreground() {
             name: "exec_command".to_string(),
             input: serde_json::json!({"cmd": "long-running command"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -3392,6 +3417,7 @@ fn preparing_a_new_action_does_not_invent_a_background_process() {
             name: "exec_command".to_string(),
             input: serde_json::json!({"cmd": "server"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -3411,6 +3437,7 @@ fn preparing_a_new_action_does_not_invent_a_background_process() {
             name: "exec_command".to_string(),
             input: serde_json::json!({"cmd": "status"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -3457,6 +3484,7 @@ fn completed_tool_duration_is_frozen_at_the_right_edge() {
             name: "command_execution".to_string(),
             input: serde_json::json!({"command": "cargo check"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     );
     started.created_at = started_at;
@@ -3470,6 +3498,7 @@ fn completed_tool_duration_is_frozen_at_the_right_edge() {
             is_error: false,
             input: None,
             input_ref: None,
+            parent_tool_call_id: None,
         },
     );
     completed.created_at = started_at + chrono::Duration::milliseconds(12_345);
@@ -3524,6 +3553,7 @@ fn running_tool_timer_switches_to_one_second_ticks_after_one_minute() {
             name: "command_execution".to_string(),
             input: serde_json::json!({"command": "cargo check"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     );
     started.created_at = started_at;
@@ -3594,6 +3624,7 @@ fn running_tool_elapsed_cache_tick_changes_each_tenth() {
             name: "command_execution".to_string(),
             input: serde_json::json!({"command": "sleep 1"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     let started_at = DateTime::parse_from_rfc3339("2026-07-29T10:00:00.000Z")
@@ -3622,6 +3653,7 @@ fn large_transcript_keeps_running_tool_elapsed_at_tenth_second_cadence() {
             name: "command_execution".to_string(),
             input: serde_json::json!({"command": "sleep 1"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     for sequence in 2..=256 {
@@ -3652,6 +3684,7 @@ fn cached_transcript_reuses_history_for_same_width_timer_updates() {
             name: "command_execution".to_string(),
             input: serde_json::json!({"command": "sleep 10"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     );
     started.created_at = Utc::now() - chrono::Duration::seconds(1);
@@ -3731,6 +3764,7 @@ fn committed_viewport_snapshot_is_dropped_when_the_timer_label_widens() {
             name: "command_execution".to_string(),
             input: serde_json::json!({"command": "sleep 900"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     );
     started.created_at = started_at;
@@ -3825,6 +3859,7 @@ fn committed_snapshot_freezes_the_timer_after_an_order_shift() {
             name: "command_execution".to_string(),
             input: serde_json::json!({"command": "sleep 900"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     );
     started.created_at = started_at;
@@ -4100,6 +4135,7 @@ fn a_new_edit_or_message_collapses_the_previous_diff() {
                     "diff": "@@ -1 +1 @@\n-old\n+new"
                 }]),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ));
     }
@@ -4262,6 +4298,7 @@ fn live_tail_updates_reuse_completed_tool_bodies() {
                 "diff": "@@ -1 +1 @@\n-old\n+new"
             }]),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -4274,6 +4311,7 @@ fn live_tail_updates_reuse_completed_tool_bodies() {
             is_error: false,
             input: None,
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -4364,6 +4402,7 @@ fn incremental_transcript_render_matches_a_full_render_through_a_live_session() 
         name: "Search".to_string(),
         input: serde_json::json!({ "query": query }),
         input_ref: None,
+        parent_tool_call_id: None,
     };
     let tool_completed = |id: &str| SessionEventKind::ToolCompleted {
         tool_call_id: id.to_string(),
@@ -4372,6 +4411,7 @@ fn incremental_transcript_render_matches_a_full_render_through_a_live_session() 
         is_error: false,
         input: None,
         input_ref: None,
+        parent_tool_call_id: None,
     };
     let plan_ids: [Uuid; 3] = std::array::from_fn(|_| Uuid::new_v4());
     let plan = |statuses: [PlanItemStatus; 3]| SessionEventKind::PlanUpdated {
@@ -4695,6 +4735,7 @@ fn large_transcript_live_tail_render_p95_gate() {
                 "diff": format!("@@ -0,0 +1,1000 @@\n{large_diff}")
             }]),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -4707,6 +4748,7 @@ fn large_transcript_live_tail_render_p95_gate() {
             is_error: false,
             input: None,
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     for tool in 0..9 {
@@ -4719,6 +4761,7 @@ fn large_transcript_live_tail_render_p95_gate() {
                 name: "Search".to_string(),
                 input: serde_json::json!({"query": format!("term {tool}")}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ));
         transcript.apply(&SessionEvent::new(
@@ -4731,6 +4774,7 @@ fn large_transcript_live_tail_render_p95_gate() {
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ));
     }
@@ -5348,6 +5392,7 @@ fn deferred_tool_input_loads_when_the_card_is_expanded() {
             name: "Edit".to_string(),
             input: serde_json::json!({"borg_payload_deferred": true}),
             input_ref: Some(payload.clone()),
+            parent_tool_call_id: None,
         },
     ));
 
@@ -5392,6 +5437,7 @@ fn deferred_edit_output_rehydrates_as_a_copyable_diff() {
             name: "Edit".to_string(),
             input: serde_json::json!({"borg_payload_deferred": true}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -5404,6 +5450,7 @@ fn deferred_edit_output_rehydrates_as_a_copyable_diff() {
             is_error: false,
             input: Some(serde_json::json!({"borg_payload_deferred": true})),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -5897,6 +5944,7 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
                 name: name.to_string(),
                 input,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ));
         transcript
@@ -5987,6 +6035,7 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
                 "patch": "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-one\n+two\n",
             })),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     let completed = rendered(&completed);
@@ -6012,6 +6061,7 @@ fn completed_edit_replaces_a_stale_json_preview_with_the_authoritative_diff() {
             name: "Edit".to_string(),
             input: serde_json::json!({"changes": "still assembling"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -6037,6 +6087,7 @@ fn completed_edit_replaces_a_stale_json_preview_with_the_authoritative_diff() {
                 ]
             })),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -6099,6 +6150,7 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
             name: "apply_patch".to_string(),
             input: input.clone(),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     assert_eq!(
@@ -6120,6 +6172,7 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
             is_error: false,
             input: Some(input),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     let completed = transcript
@@ -7016,6 +7069,7 @@ fn diff_expansion_policy_controls_action_lifetime() {
                     "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch"
                 ),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         )
     };
@@ -7027,6 +7081,7 @@ fn diff_expansion_policy_controls_action_lifetime() {
             name: "functions.exec_command".to_string(),
             input: serde_json::json!({"cmd": "cargo test"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     );
     let edit_expanded = |transcript: &Transcript| match &transcript.order[0] {
@@ -9681,6 +9736,7 @@ fn active_turn_assistant_segments_preserve_event_order() {
             name: "shell".to_string(),
             input: serde_json::json!({"command": "trace"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -9706,6 +9762,7 @@ fn active_turn_assistant_segments_preserve_event_order() {
             is_error: false,
             input: None,
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     let final_id = Uuid::new_v4();
@@ -9776,6 +9833,7 @@ fn active_partial_assistant_message_stays_before_later_tool_activity() {
             name: "shell".to_string(),
             input: serde_json::json!({"command": "trace"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -9838,6 +9896,7 @@ fn running_tool_suppresses_stale_response_spinner() {
             name: "shell".to_string(),
             input: serde_json::json!({"command": "check"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -9870,6 +9929,7 @@ fn running_tool_suppresses_stale_response_spinner() {
             is_error: false,
             input: None,
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     let rendered = transcript
@@ -10765,6 +10825,7 @@ fn recovered_idle_session_stops_orphaned_tool_spinner() {
             name: "read_file".to_string(),
             input: serde_json::json!({"path": "src/lib.rs"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     assert!(transcript.has_running_tool());
@@ -11108,6 +11169,7 @@ fn mcp_resource_readiness_failures_are_static_and_compact() {
             name: "mcp__borg_agent__list_mcp_resources".to_string(),
             input: serde_json::json!({"server": "borg_agent"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -11121,6 +11183,7 @@ fn mcp_resource_readiness_failures_are_static_and_compact() {
             is_error: true,
             input: Some(serde_json::json!({"server": "borg_agent"})),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -11993,6 +12056,7 @@ fn provider_progress_does_not_invent_a_background_process() {
             name: "command_execution".to_string(),
             input: serde_json::json!({"command": "cargo run --bin long-build"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -12035,6 +12099,7 @@ fn provider_progress_does_not_invent_a_background_process() {
             is_error: false,
             input: Some(serde_json::json!({"command": "cargo run --bin long-build"})),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     assert_eq!(transcript.shell_status(), None);
@@ -12061,6 +12126,7 @@ fn turn_completion_clears_unbacked_background_tool_state() {
             name: "command_execution".to_string(),
             input: serde_json::json!({"command": "cargo build"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -13118,6 +13184,7 @@ fn reasoning_is_one_live_muted_disclosure_that_collapses_at_a_tool_boundary() {
             name: "read_file".to_string(),
             input: serde_json::json!({"path": "src/lib.rs"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     assert!(matches!(
@@ -13244,6 +13311,7 @@ fn reasoning_completion_freezes_thinking_duration_before_a_delayed_tool() {
             name: "read_file".to_string(),
             input: serde_json::json!({"path": "src/lib.rs"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     );
     tool.created_at = tool_started_at;
@@ -13616,6 +13684,7 @@ fn turn_completion_settles_unresolved_foreground_tools() {
             name: "exec".to_string(),
             input: serde_json::json!({"cmd": "just cli"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -13660,6 +13729,7 @@ fn completed_web_search_updates_the_started_card_with_the_late_query() {
             name: "web_search".to_string(),
             input: serde_json::Value::Null,
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     let running = transcript
@@ -13680,6 +13750,7 @@ fn completed_web_search_updates_the_started_card_with_the_late_query() {
             is_error: false,
             input: Some(serde_json::json!({"query": "Borg Agent queue"})),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -14786,6 +14857,7 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
             name: "exec_command".to_string(),
             input: serde_json::json!({"cmd": "cargo test"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -14814,6 +14886,7 @@ fn runtime_process_lifecycle_drives_active_shell_status() {
             is_error: false,
             input: Some(serde_json::json!({"cmd": "cargo test"})),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     let backgrounded = transcript
@@ -14905,6 +14978,7 @@ fn watcher_process_is_counted_as_a_watcher_not_a_shell() {
             name: "exec_command".to_string(),
             input: serde_json::json!({"cmd": "cargo test"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -14938,6 +15012,7 @@ fn provider_background_handle_drives_shell_status_and_full_output() {
             name: "exec_command".to_string(),
             input: serde_json::json!({"cmd": "bun run build"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -14950,6 +15025,7 @@ fn provider_background_handle_drives_shell_status_and_full_output() {
             is_error: false,
             input: Some(serde_json::json!({"cmd": "bun run build"})),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -14967,6 +15043,7 @@ fn provider_background_handle_drives_shell_status_and_full_output() {
             name: "wait".to_string(),
             input: serde_json::json!({"cell_id": "build-1"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -14984,6 +15061,7 @@ fn provider_background_handle_drives_shell_status_and_full_output() {
             is_error: false,
             input: None,
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
 
@@ -15027,6 +15105,7 @@ fn fullscreen_command_preserves_long_lines_and_completion_input() {
             name: "exec_command".into(),
             input: serde_json::json!({}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -15039,6 +15118,7 @@ fn fullscreen_command_preserves_long_lines_and_completion_input() {
             output: "command output".into(),
             output_ref: None,
             is_error: false,
+            parent_tool_call_id: None,
         },
     ));
     let rendered = transcript
@@ -15074,6 +15154,7 @@ fn exec_poll_completion_renders_command_and_readable_output() {
                 name: "functions.exec".into(),
                 input: serde_json::json!({"action": "confirm push", "session_id": Uuid::new_v4()}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ));
         let output = serde_json::json!({
@@ -15104,6 +15185,7 @@ fn exec_poll_completion_renders_command_and_readable_output() {
                 is_error,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ));
         if deferred {
@@ -15158,6 +15240,7 @@ fn fullscreen_message_details_preserve_long_json_and_control_text() {
             name: "mcp__borg_agent__send_message".into(),
             input: input.clone(),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     transcript.apply(&SessionEvent::new(
@@ -15170,6 +15253,7 @@ fn fullscreen_message_details_preserve_long_json_and_control_text() {
             output: "{}".into(),
             output_ref: None,
             is_error: false,
+            parent_tool_call_id: None,
         },
     ));
     let lines = transcript.render_tool_for_cache(0, 60, 8).0;
@@ -15293,6 +15377,7 @@ async fn timeline_detail_click_policy_applies_to_every_expandable_entry() {
             name: "read_file".into(),
             input: serde_json::json!({"path": "source.rs"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     if let TranscriptEntry::Tool { expanded, .. } = &mut terminal.transcript.order[0] {
@@ -15771,6 +15856,7 @@ async fn action_inspector_stays_on_its_tool_when_plan_or_goal_moves() {
                 name: "exec".into(),
                 input: serde_json::json!({"cmd": "cargo check"}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ));
         let tool = terminal.transcript.tools["selected-tool"];
@@ -15808,6 +15894,7 @@ async fn back_to_actions_never_covers_compaction_status() {
             name: "exec".into(),
             input: serde_json::json!({"cmd": "cargo check"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
     ));
     terminal.open_tool_inspector(terminal.transcript.tools["selected-tool"]);
@@ -15849,6 +15936,7 @@ async fn action_inspector_stays_on_its_entry_when_late_messages_arrive() {
             name: "exec".into(),
             input: serde_json::json!({"cmd": "cargo test"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
         SessionEventKind::Error {
             message: "error detail".into(),
@@ -16266,6 +16354,7 @@ async fn resumed_work_clears_reconnecting_without_recovery_marker() {
             name: "exec".into(),
             input: serde_json::json!({"cmd": "true"}),
             input_ref: None,
+            parent_tool_call_id: None,
         },
         SessionEventKind::Message {
             message_id: Uuid::new_v4(),
@@ -16493,6 +16582,7 @@ fn watch_rows_sit_in_the_action_run_without_extra_spacing() {
                 name: "shell".to_string(),
                 input: serde_json::json!({"command": format!("echo {id}")}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
             SessionEventKind::ToolCompleted {
                 tool_call_id: id.to_string(),
@@ -16501,6 +16591,7 @@ fn watch_rows_sit_in_the_action_run_without_extra_spacing() {
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ]
         .into_iter()

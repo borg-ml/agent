@@ -85,7 +85,10 @@ The default native-provider harness exposes one shell-first `exec` surface.
 The model can use shell pipelines or invoke the installed language best suited
 to the problem; session-scoped Borg, Blu, plugin, workflow, and collaboration
 capabilities are discovered from that shell with `borg tools` and invoked with
-`borg call NAME JSON`. Set `capabilities.harness = "native"` only when the
+`borg call NAME JSON`, or from code with `import borg` in Python
+(`borg.send_message(target=..., message=...)`) and `import borg from "borg"` in
+Bun. Every such call shows in the transcript as a step of the command that made
+it. Set `capabilities.harness = "native"` only when the
 direct one-tool-per-capability fallback is preferred.
 
 Ask Borg to watch a log or deployment, for example: “Watch the build log and

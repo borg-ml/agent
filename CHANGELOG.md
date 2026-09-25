@@ -5,6 +5,14 @@ Git comparison.
 
 ## Unreleased (since 0.11.6)
 
+### Agents
+
+- Commands can call Borg from code: `import borg` in Python and
+  `import borg from "borg"` in Bun (Node: `require("borg")`), with results as
+  data and failures as `BorgError`. Calls from code and from `borg call` show in
+  the transcript as steps of the command that made them.
+- `borg call … | head` no longer panics when the reader closes the pipe.
+
 ### Models
 
 - New sessions start on the model you last used, and a session that fell back

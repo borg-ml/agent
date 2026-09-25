@@ -41,8 +41,18 @@ pub(crate) async fn list_tools(name: Option<&str>) -> Result<()> {
     } else {
         Value::Array(tools.clone())
     };
-    println!("{}", serde_json::to_string(&output)?);
-    Ok(())
+    print_json(&output)
+}
+
+/// Print one JSON line. A reader that stopped early (`| head`) is not an
+/// error of the call, so a closed pipe ends output quietly.
+fn print_json(value: &Value) -> Result<()> {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    match writeln!(stdout, "{}", serde_json::to_string(value)?).and_then(|()| stdout.flush()) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        result => Ok(result?),
+    }
 }
 
 pub(crate) async fn workspace_instances() -> Result<Value> {
@@ -72,9 +82,11 @@ pub(crate) async fn call_tool(name: &str, arguments: Option<&str>) -> Result<()>
         bail!("tool arguments must be a JSON object");
     }
     let endpoint = AgentToolEndpoint::from_env()?;
-    let output = forward(&endpoint, name, arguments, None).await?;
+    // Borg sets this on every command it runs.
+    let parent = std::env::var("BORG_TOOL_CALL_ID").ok();
+    let output = forward_as(&endpoint, name, arguments, parent.as_deref(), None).await?;
     let output = spool_result_attachments(output);
-    println!("{}", serde_json::to_string(&output)?);
+    print_json(&output)?;
     // Printed first so non-image output is never lost, then failed: an image
     // that did not reach the model must not look like a success.
     if let Some(error) = first_spool_error(&output, 0) {
@@ -811,13 +823,25 @@ async fn forward(
     arguments: Value,
     cancel: Option<CancellationToken>,
 ) -> Result<Value> {
+    forward_as(endpoint, name, arguments, None, cancel).await
+}
+
+/// `parent` names the command making the call, so Borg journals it as that
+/// command's step.
+async fn forward_as(
+    endpoint: &AgentToolEndpoint,
+    name: &str,
+    arguments: Value,
+    parent: Option<&str>,
+    cancel: Option<CancellationToken>,
+) -> Result<Value> {
     #[cfg(unix)]
     let response = match endpoint {
         AgentToolEndpoint::Unix { socket, .. } => {
             let stream = UnixStream::connect(socket)
                 .await
                 .with_context(|| format!("failed to connect to {}", socket.display()))?;
-            exchange(stream, name, arguments, None, cancel).await?
+            exchange(stream, name, arguments, None, parent, cancel).await?
         }
     };
     #[cfg(not(unix))]
@@ -826,7 +850,15 @@ async fn forward(
             let stream = TcpStream::connect(address).await.with_context(|| {
                 format!("failed to connect to local agent tool server {address}")
             })?;
-            exchange(stream, name, arguments, Some(token.as_str()), cancel).await?
+            exchange(
+                stream,
+                name,
+                arguments,
+                Some(token.as_str()),
+                parent,
+                cancel,
+            )
+            .await?
         }
     };
     if let Some(error) = response.get("error").and_then(Value::as_str) {
@@ -843,6 +875,7 @@ async fn exchange<S>(
     name: &str,
     arguments: Value,
     token: Option<&str>,
+    parent: Option<&str>,
     cancel: Option<CancellationToken>,
 ) -> Result<Value>
 where
@@ -857,6 +890,9 @@ where
     );
     if let Some(token) = token {
         request["token"] = Value::String(token.to_string());
+    }
+    if let Some(parent) = parent {
+        request["parent"] = Value::String(parent.to_string());
     }
     write.write_all(format!("{request}\n").as_bytes()).await?;
     let mut lines = BufReader::new(read).lines();

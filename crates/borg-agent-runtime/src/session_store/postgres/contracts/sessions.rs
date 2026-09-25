@@ -418,6 +418,7 @@ async fn large_tool_payloads_are_loaded_only_by_reference() {
                 name: "large".to_string(),
                 input: input.clone(),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ))
         .await

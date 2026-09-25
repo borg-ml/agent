@@ -143,6 +143,7 @@ pub(super) async fn seed_recovery_fixture(
                 name: "read_file".into(),
                 input: serde_json::json!({"path": "/tmp/a"}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ))
         .await
@@ -158,6 +159,7 @@ pub(super) async fn seed_recovery_fixture(
                 is_error: false,
                 input: None,
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ))
         .await

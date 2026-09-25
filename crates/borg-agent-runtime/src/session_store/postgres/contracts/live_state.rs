@@ -75,6 +75,7 @@ async fn parallel_generation_status_survives_reconnect_and_clears_per_call() {
                 name: "read_file".into(),
                 input: serde_json::json!({}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ))
         .await
@@ -294,6 +295,7 @@ async fn reasoning_boundaries_clear_the_snapshot_before_the_next_thought() {
                 name: "read_file".to_string(),
                 input: serde_json::json!({"path": "src/lib.rs"}),
                 input_ref: None,
+                parent_tool_call_id: None,
             },
         ))
         .await
