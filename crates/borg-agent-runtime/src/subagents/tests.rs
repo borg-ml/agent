@@ -3008,7 +3008,7 @@ async fn waking_a_child_preserves_queued_team_message_provenance() {
         child
     };
     bind_test_team(directory.path(), store.as_ref(), root, &[child.session_id]).await;
-    let message_id = coordinator
+    let routed = coordinator
         .route_message_with_options_as(
             root,
             "worker",
@@ -3016,10 +3016,22 @@ async fn waking_a_child_preserves_queued_team_message_provenance() {
             TeamMessageOptions::default(),
         )
         .await
-        .unwrap()
-        .receipt
-        .unwrap()
-        .message_id;
+        .unwrap();
+    // A sender told "dispatched" assumes an idle worker will act on it; it
+    // only reads its inbox once woken.
+    assert_eq!(
+        routed_message_json(
+            RoutedTeamMessage {
+                receipt: None,
+                dispatched_locally: routed.dispatched_locally,
+                relay_pending: routed.relay_pending,
+                awaiting_wake: routed.awaiting_wake,
+            },
+            "queued"
+        )["delivery_state"],
+        "queued_idle"
+    );
+    let message_id = routed.receipt.unwrap().message_id;
     let mut activity = coordinator.subscribe();
 
     coordinator

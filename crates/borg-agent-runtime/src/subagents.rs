@@ -3079,6 +3079,8 @@ struct RoutedTeamMessage {
     receipt: Option<WorkspaceMessageReceipt>,
     dispatched_locally: bool,
     relay_pending: bool,
+    /// Queued in an idle child's inbox, which it reads only once woken.
+    awaiting_wake: bool,
 }
 
 #[derive(Clone)]
@@ -5446,6 +5448,7 @@ impl SubagentCoordinator {
                 receipt,
                 dispatched_locally,
                 relay_pending,
+                awaiting_wake: false,
             });
         }
         if id == root_session_id {
@@ -5472,6 +5475,7 @@ impl SubagentCoordinator {
                 receipt,
                 dispatched_locally: true,
                 relay_pending,
+                awaiting_wake: false,
             });
         }
         let mut table = self.table.lock().await;
@@ -5479,19 +5483,22 @@ impl SubagentCoordinator {
             .entries
             .get_mut(&id)
             .expect("resolved subagent exists");
-        if matches!(
+        let awaiting_wake = if matches!(
             entry.snapshot.status,
             SubagentStatus::Running | SubagentStatus::WaitingForApproval | SubagentStatus::Starting
         ) && entry.commands.is_some()
         {
             send_prompt(entry, id, inbox_message).await?;
+            false
         } else {
             entry.inbox.push(inbox_message);
-        }
+            true
+        };
         Ok(RoutedTeamMessage {
             receipt,
             dispatched_locally: true,
             relay_pending,
+            awaiting_wake,
         })
     }
 
@@ -5624,6 +5631,7 @@ impl SubagentCoordinator {
                 receipt,
                 dispatched_locally,
                 relay_pending,
+                awaiting_wake: false,
             });
         }
         if id == root_session_id {
@@ -5636,6 +5644,7 @@ impl SubagentCoordinator {
                 receipt,
                 dispatched_locally: true,
                 relay_pending,
+                awaiting_wake: false,
             });
         }
         self.ensure_child_actor(id).await?;
@@ -5676,6 +5685,7 @@ impl SubagentCoordinator {
             receipt,
             dispatched_locally: true,
             relay_pending,
+            awaiting_wake: false,
         })
     }
 
@@ -5816,6 +5826,7 @@ impl SubagentCoordinator {
             receipt: Some(receipt),
             dispatched_locally: false,
             relay_pending: actor.host_id.is_some(),
+            awaiting_wake: false,
         })
     }
 
@@ -9005,7 +9016,9 @@ pub struct BroadcastReach {
 }
 
 fn routed_message_json(routed: RoutedTeamMessage, accepted_field: &str) -> Value {
-    let delivery_state = if routed.dispatched_locally {
+    let delivery_state = if routed.awaiting_wake {
+        "queued_idle"
+    } else if routed.dispatched_locally {
         "dispatched"
     } else if routed.relay_pending {
         "relay_pending"
@@ -9032,6 +9045,11 @@ fn routed_message_json(routed: RoutedTeamMessage, accepted_field: &str) -> Value
         }),
     };
     value[accepted_field] = Value::Bool(true);
+    if routed.awaiting_wake {
+        value["note"] = json!(
+            "The recipient is idle and was not woken: it reads this only when it is next given work. Use followup_task, or send_message with wake:true, for it to act on this now."
+        );
+    }
     value
 }
 
