@@ -5,6 +5,13 @@ Git comparison.
 
 ## Unreleased (since 0.11.3)
 
+### Terminal
+
+- The Running timer now keeps cumulative active time across action handoffs,
+  including for subagents, without adding a second `run` timer.
+- The Running status highlight sweeps more slowly and narrowly, without
+  changing tool-row sweep speed.
+
 ## 0.11.3 (2026-09-24)
 
 ### Terminal
