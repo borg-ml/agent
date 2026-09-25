@@ -2168,20 +2168,34 @@ async fn run_local_agent_session(
                 .context("current project directory does not exist")?,
         ),
     };
-    // With a fallback chain and no explicit choice, a fresh session starts on
-    // the chain's first route, provided its subscription is signed in (or the
-    // route opted into API billing). Otherwise the usual default applies.
+    // Without an explicit choice, a fresh session starts on the model last
+    // used, then on the fallback chain's first route, provided its
+    // subscription is signed in (or the route opted into API billing).
+    let route_ready = |route: &borg_remote::ModelRoute| {
+        route.allow_api_billing
+            || !matches!(
+                route.provider,
+                CodingProvider::Claude | CodingProvider::Codex
+            )
+            || borg_remote::provider_subscription_credentials_present(route.provider)
+    };
     let chain_start = (!resuming && args.provider.is_none() && args.model.is_none())
-        .then(|| agent_config.capabilities.model_fallback.first().cloned())
-        .flatten()
-        .filter(|route| {
-            route.allow_api_billing
-                || !matches!(
-                    route.provider,
-                    CodingProvider::Claude | CodingProvider::Codex
-                )
-                || borg_remote::provider_subscription_credentials_present(route.provider)
-        });
+        .then(|| {
+            editor_preferences
+                .interaction
+                .last_model
+                .clone()
+                .filter(route_ready)
+                .or_else(|| {
+                    agent_config
+                        .capabilities
+                        .model_fallback
+                        .first()
+                        .cloned()
+                        .filter(route_ready)
+                })
+        })
+        .flatten();
     let requested_provider = if let Some(route) = &chain_start {
         route.provider
     } else if args
@@ -4088,6 +4102,23 @@ async fn run_local_agent_session(
                         ..
                     } => {
                         provider = *configured_provider;
+                        if can_prompt || args.gui_owner {
+                            let last_model = borg_remote::ModelRoute {
+                                provider,
+                                model: model.clone(),
+                                effort: effort.clone(),
+                                allow_api_billing: false,
+                            };
+                            if editor_preferences.interaction.last_model.as_ref()
+                                != Some(&last_model)
+                            {
+                                editor_preferences.interaction.last_model = Some(last_model);
+                                dispatch_editor_preferences_save(
+                                    &editor_preferences_tx,
+                                    &editor_preferences,
+                                );
+                            }
+                        }
                         current_model = model.clone();
                         current_effort = effort.clone();
                         current_fast = *fast;

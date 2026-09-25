@@ -6753,19 +6753,6 @@ async fn run_agent_session_store_kernel_inner(
             }
         }
         at_turn_boundary = true;
-        // Back up the chain once an earlier route's limit has reset.
-        if !interrupted
-            && let Some(switch) = return_to_preferred_route(
-                &mut journal,
-                &events,
-                session_id,
-                &mut launch,
-                &route_limits,
-            )
-            .await?
-        {
-            provider_switch_pending |= switch.provider_changed;
-        }
         if active_provider != launch.provider || active_model != launch.model {
             provider_context_usage_valid = false;
         }
@@ -11040,53 +11027,6 @@ async fn fall_back_on_usage_limit(
             provider: launch.provider,
             kind: "model_fallback".to_string(),
             payload: serde_json::json!({ "from": switch.from, "to": switch.to, "until": until.to_rfc3339() }),
-        },
-    )
-    .await?;
-    Ok(Some(switch))
-}
-
-/// Between turns, return to the earliest route of the chain that has quota
-/// again. A session moved off the chain by hand is left where it is.
-async fn return_to_preferred_route(
-    journal: &mut RuntimeSessionStore,
-    events: &mpsc::Sender<SessionEvent>,
-    session_id: Uuid,
-    launch: &mut LaunchSession,
-    route_limits: &crate::model_fallback::RouteLimits,
-) -> Result<Option<FallbackSwitch>> {
-    let chain = launch.capabilities.model_fallback.clone();
-    let Some(current) =
-        crate::model_fallback::current_route(&chain, launch.provider, launch.model.as_deref())
-    else {
-        return Ok(None);
-    };
-    let Some(preferred) = crate::model_fallback::preferred_route(
-        &chain,
-        route_limits,
-        &launch.capabilities.provider_capabilities,
-        Utc::now(),
-    ) else {
-        return Ok(None);
-    };
-    if preferred >= current {
-        return Ok(None);
-    }
-    let provider_changed =
-        apply_route(journal, events, session_id, launch, &chain[preferred]).await?;
-    let switch = FallbackSwitch {
-        from: chain[current].label(),
-        to: chain[preferred].label(),
-        provider_changed,
-    };
-    record(
-        journal,
-        events,
-        session_id,
-        SessionEventKind::ProviderEvent {
-            provider: launch.provider,
-            kind: "model_fallback_restored".to_string(),
-            payload: serde_json::json!({ "from": switch.from, "to": switch.to }),
         },
     )
     .await?;

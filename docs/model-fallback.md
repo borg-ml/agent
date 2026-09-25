@@ -3,8 +3,8 @@
 A session can run on an ordered chain of models. When the model it is on
 reaches a usage limit (a 5-hour window, a weekly cap or a billing limit), Borg
 records when that limit resets, switches to the next model in the chain that
-has quota, and continues the same turn at once. At later turn boundaries it
-returns to the earliest model whose limit has reset. Only when every model in
+has quota, and continues the same turn at once. The session stays on that
+model until you change it or it is limited too. Only when every model in
 the chain is limited does the session wait, and then for the one that resets
 first. This is what lets a `/goal` run unattended around the clock.
 
@@ -13,9 +13,10 @@ first. This is what lets a `/goal` run unattended around the clock.
 fallback = ["claude-opus-5-5@max", "gpt-6-sol@xhigh", "opencode-go/deepseek-v4.1"]
 ```
 
-A new session started without `--provider` or `--model` begins on the first
-route, provided its subscription is signed in (or the route allows API
-billing); resumed sessions keep their recorded model.
+A new session started without `--provider` or `--model` begins on the model the
+last interactive session used, or on the first route when there is none,
+provided its subscription is signed in (or the route allows API billing);
+resumed sessions keep their recorded model.
 
 ## Routes
 

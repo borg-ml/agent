@@ -137,6 +137,8 @@ pub struct InteractionPreferences {
     /// grants microphone access). Until then, the dictation key opens that
     /// flow instead of recording.
     pub dictation_enabled: bool,
+    /// The model the last interactive session ran on; new sessions start there.
+    pub last_model: Option<borg_remote::ModelRoute>,
 }
 
 impl Default for InteractionPreferences {
@@ -151,6 +153,7 @@ impl Default for InteractionPreferences {
             auto_copy_selection: true,
             luna_titles_for_all_providers: false,
             dictation_enabled: false,
+            last_model: None,
         }
     }
 }
@@ -547,6 +550,12 @@ keep = true
                 auto_copy_selection: false,
                 luna_titles_for_all_providers: true,
                 dictation_enabled: true,
+                last_model: Some(borg_remote::ModelRoute {
+                    provider: borg_remote::CodingProvider::Codex,
+                    model: Some("gpt-6-sol".to_string()),
+                    effort: Some("high".to_string()),
+                    allow_api_billing: false,
+                }),
             },
             presentation: PresentationPreferences {
                 ui_language: UiLanguage::SimplifiedChinese,
