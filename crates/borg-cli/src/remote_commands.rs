@@ -5065,10 +5065,10 @@ async fn run_local_agent_session(
                         continue;
                     }
                 };
-                if terminal_event.is_escape() {
-                    if let Some(read_at) = borg_tui::take_last_escape_read() {
-                        tracing::info!(%session_id, key_queue_ms = read_at.elapsed().as_millis(), "tui escape received");
-                    }
+                if terminal_event.is_escape()
+                    && let Some(read_at) = borg_tui::take_last_escape_read()
+                {
+                    tracing::info!(%session_id, key_queue_ms = read_at.elapsed().as_millis(), "tui escape received");
                 }
                 // Resume hydration is deliberately deferred until after the
                 // first paint. Never await it from a key handler: even history

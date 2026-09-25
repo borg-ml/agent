@@ -489,6 +489,23 @@ enum StatusFocus {
 
 const STATUS_FOCUS_HINT: &str = "←/→ status menus · ↑/↓ items · Enter open · Esc back";
 
+/// Focus visible controls on either composer line. Command may be swallowed
+/// by macOS terminals, so Down/Tab navigation remains available.
+fn status_focus_shortcut(key: &KeyEvent) -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    let modifier = KeyModifiers::SUPER;
+    #[cfg(not(target_os = "macos"))]
+    let modifier = KeyModifiers::CONTROL;
+    if key.modifiers != modifier {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(digit @ '1'..='9') => Some(digit as usize - '1' as usize),
+        KeyCode::Char('0') => Some(9),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ComposerNavigation {
     WordLeft,
@@ -10054,6 +10071,16 @@ impl BorgTerminal {
     }
 
     fn handle_key(&mut self, mut key: KeyEvent) -> Result<UiAction> {
+        if self.picker.is_none()
+            && !self.keybindings_open
+            && let Some(index) = status_focus_shortcut(&key)
+            && let Some((focus, _)) = self.status_focus_targets().get(index).copied()
+        {
+            self.close_status_menus();
+            self.set_status_focus(Some(focus), None);
+            self.notice = Some(STATUS_FOCUS_HINT.to_string());
+            return Ok(UiAction::None);
+        }
         if is_selection_copy_shortcut(&key)
             && let Some(request) = self.copy_text_selection_request()
         {

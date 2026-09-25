@@ -775,8 +775,9 @@ fn tool_window_summary(entries: &[TranscriptEntry], total: usize, today_prefix: 
     parts.join(" · ")
 }
 
-/// Align the open group's time with the action glyphs below it.
-const TOOL_WINDOW_HEADER_INDENT: &str = "  ";
+/// An expanded group uses a down triangle; the timestamp starts in the same
+/// column as the collapsed `▸ ` header.
+const TOOL_WINDOW_HEADER_INDENT: &str = "▾ ";
 
 /// A group header in grey.
 fn tool_window_header(prefix: &'static str, text: String) -> Line<'static> {
