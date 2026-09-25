@@ -56,8 +56,8 @@ Git comparison.
 - The composer prompt is `›` with a blinking underscore cursor; finished
   command rows use the same slim chevron, edits use `◈`, and pending or agent
   actions retain diamond markers.
-- Search actions use a magnifying glass (`🔍`). `/cursor underline`, `/cursor
-  bar`, and `/cursor block` select a persisted composer cursor style.
+- `/cursor underline`, `/cursor bar`, and `/cursor block` select a persisted
+  composer cursor style.
 - The inactive agent roster is collapsed by default. Goal and watcher accents
   are rose-purple; todos use orange. Action-group timestamps align with rows.
 - With an empty composer, press Down to focus the status line; arrows and Tab
