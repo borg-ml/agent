@@ -422,18 +422,73 @@ fn text_blocks(content: &str) -> Vec<Value> {
 fn image_blocks(attachments: &[super::ModelInputAttachment]) -> Vec<Value> {
     attachments
         .iter()
-        .map(|attachment| {
-            let (media_type, data) = fitted_image(attachment);
-            json!({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": media_type,
-                    "data": data,
-                },
-            })
+        .flat_map(|attachment| match tiled_image(attachment) {
+            Some(pieces) => pieces
+                .into_iter()
+                .flat_map(|(label, media_type, data)| {
+                    [
+                        json!({ "type": "text", "text": label }),
+                        image_block(&media_type, &data),
+                    ]
+                })
+                .collect(),
+            None => {
+                let (media_type, data) = fitted_image(attachment);
+                vec![image_block(&media_type, &data)]
+            }
         })
         .collect()
+}
+
+fn image_block(media_type: &str, data: &str) -> Value {
+    json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": media_type,
+            "data": data,
+        },
+    })
+}
+
+/// A large attachment as a labelled overview plus tiles the model sees at
+/// full resolution (`crate::image_tiles`), or `None` to send it whole.
+/// History replays every image on every turn, so the answer is cached.
+fn tiled_image(attachment: &super::ModelInputAttachment) -> Option<Vec<(String, String, String)>> {
+    use base64::Engine as _;
+    use std::hash::{Hash, Hasher};
+    type Tiles = Option<Vec<(String, String, String)>>;
+    static CACHE: OnceLock<std::sync::Mutex<HashMap<u64, Tiles>>> = OnceLock::new();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    attachment.data_base64.hash(&mut hasher);
+    let key = hasher.finish();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        return hit.clone();
+    }
+    let engine = base64::engine::general_purpose::STANDARD;
+    let tiles: Tiles = engine
+        .decode(&attachment.data_base64)
+        .ok()
+        .and_then(|bytes| crate::image_tiles::tile(&bytes))
+        .map(|pieces| {
+            pieces
+                .into_iter()
+                .map(|piece| {
+                    (
+                        piece.label,
+                        piece.media_type.to_string(),
+                        engine.encode(piece.bytes),
+                    )
+                })
+                .collect()
+        });
+    let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+    if cache.len() >= 64 {
+        cache.clear();
+    }
+    cache.insert(key, tiles.clone());
+    tiles
 }
 
 /// Anthropic rejects a request when any image exceeds this edge once the
