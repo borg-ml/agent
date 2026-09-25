@@ -2519,6 +2519,8 @@ fn tool_copy_uses_output_and_keeps_edit_diffs_copyable() {
         user_interrupted: false,
         backgrounded: false,
         expanded: false,
+        outcome: None,
+        cwd: None,
     };
 
     let command = tool(
@@ -2555,6 +2557,8 @@ fn tool_hover_hint_names_the_copy_target() {
         user_interrupted: false,
         backgrounded: false,
         expanded: false,
+        outcome: None,
+        cwd: None,
     });
     assert_eq!(
         transcript.tool_copy_hint(0),
@@ -4127,6 +4131,8 @@ fn background_tool_elapsed_cache_tick_also_changes_each_tenth() {
         user_interrupted: false,
         backgrounded: true,
         expanded: false,
+        outcome: None,
+        cwd: None,
     });
     transcript.tools.insert("background".to_string(), 0);
 
@@ -4343,11 +4349,21 @@ fn live_tail_updates_reuse_completed_tool_bodies() {
             text: "new live tail".to_string(),
         },
     ));
+    // The reasoning row makes the edit part of a group, redrawn once boxed.
+    let _ = transcript.lines(80);
+    let boxed_misses = transcript.tool_body_cache.borrow().misses;
+    transcript.apply(&SessionEvent::new(
+        session_id,
+        4,
+        SessionEventKind::ReasoningDelta {
+            text: " and more".to_string(),
+        },
+    ));
     let _ = transcript.lines(80);
 
     assert_eq!(
         transcript.tool_body_cache.borrow().misses,
-        1,
+        boxed_misses,
         "a live tail update must not re-render completed tool bodies"
     );
 }
@@ -4633,7 +4649,7 @@ fn incremental_transcript_render_matches_a_full_render_through_a_live_session() 
         .flatten()
         .map(|window| window.start)
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(runs.len(), 2, "both action runs are boxed");
+    assert_eq!(runs.len(), 3, "every action run is boxed");
     let first_run = *runs.first().unwrap();
     let thinking = transcript
         .order
@@ -6057,7 +6073,7 @@ fn an_edit_reads_as_active_until_its_diff_is_on_screen() {
         },
     ));
     let completed = rendered(&completed);
-    assert!(completed.contains("✓ Edited"), "{completed}");
+    assert!(completed.contains("✎ Edited"), "{completed}");
     assert!(!completed.contains("in progress"), "{completed}");
     assert!(completed.contains("− one"), "{completed}");
     assert!(completed.contains("+ two"), "{completed}");
@@ -6115,7 +6131,7 @@ fn completed_edit_replaces_a_stale_json_preview_with_the_authoritative_diff() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("✓ Edited"), "{rendered}");
+    assert!(rendered.contains("✎ Edited"), "{rendered}");
     assert!(rendered.contains("+ # Long edit"), "{rendered}");
     assert!(rendered.contains("− old"), "{rendered}");
     assert!(rendered.contains("+ new"), "{rendered}");
@@ -6199,7 +6215,7 @@ fn streamed_tool_preview_is_replaced_by_the_durable_tool_once() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(completed.contains("✓ Edited"), "{completed}");
+    assert!(completed.contains("✎ Edited"), "{completed}");
     assert!(!completed.contains("in progress"), "{completed}");
 
     let mut plan = Transcript::default();
@@ -10014,6 +10030,8 @@ fn redirected_reply_is_marked_as_redirected_not_user_interrupted() {
         user_interrupted: false,
         backgrounded: false,
         expanded: false,
+        outcome: None,
+        cwd: None,
     });
     transcript.apply(&SessionEvent::new(
         session_id,
@@ -11686,6 +11704,8 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         user_interrupted: false,
         backgrounded: false,
         expanded: false,
+        outcome: None,
+        cwd: None,
     });
     transcript.order.push(TranscriptEntry::Message {
         actor: EventActor::Assistant,
@@ -11714,6 +11734,8 @@ fn transcript_separates_labeled_groups_from_header_and_tool_activity() {
         user_interrupted: false,
         backgrounded: false,
         expanded: false,
+        outcome: None,
+        cwd: None,
     });
     transcript.order.push(TranscriptEntry::Plan {
         items: vec![PlanItem {
@@ -11835,6 +11857,8 @@ fn adjacent_tool_calls_are_compact_but_leave_gap_before_following_message() {
         user_interrupted: false,
         backgrounded: false,
         expanded: false,
+        outcome: None,
+        cwd: None,
     };
     transcript.order.push(tool("Read"));
     transcript.order.push(tool("Run Git operations"));
@@ -11851,12 +11875,20 @@ fn adjacent_tool_calls_are_compact_but_leave_gap_before_following_message() {
         redirected: false,
     });
 
+    // A finished group folds; open it to see its rows.
+    assert!(transcript.toggle_tool_run_expansion(0));
     let rendered = transcript.render(80, None, None, None);
-    assert_eq!(rendered.1, vec![(0, 0, 1), (1, 1, 2)]);
-    assert!(!rendered.0[1].spans.is_empty());
-    assert!(rendered.0[2].spans.is_empty());
+    let [(0, _, first_end), (1, second_start, second_end)] = rendered.1[..] else {
+        panic!("two tool rows: {:?}", rendered.1);
+    };
+    assert_eq!(first_end, second_start, "adjacent rows have no gap");
+    assert!(!rendered.0[second_start].spans.is_empty());
     let (_, message_start, message_end) = rendered.3[0];
-    assert_eq!(message_start, 3);
+    assert!(message_start > second_end);
+    assert!(
+        rendered.0[message_start - 1].spans.is_empty(),
+        "a gap before the message"
+    );
     assert_eq!(
         rendered.0[message_end - 1]
             .spans
@@ -11899,6 +11931,8 @@ fn message_tool_message_edges_have_one_separator_row_each() {
         user_interrupted: false,
         backgrounded: false,
         expanded: false,
+        outcome: None,
+        cwd: None,
     });
     transcript
         .order
@@ -11959,6 +11993,8 @@ fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
         user_interrupted: false,
         backgrounded: false,
         expanded: true,
+        outcome: None,
+        cwd: None,
     };
     transcript.order.push(thinking("first"));
     transcript.order.push(thinking("second"));
@@ -11975,6 +12011,7 @@ fn adjacent_expanded_thinking_entries_are_compact_but_separate_from_message() {
         redirected: false,
     });
 
+    assert!(transcript.toggle_tool_run_expansion(0));
     let lines = transcript.lines(80);
     let thinking_rows = lines
         .iter()
@@ -12016,6 +12053,8 @@ fn running_actions_keep_edge_spacing_in_compact_and_boxed_runs() {
         user_interrupted: false,
         backgrounded: false,
         expanded: false,
+        outcome: None,
+        cwd: None,
     };
 
     let mut compact = Transcript::default();
@@ -12194,6 +12233,8 @@ fn boxed_thinking_rows_keep_one_edge_separator_without_duplicates() {
             user_interrupted: false,
             backgrounded: false,
             expanded: true,
+            outcome: None,
+            cwd: None,
         }));
 
     let lines = transcript
@@ -12230,6 +12271,8 @@ fn peer_reports_and_errors_keep_one_continuous_neutral_actions_gutter() {
             user_interrupted: false,
             backgrounded: false,
             expanded: false,
+            outcome: None,
+            cwd: None,
         }));
 
     for label in ["Peer one", "Peer two"] {
@@ -12502,6 +12545,8 @@ fn long_tool_runs_show_eight_lines_and_scroll_independently() {
             user_interrupted: false,
             backgrounded: false,
             expanded: false,
+            outcome: None,
+            cwd: None,
         });
     }
 
@@ -12514,7 +12559,7 @@ fn long_tool_runs_show_eight_lines_and_scroll_independently() {
     assert!(!rendered.contains("call-11"));
     assert!(rendered.contains("call-12"));
     assert!(rendered.contains("call-19"));
-    assert!(rendered.contains("actions · 20 · click to expand · ↑ scroll"));
+    assert!(rendered.contains("20 actions · click to expand · ↑ scroll"));
     assert!(!rendered.contains("scroll for older/newer"));
 
     transcript.scroll_tool_run(0, 12, -3);
@@ -12548,6 +12593,8 @@ fn actions_accordion_hides_expand_hint_when_all_rows_already_fit() {
             user_interrupted: false,
             backgrounded: false,
             expanded: false,
+            outcome: None,
+            cwd: None,
         });
     }
 
@@ -12558,8 +12605,76 @@ fn actions_accordion_hides_expand_hint_when_all_rows_already_fit() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("actions · 9"), "{rendered}");
+    assert!(rendered.contains("9 actions"), "{rendered}");
     assert!(!rendered.contains("click to expand"), "{rendered}");
+}
+
+#[test]
+fn a_finished_action_group_folds_to_its_summary_until_clicked() {
+    let tool = |detail: &str, name: &str, cwd: Option<&str>| TranscriptEntry::Tool {
+        source_name: "exec".to_string(),
+        name: name.to_string(),
+        detail: detail.to_string(),
+        code_view: None,
+        output_view: None,
+        payload_refs: Vec::new(),
+        time: "12:00".to_string(),
+        started_at: Utc::now(),
+        completed_at: Some(Utc::now()),
+        complete: true,
+        error: false,
+        user_interrupted: false,
+        backgrounded: false,
+        expanded: false,
+        outcome: Some("3 matches".to_string()),
+        cwd: cwd.map(str::to_string),
+    };
+    let mut transcript = Transcript::default();
+    transcript
+        .order
+        .push(tool("first-read", "Read", Some("/srv/ore-cues")));
+    transcript.order.push(tool("first-search", "Search", None));
+    transcript.order.push(tool("first-grep", "Search", None));
+    transcript.order.push(tool("first-list", "Read", None));
+    transcript.order.push(TranscriptEntry::Message {
+        actor: EventActor::Assistant,
+        text: "Found it.".to_string(),
+        attachments: Vec::new(),
+        model: None,
+        effort: None,
+        time: "12:01".to_string(),
+        status: MessageStatus::Complete,
+        complete: true,
+        user_interrupted: false,
+        redirected: false,
+    });
+    transcript.order.push(tool("second-run", "Run", None));
+    let render = |transcript: &Transcript| {
+        transcript
+            .lines(100)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let folded = render(&transcript);
+    assert!(
+        folded.contains(
+            "▸ 12:00 · /srv/ore-cues · read 2 · searched 2 · 4 actions · click to expand"
+        ),
+        "{folded}"
+    );
+    assert!(!folded.contains("first-read"), "{folded}");
+    assert!(
+        folded.contains("second-run"),
+        "the open group shows its rows: {folded}"
+    );
+
+    assert!(transcript.toggle_tool_run_expansion(0));
+    let unfolded = render(&transcript);
+    assert!(unfolded.contains("first-read"), "{unfolded}");
+    assert!(unfolded.contains("3 matches"), "{unfolded}");
 }
 
 #[test]
@@ -12581,6 +12696,8 @@ fn expanded_tool_run_shows_every_action_and_collapses_again() {
             user_interrupted: false,
             backgrounded: false,
             expanded: false,
+            outcome: None,
+            cwd: None,
         });
     }
     let render = |transcript: &Transcript| {
@@ -12597,7 +12714,7 @@ fn expanded_tool_run_shows_every_action_and_collapses_again() {
     assert!(expanded.contains("call-0"), "{expanded}");
     assert!(expanded.contains("call-19"), "{expanded}");
     assert!(
-        expanded.contains("actions · 20 · click to collapse"),
+        expanded.contains("20 actions · click to collapse"),
         "{expanded}"
     );
     assert!(!expanded.contains("↑ more"), "{expanded}");
@@ -12608,7 +12725,7 @@ fn expanded_tool_run_shows_every_action_and_collapses_again() {
     assert!(!collapsed.contains("call-11"), "{collapsed}");
     assert!(collapsed.contains("call-12"), "{collapsed}");
     assert!(
-        collapsed.contains("actions · 20 · click to expand · ↑ scroll"),
+        collapsed.contains("20 actions · click to expand · ↑ scroll"),
         "{collapsed}"
     );
 }
@@ -12636,6 +12753,8 @@ fn focused_tool_inspector_isolates_one_tool_and_forces_its_live_body_open() {
         user_interrupted: false,
         backgrounded: false,
         expanded: false,
+        outcome: None,
+        cwd: None,
     });
     transcript.order.push(TranscriptEntry::Tool {
         source_name: "Edit".to_string(),
@@ -12655,6 +12774,8 @@ fn focused_tool_inspector_isolates_one_tool_and_forces_its_live_body_open() {
         user_interrupted: false,
         backgrounded: false,
         expanded: false,
+        outcome: None,
+        cwd: None,
     });
 
     let (lines, tool_rows, ..) = transcript.render_tool_for_cache(2, 100, 24);
@@ -12707,6 +12828,8 @@ fn agent_lifecycle_rows_keep_one_continuous_actions_accordion() {
         user_interrupted: false,
         backgrounded: false,
         expanded: false,
+        outcome: None,
+        cwd: None,
     };
     for index in 0..4 {
         transcript.order.push(tool(index));
@@ -12730,8 +12853,8 @@ fn agent_lifecycle_rows_keep_one_continuous_actions_accordion() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert_eq!(rendered.matches("┌─ actions").count(), 1);
-    assert!(rendered.contains("actions · 11"));
+    assert_eq!(rendered.matches("┌─ ").count(), 1);
+    assert!(rendered.contains("11 actions"));
     assert!(
         rendered.contains("│ 19:38  agent · /root/v391_scaling_audit · started"),
         "{rendered}"
@@ -12757,6 +12880,8 @@ fn tool_run_scroll_only_consumes_wheel_events_while_it_can_move() {
             user_interrupted: false,
             backgrounded: false,
             expanded: false,
+            outcome: None,
+            cwd: None,
         });
     }
 
@@ -12875,6 +13000,8 @@ fn tall_expanded_tool_transcript() -> Transcript {
         user_interrupted: false,
         backgrounded: false,
         expanded: true,
+        outcome: None,
+        cwd: None,
     });
     for index in 0..20 {
         transcript.order.push(TranscriptEntry::Activity {
@@ -13002,6 +13129,8 @@ fn line_scrolling_preserves_expanded_actions() {
             user_interrupted: false,
             backgrounded: false,
             expanded: index == 8,
+            outcome: None,
+            cwd: None,
         });
     }
 
@@ -13053,6 +13182,8 @@ fn scrolled_action_viewport_pins_the_current_tool_header() {
             user_interrupted: false,
             backgrounded: false,
             expanded: index == 8,
+            outcome: None,
+            cwd: None,
         });
     }
 
@@ -13087,6 +13218,8 @@ fn expanding_an_action_preserves_the_current_line_anchor() {
             user_interrupted: false,
             backgrounded: false,
             expanded: false,
+            outcome: None,
+            cwd: None,
         });
     }
 
@@ -13269,7 +13402,7 @@ fn reasoning_lifecycle_events_show_reasoning_without_a_text_delta() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains("✓ Reasoned"));
+    assert!(rendered.contains("∴ Reasoned"));
     assert!(!rendered.contains("◇ Thinking"));
 }
 
@@ -13670,6 +13803,8 @@ fn interrupted_tools_update_in_place_with_explicit_user_cause() {
         user_interrupted: false,
         backgrounded: false,
         expanded: false,
+        outcome: None,
+        cwd: None,
     });
 
     transcript.mark_running_tools_user_interrupted(Utc::now());
@@ -13731,7 +13866,7 @@ fn turn_completion_settles_unresolved_foreground_tools() {
         .map(|line| line.to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(rendered.contains('✓'));
+    assert!(rendered.contains("▶ Ran"), "{rendered}");
     assert!(!rendered.contains("completed"));
 }
 
@@ -14599,6 +14734,8 @@ fn selection_anchors_follow_content_when_the_actions_window_shifts() {
         user_interrupted: false,
         backgrounded: false,
         expanded: false,
+        outcome: None,
+        cwd: None,
     };
     let mut transcript = Transcript::default();
     for index in 0..20 {
@@ -14649,6 +14786,8 @@ fn mixed_actions_window_selection_ranges_match_the_visible_rows() {
         user_interrupted: false,
         backgrounded: false,
         expanded: false,
+        outcome: None,
+        cwd: None,
     };
     let mut transcript = Transcript::default();
     for index in 0..4 {
@@ -14726,6 +14865,8 @@ fn drag_selection_stays_live_when_wheel_scroll_hides_its_action_anchor() {
             user_interrupted: false,
             backgrounded: false,
             expanded: false,
+            outcome: None,
+            cwd: None,
         });
     }
 
@@ -14811,6 +14952,8 @@ fn released_selection_follows_expanded_tool_text_during_nested_scroll() {
             user_interrupted: false,
             backgrounded: false,
             expanded: index == 8,
+            outcome: None,
+            cwd: None,
         });
     }
 

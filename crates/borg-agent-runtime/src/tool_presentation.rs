@@ -40,6 +40,12 @@ pub struct ToolPresentation {
     pub output: Option<ToolPresentationBody>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
+    /// A few words for the row: matches found, exit status, tests, changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// Where a command ran, shown once for a group of rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub body_rows: Vec<String>,
     #[serde(default)]
@@ -117,6 +123,10 @@ pub fn project_tool_presentation(
             })
         }),
         result: output.and_then(|output| summarize_tool_result(name, input, output, is_error)),
+        outcome: output
+            .filter(|_| is_command_tool(name) && !is_error)
+            .and_then(|output| command_outcome(input, output)),
+        cwd: command_cwd(input, output),
         body_rows: tool_detail_rows(name, input),
         backgrounded: (tool_can_start_background_process(name)
             || matches!(tool_leaf_name(name).as_str(), "wait" | "write_stdin"))
@@ -475,6 +485,8 @@ pub fn command_edit_presentation(name: &str, output: &str) -> Option<ToolPresent
         input: Some(body),
         output: None,
         result: None,
+        outcome: None,
+        cwd: None,
         body_rows: Vec::new(),
         backgrounded: false,
         hidden: false,
@@ -766,21 +778,28 @@ pub fn tool_call_summary(name: &str, input: &Value) -> (String, String) {
     }
 
     if let Some(command) = command_from_input(input) {
+        // A leading `cd DIR` is where the command ran, shown once per group.
+        let command = without_leading_cd(command);
         if let Some(query) = search_chain_query(command) {
             return (
                 "Search".to_string(),
                 format!("“{}”", compact_text(&query, 120)),
             );
         }
-        let label = if command_is_read_only(command) {
-            "Read"
-        } else {
-            "Run"
-        };
-        return (
-            label.to_string(),
-            compact_text(&unwrapped_shell_command(command), 160),
-        );
+        let unwrapped = unwrapped_shell_command(command);
+        if let Some((runtime, line)) = inline_script(&unwrapped) {
+            return (format!("Run {runtime}"), compact_text(line, 160));
+        }
+        if let Some(path) = heredoc_write_target(&unwrapped) {
+            return ("Write".to_string(), path.to_string());
+        }
+        if command_is_read_only(command) {
+            return (
+                "Read".to_string(),
+                read_target(&unwrapped).unwrap_or_else(|| compact_text(&unwrapped, 160)),
+            );
+        }
+        return ("Run".to_string(), compact_text(&unwrapped, 160));
     }
 
     if tool.contains("read")
@@ -2311,6 +2330,176 @@ fn command_has_shell_control_operator(command: &str) -> bool {
     escaped || quote.is_some()
 }
 
+fn without_leading_cd(command: &str) -> &str {
+    split_leading_cd(command)
+        .map(|(_, rest)| rest)
+        .filter(|rest| !rest.trim().is_empty())
+        .unwrap_or(command)
+}
+
+/// `python3 - <<'PY' …` and the like: the language and the first line of the
+/// script that says what it does (imports and blank lines say nothing).
+fn inline_script(command: &str) -> Option<(&'static str, &str)> {
+    static SCRIPT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"^\s*(python3?|bun|node|deno)\b[^\n<]*<<-?\s*['"]?\w+['"]?[^\n]*\n"#)
+            .expect("valid inline script pattern")
+    });
+    let found = SCRIPT.captures(command)?;
+    let runtime = match &found[1] {
+        "python" | "python3" => "Python",
+        "bun" => "Bun",
+        "deno" => "Deno",
+        _ => "Node",
+    };
+    let body = &command[found.get(0)?.end()..];
+    let line = body
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            !line.is_empty()
+                && !line.starts_with('#')
+                && !line.starts_with("//")
+                && !line.starts_with("import ")
+                && !line.starts_with("from ")
+                && !line.starts_with("const ")
+                && !line.contains(" require(")
+        })
+        .unwrap_or_default();
+    Some((runtime, line))
+}
+
+/// `cat > FILE <<EOF`, `cat <<'EOF' > FILE` and `tee FILE <<EOF` write FILE.
+fn heredoc_write_target(command: &str) -> Option<&str> {
+    static WRITE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"^\s*(?:(?:cat|tee)\s+>?\s*([^\s<>|;&]+)\s*<<|cat\s*<<-?\s*['"]?\w+['"]?\s*>\s*([^\s<>|;&]+))"#,
+        )
+        .expect("valid heredoc write pattern")
+    });
+    let found = WRITE.captures(command)?;
+    Some(found.get(1).or_else(|| found.get(2))?.as_str())
+}
+
+/// Which file, and which lines, a simple read shows: `sed -n 'A,Bp' FILE`,
+/// `head -n N FILE`, `tail -n N FILE`, `nl -ba FILE` or `cat FILE`.
+fn read_target(command: &str) -> Option<String> {
+    let words = shell_words(command);
+    if words.iter().any(|word| is_shell_operator(word)) {
+        return None;
+    }
+    let (program, arguments) = words.split_first()?;
+    let file = arguments.last().filter(|file| !file.starts_with('-'))?;
+    let count = |flag: &str| {
+        arguments
+            .windows(2)
+            .find(|pair| pair[0] == flag)
+            .and_then(|pair| pair[1].parse::<usize>().ok())
+            .or_else(|| {
+                arguments
+                    .iter()
+                    .find_map(|word| word.strip_prefix('-')?.parse::<usize>().ok())
+            })
+    };
+    match program.rsplit('/').next()? {
+        "sed" => {
+            let range = arguments.iter().find_map(|word| {
+                let (from, to) = word.strip_suffix('p')?.split_once(',')?;
+                Some(format!("{from}-{to}"))
+            })?;
+            Some(format!("{file}:{range}"))
+        }
+        "head" => {
+            Some(count("-n").map_or_else(|| file.clone(), |lines| format!("{file}:1-{lines}")))
+        }
+        "tail" => {
+            Some(count("-n").map_or_else(|| file.clone(), |lines| format!("{file} (last {lines})")))
+        }
+        "cat" | "nl" | "bat" | "less"
+            if arguments
+                .iter()
+                .filter(|word| !word.starts_with('-'))
+                .count()
+                == 1 =>
+        {
+            Some(file.clone())
+        }
+        _ => None,
+    }
+}
+
+/// A command's result in a few words for its row: how many matches a search
+/// found, a failing exit status, tests passed or failed, lines changed, or how
+/// many lines a read showed.
+fn command_outcome(input: &Value, output: &str) -> Option<String> {
+    static TESTS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(\d+) (passed|failed)").expect("valid test count pattern")
+    });
+    let command = without_leading_cd(command_from_input(input)?);
+    let value = serde_json::from_str::<Value>(&readable_result_text(output)).ok()?;
+    if value.get("running").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    if value.get("timed_out").and_then(Value::as_bool) == Some(true) {
+        return Some("timed out".to_string());
+    }
+    let exit = value.get("exit_code").and_then(Value::as_i64);
+    let stdout = value.get("stdout").and_then(Value::as_str).unwrap_or("");
+    let stderr = value.get("stderr").and_then(Value::as_str).unwrap_or("");
+    let truncated = value
+        .get("stdout_omitted_bytes")
+        .and_then(Value::as_u64)
+        .is_some_and(|omitted| omitted > 0);
+    let lines = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    let more = if truncated { "+" } else { "" };
+    if search_chain_query(command).is_some() {
+        return Some(match (exit, lines) {
+            (Some(1), 0) | (_, 0) => "no matches".to_string(),
+            (_, 1) => "1 match".to_string(),
+            (_, lines) => format!("{lines}{more} matches"),
+        });
+    }
+    if let Some(code) = exit.filter(|code| *code != 0) {
+        return Some(format!("exit {code}"));
+    }
+    if let Some(changes) = introduced_changes(output) {
+        let added: usize = changes.iter().map(|change| change.added).sum();
+        let removed: usize = changes.iter().map(|change| change.removed).sum();
+        return Some(format!("+{added} -{removed}"));
+    }
+    let (mut passed, mut failed) = (0, 0);
+    for found in TESTS.captures_iter(&format!("{stdout}\n{stderr}")) {
+        let count: usize = found[1].parse().unwrap_or(0);
+        if &found[2] == "passed" {
+            passed += count;
+        } else {
+            failed += count;
+        }
+    }
+    if failed > 0 {
+        return Some(format!("{failed} failed"));
+    }
+    if passed > 0 {
+        return Some(format!("{passed} passed"));
+    }
+    (command_is_read_only(command) && lines > 0).then(|| format!("{lines}{more} lines"))
+}
+
+/// Where a command ran: its own leading `cd`, or the directory the shell
+/// reported for it.
+fn command_cwd(input: &Value, output: Option<&str>) -> Option<String> {
+    if let Some((directory, _)) = command_from_input(input).and_then(split_leading_cd) {
+        return Some(directory.to_string());
+    }
+    let output = serde_json::from_str::<Value>(&readable_result_text(output?)).ok()?;
+    output
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
 /// A command's leading `cd DIR` and what follows it (`cd DIR && rest`,
 /// `cd DIR; rest` or a bare `cd DIR`). The shell tool remembers `DIR` for later
 /// commands, and rows show `rest` under the directory instead of the prefix.
@@ -2469,7 +2658,7 @@ fn edit_source(value: &Value) -> Option<&str> {
 
 /// True for the tool names that run a command, whose result may carry the
 /// change the command introduced rather than a diff of its own.
-fn is_command_tool(name: &str) -> bool {
+pub fn is_command_tool(name: &str) -> bool {
     matches!(
         tool_leaf_name(name).as_str(),
         "bash" | "command_execution" | "exec_command" | "exec" | "shell"
@@ -2652,6 +2841,52 @@ mod tests {
             false,
         );
         assert_eq!(presentation.detail, "up to 15m");
+    }
+
+    #[test]
+    fn command_rows_name_what_the_command_did_and_how_it_went() {
+        let row = |cmd: &str, output: Option<Value>| {
+            let output = output.map(|output| output.to_string());
+            let presentation =
+                project_tool_presentation("exec", &json!({"cmd": cmd}), output.as_deref(), false);
+            (
+                presentation.label,
+                presentation.detail,
+                presentation.outcome,
+                presentation.cwd,
+            )
+        };
+        let (label, detail, outcome, cwd) = row(
+            "cd ~/abundance-wt/ore-cues && rg -n 'class OreGeology' Source",
+            Some(json!({"exit_code": 0, "stdout": "a.h:1:x\nb.h:2:y\n"})),
+        );
+        assert_eq!(
+            (label.as_str(), cwd.as_deref()),
+            ("Search", Some("~/abundance-wt/ore-cues"))
+        );
+        assert!(detail.contains("class OreGeology"));
+        assert_eq!(outcome.as_deref(), Some("2 matches"));
+
+        let (label, detail, _, _) = row("cat > Scripts/build.py <<'EOF'\nprint(1)\nEOF", None);
+        assert_eq!(
+            (label.as_str(), detail.as_str()),
+            ("Write", "Scripts/build.py")
+        );
+
+        let (label, detail, _, _) = row(
+            "python3 - <<'PY'\nimport json\np = Path('src/main.cpp')\nPY",
+            None,
+        );
+        assert_eq!(
+            (label.as_str(), detail.as_str()),
+            ("Run Python", "p = Path('src/main.cpp')")
+        );
+
+        let (_, _, outcome, _) = row(
+            "cargo test",
+            Some(json!({"exit_code": 101, "stdout": "test result: FAILED. 3 passed; 1 failed"})),
+        );
+        assert_eq!(outcome.as_deref(), Some("exit 101"));
     }
 
     #[test]
@@ -3401,10 +3636,7 @@ all green"
         );
         assert_eq!(read.label, "Read");
         assert_eq!(read.category, ToolPresentationCategory::Read);
-        assert_eq!(
-            read.detail,
-            "sed -n '1,400p' docs/model-adaptation/CLOSED-ROUTES.md"
-        );
+        assert_eq!(read.detail, "docs/model-adaptation/CLOSED-ROUTES.md:1-400");
 
         let wrapped = project_tool_presentation(
             "functions.exec_command",

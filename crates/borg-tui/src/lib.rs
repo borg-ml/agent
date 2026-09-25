@@ -33,10 +33,11 @@ use borg_remote::{
     SessionEventKind, SessionGoal, SessionPayloadKind, SessionPayloadRef, SessionState,
     SessionStatus, SubagentActivityKind, SubagentSnapshot, SubagentStatus,
     ToolPresentationCategory, WatchSummary, command_edit_presentation, compact_text,
-    edit_is_awaiting_diff, is_diff_language, is_edit_tool, is_mcp_resource_probe, is_subagent_tool,
-    project_tool_presentation, tool_action_is_instant, tool_can_start_background_process,
-    tool_has_rich_ui, tool_output_background_handle, tool_output_code_view,
-    tool_process_followup_handle, tool_process_output_text, web_search_query,
+    edit_is_awaiting_diff, is_command_tool, is_diff_language, is_edit_tool, is_mcp_resource_probe,
+    is_subagent_tool, project_tool_presentation, tool_action_is_instant,
+    tool_can_start_background_process, tool_has_rich_ui, tool_output_background_handle,
+    tool_output_code_view, tool_process_followup_handle, tool_process_output_text,
+    web_search_query,
 };
 #[cfg(test)]
 use borg_remote::{tool_call_summary, tool_code_view};
@@ -115,7 +116,7 @@ const MAX_WHEEL_SCROLL_LINES_PER_FRAME: isize = 8;
 const WHEEL_SCROLL_EASING_DIVISOR: usize = 8;
 const NESTED_WHEEL_SCROLL_FULL_HEIGHT_ROWS: usize = 72;
 const MAX_PENDING_WHEEL_SCROLL_LINES: isize = 160;
-const TOOL_RUN_BOX_THRESHOLD: usize = 8;
+const TOOL_RUN_BOX_THRESHOLD: usize = 1;
 const MAX_COLLAPSED_PLAN_ITEMS: usize = 5;
 /// How many still-open steps a collapsed plan card shows under its change log.
 /// The change says what just happened; on its own it does not say what is
@@ -7988,8 +7989,7 @@ impl BorgTerminal {
                 is_launch_screen,
             );
             let status_color = focused_subagent_status_color(status, self.focused_child.is_some());
-            let (status_area, mut transcript_area, composer_area, footer_area) = if is_launch_screen
-            {
+            let (status_area, transcript_area, composer_area, footer_area) = if is_launch_screen {
                 let launch_width = composer_area_width.min(chunks[0].width);
                 let launch_height = composer_height
                     .saturating_add(7)
@@ -8044,22 +8044,13 @@ impl BorgTerminal {
                     Rect::default(),
                 )
             } else {
-                (chunks[2], chunks[0], chunks[3], chunks[4])
-            };
-            let back_to_actions_row = if self.focused_tool.is_some() && transcript_area.height > 1 {
-                let row = Rect {
-                    height: 1,
-                    ..transcript_area
+                // One empty row above the status line keeps the composer area
+                // apart from the transcript's last line.
+                let transcript = Rect {
+                    height: chunks[0].height.saturating_sub(1).max(1),
+                    ..chunks[0]
                 };
-                transcript_area.y += 1;
-                transcript_area.height -= 1;
-                frame.render_widget(
-                    Block::default().style(Style::default().bg(Color::Black)),
-                    row,
-                );
-                Some(row)
-            } else {
-                None
+                (chunks[2], transcript, chunks[3], chunks[4])
             };
             next_composer_text_area = Some(Rect {
                 x: composer_area
@@ -9006,12 +8997,16 @@ impl BorgTerminal {
                 }
             }
             if self.focused_child.is_some() || self.focused_tool.is_some() {
-                let (label, idle_color) = if self.focused_tool.is_some() {
-                    (" ← Back to actions ", BACKGROUND_RUNNING_TEXT)
+                // Over action details the button sits on the terminal's own
+                // background, like the details it returns from.
+                let (label, idle_color, idle_background) = if self.focused_tool.is_some() {
+                    (" ← Back to thread ", BACKGROUND_RUNNING_TEXT, Color::Reset)
                 } else {
-                    (" ↩ Return ", SUBAGENT_PINK)
+                    (" ↩ Return ", SUBAGENT_PINK, COMMAND_PANEL_BG)
                 };
-                let button_row = back_to_actions_row.unwrap_or(status_area);
+                // Beside Jump to bottom on the status row, where every other
+                // control is.
+                let button_row = status_area;
                 let button = Rect {
                     x: button_row.right().saturating_sub(label.width() as u16 + 1),
                     y: button_row.y,
@@ -9029,7 +9024,7 @@ impl BorgTerminal {
                             .bg(if self.back_to_director_hovered {
                                 MESSAGE_HOVER_BG
                             } else {
-                                COMMAND_PANEL_BG
+                                idle_background
                             })
                             .add_modifier(Modifier::BOLD),
                     ),
