@@ -3983,10 +3983,15 @@ impl SubagentCoordinator {
         Ok(snapshot)
     }
 
+    /// Give `request` to a compatible idle worker, or spawn a child for it.
+    /// `fresh` always spawns: an idle worker may be holding context or
+    /// unlanded work its parent means to follow up on, and reusing it renames
+    /// it and drops its last answer.
     async fn assign_task_as(
         &self,
         actor_session_id: Uuid,
         request: SpawnSubagent,
+        fresh: bool,
     ) -> Result<Value> {
         let launch = self.subagent_launch(&request).await?;
         let assignment_name = launch
@@ -4010,7 +4015,8 @@ impl SubagentCoordinator {
                 .entries
                 .values_mut()
                 .filter(|entry| {
-                    entry.snapshot.status == SubagentStatus::Ready
+                    !fresh
+                        && entry.snapshot.status == SubagentStatus::Ready
                         && !entry.assignment_claimed
                         && !is_persistent_peer_lane(&entry.snapshot.task_name)
                         && entry.snapshot.provider == launch.provider
@@ -6129,6 +6135,7 @@ impl SubagentCoordinator {
                         model: args.model,
                         effort: args.reasoning_effort,
                     },
+                    args.fresh,
                 )
                 .await
             }
@@ -6679,7 +6686,11 @@ pub fn subagent_tool_specs(provider: CodingProvider) -> Vec<Value> {
                         "description": model_description,
                         "examples": model_examples
                     },
-                    "reasoning_effort": { "type": "string" }
+                    "reasoning_effort": { "type": "string" },
+                    "fresh": {
+                        "type": "boolean",
+                        "description": "Always start a new child session instead of reusing an idle worker with the same profile. Use it when idle workers hold context or pending work you will follow up on, or the task needs a clean context."
+                    }
                 },
                 "required": ["task_name", "message"],
                 "additionalProperties": false
@@ -6817,7 +6828,8 @@ fn subagent_tool_description(provider: CodingProvider) -> String {
     format!(
         "Delegate a concrete, bounded task. Borg atomically reuses a compatible idle worker \
          when one is available and otherwise spawns an isolated child session; do not list \
-         agents or issue follow-up calls just to manage worker capacity. Omit provider, model, \
+         agents or issue follow-up calls just to manage worker capacity. Pass fresh:true to \
+         always start a new session, leaving idle workers to their own tasks. Omit provider, model, \
          and reasoning_effort to inherit the parent. {inheritance} All catalog-backed subagent \
          choices are also available explicitly: {}",
         subagent_model_override_description()
@@ -8270,6 +8282,8 @@ struct SpawnAgentArgs {
     provider: Option<CodingProvider>,
     model: Option<String>,
     reasoning_effort: Option<String>,
+    #[serde(default)]
+    fresh: bool,
 }
 
 #[derive(Deserialize)]
